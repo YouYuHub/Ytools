@@ -658,6 +658,7 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
         # 清理工具管理内存（使用 session_id 隔离）
         await cleanup_chat_memory_manager(session_id)
+        await cleanup_file_memory_manager(session_id)
         yield "data: [DONE]\n\n"
     except Exception as ce:
         session_chat_memory.add_chat_history({"role": "assistant", "error": ce})
