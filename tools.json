@@ -1,0 +1,150 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "format_current_time",
+            "description": "格式化当前时间\n无参数\n返回：\n    格式化 %Y-%m-%d %H:%M:%S 的时间字符串\n",
+            "parameters": {
+                "properties": {},
+                "title": "format_current_timeArguments",
+                "type": "object"
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "list_dir_item",
+            "description": "列出指定目录下的文件或目录，返回文件或目录的详细信息列表\n参数：\n    dir_path:       目录路径，默认为当前目录\n    search_mode:    查询模式，默认为 file，表示查询文件，可选项为 file, dir，all；其中 all 表示所有文件和目录，传入其他参数则只会返回文件\n    file_type:      文件类型（例如：.py），默认为 None，表示所有文件以及其子目录下的所有文件\n    depth:          整数类型，递归深度，0 表示不递归（即当前目录），1 表示一级子目录，以此类推，默认为 0\n返回：\n    文件或目录信息列表，每个元素是一个字典，包含以下字段：\n        - path: 完整路径字符串\n        - type: 类型，\"file\" 或 \"dir\"\n        - size: 文件大小（字节），仅文件有此字段\n        - name: 文件名或目录名\n    没有文件则返回空列表 []\n",
+            "parameters": {
+                "properties": {
+                    "dir_path": {
+                        "default": null,
+                        "title": "dir_path",
+                        "type": "string"
+                    },
+                    "search_mode": {
+                        "default": "file",
+                        "title": "search_mode",
+                        "type": "string"
+                    },
+                    "file_type": {
+                        "default": null,
+                        "title": "file_type",
+                        "type": "string"
+                    },
+                    "depth": {
+                        "default": 0,
+                        "title": "Depth",
+                        "type": "integer"
+                    }
+                },
+                "title": "list_dir_itemArguments",
+                "type": "object"
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "create_dir",
+            "description": "创建目录，不是创建文件\n参数：\n    dir_path: 需要创建的目录，例如D:/test ，注意，路径分割符为 / 不要使用 \\ \n返回：\n    True 创建成功，如果目录已经存在也返回 True，失败会抛出异常\n",
+            "parameters": {
+                "properties": {
+                    "dir_path": {
+                        "title": "Dir Path",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "dir_path"
+                ],
+                "title": "create_dirArguments",
+                "type": "object"
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "create_file",
+            "description": "向文件 full_file_name 中写入 content 内容，编码格式为 coding，会自动创建不存在的文件\n参数：\n    full_file_name: 必选参数，文件的完整路径，例如D:/test/test.txt；如果文件不存在，则创建文件；注意，路径分割符为 / 不要使用 \\\n    content: 必选参数，文件内容，写入内容会覆盖掉原文件内容\n    coding: 文件编码，默认为 utf-8\n返回：\n    成功返回写入文件信息（content标签内容），失败应该会直接抛出异常\n",
+            "parameters": {
+                "properties": {
+                    "full_file_name": {
+                        "title": "Full File Name",
+                        "type": "string"
+                    },
+                    "content": {
+                        "title": "Content",
+                        "type": "string"
+                    },
+                    "coding": {
+                        "default": "utf-8",
+                        "title": "coding",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "full_file_name",
+                    "content"
+                ],
+                "title": "create_fileArguments",
+                "type": "object"
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "get_file_content",
+            "description": "获取指定文件的内容\n参数：\n    full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 / 不要使用 \\ \n    startline: 开始行位置，默认为 1，表示从第一行开始\n    endline: 结束行位置(包含这行内容)，默认为 -1，表示读取到文件末尾，如果 endline < startline 则返回空字符串\n    coding: 文件编码，默认为 utf-8\n返回：\n    文件的内容，空文件会返回空值\n",
+            "parameters": {
+                "properties": {
+                    "full_file_name": {
+                        "title": "Full File Name",
+                        "type": "string"
+                    },
+                    "startline": {
+                        "default": 1,
+                        "title": "Startline",
+                        "type": "integer"
+                    },
+                    "endline": {
+                        "default": -1,
+                        "title": "Endline",
+                        "type": "integer"
+                    },
+                    "coding": {
+                        "default": "utf-8",
+                        "title": "coding",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "full_file_name"
+                ],
+                "title": "get_file_contentArguments",
+                "type": "object"
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "server_file": "mcp_server/sys_server.py",
+            "name": "over_task",
+            "description": "结束对话，无参数，无返回值 ",
+            "parameters": {
+                "properties": {},
+                "title": "over_taskArguments",
+                "type": "object"
+            }
+        }
+    }
+]

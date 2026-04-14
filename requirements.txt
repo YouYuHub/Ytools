@@ -1,0 +1,25 @@
+# Web 框架和服务器
+fastapi
+uvicorn[standard]
+
+# HTTP 客户端
+requests
+aiohttp
+
+# LLM 集成
+openai
+
+# 数据验证
+pydantic
+
+# MCP 协议（Model Context Protocol）
+mcp
+
+# 文件上传支持
+python-multipart
+
+# 文件解析库
+PyMuPDF  # PDF 解析 (fitz)
+python-docx  # DOCX 文档解析
+pandas  # CSV/Excel 文件解析
+openpyxl  # Excel (.xlsx) 文件支持

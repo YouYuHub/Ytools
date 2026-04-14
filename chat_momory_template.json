@@ -1,0 +1,11 @@
+{
+  "timestamp": "%Y-%m-%d %H:%M:%S",
+  "role": "user",
+  "content": "你能干嘛？",
+  "files": [ "a.png", "b.docx" ],
+  "reasoning_content": "你好，我要介绍自己",
+  "tool_calls": [ { "functionA": "..." } ],
+  "tool_return": "...",
+  "done": "[DONE]",
+  "error": "..."
+}
