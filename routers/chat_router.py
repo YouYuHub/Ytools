@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 # 自定义模块导入
 from config import ChatToolRequest
-from factory.chat_factory import tool_chat_server, load_all_tools
+from factory.chat_factory import tool_chat_server, load_all_tools, stop_chat_task
 from memory.chat_memory import ChatMemoryManager
 
 # 创建 API 路由器实例
@@ -24,6 +24,13 @@ async def chat_with_tool(request: ChatToolRequest, api_url: Optional[str] = None
     """ 用户聊天信息，流式响应 """
     return StreamingResponse(tool_chat_server(request, api_url), media_type='text/event-stream')
 
+
+# 停止当前聊天任务接口
+@api_chat_router.post('/stop_chat')
+async def stop_chat(session_id: str = "default"):
+    """ 停止当前聊天任务 """
+    await stop_chat_task(session_id)
+    return {'stop_chat': 'stopped'}
 
 
 # 手动工具更新接口

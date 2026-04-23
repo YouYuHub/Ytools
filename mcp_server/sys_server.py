@@ -115,14 +115,14 @@ async def create_dir(dir_path: str) -> str:
 
 
 @sys_mcp_server.tool()
-async def create_file(full_file_name: str, content: str, coding='utf-8') -> str:
+async def create_file(full_file_name: str, content: str = "", coding='utf-8') -> str:
     r"""向文件 full_file_name 中写入 content 内容，编码格式为 coding，会自动创建不存在的文件
     参数：
         full_file_name: 必选参数，文件的完整路径，例如D:/test/test.txt；如果文件不存在，则创建文件；注意，路径分割符为 / 不要使用 \
         content: 必选参数，文件内容，写入内容会覆盖掉原文件内容
         coding: 文件编码，默认为 utf-8
     返回：
-        成功返回写入文件信息（content标签内容），失败应该会直接抛出异常
+        成功返回写入文件信息（<content>标签中的内容），失败应该会直接抛出异常
     """
     # 获取文件所在的目录路径
     dir_path = os.path.dirname(full_file_name)
@@ -132,6 +132,65 @@ async def create_file(full_file_name: str, content: str, coding='utf-8') -> str:
     with open(full_file_name, 'w', encoding=coding) as f:
         f.write(content)
     return f"<content>{content}</content> 写入文件 {full_file_name} 成功"
+
+
+@sys_mcp_server.tool()
+async def write_file_lines(full_file_name: str, content: str, start_line: int, end_line: int, coding='utf-8') -> str:
+    '''
+    覆盖指定文件的指定行内容
+    参数：
+        full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 / 不要使用 \ 
+        content: 要写入的内容
+        start_line: 开始行位置，从 1 开始
+        end_line: 结束行位置(包含这行内容)，从 1 开始
+        coding: 文件编码，默认为 utf-8
+    返回：
+        成功返回写入文件信息（content标签内容），失败应该会直接抛出异常
+    '''
+    # 检查路径是否存在且是否为文件
+    if not os.path.exists(full_file_name):
+        raise FileNotFoundError(f"{full_file_name} 不存在")
+    if not os.path.isfile(full_file_name):
+        raise FileNotFoundError(f"{full_file_name} 不是一个文件")
+    
+    # 校验参数
+    if start_line < 1:
+        raise ValueError(f"start_line 必须大于等于 1，当前值为 {start_line}")
+    if end_line < start_line:
+        raise ValueError(f"end_line 必须大于等于 start_line，当前 start_line={start_line}, end_line={end_line}")
+    
+    # 读取原文件内容
+    with open(full_file_name, 'r', encoding=coding) as file:
+        lines = file.readlines()
+    
+    # 将 content 按换行符分割成多行
+    new_lines = content.splitlines(keepends=True)
+    # 如果 content 不以换行符结尾，添加换行符
+    if content and not content.endswith('\n'):
+        if new_lines:
+            new_lines[-1] = new_lines[-1] + '\n'
+        else:
+            new_lines = [content + '\n']
+    
+    # 计算需要替换的行范围（转换为 0-based 索引）
+    start_idx = start_line - 1
+    end_idx = min(end_line - 1, len(lines) - 1)  # 确保不超过文件总行数
+    
+    # 如果 start_idx 超出文件行数，扩展文件
+    if start_idx >= len(lines):
+        # 在末尾添加空行直到 start_idx
+        lines.extend(['\n'] * (start_idx - len(lines) + 1))
+        end_idx = start_idx
+    
+    # 替换指定区间的行：删除原区间的行，插入新行
+    # 这样会改变文件总行数，但保证了区间外的内容不受影响
+    lines[start_idx:end_idx+1] = new_lines
+    
+    # 写回文件
+    with open(full_file_name, 'w', encoding=coding) as file:
+        file.writelines(lines)
+    
+    return f"<content>{content}</content> 已写入文件 {full_file_name} 的第 {start_line} 到 {end_line} 行"
 
 
 @sys_mcp_server.tool()

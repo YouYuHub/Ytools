@@ -385,7 +385,7 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 "工具返回结果为 [] 表示空值\n"
                 "历史工具调用记录将通过 assistant 消息追加。\n"
                 "你需要调用 over_task() 函数（该函数无参数）才能结束你的任务，这将是任务最终的结束信号！\n"
-                "当你选择结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
+                "- 当你选择调用 over_task() 函数结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
                 # "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
             )
         else:
@@ -398,7 +398,7 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                     "工具返回结果为 [] 表示空值\n"
                     "历史工具调用记录将通过 assistant 消息追加。\n"
                     "你需要调用 over_task() 函数（该函数无参数）才能结束你的任务，这将是任务最终的结束信号！\n"
-                    "当你选择结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
+                    "- 当你选择调用 over_task() 函数结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
                     # "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
                 ),
             })
@@ -409,10 +409,11 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 f"\n用户上传了 {len(user_files)} 个文件，解析的内容如下：\n"
                 f"{user_files}"
             )
-        run_task = True
+        # run_task = True
         count_nouse_tool = 0  # 无用工具调用次数
         # last_tool_ret = ""  # 上一次调用工具的返回值
-        while run_task:
+        # while run_task:
+        while session_chat_memory.run_task:
             print(f"massages: [\n\t{',\n\t'.join(map(str, messages))}\n]")
             full_response = ""
             full_reasoning = ""
@@ -427,11 +428,12 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 if event is None:
                     yield sse_chunk
                     continue
-                if event.get("done"):
+                if event.get("done") or not session_chat_memory.run_task:
                     break
                 if event.get("error") is not None:
                     yield sse_chunk
-                    run_task = False
+                    # run_task = False
+                    session_chat_memory.run_task = False
                     break
                 content = event.get("content")
                 reasoning_content = event.get("reasoning_content")
@@ -467,10 +469,21 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 filtered_event = _filter_tool_calls_fields(event)
                 yield f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n"
             # print(f"[DEBUG] tool_calls: {tool_calls}")
+            # 模型回复过程中用户手动停止任务
+            if not session_chat_memory.run_task:
+                print("用户手动停止任务")
+                # 记录 ai 生成的内容
+                if full_reasoning:
+                    await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
+                if full_response:
+                    await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
+                # 添加用户手动停止任务消息的记录
+                await session_chat_memory.add_chat_history({"role": "user", "content": "用户手动停止任务"})
+                break  # 任务结束，退出循环
             # 检查 tool_calls 是否为空
             if not tool_calls:
                 count_nouse_tool += 1 # 不调用工具次数
-                if len(messages) == 2 or count_nouse_tool > int(load_var("WITH_OUT_TOOL_COUNT", 3)): # 第一次对话就不调用工具或者不使用工具次数超过指定次数
+                if len(messages) == 2 or count_nouse_tool >= int(load_var("WITH_OUT_TOOL_COUNT", 3)): # 第一次对话就不调用工具或者不使用工具次数达到或超过指定次数
                     # 如果模型本次流式响应输出了内容，则补充一条文本型的 assistant 历史消息。
                     if full_response:   # 优先考虑模型回答的内容
                         assistant_message = {"role": "assistant", "content": full_response}
@@ -478,7 +491,8 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                     elif full_reasoning: # 否则使用模型推理的推理内容
                         assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}   # 只保留最近 100 个字符
                         messages.append(assistant_message)
-                    run_task = False  # 停止任务
+                    # run_task = False  # 停止任务
+                    session_chat_memory.run_task = False  # 停止任务
                 else:
                     # 提醒模型使用 over_task 函数结束任务
                     if full_response:   # 优先考虑模型回答的内容
@@ -487,7 +501,7 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                     elif full_reasoning: # 否则使用模型推理的推理内容
                         assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}   # 只保留最近 100 个字符
                         messages.append(assistant_message)
-                assistant_message = {"role": "user", "content": "请完整回答我之前的问题(使用之前问题提问的语言回答)，你可以选择调用 over_task 结束或者调用其他工具，请注意：你只能通过调用 over_task 工具结束任务，不能通过其他方式结束任务，不调用工具会继续任务！"}
+                assistant_message = {"role": "user", "content": "你可以选择调用 over_task 结束或者调用其他工具，请注意：你只能通过调用 over_task 工具结束任务，不能通过其他方式结束任务，不调用工具会继续任务！"}
                 messages.append(assistant_message)
                 print("\n[INFO] 本轮对话未返回工具调用，继续任务")
                 continue  # 继续
@@ -652,7 +666,8 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 # print(ret, end="\n\n\n")
                 # messages.append(_tool_result_assistant_message(tool_name, tool_args, ret))
                 # 标记任务结束，退出循环
-                run_task = False
+                # run_task = False
+                session_chat_memory.run_task = False
                 print("[INFO] over_task 信号已处理，任务结束")
         # 写入结束消息到文件
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
@@ -663,3 +678,11 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
     except Exception as ce:
         session_chat_memory.add_chat_history({"role": "assistant", "error": ce})
         raise ce
+
+
+async def stop_chat_task(session_id):
+    ''' 手动优雅停止当前会话的聊天任务 '''
+    try:
+        (await get_chat_memory_manager(session_id)).run_task = False
+    except Exception as e:
+        raise e

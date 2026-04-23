@@ -52,10 +52,22 @@ class ChatMemoryManager:
     """工具调用历史管理器 - 持久化到文件，支持多会话隔离"""
 
     def __init__(self, session_id: str):
+        self._run_task = True
         self._lock = threading.Lock()
         self._file_path = _get_chat_history_file(session_id)
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         self._file_path.touch(exist_ok=True)
+
+    @property
+    def run_task(self) -> bool:
+        return self._run_task
+
+    @run_task.setter
+    def run_task(self, value: bool) -> None:
+        """
+        优雅控制对话启停功能
+        """
+        self._run_task = value
 
     async def add_chat_history(self, input_text: Any) -> str:
         """

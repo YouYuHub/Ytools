@@ -360,48 +360,79 @@ async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service_
         raise FileNotFoundError(f"MCP 服务器文件 '{mcp_service_file}' 不存在")
     elif not mcp_service_file.endswith(".py"):
         raise ValueError(f"MCP 服务器文件 '{mcp_service_file}' 必须是 Python 文件")
+    
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[mcp_service_file],
         # env=os.environ.copy()
     )
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            # 初始化会话
-            await session.initialize()
-            # 验证工具是否存在
-            tools = await session.list_tools()
-            available_tools = [tool.name for tool in tools.tools]
-            if function_name not in available_tools:
-                raise ValueError(
-                    f"工具 '{function_name}' 不存在。可用工具: {', '.join(available_tools)}"
-                )
-            # 调用工具
-            result = await session.call_tool(function_name, arguments)
-            # 解析结果
-            # 注意：即使 result.content 为空，也可能是合法的返回值（如空列表 []）
-            if result.isError:
-                # 如果工具执行出错，抛出异常
-                error_text = result.content[0].text if result.content else "未知错误"
-                raise ValueError(f"MCP 工具执行失败: {error_text}")
-            if result.content and len(result.content) > 0:
-                # 如果只有一个 content 元素，直接返回其文本
-                if len(result.content) == 1:
-                    return result.content[0].text
-                else:
-                    # 如果有多个 content 元素，将它们合并（适用于返回列表的情况）
-                    texts = []
-                    for content_item in result.content:
-                        if hasattr(content_item, 'text') and content_item.text:
-                            texts.append(content_item.text)
-                    # 如果所有元素都是文本，尝试判断是否是列表形式
-                    # 对于 list_dir_item 这样的函数，返回的是多个独立的文本项
-                    return texts
-            else:
-                # 没有 content 但也没有错误，可能是空列表等合法返回值
-                # 返回空列表表示成功但无内容
-                return []
-
+    
+    try:
+        async with stdio_client(server_params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                # 初始化会话
+                await session.initialize()
+                # 验证工具是否存在
+                tools = await session.list_tools()
+                available_tools = [tool.name for tool in tools.tools]
+                if function_name not in available_tools:
+                    raise ValueError(
+                        f"工具 '{function_name}' 不存在。可用工具: {', '.join(available_tools)}"
+                    )
+                
+                try:
+                    # 调用工具
+                    result = await session.call_tool(function_name, arguments)
+                    # 解析结果
+                    # 注意：即使 result.content 为空，也可能是合法的返回值（如空列表 []）
+                    if result.isError:
+                        # 如果工具执行出错，抛出异常
+                        error_text = result.content[0].text if result.content else "未知错误"
+                        raise ValueError(f"MCP 工具执行失败: {error_text}")
+                    
+                    if result.content and len(result.content) > 0:
+                        # 如果只有一个 content 元素，直接返回其文本
+                        if len(result.content) == 1:
+                            return result.content[0].text
+                        else:
+                            # 如果有多个 content 元素，将它们合并（适用于返回列表的情况）
+                            texts = []
+                            for content_item in result.content:
+                                if hasattr(content_item, 'text') and content_item.text:
+                                    texts.append(content_item.text)
+                            # 如果所有元素都是文本，尝试判断是否是列表形式
+                            # 对于 list_dir_item 这样的函数，返回的是多个独立的文本项
+                            return texts
+                    else:
+                        # 没有 content 但也没有错误，可能是空列表等合法返回值
+                        # 返回空列表表示成功但无内容
+                        return []
+                except Exception as call_error:
+                    # 重新抛出工具调用错误
+                    raise call_error
+    except ExceptionGroup as eg:
+        # 解包 ExceptionGroup，提取第一个有意义的异常
+        # ExceptionGroup 可能嵌套多层，需要递归查找
+        def extract_real_exception(exc_group):
+            """递归提取 ExceptionGroup 中的真实异常"""
+            if hasattr(exc_group, 'exceptions') and exc_group.exceptions:
+                # 取第一个异常
+                first_exc = exc_group.exceptions[0]
+                # 如果还是 ExceptionGroup，继续递归
+                if isinstance(first_exc, ExceptionGroup):
+                    return extract_real_exception(first_exc)
+                return first_exc
+            return exc_group
+        
+        real_exception = extract_real_exception(eg)
+        # 如果是 ValueError（工具验证错误），直接抛出
+        if isinstance(real_exception, ValueError):
+            raise real_exception
+        # 其他异常，包装后抛出
+        raise RuntimeError(f"MCP 调用失败: {real_exception}") from real_exception
+    except Exception as e:
+        # 其他异常直接抛出
+        raise e
 
 
 if __name__ == '__main__':

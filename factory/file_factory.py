@@ -497,7 +497,6 @@ def batch_extract_text_from_bytes(
             executor.submit(_parse_single_file, file_info): file_info
             for file_info in file_data_list
         }
-        
         for future in as_completed(future_to_file):
             try:
                 result = future.result()
@@ -509,11 +508,9 @@ def batch_extract_text_from_bytes(
                     'status': 'failed',
                     'error': f'线程执行异常: {str(e)}'
                 })
-    
     # 按原始顺序排序（可选）
     filename_order = {info['filename']: i for i, info in enumerate(file_data_list)}
     results.sort(key=lambda x: filename_order.get(x['filename'], 999))
-    
     return results
 
 
@@ -560,7 +557,6 @@ def batch_extract_pages_from_bytes(
             executor.submit(_parse_single_file_pages, file_info): file_info
             for file_info in file_data_list
         }
-        
         for future in as_completed(future_to_file):
             try:
                 result = future.result()
@@ -572,9 +568,7 @@ def batch_extract_pages_from_bytes(
                     'status': 'failed',
                     'error': f'线程执行异常: {str(e)}'
                 })
-    
     # 按原始顺序排序
     filename_order = {info['filename']: i for i, info in enumerate(file_data_list)}
     results.sort(key=lambda x: filename_order.get(x['filename'], 999))
-    
     return results
