@@ -308,37 +308,6 @@ def _decrypt_dpapi_secret(secret_text: str) -> str:
         return secret_text
 
 
-def encrypt_dpapi_secret(secret_text: str) -> str:
-    if sys.platform != "win32":
-        raise RuntimeError("DPAPI encryption is only available on Windows")
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
-    raw = secret_text.encode("utf-8")
-    buffer = ctypes.create_string_buffer(raw, len(raw))
-    in_blob = _DATA_BLOB(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
-    out_blob = _DATA_BLOB()
-    if crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)) == 0:
-        raise RuntimeError("DPAPI encryption failed")
-    try:
-        encrypted = ctypes.string_at(out_blob.pbData, out_blob.cbData)
-        return "enc:dpapi:" + base64.b64encode(encrypted).decode("utf-8")
-    finally:
-        kernel32.LocalFree(out_blob.pbData)
-
-
-def _load_setting_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        return {}
-    return {}
-
-
 def _load_setting_array_or_dict(path: Path) -> Any:
     if not path.exists():
         return {}
@@ -401,13 +370,9 @@ def _format_env_value(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
-    if text.startswith("\"") and text.endswith("\""):
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         return text
-    if text.startswith("'") and text.endswith("'"):
-        return text
-    if any(char.isspace() for char in text) or "#" in text or "=" in text:
-        return json.dumps(text, ensure_ascii=False)
-    return text
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _persist_env_values(updated_vars: dict[str, Any], coding: str = "utf-8") -> None:
@@ -439,18 +404,6 @@ def _persist_env_values(updated_vars: dict[str, Any], coding: str = "utf-8") -> 
             f.writelines(output_lines)
 
 
-def set_env_var(var_name: str, value: Any, coding: str = "utf-8") -> str:
-    if not isinstance(var_name, str) or not var_name.strip():
-        raise ValueError("var_name 不能为空")
-    # 显式声明全局，保证调用方通过 env_manager.env_vars 取到的就是本函数更新后的字典。
-    global env_vars
-    normalized_name = var_name.strip()
-    normalized_value = _format_env_value(value)
-    env_vars[normalized_name] = _resolve_variable_references(normalized_value, {**env_vars, normalized_name: normalized_value})
-    _persist_env_values({normalized_name: normalized_value}, coding=coding)
-    return normalized_value
-
-
 def set_env_vars(values: dict[str, Any], coding: str = "utf-8") -> dict[str, str]:
     """批量写入 .env 并同步更新内存中的 env_vars。
 
@@ -463,27 +416,18 @@ def set_env_vars(values: dict[str, Any], coding: str = "utf-8") -> dict[str, str
     # 显式声明全局，保证调用方通过 env_manager.env_vars 取到的就是本函数更新后的字典。
     global env_vars
     normalized_updates: dict[str, str] = {}
+    raw_updates: dict[str, Any] = {}
     for key, value in values.items():
         if not isinstance(key, str) or not key.strip():
             continue
         normalized_key = key.strip()
         normalized_value = _format_env_value(value)
         normalized_updates[normalized_key] = normalized_value
+        raw_updates[normalized_key] = value
         env_vars[normalized_key] = _resolve_variable_references(normalized_value, {**env_vars, normalized_key: normalized_value})
-    if normalized_updates:
-        _persist_env_values(normalized_updates, coding=coding)
+    if raw_updates:
+        _persist_env_values(raw_updates, coding=coding)
     return normalized_updates
-
-
-def get_env_var(var_name: str, default: Any = None) -> Any:
-    if not isinstance(var_name, str) or not var_name.strip():
-        return default
-    normalized_name = var_name.strip()
-    if normalized_name in setting_vars:
-        return setting_vars[normalized_name]
-    if normalized_name in env_vars:
-        return env_vars[normalized_name]
-    return default
 
 
 def get_env_file_path() -> str | None:

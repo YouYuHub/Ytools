@@ -99,7 +99,7 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         env_file = self._temp_path / ".env"
         content = env_file.read_text(encoding="utf-8")
         self.assertIn("CHAT_OWNERSHIP_NANE=", content)
-        self.assertIn('CHAT_MODEL_NAME=deepseek-v4-flash', content)
+        self.assertIn('CHAT_MODEL_NAME="deepseek-v4-flash"', content)
 
     async def test_select_unknown_model_returns_400(self) -> None:
         from fastapi import HTTPException
