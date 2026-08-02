@@ -3,11 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 # 加载 env 环境变量
-from load_env import init_path
-init_path()
+from config import apply_persisted_work_dir, PROJECT_ROOT
+from env_manager import init_path
+init_path(PROJECT_ROOT)
+apply_persisted_work_dir()
 
 # 引入路由，需要在 init_path() 之后
 from routers.chat_router import api_chat_router
+from routers.chat_config_router import api_chat_config_router
 from routers.tools_manage_router import api_tools_manage_router
 from routers.file_router import api_file_router
 
@@ -29,7 +32,7 @@ def custom_openapi():
         description=app.description,
         routes=app.routes,
     )
-
+    
     def patch_binary_format(schema_part):
         if isinstance(schema_part, dict):
             if schema_part.get("type") == "string" and schema_part.get("contentMediaType"):
@@ -44,8 +47,8 @@ def custom_openapi():
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
-app.openapi = custom_openapi
 
+app.openapi = custom_openapi
 # 跨域设置
 app.add_middleware(
     CORSMiddleware,
@@ -63,12 +66,13 @@ async def root():
 
 
 # 包含路由
-app.include_router(api_chat_router, tags=["ChatTool"])
+app.include_router(api_chat_router, tags=["ChatLLM"])
+app.include_router(api_chat_config_router, tags=["ChatConfig"])
 app.include_router(api_tools_manage_router, tags=["ToolsManage"])
 app.include_router(api_file_router, tags=["FileUpload"])
 
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app='main:app', host="0.0.0.0", port=48621, reload=False)
-
+    uvicorn.run(app='main:app', host="0.0.0.0", port=48621,
+                reload=True, reload_dirs=[str(PROJECT_ROOT)])

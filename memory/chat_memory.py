@@ -5,13 +5,15 @@ import json
 import re
 # import os
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 # fastapi
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+
+from memory.chat_round_store import ChatRoundStore, merge_usage_dict
+from memory.timestamp_utils import now_str as _now_str
 
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
@@ -48,15 +50,141 @@ def _read_jsonlines(file_path: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _now_str() -> str:
+    # 已迁移到 memory.timestamp_utils.now_str；保留本函数作为旧调用方的兼容入口。
+    from memory.timestamp_utils import now_str as _impl
+    return _impl()
+
+
+def _default_title(session_id: str) -> str:
+    return f"session_{session_id}"
+
+
+def _default_meta(session_id: str) -> dict[str, Any]:
+    now = _now_str()
+    return {
+        "session_id": session_id,
+        "title": _default_title(session_id),
+        "user_questions": [],
+        "usage": {},
+        "created_at": now,
+        "updated_at": now,
+        "record_count": 0,
+        "completion_count": 0,
+        "context_summary": None,
+    }
+
+
+def _is_meta_record(entry: Any) -> bool:
+    return isinstance(entry, dict) and isinstance(entry.get("_meta"), dict)
+
+
+# 摘要/历史格式化已迁移到 memory.chat_history_format，本文件仅保留调用入口
+from memory.chat_history_format import (
+    normalize_context_summary as _normalize_context_summary,
+    render_context_summary as _render_context_summary,
+    round_entry_to_context_messages as _round_entry_to_context_messages,
+    format_tool_call_history_line as _format_tool_call_history_line,
+)
+
+
+def _normalize_usage_record_usage(entry: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    usage_total = {}
+    completion_count = 0
+    if entry.get("event") == "chat_round":
+        round_total = entry.get("usage_total")
+        if isinstance(round_total, dict):
+            usage_total = round_total
+        if isinstance(entry.get("completion_count"), int):
+            completion_count = entry.get("completion_count", 0)
+    return usage_total, completion_count
+
+
+# 上述格式化函数已迁移至 memory/chat_history_format.py（统一入口）
+# 为保留向后兼容，旧名字仍然指向新实现，供其他模块使用。
+
+
+def _recompute_meta_from_entries(
+    session_id: str,
+    base_meta: dict[str, Any] | None,
+    entries: list[dict[str, Any]]
+) -> dict[str, Any]:
+    now = _now_str()
+    meta = dict(base_meta) if isinstance(base_meta, dict) else _default_meta(session_id)
+    if not meta.get("session_id"):
+        meta["session_id"] = session_id
+    if not meta.get("created_at"):
+        meta["created_at"] = now
+    title = meta.get("title")
+    if not isinstance(title, str) or not title.strip():
+        meta["title"] = _default_title(session_id)
+
+    questions: list[str] = []
+    usage_total: dict[str, Any] = {}
+    completion_count = 0
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") == "chat_round":
+            question = entry.get("question")
+            if isinstance(question, str) and question.strip():
+                questions.append(question.strip())
+        entry_usage_total, entry_completion_count = _normalize_usage_record_usage(entry)
+        if entry_usage_total:
+            merge_usage_dict(usage_total, entry_usage_total)
+        completion_count += entry_completion_count
+
+    meta["user_questions"] = questions
+    meta["usage"] = usage_total
+    meta["record_count"] = len(entries)
+    meta["completion_count"] = completion_count
+    meta["updated_at"] = now
+    meta["context_summary"] = _normalize_context_summary(meta.get("context_summary"))
+
+    if (
+        meta.get("title") == _default_title(session_id)
+        and questions
+    ):
+        first_q = questions[0]
+        meta["title"] = first_q[:40] if first_q else _default_title(session_id)
+
+    return meta
+
+
+def _load_meta_and_entries(file_path: Path, session_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rows = _read_jsonlines(file_path)
+    if rows and _is_meta_record(rows[0]):
+        base_meta = rows[0].get("_meta") or _default_meta(session_id)
+        entries = [row for row in rows[1:] if isinstance(row, dict)]
+    else:
+        base_meta = _default_meta(session_id)
+        entries = [row for row in rows if isinstance(row, dict)]
+    meta = _recompute_meta_from_entries(session_id, base_meta, entries)
+    return meta, entries
+
+
+def _write_meta_and_entries(file_path: Path, meta: dict[str, Any], entries: list[dict[str, Any]]) -> None:
+    with file_path.open("w", encoding="utf-8") as fp:
+        fp.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
+        for entry in entries:
+            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 class ChatMemoryManager:
     """工具调用历史管理器 - 持久化到文件，支持多会话隔离"""
 
     def __init__(self, session_id: str):
+        self.session_id = session_id
         self._run_task = True
         self._lock = threading.Lock()
         self._file_path = _get_chat_history_file(session_id)
+        self._round_store = ChatRoundStore(session_id)
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         self._file_path.touch(exist_ok=True)
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
 
     @property
     def run_task(self) -> bool:
@@ -78,7 +206,7 @@ class ChatMemoryManager:
             操作结果字符串
         """
         record: dict[str, Any] = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": _now_str()
         }
         if isinstance(input_text, str):
             record["content"] = input_text
@@ -86,10 +214,35 @@ class ChatMemoryManager:
             record.update(input_text)
         else:
             record["content"] = str(input_text)
-        # print(f"add_chat_history: {record}")
         with self._lock:
-            _write_jsonline(self._file_path, record)
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            completed_round = self._round_store.record_message(record)
+            if completed_round is not None:
+                entries.append(completed_round)
+                meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+                _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
+
+    async def update_current_round_usage(
+        self,
+        usage_total: dict[str, Any],
+        completion_count: int = 0,
+    ) -> str:
+        """将当前轮次的 usage 汇总挂到内存中的 pending round。"""
+        with self._lock:
+            return self._round_store.add_usage(usage_total, completion_count)
+
+    async def get_meta(self) -> dict[str, Any]:
+        return await self.get_session_meta()
+
+    async def get_session_meta(self) -> dict[str, Any]:
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def get_session_metadata(self) -> dict[str, Any]:
+        return await self.get_session_meta()
 
     async def get_chat_history(self, number: int = -1) -> list[dict[str, Any]]:
         """
@@ -103,8 +256,64 @@ class ChatMemoryManager:
             # 抛出类型不匹配错误
             raise TypeError("number 参数必须为整数")
         with self._lock:
-            entries = _read_jsonlines(self._file_path)
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
         return entries[-number:] if number > 0 else entries
+
+    async def get_context_summary(self) -> dict[str, Any] | None:
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return _normalize_context_summary(meta.get("context_summary"))
+
+    async def update_context_summary(self, summary: dict[str, Any] | str | None) -> str:
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["context_summary"] = _normalize_context_summary(summary)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
+    async def get_context_messages(self, max_rounds: int = 6) -> list[dict[str, Any]]:
+        """
+        获取用于模型上下文的历史消息（按轮次聚合后展开）
+        Args:
+            max_rounds: 最近保留轮次，<=0 表示全部
+        Returns:
+            符合 ChatCompletion messages 结构的消息列表
+        """
+        if max_rounds is None:
+            max_rounds = 6
+        if not hasattr(max_rounds, "__int__"):
+            raise TypeError("max_rounds 参数必须为整数")
+        max_rounds = int(max_rounds)
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
+
+        summary_message = _render_context_summary(meta.get("context_summary"))
+        summarized_round_count = 0
+        context_summary = _normalize_context_summary(meta.get("context_summary"))
+        if context_summary is not None:
+            summarized_round_count = min(
+                max(0, int(context_summary.get("source_round_count", 0) or 0)),
+                len([row for row in entries if isinstance(row, dict) and row.get("event") == "chat_round"]),
+            )
+
+        round_entries = [
+            row for row in entries
+            if isinstance(row, dict) and row.get("event") == "chat_round"
+        ]
+        if summarized_round_count > 0:
+            round_entries = round_entries[summarized_round_count:]
+        if max_rounds > 0:
+            round_entries = round_entries[-max_rounds:]
+
+        messages: list[dict[str, Any]] = []
+        if summary_message:
+            messages.append({"role": "system", "content": summary_message})
+        for round_entry in round_entries:
+            messages.extend(_round_entry_to_context_messages(round_entry))
+        return messages
 
     async def clear_chat_history(self) -> str:
         """
@@ -113,7 +322,9 @@ class ChatMemoryManager:
             操作结果字符串
         """
         with self._lock:
-            self._file_path.write_text("", encoding="utf-8")
+            self._round_store.reset()
+            meta = _default_meta(self.session_id)
+            _write_meta_and_entries(self._file_path, meta, [])
         return "清空成功"
 
     @staticmethod
@@ -137,6 +348,22 @@ class ChatMemoryManager:
             return FileResponse(chat_history_file, filename=chat_history_file.name)
         else:
             raise HTTPException(status_code=404, detail="Chat session file not found")
+
+    @staticmethod
+    def get_chat_session_meta(session_id: str) -> dict[str, Any]:
+        """
+        获取指定 session_id 的聊天历史元数据（首行 _meta）
+        :param session_id: 会话ID
+        :return: 元数据字典
+        """
+        chat_history_file = _get_chat_history_file(session_id)
+        if not chat_history_file.exists():
+            raise HTTPException(status_code=404, detail="Chat session file not found")
+        manager = ChatMemoryManager(session_id)
+        with manager._lock:
+            meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
+            _write_meta_and_entries(manager._file_path, meta, entries)
+        return meta
 
     @staticmethod
     def delete_chat_session_file(session_id: str) -> dict:
@@ -165,7 +392,7 @@ class ChatMemoryManager:
             }
 
     @staticmethod
-    def delete_chat_session_file_line(session_id: str, startline: int, endline: int) -> dict[str, str]:
+    def delete_chat_session_file_line(session_id: str, startline: int, endline: int) -> dict[str, Any]:
         """
         删除指定 session_id 的 jsonl 文件指定行范围
         :param session_id: 会话 ID
@@ -187,15 +414,14 @@ class ChatMemoryManager:
             raise ValueError(f"起始行号({startline})不能大于结束行号({endline})")
         manager = ChatMemoryManager(session_id)
         with manager._lock:
-            with manager._file_path.open("r", encoding="utf-8") as fp:
-                lines = fp.readlines()
-            total_lines = len(lines)
+            meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
+            total_lines = len(entries)
             if total_lines == 0:
                 return {
                     "state": "failed",
                     "describe": "当前会话历史文件为空，无可删除行"
                 }
-            # 调整行号范围,确保在有效范围内
+            # 这里的行号以“业务记录行”计数（不包含第一行 _meta）
             valid_start = max(1, startline)
             valid_end = min(endline, total_lines)
             if valid_start > valid_end:
@@ -203,21 +429,22 @@ class ChatMemoryManager:
                     "state": "failed",
                     "describe": f"指定的行号范围超出文件范围,当前总行数为 {total_lines}"
                 }
-            # 保留不在删除范围内的行
-            remaining_lines = [
-                line for index, line in enumerate(lines, start=1)
+            remaining_entries = [
+                entry for index, entry in enumerate(entries, start=1)
                 if index < valid_start or index > valid_end
             ]
             deleted_count = valid_end - valid_start + 1
-            with manager._file_path.open("w", encoding="utf-8") as fp:
-                fp.writelines(remaining_lines)
+            meta = _recompute_meta_from_entries(manager.session_id, meta, remaining_entries)
+            _write_meta_and_entries(manager._file_path, meta, remaining_entries)
         return {
             "state": "succeed",
-            "describe": f"已删除第 {valid_start} 到 {valid_end} 行,共 {deleted_count} 行。原始行数 {total_lines},剩余行数 {len(remaining_lines)}"
+            "describe": f"已删除第 {valid_start} 到 {valid_end} 行,共 {deleted_count} 行。原始记录数 {total_lines},剩余记录数 {len(remaining_entries)}",
+            "meta_after": meta,
+            "usage_after": meta.get("usage", {})
         }
 
 
-# 会话管理器注册表（用于缓存不同session_id的管理器实例）
+# 会话管理器注册表（用于缓存不同 session_id 的管理器实例）
 _session_managers: dict[str, ChatMemoryManager] = {}
 _session_lock = threading.Lock()
 

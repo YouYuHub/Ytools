@@ -1,181 +1,50 @@
-# py 库导入
+# 标准库导入
 # import re
-import json
-# import time
 import asyncio
+import json
+import uuid
+from functools import partial
 # import inspect
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, AsyncGenerator
 
 # 自定义模块导入
-from chat.chat_tool import ChatTool
-from config import Message, ChatToolRequest, get_current_dir
-from load_env import load_var
+from env_manager import ChatModelConfigurationError, load_var, require_default_chat_config
+from chat.chat_llm import ChatLLM
+from config import ChatLLMRequest, get_current_dir
 from memory.chat_memory import get_chat_memory_manager, cleanup_chat_memory_manager
 from memory.file_memory import get_file_memory_manager, cleanup_file_memory_manager
-from util.mcp_client import call_mcp_tool
+from factory.tool_executor import normalize_tool_calls, prepare_tool_execution, execute_tool_round
+from factory.chat_runtime import (
+    parse_bool_like,
+    parse_int_like,
+    frontend_provides_full_history,
+    build_request_messages,
+    UsageAccumulator,
+    estimate_messages_tokens,
+    estimate_text_tokens,
+    resolve_model_max_input_tokens,
+)
+from factory import tool_registry
 
 
-ALL_TOOLS: List[Dict[str, Any]] = []
-TOOL_MCP_SERVERS: Dict[str, str] = {}
-
-
-def _filter_parameters(params: dict) -> dict:
-    """
-    过滤 parameters 对象，移除非JSON Schema标准字段
-    保留 type, properties, required, items, default 等标准字段
-    Args:
-        params: 原始parameters对象
-    Returns:
-        过滤后的parameters对象
-    """
-    if not isinstance(params, dict):
-        return params
-    filtered = {}
-    # JSON Schema 标准字段白名单（包含 default）
-    standard_fields = {
-        "type", "properties", "required", "items", 
-        "additionalProperties", "enum", "const",
-        "anyOf", "allOf", "oneOf", "not",
-        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-        "minLength", "maxLength", "pattern",
-        "minItems", "maxItems", "uniqueItems",
-        "format", "default"  # ✅ 保留 default 字段
-    }
-    for key, value in params.items():
-        if key in standard_fields:
-            # 递归处理嵌套的 properties
-            if key == "properties" and isinstance(value, dict):
-                filtered[key] = {
-                    prop_name: _filter_parameter_property(prop_def)
-                    for prop_name, prop_def in value.items()
+BUILTIN_CHECK_TOOL_EXISTS_NAME = "check_tool_exists"
+BUILTIN_CHECK_TOOL_EXISTS_DEF = {
+    "type": "function",
+    "function": {
+        "name": BUILTIN_CHECK_TOOL_EXISTS_NAME,
+        "description": "检查指定工具是否在后端实时可用工具中存在",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "要检查的工具名称"
                 }
-            # 递归处理 items
-            elif key == "items" and isinstance(value, dict):
-                filtered[key] = _filter_parameters(value)
-            else:
-                filtered[key] = value
-        # 忽略 title 等非标准字段
-    return filtered
-
-
-def _filter_parameter_property(prop_def: dict) -> dict:
-    """
-    过滤单个参数属性的定义
-    Args:
-        prop_def: 参数属性定义
-    Returns:
-        过滤后的参数属性定义
-    """
-    if not isinstance(prop_def, dict):
-        return prop_def
-    filtered = {}
-    # JSON Schema 标准字段（包含 default）
-    standard_fields = {
-        "type", "description", "enum", "const",
-        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-        "minLength", "maxLength", "pattern",
-        "format", "default", "items",  # ✅ 保留 default 字段
-        "anyOf", "allOf", "oneOf"
+            },
+            "required": ["tool_name"]
+        }
     }
-    for key, value in prop_def.items():
-        if key in standard_fields:
-            if key == "items" and isinstance(value, dict):
-                filtered[key] = _filter_parameters(value)
-            else:
-                filtered[key] = value
-    return filtered
-
-
-def _filter_tool_for_api(tool_def: dict) -> dict:
-    """
-    过滤工具定义，只保留OpenAI API标准字段
-    移除 server_file、title 等非标准字段
-    Args:
-        tool_def: 原始工具定义（包含server_file等额外字段）
-    Returns:
-        符合OpenAI API标准的工具定义
-    """
-    if not isinstance(tool_def, dict):
-        return tool_def
-    filtered = {}
-    # 保留 type 字段
-    if "type" in tool_def:
-        filtered["type"] = tool_def["type"]
-    # 处理 function 字段
-    if "function" in tool_def and isinstance(tool_def["function"], dict):
-        func_info = tool_def["function"]
-        filtered_func = {}
-        # 只保留标准字段：name, description, parameters
-        if "name" in func_info:
-            filtered_func["name"] = func_info["name"]
-        if "description" in func_info:
-            filtered_func["description"] = func_info["description"]
-        # 处理 parameters，递归过滤非标准字段
-        if "parameters" in func_info and isinstance(func_info["parameters"], dict):
-            filtered_func["parameters"] = _filter_parameters(func_info["parameters"])
-        filtered["function"] = filtered_func
-    return filtered
-
-
-# 从 tools.json 加载所有工具并过滤为标准 API 格式
-def _load_and_filter_tools() -> tuple[list, dict]:
-    """
-    从 tools.json 加载工具定义，同时完成：
-    1. 过滤出符合OpenAI API标准的工具定义
-    2. 构建工具名到MCP服务器文件的映射
-    Returns:
-        (filtered_tools, tool_mcp_servers): 过滤后的工具列表和MCP服务器映射
-    """
-    tools_json_path = get_current_dir() + "/tools.json"
-    with open(tools_json_path, "r", encoding="utf-8") as f:
-        raw_tools = json.load(f)
-    filtered_tools = []
-    tool_mcp_servers = {}
-    for tool_def in raw_tools:
-        if not isinstance(tool_def, dict):
-            continue
-        # 提取 server_file 用于构建映射（在过滤前）
-        func_info = tool_def.get("function", {})
-        tool_name = func_info.get("name")
-        server_file = func_info.get("server_file")
-        if tool_name and server_file:
-            tool_mcp_servers[tool_name] = server_file
-        # 过滤工具定义为API标准格式
-        filtered_tool = _filter_tool_for_api(tool_def)
-        if filtered_tool:
-            filtered_tools.append(filtered_tool)
-    return filtered_tools, tool_mcp_servers
-
-
-# 加载并过滤工具，同时构建 MCP 映射
-async def load_all_tools() -> None:
-    """ 加载并过滤工具，同时构建MCP映射 """
-    global ALL_TOOLS, TOOL_MCP_SERVERS
-    ALL_TOOLS, TOOL_MCP_SERVERS = _load_and_filter_tools()
-    print(f"✅ 已加载 {len(ALL_TOOLS)} 个工具，构建 {len(TOOL_MCP_SERVERS)} 个MCP映射")
-    # for name, server in TOOL_MCP_SERVERS.items():
-    #     print(f"   - {name}: {server}")
-asyncio.run(load_all_tools())   # 初始化工具加载
-print(f"ALL_TOOLS: {ALL_TOOLS}\n\n\nTOOL_MCP_SERVERS: {TOOL_MCP_SERVERS}\n")
-
-
-def _parse_tool_call(tool_call: dict) -> tuple[str | None, dict]:
-    if not isinstance(tool_call, dict):
-        return None, {}
-    function_info = tool_call.get("function") or {}
-    tool_name = function_info.get("name")
-    arguments = function_info.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {}
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, dict):
-        arguments = {"arguments": arguments}
-    return tool_name, arguments
+}
 
 
 def _format_tool_result(result: Any) -> str:
@@ -187,16 +56,41 @@ def _format_tool_result(result: Any) -> str:
         return str(result)
 
 
-def _tool_result_assistant_message(tool_name: str, tool_args: dict, result: str) -> dict:
-    # history_block = _build_tool_history_block_text() 没必要添加历史，因为会追加 assistant 消息
-    content = (
-        # f"\n{tool_name}工具调用结果：[\n"
-        "\n工具调用结果：[\n"
-        f"function: {tool_name}\n"
-        f"arguments: {json.dumps(tool_args, ensure_ascii=False)}\n"
-        f"result: {result}\n]\n"
-    )
-    return {"role": "assistant", "content": content}
+def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
+    if not isinstance(delta, dict):
+        return
+    for key, value in delta.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            existed = total.get(key, 0)
+            if not isinstance(existed, (int, float)) or isinstance(existed, bool):
+                existed = 0
+            total[key] = existed + value
+        elif isinstance(value, dict):
+            child = total.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                total[key] = child
+            _merge_usage_values(child, value)
+
+
+# "注意：目前工具函数仅支持单个使用，不支持并发批量使用；所以请一次最多使用一个工具。"
+# 当前工作路径为<{_format_tool_result(get_current_dir())}>
+SYS_PROMPT = """
+    本轮工具集合由用户选择并由系统注入，你只能调用当前可见工具（如果用户提供了）；禁止臆造、改名或扩展工具。
+    程序支持并发工具调用，但并发结果完成顺序不保证；工具返回 [] 表示空值而不是失败。
+    历史记录只保留工具调用参数，不保留工具结果全文。
+    如果任务已完成，直接给最终答复；如果无需调用工具即可完成，也可直接结束本轮。
+    注意：本轮你的思考过程（reasoning_content）只会保留最后 1024 字节的内容，请确保关键决策信息在最后 1k 内。
+"""
+# 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
+# "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
+
+
+async def load_all_tools() -> None:
+    """加载并过滤工具，同时构建 MCP 映射。"""
+    await tool_registry.refresh_tools_from_mcp(get_current_dir())
+    print(f"✅ 已加载 {len(tool_registry.ALL_TOOLS)} 个工具，构建 {len(tool_registry.TOOL_MCP_SERVERS)} 个MCP映射")
+print("[INFO] 工具将按需实时刷新（来源: setting/mcp_servers.json）")
 
 
 def _parse_sse_event(sse_chunk: str) -> dict[str, Any] | None:
@@ -242,7 +136,10 @@ def _filter_tool_calls_fields(event: dict[str, Any]) -> dict[str, Any]:
     return filtered_event
 
 
-def _merge_function_call_delta(accumulated: List[dict], function_call_delta: dict) -> None:
+def _merge_function_call_delta(
+    accumulated: List[dict],
+    function_call_delta: dict
+) -> None:
     """合并流式 function_call 增量数据到累积列表中（兼容老模型）
     规则：
     - function_call 是单个对象，不是列表
@@ -278,7 +175,10 @@ def _merge_function_call_delta(accumulated: List[dict], function_call_delta: dic
         existing_fc["function"]["arguments"] += fc_arguments
 
 
-def _merge_tool_call_delta(accumulated: List[dict], tool_calls_delta: list[dict]) -> None:
+def _merge_tool_call_delta(
+    accumulated: List[dict],
+    tool_calls_delta: list[dict]
+) -> None:
     """合并流式工具调用增量数据到累积列表中
     规则：
     - accumulated 包含所有出现过的 index 对应的工具调用
@@ -304,60 +204,309 @@ def _merge_tool_call_delta(accumulated: List[dict], tool_calls_delta: list[dict]
         if existing_tc is None:
             existing_tc = {
                 "index": index,
-                # "id": "",
+                "id": delta.get("id") or f"call_{uuid.uuid4().hex}",
                 "function": {
                     "name": "",
                     "arguments": ""
                 },
-                # "type": "function"
+                "type": "function"
             }
             accumulated.append(existing_tc)
         delta_function = delta.get("function", {})
-        # 累加 id（如果有的话）
-        # if delta.get("id"):
-        #     existing_tc["id"] += delta["id"]
-        # 累加 function.name
+        if delta.get("id"):
+            existing_tc["id"] = delta["id"]
         if delta_function.get("name"):
             existing_tc["function"]["name"] += delta_function["name"]
-        # 累加 function.arguments
         if delta_function.get("arguments"):
             existing_tc["function"]["arguments"] += delta_function["arguments"]
-            # print(existing_tc["function"]["arguments"], end="")
-        # 设置 type（如果有的话）
-        # if delta.get("type"):
-        #     existing_tc["type"] = delta["type"]
+        if delta.get("type"):
+            existing_tc["type"] = delta["type"]
     # 遵守 ai 给的 index 字段排序
     accumulated.sort(key=lambda x: x["index"])
 
 
-def _invoke_tool_function(name: str, arguments: dict) -> Any:
-    """调用 MCP 工具（同步包装器，在线程池中执行）"""
-    # 检查工具是否在MCP映射中
-    if name not in TOOL_MCP_SERVERS:
-        raise ValueError(f"工具 {name} 未在MCP服务器中注册，无法调用")
-    # 获取对应的MCP服务器文件
-    mcp_server_file = TOOL_MCP_SERVERS[name]
-    # 在线程池中运行异步MCP调用
-    loop = asyncio.new_event_loop()
-    try:
-        result = loop.run_until_complete(
-            call_mcp_tool(
-                function_name=name,
-                arguments=arguments,
-                mcp_service_file=mcp_server_file
-            )
-        )
-        return result
-    finally:
-        loop.close()
+def _sse_error_payload(message: str) -> str:
+    return f"data: {json.dumps({'error': message}, ensure_ascii=False)}\n\n"
 
 
-async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> AsyncGenerator[str, None]:
+def _serialize_tool_definition(tool_def: Any) -> dict:
+    if hasattr(tool_def, "model_dump"):
+        return tool_def.model_dump(exclude_none=True)
+    if hasattr(tool_def, "dict"):
+        return tool_def.dict(exclude_none=True)
+    if isinstance(tool_def, dict):
+        return tool_def
+    return {}
+
+
+def _tool_name_from_definition(tool_def: dict) -> str:
+    if not isinstance(tool_def, dict):
+        return ""
+    func_info = tool_def.get("function")
+    if not isinstance(func_info, dict):
+        return ""
+    name = func_info.get("name")
+    return name if isinstance(name, str) else ""
+
+
+# 历史摘要与轮次格式化已迁移到 memory.chat_history_format
+from memory.chat_history_format import (
+    format_tool_call_history_line as _format_tool_call_history_line,
+    render_context_summary as _render_summary_state,
+    round_entry_to_context_messages as _round_entry_to_context_messages,
+)
+
+
+# 摘要渲染已迁移到 memory.chat_history_format._render_summary_state
+# 保留下面这段兼容占位，避免外部引用旧名字时漏改
+
+
+def _estimate_round_entry_tokens(round_entry: dict[str, Any]) -> int:
+    return estimate_messages_tokens(_round_entry_to_context_messages(round_entry))
+
+
+def _round_entry_to_summary_text(round_entry: dict[str, Any]) -> str:
+    lines: list[str] = []
+    question = round_entry.get("question")
+    if isinstance(question, str) and question.strip():
+        lines.append(f"用户问题: {question.strip()}")
+    for message in _round_entry_to_context_messages(round_entry):
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            lines.append(f"{role}: {content.strip()}")
+    return "\n".join(lines)
+
+
+async def _summarize_round_chunk(
+    tool_request: ChatLLMRequest,
+    previous_summary_state: dict[str, Any] | None,
+    chunk_rounds: list[dict[str, Any]],
+) -> dict[str, Any]:
+    previous_summary_text = _render_summary_state(previous_summary_state)
+    chunk_payload = [
+        {
+            "question": round_entry.get("question", ""),
+            "text": _round_entry_to_summary_text(round_entry),
+        }
+        for round_entry in chunk_rounds
+        if isinstance(round_entry, dict)
+    ]
+    prompt_payload = {
+        "previous_summary": previous_summary_text or "",
+        "rounds": chunk_payload,
+    }
+    summary_prompt = (
+        "你是会话压缩器。请把给定的旧对话压缩成后续模型继续可用的上下文摘要。"
+        "要求：保留用户目标、已确认事实、工具结果、数值、约束条件、未完成事项；"
+        "删除寒暄和重复细节；如果有工具状态或待办，请显式列出。"
+        "只输出严格 JSON，不要输出多余文本。JSON 结构为："
+        "{\"summary\": string, \"key_facts\": [string], \"open_items\": [string], \"tool_state\": [string]}"
+    )
+    summary_request = ChatLLMRequest(
+        messages=[
+            {"role": "system", "content": summary_prompt},
+            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False, indent=2)},
+        ],
+        max_tokens=max(256, min(1024, int(tool_request.max_tokens or 1024) // 4 or 256)),
+        temperature=0.2,
+        top_p=1.0,
+        presence_penalty=0.0,
+        stream=False,
+        reasoning_effort="low",
+        tool_choice="none",
+        parallel_tool_calls=False,
+        session_id=tool_request.session_id,
+        use_backend_history=False,
+        backend_history_rounds=0,
+    )
+
+    result = await asyncio.to_thread(partial(ChatLLM.chat_completions, request=summary_request, stream=False))
+    summary_text = ""
+    if isinstance(result, dict):
+        summary_text = str(result.get("content") or result.get("reasoning_content") or "").strip()
+
+    parsed_summary: dict[str, Any] | None = None
+    if summary_text:
+        try:
+            candidate = json.loads(summary_text)
+            if isinstance(candidate, dict):
+                parsed_summary = candidate
+        except Exception:
+            parsed_summary = None
+
+    if parsed_summary is None:
+        parsed_summary = {
+            "summary": summary_text or "旧对话压缩失败，保留简化摘要。",
+            "key_facts": [],
+            "open_items": [],
+            "tool_state": [],
+        }
+
+    parsed_summary.setdefault("summary", summary_text or "旧对话压缩失败，保留简化摘要。")
+    parsed_summary.setdefault("key_facts", [])
+    parsed_summary.setdefault("open_items", [])
+    parsed_summary.setdefault("tool_state", [])
+    parsed_summary["source_round_count"] = len(chunk_rounds)
+    return parsed_summary
+
+
+async def _compact_session_history_if_needed(
+    session_chat_memory,
+    tool_request: ChatLLMRequest,
+) -> None:
+    context_limit = resolve_model_max_input_tokens(default=8192)
+    trigger_ratio = float(load_var("HISTORY_COMPACT_TRIGGER_RATIO", "0.8") or 0.8)
+    if trigger_ratio <= 0:
+        trigger_ratio = 0.8
+    if trigger_ratio > 0.95:
+        trigger_ratio = 0.95
+    budget_limit = max(1024, int(context_limit * trigger_ratio))
+    keep_min_rounds = max(1, int(load_var("HISTORY_COMPACT_KEEP_ROUNDS", "4") or 4))
+    chunk_rounds_target = max(1, int(load_var("HISTORY_COMPACT_CHUNK_ROUNDS", "3") or 3))
+
+    summary_state = await session_chat_memory.get_context_summary()
+    history_entries = await session_chat_memory.get_chat_history()
+    round_entries = [
+        entry for entry in history_entries
+        if isinstance(entry, dict) and entry.get("event") == "chat_round"
+    ]
+    summarized_count = 0
+    if isinstance(summary_state, dict):
+        try:
+            summarized_count = max(0, int(summary_state.get("source_round_count", 0) or 0))
+        except (TypeError, ValueError):
+            summarized_count = 0
+    summarized_count = min(summarized_count, len(round_entries))
+    raw_rounds = round_entries[summarized_count:]
+    if len(raw_rounds) <= keep_min_rounds:
+        return
+
+    while True:
+        summary_message = _render_summary_state(summary_state)
+        current_messages: list[dict[str, Any]] = []
+        if summary_message:
+            current_messages.append({"role": "system", "content": summary_message})
+        for round_entry in raw_rounds:
+            current_messages.extend(_round_entry_to_context_messages(round_entry))
+
+        if estimate_messages_tokens(current_messages) <= budget_limit:
+            return
+
+        if len(raw_rounds) <= keep_min_rounds:
+            return
+
+        tail_rounds: list[dict[str, Any]] = []
+        tail_tokens = estimate_messages_tokens(current_messages[:1]) if summary_message else 0
+        for round_entry in reversed(raw_rounds):
+            round_tokens = _estimate_round_entry_tokens(round_entry)
+            if tail_rounds and tail_tokens + round_tokens > budget_limit:
+                break
+            tail_rounds.append(round_entry)
+            tail_tokens += round_tokens
+        tail_rounds.reverse()
+
+        if not tail_rounds or len(tail_rounds) >= len(raw_rounds):
+            return
+
+        summarize_count = len(raw_rounds) - len(tail_rounds)
+        summarize_count = max(1, min(summarize_count, chunk_rounds_target))
+        summarize_count = min(summarize_count, len(raw_rounds) - keep_min_rounds)
+        if summarize_count <= 0:
+            return
+
+        chunk_rounds = raw_rounds[:summarize_count]
+        summary_state = await _summarize_round_chunk(tool_request, summary_state, chunk_rounds)
+        await session_chat_memory.update_context_summary(summary_state)
+        raw_rounds = raw_rounds[summarize_count:]
+
+
+async def tool_chat_server(
+    tool_request: ChatLLMRequest
+) -> AsyncGenerator[str, None]:
     """工具聊天服务器，按需补齐工具并以 SSE 格式输出模型响应。"""
+    try:
+        require_default_chat_config()
+    except ChatModelConfigurationError as exc:
+        yield _sse_error_payload(str(exc))
+        return
+
     # 从请求中获取 session_id
     session_id = getattr(tool_request, 'session_id', 'default')
-    # 获取所有工具
-    tool_request.tools = ALL_TOOLS
+    await load_all_tools()
+    # 计算本轮允许使用的工具：后端实时工具为唯一真相；前端仅允许传 tool_names
+    configured_tools = list(tool_registry.ALL_TOOLS)
+    configured_tool_servers = dict(tool_registry.TOOL_MCP_SERVERS)
+    configured_tool_by_name = {
+        _tool_name_from_definition(tool_def): tool_def
+        for tool_def in configured_tools
+        if _tool_name_from_definition(tool_def)
+    }
+    requested_tool_names = getattr(tool_request, "tool_names", None)
+
+    if isinstance(requested_tool_names, list):
+        requested_names = [str(name).strip() for name in requested_tool_names if str(name).strip()]
+
+        if not requested_names:
+            warning_event = {
+                "warning": {
+                    "code": "NO_TOOL_SELECTED",
+                    "message": "本轮未选择任何工具，已按无工具模式继续",
+                }
+            }
+            yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
+            round_tools = []
+            round_tool_servers = {}
+        else:
+            selected_tools: list[dict] = []
+            selected_servers: dict[str, str] = {}
+            ignored_names: list[str] = []
+            seen_names = set()
+
+            for tool_name in requested_names:
+                if tool_name in seen_names:
+                    continue
+                seen_names.add(tool_name)
+                if tool_name == BUILTIN_CHECK_TOOL_EXISTS_NAME:
+                    continue
+                real_tool = configured_tool_by_name.get(tool_name)
+                if real_tool is None:
+                    ignored_names.append(tool_name)
+                    continue
+                selected_tools.append(real_tool)
+                if tool_name in configured_tool_servers:
+                    selected_servers[tool_name] = configured_tool_servers[tool_name]
+
+            if ignored_names:
+                warning_event = {
+                    "warning": {
+                        "code": "UNKNOWN_TOOL_IGNORED",
+                        "message": "前端传入了未注册工具名，已忽略",
+                        "ignored_tools": ignored_names,
+                    }
+                }
+                yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
+
+            round_tools = selected_tools
+            round_tool_servers = selected_servers
+    else:
+        warning_event = {
+            "warning": {
+                "code": "NO_TOOL_SELECTED",
+                "message": "缺少 tool_names 字段，已按无工具模式继续",
+            }
+        }
+        yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
+        round_tools = []
+        round_tool_servers = {}
+
+    # 当且仅当前端有工具选择时，注入内置工具
+    if round_tools:
+        if BUILTIN_CHECK_TOOL_EXISTS_NAME not in round_tool_servers:
+            round_tools = round_tools + [BUILTIN_CHECK_TOOL_EXISTS_DEF]
+            round_tool_servers[BUILTIN_CHECK_TOOL_EXISTS_NAME] = "__builtin__"
+
+    tool_request.tools = round_tools
     # print(f"tools: {tool_request.tools}")
     tool_choice = tool_request.tool_choice
     if not isinstance(tool_choice, (str, dict)):
@@ -366,62 +515,88 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
     messages: List[dict] = []
     for message in tool_request.messages or []:
         if hasattr(message, "model_dump"):
-            messages.append(message.model_dump())
+            msg = message.model_dump(exclude_none=True)
         elif hasattr(message, "dict"):
-            messages.append(message.dict())
+            msg = message.dict(exclude_none=True)
         else:
-            messages.append(message)
+            msg = message
+        if isinstance(msg, dict):
+            msg = {k: v for k, v in msg.items() if v is not None}
+        messages.append(msg)
+    incoming_messages = list(messages)
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
     session_file_memory = await get_file_memory_manager(session_id)
     try:
-        await session_chat_memory.add_chat_history(messages)   # 不需要记录项目中的系统提示词
+        use_backend_history = parse_bool_like(
+            getattr(tool_request, "use_backend_history", None),
+            parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
+        )
+        backend_history_rounds = parse_int_like(
+            getattr(tool_request, "backend_history_rounds", None),
+            parse_int_like(load_var("BACKEND_HISTORY_ROUNDS", 6), 6)
+        )
+
+        if use_backend_history:
+            if frontend_provides_full_history(incoming_messages):
+                print("[INFO] 检测到前端已提供完整历史，本次跳过后端历史拼接")
+            else:
+                backend_messages = await session_chat_memory.get_context_messages(
+                    max_rounds=backend_history_rounds
+                )
+                if backend_messages:
+                    messages = backend_messages + messages
+                    print(f"[INFO] 已拼接后端历史消息 {len(backend_messages)} 条（最近 {backend_history_rounds} 轮）")
+
+        latest_user_message = None
+        for msg in reversed(incoming_messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    latest_user_message = msg
+                break
+        if latest_user_message:
+            await session_chat_memory.add_chat_history(latest_user_message)
         # 检查是否存在系统提示词，添加一些提示
         if messages[0]["role"] == "system":
-            messages[0]["content"] += (
-                f"\n当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
-                # "注意：目前工具函数仅支持单个使用，不支持并发批量使用；所以请一次最多使用一个工具。"
-                "程序支持并发工具，你可以选择并发工具调用哦！\n"
-                "工具返回结果为 [] 表示空值\n"
-                "历史工具调用记录将通过 assistant 消息追加。\n"
-                "你需要调用 over_task() 函数（该函数无参数）才能结束你的任务，这将是任务最终的结束信号！\n"
-                "- 当你选择调用 over_task() 函数结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
-                # "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
-            )
+            messages[0]["content"] += (f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n" + SYS_PROMPT)
         else:
             messages.insert(0, {
                 "role": "system",
                 "content": (
-                    "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，需要你回答用户问题（根据用户使用的语言回答）；\n"
+                    "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
                     f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
-                    "程序支持并发工具，你可以选择并发工具调用哦！\n"
-                    "工具返回结果为 [] 表示空值\n"
-                    "历史工具调用记录将通过 assistant 消息追加。\n"
-                    "你需要调用 over_task() 函数（该函数无参数）才能结束你的任务，这将是任务最终的结束信号！\n"
-                    "- 当你选择调用 over_task() 函数结束当前一次或多次工具调用任务的时候，请向用户总结说明你的操作（over_task 除外），简短说明概要即可。\n"
-                    # "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
+                    + SYS_PROMPT
                 ),
             })
         # 这里做文件处理，并添加文件解析内容到 "content" 字段
         user_files = session_file_memory.get_file_memory_chat()
         if user_files:
             messages[0]["content"] += (
-                f"\n用户上传了 {len(user_files)} 个文件，解析的内容如下：\n"
+                f"\n用户上传的 {len(user_files)} 个文件，解析的内容如下：\n"
                 f"{user_files}"
             )
         # run_task = True
-        count_nouse_tool = 0  # 无用工具调用次数
         # last_tool_ret = ""  # 上一次调用工具的返回值
         # while run_task:
         while session_chat_memory.run_task:
             print(f"massages: [\n\t{',\n\t'.join(map(str, messages))}\n]")
             full_response = ""
             full_reasoning = ""
+            finish_reason = None  # 追踪模型完成原因：stop（正常完成）、length（token 截断）、tool_calls（工具调用）
+            pending_finish_payload: dict[str, Any] | None = None  # 延后发送 finish_reason，先发 usage 尾帧
+            stream_error = None  # 追踪上游流式错误（与用户手动停止区分，避免误记为"停止任务"）
             tool_calls: List[dict] = []
+            usage_accumulator = UsageAccumulator()
             # 将 messages 附加到 tool_request 中
-            tool_request.messages = [Message(**msg) if isinstance(msg, dict) else msg for msg in messages]
-            async for sse_chunk in ChatTool.chat_with_history_sse(api_url=api_url,
-                request=tool_request, # 传递完整的 ChatToolRequest 对象（已包含 messages）
+            tool_request.messages = build_request_messages(messages)
+            # 注意：ChatLLM.chat_completions(stream=True) 返回 async generator，
+            # 外层 tool_chat_server 是 async def，必须用 async for 迭代，
+            # 否则会抛 TypeError: 'async_generator' object is not iterable
+            async for sse_chunk in ChatLLM.chat_completions(
+                request = tool_request, # 传递完整的 ChatLLMRequest 对象（已包含 messages）
+                stream = True,
+                stop_checker = lambda: (not session_chat_memory.run_task)
             ):
                 # print(f"sse_chunk: {sse_chunk}")
                 event = _parse_sse_event(sse_chunk)
@@ -429,12 +604,40 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                     yield sse_chunk
                     continue
                 if event.get("done") or not session_chat_memory.run_task:
+                    if pending_finish_payload is not None:
+                        yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                        pending_finish_payload = None
                     break
                 if event.get("error") is not None:
                     yield sse_chunk
-                    # run_task = False
+                    stream_error = event.get("error")
                     session_chat_memory.run_task = False
                     break
+                # ChatLLM 做了统一处理，会单独发送 usage 事件（不带 finish_reason / choices）
+                # 只要本事件携带 usage 就尝试收集，后续由 completion_id/指纹去重
+                usage_accumulator.collect(event)
+                # 捕获 finish_reason 信号（stop/length/tool_calls）
+                if event.get("finish_reason") is not None:
+                    finish_reason = event["finish_reason"]
+                    pending_finish_payload = {"finish_reason": finish_reason}
+                    if event.get("id") is not None:
+                        pending_finish_payload["id"] = event["id"]
+                    if event.get("usage") is not None:
+                        pending_finish_payload["usage"] = event["usage"]
+                    event = event.copy()
+                    event.pop("finish_reason", None)
+                choices = event.get("choices")
+                # 部分服务会在 finish_reason 之后再发一帧 choices:[] + usage 统计帧
+                # 这类帧需要优先透传 usage，然后再发送 finish_reason，避免前端提前收流
+                if isinstance(choices, list) and len(choices) == 0 and event.get("usage") is not None:
+                    usage_event = {"type": "usage", "usage": event["usage"]}
+                    if event.get("id") is not None:
+                        usage_event["id"] = event["id"]
+                    yield f"data: {json.dumps(usage_event, ensure_ascii=False)}\n\n"
+                    if pending_finish_payload is not None:
+                        yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                        pending_finish_payload = None
+                    continue
                 content = event.get("content")
                 reasoning_content = event.get("reasoning_content")
                 tool_calls_delta = event.get("tool_calls")
@@ -468,54 +671,94 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                 # 过滤 tool_calls 中的 id 和 type 字段后再输出
                 filtered_event = _filter_tool_calls_fields(event)
                 yield f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n"
+
+            if usage_accumulator.count > 0:
+                round_usage_total: dict[str, Any] = {}
+                usage_accumulator.merge_to(round_usage_total, _merge_usage_values)
+                await session_chat_memory.update_current_round_usage(
+                    usage_total=round_usage_total,
+                    completion_count=usage_accumulator.count,
+                )
+
             # print(f"[DEBUG] tool_calls: {tool_calls}")
+            if pending_finish_payload is not None:
+                yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                pending_finish_payload = None
+            # 上游模型流出错（如连接被切断）：记录真实错误原因，而不是伪装成"用户停止任务"
+            if stream_error is not None:
+                print(f"\n[ERROR] 模型流式响应出错: {stream_error}")
+                # 记录 ai 已生成的内容
+                if full_reasoning:
+                    await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
+                if full_response:
+                    await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
+                # 记录真实错误，便于事后追溯
+                await session_chat_memory.add_chat_history({"role": "assistant", "error": str(stream_error)})
+                break  # 任务因错误结束，退出循环
             # 模型回复过程中用户手动停止任务
             if not session_chat_memory.run_task:
-                print("用户手动停止任务")
+                print("停止任务")
                 # 记录 ai 生成的内容
                 if full_reasoning:
                     await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
                 if full_response:
                     await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
                 # 添加用户手动停止任务消息的记录
-                await session_chat_memory.add_chat_history({"role": "user", "content": "用户手动停止任务"})
+                await session_chat_memory.add_chat_history({"role": "user", "content": "停止任务"})
                 break  # 任务结束，退出循环
+            known_tool_names = list(round_tool_servers.keys())
+            # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
+            tool_calls = normalize_tool_calls(tool_calls, known_tool_names)
             # 检查 tool_calls 是否为空
             if not tool_calls:
-                count_nouse_tool += 1 # 不调用工具次数
-                if len(messages) == 2 or count_nouse_tool >= int(load_var("WITH_OUT_TOOL_COUNT", 3)): # 第一次对话就不调用工具或者不使用工具次数达到或超过指定次数
-                    # 如果模型本次流式响应输出了内容，则补充一条文本型的 assistant 历史消息。
-                    if full_response:   # 优先考虑模型回答的内容
+                # 如果 finish_reason 是 "length"，说明模型输出因 max_tokens 不足被截断
+                # 需要提示模型继续完成回答，而不是按"未调用工具"的逻辑处理
+                if finish_reason == "length":
+                    print(f"[WARN] 模型输出被截断(finish_reason=length)，提示模型继续完成回答")
+                    assistant_message = {}
+                    if full_response:
                         assistant_message = {"role": "assistant", "content": full_response}
-                        messages.append(assistant_message)
-                    elif full_reasoning: # 否则使用模型推理的推理内容
-                        assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}   # 只保留最近 100 个字符
-                        messages.append(assistant_message)
-                    # run_task = False  # 停止任务
-                    session_chat_memory.run_task = False  # 停止任务
-                else:
-                    # 提醒模型使用 over_task 函数结束任务
-                    if full_response:   # 优先考虑模型回答的内容
-                        assistant_message = {"role": "assistant", "content": full_response}
-                        messages.append(assistant_message)
-                    elif full_reasoning: # 否则使用模型推理的推理内容
-                        assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}   # 只保留最近 100 个字符
-                        messages.append(assistant_message)
-                assistant_message = {"role": "user", "content": "你可以选择调用 over_task 结束或者调用其他工具，请注意：你只能通过调用 over_task 工具结束任务，不能通过其他方式结束任务，不调用工具会继续任务！"}
-                messages.append(assistant_message)
-                print("\n[INFO] 本轮对话未返回工具调用，继续任务")
-                continue  # 继续
-            # 只要有思考过程就添加模型聊天思考历史记录到文件
+                    elif full_reasoning:
+                        assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}
+                    messages.append(assistant_message)
+                    messages.append({"role": "user", "content": "你的回答因为长度限制被截断了，请继续。", "_internal": True})
+                    continue  # 让模型继续，不进入"未调用工具"的逻辑
+                assistant_message = {"role": "assistant", "content": full_response} if full_response else None
+                if assistant_message is not None:
+                    messages.append(assistant_message)
+                    await session_chat_memory.add_chat_history(assistant_message)
+                session_chat_memory.run_task = False
+                print("\n[INFO] 本轮对话未返回工具调用，任务结束")
+                break
+            # 构建包含 tool_calls 的 assistant 消息（符合 OpenAI API 规范）
+            assistant_message = {"role": "assistant"}
+            if full_response:
+                assistant_message["content"] = full_response
+            elif full_reasoning:
+                assistant_message["content"] = f"...{full_reasoning[-100:]}"
+            # 思考模型下，带 tool_calls 的 assistant 消息必须回传 reasoning_content，否则 DeepSeek 会报 400
             if full_reasoning:
-                await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
-            # 如果模型本次流式响应输出了内容，则补充一条文本型的 assistant 历史消息。
-            if full_response:   # 优先考虑模型回答的内容
-                assistant_message = {"role": "assistant", "content": full_response}
-                messages.append(assistant_message)
-                # 添加模型聊天响应历史记录到文件
-                await session_chat_memory.add_chat_history(assistant_message)
-            elif full_reasoning: # 否则使用模型推理的推理内容
-                messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"}) # 只保留最近 100 个字符
+                assistant_message["reasoning_content"] = full_reasoning[-1024:]
+            formatted_tool_calls = []
+            for tc in tool_calls:
+                function_info = tc.get("function") or {}
+                tool_name = function_info.get("name")
+                # 只回传已知工具，避免将非法 tool_call 继续发给上游导致 400
+                if tool_name not in round_tool_servers:
+                    print(f"[WARN] 跳过未知工具调用，不回传上游: {tool_name}")
+                    continue
+                formatted_tc = {
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": function_info.get("name", ""),
+                        "arguments": function_info.get("arguments", "{}")
+                    }
+                }
+                formatted_tool_calls.append(formatted_tc)
+            assistant_message["tool_calls"] = formatted_tool_calls
+            messages.append(assistant_message)
+            await session_chat_memory.add_chat_history(assistant_message)
             # 验证 tool_calls 的完整性
             # print(f"\n[DEBUG] 接收到 {len(tool_calls)} 个工具调用")
             # for i, tc in enumerate(tool_calls):
@@ -532,111 +775,115 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
             #         except json.JSONDecodeError as e:
             #             print(f"      ❌ 参数JSON不完整或格式错误: {e}")
             #             print(f"      参数字符串预览: {arguments_str[:200]}...")
-            # 解析所有工具调用，分离 over_task 和其他工具
-            parsed_tools = []
-            over_task_call = None
-            has_parse_error = False
-            for i, tool_call in enumerate(tool_calls, 1):
-                tool_name, tool_args = _parse_tool_call(tool_call)
-                if not tool_name:
-                    print(f"[WARNING] 第{i}个工具调用解析失败（无工具名），跳过")
-                    continue
-                # 检查是否是 over_task 工具
-                if tool_name == "over_task":
-                    print("\n[INFO] 检测到 over_task 信号，将在此轮工具执行完成后结束任务")
-                    over_task_call = (i, tool_call, tool_name, tool_args)
-                    # 注意：不立即 break，继续收集其他工具
-                else:
-                    # 验证参数是否为空（可能是JSON解析失败导致）
-                    func_info = tool_call.get("function", {})
-                    arguments_str = func_info.get("arguments", "")
-                    if arguments_str and not tool_args:
-                        print(f"[ERROR] 工具 {tool_name} 有参数字符串但解析后为空，可能是JSON不完整！")
-                        print(f"        原始参数字符串: {arguments_str[:300]}...")
-                        has_parse_error = True
-                    parsed_tools.append((i, tool_call, tool_name, tool_args))
-            # 如果有解析错误，警告用户
-            if has_parse_error:
+            plan = prepare_tool_execution(tool_calls, known_tool_names)
+            parsed_tools = plan.parsed_tools
+            if plan.has_parse_error:
                 print("[WARNING] 检测到工具参数解析错误，可能导致工具执行失败")
+            blocked_tools = [item for item in parsed_tools if item[2] not in round_tool_servers]
+            parsed_tools = [item for item in parsed_tools if item[2] in round_tool_servers]
+            if blocked_tools:
+                print(f"[WARN] 检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
+                for _, blocked_tool_call, blocked_tool_name, blocked_tool_args in blocked_tools:
+                    blocked_tool_call_id = blocked_tool_call.get("id", "") if isinstance(blocked_tool_call, dict) else ""
+                    blocked_ret = f"工具 {blocked_tool_name} 未在本轮授权列表中，禁止调用"
+                    await session_chat_memory.add_chat_history(
+                        input_text={
+                            "role": "tool",
+                            "tool_call_id": blocked_tool_call_id,
+                            "tool_name": blocked_tool_name,
+                            "arguments": json.dumps(blocked_tool_args, ensure_ascii=False),
+                            "result": blocked_ret,
+                        }
+                    )
+                    blocked_tool_message = {
+                        "role": "tool",
+                        "tool_call_id": blocked_tool_call_id,
+                        "content": blocked_ret,
+                    }
+                    messages.append(blocked_tool_message)
+                    blocked_event = {
+                        "tool_return": {
+                            "function_name": blocked_tool_name,
+                            "arguments": blocked_tool_args,
+                            "result": blocked_ret,
+                            "blocked": True,
+                        }
+                    }
+                    yield f"data: {json.dumps(blocked_event, ensure_ascii=False)}\n\n"
+                if not parsed_tools:
+                    continue
+            if not parsed_tools and not round_tool_servers:
+                assistant_message = {"role": "assistant", "content": full_response} if full_response else None
+                if assistant_message is not None:
+                    messages.append(assistant_message)
+                    await session_chat_memory.add_chat_history(assistant_message)
+                session_chat_memory.run_task = False
+                break
             # 如果没有任何有效工具可执行，退出
-            if not parsed_tools and not over_task_call:
+            if not parsed_tools:
                 print("[WARNING] 没有可执行的有效工具，退出循环")
                 break
-            print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具" + (" + over_task" if over_task_call else ""))
-            # 使用线程池并发执行所有普通工具（不包括 over_task）
-            if parsed_tools:
-                tool_results = []
-                max_workers = min(10, len(parsed_tools))  # 最多10个线程
+            print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具")
+            # 内置工具与 MCP 工具分开执行
+            builtin_results = []
+            external_parsed_tools = []
+            for idx, tc, tn, ta in parsed_tools:
+                if tn == BUILTIN_CHECK_TOOL_EXISTS_NAME:
+                    query_name = ""
+                    if isinstance(ta, dict):
+                        query_name = str(ta.get("tool_name", "")).strip()
+                    exists = bool(query_name and query_name in configured_tool_by_name)
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": {
+                            "tool_name": query_name,
+                            "exists": exists,
+                            "server": configured_tool_servers.get(query_name, "") if exists else "",
+                        },
+                        "error": None,
+                    })
+                else:
+                    external_parsed_tools.append((idx, tc, tn, ta))
 
-                # 定义工具执行函数
-                def execute_tool(index, tool_call, tool_name, tool_args):
-                    try:
-                        # print(f"[THREAD START] 开始执行工具 #{index}: {tool_name}", flush=True)
-                        result = _invoke_tool_function(tool_name, tool_args)
-                        ret = _format_tool_result(result)
-                        # print(f"[THREAD SUCCESS] 工具 #{index} {tool_name} 执行成功", flush=True)
-                        return index, tool_call, tool_name, tool_args, ret, None
-                    except Exception as exc:
-                        ret = f"工具执行失败：{exc}"
-                        print(f"[THREAD ERROR] 工具 #{index} {tool_name} 执行失败: {exc}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-                        return index, tool_call, tool_name, tool_args, ret, exc
+            tool_results = []
+            # 使用线程池并发执行 MCP 工具
+            if external_parsed_tools:
+                max_workers = min(int(load_var(
+                    "ONE_TASK_MAX_WORKERS", 3)),
+                    len(external_parsed_tools))  # 默认最多 3 个线程
+                tool_results.extend(execute_tool_round(
+                    parsed_tools=external_parsed_tools,
+                    tool_mcp_servers=round_tool_servers,
+                    max_workers=max_workers,
+                ))
+            if builtin_results:
+                tool_results.extend(builtin_results)
 
-                # 在线程池中执行所有普通工具
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(execute_tool, idx, tc, tn, ta): (idx, tc, tn, ta)
-                        for idx, tc, tn, ta in parsed_tools
-                    }
-                    # 收集所有结果
-                    completed_count = 0
-                    for future in as_completed(futures):
-                        try:
-                            index, tool_call, tool_name, tool_args, ret, error = future.result()
-                            # status = "✅" if not error else "❌"
-                            # print(f"[COLLECT {completed_count + 1}/{len(futures)}] {status} 工具 #{index} {tool_name}", flush=True)
-                            tool_results.append({
-                                'index': index,
-                                'tool_call': tool_call,
-                                'tool_name': tool_name,
-                                'tool_args': tool_args,
-                                'result': ret,
-                                'error': error
-                            })
-                            completed_count += 1
-                        except Exception as e:
-                            # 处理未来对象本身的异常
-                            idx, tc, tn, ta = futures[future]
-                            print(f"[FUTURE ERROR] 获取工具 #{idx} {tn} 结果时异常: {e}", flush=True)
-                            import traceback
-                            traceback.print_exc()
-                            tool_results.append({
-                                'index': idx,
-                                'tool_call': tc,
-                                'tool_name': tn,
-                                'tool_args': ta,
-                                'result': f"工具执行异常：{e}",
-                                'error': e
-                            })
-                    print(f"[INFO] 有 {completed_count} 个工具执行完成", flush=True)
+            if tool_results:
+                print(f"[INFO] 有 {len(tool_results)} 个工具执行完成", flush=True)
                 # 按索引排序结果
                 tool_results.sort(key=lambda x: x['index'])
                 # 统一添加所有工具结果到 messages 和历史记录（使用 session_id 隔离）
                 # 获取当前会话的记忆管理器
                 for tool_result in tool_results:
+                    tool_call = tool_result['tool_call']
+                    tool_call_id = tool_call.get("id", "")
                     tool_name = tool_result['tool_name']
                     tool_args = tool_result['tool_args']
                     ret = _format_tool_result(tool_result['result'])
                     await session_chat_memory.add_chat_history(
                         input_text={
-                            "role": "assistant",
-                            "tool_return": {"function": tool_name, "arguments": json.dumps(tool_args, ensure_ascii=False), "result": ret}
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "arguments": json.dumps(tool_args, ensure_ascii=False),
+                            "result": ret
                         }
                     )
-                    # print(f"\n\n函数{tool_name}参数(字典表示)为{tool_args}执行结果：")
-                    # print(ret, end="\n\n\n")
-                    # 发送工具调用结果
+                    # 发送工具调用结果到前端 SSE
                     tool_ret = {
                         "tool_return": {
                             "function_name": tool_name,
@@ -645,38 +892,22 @@ async def tool_chat_server(tool_request: ChatToolRequest, api_url=None) -> Async
                         }
                     }
                     yield f"data: {json.dumps(tool_ret)}\n\n"
-                    # 添加 assistant 消息
-                    assistant_tool_call = _tool_result_assistant_message(tool_name, tool_args, ret)
-                    messages.append(assistant_tool_call)
-                    # last_tool_ret = assistant_tool_call["content"]
-            # 所有普通工具执行完成后，检查是否有 over_task 信号
-            if over_task_call:
-                idx, tool_call, tool_name, tool_args = over_task_call
-                print(f"\n[INFO] 所有工具执行完成，检测到 over_task 信号，准备结束任务")
-                # over_task 只是一个结束信号，不需要真正执行
-                # 但为了保持一致性，仍然添加到历史记录和消息中
-                ret = "任务结束信号已接收"
-                await session_chat_memory.add_chat_history(
-                    input_text={
-                        "role": "assistant",
-                        "tool_return": {"function": tool_name, "arguments": json.dumps(tool_args, ensure_ascii=False), "result": ret}
+                    # 以 tool role 添加工具结果消息（符合 OpenAI API 规范）
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": ret
                     }
-                )
-                # print(f"\n\n函数{tool_name}参数(字典表示)为{tool_args}执行结果：")
-                # print(ret, end="\n\n\n")
-                # messages.append(_tool_result_assistant_message(tool_name, tool_args, ret))
-                # 标记任务结束，退出循环
-                # run_task = False
-                session_chat_memory.run_task = False
-                print("[INFO] over_task 信号已处理，任务结束")
+                    messages.append(tool_message)
         # 写入结束消息到文件
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
+        await _compact_session_history_if_needed(session_chat_memory, tool_request)
         # 清理工具管理内存（使用 session_id 隔离）
         await cleanup_chat_memory_manager(session_id)
         await cleanup_file_memory_manager(session_id)
         yield "data: [DONE]\n\n"
     except Exception as ce:
-        session_chat_memory.add_chat_history({"role": "assistant", "error": ce})
+        await session_chat_memory.add_chat_history({"role": "assistant", "error": str(ce)})
         raise ce
 
 

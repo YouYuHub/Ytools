@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from memory.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str as _timestamp_now
+
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files" / "upload"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -60,7 +62,7 @@ def _get_record_timestamp(file_path: Path) -> float:
     timestamp = data.get("timestamp")
     if isinstance(timestamp, str):
         try:
-            return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").timestamp()
+            return datetime.strptime(timestamp, DEFAULT_TIMESTAMP_FORMAT).timestamp()
         except ValueError:
             pass
     try:
@@ -99,7 +101,7 @@ class FileMemoryManager:
         if not file_info.get("filename"):
             raise ValueError("file_info 必须包含 filename")
         record = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": _timestamp_now()
         }
         record.update(file_info)
         with self._lock:
@@ -112,7 +114,7 @@ class FileMemoryManager:
                         old_file.unlink(missing_ok=True)
         return f"保存成功: {file_path.name}"
 
-    def get_file_memory(self, number: int = -1) -> list[dict[str, Any]]:
+    def get_file_memory_all(self, number: int = -1) -> list[dict[str, Any]]:
         """
         获取最近文件上传历史列表
         Args:
@@ -162,7 +164,7 @@ class FileMemoryManager:
         Returns:
             纯文本格式的文件历史摘要
         """
-        records = self.get_file_memory(number)
+        records = self.get_file_memory_all(number)
         summary_parts = []
         total_chars = 0
         for record in records:
@@ -264,15 +266,15 @@ if __name__ == "__main__":
     # 测试会话1
     manager_1.add_file_memory({"filename": "test1.pdf", "type": "pdf", "size": 1024})
     manager_1.add_file_memory({"filename": "test2.docx", "type": "docx", "size": 2048})
-    print(f"Session 1 文件: {manager_1.get_file_memory()}")
+    print(f"Session 1 文件: {manager_1.get_file_memory_all()}")
 
     # 测试会话2
     manager_2.add_file_memory({"filename": "another.txt", "type": "txt", "size": 512})
-    print(f"Session 2 文件: {manager_2.get_file_memory()}")
+    print(f"Session 2 文件: {manager_2.get_file_memory_all()}")
 
     # 验证隔离
-    print(f"\n验证隔离 - Session 1: {len(manager_1.get_file_memory())} 个文件")
-    print(f"验证隔离 - Session 2: {len(manager_2.get_file_memory())} 个文件")
+    print(f"\n验证隔离 - Session 1: {len(manager_1.get_file_memory_all())} 个文件")
+    print(f"验证隔离 - Session 2: {len(manager_2.get_file_memory_all())} 个文件")
 
     # 测试2：数量限制
     print("\n【测试2】数量限制测试（最多10个文件）")
@@ -283,7 +285,7 @@ if __name__ == "__main__":
             "type": "txt",
             "size": 100 * (i + 1)
         })
-    files = manager_limit.get_file_memory(10)
+    files = manager_limit.get_file_memory_all(10)
     print(f"添加12个文件后保留: {len(files)} 个文件")
     print(f"文件名: {[f['filename'] for f in files]}")
 
@@ -298,10 +300,10 @@ if __name__ == "__main__":
 
     # 测试4：清理功能
     print("\n【测试4】清理功能测试")
-    print(f"清理前 Session 1: {len(manager_1.get_file_memory())} 个文件")
+    print(f"清理前 Session 1: {len(manager_1.get_file_memory_all())} 个文件")
     manager_1.clear_file_memory()
-    print(f"清理后 Session 1: {len(manager_1.get_file_memory())} 个文件")
-    print(f"Session 2 未受影响: {len(manager_2.get_file_memory())} 个文件")
+    print(f"清理后 Session 1: {len(manager_1.get_file_memory_all())} 个文件")
+    print(f"Session 2 未受影响: {len(manager_2.get_file_memory_all())} 个文件")
 
     # 测试5：并发安全测试
     print("\n【测试5】并发安全测试")
@@ -341,7 +343,7 @@ if __name__ == "__main__":
     for i in range(5):
         session_id = f"concurrent_session_{i}"
         manager = get_file_memory_manager(session_id)
-        files = manager.get_file_memory(10)
+        files = manager.get_file_memory_all(10)
         print(f"  {session_id}: {len(files)} 个文件")
 
     # 清理测试数据

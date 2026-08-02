@@ -2,47 +2,33 @@ from typing import Optional, List
 # fastapi 库导入
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
-# from pydantic import BaseModel
 
 # 自定义模块导入
-from config import ChatToolRequest
-from factory.chat_factory import tool_chat_server, load_all_tools, stop_chat_task
-from memory.chat_memory import ChatMemoryManager
+from config import ChatLLMRequest
+from factory.chat_factory import tool_chat_server, stop_chat_task
+from memory.chat_memory import ChatMemoryManager, get_chat_memory_manager
+from routers.chat_config_router import get_chat_work_dir_config
 
 # 创建 API 路由器实例
 api_chat_router = APIRouter()
 
 
-# 聊天模型响应体
-# class Response(BaseModel):
-#     message: str
-
-
 # 聊天主接口
 @api_chat_router.post('/chat_with_tool')
-async def chat_with_tool(request: ChatToolRequest, api_url: Optional[str] = None):
+async def chat_with_tool(request: ChatLLMRequest):
     """ 用户聊天信息，流式响应 """
-    return StreamingResponse(tool_chat_server(request, api_url), media_type='text/event-stream')
+    return StreamingResponse(tool_chat_server(request), media_type='text/event-stream')
 
 
 # 停止当前聊天任务接口
 @api_chat_router.post('/stop_chat')
 async def stop_chat(session_id: str = "default"):
     """ 停止当前聊天任务 """
-    await stop_chat_task(session_id)
-    return {'stop_chat': 'stopped'}
-
-
-# 手动工具更新接口
-@api_chat_router.post('/update_tools')
-async def update_tools():
-    """ 手动更新工具 """
     try:
-        await load_all_tools()
-        return {'message': '工具更新成功'}
+        await stop_chat_task(session_id)
+        return {'stop_chat': 'stopped'}
     except Exception as e:
-        return {'message': '工具更新失败', "error": str(e)}
-
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @api_chat_router.get('/chat_history/sessions')
@@ -52,8 +38,11 @@ async def list_chat_history_sessions():
     返回:
         会话文件名列表
     """
-    sessions = ChatMemoryManager.list_chat_sessions()
-    return JSONResponse(content=[session.name for session in sessions])
+    try:
+        sessions = ChatMemoryManager.list_chat_sessions()
+        return JSONResponse(content=[session.name for session in sessions])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @api_chat_router.get('/chat_history/file')
@@ -66,6 +55,25 @@ async def get_chat_history_file(session_id: str = "default"):
         文件响应
     """
     return ChatMemoryManager.get_chat_session_file(session_id)
+
+
+@api_chat_router.get('/chat_history/meta')
+async def get_chat_history_meta(session_id: str = "default"):
+    """
+    获取指定会话的聊天历史元数据（jsonl 首行 _meta）
+    参数:
+        session_id: 会话ID
+    返回:
+        元数据字典
+    """
+    try:
+        manager = await get_chat_memory_manager(session_id)
+        meta = await manager.get_session_meta()
+        return JSONResponse(content=meta)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @api_chat_router.delete('/chat_history/delete_file')
@@ -103,3 +111,4 @@ async def delete_chat_history_lines(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(content=result)
+

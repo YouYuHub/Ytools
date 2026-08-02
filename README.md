@@ -20,13 +20,3 @@
    ```bash
    python main.py
    ```
-
-## 目录说明
-
-- `main.py`：应用入口
-- `routers/`：API 路由定义
-- `chat/`：聊天工具客户端实现
-- `mcp_server/`：MCP 服务相关代码
-- `memory/`：记忆管理模块
-- `util/`：辅助工具模块
-- `config.py`：Pydantic 配置模型

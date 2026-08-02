@@ -1,0 +1,129 @@
+{
+  "Ollama": {
+    "vendor": "ollama",
+    "url": "http://localhost:11434"
+  },
+  "Wsl Completions": {
+    "vendor": "wsl",
+    "apiKey": "not-needed",
+    "apiType": "chat-completions",
+    "models": {
+      "Qwen3.5-2B": {
+        "id": "Qwen3.5-2B",
+        "url": "http://172.23.144.63:10001/v1",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 240000,
+        "maxOutputTokens": 16000
+      }
+    }
+  },
+  "ApiYi Claude": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-your-api-key-for-apiyi",
+    "apiType": "messages",
+    "models": {
+      "claude-opus-4-8": {
+        "id": "claude-opus-4-8",
+        "url": "https://api.apiyi.com/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 16000
+      }
+    }
+  },
+  "Qwen Completions": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-your-api-key-for-qwen",
+    "apiType": "chat-completions",
+    "models": {
+      "glm-5.1": {
+        "id": "glm-5.1",
+        "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 26000
+      },
+      "qwen3.7-max": {
+        "id": "qwen3.7-max",
+        "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 26000
+      }
+    }
+  },
+  "OpenCode Message": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-your-api-key-for-open-code",
+    "apiType": "messages",
+    "models": {
+      "qwen3.7-max": {
+        "id": "qwen3.7-max",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 888888,
+        "maxOutputTokens": 16000
+      },
+      "minimax-m3": {
+        "id": "minimax-m3",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 65536
+      },
+      "qwen3.7-plus": {
+        "id": "qwen3.7-plus",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 888888,
+        "maxOutputTokens": 65536
+      }
+    }
+  },
+  "OpenCode Completions": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-your-api-key-for-open-code",
+    "apiType": "chat-completions",
+    "models": {
+      "mimo-v2.5-pro": {
+        "id": "mimo-v2.5-pro",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 198000,
+        "maxOutputTokens": 16000
+      },
+      "deepseek-v4-pro": {
+        "id": "deepseek-v4-pro",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 888888,
+        "maxOutputTokens": 65536
+      },
+      "deepseek-v4-flash": {
+        "id": "deepseek-v4-flash",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 16000
+      },
+      "glm-5.2": {
+        "id": "glm-5.2",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 16000
+      }
+    }
+  }
+}

@@ -49,7 +49,7 @@ def _parse_single_file(file_info: dict) -> dict:
         }
 
 
-@api_file_router.post("/upload")
+@api_file_router.post("/upload_session_files")
 async def upload_files(
     files: List[UploadFile] = File(...),
     session_id: str = "default"  # 会话ID，用于隔离不同用户的文件历史
@@ -115,7 +115,7 @@ async def upload_files(
             for file_data in file_data_list
         }
         # 获取当前会话的记忆管理器
-        session_file_memory = get_file_memory_manager(session_id)
+        session_file_memory = await get_file_memory_manager(session_id)
         # 等待所有解析任务完成
         for future in as_completed(future_to_file):
             file_data = future_to_file[future]
@@ -158,7 +158,7 @@ async def upload_files(
     })
 
 
-@api_file_router.get("/memory")
+@api_file_router.get("/get_session_file_memory")
 async def get_file_history(
     number: int = 10,
     session_id: str = "default"
@@ -175,17 +175,17 @@ async def get_file_history(
     if number < 1 or number > 10:
         number = 10
     # 获取当前会话的记忆管理器
-    session_file_memory = get_file_memory_manager(session_id)
-    history = session_file_memory.get_file_memory(number)
+    session_file_memory = await get_file_memory_manager(session_id)
+    history = session_file_memory.get_file_memory_all(number)
     return JSONResponse(content={
         "total": len(history),
         "files": history
     })
 
 
-@api_file_router.get("/memory/text")
+@api_file_router.get("/get_session_file_text")
 async def get_file_history_text(
-    number: int = 10, 
+    number: int = 10,
     max_total_chars: int = 3000,
     session_id: str = "default"
 ):
@@ -202,7 +202,7 @@ async def get_file_history_text(
     if number < 1 or number > 10:
         number = 10
     # 获取当前会话的记忆管理器
-    session_file_memory = get_file_memory_manager(session_id)
+    session_file_memory = await get_file_memory_manager(session_id)
     text_summary = session_file_memory.get_file_memory_text(number, max_total_chars)
     return JSONResponse(content={
         "summary": text_summary,
@@ -210,7 +210,7 @@ async def get_file_history_text(
     })
 
 
-@api_file_router.delete("/memory/{filename}")
+@api_file_router.delete("/delete_session_file_memory")
 async def delete_file_history(
     filename: str,
     session_id: str = "default"
@@ -224,7 +224,7 @@ async def delete_file_history(
         操作结果
     """
     # 获取当前会话的记忆管理器
-    session_file_memory = get_file_memory_manager(session_id)
+    session_file_memory = await get_file_memory_manager(session_id)
     deleted_count = session_file_memory.delete_file_memory(filename)
     return JSONResponse(content={
         "message": f"已删除 {deleted_count} 个文件记录" if deleted_count > 0 else "未找到匹配的文件",
@@ -232,7 +232,7 @@ async def delete_file_history(
     })
 
 
-@api_file_router.delete("/memory")
+@api_file_router.delete("/clear_session_file_memorys")
 async def clear_file_history(
     session_id: str = "default"
 ):
@@ -244,7 +244,7 @@ async def clear_file_history(
         操作结果
     """
     # 获取当前会话的记忆管理器
-    session_file_memory = get_file_memory_manager(session_id)
+    session_file_memory = await get_file_memory_manager(session_id)
     result = session_file_memory.clear_file_memory()
     return JSONResponse(content={
         "message": result

@@ -3,7 +3,7 @@
   "role": "user",
   "content": "你能干嘛？",
   "files": [ "a.png", "b.docx" ],
-  "reasoning_content": "你好，我要介绍自己",
+  "reasoning_content": "我要介绍自己",
   "tool_calls": [ { "functionA": "..." } ],
   "tool_return": "...",
   "done": "[DONE]",

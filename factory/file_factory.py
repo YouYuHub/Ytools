@@ -54,7 +54,7 @@ def _parse_pdf(data: bytes) -> str:
         RuntimeError: 当 PyMuPDF 不可用时抛出
     """
     if not fitz:
-        raise RuntimeError('PyMuPDF not installed or unavailable')
+        raise RuntimeError('(fitz) PyMuPDF not installed or unavailable')
     try:
         # 从字节数据打开 PDF 文档
         doc = fitz.open(stream=data, filetype="pdf")
@@ -299,7 +299,7 @@ def _parse_csv(data: bytes) -> str:
             df = pd.read_csv(bio, dtype=str, engine='python')
         except Exception:
             bio.seek(0)
-            df = pd.read_csv(bio, dtype=str, encoding='utf-8', engine='python', error_bad_lines=False)
+            df = pd.read_csv(bio, dtype=str, encoding='utf-8', engine='python', on_bad_lines='skip')
         texts = []
         for r in df.fillna('').astype(str).values:
             texts.append(' '.join(r.tolist()))

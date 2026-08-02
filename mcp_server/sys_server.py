@@ -8,7 +8,6 @@ from datetime import datetime
 
 # 第三方库
 from mcp.server.fastmcp import FastMCP
-
 # 创建 MCP 服务器实例
 sys_mcp_server = FastMCP("sys-mcp-server")
 
@@ -24,6 +23,7 @@ async def format_current_time() -> str:
         格式化 %Y-%m-%d %H:%M:%S 的时间字符串
     """
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 
 @sys_mcp_server.tool()
@@ -103,7 +103,7 @@ async def list_dir_item(dir_path=None, search_mode='file', file_type=None, depth
 async def create_dir(dir_path: str) -> str:
     r""" 创建目录，不是创建文件
     参数：
-        dir_path: 需要创建的目录，例如D:/test ，注意，路径分割符为 / 不要使用 \ 
+        dir_path: 需要创建的目录，例如D:/test ，注意，路径分割符为 /（反斜杠 \\ 无效）
     返回：
         True 创建成功，如果目录已经存在也返回 True，失败会抛出异常
     """
@@ -139,13 +139,13 @@ async def write_file_lines(full_file_name: str, content: str, start_line: int, e
     '''
     覆盖指定文件的指定行内容
     参数：
-        full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 / 不要使用 \ 
+        full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 /（反斜杠 \\ 无效）
         content: 要写入的内容
         start_line: 开始行位置，从 1 开始
         end_line: 结束行位置(包含这行内容)，从 1 开始
         coding: 文件编码，默认为 utf-8
     返回：
-        成功返回写入文件信息（content标签内容），失败应该会直接抛出异常
+        成功返回写入文件信息（<content>标签中的内容），失败应该会直接抛出异常
     '''
     # 检查路径是否存在且是否为文件
     if not os.path.exists(full_file_name):
@@ -197,7 +197,7 @@ async def write_file_lines(full_file_name: str, content: str, start_line: int, e
 async def get_file_content(full_file_name: str, startline: int = 1, endline: int = -1, coding='utf-8') -> str:
     r""" 获取指定文件的内容
     参数：
-        full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 / 不要使用 \ 
+        full_file_name: 文件的完整路径，例如D:/test/test.txt，注意，路径分割符为 /（反斜杠 \\ 无效）
         startline: 开始行位置，默认为 1，表示从第一行开始
         endline: 结束行位置(包含这行内容)，默认为 -1，表示读取到文件末尾，如果 endline < startline 则返回空字符串
         coding: 文件编码，默认为 utf-8
@@ -224,10 +224,10 @@ async def get_file_content(full_file_name: str, startline: int = 1, endline: int
         return ''.join(lines[startline-1 : endline])
 
 
-@sys_mcp_server.tool()
-def over_task():
-    """ 结束对话，无参数，无返回值 """
-    pass
+# @sys_mcp_server.tool()
+# def over_task():
+#     """ 结束对话，无参数，无返回值 """
+#     pass
 
 
 # 运行服务器
