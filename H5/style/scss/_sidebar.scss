@@ -1,0 +1,391 @@
+// 侧边栏：窄图标栏（折叠态）+ 完整面板（展开态）
+//
+// 嵌套约定：组件内部按 DOM 层级嵌套；.icon-btn 为顶栏/弹窗共用的全局类，
+// 必须保持顶层扁平，不能嵌套进 .panel-head。
+
+.sidebar {
+  flex-shrink: 0;
+  display: flex;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  z-index: 50;
+  transition: background-color 0.2s ease;
+
+  // 折叠态切换窄栏 / 面板显隐
+  &.collapsed {
+    .rail {
+      display: flex;
+    }
+
+    .panel {
+      display: none;
+    }
+  }
+
+  // ---------- 移动端 ----------
+  @media (max-width: 768px) {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    transform: translateX(0);
+    transition: transform 0.25s ease;
+
+    // 抽屉模式：折叠即整体滑出屏幕，面板保持可见
+    &.collapsed {
+      transform: translateX(-100%);
+
+      .rail {
+        display: none;
+      }
+
+      .panel {
+        display: flex;
+      }
+    }
+  }
+
+  // 窄屏（<=445px）：抽屉全屏铺满视口（main 被完全盖住），
+  // 宽度始终 100vw，不设固定最小宽度以免超出右侧边界
+  @media (max-width: 445px) {
+    width: 100vw;
+
+    .panel {
+      width: 100%;
+    }
+  }
+}
+
+// ---------- 窄图标栏 ----------
+.rail {
+  display: none;
+  width: var(--rail-width);
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0;
+  gap: 6px;
+
+  .rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    transition: background-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    .icon {
+      width: 26px;
+      height: 26px;
+    }
+  }
+
+  .rail-logo {
+    font-size: 17px;
+    font-weight: 700;
+    margin-bottom: 10px;
+  }
+
+  .rail-spacer {
+    flex: 1;
+  }
+
+  .rail-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--avatar);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+// ---------- 完整面板 ----------
+.panel {
+  width: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 12px 2px 16px;
+
+    .wordmark {
+      flex: 1;
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+  }
+
+  .side-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 2px 12px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    transition: background-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    .icon {
+      width: 18px;
+      height: 18px;
+    }
+  }
+
+  // 搜索框
+  .search-box {
+    display: none;
+    margin: 0 12px 4px;
+
+    &.show {
+      display: block;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg-elevated);
+      outline: none;
+      font-size: 14px;
+
+      &:focus {
+        border-color: var(--text-tertiary);
+      }
+    }
+  }
+
+  // 会话列表
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 2px 12px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+
+    .session-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-tertiary);
+      padding: 14px 10px 6px;
+    }
+
+    .session-item {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 42px;
+      padding: 0 4px;
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      color: var(--text);
+      text-align: left;
+      position: relative;
+      transition: background-color 0.15s ease;
+
+      &:hover {
+        background: var(--bg-hover);
+      }
+
+      &.active {
+        background: var(--bg-active);
+      }
+
+      // 选中项：默认 --bg-active 在两种主题下都偏淡，这里按主题加深/提亮，并给文字加浅粉色
+      html[data-theme="light"] &.active {
+        background: rgba(0, 0, 0, 0.12);
+        color: #e875a5;
+      }
+
+      html[data-theme="dark"] &.active {
+        background: rgba(255, 255, 255, 0.15);
+        color: #f7a8c4;
+      }
+
+      // 悬停 / 菜单打开时显示三点操作按钮
+      &:hover .session-actions,
+      &.menu-open .session-actions {
+        display: flex;
+      }
+    }
+
+    .session-select {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      flex: 1;
+      align-self: stretch;
+      padding: 9px 6px;
+      text-align: left;
+    }
+
+    .session-edit {
+      display: flex;
+      align-items: center;
+      flex: 1;
+      min-width: 0;
+      align-self: stretch;
+      padding: 4px 6px;
+
+      .session-name-editor {
+        width: 100%;
+        min-width: 0;
+        padding: 5px 7px;
+        border: 1px solid var(--border-strong);
+        border-radius: 6px;
+        outline: none;
+        background: var(--bg-elevated);
+        color: var(--text);
+        font: inherit;
+        font-size: 14px;
+
+        &:focus {
+          border-color: #0b84d8;
+        }
+      }
+    }
+
+    .session-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-actions {
+      display: none;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-tertiary);
+      flex-shrink: 0;
+
+      &:hover {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+
+      .icon {
+        width: 15px;
+        height: 15px;
+      }
+    }
+  }
+
+  // ---------- 底部用户卡片 ----------
+  .panel-foot {
+    border-top: 1px solid var(--border);
+    padding: 6px 12px;
+    position: relative;
+
+    .profile-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: var(--radius-md);
+      text-align: left;
+      transition: background-color 0.15s ease;
+
+      &:hover {
+        background: var(--bg-hover);
+      }
+
+      .avatar {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: var(--avatar);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .profile-info {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        line-height: 1.3;
+        min-width: 0;
+
+        .profile-name {
+          font-size: 14px;
+          font-weight: 500;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .profile-sub {
+          font-size: 12px;
+          color: var(--text-tertiary);
+        }
+      }
+
+      .profile-plan {
+        font-size: 12px;
+        color: var(--text-secondary);
+        border: 1px solid var(--border-strong);
+        border-radius: 999px;
+        padding: 4px 12px;
+        flex-shrink: 0;
+      }
+    }
+
+    // 主题菜单从用户卡片上方弹出
+    .theme-menu {
+      bottom: calc(100% + 6px);
+      left: 12px;
+      right: 12px;
+    }
+  }
+}
+
+// ---------- 全局图标按钮（顶栏 / 各弹窗头部共用，勿嵌套进局部组件） ----------
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: background-color 0.15s ease;
+
+  .icon {
+    width: 26px;
+    height: 26px;
+  }
+
+  &:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+}

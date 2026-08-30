@@ -1,0 +1,201 @@
+// 整体布局：主区 / 顶栏 / 空态居中 / 回到底部悬浮钮
+//
+// 嵌套约定：
+// - 组件内部结构按 DOM 层级嵌套（深度 <=3），状态/伪类用 &
+// - 跨容器状态（.app.empty .*）与全局复用类保持顶层扁平，避免选择器被过度限定
+
+.app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+
+  // ---------- 空态：输入条垂直居中（ChatGPT 首页形态） ----------
+  // （.app.empty .suggest-row 在 _composer、.app.empty .enhance-panel 在 _components）
+  &.empty {
+    .chat-scroll {
+      display: none;
+    }
+
+    .bottom {
+      inset: 0;
+      justify-content: center;
+      padding-bottom: 8vh;
+    }
+
+    .welcome {
+      display: block;
+    }
+
+    .scroll-bottom-btn {
+      display: none;
+    }
+  }
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+
+  // 移动端才显示的汉堡按钮（限定在主区内，避免侧边栏误用）
+  .only-mobile {
+    display: none;
+
+    @media (max-width: 768px) {
+      display: flex;
+    }
+  }
+
+  // ---------- 消息滚动区 ----------
+  .chat-scroll {
+    flex: 1;
+    overflow-y: scroll;
+    scroll-behavior: smooth;
+    min-height: 0;
+    scrollbar-gutter: stable;
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+  }
+
+  .chat-inner {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 64px 24px var(--chat-bottom-padding, 56px);
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+
+    @media (max-width: 768px) {
+      padding: 60px 16px var(--chat-bottom-padding, 48px);
+    }
+  }
+}
+
+// ---------- 顶栏 ----------
+.topbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 10px 16px;
+  pointer-events: none;
+
+  >* {
+    pointer-events: auto;
+  }
+
+  .topbar-spacer {
+    flex: 1;
+  }
+}
+
+// ---------- 顶栏操作（分享 / 加载 / 压缩 菜单） ----------
+// 图标按钮 + 下拉菜单；空态点击按钮直接进入加载（见 app.js）
+.top-actions {
+  position: relative;
+}
+
+.topbar-menu {
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 168px;
+}
+
+// ---------- 会话操作按钮：空态显示"加载 JSONL"图标 ----------
+// 初始空态用 icon-load（更直白），有会话内容时切回 icon-dots
+#sessionActionsBtn {
+  .icon-load {
+    display: none;
+  }
+
+  .app.empty & .icon-dots {
+    display: none;
+  }
+
+  .app.empty & .icon-load {
+    display: block;
+  }
+}
+
+// ---------- 底部区（欢迎语 + 输入条） ----------
+.bottom {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  padding: 0 20px 12px;
+  pointer-events: none;
+
+  >* {
+    pointer-events: auto;
+  }
+
+  @media (max-width: 768px) {
+    padding: 0 8px 10px;
+  }
+}
+
+.welcome {
+  display: none;
+  text-align: center;
+  margin-bottom: 22px;
+
+  .welcome-title {
+    font-size: 26px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+}
+
+// ---------- 回到底部悬浮钮 ----------
+.scroll-bottom-btn {
+  position: absolute;
+  left: 50%;
+  bottom: var(--scroll-bottom-offset, 108px);
+  transform: translateX(-50%);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, bottom 0.15s ease;
+  z-index: 20;
+
+  &.show {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+// ---------- 遮罩 ----------
+.scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 40;
+
+  @media (max-width: 768px) {
+    &.show {
+      display: block;
+    }
+  }
+}

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
 from config import get_current_dir
-from factory import tool_registry
+from factory.agent_runtime import tool_registry
 
 # 实例化APIRouter
 api_tools_manage_router = APIRouter(prefix="/tools")

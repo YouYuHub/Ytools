@@ -42,7 +42,7 @@ def custom_openapi():
         elif isinstance(schema_part, list):
             for item in schema_part:
                 patch_binary_format(item)
-
+                
     patch_binary_format(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
@@ -72,7 +72,22 @@ app.include_router(api_tools_manage_router, tags=["ToolsManage"])
 app.include_router(api_file_router, tags=["FileUpload"])
 
 
+
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app='main:app', host="0.0.0.0", port=48621,
-                reload=True, reload_dirs=[str(PROJECT_ROOT)])
+    uvicorn.run(app='main:app',
+        host="0.0.0.0", port=48621,
+        reload=True, reload_dirs=[str(PROJECT_ROOT)],
+        reload_excludes=[
+            # "mcp_server/*",     # 排除 generated 子目录
+            "mcp_server/**",
+            "test/**",          # 递归排除 test 下所有层级
+            "setting/**",
+            "history_files/**",
+            "docs/**",
+            "H5/**",
+            # "*.pyc",            # 也可按模式排除文件
+            "*.md",
+            "*.txt",
+        ],
+    )

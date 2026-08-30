@@ -1,0 +1,350 @@
+﻿import unittest
+
+from memory.chat_history_format import (
+    format_tool_call_history_line,
+    extract_recent_questions,
+    normalize_context_summary,
+    parse_summary_sections,
+    render_context_summary,
+    render_recent_questions_message,
+    render_summary_block,
+    round_entry_to_compaction_text,
+    round_entry_to_context_messages,
+)
+
+
+class ChatHistoryFormatTests(unittest.TestCase):
+    def test_extract_recent_questions_uses_all_rounds_and_token_budget(self):
+        entries = [
+            {"event": "chat_round", "question": "旧问题"},
+            {"event": "chat_round", "question": "中间问题"},
+            {"event": "chat_round", "events": [{"role": "user", "content": "最新问题"}]},
+        ]
+        questions = extract_recent_questions(entries, token_budget=6)
+        self.assertEqual(questions, ["最新问题"])
+
+    def test_render_recent_questions_allows_question_only_summary_state(self):
+        message = render_recent_questions_message({
+            "recent_questions": ["问题一", "问题二"],
+            "source_round_count": 2,
+        })
+        self.assertIsNotNone(message)
+        self.assertIn("问题一", message["content"])
+        self.assertIn("问题二", message["content"])
+
+    def test_round_entry_to_context_messages_skips_think_and_done(self):
+        round_entry = {
+            "question": "查时间",
+            "events": [
+                {"role": "user", "content": "现在几点？"},
+                {"role": "assistant", "reasoning_content": "调用 run_pipe_command"},
+                {"role": "assistant", "content": "<think>先取时间</think>"},
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "run_pipe_command", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "content": "14:20"},
+                {"role": "assistant", "content": "现在是 14:20"},
+                {"role": "assistant", "content": "现在是 14:20"},
+                {"role": "assistant", "done": "[DONE]"},
+            ],
+        }
+        messages = round_entry_to_context_messages(round_entry)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0], {"role": "user", "content": "现在几点？"})
+        self.assertIn("[调用工具] run_pipe_command({})", messages[1]["content"])
+        self.assertIn("现在是 14:20", messages[1]["content"])
+        # 重复文本应该被去重，不出现两次
+        self.assertEqual(messages[1]["content"].count("现在是 14:20"), 1)
+
+    def test_format_tool_call_history_line_handles_missing_parts(self):
+        self.assertIsNone(format_tool_call_history_line({"function": {}}))
+        self.assertIsNone(format_tool_call_history_line(None))
+        self.assertEqual(
+            format_tool_call_history_line({"function": {"name": "foo"}}),
+            "[调用工具] foo({})",
+        )
+
+    def test_normalize_context_summary_handles_string_and_dict(self):
+        self.assertIsNone(normalize_context_summary(None))
+        self.assertIsNone(normalize_context_summary("   "))
+        self.assertEqual(normalize_context_summary("简短摘要")["summary"], "简短摘要")
+        normalized = normalize_context_summary({
+            "content": "历史摘要",  # 兼容旧字段名
+            "key_facts": ["a", 1, "  ", "b"],
+            "open_items": "一项",
+            "tool_state": [],
+            "source_round_count": "5",
+        })
+        self.assertEqual(normalized["summary"], "历史摘要")
+        self.assertEqual(normalized["key_facts"], ["a", "1", "b"])
+        self.assertEqual(normalized["open_items"], ["一项"])
+        self.assertEqual(normalized["tool_state"], [])
+        self.assertEqual(normalized["source_round_count"], 5)
+
+    def test_render_context_summary_includes_all_sections(self):
+        rendered = render_context_summary({
+            "summary": "核心结论",
+            "key_facts": ["事实1"],
+            "open_items": ["待办1"],
+            "tool_state": ["工具运行了"],
+        })
+        self.assertIn("核心结论", rendered)
+        self.assertIn("- 事实1", rendered)
+        self.assertIn("- 待办1", rendered)
+        self.assertIn("- 工具运行了", rendered)
+
+    def test_normalize_context_summary_supports_blocks(self):
+        normalized = normalize_context_summary({
+            "blocks": [
+                {"summary": "第一段", "key_facts": ["事实A"]},
+                {"content": "第二段", "open_items": ["待办B"]},
+            ],
+            "source_round_count": "7",
+        })
+        self.assertEqual(len(normalized["blocks"]), 2)
+        self.assertEqual(normalized["summary"], "第一段\n\n第二段")
+        self.assertEqual(normalized["key_facts"], ["事实A"])
+        self.assertEqual(normalized["open_items"], ["待办B"])
+        self.assertEqual(normalized["source_round_count"], 7)
+
+    def test_normalize_context_summary_discards_invalid_blocks(self):
+        normalized = normalize_context_summary({
+            "blocks": ["", None, 123, {"summary": "   "}, {"summary": "有效"}],
+        })
+        self.assertEqual(len(normalized["blocks"]), 1)
+        self.assertEqual(normalized["summary"], "有效")
+
+    def test_render_context_summary_renders_multiple_blocks(self):
+        rendered = render_context_summary({
+            "blocks": [
+                {"summary": "第一段摘要"},
+                {"summary": "第二段摘要", "key_facts": ["事实2"]},
+            ],
+            "return_blocks": 1,
+        })
+        self.assertIn("【历史压缩摘要 1】", rendered)
+        self.assertIn("第一段摘要", rendered)
+        self.assertIn("【历史压缩摘要 2】", rendered)
+        self.assertIn("第二段摘要", rendered)
+        self.assertIn("- 事实2", rendered)
+
+    def test_render_context_summary_single_block_keeps_legacy_format(self):
+        rendered = render_context_summary({"summary": "核心"})
+        self.assertTrue(rendered.startswith("【历史压缩摘要】"))
+        self.assertNotIn("【历史压缩摘要 1】", rendered)
+
+    def test_parse_summary_sections_splits_by_headers(self):
+        text = (
+            "任务背景。\n"
+            "【任务目标】\n- 实现远程终端控制\n"
+            "【已完成工作】\n1. NamedPipeServer\n- Packet协议\n"
+            "【关键设计决定】\n- 不用socket\n- 使用Named Pipe\n"
+            "【未解决问题】\n- dispatcher未完成\n"
+            "【重要文件】\n- src/session.cpp：负责PTY生命周期\n"
+        )
+        sections = parse_summary_sections(text)
+        self.assertEqual(sections["summary"], "任务背景。")
+        self.assertEqual(sections["objective"], ["实现远程终端控制"])
+        self.assertEqual(sections["completed"], ["NamedPipeServer", "Packet协议"])
+        self.assertEqual(sections["decisions"], ["不用socket", "使用Named Pipe"])
+        self.assertEqual(sections["open_items"], ["dispatcher未完成"])
+        self.assertEqual(sections["files"], ["src/session.cpp：负责PTY生命周期"])
+
+    def test_parse_summary_sections_plain_text_goes_to_summary(self):
+        sections = parse_summary_sections("任务仍需继续；工具已返回关键结果。")
+        self.assertEqual(sections["summary"], "任务仍需继续；工具已返回关键结果。")
+        self.assertEqual(sections["objective"], [])
+        self.assertEqual(sections["open_items"], [])
+
+    def test_parse_summary_sections_handles_aliases_and_repeated_headers(self):
+        text = (
+            "【当前任务目标】\n- 目标A\n"
+            "【下一步】\n- 待办B\n"
+            "【下一步】\n- 待办C\n"
+        )
+        sections = parse_summary_sections(text)
+        self.assertEqual(sections["summary"], "")
+        self.assertEqual(sections["objective"], ["目标A"])
+        self.assertEqual(sections["open_items"], ["待办B", "待办C"])
+
+    def test_normalize_summary_block_accepts_section_fields(self):
+        normalized = normalize_context_summary({
+            "blocks": [{
+                "summary": "",
+                "objective": ["目标A"],
+                "completed": ["完成B"],
+                "open_items": ["待办C"],
+                "files": ["文件D"],
+            }],
+        })
+        block = normalized["blocks"][0]
+        self.assertEqual(block["objective"], ["目标A"])
+        self.assertEqual(block["completed"], ["完成B"])
+        self.assertEqual(block["open_items"], ["待办C"])
+        self.assertEqual(block["files"], ["文件D"])
+        self.assertEqual(normalized["summary"], "")
+        self.assertEqual(normalized["files"], ["文件D"])
+
+    def test_render_summary_block_renders_section_headers(self):
+        rendered = render_summary_block({
+            "summary": "",
+            "objective": ["目标A"],
+            "completed": ["完成B"],
+            "decisions": ["不用socket用Named Pipe"],
+            "open_items": ["待办C"],
+            "files": ["文件D"],
+        })
+        self.assertIn("【任务目标】", rendered)
+        self.assertIn("- 目标A", rendered)
+        self.assertIn("【已完成工作】", rendered)
+        self.assertIn("- 完成B", rendered)
+        self.assertIn("【关键设计决定】", rendered)
+        self.assertIn("- 不用socket用Named Pipe", rendered)
+        self.assertIn("【未解决问题】", rendered)
+        self.assertIn("- 待办C", rendered)
+        self.assertIn("【重要文件】", rendered)
+        self.assertIn("- 文件D", rendered)
+        self.assertNotIn("【保留事实】", rendered)
+
+    def test_render_summary_block_summary_precedes_sections(self):
+        rendered = render_summary_block({
+            "summary": "正文开头",
+            "objective": ["目标A"],
+        })
+        self.assertLess(rendered.index("正文开头"), rendered.index("【任务目标】"))
+
+    def test_round_entry_to_compaction_text_keeps_tool_result(self):
+        text = round_entry_to_compaction_text({
+            "question": "查磁盘",
+            "events": [
+                {"role": "user", "content": "查磁盘"},
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "disk_info", "arguments": "{}"}}
+                ]},
+                {
+                    "role": "tool",
+                    "tool_name": "disk_info",
+                    "arguments": "{}",
+                    "result": "C 盘剩余 120GB",
+                },
+            ],
+        })
+        self.assertIn("[调用工具] disk_info({})", text)
+        self.assertIn("【工具结果：disk_info】", text)
+        self.assertIn("C 盘剩余 120GB", text)
+
+    def test_round_compression_state_skips_compressed_tool_prefix(self):
+        round_entry = {
+            "question": "分两步查文件",
+            "compress_content": "第一步已经完成：发现目标目录。",
+            "compress_index": 1,
+            "events": [
+                {"role": "user", "content": "分两步查文件"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "function": {"name": "list_dir_item", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "tool_name": "list_dir_item", "result": "旧的超长目录结果"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_2", "function": {"name": "get_file_content", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_2", "tool_name": "get_file_content", "result": "第二步结果"},
+                {"role": "assistant", "content": "任务继续完成。"},
+            ],
+        }
+
+        text_messages = round_entry_to_context_messages(round_entry)
+        self.assertEqual(text_messages[0], {"role": "user", "content": "分两步查文件"})
+        self.assertIn("第一步已经完成", text_messages[1]["content"])
+        self.assertNotIn("list_dir_item({})", text_messages[1]["content"])
+        self.assertIn("get_file_content({})", text_messages[1]["content"])
+        self.assertNotIn("旧的超长目录结果", text_messages[1]["content"])
+
+        tool_messages = round_entry_to_context_messages(round_entry, max_tool_result_length=-1)
+        self.assertEqual(tool_messages[0]["role"], "user")
+        self.assertIn("第一步已经完成", tool_messages[1]["content"])
+        self.assertEqual(tool_messages[2]["tool_calls"][0]["id"], "call_2")
+        self.assertEqual(tool_messages[3]["content"], "第二步结果")
+        self.assertEqual(tool_messages[4]["content"], "任务继续完成。")
+
+        compaction_text = round_entry_to_compaction_text(round_entry)
+        self.assertIn("第一步已经完成", compaction_text)
+        self.assertIn("第二步结果", compaction_text)
+        self.assertNotIn("旧的超长目录结果", compaction_text)
+        self.assertNotIn("list_dir_item({})", compaction_text)
+
+    def _tool_round_entry(self):
+        return {
+            "question": "查时间",
+            "events": [
+                {"role": "user", "content": "现在几点？"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "run_pipe_command", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "tool_name": "run_pipe_command", "result": "14:20"},
+                {"role": "assistant", "content": "现在是 14:20"},
+                {"role": "assistant", "done": "[DONE]"},
+            ],
+        }
+
+    def test_round_entry_to_context_messages_tool_result_full_return(self):
+        """负数表示完整回传工具结果，且符合 Chat Completions 规范（tool 消息带 tool_call_id）。"""
+        messages = round_entry_to_context_messages(self._tool_round_entry(), max_tool_result_length=-1)
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(messages[0], {"role": "user", "content": "现在几点？"})
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["name"], "run_pipe_command")
+        self.assertEqual(messages[2], {"role": "tool", "tool_call_id": "call_1", "content": "14:20"})
+        self.assertEqual(messages[3], {"role": "assistant", "content": "现在是 14:20"})
+
+    def test_round_entry_to_context_messages_tool_result_truncated(self):
+        """正数表示单个工具结果截断到前 N 字符，并保留省略标记。"""
+        round_entry = {
+            "question": "查文件",
+            "events": [
+                {"role": "user", "content": "查文件"},
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "get_file_content", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_name": "get_file_content", "result": "A" * 50},
+            ],
+        }
+        messages = round_entry_to_context_messages(round_entry, max_tool_result_length=10)
+        self.assertEqual(len(messages), 3)
+        tool_message = messages[-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertTrue(tool_message["content"].startswith("A" * 10))
+        self.assertIn("截断", tool_message["content"])
+        self.assertLess(len(tool_message["content"]), 50)
+
+    def test_round_entry_to_context_messages_tool_result_disabled_by_zero(self):
+        """0 表示不回传工具结果，保持默认文本模式（不产生 tool 消息）。"""
+        messages = round_entry_to_context_messages(self._tool_round_entry(), max_tool_result_length=0)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertIn("[调用工具] run_pipe_command({})", messages[1]["content"])
+        self.assertNotIn("tool_calls", messages[1])
+        self.assertTrue(all(message.get("role") != "tool" for message in messages))
+
+    def test_round_entry_to_context_messages_tool_result_missing_call_id_fallback(self):
+        """tool 事件缺少 tool_call_id 时回退挂到最近一次工具调用，不丢失结果。"""
+        round_entry = {
+            "question": "查时间",
+            "events": [
+                {"role": "user", "content": "现在几点？"},
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "run_pipe_command", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "content": "14:20"},
+                {"role": "assistant", "content": "现在是 14:20"},
+                {"role": "assistant", "done": "[DONE]"},
+            ],
+        }
+        messages = round_entry_to_context_messages(round_entry, max_tool_result_length=-1)
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_0")
+        self.assertEqual(messages[2]["tool_call_id"], "call_0")
+        self.assertEqual(messages[2]["content"], "14:20")
+
+
+if __name__ == "__main__":
+    unittest.main()

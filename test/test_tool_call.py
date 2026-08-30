@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from factory import tool_registry
+from factory.agent_runtime import tool_registry
 from config import FunctionDefinition
 
 
@@ -16,10 +16,10 @@ class ToolRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
             ]
 
-        with patch("factory.tool_registry._read_server_ids", return_value=["sysServer"]), \
-             patch("factory.tool_registry._resolve_server_ref", return_value="python mcp_server/sys_server.py"), \
-             patch("factory.tool_registry.get_mcp_tools", side_effect=fake_get_mcp_tools), \
-             patch("factory.tool_registry.load_var", side_effect=lambda k, d=None: {"MCP_DISCOVERY_MAX_CONCURRENCY": "2", "MCP_DISCOVERY_TIMEOUT_SECONDS": "5"}.get(k, d)):
+        with patch("factory.agent_runtime.tool_registry._read_server_ids", return_value=["sysServer"]), \
+               patch("factory.agent_runtime.tool_registry._resolve_server_ref", return_value="python mcp_server/sys_server.py"), \
+               patch("factory.agent_runtime.tool_registry.get_mcp_tools", side_effect=fake_get_mcp_tools), \
+               patch("factory.agent_runtime.tool_registry.load_var", side_effect=lambda k, d=None: {"MCP_DISCOVERY_MAX_CONCURRENCY": "2", "MCP_DISCOVERY_TIMEOUT_SECONDS": "5"}.get(k, d)):
             result = await tool_registry.refresh_tools_from_mcp(".")
 
         self.assertEqual(result["total"], 1)
@@ -34,10 +34,10 @@ class ToolRegistryDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("connect failed")
             return [FunctionDefinition(name="ok_tool", description="", parameters={})]
 
-        with patch("factory.tool_registry._read_server_ids", return_value=["badServer", "sysServer"]), \
-             patch("factory.tool_registry._resolve_server_ref", side_effect=lambda _dir, sid: sid), \
-             patch("factory.tool_registry.get_mcp_tools", side_effect=fake_get_mcp_tools), \
-             patch("factory.tool_registry.load_var", side_effect=lambda k, d=None: {"MCP_DISCOVERY_MAX_CONCURRENCY": "2", "MCP_DISCOVERY_TIMEOUT_SECONDS": "5"}.get(k, d)):
+        with patch("factory.agent_runtime.tool_registry._read_server_ids", return_value=["badServer", "sysServer"]), \
+               patch("factory.agent_runtime.tool_registry._resolve_server_ref", side_effect=lambda _dir, sid: sid), \
+               patch("factory.agent_runtime.tool_registry.get_mcp_tools", side_effect=fake_get_mcp_tools), \
+               patch("factory.agent_runtime.tool_registry.load_var", side_effect=lambda k, d=None: {"MCP_DISCOVERY_MAX_CONCURRENCY": "2", "MCP_DISCOVERY_TIMEOUT_SECONDS": "5"}.get(k, d)):
             result = await tool_registry.refresh_tools_from_mcp(".")
 
         self.assertEqual(result["total"], 1)

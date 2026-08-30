@@ -1,0 +1,114 @@
+﻿import tempfile
+import unittest
+from pathlib import Path
+
+import memory.chat_memory as chat_memory
+from memory.chat_memory import ChatMemoryManager
+
+
+class CompactionEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """压缩事件落盘：SSE 推送与 JSONL 保存同一份 payload，字段一致且不污染统计。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_root = chat_memory.HISTORY_ROOT
+        chat_memory.HISTORY_ROOT = Path(self._tmp)
+        self.session_id = "compaction_event_test"
+        self.manager = ChatMemoryManager(self.session_id)
+
+    def tearDown(self):
+        chat_memory.HISTORY_ROOT = self._orig_root
+
+    async def _add_round(self, question: str):
+        await self.manager.add_chat_history({"role": "user", "content": question})
+        await self.manager.add_chat_history({"role": "assistant", "content": "回答"})
+        await self.manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
+
+    def _load_entries(self):
+        _, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        return entries
+
+    async def test_compaction_events_are_appended_verbatim_with_timestamp(self):
+        payload = {
+            "event": "context_compaction",
+            "scope": "round",
+            "phase": "start",
+            "role": "assistant",
+            "compress_context": "【上下文摘要】\n...",
+        }
+        result = await self.manager.add_context_compaction_event(payload)
+        self.assertEqual(result, "记录成功")
+
+        entries = self._load_entries()
+        self.assertEqual(len(entries), 1)
+        saved = entries[0]
+        for key in ("event", "scope", "phase", "role", "compress_context"):
+            self.assertEqual(saved[key], payload[key])
+        self.assertTrue(saved.get("timestamp"))
+
+    async def test_compaction_events_do_not_pollute_usage_or_question_stats(self):
+        await self._add_round("问题一")
+        await self.manager.add_chat_history({
+            "role": "assistant",
+            "content": "完成",
+            "done": "[DONE]",
+        })
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction",
+            "scope": "session",
+            "phase": "done",
+            "role": "assistant",
+            "summary_usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        })
+
+        meta = await self.manager.get_session_meta()
+        self.assertEqual(meta["user_questions"], ["问题一"])
+        self.assertNotIn("prompt_tokens", meta.get("usage", {}))
+        entries = self._load_entries()
+        self.assertEqual(sum(1 for e in entries if e.get("event") == "chat_round"), 1)
+        self.assertEqual(sum(1 for e in entries if e.get("event") == "context_compaction"), 1)
+
+    async def test_invalid_compaction_event_rejected(self):
+        result = await self.manager.add_context_compaction_event({"role": "assistant", "x": 1})
+        self.assertEqual(result, "忽略非法压缩事件")
+        self.assertEqual(len(self._load_entries()), 0)
+
+    async def test_orphan_compaction_starts_detected_and_aborted(self):
+        """任务中断遗留（有 start 无 done/aborted）的压缩事件被检测并可标记中断。"""
+        await self._add_round("问题一")
+        # session scope：start 后正常 done -> 不算孤儿
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "session", "phase": "start",
+            "role": "assistant", "context_summary": "待压缩",
+        })
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "session", "phase": "done",
+            "role": "assistant", "summary_usage": {"total_tokens": 10},
+        })
+        # round scope：start 无 done -> 孤儿
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "round", "phase": "start",
+            "role": "assistant", "compress_context": "待压缩轨迹",
+        })
+
+        orphans = await self.manager.find_orphan_compaction_events()
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(orphans[0]["scope"], "round")
+        self.assertEqual(orphans[0]["phase"], "start")
+
+        result = await self.manager.mark_compaction_aborted(orphans[0])
+        self.assertEqual(result, "记录成功")
+
+        # 标记后不再有孤儿
+        self.assertEqual(await self.manager.find_orphan_compaction_events(), [])
+        entries = self._load_entries()
+        aborted = [e for e in entries if e.get("phase") == "aborted"]
+        self.assertEqual(len(aborted), 1)
+        self.assertEqual(aborted[0]["scope"], "round")
+        self.assertEqual(aborted[0]["reason"], "task_interrupted")
+
+
+if __name__ == "__main__":
+    unittest.main()

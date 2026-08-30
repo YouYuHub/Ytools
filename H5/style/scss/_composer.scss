@@ -1,0 +1,710 @@
+// 输入区：空态与单行时单行排布（输入框 + 功能条同一行，Gemini 同款形态），
+// 输入框占满“+”与“参数”之间；超过 1 行（.grow）后切换为输入框在上、功能条在下
+//
+// 嵌套约定：@media 就近内嵌且保持在对应基础规则之后（同优先级时靠源序覆盖）；
+// .composer-btn / .boost-btn / .round-btn 为通用按钮组件，保持顶层扁平。
+
+.composer-wrap {
+  // 垂直布局：状态栏 / todo 面板 / 输入框自上而下占位，互不遮挡
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  position: relative;
+
+  // 宽屏（>=1000px）：输入框占父容器可用宽度 85%
+  @media (min-width: 1000px) {
+    width: 85%;
+    max-width: none;
+  }
+}
+
+// 当前会话上下文 token 状态：放在输入框上方，紧贴 composer，避免占用顶栏空间
+.context-token-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+  margin: 0 18px 4px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+
+  // 无会话上下文时只隐藏 token 摘要（工作路径仍常显）
+  &.ctx-hidden {
+    .context-token-summary,
+    .context-token-todo-slot {
+      display: none;
+    }
+  }
+
+  // 左侧占位：预留给 todo 按钮，同时把摘要推向居中
+  .context-token-todo-slot {
+    flex: 1 1 0;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .context-token-summary {
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    cursor: help;
+
+    // 小屏只显示百分比
+    @media (max-width: 420px) {
+      .cts-nums {
+        display: none;
+      }
+    }
+  }
+
+  // 工作路径：固定百分比宽度（不随内容撑开），溢出省略；双击进入编辑
+  .context-token-workdir {
+    flex: 0 1 38%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+    margin-left: auto;
+    cursor: text;
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+
+    @media (max-width: 420px) {
+      flex-basis: 42%;
+    }
+  }
+
+  // 工作路径内联编辑框（JS 动态插入）
+  .context-token-workdir-editor {
+    width: 100%;
+    min-width: 0;
+    padding: 2px 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    outline: none;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: inherit;
+    font-size: 11px;
+    text-align: right;
+
+    &:focus {
+      border-color: #0b84d8;
+    }
+  }
+
+  &.is-warning .context-token-summary {
+    color: #b7791f;
+  }
+
+  &.is-danger .context-token-summary {
+    color: var(--danger);
+  }
+
+  html[data-theme="dark"] &.is-warning .context-token-summary {
+    color: #e5ad58;
+  }
+}
+
+.composer {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  background: var(--bg-composer);
+  border: 1px solid transparent;
+  border-radius: 24px;
+  padding: 6px 8px;
+  margin: 0 8px;
+  transition: background-color 0.2s ease, border-color 0.2s ease,
+    box-shadow 0.2s ease;
+
+  &:hover {
+    border-color: var(--border-strong);
+  }
+
+  &:focus-within {
+    border-color: var(--border-strong);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  }
+
+  // 有待发送媒体附件：附件行经 flex 换行占满输入行上方一整行，
+  // 输入行保持原形态（+ 输入 参数 发送 同行，GPT Web 同款）。
+  // 附件容器 order 为 0，排在带 order 1-5 的输入行元素之前；
+  // 多行输入（.grow）为列布局，附件行同样位于输入框上方
+  &.has-media {
+    flex-wrap: wrap;
+
+    .composer-attachments {
+      flex-basis: 100%;
+    }
+  }
+
+  // 超过 1 行（.grow）：输入框在上占满整行，功能条在其下
+  &.grow {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+
+    .composer-input {
+      width: 100%;
+      // 列布局（主轴=垂直）下 flex:1 的 basis 0% 会覆盖内联 height；
+      // 改回 auto 让 autosize() 设置的行高真正生效
+      flex-basis: auto;
+    }
+
+    .composer-bar {
+      display: flex;
+      width: 100%;
+    }
+  }
+
+  // 输入框：空态/输入第一行都是单行（38px），
+  // 文字换行放不下时才由 autosize() 按行增高（60px、84px…），上限 200px
+  .composer-input {
+    flex: 1;
+    min-width: 0;
+    min-height: 38px;
+    max-height: 200px;
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
+    padding: 1px 0;
+    // text-align: center;
+    font-size: 22px;
+    line-height: 1.5;
+    overflow-y: auto;
+
+    &::placeholder {
+      color: var(--text-tertiary);
+    }
+  }
+
+  // 单行：composer-bar 内容直接作为 .composer 的 flex 子项排布，
+  // 输入框 flex:1 占满“+”与“参数”之间（spacer 不占空间）
+  &:not(.grow) {
+    .composer-bar {
+      display: contents;
+    }
+
+    .composer-input {
+      order: 2;
+    }
+
+    #plusBtn {
+      order: 1;
+    }
+
+    .composer-bar-spacer {
+      order: 3;
+      flex: 0;
+    }
+
+    #boostBtn {
+      order: 4;
+    }
+
+    #micBtn {
+      order: 5;
+    }
+
+    #voiceBtn,
+    #sendBtn,
+    #stopBtn {
+      order: 6;
+    }
+  }
+
+  // 移动端（<=768px）：“+”图标按钮 + “设置”图标 + 语音/发送 round-btn
+  // 麦克风等一律收起；参数按钮整合为纯图标“设置”；
+  // 单行：[+] [输入框] [设置] [语音/发送]；变高后：[+] 左下，[设置] [语音/发送] 右下
+  @media (max-width: 768px) {
+    #micBtn {
+      display: none;
+    }
+
+    // 参数（模型与参数设置）→ 纯图标“设置”，排在语音对话之前（右侧）
+    &:not(.grow) #boostBtn,
+    &.grow #boostBtn {
+      order: 6;
+    }
+
+    #boostBtn {
+      width: 38px;
+      height: 38px;
+      padding: 0;
+      gap: 0;
+      border-radius: 50%;
+      justify-content: center;
+
+      span {
+        display: none;
+      }
+
+      .icon {
+        width: 28px;
+        height: 28px;
+        margin: 0;
+      }
+    }
+
+    // 占位弹性元素排在“设置”之后，把语音/发送推到右侧
+    .composer-bar-spacer {
+      order: 2;
+    }
+
+    // 语音 / 发送 / 停止 保持在功能条右侧（列布局下生效）
+    &.grow #voiceBtn,
+    &.grow #sendBtn,
+    &.grow #stopBtn {
+      order: 6;
+    }
+  }
+
+  // 窄屏（<=445px）：始终上下两行——文本输入在上、功能按钮在下
+  // （不再依赖 .grow 动态切换，布局恒定，输入框占满整行）
+  @media (max-width: 445px) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+
+    // 输入框排在最前（覆盖单行的 order:2，保证列布局下在功能条之上）
+    &:not(.grow) .composer-input,
+    &.grow .composer-input {
+      order: 0;
+      width: 100%;
+      flex-basis: auto;
+    }
+
+    &:not(.grow) .composer-bar,
+    &.grow .composer-bar {
+      display: flex;
+      width: 100%;
+    }
+
+    // “+” 最左，设置/语音/发送右侧
+    &:not(.grow) #plusBtn,
+    &.grow #plusBtn {
+      order: 1;
+    }
+
+    &:not(.grow) .composer-bar-spacer,
+    &.grow .composer-bar-spacer {
+      order: 2;
+      flex: 1;
+    }
+
+    &:not(.grow) #boostBtn,
+    &.grow #boostBtn,
+    &:not(.grow) #voiceBtn,
+    &:not(.grow) #sendBtn,
+    &:not(.grow) #stopBtn {
+      order: 6;
+    }
+  }
+}
+
+// 功能条按钮（列布局 .grow 下）：spacer 弹性占位把其余按钮推到右侧
+// （原文件此处定义重复了两次，重构时已合并为一条）
+.composer-bar-spacer {
+  flex: 1;
+}
+
+.composer-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease;
+
+  .icon {
+    width: 30px;
+    height: 30px;
+  }
+
+  &:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  &.on {
+    color: var(--text);
+    background: var(--bg-active);
+  }
+}
+
+// “增强” 文字钮
+.boost-btn {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 38px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 24px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+
+  .menu-item-label {
+    margin: 0;
+    margin-top: -1px;
+    padding-right: 6px;
+    padding-bottom: 1px;
+  }
+
+  .icon {
+    width: 28px;
+    height: 28px;
+  }
+
+  &:hover {
+    background: var(--bg-active);
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+}
+
+// 右侧主按钮：圆形（语音 / 发送 / 停止）
+.round-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  flex-shrink: 0;
+  transition: opacity 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+
+  .icon {
+    width: 30px;
+    height: 30px;
+  }
+
+  &:hover {
+    opacity: 0.9;
+    transform: scale(1.07);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+  }
+
+  &:active {
+    transform: scale(0.94);
+    box-shadow: none;
+  }
+}
+
+// 浅色主题：语音按钮弱化为灰色（深色主题沿用 --accent 浅色圆钮）
+html:not([data-theme="dark"]) #voiceBtn {
+  background: #e0e0e0;
+  color: #757575;
+}
+
+.stop-square {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+// “+” 弹出菜单
+.plus-menu {
+  bottom: calc(100% + 8px);
+  left: 8px;
+}
+
+// 建议胶囊（空态时显示在输入条下方）
+.suggest-row {
+  display: none;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+
+  .suggest-chip {
+    padding: 8px 16px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: background-color 0.15s ease, color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+  }
+}
+
+// 空态由根节点 .app.empty 控制（跨容器状态，保持扁平前缀）
+.app.empty .suggest-row {
+  display: flex;
+}
+
+// 工具选择 / 已上传文件 标签行
+.tool-chips,
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 4px 0;
+}
+
+.tool-chip,
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
+// 工具标签：on 态表示该工具已在本次会话启用
+.tool-chip.on {
+  color: var(--text);
+  background: var(--bg-active);
+  border-color: var(--text-tertiary);
+}
+
+.file-chip {
+  cursor: default;
+  max-width: 260px;
+
+  .file-chip-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .icon {
+    width: 13px;
+    height: 13px;
+    color: var(--text-tertiary);
+  }
+
+  .file-chip-del {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    color: var(--text-tertiary);
+    cursor: pointer;
+
+    &:hover {
+      color: var(--danger);
+    }
+  }
+}
+
+// 待发送媒体附件预览：粘贴/选择的图片音频视频显示在输入框上方
+// （composer 通过 .has-media 切为列布局，附件行在输入框之上，输入框随之变高）
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 8px 2px;
+}
+
+.media-chip {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: var(--bg-code);
+
+  .media-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  // 音频/视频无预览帧：显示类别占位
+  .media-thumb-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .media-remove {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.8);
+    }
+  }
+}
+
+// 会话内已解析文档（file_memory）与媒体同区展示：横条形 chip
+.doc-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  height: 40px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-code);
+  color: var(--text-secondary);
+  font-size: 12px;
+
+  .icon {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+  }
+
+  .doc-chip-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  // 复用媒体移除按钮，改为垂直居中的小号形态
+  .media-remove {
+    top: 50%;
+    right: 6px;
+    transform: translateY(-50%);
+  }
+}
+
+// ---------- 任务计划（模型自我规划，内置 todo_write 工具） ----------
+// 按钮：放在 context-token-status 左侧预留槽（contextTokenTodoSlot）
+.todo-toggle {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+
+  &.open {
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+}
+
+// 向下展开的计划面板：挂在 composer-wrap（relative）上，
+// left/right 18px 与 context-token-status 的页边距一致 → 宽度对齐；
+// 窄高度（约 4 行）、11px 小字、每步一行省略、整体溢出隐藏
+.todo-panel {
+  // 垂直布局占位：位于状态栏与输入框之间，宽度与状态栏对齐（页边距一致）；
+  // 步骤全部可见（不设高度上限、不裁切），仅保留每行省略
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 18px 6px;
+  padding: 6px 10px;
+  background: var(--bg-composer);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.todo-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+
+  .todo-row-icon {
+    flex: 0 0 auto;
+    width: 12px;
+    text-align: center;
+  }
+
+  .todo-row-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &.todo-done {
+    opacity: 0.55;
+
+    .todo-row-text {
+      text-decoration: line-through;
+    }
+  }
+
+  &.todo-in_progress {
+    color: var(--text);
+  }
+}
+
+// todo 按钮方向指示：收起时朝右，展开时朝下
+.todo-toggle .todo-chevron {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s ease;
+}
+
+.todo-toggle.open .todo-chevron {
+  transform: rotate(0deg);
+}
+
+.todo-toggle:not(.open) .todo-chevron {
+  transform: rotate(-90deg);
+}

@@ -5,7 +5,7 @@ import tempfile
 import json
 from pathlib import Path
 
-from factory.chat_runtime import (
+from factory.agent_runtime.chat_runtime import (
     parse_bool_like,
     parse_int_like,
     frontend_provides_full_history,
@@ -79,11 +79,44 @@ class ChatRuntimeTests(unittest.TestCase):
         manager = ChatMemoryManager("meta_test_session")
         meta = asyncio.run(manager.get_session_meta())
 
-        self.assertEqual(meta["session_id"], "meta_test_session")
+        # 会话标识以文件名为准，_meta 不包含 session_id
+        self.assertNotIn("session_id", meta)
         self.assertIn("created_at", meta)
         self.assertIn("usage", meta)
 
-    def test_context_messages_keep_user_content_and_tool_commands(self):
+    def test_update_session_title_persists_and_keeps_other_fields(self):
+        session_id = f"meta_title_{uuid.uuid4().hex}"
+        manager = ChatMemoryManager(session_id)
+
+        async def _run_case():
+            await manager.clear_chat_history()
+            before = await manager.get_session_meta()
+            created_before = before.get("created_at")
+            await manager.update_session_title("我的自定义会话标题")
+            after = await manager.get_session_meta()
+            # 空标题应报错
+            try:
+                await manager.update_session_title("   ")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("空标题应当抛出 ValueError")
+            return before, after, created_before
+
+        try:
+            before, after, created_before = asyncio.run(_run_case())
+            self.assertEqual(after["title"], "我的自定义会话标题")
+            # 其他字段保持不变（created_at 不被覆盖）
+            self.assertEqual(after["created_at"], created_before)
+            # 会话标识以文件名为准，_meta 不包含 session_id
+            self.assertNotIn("session_id", after)
+            # 再次更新，验证可重复修改
+            self.assertEqual(asyncio.run(manager.update_session_title("标题2"))["title"], "标题2")
+        finally:
+            ChatMemoryManager.delete_chat_session_file(session_id)
+
+    def test_context_messages_use_question_index_without_raw_history(self):
+        """无摘要时按窗口回传最近 N 轮完整对话（最旧超出窗口舍弃）。"""
         session_id = f"ctx_compact_{uuid.uuid4().hex}"
         manager = ChatMemoryManager(session_id)
 
@@ -113,22 +146,24 @@ class ChatRuntimeTests(unittest.TestCase):
             await manager.add_chat_history({"role": "assistant", "content": "现在系统时间是 14:20:00。"})
             await manager.add_chat_history({"role": "assistant", "content": "距离上次查询大约 32 分钟。"})
             await manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
-            return await manager.get_context_messages(max_rounds=6)
+            return await manager.get_context_messages(max_rounds=6, max_tool_result_length=0)
 
         try:
             context_messages = asyncio.run(_run_case())
+            # 无摘要：1 条 user + 1 条 assistant（工具调用参数行并入 assistant 文本）
             self.assertEqual(len(context_messages), 2)
             self.assertEqual(context_messages[0]["role"], "user")
-            self.assertEqual(context_messages[0]["content"], "能告诉我现在系统时间是几点吗？")
+            self.assertIn("能告诉我现在系统时间是几点吗？", context_messages[0]["content"])
             self.assertEqual(context_messages[1]["role"], "assistant")
-            self.assertEqual(
-                context_messages[1]["content"],
-                "我先查一下当前系统时间。\n[调用工具] run_pipe_command({\"command\": \"echo %date% %time%\"})\n现在系统时间是 14:20:00。\n距离上次查询大约 32 分钟。",
-            )
+            self.assertIn("现在系统时间是 14:20:00", context_messages[1]["content"])
+            # 工具结果不回传（max_tool_result_length=0），仅保留调用参数行
+            self.assertIn("[调用工具] run_pipe_command", context_messages[1]["content"])
+            self.assertNotIn("14:20:00.68", context_messages[1]["content"])
         finally:
             ChatMemoryManager.delete_chat_session_file(session_id)
 
     def test_context_messages_include_summary_and_skip_compacted_rounds(self):
+        """摘要模式：摘要 + 已压缩轮次问题保真 + 未压缩轮次完整对话。"""
         session_id = f"ctx_summary_{uuid.uuid4().hex}"
         manager = ChatMemoryManager(session_id)
 
@@ -151,13 +186,69 @@ class ChatRuntimeTests(unittest.TestCase):
 
         try:
             context_messages = asyncio.run(_run_case())
+            # 消息结构：摘要 system + 问题索引 system + 第2轮完整对话（user+assistant）
             self.assertEqual(context_messages[0]["role"], "system")
             self.assertIn("第一轮已完成", context_messages[0]["content"])
-            self.assertEqual(len(context_messages), 3)
-            self.assertEqual(context_messages[1]["role"], "user")
-            self.assertEqual(context_messages[1]["content"], "第二轮问题")
-            self.assertEqual(context_messages[2]["role"], "assistant")
-            self.assertEqual(context_messages[2]["content"], "第二轮回答")
+            self.assertEqual(context_messages[1]["role"], "system")
+            # 问题索引只含已压缩的第 1 轮（第 2 轮以完整对话回传，不重复进索引）
+            self.assertIn("第 1 轮：第一轮问题", context_messages[1]["content"])
+            self.assertNotIn("第二轮问题", context_messages[1]["content"])
+            # 第 2 轮完整对话回传
+            self.assertEqual(context_messages[2]["role"], "user")
+            self.assertIn("第二轮问题", context_messages[2]["content"])
+            self.assertEqual(context_messages[3]["role"], "assistant")
+            self.assertIn("第二轮回答", context_messages[3]["content"])
+            self.assertEqual(len(context_messages), 4)
+        finally:
+            ChatMemoryManager.delete_chat_session_file(session_id)
+
+    def test_single_round_compaction_checkpoint_and_events_persist(self):
+        session_id = f"ctx_round_compression_{uuid.uuid4().hex}"
+        manager = ChatMemoryManager(session_id)
+
+        async def _run_case():
+            await manager.clear_chat_history()
+            await manager.add_chat_history({"role": "user", "content": "分步读取文件"})
+            await manager.add_chat_history({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "list_dir_item", "arguments": "{}"},
+                }],
+            })
+            await manager.add_chat_history({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "tool_name": "list_dir_item",
+                "result": "目录结果",
+            })
+            await manager.update_current_round_compaction("已完成目录扫描。", 1)
+            checkpoint_rows = [
+                json.loads(line)
+                for line in (await manager.get_file_text()).splitlines()
+                if line.strip()
+            ]
+            await manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
+            final_entries = await manager.get_chat_history()
+            return checkpoint_rows, final_entries
+
+        try:
+            checkpoint_rows, final_entries = asyncio.run(_run_case())
+            self.assertIn("_active_round_compaction", checkpoint_rows[0]["_meta"])
+            checkpoint_events = checkpoint_rows[0]["_meta"]["_active_round_compaction"]["events"]
+            self.assertEqual(checkpoint_events[-1]["summary_text"], "已完成目录扫描。")
+            self.assertEqual(checkpoint_events[-1]["compress_index"], 1)
+            self.assertEqual(len(final_entries), 1)
+            self.assertNotIn("compress_content", final_entries[0])
+            self.assertNotIn("compress_index", final_entries[0])
+            final_compaction = next(
+                event for event in final_entries[0]["events"]
+                if event.get("event") == "context_compaction"
+            )
+            self.assertEqual(final_compaction["summary_text"], "已完成目录扫描。")
+            self.assertEqual(final_compaction["compress_index"], 1)
+            self.assertNotIn("_active_round_compaction", (asyncio.run(manager.get_meta())))
         finally:
             ChatMemoryManager.delete_chat_session_file(session_id)
 
@@ -169,7 +260,7 @@ class ChatRuntimeTests(unittest.TestCase):
             temp_path = Path(temp_dir)
             (temp_path / "setting").mkdir(parents=True, exist_ok=True)
             (temp_path / ".env").write_text(
-                "CHAT_OWNERSHIP_NANE=OpenCode Completions\nCHAT_MODEL_NAME=deepseek-v4-pro\n",
+                "CHAT_OWNERSHIP_NANE=OpenCode Completions\nCHAT_MODEL_NAME=Deepseek V4 Pro\n",
                 encoding="utf-8",
             )
             (temp_path / "setting" / "models.json").write_text(
@@ -179,7 +270,7 @@ class ChatRuntimeTests(unittest.TestCase):
                         "apiKey": "test-key",
                         "apiType": "chat-completions",
                         "models": {
-                            "deepseek-v4-pro": {
+                            "Deepseek V4 Pro": {
                                 "id": "deepseek-v4-pro",
                                 "url": "https://example.test/v1",
                                 "toolCalling": True,
@@ -197,7 +288,8 @@ class ChatRuntimeTests(unittest.TestCase):
                 init_path(str(temp_path))
                 default_chat_config = get_default_chat_config()
                 self.assertIsInstance(default_chat_config, dict)
-                self.assertEqual(default_chat_config.get("selected_model_name"), "deepseek-v4-pro")
+                self.assertEqual(default_chat_config.get("selected_model_name"), "Deepseek V4 Pro")
+                self.assertEqual(default_chat_config.get("selected_model_id"), "deepseek-v4-pro")
                 self.assertEqual(default_chat_config.get("url"), "https://example.test/v1")
                 self.assertEqual(default_chat_config.get("apiKey"), "test-key")
                 self.assertEqual(resolve_model_max_input_tokens(default=8192), 123456)

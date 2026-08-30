@@ -1,0 +1,373 @@
+@use "sass:list";
+@use "sass:string";
+
+// ---------- Prism 语法高亮主题 ----------
+// 不用 Prism 官方主题，token 颜色走自身主题变量（浅色/深色各自一套）
+
+:root {
+  // 基线：GitHub 风格（go/rust/bash 等未单独配色的语言使用）
+  --prism-comment: #6e7781;
+  --prism-punctuation: #57606a;
+  --prism-keyword: #cf222e;
+  --prism-directive: #cf222e;
+  --prism-atrule: #cf222e;
+  --prism-string: #0a3069;
+  --prism-attr-value: #0a3069;
+  --prism-number: #0550ae;
+  --prism-boolean: #0550ae;
+  --prism-function: #8250df;
+  --prism-macro: #8250df;
+  --prism-class: #953800;
+  --prism-decorator: #953800;
+  --prism-property: #116329;
+  --prism-tag: #116329;
+  --prism-attr-name: #116329;
+  --prism-selector: #116329;
+  --prism-builtin: #116329;
+  --prism-operator: #cf222e;
+  --prism-diff-add: #116329;
+  --prism-diff-del: #cf222e;
+  --prism-diff-add-bg: rgba(16, 185, 129, 0.09);
+  --prism-diff-del-bg: rgba(224, 46, 42, 0.09);
+  --prism-diff-coord: #57606a;
+}
+
+html[data-theme="dark"] {
+  --prism-comment: #8b949e;
+  --prism-punctuation: #9aa4b0;
+  --prism-keyword: #ff7b72;
+  --prism-directive: #ff7b72;
+  --prism-atrule: #ff7b72;
+  --prism-string: #a5d6ff;
+  --prism-attr-value: #a5d6ff;
+  --prism-number: #79c0ff;
+  --prism-boolean: #79c0ff;
+  --prism-function: #d2a8ff;
+  --prism-macro: #d2a8ff;
+  --prism-class: #ffa657;
+  --prism-decorator: #ffa657;
+  --prism-property: #7ee787;
+  --prism-tag: #7ee787;
+  --prism-attr-name: #7ee787;
+  --prism-selector: #7ee787;
+  --prism-builtin: #7ee787;
+  --prism-operator: #ff7b72;
+  --prism-diff-add: #56d364;
+  --prism-diff-del: #ff7b72;
+  --prism-diff-add-bg: rgba(63, 185, 80, 0.16);
+  --prism-diff-del-bg: rgba(248, 81, 73, 0.16);
+  --prism-diff-coord: #8b949e;
+}
+
+// 基础 token 分组着色（颜色全部走变量，语言调色板只需覆盖变量即可生效）
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: var(--prism-comment);
+}
+
+.token.punctuation,
+.token.double-colon {
+  color: var(--prism-punctuation);
+}
+
+.token.keyword,
+.token.important,
+.token.bold {
+  color: var(--prism-keyword);
+}
+
+.token.directive,
+.token.instruction {
+  color: var(--prism-directive);
+}
+
+.token.atrule {
+  color: var(--prism-atrule);
+}
+
+.token.attr-value {
+  color: var(--prism-attr-value);
+}
+
+.token.string,
+.token.char,
+.token.raw-string,
+.token.scalar,
+.token.inner-value {
+  color: var(--prism-string);
+}
+
+.token.number,
+.token.regex {
+  color: var(--prism-number);
+}
+
+.token.boolean {
+  color: var(--prism-boolean);
+}
+
+.token.function {
+  color: var(--prism-function);
+}
+
+.token.macro {
+  color: var(--prism-macro);
+}
+
+.token.class-name,
+.token.module,
+.token.namespace,
+.token.section,
+.token.generic {
+  color: var(--prism-class);
+}
+
+.token.decorator {
+  color: var(--prism-decorator);
+}
+
+.token.property,
+.token.variable,
+.token.constant,
+.token.symbol,
+.token.builtin-target {
+  color: var(--prism-property);
+}
+
+.token.tag {
+  color: var(--prism-tag);
+}
+
+.token.attr-name {
+  color: var(--prism-attr-name);
+}
+
+.token.selector {
+  color: var(--prism-selector);
+}
+
+.token.builtin {
+  color: var(--prism-builtin);
+}
+
+.token.operator {
+  color: var(--prism-operator);
+}
+
+.token.important,
+.token.bold {
+  font-weight: 600;
+}
+
+.token.italic {
+  font-style: italic;
+}
+
+// ---------- 语言专属调色板 ----------
+// 按编辑器生态配色：
+//   Web/配置文件 → VS Code（Light+ / Dark+）：js/ts/css/html/less/scss/sass/qml/qss/
+//     json/makefile/docker/yaml/ini(env)/gitignore(ignore)/cmake；qss 复用 css 语法
+//   Python / Java  → IntelliJ（Light / Darcula，PyCharm 同源）
+//   C / C++        → Visual Studio（Light / Dark）
+// 选择器同时覆盖普通代码块（code.language-x）与 diff 行内语法
+// （diff-highlight 插件会给行 token 追加 language-<内层> 类）。
+// 未列出的语言（go/rust/bash）使用基线配色。
+
+@mixin language-palette($langs) {
+  $sel: ();
+  @each $l in $langs {
+    $sel: list.append($sel, string.unquote(".codeblock code.language-#{$l}"), comma);
+    $sel: list.append($sel, string.unquote(".token.language-#{$l}"), comma);
+  }
+  #{$sel} {
+    @content;
+  }
+}
+
+// --- VS Code Light+（js / ts / css / html / less / scss / sass / qss / qml / json / cmake / makefile / docker / yaml / ini / ignore） ---
+@include language-palette("javascript" "typescript" "css" "markup" "less" "scss" "sass" "qml" "json" "cmake" "makefile" "docker" "yaml" "ini" "ignore") {
+  --prism-keyword: #0000ff;
+  --prism-atrule: #af00db;
+  --prism-directive: #af00db;
+  --prism-string: #a31515;
+  --prism-attr-value: #a31515;
+  --prism-number: #098658;
+  --prism-boolean: #0000ff;
+  --prism-function: #795e26;
+  --prism-class: #267f99;
+  --prism-property: #001080;
+  --prism-tag: #800000;
+  --prism-attr-name: #ff0000;
+  --prism-selector: #800000;
+  --prism-builtin: #267f99;
+  --prism-comment: #008000;
+  --prism-punctuation: #000000;
+  --prism-operator: #000000;
+}
+
+// --- VS Code Dark+（js / ts / css / html / less / scss / sass / qss / qml / json / cmake / makefile / docker / yaml / ini / ignore） ---
+html[data-theme="dark"] {
+  @include language-palette("javascript" "typescript" "css" "markup" "less" "scss" "sass" "qml" "json" "cmake" "makefile" "docker" "yaml" "ini" "ignore") {
+    --prism-keyword: #569cd6;
+    --prism-atrule: #c586c0;
+    --prism-directive: #c586c0;
+    --prism-string: #ce9178;
+    --prism-attr-value: #ce9178;
+    --prism-number: #b5cea8;
+    --prism-boolean: #569cd6;
+    --prism-function: #dcdcaa;
+    --prism-class: #4ec9b0;
+    --prism-property: #9cdcfe;
+    --prism-tag: #569cd6;
+    --prism-attr-name: #9cdcfe;
+    --prism-selector: #d7ba7d;
+    --prism-builtin: #4ec9b0;
+    --prism-comment: #6a9955;
+    --prism-punctuation: #d4d4d4;
+    --prism-operator: #d4d4d4;
+  }
+}
+
+// --- IntelliJ Light（java，PyCharm 同源） ---
+@include language-palette("java") {
+  --prism-keyword: #0033b3;
+  --prism-string: #067d17;
+  --prism-attr-value: #067d17;
+  --prism-number: #1750eb;
+  --prism-boolean: #0033b3;
+  --prism-function: #00627a;
+  --prism-class: #000000;
+  --prism-decorator: #a50a5b;
+  --prism-property: #000000;
+  --prism-builtin: #0033b3;
+  --prism-comment: #8c8c8c;
+  --prism-punctuation: #000000;
+  --prism-operator: #000000;
+}
+
+// --- Python（IntelliJ 基础上微调：字符串 VSCode 黄橙色、类型绿色） ---
+@include language-palette("python") {
+  --prism-keyword: #0033b3;
+  --prism-string: #a31515;
+  --prism-attr-value: #a31515;
+  --prism-number: #1750eb;
+  --prism-boolean: #0033b3;
+  --prism-function: #00627a;
+  --prism-class: #067d17;
+  --prism-decorator: #a50a5b;
+  --prism-property: #000000;
+  --prism-builtin: #0033b3;
+  --prism-comment: #8c8c8c;
+  --prism-punctuation: #000000;
+  --prism-operator: #000000;
+}
+
+// --- IntelliJ Darcula（java） ---
+html[data-theme="dark"] {
+  @include language-palette("java") {
+    --prism-keyword: #cc7832;
+    --prism-string: #6a8759;
+    --prism-attr-value: #6a8759;
+    --prism-number: #6897bb;
+    --prism-boolean: #cc7832;
+    --prism-function: #ffc66d;
+    --prism-class: #ffc66d;
+    --prism-decorator: #a8c023;
+    --prism-property: #a9b7c6;
+    --prism-builtin: #ffc66d;
+    --prism-comment: #808080;
+    --prism-punctuation: #a9b7c6;
+    --prism-operator: #a9b7c6;
+  }
+}
+
+// --- Python Darcula 微调（字符串 VSCode 黄橙色、类型 VSCode 绿色） ---
+html[data-theme="dark"] {
+  @include language-palette("python") {
+    --prism-keyword: #cc7832;
+    --prism-string: #ce9178;
+    --prism-attr-value: #ce9178;
+    --prism-number: #6897bb;
+    --prism-boolean: #cc7832;
+    --prism-function: #ffc66d;
+    --prism-class: #4ec9b0;
+    --prism-decorator: #a8c023;
+    --prism-property: #a9b7c6;
+    --prism-builtin: #ffc66d;
+    --prism-comment: #808080;
+    --prism-punctuation: #a9b7c6;
+    --prism-operator: #a9b7c6;
+  }
+}
+
+// --- Visual Studio Light（c / cpp / csharp） ---
+@include language-palette("c" "cpp" "csharp") {
+  --prism-keyword: #0000ff;
+  --prism-directive: #0000ff;
+  --prism-string: #a31515;
+  --prism-attr-value: #a31515;
+  --prism-number: #098658;
+  --prism-boolean: #0000ff;
+  --prism-function: #795e26;
+  --prism-macro: #800080;
+  --prism-class: #2b91af;
+  --prism-property: #001080;
+  --prism-comment: #008000;
+  --prism-punctuation: #000000;
+  --prism-operator: #000000;
+}
+
+// --- Visual Studio Dark（c / cpp / csharp） ---
+html[data-theme="dark"] {
+  @include language-palette("c" "cpp" "csharp") {
+    --prism-keyword: #569cd6;
+    --prism-directive: #569cd6;
+    --prism-string: #ce9178;
+    --prism-attr-value: #ce9178;
+    --prism-number: #b5cea8;
+    --prism-boolean: #569cd6;
+    --prism-function: #dcdcaa;
+    --prism-macro: #bd63c5;
+    --prism-class: #4ec9b0;
+    --prism-property: #9cdcfe;
+    --prism-comment: #6a9955;
+    --prism-punctuation: #d4d4d4;
+    --prism-operator: #d4d4d4;
+  }
+}
+
+// ---------- diff 高亮 ----------
+// Prism diff 组件：coord(+++/---/@@) + deleted/inserted/unchanged 行级 token；
+// diff-highlight 插件：行内再做内层语法高亮（外层 span 带 .language-<内层> 类）。
+.token.coord {
+  color: var(--prism-diff-coord);
+}
+
+// 新增行：整行浅绿底 + 前缀绿色（diff 行色固定，不随语言调色板变化）
+.token.inserted-sign,
+.token.inserted-arrow {
+  background: var(--prism-diff-add-bg);
+}
+
+.token.inserted,
+.token.inserted-sign {
+  color: var(--prism-diff-add);
+}
+
+// 删除行：整行浅红底 + 前缀红色
+.token.deleted-sign,
+.token.deleted-arrow {
+  background: var(--prism-diff-del-bg);
+}
+
+.token.deleted,
+.token.deleted-sign {
+  color: var(--prism-diff-del);
+}
+
+// 前缀字符（+ / -）不可选中
+.token.prefix {
+  user-select: none;
+}

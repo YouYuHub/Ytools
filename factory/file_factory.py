@@ -1,4 +1,7 @@
-"""具体解析器实现：支持 pdf, docx, doc, csv, xls, xlsx, txt, md"""
+"""具体解析器实现：支持 pdf, docx, doc, csv, xls, xlsx, txt, md
+依赖：
+pip install
+"""
 import os
 import io
 import subprocess

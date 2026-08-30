@@ -4,27 +4,39 @@
 """
 # 标准库
 import os
-from datetime import datetime
+import sys
+from pathlib import Path
+# from datetime import datetime
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # 第三方库
-from mcp.server.fastmcp import FastMCP
+try:
+    # mcp 2.x：FastMCP 更名为 MCPServer（API 兼容，平替改名）
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:
+    # mcp 1.x：旧的 fastmcp 模块
+    from mcp.server.fastmcp import FastMCP
+# 共享时间戳格式（全仓库统一，避免硬编码格式串）
+from util.timestamp_utils import format_timestamp
 # 创建 MCP 服务器实例
 sys_mcp_server = FastMCP("sys-mcp-server")
 
-# 自定义模块
 
-
-# 工具定义
+# 工具定义，mcp 服务是一个工具类服务，独立项目主要逻辑外，所以这里硬编码
 @sys_mcp_server.tool()
 async def format_current_time() -> str:
     """ 格式化当前时间
     无参数
     返回：
         格式化 %Y-%m-%d %H:%M:%S 的时间字符串
+        格式化的当前时间字符串
     """
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
+    # return datetime.strftime(format="%Y-%m-%d %H:%M:%S")
+    return format_timestamp()
+    
 
 @sys_mcp_server.tool()
 async def list_dir_item(dir_path=None, search_mode='file', file_type=None, depth: int = 0) -> list[dict]:
@@ -152,17 +164,14 @@ async def write_file_lines(full_file_name: str, content: str, start_line: int, e
         raise FileNotFoundError(f"{full_file_name} 不存在")
     if not os.path.isfile(full_file_name):
         raise FileNotFoundError(f"{full_file_name} 不是一个文件")
-    
     # 校验参数
     if start_line < 1:
         raise ValueError(f"start_line 必须大于等于 1，当前值为 {start_line}")
     if end_line < start_line:
         raise ValueError(f"end_line 必须大于等于 start_line，当前 start_line={start_line}, end_line={end_line}")
-    
     # 读取原文件内容
     with open(full_file_name, 'r', encoding=coding) as file:
         lines = file.readlines()
-    
     # 将 content 按换行符分割成多行
     new_lines = content.splitlines(keepends=True)
     # 如果 content 不以换行符结尾，添加换行符
@@ -171,25 +180,20 @@ async def write_file_lines(full_file_name: str, content: str, start_line: int, e
             new_lines[-1] = new_lines[-1] + '\n'
         else:
             new_lines = [content + '\n']
-    
     # 计算需要替换的行范围（转换为 0-based 索引）
     start_idx = start_line - 1
     end_idx = min(end_line - 1, len(lines) - 1)  # 确保不超过文件总行数
-    
     # 如果 start_idx 超出文件行数，扩展文件
     if start_idx >= len(lines):
         # 在末尾添加空行直到 start_idx
         lines.extend(['\n'] * (start_idx - len(lines) + 1))
         end_idx = start_idx
-    
     # 替换指定区间的行：删除原区间的行，插入新行
     # 这样会改变文件总行数，但保证了区间外的内容不受影响
     lines[start_idx:end_idx+1] = new_lines
-    
     # 写回文件
     with open(full_file_name, 'w', encoding=coding) as file:
         file.writelines(lines)
-    
     return f"<content>{content}</content> 已写入文件 {full_file_name} 的第 {start_line} 到 {end_line} 行"
 
 

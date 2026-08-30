@@ -92,46 +92,52 @@ class ChatLLM:
                 with suppress(asyncio.CancelledError):
                     await task
 
-    @staticmethod
-    def should_include_reasoning_effort(model_name: str) -> bool:
-        """
-        判断是否应该在请求中包含 reasoning_effort 参数
-        该参数仅适用于 OpenAI o系列、GPT-5系列和部分DeepSeek模型
-        参数:
-            model_name: 模型名称
-        返回:
-            True 如果应该包含 reasoning_effort 参数，否则 False
-        """
-        if not model_name:
-            return False
-        model_lower = model_name.lower()
-        # GPT-5系列（所有以 gpt-5 开头的模型都支持）
-        if model_lower.startswith("gpt-5"):
-            return True
-        # o系列（所有以 o 开头的模型都支持，如 o1, o3, o4-mini 等）
-        if model_lower.startswith("gpt-o"):
-            return True
-        # DeepSeek 支持 reasoning_effort 的模型
-        deepseek_reasoning_models = set((
-            "deepseek-v4-flash",
-            "deepseek-v4-pro",
-            # "deepseek-coder".0
-        ))
-        # if any(dm in model_lower for dm in deepseek_reasoning_models):
-        if model_lower in deepseek_reasoning_models:
-            return True
-        # # 开源 GPT-OSS 模型
-        # if "gpt-oss" in model_lower:
-        #     return True
-        return False
+    # @staticmethod
+    # def should_include_reasoning_effort(model_name: str) -> bool:
+    #     """
+    #     判断是否应该在请求中包含 reasoning_effort 参数
+    #     该参数仅适用于 OpenAI o系列、GPT-5系列和部分DeepSeek模型
+    #     参数:
+    #         model_name: 模型名称
+    #     返回:
+    #         True 如果应该包含 reasoning_effort 参数，否则 False
+    #     """
+    #     if not model_name:
+    #         return False
+    #     model_lower = model_name.lower()
+    #     # GPT-5系列（所有以 gpt-5 开头的模型都支持）
+    #     if model_lower.startswith("gpt-5"):
+    #         return True
+    #     # o系列（所有以 o 开头的模型都支持，如 o1, o3, o4-mini 等）
+    #     if model_lower.startswith("gpt-o"):
+    #         return True
+    #     # DeepSeek 支持 reasoning_effort 的模型
+    #     deepseek_reasoning_models = set((
+    #         "deepseek-v4-flash",
+    #         "deepseek-v4-pro",
+    #         # "deepseek-coder".0
+    #     ))
+    #     # if any(dm in model_lower for dm in deepseek_reasoning_models):
+    #     if model_lower in deepseek_reasoning_models:
+    #         return True
+    #     # # 开源 GPT-OSS 模型
+    #     # if "gpt-oss" in model_lower:
+    #     #     return True
+    #     return False
 
     @staticmethod
-    def _resolve_active_chat_config() -> dict[str, Any]:
-        if require_default_chat_config is None:
-            raise ChatModelConfigurationError("无法加载当前聊天模型配置")
-        chat_config = require_default_chat_config()
+    def _resolve_chat_config(model_config: Optional[Dict[str, Any]] = None) -> dict[str, Any]:
+        """校验当前或调用方指定的 Chat Completions 模型配置。"""
+        if model_config is None:
+            if require_default_chat_config is None:
+                raise ChatModelConfigurationError("无法加载当前聊天模型配置")
+            chat_config = require_default_chat_config()
+        elif isinstance(model_config, dict):
+            chat_config = model_config
+        else:
+            raise ChatModelConfigurationError("指定的聊天模型配置必须是字典")
         api_url = chat_config.get("url")
-        model_name = chat_config.get("selected_model_name")
+        model_name = chat_config.get("selected_model_id") or chat_config.get("selected_model_name")
         print(f"[INFO] model: {model_name}")
         api_type = str(chat_config.get("apiType") or "chat-completions").strip().casefold()
         if not isinstance(api_url, str) or not api_url.strip():
@@ -148,13 +154,18 @@ class ChatLLM:
         return chat_config
 
     @staticmethod
+    def _resolve_active_chat_config() -> dict[str, Any]:
+        """解析 .env 当前选中的聊天模型。"""
+        return ChatLLM._resolve_chat_config()
+
+    @staticmethod
     def confirm_completions_url(api_url: str) -> str:
         base = api_url.rstrip('/')
         if base.endswith('/chat/completions'):
             return base
-        if base.endswith('/v1'):
-            return f"{base}/chat/completions"
-        return f"{base}/v1/chat/completions"
+        # if base.endswith('/v1'):
+        #     return f"{base}/chat/completions"
+        return f"{base}/chat/completions"
 
     @staticmethod
     def _serialize_messages(messages: Optional[List[Any]]) -> List[Dict[str, Any]]:
@@ -192,8 +203,9 @@ class ChatLLM:
             "top_p": request.top_p,
             "presence_penalty": request.presence_penalty,
         }
-        if request.reasoning_effort and ChatLLM.should_include_reasoning_effort(model_name):
-            payload["reasoning_effort"] = request.reasoning_effort
+        # if request.reasoning_effort and ChatLLM.should_include_reasoning_effort(model_name):
+        #     payload["reasoning_effort"] = request.reasoning_effort
+        payload["reasoning_effort"] = request.reasoning_effort
         if request.tools is not None:
             serialized_tools: List[Dict[str, Any]] = []
             for tool in request.tools:
@@ -204,10 +216,10 @@ class ChatLLM:
                 else:
                     serialized_tools.append(tool)
             payload["tools"] = serialized_tools
-        if request.tool_choice is not None:
-            payload["tool_choice"] = request.tool_choice
-        if request.parallel_tool_calls is not None:
-            payload["parallel_tool_calls"] = request.parallel_tool_calls
+            if request.tool_choice is not None:
+                payload["tool_choice"] = request.tool_choice
+            if request.parallel_tool_calls is not None:
+                payload["parallel_tool_calls"] = request.parallel_tool_calls
         if request.extra_body:
             reserved_keys = {"model", "messages", "stream", "tools", "tool_choice", "parallel_tool_calls"}
             payload.update({
@@ -336,8 +348,72 @@ class ChatLLM:
             yield buffer
 
     @staticmethod
+    def _read_full_response_body(f, is_chunked: bool) -> bytes:
+        """同步读取完整 HTTP 响应体，支持 chunked 传输编码。
+
+        非流式 LLM 响应对大 body 普遍使用 Transfer-Encoding: chunked；
+        直接 f.read() 会拿到 `<hex-size>\\r\\n<data>\\r\\n...0\\r\\n\\r\\n`
+        的原始分块格式，导致 json.loads 报
+        'Expecting value: line 1 column 1 (char 0)'。
+        """
+        if not is_chunked:
+            return f.read()
+        buffer = b""
+        while True:
+            size_line = f.readline()
+            if not size_line:
+                break
+            try:
+                size = int(size_line.strip().split(b";")[0] or b"0", 16)
+            except ValueError:
+                break
+            if size == 0:
+                break  # 最后一个 chunk，忽略 trailers
+            data = f.read(size)
+            if not data:
+                break
+            f.read(2)  # chunk 数据末尾的 CRLF
+            buffer += data
+        return buffer
+
+    @staticmethod
+    async def _aread_full_response_body(
+        reader,
+        is_chunked: bool,
+        timeout_read: float,
+        stop_checker: Optional[Any] = None,
+    ) -> bytes:
+        """异步读取完整 HTTP 响应体，支持 chunked 传输编码（见同步版说明）。"""
+        if not is_chunked:
+            return await ChatLLM._wait_with_stop(reader.read(), timeout_read, stop_checker)
+        buffer = b""
+        while True:
+            size_line = await ChatLLM._wait_with_stop(
+                reader.readline(), timeout_read, stop_checker
+            )
+            if not size_line:
+                break
+            try:
+                size = int(size_line.strip().split(b";")[0] or b"0", 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            data = await ChatLLM._wait_with_stop(
+                reader.readexactly(size), timeout_read, stop_checker
+            )
+            if not data:
+                break
+            await ChatLLM._wait_with_stop(
+                reader.readexactly(2), timeout_read, stop_checker
+            )  # chunk 数据末尾的 CRLF
+            buffer += data
+        return buffer
+
+    @staticmethod
     def std_completions_sse(
         request: ChatLLMRequest = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> Generator[str, None, None]:
         """标准库的 SSE 协议，不依赖 openai 库
         使用给定的对话历史进行聊天，返回 SSE 格式的流式数据
@@ -361,13 +437,13 @@ class ChatLLM:
         retry_count = 0
         while True:
             try:
-                chat_config = ChatLLM._resolve_active_chat_config()
+                chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
                 api_key = chat_config.get("apiKey") or "not-needed"
                 payload = ChatLLM._build_request_payload(
                     request,
                     stream=True,
-                    model_name=chat_config["selected_model_name"],
+                    model_name=chat_config["selected_model_id"],
                 )
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
@@ -423,7 +499,7 @@ class ChatLLM:
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
                     if "200" not in status_str and "201" not in status_str:
                         last_step = "read_error_body"
-                        error_body = f.read()
+                        error_body = ChatLLM._read_full_response_body(f, is_chunked)
                         error_text = error_body.decode("utf-8", errors="replace")
                         yield f"data: {json.dumps({'error': f'HTTP Error: {status_str}: {error_text}'}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
@@ -505,6 +581,7 @@ class ChatLLM:
     async def async_std_completions_sse(
         request: ChatLLMRequest = None,
         stop_checker: Optional[Any] = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         """标准库 SSE 协议异步版本，不依赖 aiohttp/openai 库
         使用给定的对话历史进行聊天，返回 SSE 格式的流式数据
@@ -531,13 +608,13 @@ class ChatLLM:
                 yield "data: [DONE]\n\n"
                 return
             try:
-                chat_config = ChatLLM._resolve_active_chat_config()
+                chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
                 api_key = chat_config.get("apiKey") or "not-needed"
                 payload = ChatLLM._build_request_payload(
                     request,
                     stream=True,
-                    model_name=chat_config["selected_model_name"],
+                    model_name=chat_config["selected_model_id"],
                 )
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
@@ -593,7 +670,9 @@ class ChatLLM:
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
                     if "200" not in status_str and "201" not in status_str:
                         last_step = "read_error_body"
-                        error_body = await ChatLLM._wait_with_stop(reader.read(), timeout_read, stop_checker)
+                        error_body = await ChatLLM._aread_full_response_body(
+                            reader, is_chunked, timeout_read, stop_checker
+                        )
                         error_text = error_body.decode("utf-8", errors="replace")
                         yield f"data: {json.dumps({'error': f'HTTP Error: {status_str}: {error_text}'}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
@@ -680,6 +759,7 @@ class ChatLLM:
         request: ChatLLMRequest = None,
         stream: Optional[bool] = None,
         stop_checker: Optional[Any] = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> Union[AsyncGenerator[str, Any], dict[str, Any]]:
         """统一聊天入口，支持流式和非流式响应。
 
@@ -702,16 +782,17 @@ class ChatLLM:
                 async for chunk in ChatLLM.async_std_completions_sse(
                     request=request,
                     stop_checker=stop_checker,
+                    model_config=model_config,
                 ):
                     yield chunk
             return _stream_generator()
-        chat_config = ChatLLM._resolve_active_chat_config()
+        chat_config = ChatLLM._resolve_chat_config(model_config)
         url = ChatLLM.confirm_completions_url(chat_config["url"])
         api_key = chat_config.get("apiKey") or "not-needed"
         payload = ChatLLM._build_request_payload(
             request,
             stream=False,
-            model_name=chat_config["selected_model_name"],
+            model_name=chat_config["selected_model_id"],
         )
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
@@ -759,12 +840,20 @@ class ChatLLM:
                 if ":" in header_str:
                     h_key, h_val = header_str.split(":", 1)
                     resp_headers[h_key.strip().lower()] = h_val.strip()
+            is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
             if "200" not in status_str and "201" not in status_str:
-                error_body = f.read()
+                error_body = ChatLLM._read_full_response_body(f, is_chunked)
                 raise RuntimeError(f"HTTP Error: {status_str}: {error_body.decode('utf-8', errors='replace')}")
-            response_body = f.read()
+            response_body = ChatLLM._read_full_response_body(f, is_chunked)
             response_text = response_body.decode("utf-8", errors="replace")
-            response_json = json.loads(response_text) if response_text else {}
+            try:
+                response_json = json.loads(response_text) if response_text else {}
+            except json.JSONDecodeError as exc:
+                # 带上下文抛出，便于诊断网关返回非 JSON（HTML 错误页/空体/分块未解码等）
+                raise RuntimeError(
+                    f"压缩/非流式响应不是有效 JSON（{status_str}）：{exc}；"
+                    f"body 前 300 字符：{response_text[:300]!r}"
+                ) from exc
             choices = response_json.get("choices", [])
             if not choices:
                 return {

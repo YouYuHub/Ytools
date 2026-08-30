@@ -13,6 +13,17 @@ from env_manager import load_var       # 环境变量加载
 # 程序的根目录，通常用于相对路径的计算
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# 兼容旧版原始历史上下文与统计的默认轮数；摘要-only 模式下已完成轮次不再按轮回传。
+# 历史压缩设置中的 keep_rounds 仍保留为兼容配置，避免旧客户端字段失效。
+DEFAULT_CONTEXT_HISTORY_ROUNDS = 20         # 默认的上下文历史轮数
+DEFAULT_HISTORY_TRIGGER_RATIO = 0.8         # 历史压缩触发比例
+DEFAULT_HISTORY_CHUNK_ROUNDS = 3            # 历史压缩每次处理的轮数
+DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
+DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模型上下文的系数
+DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务
+DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符
+DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
+
 
 
 class Message(BaseModel):
@@ -41,7 +52,7 @@ class ToolDefinition(BaseModel):
 class ChatLLMRequest(BaseModel):
     """用户信息"""
     messages: List[Message]                     # 输入的消息列表，每个消息包含一个角色 role 和内容 content，用于表示对话的上下文。
-    max_tokens: int = 8192                      # 指定生成的最大 token 数量，默认为 32768（官方推荐值），复杂任务可设置 81920
+    max_tokens: int = 8192                      # 指定生成的最大 token 数量
     temperature: float = 0.7                    # 用于控制生成文本的随机性，默认为 1.0。较高的温度会使生成的文本更加随机，而较低的温度则会使文本更加确定。
     top_p: float = 1.0                          # 用于控制生成文本的多样性，默认为 1.0。这个参数是核采样（nucleus sampling）的一部分，用于过滤掉概率低于阈值的 token。
     stream: bool = False                        # 是否使用流式响应
@@ -59,17 +70,76 @@ class ChatLLMRequest(BaseModel):
     tools: Optional[List[ToolDefinition]] = Field(default=None, exclude=True)  # 服务端内部字段：由后端按 tool_names 生成真实工具定义
     session_id: str = "default"                 # 会话ID，用于隔离不同会话的记忆（工具和文件历史）
     use_backend_history: Optional[bool] = None   # 是否启用后端会话历史拼接（None 表示走服务端默认）
-    backend_history_rounds: Optional[int] = None # 后端拼接最近多少轮历史（None 表示走服务端默认）
-
-
-class HistoryCompactionConfig(BaseModel):
-    keep_rounds: int = Field(..., ge=1, description="保留最近的原始轮数")
-    trigger_ratio: float = Field(..., gt=0, le=1, description="触发历史压缩的上下文占比")
+    backend_history_rounds: Optional[int] = None # 兼容参数；摘要-only 模式不限制已完成历史回传
 
 
 class ChatModelSelection(BaseModel):
-    provider: str = Field(..., min_length=1, description="顶层 provider 名称（对应 .env 中的 CHAT_OWNERSHIP_NANE）")
-    model: str = Field(..., min_length=1, description="模型 id（对应 .env 中的 CHAT_MODEL_NAME）")
+    provider: str = Field(..., min_length=1, description="顶层 provider 名称")
+    model: str = Field(..., min_length=1, description="模型命名（models.json 中 models 字段的键名）")
+    role: str = Field(
+        "chat_model",
+        description="模型角色：chat_model（聊天）/ compaction_model（压缩）/ title_model（标题），默认 chat_model",
+    )
+    parameter: Optional[dict[str, Any]] = Field(
+        None,
+        description="该模型的默认生成参数（如 temperature/max_tokens/top_p 等），全量替换语义；不传表示保持现有配置",
+    )
+
+
+class HistoryCompactionConfig(BaseModel):
+    """上下文压缩策略的完整配置请求。"""
+
+    keep_rounds: int = Field(
+        DEFAULT_CONTEXT_HISTORY_ROUNDS,
+        ge=0,
+        le=200,
+        description="模型上下文保留的总轮次窗口：未压缩轮次完整对话占窗口，"
+                    "已压缩轮次问题按剩余窗口保真；0 表示无限轮次（仅按阈值压缩）",
+    )
+    trigger_ratio: float = Field(
+        DEFAULT_HISTORY_TRIGGER_RATIO,
+        gt=0,
+        le=0.95,
+        description="历史压缩触发比例；未使用强制摘要模式的调用按该比例判断（最大 0.95）",
+    )
+    summary_budget_ratio: float = Field(
+        DEFAULT_SUMMARY_BUDGET_RATIO,
+        gt=0,
+        le=0.5,
+        description="累计摘要总预算 = 聊天模型窗口 × 该比例（最大 0.5）",
+    )
+    oversized_reject_factor: Optional[float] = Field(
+        DEFAULT_OVERSIZED_REJECT_FACTOR,
+        ge=0,
+        le=10,
+        description="单次工具结果超过 min(聊天窗口,压缩窗口)×该系数时拒绝写入模型上下文并让模型重新考虑；0 关闭，None 表示保持当前 .env 配置",
+    )
+    max_oversized_rejections: Optional[int] = Field(
+        DEFAULT_MAX_OVERSIZED_REJECTIONS,
+        ge=1,
+        description="连续超长拒绝达到该次数时终止当前任务；None 表示保持当前 .env 配置",
+    )
+class ContextReturnConfig(BaseModel):
+    """思考过程与历史工具结果的最大回传长度配置。"""
+
+    reasoning_max_length: int = Field(
+        DEFAULT_REASONING_RETURN_MAX_LENGTH,
+        description="思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符",
+    )
+    tool_result_max_length: int = Field(
+        DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+        description="历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符",
+    )
+
+
+class McpToolSelection(BaseModel):
+    """MCP 工具选择配置请求：服务名 -> 工具名数组。"""
+
+    inputs: dict[str, list[Any]] = Field(
+        default_factory=dict,
+        description="工具选择映射：键为 mcp_servers.json 中配置的服务名，值为该服务下选中的工具名数组；"
+                    "非法条目（非字符串/空串/重复）由服务端规整时丢弃",
+    )
 
 
 

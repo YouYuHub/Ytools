@@ -28,6 +28,36 @@ class ChatRoundStoreTests(unittest.TestCase):
         store = ChatRoundStore("demo")
         self.assertIsNone(store.finalize_round("done"))
 
+    def test_compaction_state_is_saved_on_final_round(self):
+        store = ChatRoundStore("demo")
+        store.record_message({"role": "user", "content": "查文件"})
+        store.record_message({
+            "role": "assistant",
+            "tool_calls": [{"id": "call_1", "function": {"name": "list_dir_item", "arguments": "{}"}}],
+        })
+        store.record_message({"role": "tool", "tool_call_id": "call_1", "content": "结果"})
+
+        self.assertEqual(store.current_tool_result_count(), 1)
+        self.assertTrue(store.update_compaction(
+            "已完成目录扫描。",
+            1,
+            compress_usage={"prompt_tokens": 2, "total_tokens": 2},
+        ))
+
+        completed = store.record_message({"role": "assistant", "done": "[DONE]"})
+        self.assertNotIn("compress_content", completed)
+        self.assertNotIn("compress_index", completed)
+        self.assertNotIn("compress_usage", completed)
+        compaction = next(
+            event for event in completed["events"]
+            if event.get("event") == "context_compaction"
+        )
+        self.assertEqual(compaction["event"], "context_compaction")
+        self.assertEqual(compaction["summary_text"], "已完成目录扫描。")
+        self.assertEqual(compaction["compress_index"], 1)
+        self.assertEqual(compaction["compress_usage"]["total_tokens"], 2)
+        self.assertEqual(completed["usage_total"]["total_tokens"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

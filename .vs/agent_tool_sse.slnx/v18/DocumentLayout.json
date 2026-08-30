@@ -5,6 +5,50 @@
     {
       "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\main.py||{8B382828-6202-11D1-8870-0000F87579D2}",
       "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:main.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\routers\\file_router.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:routers\\file_router.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\chat_momory_template.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:docs\\chat_momory_template.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\project_structure.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:project_structure.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\compact.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:docs\\compact.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\mcp_server\\sys_server.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:mcp_server\\sys_server.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\factory\\chat_factory.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:factory\\chat_factory.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\tmp_repro.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:tmp_repro.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\requirements.txt||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:requirements.txt||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\mcp_servers.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:setting\\mcp_servers.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\models.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:setting\\models.json||{90A6B3A7-C1A3-4009-A288-E2FF89E96FA0}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\chat\\chat_llm.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:chat\\chat_llm.py||{8B382828-6202-11D1-8870-0000F87579D2}"
     }
   ],
   "DocumentGroupContainers": [
@@ -14,7 +58,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 7,
+          "SelectedChildIndex": 14,
           "Children": [
             {
               "$type": "Bookmark",
@@ -45,6 +89,79 @@
               "Name": "ST:0:0:{aa2115a1-9712-457b-9047-dbb71ca2cde3}"
             },
             {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{c93a910a-0fa6-4307-93a4-f2bd61ec7828}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{aa2115a1-9712-457b-9047-dbb71ca2cdd2}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 4,
+              "Title": "compact.md",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\compact.md",
+              "RelativeDocumentMoniker": "docs\\compact.md",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\compact.md",
+              "RelativeToolTip": "docs\\compact.md",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAHEBAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-08-30T06:05:46.095Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "chat_momory_template.json",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\chat_momory_template.json",
+              "RelativeDocumentMoniker": "docs\\chat_momory_template.json",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\docs\\chat_momory_template.json",
+              "RelativeToolTip": "docs\\chat_momory_template.json",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001642|",
+              "WhenOpened": "2026-08-30T06:05:24.272Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 3,
+              "Title": "project_structure.md",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\project_structure.md",
+              "RelativeDocumentMoniker": "project_structure.md",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\project_structure.md",
+              "RelativeToolTip": "project_structure.md",
+              "ViewState": "AgIAAOoAAAAAAAAAAAAAAOMAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-08-29T06:56:35.128Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "file_router.py",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\routers\\file_router.py",
+              "RelativeDocumentMoniker": "routers\\file_router.py",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\routers\\file_router.py",
+              "RelativeToolTip": "routers\\file_router.py",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABUAAAABAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-29T10:47:50.671Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 5,
+              "Title": "sys_server.py",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\mcp_server\\sys_server.py",
+              "RelativeDocumentMoniker": "mcp_server\\sys_server.py",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\mcp_server\\sys_server.py",
+              "RelativeToolTip": "mcp_server\\sys_server.py",
+              "ViewState": "AgIAABIAAAAAAAAAAAAAAA0AAAAAAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-29T10:00:56.83Z",
+              "EditorCaption": ""
+            },
+            {
               "$type": "Document",
               "DocumentIndex": 0,
               "Title": "main.py",
@@ -52,9 +169,87 @@
               "RelativeDocumentMoniker": "main.py",
               "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\main.py",
               "RelativeToolTip": "main.py",
-              "ViewState": "AgIAADYAAAAAAAAAAAAAAEgAAAAAAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.002457|",
-              "WhenOpened": "2026-08-02T10:59:23.286Z",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAACIAAAAEAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-28T15:02:27.956Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 6,
+              "Title": "chat_factory.py",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\factory\\chat_factory.py",
+              "RelativeDocumentMoniker": "factory\\chat_factory.py",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\factory\\chat_factory.py",
+              "RelativeToolTip": "factory\\chat_factory.py",
+              "ViewState": "AgIAABIAAAAAAAAAAAAAALQDAAAwAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-30T05:16:20.267Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 10,
+              "Title": "models.json",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\models.json",
+              "RelativeDocumentMoniker": "setting\\models.json",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\models.json",
+              "RelativeToolTip": "setting\\models.json",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABEAAAAHAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001642|",
+              "WhenOpened": "2026-08-29T10:02:07.478Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 8,
+              "Title": "requirements.txt",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\requirements.txt",
+              "RelativeDocumentMoniker": "requirements.txt",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\requirements.txt",
+              "RelativeToolTip": "requirements.txt",
+              "ViewState": "AgIAAA8AAAAAAAAAAAAAAA8AAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.003109|",
+              "WhenOpened": "2026-08-29T09:03:49.099Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 7,
+              "Title": "tmp_repro.py",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\tmp_repro.py",
+              "RelativeDocumentMoniker": "tmp_repro.py",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\tmp_repro.py",
+              "RelativeToolTip": "tmp_repro.py",
+              "ViewState": "AgIAAEMAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-29T11:08:55.721Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 9,
+              "Title": "mcp_servers.json",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\mcp_servers.json",
+              "RelativeDocumentMoniker": "setting\\mcp_servers.json",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\setting\\mcp_servers.json",
+              "RelativeToolTip": "setting\\mcp_servers.json",
+              "ViewState": "AgIAAAkAAAAAAAAAAAAAABAAAAAEAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001642|",
+              "WhenOpened": "2026-08-28T15:34:28.679Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 11,
+              "Title": "chat_llm.py",
+              "DocumentMoniker": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\chat\\chat_llm.py",
+              "RelativeDocumentMoniker": "chat\\chat_llm.py",
+              "ToolTip": "C:\\Users\\Administrator\\Desktop\\python\u5B66\u4E60\u5F55\\main_study\\large_model\\agent_tool_sse\\chat\\chat_llm.py",
+              "RelativeToolTip": "chat\\chat_llm.py",
+              "ViewState": "AgIAAJkDAAAAAAAAAIAywKMDAAAEAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARXSURBVFhHxZdfiFR1FMc/v3vnzzqrbbvmuqWJCsk2BjW5ML0kK4TkQyEE6dMyCBeqhyR72S2I6KGIejEfhx56kLKMooxArZTMXCIXpBalpJqUTSfN3dm9d6fZ3\u002B/0cOfOztz50xW1vnC4vznn/s75/s45v3MZ\u002BD8hImHVfw4VVgRwHOdG2F0EhvP5/M9hQxgdCezduzes/lfs3r2bdDo9OTk52ROFhBVW3AyMjIykM5nMZeCY4zhrwvZ63BICALlcLlMl8aXjOKvD9gCxsKIVxsfHw6oGDA0NYdt2WE0ul8sAExMTE8ccxxnO5/MXwu9EysDQ0FBHaRU8QC6Xy6TT6RngWNjGrWrCdsjn803xmhQB6glcTwk8zwubARgdHW1JoC0cxxHXdcV1XSmVSh0leM91XfE8ryb1\u002BnZzJVIP2LbdUWKxGIlEkiuecO6Sx\u002BnCDGf/mKM4p0kkEh17pG1KopZgcHCQ05eE/Sd/4a9ZD6M1Rmu0XsBozfLuBGNPbOL898fZsWNHU7wmRYB6AlrrsLmGxJIUT\u002B47wa7N67k87fL\u002ByfNNJFJxi/3PPcKKvt6meDdcgmm3QqWygK3AUmCMwRhdFX89485TkRgisjTsOxKB8fHxtmKMYIzmrc9/4N2vf6qdflEMRmuqHdg0\u002BJpSEqBdCSzLwo7F\u002BXFqlqulMkYMc/MVRAxiBBHDqXNTnDp7EV0jscChl7ayMjXlh0ys/R37jj1KqYORCARQSlEWmxc\u002BOMNvxVLNeX2g1mvNkZfvp08fqDqKQ98eTWzFpusqQbFY5MPvLlCoBa9KqObNa42imkXRsFCC0mEbeCoSgWDmr1q1iolfrzQ4NsavcWvxbalknGWJa2AqoMtgyuCdAdgciUDQ8ZZlUfhztua4pdSdXIymp7uLN3c9SMz9yg9syj6JcgGkMhipB4JBNDw8zLbXj2C0rtbXv\u002BcP3dPPs1u7WL6kFPICSesazJ4AXfIzYCog1efad6Jdw6AEIkJ3wmo48YaB23ht\u002ByXuUu\u002BRnP\u002BsTg6RdD\u002BCmcOwML2Y\u002BiADugLWkmgEghKICOv7lzbUf1tmJco71bhBdDVIXdBa4Oo6uQ5U7FwkAsEtKBQKDN97Z0MGelIGgjEDjY0WDlqvW7YF4JNIBLLZLNlsloGBAR59YDXbMmuwlT8BCf5biOkcOPit/4buLPQ\u002BPgfsi9SE9bAsi3g8jmVVueurUHxlscFMBeJroOs\u002Bn5Ro/9m7Hezap2ASeEYpdTxSBuphjKFcLuN5HvPz876ydrrqab1JuLIfrh6Ea59C8W0wJYC1QJdSaqNS6jhRP0btICL\u002BWA3XNyDS/zTc/QaYCiIWwJRSqlzvo2MJwrpWGBsbY133xzD77eL9rpViNcR6QVl4/a8eSKVSO8P72xKIChHZCOYoM0cHmP4CvLP\u002BvVdx6NoAPVuoLH3MjSeSDyulTof33xSIyO0i8ryIfCMiJfFREpGTIvKiiCwP7wnwD7tNXzLGHmUXAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-08-29T06:42:59.033Z",
               "EditorCaption": ""
             }
           ]

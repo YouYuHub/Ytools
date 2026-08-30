@@ -1,11 +1,237 @@
 {
-  "timestamp": "%Y-%m-%d %H:%M:%S",
-  "role": "user",
-  "content": "你能干嘛？",
-  "files": [ "a.png", "b.docx" ],
-  "reasoning_content": "我要介绍自己",
-  "tool_calls": [ { "functionA": "..." } ],
-  "tool_return": "...",
-  "done": "[DONE]",
-  "error": "..."
+  "_说明": "history_files/<session_id>_chat.jsonl 的落盘格式模板（每行一个 JSON 对象，UTF-8）。第 1 行固定为 {\"_meta\": {...}}；第 2 行起为 chat_round 轮次条目与 session 级 context_compaction 事件行。'...' 表示长字符串占位。媒体文件二进制保存在 history_files/upload/<upload_id>/media/ 下，消息里仅存 media://<stored_name> 引用；上传的可解析文档原始字节在 history_files/upload/<upload_id>/files/ 下。任务进行中另有检查点侧车 <session_id>_chat.jsonl.pending（内容为单个 chat_round 快照），轮次收尾后删除。",
+  "第1行_meta": {
+    "_meta": {
+      "title": "...",
+      "user_questions": ["...", "..."],
+      "todo": [
+        { "content": "...", "status": "pending | in_progress | done" }
+      ],
+      "usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "prompt_tokens_details": { "cached_tokens": 0 },
+        "completion_tokens_details": { "reasoning_tokens": 0 },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0
+      },
+      "created_at": "YYYY-MM-DD HH:MM:SS",
+      "updated_at": "YYYY-MM-DD HH:MM:SS",
+      "record_count": 0,
+      "completion_count": 0,
+      "upload_id": "...",
+      "context_summary": null,
+      "compress_usage": {},
+      "_history_compress_usage": {}
+    }
+  },
+  "_meta字段备注": {
+    "title": "会话标题；默认取第一个用户问题前 40 字符，可由前端改名",
+    "user_questions": "从全部 chat_round 提取的原始用户问题列表（跳过'停止任务'），每次重算 meta 时重建",
+    "todo": "todo_write 工具写入的当前任务计划，跨轮注入系统提示",
+    "usage": "全部 chat_round.usage_total 的累计值",
+    "upload_id": "本会话上传目录名（history_files/upload/ 下），删除会话时连带清理",
+    "context_summary": "null 或跨轮累计摘要状态，结构见下方 context_summary模板",
+    "compress_usage": "全部压缩模型调用的 usage 累计（含 compression_count 与 last 两个字段）",
+    "_history_compress_usage": "跨轮历史压缩单独的 usage 累计（已并入 compress_usage，用于区分统计口径）",
+    "_active_round_compaction": "临时字段：任务进行中单轮压缩的检查点 {question, events, started_at}，轮次收尾/新轮次开始时清除",
+    "_pending_round_checkpoint": "旧版检查点字段（已迁移到 .pending 侧车文件），加载时兼容清理"
+  },
+  "context_summary模板": {
+    "summary": "...",
+    "objective": ["【任务目标】段落条目"],
+    "completed": ["【已完成工作】段落条目"],
+    "decisions": ["【关键设计决定】段落条目"],
+    "open_items": ["【未解决问题】段落条目"],
+    "files": ["【重要文件】段落条目"],
+    "key_facts": ["【保留事实】段落条目"],
+    "tool_state": ["【工具状态】段落条目"],
+    "blocks": [
+      {
+        "summary": "...",
+        "objective": ["..."],
+        "completed": ["..."],
+        "decisions": ["..."],
+        "open_items": ["..."],
+        "files": ["..."],
+        "key_facts": ["..."],
+        "tool_state": ["..."],
+        "round_start": 1,
+        "round_end": 0
+      }
+    ],
+    "return_blocks": 1,
+    "source_round_count": 0,
+    "recent_questions": ["..."],
+    "recent_question_numbers": [1],
+    "recent_questions_scope": "all_history"
+  },
+  "chat_round条目": {
+    "event": "chat_round",
+    "question": "...",
+    "started_at": "YYYY-MM-DD HH:MM:SS",
+    "events": [
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "user",
+        "content": "..."
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "..." },
+          { "type": "image_url", "image_url": { "url": "media://clipboard-....png" } },
+          { "type": "input_audio", "input_audio": { "data": "media://....wav", "format": "wav" } },
+          { "type": "video_url", "video_url": { "url": "media://....mp4" } }
+        ]
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "assistant",
+        "content": "...",
+        "reasoning_content": "...",
+        "tool_calls": [
+          {
+            "id": "call_...",
+            "type": "function",
+            "function": { "name": "...", "arguments": "{...}" }
+          }
+        ]
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "tool",
+        "tool_call_id": "call_...",
+        "tool_name": "...",
+        "arguments": "{...}",
+        "result": "..."
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "tool",
+        "tool_call_id": "call_...",
+        "tool_name": "...",
+        "arguments": "{...}",
+        "result": "...超大结果反馈文案...",
+        "result_preview": "...头尾节选...",
+        "oversized": true,
+        "oversized_estimated_tokens": 0
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "assistant",
+        "content": "..."
+      },
+      {
+        "event": "context_compaction",
+        "scope": "round",
+        "phase": "start",
+        "role": "assistant",
+        "compress_context": "...",
+        "timestamp": "YYYY-MM-DD HH:MM:SS"
+      },
+      {
+        "event": "context_compaction",
+        "scope": "round",
+        "phase": "done",
+        "role": "assistant",
+        "before_tokens": 0,
+        "after_tokens": 0,
+        "compress_index": 0,
+        "block_count": 1,
+        "summary_text": "...",
+        "compress_usage": {
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "before_tokens": 0,
+          "after_tokens": 0,
+          "fallback": false,
+          "block_count": 1,
+          "cumulative": true
+        },
+        "timestamp": "YYYY-MM-DD HH:MM:SS"
+      },
+      {
+        "event": "context_compaction",
+        "scope": "round",
+        "phase": "aborted",
+        "role": "assistant",
+        "reason": "task_interrupted",
+        "timestamp": "YYYY-MM-DD HH:MM:SS"
+      },
+      { "timestamp": "YYYY-MM-DD HH:MM:SS", "role": "user", "content": "停止任务" },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "assistant",
+        "done": "[DONE]"
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "assistant",
+        "error": "..."
+      }
+    ],
+    "completion_count": 0,
+    "usage_total": {
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "prompt_tokens_details": { "cached_tokens": 0 },
+      "completion_tokens_details": { "reasoning_tokens": 0 },
+      "prompt_cache_hit_tokens": 0,
+      "prompt_cache_miss_tokens": 0
+    },
+    "status": "running | done | error | stopped | interrupted",
+    "ended_at": "YYYY-MM-DD HH:MM:SS"
+  },
+  "_chat_round字段备注": {
+    "question": "本轮原始用户问题（多模态消息取纯文本部件，不含媒体占位符；'停止任务'不作为问题）",
+    "events": "时间顺序事件流；role=user 的第一条非'停止任务'消息即问题；assistant 的 done/error 为收尾标记；role=tool 的数量是单轮压缩游标的计数基准",
+    "content(media://)": "消息落盘时媒体保持 media:// 引用不膨胀；仅发送上游前解析为 data URL / base64",
+    "context_compaction(round)": "单轮工具轨迹压缩事件，写入本轮 events；delta 增量帧仅实时 SSE 推送、不落盘",
+    "compress_index": "已纳入摘要的工具结果数量（按 role=tool 计数，不是 events 下标）；历史重建时跳过游标之前的工具轨迹",
+    "status(interrupted)": "进程重启后由 .pending 检查点恢复的未收尾轮次",
+    "旧版兼容字段": "导入/旧记录可能带顶层 compress_content / compress_index / compress_blocks / compress_usage，加载时兼容读取；新格式只写 events"
+  },
+  "session级压缩事件行": [
+    {
+      "event": "context_compaction",
+      "scope": "session",
+      "phase": "start",
+      "role": "assistant",
+      "context_summary": "...",
+      "timestamp": "YYYY-MM-DD HH:MM:SS"
+    },
+    {
+      "event": "context_compaction",
+      "scope": "session",
+      "phase": "done",
+      "role": "assistant",
+      "summary_text": "...",
+      "summary_usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "compressed_rounds": 0,
+        "fallback": false,
+        "cumulative": true
+      },
+      "timestamp": "YYYY-MM-DD HH:MM:SS"
+    }
+  ],
+  "_session事件备注": "session 级压缩事件独立成行（不挂在 chat_round 下）；scope=round 的 aborted 事件同样可能独立成行。phase=delta 仅 SSE 实时推送、不落盘。",
+  "检查点侧车文件": {
+    "_文件名": "<session_id>_chat.jsonl.pending（单对象，非 JSONL）",
+    "event": "chat_round",
+    "question": "...",
+    "started_at": "YYYY-MM-DD HH:MM:SS",
+    "events": ["...收尾前已积累的全部事件..."],
+    "completion_count": 0,
+    "usage_total": {},
+    "status": "running",
+    "ended_at": null
+  }
 }

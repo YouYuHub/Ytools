@@ -1,50 +1,79 @@
 # 标准库导入
 # import re
 import asyncio
+import copy
 import json
 import uuid
-from functools import partial
+from collections import deque
 # import inspect
 from typing import Any, Dict, List, AsyncGenerator
 
 # 自定义模块导入
 from env_manager import ChatModelConfigurationError, load_var, require_default_chat_config
 from chat.chat_llm import ChatLLM
-from config import ChatLLMRequest, get_current_dir
+from config import (
+    ChatLLMRequest,
+    DEFAULT_CONTEXT_HISTORY_ROUNDS,
+    DEFAULT_REASONING_RETURN_MAX_LENGTH,
+    DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+    get_current_dir,
+)
 from memory.chat_memory import get_chat_memory_manager, cleanup_chat_memory_manager
-from memory.file_memory import get_file_memory_manager, cleanup_file_memory_manager
-from factory.tool_executor import normalize_tool_calls, prepare_tool_execution, execute_tool_round
-from factory.chat_runtime import (
+from memory.file_memory import (
+    cleanup_file_memory_manager,
+    get_file_memory_manager,
+    resolve_message_media_refs,
+)
+from memory.chat_history_format import content_part_to_text
+from factory.agent_runtime import tool_registry
+from factory.agent_runtime.builtin_tools import (
+    TODO_TOOL_NAME,
+    execute_builtin_tool,
+    inject_builtin_tools,
+    is_builtin_tool,
+    normalize_todo_items,
+)
+from factory.agent_runtime.chat_runtime import (
     parse_bool_like,
     parse_int_like,
+    parse_return_length,
     frontend_provides_full_history,
     build_request_messages,
-    UsageAccumulator,
+    estimate_message_tokens,
     estimate_messages_tokens,
+    estimate_request_context_tokens,
     estimate_text_tokens,
+    estimate_tool_definition_tokens,
     resolve_model_max_input_tokens,
+    UsageAccumulator,
 )
-from factory import tool_registry
+from factory.agent_runtime.context_compaction import (
+    ContextCompactionError,
+    _find_current_round_start,
+    build_oversized_tool_feedback,
+    compact_active_round_context_if_needed,
+    compact_session_history_if_needed,
+    load_context_compaction_settings,
+    make_oversized_result_preview,
+    resolve_oversized_result_token_threshold,
+    resolve_context_compaction_threshold,
+    resolve_summary_total_budget,
+)
+from factory.agent_runtime.tool_executor import (
+    execute_tool_round,
+    normalize_tool_calls,
+    prepare_tool_execution,
+)
 
 
-BUILTIN_CHECK_TOOL_EXISTS_NAME = "check_tool_exists"
-BUILTIN_CHECK_TOOL_EXISTS_DEF = {
-    "type": "function",
-    "function": {
-        "name": BUILTIN_CHECK_TOOL_EXISTS_NAME,
-        "description": "检查指定工具是否在后端实时可用工具中存在",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tool_name": {
-                    "type": "string",
-                    "description": "要检查的工具名称"
-                }
-            },
-            "required": ["tool_name"]
-        }
-    }
-}
+# P1 首调用预算检查：文件记忆超窗降级为摘要时的最大字符数
+# （与 memory/file_memory.py 的 get_file_memory_text 摘要语义一致）
+_FIRST_CALL_FILE_MEMORY_MAX_CHARS = 3000
+
+# 记录当前后台运行的会话生成任务（session_id -> _SessionStream）
+# 前端刷新/断开 SSE 连接时，后台任务不会被取消，事件持续写入缓冲与 JSONL
+_SESSION_STREAMS: dict[str, "_SessionStream"] = {}
+_SESSION_STREAM_MAX_BUFFER = 4000  # 有界环形缓冲：防止长时间无消费时内存膨胀
 
 
 def _format_tool_result(result: Any) -> str:
@@ -73,17 +102,60 @@ def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
             _merge_usage_values(child, value)
 
 
-# "注意：目前工具函数仅支持单个使用，不支持并发批量使用；所以请一次最多使用一个工具。"
+# 思考过程（reasoning_content）回传长度：0=不回传，负数=全部回传，正数=保留末尾 N 字符
+def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MAX_LENGTH) -> int:
+    return parse_return_length(load_var("REASONING_RETURN_MAX_LENGTH", default), default)
+
+
+def build_runtime_system_text() -> str:
+    """构造运行时系统提示附加文本（工作路径 + 系统提示）。
+
+    与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
+    token 统计接口用它单独估算系统提示词开销。
+    """
+    return (
+        f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
+        + _build_sys_prompt()
+    )
+
+
 # 当前工作路径为<{_format_tool_result(get_current_dir())}>
-SYS_PROMPT = """
-    本轮工具集合由用户选择并由系统注入，你只能调用当前可见工具（如果用户提供了）；禁止臆造、改名或扩展工具。
-    程序支持并发工具调用，但并发结果完成顺序不保证；工具返回 [] 表示空值而不是失败。
-    历史记录只保留工具调用参数，不保留工具结果全文。
-    如果任务已完成，直接给最终答复；如果无需调用工具即可完成，也可直接结束本轮。
-    注意：本轮你的思考过程（reasoning_content）只会保留最后 1024 字节的内容，请确保关键决策信息在最后 1k 内。
-"""
+# 本轮工具集合由用户选择并由系统注入，你只能调用当前可见工具（如果用户提供了）；禁止臆造、改名或扩展工具。
+# 如果任务已完成，直接给最终答复。
+def _build_sys_prompt() -> str:
+    """构建系统提示词。
+
+    思考过程/历史工具结果的回传长度提示只在配置为正数（截断回传）时出现：
+    截断会改变模型看到的内容，必须明确告知边界；全量回传与不回传时不提示。
+    """
+    reasoning_limit = _load_reasoning_return_max_length()
+    tool_result_limit = parse_return_length(
+        load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
+        DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+    )
+    notes = [
+        "工具由用户选择提供，你只能使用当前可见工具（如果用户提供了）；之前用过的工具不可见则不能使用。",
+    ]
+    if tool_result_limit > 0:
+        # 与 chat_history_format._truncate_tool_result_text 的"前 N 字符"语义一致
+        notes.append(
+            f"历史轮次中每个工具结果只回传最前面 {tool_result_limit} 字符（超出部分省略）；重要工具结果会由上下文摘要保留。"
+        )
+    elif tool_result_limit == 0:
+        notes.append("后端常规历史上下文只保留工具调用参数；重要工具结果会由上下文摘要保留。")
+    # tool_result_limit < 0：工具结果完整回传，无需提示
+    if reasoning_limit > 0:
+        # 与上方 full_reasoning[-reasoning_limit:] 的"末尾 N 字符"语义一致
+        notes.append(f"你的思考过程（reasoning_content）只会保留最后 {reasoning_limit} 字符。")
+    # reasoning_limit <= 0：完整回传或不回传，无需提示
+    numbered_notes = "\n".join(f"{index}、{note}" for index, note in enumerate(notes, start=1))
+    return (
+        "当前系统已安装基础 py 环境。\n"
+        "程序支持并发工具调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
+        "注意：\n"
+        f"{numbered_notes}\n"
+    )
 # 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
-# "不管是否调用工具，当你最终回答用户时都需要调用 over_task，因为你只能通过该方式结束当前任务或会话，否则消息可能会越来越长"
 
 
 async def load_all_tools() -> None:
@@ -229,16 +301,6 @@ def _sse_error_payload(message: str) -> str:
     return f"data: {json.dumps({'error': message}, ensure_ascii=False)}\n\n"
 
 
-def _serialize_tool_definition(tool_def: Any) -> dict:
-    if hasattr(tool_def, "model_dump"):
-        return tool_def.model_dump(exclude_none=True)
-    if hasattr(tool_def, "dict"):
-        return tool_def.dict(exclude_none=True)
-    if isinstance(tool_def, dict):
-        return tool_def
-    return {}
-
-
 def _tool_name_from_definition(tool_def: dict) -> str:
     if not isinstance(tool_def, dict):
         return ""
@@ -249,188 +311,210 @@ def _tool_name_from_definition(tool_def: dict) -> str:
     return name if isinstance(name, str) else ""
 
 
-# 历史摘要与轮次格式化已迁移到 memory.chat_history_format
-from memory.chat_history_format import (
-    format_tool_call_history_line as _format_tool_call_history_line,
-    render_context_summary as _render_summary_state,
-    round_entry_to_context_messages as _round_entry_to_context_messages,
-)
 
+class _SessionStream:
+    """一次后台 Agent 生成任务的环形事件缓冲 + 订阅管理。
 
-# 摘要渲染已迁移到 memory.chat_history_format._render_summary_state
-# 保留下面这段兼容占位，避免外部引用旧名字时漏改
+    - 生成循环独立任务运行：页面刷新不再中止生成；
+    - 后到的消费者回放"当前轮"起的事件（含 reconnect 标记）；
+    - emit 为非阻塞追加（有界 deque），消费端断线不影响生产端。
+    """
 
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.task: asyncio.Task | None = None
+        self.buffer = deque(maxlen=_SESSION_STREAM_MAX_BUFFER)
+        self.seq = 0              # 已放入缓冲的事件总条数
+        self.round_start_seq = 0  # 当前生成轮次的第一条事件序号（重连回放起点）
+        self.done = False
+        self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
+        self.cond = asyncio.Condition()
 
-def _estimate_round_entry_tokens(round_entry: dict[str, Any]) -> int:
-    return estimate_messages_tokens(_round_entry_to_context_messages(round_entry))
+    def emit(self, chunk: str) -> None:
+        if not isinstance(chunk, str):
+            return
+        self.buffer.append(chunk)
+        self.seq += 1
 
-
-def _round_entry_to_summary_text(round_entry: dict[str, Any]) -> str:
-    lines: list[str] = []
-    question = round_entry.get("question")
-    if isinstance(question, str) and question.strip():
-        lines.append(f"用户问题: {question.strip()}")
-    for message in _round_entry_to_context_messages(round_entry):
-        role = message.get("role", "")
-        content = message.get("content", "")
-        if isinstance(content, str) and content.strip():
-            lines.append(f"{role}: {content.strip()}")
-    return "\n".join(lines)
-
-
-async def _summarize_round_chunk(
-    tool_request: ChatLLMRequest,
-    previous_summary_state: dict[str, Any] | None,
-    chunk_rounds: list[dict[str, Any]],
-) -> dict[str, Any]:
-    previous_summary_text = _render_summary_state(previous_summary_state)
-    chunk_payload = [
-        {
-            "question": round_entry.get("question", ""),
-            "text": _round_entry_to_summary_text(round_entry),
-        }
-        for round_entry in chunk_rounds
-        if isinstance(round_entry, dict)
-    ]
-    prompt_payload = {
-        "previous_summary": previous_summary_text or "",
-        "rounds": chunk_payload,
-    }
-    summary_prompt = (
-        "你是会话压缩器。请把给定的旧对话压缩成后续模型继续可用的上下文摘要。"
-        "要求：保留用户目标、已确认事实、工具结果、数值、约束条件、未完成事项；"
-        "删除寒暄和重复细节；如果有工具状态或待办，请显式列出。"
-        "只输出严格 JSON，不要输出多余文本。JSON 结构为："
-        "{\"summary\": string, \"key_facts\": [string], \"open_items\": [string], \"tool_state\": [string]}"
-    )
-    summary_request = ChatLLMRequest(
-        messages=[
-            {"role": "system", "content": summary_prompt},
-            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False, indent=2)},
-        ],
-        max_tokens=max(256, min(1024, int(tool_request.max_tokens or 1024) // 4 or 256)),
-        temperature=0.2,
-        top_p=1.0,
-        presence_penalty=0.0,
-        stream=False,
-        reasoning_effort="low",
-        tool_choice="none",
-        parallel_tool_calls=False,
-        session_id=tool_request.session_id,
-        use_backend_history=False,
-        backend_history_rounds=0,
-    )
-
-    result = await asyncio.to_thread(partial(ChatLLM.chat_completions, request=summary_request, stream=False))
-    summary_text = ""
-    if isinstance(result, dict):
-        summary_text = str(result.get("content") or result.get("reasoning_content") or "").strip()
-
-    parsed_summary: dict[str, Any] | None = None
-    if summary_text:
+    def notify(self) -> None:
+        async def notify_all() -> None:
+            async with self.cond:
+                self.cond.notify_all()
         try:
-            candidate = json.loads(summary_text)
-            if isinstance(candidate, dict):
-                parsed_summary = candidate
-        except Exception:
-            parsed_summary = None
+            asyncio.get_running_loop().create_task(notify_all())
+        except RuntimeError:
+            pass
 
-    if parsed_summary is None:
-        parsed_summary = {
-            "summary": summary_text or "旧对话压缩失败，保留简化摘要。",
-            "key_facts": [],
-            "open_items": [],
-            "tool_state": [],
-        }
+    def set_round_start(self) -> None:
+        # 每轮循环开始处调用，确保重连时只回放当前轮
+        self.round_start_seq = self.seq
 
-    parsed_summary.setdefault("summary", summary_text or "旧对话压缩失败，保留简化摘要。")
-    parsed_summary.setdefault("key_facts", [])
-    parsed_summary.setdefault("open_items", [])
-    parsed_summary.setdefault("tool_state", [])
-    parsed_summary["source_round_count"] = len(chunk_rounds)
-    return parsed_summary
+    async def finish(self) -> None:
+        self.done = True
+        async with self.cond:
+            self.cond.notify_all()
+
+    def is_running(self) -> bool:
+        return self.task is not None and not self.task.done() and not self.done
 
 
-async def _compact_session_history_if_needed(
-    session_chat_memory,
-    tool_request: ChatLLMRequest,
+def _get_session_stream(session_id: str) -> _SessionStream | None:
+    return _SESSION_STREAMS.get(session_id)
+
+
+def _set_session_stream(session_id: str) -> _SessionStream:
+    if len(_SESSION_STREAMS) > 128:
+        for done_sid, done_stream in list(_SESSION_STREAMS.items()):
+            if done_stream.done and (done_stream.task is None or done_stream.task.done()):
+                _SESSION_STREAMS.pop(done_sid, None)
+    stream = _SessionStream(session_id)
+    _SESSION_STREAMS[session_id] = stream
+    return stream
+
+
+async def _stream_emit(stream: _SessionStream, chunk: str) -> None:
+    stream.emit(chunk)
+    stream.notify()
+
+
+async def _emit_compaction_event(
+    stream: _SessionStream,
+    session_chat_memory: Any,
+    payload: dict[str, Any],
 ) -> None:
-    context_limit = resolve_model_max_input_tokens(default=8192)
-    trigger_ratio = float(load_var("HISTORY_COMPACT_TRIGGER_RATIO", "0.8") or 0.8)
-    if trigger_ratio <= 0:
-        trigger_ratio = 0.8
-    if trigger_ratio > 0.95:
-        trigger_ratio = 0.95
-    budget_limit = max(1024, int(context_limit * trigger_ratio))
-    keep_min_rounds = max(1, int(load_var("HISTORY_COMPACT_KEEP_ROUNDS", "4") or 4))
-    chunk_rounds_target = max(1, int(load_var("HISTORY_COMPACT_CHUNK_ROUNDS", "3") or 3))
+    """压缩进度事件：先推送 SSE 帧，再按同一份 payload 持久化。
 
-    summary_state = await session_chat_memory.get_context_summary()
-    history_entries = await session_chat_memory.get_chat_history()
-    round_entries = [
-        entry for entry in history_entries
-        if isinstance(entry, dict) and entry.get("event") == "chat_round"
-    ]
-    summarized_count = 0
-    if isinstance(summary_state, dict):
-        try:
-            summarized_count = max(0, int(summary_state.get("source_round_count", 0) or 0))
-        except (TypeError, ValueError):
-            summarized_count = 0
-    summarized_count = min(summarized_count, len(round_entries))
-    raw_rounds = round_entries[summarized_count:]
-    if len(raw_rounds) <= keep_min_rounds:
+    顺序刻意如此：实时显示优先，落盘不得阻塞推送（Windows 上文件可能被
+    搜索索引/杀软短暂占用，落盘重试会拖慢 SSE）；落盘失败只影响历史
+    加载，不阻断实时展示，打 WARN 即可。两处字段结构完全一致。
+
+    例外：phase="delta" 是压缩模型的思考/正文增量帧，只用于实时渲染，
+    体量大且无回放价值，不落盘（历史回放使用 done 事件的 summary_text）。
+    round scope 事件归入当前 chat_round.events，session scope 仍为独立 JSONL 行。
+    """
+    await _stream_emit(stream, f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+    if payload.get("phase") == "delta":
         return
-
-    while True:
-        summary_message = _render_summary_state(summary_state)
-        current_messages: list[dict[str, Any]] = []
-        if summary_message:
-            current_messages.append({"role": "system", "content": summary_message})
-        for round_entry in raw_rounds:
-            current_messages.extend(_round_entry_to_context_messages(round_entry))
-
-        if estimate_messages_tokens(current_messages) <= budget_limit:
-            return
-
-        if len(raw_rounds) <= keep_min_rounds:
-            return
-
-        tail_rounds: list[dict[str, Any]] = []
-        tail_tokens = estimate_messages_tokens(current_messages[:1]) if summary_message else 0
-        for round_entry in reversed(raw_rounds):
-            round_tokens = _estimate_round_entry_tokens(round_entry)
-            if tail_rounds and tail_tokens + round_tokens > budget_limit:
-                break
-            tail_rounds.append(round_entry)
-            tail_tokens += round_tokens
-        tail_rounds.reverse()
-
-        if not tail_rounds or len(tail_rounds) >= len(raw_rounds):
-            return
-
-        summarize_count = len(raw_rounds) - len(tail_rounds)
-        summarize_count = max(1, min(summarize_count, chunk_rounds_target))
-        summarize_count = min(summarize_count, len(raw_rounds) - keep_min_rounds)
-        if summarize_count <= 0:
-            return
-
-        chunk_rounds = raw_rounds[:summarize_count]
-        summary_state = await _summarize_round_chunk(tool_request, summary_state, chunk_rounds)
-        await session_chat_memory.update_context_summary(summary_state)
-        raw_rounds = raw_rounds[summarize_count:]
+    try:
+        add_event = getattr(session_chat_memory, "add_context_compaction_event", None)
+        if callable(add_event):
+            await add_event(payload)
+    except Exception as exc:
+        print(f"[WARN] 压缩事件落盘失败：{exc}")
 
 
-async def tool_chat_server(
-    tool_request: ChatLLMRequest
-) -> AsyncGenerator[str, None]:
-    """工具聊天服务器，按需补齐工具并以 SSE 格式输出模型响应。"""
+async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict[str, Any], list[dict[str, str]] | None]:
+    """校验并落盘模型提交的任务计划；返回 (工具结果, 规整后的列表或 None)。"""
+    raw_todos = tool_args.get("todos") if isinstance(tool_args, dict) else None
+    items = normalize_todo_items(raw_todos)
+    if items is None:
+        return {
+            "error": "todos 参数无效：需要 {content, status(pending|in_progress|done)} 对象数组"
+                     "（≤20 项，content ≤200 字符），每次调用全量覆盖"
+        }, None
+    await session_chat_memory.update_session_todo(items)
+    done_count = sum(1 for item in items if item["status"] == "done")
+    return {
+        "message": f"任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项）",
+        "total": len(items),
+        "done": done_count,
+    }, items
+
+
+def _request_has_new_user_message(tool_request: ChatLLMRequest) -> bool:
+    for msg in tool_request.messages or []:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if role == "user" and content_part_to_text(content).strip():
+            return True
+    return False
+
+
+async def _compact_task_context_if_needed(
+    messages: List[dict[str, Any]],
+    tool_request: ChatLLMRequest,
+    session_chat_memory: Any,
+    stream: Any,
+    *,
+    threshold: int,
+    backend_history_rounds: int,
+    runtime_sys_text: str,
+    file_block_text: str,
+    event_emitter: Any,
+) -> List[dict[str, Any]] | None:
+    """任务内上下文预算管理：达到阈值时压缩历史并重建内存消息。
+
+    触发：全量上下文估算 > threshold（单轮阈值 = min(聊天,压缩)窗口 × 比例）。
+    行为：
+    1. 跨轮压缩持久层历史（force_all：不保留原始轮次；预算 = 阈值 × 0.4）——
+       老轮次压成累计摘要并重建全历史最近问题索引，压缩游标推进；
+    2. 从持久层重建内存消息的历史部分：主 system（persona+运行时文本+文件块）
+       保持在首位，累计摘要 system 与最近问题排在其后；
+    3. 当前任务轮的消息（最后一条用户问题起）原样保留，交由单轮压缩继续管理。
+
+    返回重建后的 messages；未触发返回 None。
+    """
+    context_now = estimate_request_context_tokens(messages, tool_request.tools)
+    if threshold <= 0 or context_now <= threshold:
+        return None
+    round_start = _find_current_round_start(messages)
+    active_messages = messages[round_start:] if round_start is not None else []
+    system_message = messages[0] if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" else None
+    # 历史预算 = 阈值 × 0.4；摘要与最近问题由 summary-only 视图统一回传。
+    history_budget = max(2048, int(threshold * 0.4))
+    print(
+        f"[INFO] 任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
+        f"压缩持久层历史（预算 {history_budget}）并重建内存历史部分"
+    )
+    await compact_session_history_if_needed(
+        session_chat_memory,
+        tool_request,
+        settings=load_context_compaction_settings(),
+        budget_tokens=history_budget,
+        enforce=True,
+        force_all=True,
+        event_emitter=event_emitter,
+    )
+    history_messages = await session_chat_memory.get_context_messages(
+        # <=0 表示无限窗口（keep_rounds=0），原样透传；否则至少保留 1 轮
+        max_rounds=backend_history_rounds if backend_history_rounds <= 0 else max(1, backend_history_rounds)
+    )
+    # 主 system（persona+运行时文本+文件块）保持在首位，累计摘要/最近问题排在
+    # 其后：不再把运行时文本混入【历史压缩摘要】消息，也不向已含文件块的
+    # system_message 重复追加 file_block_text。
+    if system_message is not None:
+        rebuilt = [dict(system_message)]
+    else:
+        rebuilt = [{
+            "role": "system",
+            "content": (
+                "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
+                + runtime_sys_text
+                + file_block_text
+            ),
+        }]
+    rebuilt.extend(history_messages)
+    rebuilt.extend(active_messages)
+    after_tokens = estimate_request_context_tokens(rebuilt, tool_request.tools)
+    print(f"[INFO] 任务内历史重建完成：{context_now} -> {after_tokens} tokens")
+    return rebuilt
+
+
+def is_chat_stream_running(session_id: str) -> bool:
+    stream = _get_session_stream(session_id)
+    return bool(stream and stream.is_running())
+
+
+async def _run_chat_generation(
+    tool_request: ChatLLMRequest,
+    stream: _SessionStream,
+) -> None:
+    """后台独立任务：执行完整 Agent 生成循环，事件写入 stream 缓冲。"""
     try:
         require_default_chat_config()
     except ChatModelConfigurationError as exc:
-        yield _sse_error_payload(str(exc))
+        await _stream_emit(stream, _sse_error_payload(str(exc)))
         return
-
     # 从请求中获取 session_id
     session_id = getattr(tool_request, 'session_id', 'default')
     await load_all_tools()
@@ -442,11 +526,12 @@ async def tool_chat_server(
         for tool_def in configured_tools
         if _tool_name_from_definition(tool_def)
     }
+    configured_tool_names = set(configured_tool_by_name)
     requested_tool_names = getattr(tool_request, "tool_names", None)
-
+    # 先初始化：未携带 tool_names（无工具模式）时下游引用（todo_requested 等）也要可用
+    requested_names: list[str] = []
     if isinstance(requested_tool_names, list):
         requested_names = [str(name).strip() for name in requested_tool_names if str(name).strip()]
-
         if not requested_names:
             warning_event = {
                 "warning": {
@@ -454,7 +539,7 @@ async def tool_chat_server(
                     "message": "本轮未选择任何工具，已按无工具模式继续",
                 }
             }
-            yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
+            await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
             round_tools = []
             round_tool_servers = {}
         else:
@@ -462,12 +547,11 @@ async def tool_chat_server(
             selected_servers: dict[str, str] = {}
             ignored_names: list[str] = []
             seen_names = set()
-
             for tool_name in requested_names:
                 if tool_name in seen_names:
                     continue
                 seen_names.add(tool_name)
-                if tool_name == BUILTIN_CHECK_TOOL_EXISTS_NAME:
+                if is_builtin_tool(tool_name):
                     continue
                 real_tool = configured_tool_by_name.get(tool_name)
                 if real_tool is None:
@@ -476,7 +560,6 @@ async def tool_chat_server(
                 selected_tools.append(real_tool)
                 if tool_name in configured_tool_servers:
                     selected_servers[tool_name] = configured_tool_servers[tool_name]
-
             if ignored_names:
                 warning_event = {
                     "warning": {
@@ -485,8 +568,7 @@ async def tool_chat_server(
                         "ignored_tools": ignored_names,
                     }
                 }
-                yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
-
+                await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
             round_tools = selected_tools
             round_tool_servers = selected_servers
     else:
@@ -496,22 +578,16 @@ async def tool_chat_server(
                 "message": "缺少 tool_names 字段，已按无工具模式继续",
             }
         }
-        yield f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n"
+        await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
         round_tools = []
         round_tool_servers = {}
-
-    # 当且仅当前端有工具选择时，注入内置工具
-    if round_tools:
-        if BUILTIN_CHECK_TOOL_EXISTS_NAME not in round_tool_servers:
-            round_tools = round_tools + [BUILTIN_CHECK_TOOL_EXISTS_DEF]
-            round_tool_servers[BUILTIN_CHECK_TOOL_EXISTS_NAME] = "__builtin__"
-
-    tool_request.tools = round_tools
-    # print(f"tools: {tool_request.tools}")
-    tool_choice = tool_request.tool_choice
-    if not isinstance(tool_choice, (str, dict)):
-        tool_choice = "auto"
-    # extra_body = dict(tool_request.extra_body) if tool_request.extra_body else {}
+    # 当且仅当前端有工具选择时，注入本地工具；无工具时不向上游发送 tools 字段。
+    # todo_write 例外：用户显式启用（plus 菜单开关）即注入，即使未选择任何 MCP 工具。
+    todo_requested = TODO_TOOL_NAME in (requested_names or [])
+    round_tools, round_tool_servers = inject_builtin_tools(
+        round_tools, round_tool_servers, include_todo=todo_requested
+    )
+    tool_request.tools = round_tools or None
     messages: List[dict] = []
     for message in tool_request.messages or []:
         if hasattr(message, "model_dump"):
@@ -527,60 +603,315 @@ async def tool_chat_server(
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
     session_file_memory = await get_file_memory_manager(session_id)
+    # 新生成任务必须显式置回运行态：上一个被中断的任务可能在 finally 里置 False，
+    # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
+    session_chat_memory.run_task = True
     try:
         use_backend_history = parse_bool_like(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
         )
+        configured_history_value = load_var("HISTORY_COMPACT_KEEP_ROUNDS", None)
+        if configured_history_value is None:
+            # 兼容旧版仅配置 BACKEND_HISTORY_ROUNDS 的项目；一旦聊天设置写入
+            # HISTORY_COMPACT_KEEP_ROUNDS，用户设置应优先于旧环境变量。
+            configured_history_value = load_var(
+                "BACKEND_HISTORY_ROUNDS", DEFAULT_CONTEXT_HISTORY_ROUNDS
+            )
+        configured_history_rounds = parse_int_like(
+            configured_history_value,
+            DEFAULT_CONTEXT_HISTORY_ROUNDS,
+        )
         backend_history_rounds = parse_int_like(
             getattr(tool_request, "backend_history_rounds", None),
-            parse_int_like(load_var("BACKEND_HISTORY_ROUNDS", 6), 6)
+            configured_history_rounds,
         )
-
-        if use_backend_history:
-            if frontend_provides_full_history(incoming_messages):
-                print("[INFO] 检测到前端已提供完整历史，本次跳过后端历史拼接")
+        history_compaction_settings = load_context_compaction_settings()
+        frontend_history_provided = frontend_provides_full_history(incoming_messages)
+        if frontend_history_provided:
+            # 旧客户端可能把完整历史一并提交；只保留最后一个用户问题开始的当前任务，
+            # 历史部分统一从后端累计摘要重建，避免原始轮次绕过摘要-only 策略。
+            current_start = _find_current_round_start(messages)
+            if current_start is None:
+                messages = []
+                incoming_messages = []
             else:
-                backend_messages = await session_chat_memory.get_context_messages(
-                    max_rounds=backend_history_rounds
-                )
-                if backend_messages:
-                    messages = backend_messages + messages
-                    print(f"[INFO] 已拼接后端历史消息 {len(backend_messages)} 条（最近 {backend_history_rounds} 轮）")
-
-        latest_user_message = None
-        for msg in reversed(incoming_messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, str) and content.strip():
-                    latest_user_message = msg
-                break
-        if latest_user_message:
-            await session_chat_memory.add_chat_history(latest_user_message)
-        # 检查是否存在系统提示词，添加一些提示
-        if messages[0]["role"] == "system":
-            messages[0]["content"] += (f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n" + SYS_PROMPT)
+                messages = messages[current_start:]
+                incoming_messages = list(messages)
+            print("[INFO] 检测到前端完整历史，已丢弃历史部分并改用后端累计摘要")
+        # 检查是否存在系统提示词，添加一些提示。
+        # runtime_sys_text 为任务级运行时附加文本（工作路径+系统提示），
+        # 任务内历史重建（压缩后）与降级链重建候选消息时复用同一份文本。
+        # 主 system 必须先于后端历史拼接合成：拼接后 messages[0] 会是后端的
+        # 【历史压缩摘要】system 消息，不能把运行时文本追加给它，否则 persona 缺位。
+        runtime_sys_text = build_runtime_system_text()
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            messages[0]["content"] += runtime_sys_text
         else:
             messages.insert(0, {
                 "role": "system",
                 "content": (
                     "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
-                    f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
-                    + SYS_PROMPT
+                    + runtime_sys_text
                 ),
             })
+        if use_backend_history:
+            try:
+                # 中断恢复：上次任务可能在压缩进行到一半时被终止（无 done 信号）。
+                # 压缩结果采用"完成后一次性写入"，中断不会留下半成品数据——
+                # 此处把孤儿 start 标记为 aborted（前端失效对应条目）。
+                for orphan in await session_chat_memory.find_orphan_compaction_events():
+                    await session_chat_memory.mark_compaction_aborted(orphan)
+                    print(
+                        f"[INFO] 检测到未完成的压缩（scope={orphan.get('scope')}，"
+                        f"开始于 {orphan.get('timestamp')}），本次将重新压缩"
+                    )
+            except Exception as exc:
+                print(f"[WARN] 压缩中断状态检查失败：{exc}")
+            try:
+                await compact_session_history_if_needed(
+                    session_chat_memory,
+                    tool_request,
+                    settings=history_compaction_settings,
+                    event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                )
+            except ContextCompactionError as exc:
+                # 压缩模型与聊天模型均失败：终止任务，不回退到原始历史。
+                detail = f"上下文压缩失败，任务已终止：{exc}"
+                print(f"[ERROR] {detail}")
+                session_chat_memory.run_task = False
+                await _stream_emit(stream, _sse_error_payload(detail))
+                return
+            except Exception as exc:
+                detail = f"上下文历史压缩失败，任务已终止：{exc}"
+                print(f"[ERROR] {detail}")
+                session_chat_memory.run_task = False
+                await _stream_emit(stream, _sse_error_payload(detail))
+                return
+            backend_messages = await session_chat_memory.get_context_messages(
+                max_rounds=backend_history_rounds
+            )
+            if backend_messages:
+                # 主 system 保持在首位：累计摘要/最近问题/历史轮次排在其后
+                messages = [messages[0]] + backend_messages + messages[1:]
+                print(f"[INFO] 已拼接累计摘要和最近问题（消息 {len(backend_messages)} 条）")
+        latest_user_message = None
+        latest_user_text = ""
+        for msg in reversed(incoming_messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                # 多模态消息 content 为部件列表：取文本部件作为问题文本，
+                # 原始消息（含 media:// 媒体引用）原样落盘
+                latest_user_text = content_part_to_text(msg.get("content")).strip()
+                if latest_user_text:
+                    latest_user_message = msg
+                break
+        if latest_user_message:
+            await session_chat_memory.add_chat_history(latest_user_message)
+            if not stream.question_text:
+                stream.question_text = latest_user_text
+        # 多媒体引用解析：本轮消息 content 列表里的 media:// 引用替换为上游
+        # 可用的 data URL / base64（image_url.url；input_audio.data 为纯 base64）。
+        # 用户消息此刻已按原始引用落盘，历史 JSONL 不会膨胀；历史轮次的引用
+        # 不解析、不重复注入媒体数据。
+        try:
+            unresolved_media = resolve_message_media_refs(session_id, incoming_messages)
+            if unresolved_media:
+                print(
+                    f"[WARN] {len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
+                    f"已原样保留: {unresolved_media[:3]}"
+                )
+        except Exception as media_error:
+            print(f"[WARN] 媒体引用解析失败（按原始引用发送）: {media_error}")
         # 这里做文件处理，并添加文件解析内容到 "content" 字段
         user_files = session_file_memory.get_file_memory_chat()
+        file_memory_suffix = ""
+        # 当前生效的文件块文本：重建降级候选消息时按此复现系统提示内容
+        active_file_block = ""
         if user_files:
-            messages[0]["content"] += (
+            file_memory_suffix = (
                 f"\n用户上传的 {len(user_files)} 个文件，解析的内容如下：\n"
                 f"{user_files}"
             )
+            active_file_block = file_memory_suffix
+            messages[0]["content"] += file_memory_suffix
+        # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）
+        try:
+            session_todo = await session_chat_memory.get_session_todo()
+        except Exception:
+            session_todo = []
+        if session_todo:
+            todo_lines = []
+            for item in session_todo:
+                mark = {"done": "[x]", "in_progress": "[>]"}.get(item.get("status"), "[ ]")
+                todo_lines.append(f"{mark} {item.get('content', '')}")
+            todo_suffix = (
+                "\n当前任务计划（可调用 todo_write 全量更新，保持与最新进展同步）：\n"
+                + "\n".join(todo_lines)
+            )
+            messages[0]["content"] += todo_suffix
+        # P1：首次模型调用前的上下文预算检查。
+        # 组装完系统提示/文件内容后，预估整个请求上下文（消息+工具定义）；
+        # 超窗请求直接发往上游只会得到 400 或静默截断，这里先诊断并按需降级。
+        # 基准使用模型窗口（硬限制）；单轮压缩阈值（窗口×比例）由任务内压缩负责。
+        try:
+            first_call_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+            model_window = resolve_model_max_input_tokens(default=8192)
+            if first_call_tokens > model_window:
+                print(
+                    f"[WARN] 首次模型调用上下文 {first_call_tokens} tokens 超过模型窗口 {model_window}"
+                )
+                if user_files and file_memory_suffix:
+                    # 文件记忆无上限（get_file_memory_chat 返回全部文件完整内容），
+                    # 是最常见的超窗来源：降级为纯文本摘要后重新估算。
+                    downgraded_text = session_file_memory.get_file_memory_text(
+                        max_total_chars=_FIRST_CALL_FILE_MEMORY_MAX_CHARS
+                    )
+                    if messages[0]["content"].endswith(file_memory_suffix):
+                        messages[0]["content"] = messages[0]["content"][:-len(file_memory_suffix)]
+                    if downgraded_text:
+                        messages[0]["content"] += (
+                            f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
+                            f"{downgraded_text}"
+                        )
+                    downgraded_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+                    active_file_block = (
+                        f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
+                        f"{downgraded_text}"
+                        if downgraded_text
+                        else ""
+                    )
+                    print(
+                        f"[WARN] 文件记忆已降级为摘要：{first_call_tokens} -> {downgraded_tokens} tokens"
+                    )
+                    warning_event = {
+                        "warning": {
+                            "code": "CONTEXT_BUDGET_FILE_DOWNGRADED",
+                            "message": (
+                                f"上传文件内容超过模型窗口预算（{first_call_tokens} > {model_window} tokens），"
+                                "已降级为摘要文本，可能影响文件内容的完整性。"
+                            ),
+                        }
+                    }
+                    await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
+                    first_call_tokens = downgraded_tokens
+                if first_call_tokens > model_window:
+                    # ===== 切换到更小窗口模型后的历史降级链 =====
+                    # 强制跨轮压缩：预算按实际可用空间计算（窗口-系统-文件-当前请求-
+                    # 工具定义-安全余量），把全部历史纳入累计摘要，不再回传原始轮次。
+                    system_tokens = estimate_message_tokens(messages[0])
+                    tools_tokens = estimate_tool_definition_tokens(tool_request.tools)
+                    frontend_tokens = estimate_messages_tokens(
+                        messages[max(0, len(messages) - len(incoming_messages)):]
+                    )
+                    history_allowance = max(
+                        1024,
+                        model_window - system_tokens - tools_tokens - frontend_tokens
+                        - max(1024, model_window // 16),
+                    )
+                    try:
+                        await compact_session_history_if_needed(
+                            session_chat_memory,
+                            tool_request,
+                            budget_tokens=history_allowance,
+                            enforce=True,
+                            force_all=True,
+                            event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                        )
+                    except ContextCompactionError as exc:
+                        # 压缩模型与聊天模型均失败：终止任务，不再走后续降级
+                        detail = f"上下文压缩失败（聊天模型重试仍不可用），任务已终止：{exc}"
+                        print(f"[ERROR] {detail}")
+                        session_chat_memory.run_task = False
+                        await _stream_emit(stream, _sse_error_payload(detail))
+                        return
+                    except Exception as exc:
+                        detail = f"强制历史压缩失败，任务已终止：{exc}"
+                        print(f"[ERROR] {detail}")
+                        session_chat_memory.run_task = False
+                        await _stream_emit(stream, _sse_error_payload(detail))
+                        return
+
+                    # 继续用累计摘要视图重建候选；runtime_sys_text / active_file_block
+                    # 复用任务级变量，不能回退为原始历史轮次。
+
+                    def _assemble_candidate(backend_msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                        # 复用任务已合成的主 system（persona+运行时文本+文件块，
+                        # 含预算降级后的版本）：摘要/最近问题排在其后，
+                        # 不再把运行时文本混入【历史压缩摘要】消息。
+                        if (
+                            messages
+                            and isinstance(messages[0], dict)
+                            and messages[0].get("role") == "system"
+                        ):
+                            main_system = copy.deepcopy(messages[0])
+                        else:
+                            main_system = {
+                                "role": "system",
+                                "content": (
+                                    "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
+                                    + runtime_sys_text
+                                    + active_file_block
+                                ),
+                            }
+                        return [main_system] + list(backend_msgs or []) + copy.deepcopy(incoming_messages)
+
+                    degraded_messages = None
+                    question_budgets = (10_000, 5_000, 2_000, 1_000, 256)
+                    for question_budget in question_budgets:
+                        candidate_backend = await session_chat_memory.get_context_messages(
+                            max_rounds=backend_history_rounds,
+                            recent_questions_token_budget=question_budget,
+                        )
+                        candidate = _assemble_candidate(candidate_backend)
+                        if estimate_request_context_tokens(candidate, tool_request.tools) <= model_window:
+                            degraded_messages = candidate
+                            if question_budget != question_budgets[0]:
+                                print("[INFO] 摘要上下文已按窗口收紧最近问题索引")
+                            break
+
+                    if degraded_messages is not None:
+                        messages = degraded_messages
+                        first_call_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+                        history_tokens = max(
+                            0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens
+                        )
+                        print(
+                            f"[INFO] 首次模型调用上下文已按新模型窗口降级："
+                            f"{first_call_tokens} tokens（摘要-only，最近问题预算已收紧，"
+                            f"后端历史约 {history_tokens} tokens）"
+                        )
+                    else:
+                        # 全部降级后仍超限，才报压缩错误
+                        detail = (
+                            f"首次模型调用上下文预估 {first_call_tokens} tokens，"
+                            f"超过模型窗口 {model_window} tokens。"
+                            f"组成：系统提示+文件 {system_tokens}、后端历史 "
+                            f"{max(0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens)}、"
+                            f"当前请求 {frontend_tokens}、工具定义 {tools_tokens}。"
+                            "已尝试强制压缩历史并收紧最近问题索引仍无法放入窗口，"
+                            "请清理上传文件或开启新会话后重试。"
+                        )
+                        print(f"[ERROR] {detail}")
+                        await _stream_emit(stream, _sse_error_payload(detail))
+                        return
+        except Exception as exc:
+            print(f"[WARN] 首次调用预算检查跳过：{exc}")
+        # 超大工具结果拒绝策略（仅任务内解析一次）：
+        # 阈值 = min(聊天窗口, 压缩窗口) × 系数，连续超长达到上限后终止任务
+        compaction_settings = load_context_compaction_settings()
+        oversized_result_threshold = resolve_oversized_result_token_threshold(compaction_settings)
+        # 任务内上下文预算管理阈值：与跨轮压缩统一使用 trigger_ratio
+        context_compaction_threshold = resolve_context_compaction_threshold(compaction_settings)
+        max_oversized_rejections = compaction_settings.max_oversized_rejections
+        consecutive_oversized_count = 0
         # run_task = True
         # last_tool_ret = ""  # 上一次调用工具的返回值
         # while run_task:
         while session_chat_memory.run_task:
+            stream.set_round_start()
             print(f"massages: [\n\t{',\n\t'.join(map(str, messages))}\n]")
+            # 大上下文下整包转储会向控制台刷 MB 级文本并拖慢循环，只打印概要
+            # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
             full_response = ""
             full_reasoning = ""
             finish_reason = None  # 追踪模型完成原因：stop（正常完成）、length（token 截断）、tool_calls（工具调用）
@@ -601,15 +932,15 @@ async def tool_chat_server(
                 # print(f"sse_chunk: {sse_chunk}")
                 event = _parse_sse_event(sse_chunk)
                 if event is None:
-                    yield sse_chunk
+                    await _stream_emit(stream, sse_chunk)
                     continue
                 if event.get("done") or not session_chat_memory.run_task:
                     if pending_finish_payload is not None:
-                        yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                        await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                         pending_finish_payload = None
                     break
                 if event.get("error") is not None:
-                    yield sse_chunk
+                    await _stream_emit(stream, sse_chunk)
                     stream_error = event.get("error")
                     session_chat_memory.run_task = False
                     break
@@ -633,9 +964,9 @@ async def tool_chat_server(
                     usage_event = {"type": "usage", "usage": event["usage"]}
                     if event.get("id") is not None:
                         usage_event["id"] = event["id"]
-                    yield f"data: {json.dumps(usage_event, ensure_ascii=False)}\n\n"
+                    await _stream_emit(stream, f"data: {json.dumps(usage_event, ensure_ascii=False)}\n\n")
                     if pending_finish_payload is not None:
-                        yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                        await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                         pending_finish_payload = None
                     continue
                 content = event.get("content")
@@ -670,8 +1001,7 @@ async def tool_chat_server(
                     #     print(f"[STREAM] function_call += name:'{fc_name[:30]}', args_len:{len(fc_args)}", flush=True)
                 # 过滤 tool_calls 中的 id 和 type 字段后再输出
                 filtered_event = _filter_tool_calls_fields(event)
-                yield f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n"
-
+                await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
             if usage_accumulator.count > 0:
                 round_usage_total: dict[str, Any] = {}
                 usage_accumulator.merge_to(round_usage_total, _merge_usage_values)
@@ -679,10 +1009,9 @@ async def tool_chat_server(
                     usage_total=round_usage_total,
                     completion_count=usage_accumulator.count,
                 )
-
             # print(f"[DEBUG] tool_calls: {tool_calls}")
             if pending_finish_payload is not None:
-                yield f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n"
+                await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                 pending_finish_payload = None
             # 上游模型流出错（如连接被切断）：记录真实错误原因，而不是伪装成"用户停止任务"
             if stream_error is not None:
@@ -703,8 +1032,8 @@ async def tool_chat_server(
                     await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
                 if full_response:
                     await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
-                # 添加用户手动停止任务消息的记录
-                await session_chat_memory.add_chat_history({"role": "user", "content": "停止任务"})
+                # 手动停止：不再写入"停止任务"假消息，直接以 stopped 状态收尾当前轮次
+                await session_chat_memory.stop_current_round()
                 break  # 任务结束，退出循环
             known_tool_names = list(round_tool_servers.keys())
             # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
@@ -724,7 +1053,20 @@ async def tool_chat_server(
                     messages.append({"role": "user", "content": "你的回答因为长度限制被截断了，请继续。", "_internal": True})
                     continue  # 让模型继续，不进入"未调用工具"的逻辑
                 assistant_message = {"role": "assistant", "content": full_response} if full_response else None
+                if assistant_message is None and full_reasoning:
+                    assistant_message = {"role": "assistant", "content": ""}
                 if assistant_message is not None:
+                    # 思考模型的最终回答同样落盘思考过程（SSE 已实时展示，
+                    # JSONL 缺失会导致历史回放/审计看不到思考）；回传长度
+                    # 规则与下方 tool_calls 分支保持一致。历史回放不重发
+                    # reasoning，无上游 400 风险。
+                    final_reasoning_limit = _load_reasoning_return_max_length()
+                    if full_reasoning and final_reasoning_limit != 0:
+                        assistant_message["reasoning_content"] = (
+                            full_reasoning
+                            if final_reasoning_limit < 0
+                            else full_reasoning[-final_reasoning_limit:]
+                        )
                     messages.append(assistant_message)
                     await session_chat_memory.add_chat_history(assistant_message)
                 session_chat_memory.run_task = False
@@ -736,9 +1078,12 @@ async def tool_chat_server(
                 assistant_message["content"] = full_response
             elif full_reasoning:
                 assistant_message["content"] = f"...{full_reasoning[-100:]}"
-            # 思考模型下，带 tool_calls 的 assistant 消息必须回传 reasoning_content，否则 DeepSeek 会报 400
-            if full_reasoning:
-                assistant_message["reasoning_content"] = full_reasoning[-1024:]
+            # 思考模型下，带 tool_calls 的 assistant 消息通常需要回传 reasoning_content（否则 DeepSeek 会报 400）
+            # 回传长度可配置：0=不回传，负数=全部回传，正数=保留末尾 N 字符
+            reasoning_limit = _load_reasoning_return_max_length()
+            if full_reasoning and reasoning_limit != 0:
+                reasoning_content = full_reasoning if reasoning_limit < 0 else full_reasoning[-reasoning_limit:]
+                assistant_message["reasoning_content"] = reasoning_content
             formatted_tool_calls = []
             for tc in tool_calls:
                 function_info = tc.get("function") or {}
@@ -799,6 +1144,7 @@ async def tool_chat_server(
                         "role": "tool",
                         "tool_call_id": blocked_tool_call_id,
                         "content": blocked_ret,
+                        "_tool_name": blocked_tool_name,
                     }
                     messages.append(blocked_tool_message)
                     blocked_event = {
@@ -809,7 +1155,7 @@ async def tool_chat_server(
                             "blocked": True,
                         }
                     }
-                    yield f"data: {json.dumps(blocked_event, ensure_ascii=False)}\n\n"
+                    await _stream_emit(stream, f"data: {json.dumps(blocked_event, ensure_ascii=False)}\n\n")
                 if not parsed_tools:
                     continue
             if not parsed_tools and not round_tool_servers:
@@ -827,27 +1173,39 @@ async def tool_chat_server(
             # 内置工具与 MCP 工具分开执行
             builtin_results = []
             external_parsed_tools = []
+            todo_updated = False
             for idx, tc, tn, ta in parsed_tools:
-                if tn == BUILTIN_CHECK_TOOL_EXISTS_NAME:
-                    query_name = ""
-                    if isinstance(ta, dict):
-                        query_name = str(ta.get("tool_name", "")).strip()
-                    exists = bool(query_name and query_name in configured_tool_by_name)
+                if tn == TODO_TOOL_NAME:
+                    # 模型自我规划：校验并写入会话 todo（_meta.todo），随后推 SSE 给前端
+                    todo_result, todo_items = await _apply_session_todo(session_chat_memory, ta)
+                    if todo_items is not None:
+                        todo_updated = True
                     builtin_results.append({
                         "index": idx,
                         "tool_call": tc,
                         "tool_name": tn,
                         "tool_args": ta,
-                        "result": {
-                            "tool_name": query_name,
-                            "exists": exists,
-                            "server": configured_tool_servers.get(query_name, "") if exists else "",
-                        },
+                        "result": todo_result,
+                        "error": None,
+                    })
+                    continue
+                builtin_result = execute_builtin_tool(
+                    tn,
+                    ta,
+                    configured_tool_names,
+                    configured_tool_servers,
+                )
+                if builtin_result is not None:
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": builtin_result,
                         "error": None,
                     })
                 else:
                     external_parsed_tools.append((idx, tc, tn, ta))
-
             tool_results = []
             # 使用线程池并发执行 MCP 工具
             if external_parsed_tools:
@@ -861,11 +1219,20 @@ async def tool_chat_server(
                 ))
             if builtin_results:
                 tool_results.extend(builtin_results)
-
+            if todo_updated:
+                try:
+                    todos = await session_chat_memory.get_session_todo()
+                    await _stream_emit(
+                        stream,
+                        f"data: {json.dumps({'event': 'todo', 'todos': todos}, ensure_ascii=False)}\n\n",
+                    )
+                except Exception as todo_emit_error:
+                    print(f"[WARN] todo 事件推送失败: {todo_emit_error}")
             if tool_results:
                 print(f"[INFO] 有 {len(tool_results)} 个工具执行完成", flush=True)
                 # 按索引排序结果
                 tool_results.sort(key=lambda x: x['index'])
+                oversized_abort = False
                 # 统一添加所有工具结果到 messages 和历史记录（使用 session_id 隔离）
                 # 获取当前会话的记忆管理器
                 for tool_result in tool_results:
@@ -874,6 +1241,67 @@ async def tool_chat_server(
                     tool_name = tool_result['tool_name']
                     tool_args = tool_result['tool_args']
                     ret = _format_tool_result(tool_result['result'])
+                    # 超大结果拒绝：超过阈值时结果不进入模型上下文，
+                    # 改为写入"输出过长"反馈让模型重新考虑工具使用；
+                    # 原始结果只保留截断预览到 JSONL，连续超长达到上限后终止任务
+                    if oversized_result_threshold > 0 and estimate_text_tokens(ret) > oversized_result_threshold:
+                        consecutive_oversized_count += 1
+                        estimated_tokens = estimate_text_tokens(ret)
+                        oversized_feedback = build_oversized_tool_feedback(
+                            tool_name, estimated_tokens, oversized_result_threshold, result_text=ret
+                        )
+                        print(
+                            f"[WARN] 工具 {tool_name} 返回结果过大"
+                            f"（估算 {estimated_tokens} tokens > 拒绝阈值 {oversized_result_threshold}），"
+                            f"连续 {consecutive_oversized_count}/{max_oversized_rejections} 次，"
+                            "已告知模型重新考虑工具使用"
+                        )
+                        if consecutive_oversized_count >= max_oversized_rejections:
+                            # 达到连续拒绝上限：终止任务
+                            await session_chat_memory.add_chat_history(
+                                {"role": "assistant", "content": oversized_feedback}
+                            )
+                            await _stream_emit(
+                                stream,
+                                f"data: {json.dumps({'content': oversized_feedback}, ensure_ascii=False)}\n\n",
+                            )
+                            session_chat_memory.run_task = False
+                            oversized_abort = True
+                            break
+                        # JSONL 记录：不落完整结果，落截断预览 + 拒绝信息（保留关键头尾）
+                        await session_chat_memory.add_chat_history(
+                            input_text={
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "arguments": json.dumps(tool_args, ensure_ascii=False),
+                                "result": oversized_feedback,
+                                "result_preview": make_oversized_result_preview(ret),
+                                "oversized": True,
+                                "oversized_estimated_tokens": estimated_tokens,
+                            }
+                        )
+                        # 发送结果到前端 SSE（携带超长标记，前端仍按普通 tool_return 渲染）
+                        oversized_event = {
+                            "tool_return": {
+                                "function_name": tool_name,
+                                "arguments": tool_args,
+                                "result": oversized_feedback,
+                                "oversized": True,
+                            }
+                        }
+                        await _stream_emit(stream, f"data: {json.dumps(oversized_event, ensure_ascii=False)}\n\n")
+                        # 以 tool role 添加超长反馈消息（符合 OpenAI API 规范），模型将看到并重新规划
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": oversized_feedback,
+                            "_tool_name": tool_name,
+                            "_oversized": True,
+                        })
+                        continue
+                    # 正常结果：重置连续超长计数，按原逻辑落盘
+                    consecutive_oversized_count = 0
                     await session_chat_memory.add_chat_history(
                         input_text={
                             "role": "tool",
@@ -891,24 +1319,174 @@ async def tool_chat_server(
                             "result": ret
                         }
                     }
-                    yield f"data: {json.dumps(tool_ret)}\n\n"
+                    await _stream_emit(stream, f"data: {json.dumps(tool_ret)}\n\n")
                     # 以 tool role 添加工具结果消息（符合 OpenAI API 规范）
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": ret
+                        "content": ret,
+                        "_tool_name": tool_name,
                     }
                     messages.append(tool_message)
+                if oversized_abort:
+                    break
+                # 任务内上下文预算管理：全量上下文达到单轮阈值（窗口×比例）时，
+                # 压缩持久层历史（老轮次→摘要块+最近问题）并重建内存历史部分。
+                # 此前历史只在请求开始/收尾时压缩，长任务中会一路膨胀到窗口上限。
+                try:
+                    rebuilt_messages = await _compact_task_context_if_needed(
+                        messages,
+                        tool_request,
+                        session_chat_memory,
+                        stream,
+                        threshold=context_compaction_threshold,
+                        backend_history_rounds=backend_history_rounds,
+                        runtime_sys_text=runtime_sys_text,
+                        file_block_text=active_file_block,
+                        event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                    )
+                except ContextCompactionError as exc:
+                    detail = f"任务内历史压缩失败，任务已终止：{exc}"
+                    print(f"[ERROR] {detail}")
+                    session_chat_memory.run_task = False
+                    await _stream_emit(stream, _sse_error_payload(detail))
+                    break
+                except Exception as exc:
+                    print(f"[WARN] 任务内历史压缩跳过：{exc}")
+                else:
+                    if rebuilt_messages is not None:
+                        messages = rebuilt_messages
+                try:
+                    current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
+                    round_compaction = await compact_active_round_context_if_needed(
+                        messages,
+                        tool_request,
+                        compression_index=current_tool_result_count,
+                        event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                    )
+                except ContextCompactionError as exc:
+                    # 压缩模型与聊天模型均失败：终止任务，不再降级
+                    detail = f"单轮上下文压缩失败，任务已终止：{exc}"
+                    print(f"[ERROR] {detail}")
+                    session_chat_memory.run_task = False
+                    await _stream_emit(stream, _sse_error_payload(detail))
+                    break
+                except Exception as exc:
+                    print(f"[WARN] 单轮工具上下文压缩跳过：{exc}")
+                else:
+                    if round_compaction.triggered:
+                        messages = round_compaction.messages
+                        # 单轮压缩的 start/done 已由 event_emitter 按实际发生顺序
+                        # 写入当前 chat_round.events，不再重复保存顶层摘要状态。
         # 写入结束消息到文件
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
-        await _compact_session_history_if_needed(session_chat_memory, tool_request)
+        try:
+            final_compaction_settings = load_context_compaction_settings()
+            await compact_session_history_if_needed(
+                session_chat_memory,
+                tool_request,
+                settings=final_compaction_settings,
+                event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+            )
+        except ContextCompactionError as exc:
+            detail = f"收尾历史压缩失败（聊天模型重试仍不可用）：{exc}"
+            print(f"[ERROR] {detail}")
+            await _stream_emit(stream, _sse_error_payload(detail))
+        except Exception as exc:
+            print(f"[WARN] 结束后的历史压缩跳过：{exc}")
+    except asyncio.CancelledError:
+        # 服务端关停或被新消息打断：尽力把已生成内容落盘后重新抛出
+        try:
+            await session_chat_memory.add_chat_history({"role": "assistant", "error": "生成任务已取消（新消息打断或服务停止）"})
+        except Exception:
+            pass
+        raise
+    except Exception as ce:
+        # 错误同时写历史与推 SSE：只落盘不推送会让前端在无事件的长连接上无限等待
+        try:
+            await session_chat_memory.add_chat_history({"role": "assistant", "error": str(ce)})
+            await _stream_emit(stream, _sse_error_payload(f"生成任务异常终止: {ce}"))
+        except Exception:
+            pass
+        raise ce
+    finally:
         # 清理工具管理内存（使用 session_id 隔离）
+        try:
+            session_chat_memory.run_task = False
+        except Exception:
+            pass
         await cleanup_chat_memory_manager(session_id)
         await cleanup_file_memory_manager(session_id)
+        await stream.finish()
+
+
+async def tool_chat_server(
+    tool_request: ChatLLMRequest
+) -> AsyncGenerator[str, None]:
+    """聊天流式入口：后台生成任务 + 可重连消费。
+
+    - 首个请求启动后台生成任务（asyncio.create_task）；
+    - 页面刷新后的重连请求（无用户消息）只订阅事件缓冲，从当前轮起点回放；
+    - 携带新用户消息的请求会先平滑打断旧任务，再重新开始一轮生成。
+    """
+    session_id = getattr(tool_request, 'session_id', 'default')
+    stream = _get_session_stream(session_id)
+    creating = False
+    if stream is None or stream.task is None or stream.task.done():
+        stream = _set_session_stream(session_id)
+        stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+        creating = True
+    elif _request_has_new_user_message(tool_request):
+        # 已存在生成任务且本次请求携带新用户消息：显式取消旧任务并等待其
+        # 完全退出后再启动新任务。旧任务的 CancelledError 处理会以 error
+        # 事件收尾当前轮次并落盘已积累的工具调用/思考，避免新旧两个生成
+        # 循环交错写入同一 pending 轮次（仅靠 run_task 标记存在竞态窗口：
+        # 新任务会把标记置回 True，旧循环可能继续运行）。
+        old_task = stream.task
+        try:
+            (await get_chat_memory_manager(session_id)).run_task = False
+        except Exception:
+            pass
+        if old_task is not None:
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as old_error:
+                print(f"[WARN] 旧生成任务退出异常（已忽略）: {old_error}")
+        stream = _set_session_stream(session_id)
+        stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+        creating = True
+    try:
+        if stream.done:
+            seen = stream.seq  # 已完成的生成：不重复回放（内容已在 JSONL）
+        else:
+            seen = stream.round_start_seq
+            if not creating:
+                # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件
+                marker = {"replay": True, "question_text": stream.question_text or ""}
+                yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
+        while True:
+            while seen < stream.seq:
+                base = stream.seq - len(stream.buffer)
+                if seen < base:
+                    seen = base  # 环形缓冲已滚动：跳过过期片段
+                chunk = stream.buffer[seen - base]
+                seen += 1
+                yield chunk
+            if stream.done:
+                break
+            async with stream.cond:
+                if seen >= stream.seq and not stream.done:
+                    await stream.cond.wait()
         yield "data: [DONE]\n\n"
-    except Exception as ce:
-        await session_chat_memory.add_chat_history({"role": "assistant", "error": str(ce)})
-        raise ce
+    except asyncio.CancelledError:
+        # 仅消费端被取消（页面刷新/关闭）：后台生成任务不受影响
+        raise
+    finally:
+        if stream.task is not None and stream.task.done() and not stream.done:
+            await stream.finish()
 
 
 async def stop_chat_task(session_id):

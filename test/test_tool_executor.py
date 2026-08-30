@@ -1,6 +1,6 @@
 import unittest
 
-from factory.tool_executor import normalize_tool_calls, parse_tool_call, prepare_tool_execution
+from factory.agent_runtime.tool_executor import normalize_tool_calls, parse_tool_call, prepare_tool_execution
 
 
 class ToolExecutorTests(unittest.TestCase):

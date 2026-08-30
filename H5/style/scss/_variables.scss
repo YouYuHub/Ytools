@@ -1,0 +1,67 @@
+// 主题变量：light 为默认，dark 通过 [data-theme="dark"] 覆盖
+// 有效主题由 JS 根据 localStorage 偏好（system/light/dark）解析后写到 <html data-theme>
+
+:root {
+  --bg: #ffffff;
+  --bg-sidebar: #f9f9f9;
+  --bg-elevated: #ffffff;
+  --bg-composer: #ddd;
+  --bg-bubble-user: #ffeeee;
+  --bg-code: #f7f7f7;
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --bg-active: rgba(0, 0, 0, 0.08);
+
+  --text: #0d0d0d;
+  --text-secondary: #5d5d5d;
+  --text-tertiary: #8f8f8f;
+
+  --border: #ececec;
+  --border-strong: #dbdbdb;
+  --scroll-track: #f1f1f1;
+  --scroll-thumb: #b8b8b8;
+
+  --accent: #0d0d0d;
+  --accent-contrast: #ffffff;
+  --danger: #e02e2a;
+  --avatar: #e05d44;
+
+  --shadow-menu: 0 8px 30px rgba(0, 0, 0, 0.12);
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 28px;
+
+  --rail-width: 50px;
+  --sidebar-width: 260px;
+  --content-max: 960px;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html[data-theme="dark"] {
+  --bg: #0d0d0d;
+  --bg-sidebar: #000000;
+  --bg-elevated: #1e1e1e;
+  --bg-composer: #333;
+  --bg-bubble-user: #b77777;
+  --bg-code: #1e1e1e;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.1);
+
+  --text: #ececec;
+  --text-secondary: #a3a3a3;
+  --text-tertiary: #6e6e6e;
+
+  --border: #1c1c1c;
+  --border-strong: #2e2e2e;
+  --scroll-track: #151515;
+  --scroll-thumb: #555555;
+
+  --accent: #ececec;
+  --accent-contrast: #0d0d0d;
+
+  --shadow-menu: 0 8px 30px rgba(0, 0, 0, 0.55);
+}

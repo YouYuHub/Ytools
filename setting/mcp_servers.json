@@ -1,20 +1,10 @@
 {
   "servers": {
-    "microsoft/markitdown": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "markitdown-mcp"
-      ],
-      "gallery": "https://api.mcp.github.com",
-      "version": "1.0.0"
-    },
     "pipeIpcMcp": {
       "type": "stdio",
       "command": "mcp_server/PipeIpcMCP.exe",
-      "args": [
-      ],
-      "version": "1.0.0"
+      "args": [],
+      "version": "2.0.0"
     },
     "sysServer": {
       "type": "stdio",
@@ -25,5 +15,8 @@
       "version": "1.0.0"
     }
   },
-  "inputs": []
+  "inputs": {
+    "pipeIpcMcp": [],
+    "sysServer": []
+  }
 }

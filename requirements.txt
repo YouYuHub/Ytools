@@ -1,3 +1,4 @@
+#################### necessary start ####################
 # Web框架和服务器
 fastapi
 uvicorn
@@ -5,5 +6,21 @@ uvicorn
 # 数据验证
 pydantic
 
-# MCP协议（Model Context Protocol）
+# MCP协议（Model Context Protocol）；可选，但是使用必备
 mcp
+
+# 图片格式转化，多模态模型上传图片的格式转化使用
+pillow
+#################### necessary end ####################
+
+
+
+#################### optional start ####################
+# 文档解析
+fitz
+docx
+pandas
+
+# 图片格式转换：ICO/TIFF 等视觉模型不原生接受的格式自动转 PNG
+pillow
+#################### optional end ####################

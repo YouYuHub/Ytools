@@ -25,3 +25,4 @@ def delete_pycache_directories(root_directory = None) -> None:
 # root_path = input("input the delete __pycache__ dir: ")
 # delete_pycache_directories(root_path.strip(r'"'))
 delete_pycache_directories()
+delete_pycache_directories(None)

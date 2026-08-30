@@ -1,10 +1,14 @@
 """ 记录当前轮次对话所有工具调用的历史 - 支持多会话文件持久化 """
-from __future__ import annotations
+# from __future__ import annotations
 
 import json
+import os
 import re
-# import os
+import shutil
 import threading
+import time
+import copy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,16 +16,35 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
-from memory.chat_round_store import ChatRoundStore, merge_usage_dict
-from memory.timestamp_utils import now_str as _now_str
+from memory.chat_round_store import (
+    ChatRoundStore,
+    compression_usage_values,
+    merge_compression_usage,
+    merge_usage_dict,
+    parse_round_entry,
+)
+from util.timestamp_utils import now_str
+from config import DEFAULT_CONTEXT_HISTORY_ROUNDS, DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH
 
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 
+# 会话上传文件的根目录（与 memory.file_memory.HISTORY_ROOT 保持一致）
+UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "upload"
+
 
 
 def _safe_session_id(session_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id)
+    """把 session_id 规整为安全文件名片段。
+
+    会话标识以文件名为准，因此必须无损保留合法的文件名字符：
+    - 保留 Unicode 字母/数字（含中文）、空格、下划线、点、横线
+    - 路径分隔符等其余字符替换为下划线
+    - 拦截 `..` 防止路径穿越
+    """
+    value = re.sub(r"[^\w .-]+", "_", session_id)
+    value = value.replace("..", "_")
+    return value.strip(" ._-")
 
 
 def _get_chat_history_file(session_id: str) -> Path:
@@ -29,9 +52,9 @@ def _get_chat_history_file(session_id: str) -> Path:
     return HISTORY_ROOT / f"{safe_id}_chat.jsonl"
 
 
-def _write_jsonline(file_path: Path, data: dict[str, Any]) -> None:
-    with file_path.open("a+", encoding="utf-8") as fp:
-        fp.write(json.dumps(data, ensure_ascii=False) + "\n")
+# def _write_jsonline(file_path: Path, data: dict[str, Any]) -> None:
+#     with file_path.open("a+", encoding="utf-8") as fp:
+#         fp.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
 def _read_jsonlines(file_path: Path) -> list[dict[str, Any]]:
@@ -50,29 +73,44 @@ def _read_jsonlines(file_path: Path) -> list[dict[str, Any]]:
     return entries
 
 
-def _now_str() -> str:
-    # 已迁移到 memory.timestamp_utils.now_str；保留本函数作为旧调用方的兼容入口。
-    from memory.timestamp_utils import now_str as _impl
-    return _impl()
-
-
 def _default_title(session_id: str) -> str:
     return f"session_{session_id}"
 
 
 def _default_meta(session_id: str) -> dict[str, Any]:
-    now = _now_str()
+    now = now_str()
     return {
-        "session_id": session_id,
         "title": _default_title(session_id),
         "user_questions": [],
+        "todo": [],
         "usage": {},
         "created_at": now,
         "updated_at": now,
         "record_count": 0,
         "completion_count": 0,
         "context_summary": None,
+        "compress_usage": {},
     }
+
+
+def normalize_session_id(raw: Any) -> str:
+    """把任意输入规整为合法 session_id。
+
+    会话标识以文件名为准（`history_files/<session_id>_chat.jsonl`），
+    因此这里会：
+    - 兼容直接传入文件名（去掉 `_chat.jsonl` / `.jsonl` 后缀）
+    - 无损保留合法的文件名字符（中文等 Unicode 字符、空格、`_ . -`），
+      仅把路径分隔符等危险字符替换为下划线（与 _safe_session_id 一致）
+    - 空值回退为 "default"
+    """
+    if raw is None:
+        return "default"
+    value = str(raw).strip()
+    # 兼容直接传入文件名（如 web-xxx_chat.jsonl / web-xxx.jsonl）
+    value = re.sub(r"_chat\.jsonl$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\.jsonl$", "", value, flags=re.IGNORECASE)
+    value = _safe_session_id(value).strip(" ._-")
+    return value or "default"
 
 
 def _is_meta_record(entry: Any) -> bool:
@@ -83,9 +121,37 @@ def _is_meta_record(entry: Any) -> bool:
 from memory.chat_history_format import (
     normalize_context_summary as _normalize_context_summary,
     render_context_summary as _render_context_summary,
+    render_recent_questions_message as _render_recent_questions_message,
+    extract_recent_questions as _extract_recent_questions,
+    extract_recent_question_items as _extract_recent_question_items,
+    split_context_window as _split_context_window,
+    RECENT_QUESTIONS_TOKEN_BUDGET,
     round_entry_to_context_messages as _round_entry_to_context_messages,
+    round_entry_compression_usage as _round_entry_compression_usage,
     format_tool_call_history_line as _format_tool_call_history_line,
+    _round_question as _extract_round_question,
 )
+from env_manager import load_var as _load_var
+from factory.agent_runtime.chat_runtime import (
+    estimate_messages_tokens as _estimate_messages_tokens,
+    estimate_request_context_tokens as _estimate_request_context_tokens,
+    estimate_text_tokens as _estimate_text_tokens,
+    estimate_tool_definition_tokens as _estimate_tool_definition_tokens,
+    parse_return_length as _parse_return_length,
+    resolve_model_max_input_tokens as _resolve_model_max_input_tokens,
+)
+
+
+def _default_context_history_rounds() -> int:
+    """读取当前历史压缩设置，作为上下文 API 省略轮数时的默认值。
+
+    0 表示无限轮次窗口（仅按阈值压缩），原样返回。
+    """
+    try:
+        value = int(_load_var("HISTORY_COMPACT_KEEP_ROUNDS", DEFAULT_CONTEXT_HISTORY_ROUNDS) or 0)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_HISTORY_ROUNDS
+    return value if value >= 0 else DEFAULT_CONTEXT_HISTORY_ROUNDS
 
 
 def _normalize_usage_record_usage(entry: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -107,48 +173,73 @@ def _normalize_usage_record_usage(entry: dict[str, Any]) -> tuple[dict[str, Any]
 def _recompute_meta_from_entries(
     session_id: str,
     base_meta: dict[str, Any] | None,
-    entries: list[dict[str, Any]]
+    entries: list[dict[str, Any]],
+    bump_updated_at: bool = True,
 ) -> dict[str, Any]:
-    now = _now_str()
+    now = now_str()
     meta = dict(base_meta) if isinstance(base_meta, dict) else _default_meta(session_id)
-    if not meta.get("session_id"):
-        meta["session_id"] = session_id
+    # 会话标识以文件名为准，不再写入 _meta；每次重算都要清理，
+    # 因为上传的 jsonl（如 web-xxx_chat.jsonl）其 _meta 里仍带 session_id，
+    # 不是“只清理一次”就能完成的
+    meta.pop("session_id", None)
     if not meta.get("created_at"):
         meta["created_at"] = now
     title = meta.get("title")
     if not isinstance(title, str) or not title.strip():
         meta["title"] = _default_title(session_id)
-
     questions: list[str] = []
     usage_total: dict[str, Any] = {}
+    compress_usage_total: dict[str, Any] = {}
     completion_count = 0
-
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         if entry.get("event") == "chat_round":
-            question = entry.get("question")
-            if isinstance(question, str) and question.strip():
-                questions.append(question.strip())
+            # question 为空时回退从事件提取（多模态消息的文本部件），
+            # 兼容修复前已落盘的空 question 轮次，重建 user_questions / 会话标题
+            question = _extract_round_question(entry)
+            if question:
+                questions.append(question)
         entry_usage_total, entry_completion_count = _normalize_usage_record_usage(entry)
         if entry_usage_total:
             merge_usage_dict(usage_total, entry_usage_total)
+        if entry.get("event") == "chat_round":
+            merge_compression_usage(
+                compress_usage_total,
+                _round_entry_compression_usage(entry),
+            )
         completion_count += entry_completion_count
-
+    history_compress_usage = meta.get("_history_compress_usage")
+    if merge_compression_usage(compress_usage_total, history_compress_usage):
+        merge_usage_dict(usage_total, compression_usage_values(history_compress_usage))
+    active_round_compaction = meta.get("_active_round_compaction")
+    if isinstance(active_round_compaction, dict):
+        active_usage = _round_entry_compression_usage({
+            "events": active_round_compaction.get("events", []),
+        })
+        if not active_usage:
+            active_usage = active_round_compaction.get("compress_usage")
+        if merge_compression_usage(compress_usage_total, active_usage):
+            merge_usage_dict(usage_total, compression_usage_values(active_usage))
     meta["user_questions"] = questions
     meta["usage"] = usage_total
+    meta["compress_usage"] = compress_usage_total
     meta["record_count"] = len(entries)
     meta["completion_count"] = completion_count
-    meta["updated_at"] = now
+    # 只有真实写入（追加轮次 / 改标题 / 删除记录 / 导入）才刷新 updated_at；
+    # 纯读取（如打开会话列表时逐个拉 meta）不能改动它，
+    # 否则“按最近更新排序”会退化为“按最后一次 meta 读取顺序排序”，顺序失真
+    if bump_updated_at:
+        meta["updated_at"] = now
+    elif not meta.get("updated_at"):
+        meta["updated_at"] = now
     meta["context_summary"] = _normalize_context_summary(meta.get("context_summary"))
-
     if (
         meta.get("title") == _default_title(session_id)
         and questions
     ):
         first_q = questions[0]
         meta["title"] = first_q[:40] if first_q else _default_title(session_id)
-
     return meta
 
 
@@ -160,15 +251,50 @@ def _load_meta_and_entries(file_path: Path, session_id: str) -> tuple[dict[str, 
     else:
         base_meta = _default_meta(session_id)
         entries = [row for row in rows if isinstance(row, dict)]
-    meta = _recompute_meta_from_entries(session_id, base_meta, entries)
+    meta = _recompute_meta_from_entries(session_id, base_meta, entries, bump_updated_at=False)
     return meta, entries
 
 
 def _write_meta_and_entries(file_path: Path, meta: dict[str, Any], entries: list[dict[str, Any]]) -> None:
-    with file_path.open("w", encoding="utf-8") as fp:
+    # 先写临时文件再原子替换：流式期间其他请求（如 /chat_history/file 读取）
+    # 不会读到写了一半的文件，避免并发竞态导致记录丢失。
+    # Windows 上刚写入的临时文件可能被搜索索引/杀软短暂占用，
+    # os.replace 偶发 WinError 5，重试几次规避。
+    tmp_path = file_path.with_name(file_path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fp:
         fp.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
         for entry in entries:
             fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    for attempt in range(6):
+        try:
+            os.replace(tmp_path, file_path)
+            return
+        except OSError:
+            if attempt >= 5:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
+def _delete_path_with_retry(path: Path, *, recursive: bool = False, attempts: int = 6) -> None:
+    """删除文件或目录，带重试。
+
+    与 _write_meta_and_entries 同理：Windows 上文件/目录可能被搜索索引、杀软
+    或刚关闭的句柄短暂占用，首次删除偶发 WinError 5；重试几次规避，
+    仍失败则抛出 OSError 交由上层处理。
+    """
+    for attempt in range(attempts):
+        try:
+            if recursive:
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 class ChatMemoryManager:
@@ -185,6 +311,38 @@ class ChatMemoryManager:
         with self._lock:
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
+        self._recover_pending_round_checkpoint()
+
+    def _recover_pending_round_checkpoint(self) -> None:
+        """进程重启后恢复上次未收尾的轮次（工具调用/思考/工具结果不丢）。
+
+        仅在管理器新建时执行：检查点由活跃轮次逐事件写入，而活跃写进程
+        一定持有缓存的管理器实例——走到新建，即说明写入它的进程已结束，
+        不会误伤仍在进行中的轮次。恢复为 interrupted 状态的历史轮次，
+        user_questions/标题/回放照常可用。
+        """
+        with self._lock:
+            # 新机制：侧车文件（当前轮快照）；兼容清理旧版写入的 _meta 检查点
+            recovered = None
+            try:
+                if self._pending_checkpoint_path.exists():
+                    recovered = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                recovered = None
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            legacy_checkpoint = meta.pop("_pending_round_checkpoint", None)
+            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
+                recovered = legacy_checkpoint
+            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
+                return
+            normalized = dict(recovered)
+            if normalized.get("status") == "running":
+                normalized["status"] = "interrupted"
+            normalized.setdefault("ended_at", normalized.get("started_at"))
+            entries.append(normalized)
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        self._clear_pending_checkpoint()
 
     @property
     def run_task(self) -> bool:
@@ -197,6 +355,14 @@ class ChatMemoryManager:
         """
         self._run_task = value
 
+    async def get_file_text(self) -> str | None:
+        """锁内读取完整 jsonl 文本（文件不存在返回 None），
+        避免与并发写入交替读写读到不完整内容。"""
+        with self._lock:
+            if not self._file_path.exists():
+                return None
+            return self._file_path.read_text(encoding="utf-8")
+
     async def add_chat_history(self, input_text: Any) -> str:
         """
         追加工具调用记录到 JSONL 文件中
@@ -206,7 +372,7 @@ class ChatMemoryManager:
             操作结果字符串
         """
         record: dict[str, Any] = {
-            "timestamp": _now_str()
+            "timestamp": now_str()
         }
         if isinstance(input_text, str):
             record["content"] = input_text
@@ -216,8 +382,74 @@ class ChatMemoryManager:
             record["content"] = str(input_text)
         with self._lock:
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            had_pending_round = self._round_store.pending_round is not None
             completed_round = self._round_store.record_message(record)
+            started_new_round = (
+                not had_pending_round
+                and self._round_store.pending_round is not None
+            )
+            meta_changed = False
+            # 上次进程异常退出后可能留下活动轮次检查点；新轮次开始时清掉，
+            # 避免把上一轮的压缩状态误认成当前任务状态。
+            if started_new_round and "_active_round_compaction" in meta:
+                meta.pop("_active_round_compaction", None)
+                meta_changed = True
             if completed_round is not None:
+                meta.pop("_active_round_compaction", None)
+                # 轮次已收尾：检查点完成使命，连同最终事件一起落盘
+                self._clear_pending_checkpoint()
+                entries.append(completed_round)
+                meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+                _write_meta_and_entries(self._file_path, meta, entries)
+            else:
+                # 收尾前的轮次事件只存在内存，重启/崩溃即丢失（工具调用、
+                # 思考过程、工具结果都是不可再生的数据）。追加后把 pending
+                # 轮次快照写入侧车文件（仅当前轮事件，体量小、原子替换）；
+                # 不做全历史重写——大会话逐事件重写 JSONL 会卡住整个请求。
+                checkpoint = self._round_store.snapshot_pending_round()
+                if checkpoint is not None:
+                    self._write_pending_checkpoint(checkpoint)
+                elif meta_changed:
+                    meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+                    _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
+    @property
+    def _pending_checkpoint_path(self) -> Path:
+        return self._file_path.with_name(self._file_path.name + ".pending")
+
+    def _write_pending_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """侧车检查点：只含当前轮快照，写临时文件后原子替换。
+
+        Windows 上刚写入的文件可能被搜索索引/杀软短暂占用导致 os.replace
+        偶发 WinError 5，与 _write_meta_and_entries 同款重试规避。
+        """
+        tmp_path = self._pending_checkpoint_path.with_name(self._pending_checkpoint_path.name + ".tmp")
+        tmp_path.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
+        last_error: OSError | None = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp_path, self._pending_checkpoint_path)
+                return
+            except OSError as replace_error:
+                last_error = replace_error
+                time.sleep(0.01 * (attempt + 1))
+        raise last_error
+
+    def _clear_pending_checkpoint(self) -> None:
+        try:
+            self._pending_checkpoint_path.unlink()
+        except OSError:
+            pass
+
+    async def stop_current_round(self) -> str:
+        """用户手动停止任务：直接以 stopped 状态收尾当前轮次，不写入"停止任务"假消息。"""
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            completed_round = self._round_store.finalize_round("stopped")
+            if completed_round is not None:
+                meta.pop("_active_round_compaction", None)
+                self._clear_pending_checkpoint()
                 entries.append(completed_round)
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
@@ -232,6 +464,153 @@ class ChatMemoryManager:
         with self._lock:
             return self._round_store.add_usage(usage_total, completion_count)
 
+    async def get_current_round_tool_result_count(self) -> int:
+        """返回当前任务已经记录的工具结果数量，作为单轮压缩游标。"""
+        with self._lock:
+            return self._round_store.current_tool_result_count()
+
+    async def update_current_round_compaction(
+        self,
+        compress_content: str,
+        compress_index: int,
+        compress_usage: dict[str, Any] | None = None,
+        compress_blocks: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """兼容旧调用方：把当前轮累计压缩摘要写成 round done 事件。
+
+        pending round 最终收尾时只会把事件写入 `chat_round.events`；活动期间
+        同步写入 `_meta._active_round_compaction`，避免任务中断时压缩状态完全丢失。
+        """
+        with self._lock:
+            if not self._round_store.update_compaction(
+                compress_content,
+                compress_index,
+                compress_blocks=compress_blocks,
+                compress_usage=compress_usage,
+            ):
+                return "忽略无有效压缩状态"
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            pending_round = self._round_store.pending_round or {}
+            meta["_active_round_compaction"] = {
+                "question": pending_round.get("question", ""),
+                "events": [
+                    event for event in pending_round.get("events", [])
+                    if isinstance(event, dict) and event.get("event") == "context_compaction"
+                ],
+                "started_at": pending_round.get("started_at"),
+            }
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
+    async def add_context_compaction_event(self, payload: dict[str, Any]) -> str:
+        """追加压缩过程事件。
+
+        round scope 写入当前 pending `chat_round.events`，session scope 仍写入独立
+        JSONL 事件行。timestamp 由本方法补充。
+        """
+        if not isinstance(payload, dict) or payload.get("event") != "context_compaction":
+            return "忽略非法压缩事件"
+        record = dict(payload)
+        record.setdefault("timestamp", now_str())
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if record.get("scope") == "round":
+                if not self._round_store.record_compaction_event(record):
+                    return "忽略无进行中轮次或非法压缩事件"
+                pending_round = self._round_store.pending_round or {}
+                meta["_active_round_compaction"] = {
+                    "question": pending_round.get("question", ""),
+                    "events": [
+                        event for event in pending_round.get("events", [])
+                        if isinstance(event, dict) and event.get("event") == "context_compaction"
+                    ],
+                    "started_at": pending_round.get("started_at"),
+                }
+            else:
+                entries.append(record)
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
+    async def find_orphan_compaction_events(self) -> list[dict[str, Any]]:
+        """返回未完成的压缩 start 事件（任务中断遗留：有 start、无对应 done/aborted）。
+
+        压缩结果采用"完成后一次性写入"（context_summary / pending round 的
+        compress 字段），中断时不会留下半成品数据；孤儿 start 仅代表展示层
+        有未闭合的压缩过程条目，由调用方标记 aborted 并在下一次请求按需重新压缩。
+        """
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+        open_starts: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("event") != "context_compaction":
+                continue
+            scope = str(entry.get("scope") or "unknown")
+            phase = entry.get("phase")
+            if phase == "start":
+                open_starts[scope] = entry
+            elif phase in ("done", "aborted"):
+                open_starts.pop(scope, None)
+        active_checkpoint = meta.get("_active_round_compaction")
+        if isinstance(active_checkpoint, dict):
+            for event in active_checkpoint.get("events", []):
+                if not isinstance(event, dict):
+                    continue
+                phase = event.get("phase")
+                if phase == "start":
+                    open_starts["round"] = event
+                elif phase in ("done", "aborted"):
+                    open_starts.pop("round", None)
+        return list(open_starts.values())
+
+    async def mark_compaction_aborted(self, orphan: dict[str, Any]) -> str:
+        """把一个未完成的压缩 start 事件标记为 aborted（前端据此失效对应条目）。"""
+        scope = orphan.get("scope")
+        if scope == "round":
+            with self._lock:
+                meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+                checkpoint = meta.get("_active_round_compaction")
+                if not isinstance(checkpoint, dict):
+                    return "忽略无活动压缩"
+                events = checkpoint.get("events")
+                if not isinstance(events, list):
+                    return "忽略无活动压缩"
+                events.append({
+                    "event": "context_compaction",
+                    "scope": "round",
+                    "phase": "aborted",
+                    "role": "assistant",
+                    "reason": "task_interrupted",
+                    "timestamp": now_str(),
+                })
+                meta["_active_round_compaction"] = {**checkpoint, "events": events}
+                meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+                _write_meta_and_entries(self._file_path, meta, entries)
+            return "记录成功"
+        return await self.add_context_compaction_event({
+            "event": "context_compaction",
+            "scope": scope,
+            "phase": "aborted",
+            "role": "assistant",
+            "reason": "task_interrupted",
+        })
+
+    async def add_history_compression_usage(self, usage: dict[str, Any] | None) -> str:
+        if not usage:
+            return "忽略空压缩 usage"
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            history_usage = meta.get("_history_compress_usage")
+            if not isinstance(history_usage, dict):
+                history_usage = {}
+                meta["_history_compress_usage"] = history_usage
+            if not merge_compression_usage(history_usage, usage):
+                return "忽略空压缩 usage"
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
     async def get_meta(self) -> dict[str, Any]:
         return await self.get_session_meta()
 
@@ -243,6 +622,63 @@ class ChatMemoryManager:
 
     async def get_session_metadata(self) -> dict[str, Any]:
         return await self.get_session_meta()
+
+    async def get_session_todo(self) -> list[dict[str, Any]]:
+        """读取当前任务计划（_meta.todo）；无记录返回空列表。"""
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+        todo = meta.get("todo")
+        return todo if isinstance(todo, list) else []
+
+    async def update_session_todo(self, todos: list[dict[str, Any]]) -> str:
+        """写入当前任务计划（_meta.todo），供前端展示与跨轮系统提示注入。"""
+        if not isinstance(todos, list):
+            raise ValueError("todos 必须是列表")
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["todo"] = todos
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return "记录成功"
+
+    async def update_session_title(self, title: str) -> dict[str, Any]:
+        """
+        更新当前会话首行 _meta 的 title 字段
+        Args:
+            title: 新的会话标题
+        Returns:
+            更新后的元数据字典
+        """
+        new_title = (title or "").strip()
+        if not new_title:
+            raise ValueError("title 不能为空")
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["title"] = new_title
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def update_session_upload_id(self, upload_id: str) -> dict[str, Any]:
+        """
+        把本会话上传文件所在目录名写入首行 _meta 的 upload_id 字段。
+
+        上传目录按上传时前端传入的 session_id 命名（history_files/upload/
+        下的文件夹名），可能与会话文件名不一致；记录后可保证删除会话时
+        能连带清理上传目录（见 delete_chat_session_file）。
+        Args:
+            upload_id: 上传目录名（history_files/upload/ 下的文件夹名）
+        Returns:
+            更新后的元数据字典
+        """
+        upload_id = (upload_id or "").strip()
+        if not upload_id:
+            raise ValueError("upload_id 不能为空")
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["upload_id"] = upload_id
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
 
     async def get_chat_history(self, number: int = -1) -> list[dict[str, Any]]:
         """
@@ -273,47 +709,263 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
 
-    async def get_context_messages(self, max_rounds: int = 6) -> list[dict[str, Any]]:
+    async def get_context_messages(
+        self,
+        max_rounds: int | None = None,
+        max_tool_result_length: int | None = None,
+        minimal: bool = False,
+        recent_questions_token_budget: int | None = None,
+    ) -> list[dict[str, Any]]:
         """
-        获取用于模型上下文的历史消息（按轮次聚合后展开）
+        获取用于模型上下文的历史视图（按 HISTORY_COMPACT_KEEP_ROUNDS 总轮次窗口）。
+
+        窗口语义（keep_rounds = 模型上下文保留的总轮次窗口）：
+        - 未压缩轮次优先占窗口，以完整对话回传（含助手回答、工具调用等），
+          其问题不重复进入保真索引；
+        - 剩余窗口从最新往回分配给已压缩轮次的原始用户问题（保真索引，
+          受 10k token 预算限制，超出从最旧丢弃）；
+        - keep_rounds <= 0 表示无限窗口（仅按阈值压缩）。
+
         Args:
-            max_rounds: 最近保留轮次，<=0 表示全部
+            max_rounds: 总轮次窗口；省略时跟随 HISTORY_COMPACT_KEEP_ROUNDS，
+                <=0 表示无限窗口
+            max_tool_result_length: 窗口内完整轮次的工具结果回传长度
+            minimal: 兼容参数，不再切换已完成历史表示
+            recent_questions_token_budget: 保真问题索引预算；省略时为 10k
         Returns:
-            符合 ChatCompletion messages 结构的消息列表
+            符合 ChatCompletion messages 结构的累计摘要/问题索引/完整轮次消息列表
         """
         if max_rounds is None:
-            max_rounds = 6
+            max_rounds = _default_context_history_rounds()
         if not hasattr(max_rounds, "__int__"):
             raise TypeError("max_rounds 参数必须为整数")
         max_rounds = int(max_rounds)
+        if max_tool_result_length is None:
+            max_tool_result_length = _parse_return_length(
+                _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
+                DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+            )
         with self._lock:
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
-
-        summary_message = _render_context_summary(meta.get("context_summary"))
-        summarized_round_count = 0
         context_summary = _normalize_context_summary(meta.get("context_summary"))
-        if context_summary is not None:
-            summarized_round_count = min(
-                max(0, int(context_summary.get("source_round_count", 0) or 0)),
-                len([row for row in entries if isinstance(row, dict) and row.get("event") == "chat_round"]),
-            )
-
+        summary_message = _render_context_summary(context_summary)
         round_entries = [
             row for row in entries
             if isinstance(row, dict) and row.get("event") == "chat_round"
         ]
-        if summarized_round_count > 0:
-            round_entries = round_entries[summarized_round_count:]
-        if max_rounds > 0:
-            round_entries = round_entries[-max_rounds:]
+        summarized_count = 0
+        if context_summary is not None:
+            try:
+                summarized_count = max(0, int(context_summary.get("source_round_count", 0) or 0))
+            except (TypeError, ValueError):
+                summarized_count = 0
+            if summarized_count > len(round_entries):
+                # 游标失效（历史被删等）：视为无摘要，下次压缩前从原始轮次重建
+                context_summary = None
+                summary_message = None
+                summarized_count = 0
+        if recent_questions_token_budget is None:
+            question_budget = RECENT_QUESTIONS_TOKEN_BUDGET
+        else:
+            try:
+                question_budget = max(256, int(recent_questions_token_budget))
+            except (TypeError, ValueError):
+                question_budget = 10_000
 
         messages: list[dict[str, Any]] = []
         if summary_message:
             messages.append({"role": "system", "content": summary_message})
-        for round_entry in round_entries:
-            messages.extend(_round_entry_to_context_messages(round_entry))
+        if context_summary is not None:
+            # 摘要模式：未压缩轮次完整对话占窗口，已压缩轮次问题按剩余窗口保真
+            # （未压缩轮次的问题不重复进入索引）
+            question_items, raw_rounds = _split_context_window(
+                round_entries, summarized_count, max_rounds, question_budget
+            )
+            recent_questions_message = _render_recent_questions_message(question_items)
+            if recent_questions_message:
+                messages.append(recent_questions_message)
+        else:
+            # 未触发过压缩：按窗口回传最近 N 轮完整对话（最旧的超出窗口舍弃），
+            # 此时没有已压缩轮次，无需问题索引
+            question_items = []
+            raw_rounds = round_entries[-max_rounds:] if max_rounds > 0 else round_entries
+        for round_entry in raw_rounds:
+            messages.extend(
+                _round_entry_to_context_messages(round_entry, max_tool_result_length)
+            )
         return messages
+
+    async def get_context_token_stats(
+        self,
+        max_rounds: int | None = None,
+        max_tool_result_length: int | None = None,
+        tools: list[Any] | None = None,
+        system_prompt_text: str | None = None,
+    ) -> dict[str, Any]:
+        """返回模型上下文构成的 token 统计，供调试/前端展示压缩效果。
+
+        进入摘要模式后，统计的历史部分与 `get_context_messages` 一致：
+        累计摘要 + 已压缩轮次保真问题索引 + 窗口内未压缩轮次完整对话；
+        没有摘要的旧会话暂按原始轮次估算。
+
+        `system_prompt_text` 为运行时系统提示附加文本（工作路径+系统提示），
+        真实请求会追加到首条 system 消息；传入后单独统计并计入请求上下文总额。
+        """
+        if max_rounds is None:
+            max_rounds = _default_context_history_rounds()
+        if not hasattr(max_rounds, "__int__"):
+            raise TypeError("max_rounds 参数必须为整数")
+        max_rounds = int(max_rounds)
+        if max_tool_result_length is None:
+            max_tool_result_length = _parse_return_length(
+                _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
+                DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+            )
+        with self._lock:
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            _write_meta_and_entries(self._file_path, meta, entries)
+            # 流式任务尚未收到 done 时，当前轮仍只存在于 ChatRoundStore.pending_round；
+            # 复制快照供 token_stats 纳入统计，避免轮询只能看到上一轮的旧数据。
+            pending_round = copy.deepcopy(self._round_store.pending_round)
+        context_summary = _normalize_context_summary(meta.get("context_summary"))
+        summary_message = (
+            _render_context_summary(context_summary)
+            if context_summary is not None else None
+        )
+        round_entries = [
+            row for row in entries
+            if isinstance(row, dict) and row.get("event") == "chat_round"
+        ]
+        summarized_round_count = 0
+        if context_summary is not None:
+            try:
+                stored_source_count = max(0, int(context_summary.get("source_round_count", 0) or 0))
+            except (TypeError, ValueError):
+                stored_source_count = 0
+            if stored_source_count > len(round_entries):
+                # token_stats 不能展示一个游标已失效的摘要；下次聊天前会重建它。
+                context_summary = None
+                summary_message = None
+            else:
+                summarized_round_count = stored_source_count
+        # 有摘要后按总轮次窗口切分：未压缩轮次完整回传（占窗口），
+        # 已压缩轮次问题按剩余窗口进入保真索引；没有摘要的旧会话
+        # 暂时保留原始估算，供前端展示并触发首次压缩。
+        summary_only = context_summary is not None
+        if summary_only:
+            question_items, raw_rounds = _split_context_window(
+                round_entries, summarized_round_count, max_rounds
+            )
+            retained_rounds: list[dict[str, Any]] = list(raw_rounds)
+        else:
+            question_items = []
+            retained_rounds = round_entries
+            if max_rounds > 0:
+                retained_rounds = retained_rounds[-max_rounds:]
+        if (
+            isinstance(pending_round, dict)
+            and isinstance(pending_round.get("events"), list)
+            and pending_round.get("events")
+        ):
+            retained_rounds.append(pending_round)
+
+        messages: list[dict[str, Any]] = []
+        if summary_message:
+            messages.append({"role": "system", "content": summary_message})
+        recent_questions_message = (
+            _render_recent_questions_message(question_items)
+            if summary_only else None
+        )
+        if recent_questions_message:
+            messages.append(recent_questions_message)
+        round_tokens: list[dict[str, Any]] = []
+        for round_entry in retained_rounds:
+            round_messages = _round_entry_to_context_messages(
+                round_entry, max_tool_result_length
+            )
+            # 当前轮只有 user 事件时，通用历史格式化器会等待 assistant 内容；
+            # 实时统计仍应计入这条已经送出的用户消息。
+            if (
+                not round_messages
+                and round_entry is pending_round
+                and isinstance(round_entry.get("question"), str)
+                and round_entry.get("question", "").strip()
+            ):
+                round_messages = [{
+                    "role": "user",
+                    "content": round_entry["question"].strip(),
+                }]
+            compress_usage = _round_entry_compression_usage(round_entry)
+            round_tokens.append({
+                "question": round_entry.get("question", ""),
+                "status": round_entry.get("status", ""),
+                "messages": len(round_messages),
+                "tokens": _estimate_messages_tokens(round_messages),
+                "compress_count": (
+                    compress_usage.get("compression_count", 0)
+                    if isinstance(compress_usage, dict) else 0
+                ),
+            })
+            messages.extend(round_messages)
+
+        messages_tokens = _estimate_messages_tokens(messages)
+        tool_definition_tokens = _estimate_tool_definition_tokens(tools)
+        # 运行时系统提示词（工作路径+系统提示）：真实请求追加在首条 system 消息，
+        # 单独统计并计入请求上下文总额，避免低估
+        system_prompt_tokens = (
+            _estimate_text_tokens(system_prompt_text)
+            if isinstance(system_prompt_text, str) and system_prompt_text.strip()
+            else 0
+        )
+        request_context_tokens = (
+            messages_tokens + system_prompt_tokens + tool_definition_tokens
+        )
+        context_token_limit = _resolve_model_max_input_tokens(default=8192)
+
+        compress_usage_total = meta.get("compress_usage")
+        if not isinstance(compress_usage_total, dict):
+            compress_usage_total = {}
+        history_compress_usage = meta.get("_history_compress_usage")
+        history_compress_count = 0
+        if isinstance(history_compress_usage, dict):
+            try:
+                history_compress_count = max(
+                    0, int(history_compress_usage.get("compression_count", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                history_compress_count = 0
+
+        return {
+            "context_token_limit": context_token_limit,
+            "messages_tokens": messages_tokens,
+            "system_prompt_tokens": system_prompt_tokens,
+            "tool_definition_tokens": tool_definition_tokens,
+            "request_context_tokens": request_context_tokens,
+            "estimated_budget_ratio": round(
+                request_context_tokens / context_token_limit, 4
+            ) if context_token_limit > 0 else 0.0,
+            "rounds": {
+                "total": len(round_entries) + (1 if pending_round else 0),
+                "summarized": summarized_round_count,
+                "retained": len(retained_rounds),
+                "max_rounds": max_rounds,
+            },
+            "history_context_mode": "summary_only" if summary_only else "legacy_raw",
+            "raw_history_rounds_sent": (
+                max(0, len(retained_rounds) - (1 if pending_round else 0))
+            ),
+            "has_context_summary": bool(summary_message),
+            "summary_text_length": len(summary_message) if summary_message else 0,
+            "recent_questions_length": (
+                len(recent_questions_message.get("content", ""))
+                if recent_questions_message else 0
+            ),
+            "recent_questions_count": len(question_items) if summary_only else 0,
+            "context_compress_count": compress_usage_total.get("compression_count", 0),
+            "history_compress_count": history_compress_count,
+            "round_tokens": round_tokens,
+        }
 
     async def clear_chat_history(self) -> str:
         """
@@ -368,28 +1020,58 @@ class ChatMemoryManager:
     @staticmethod
     def delete_chat_session_file(session_id: str) -> dict:
         """
-        删除指定 session_id 的 jsonl 文件
+        删除指定 session_id 的 jsonl 文件，并连同该会话上传文件所在目录一并删除。
+
+        - 上传目录名优先取 jsonl 首行 _meta 记录的 upload_id；
+          旧记录无该字段时回退为按 session_id 推导的目录名；
+        - jsonl 与上传目录互不依赖：任一侧存在都会被删除
+          （可顺带清理有上传目录但无聊天文件的孤儿会话）；
+        - 任一删除步骤失败（如 Windows 上文件被占用）都会抛出 OSError，
+          由路由层转换为 HTTP 异常返回给前端。
+
         :param session_id: 会话 ID
-        :return: 操作结果字符串
+        :return: 操作结果字典
+        :raises OSError: 删除失败时抛出
         """
         chat_history_file = _get_chat_history_file(session_id)
+        recorded_upload_id: Any = None
         if chat_history_file.exists():
+            # 先读 _meta 里记录的 upload_id（jsonl 即将删除，需先取出）
             try:
-                chat_history_file.unlink()
-                return {
-                    "state": "succeed",
-                    "describe": f"Session file {session_id}_chat.jsonl deleted"
-                }
-            except OSError as e:
-                return {
-                    "state": "failed",
-                    "describe": f"Failed to delete session file {session_id}_chat.jsonl: {str(e)}"
-                }
-        else:
+                meta, _ = _load_meta_and_entries(chat_history_file, session_id)
+                recorded_upload_id = meta.get("upload_id")
+            except OSError:
+                recorded_upload_id = None
+        deleted_parts: list[str] = []
+        # 1) 删除 jsonl 历史文件与其 pending 检查点侧车
+        if chat_history_file.exists():
+            _delete_path_with_retry(chat_history_file)
+            deleted_parts.append(f"会话文件 {chat_history_file.name}")
+        pending_sidecar = chat_history_file.with_name(chat_history_file.name + ".pending")
+        if pending_sidecar.exists():
+            _delete_path_with_retry(pending_sidecar)
+            deleted_parts.append(f"检查点 {pending_sidecar.name}")
+        # 2) 删除上传目录：优先用记录的 upload_id（需重新清洗，避免畸形值逃逸），
+        #    否则回退为按 session_id 推导的目录名
+        upload_dir_name = ""
+        if recorded_upload_id:
+            upload_dir_name = _safe_session_id(str(recorded_upload_id))
+        if not upload_dir_name:
+            upload_dir_name = _safe_session_id(session_id)
+        if upload_dir_name:
+            upload_dir = UPLOAD_HISTORY_ROOT / upload_dir_name
+            if upload_dir.exists():
+                _delete_path_with_retry(upload_dir, recursive=True)
+                deleted_parts.append(f"上传目录 upload/{upload_dir_name}")
+        if not deleted_parts:
             return {
                 "state": "succeed",
-                "describe": f"Session file {session_id}_chat.jsonl not found"
+                "describe": f"会话文件 {session_id}_chat.jsonl 及其上传目录均不存在",
             }
+        return {
+            "state": "succeed",
+            "describe": "已删除：" + "、".join(deleted_parts),
+        }
 
     @staticmethod
     def delete_chat_session_file_line(session_id: str, startline: int, endline: int) -> dict[str, Any]:
@@ -434,6 +1116,9 @@ class ChatMemoryManager:
                 if index < valid_start or index > valid_end
             ]
             deleted_count = valid_end - valid_start + 1
+            # 删除会改变轮次顺序/数量，旧摘要游标不再可靠；下次聊天前由统一
+            # 跨轮压缩流程从剩余原始轮次重建累计摘要和问题索引。
+            meta["context_summary"] = None
             meta = _recompute_meta_from_entries(manager.session_id, meta, remaining_entries)
             _write_meta_and_entries(manager._file_path, meta, remaining_entries)
         return {
@@ -442,6 +1127,176 @@ class ChatMemoryManager:
             "meta_after": meta,
             "usage_after": meta.get("usage", {})
         }
+
+    @staticmethod
+    def import_jsonl_chat_history(
+        session_id: str,
+        raw_bytes: bytes,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """导入上传的 jsonl 聊天历史文件并写入 history_files 目录。
+
+        流程：
+        - 解析上传字节流；首行若是 `{"_meta": ...}` 则作为基础 meta（`session_id` 字段会被移除）；
+        - 逐行通过 `parse_round_entry` 验证；不合法行直接丢弃；
+        - 目标文件（`<session_id>_chat.jsonl`）已存在且 `overwrite=False`（默认）时，
+          自动追加时间戳另存为 `<session_id>_<时间戳>_chat.jsonl`，避免覆盖旧会话；
+          `overwrite=True` 时强制覆盖目标文件；
+        - 写入后通过 `_recompute_meta_from_entries` 重新计算 user_questions / usage / record_count / completion_count。
+
+        Args:
+            session_id: 目标会话 ID（会先经 normalize_session_id 规整）。
+            raw_bytes: 上传的 jsonl 字节流。
+            overwrite: 是否强制覆盖同名历史文件（默认 False，重名自动另存）。
+
+        Returns:
+            包含 state / session_id（实际写入）/ filename / total_lines / imported_rounds /
+            skipped_lines / collision / meta 等字段的字典。
+        """
+        return _import_jsonl_payload(session_id, raw_bytes, overwrite=overwrite)
+
+
+def _resolve_import_target(
+    session_id: str,
+    overwrite: bool,
+) -> tuple[str, Path, bool]:
+    """解析导入目标文件，处理同名冲突。
+
+    Returns:
+        (实际 session_id, 目标文件路径, 是否发生冲突另存)
+    - overwrite=True：强制写入 `<session_id>_chat.jsonl`（覆盖），collision=False
+    - overwrite=False：目标不存在则直接使用；已存在则追加时间戳
+      另存为 `<session_id>_<时间戳>_chat.jsonl`，collision=True
+    """
+    base_id = normalize_session_id(session_id)
+    target_file = _get_chat_history_file(base_id)
+    if overwrite:
+        return base_id, target_file, False
+    if not target_file.exists():
+        return base_id, target_file, False
+    # 同名冲突：追加时间戳（同一秒再次冲突时递增序号）
+    counter = 0
+    while True:
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if counter:
+            suffix = f"{suffix}_{counter}"
+        candidate_id = f"{base_id}_{suffix}"
+        candidate_file = _get_chat_history_file(candidate_id)
+        if not candidate_file.exists():
+            return candidate_id, candidate_file, True
+        counter += 1
+
+
+def _import_jsonl_payload(
+    session_id: str,
+    raw_bytes: bytes,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """将上传的 jsonl 字节流解析并写入历史文件。
+
+    解析规则：
+    - 跳过空行
+    - 第 1 行若为 `{"_meta": {...}}` 结构，作为基础元数据（其中 session_id 字段会被移除）；
+      否则忽略元数据并以默认 meta 起算
+    - 其余行尝试用 `parse_round_entry` 还原为标准 `chat_round` 条目；
+      无法解析的行直接丢弃并计入 skipped_lines
+    - 目标文件同名且 overwrite=False（默认）时自动追加时间戳另存，避免覆盖旧会话
+    - 全部解析完成后通过 `_recompute_meta_from_entries` 重新聚合 user_questions / usage / record_count / completion_count
+
+    Returns:
+        包含 session_id（实际写入）/ filename / total_lines / imported_rounds /
+        skipped_lines / collision / meta 的字典
+    """
+    if raw_bytes is None:
+        raise ValueError("raw_bytes 不能为空")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # 兼容 GBK/UTF-8-sig 等常见中文编码
+        text = raw_bytes.decode("utf-8-sig", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    total_lines = len(lines)
+    base_meta: dict[str, Any] | None = None
+    candidate_entries: list[dict[str, Any]] = []
+    if lines and _is_meta_record(_safe_parse_jsonl_line(lines[0])):
+        try:
+            first_row = json.loads(lines[0])
+            base_meta = first_row.get("_meta") if isinstance(first_row, dict) else None
+        except json.JSONDecodeError:
+            base_meta = None
+        lines = lines[1:]
+    skipped_lines = 0
+    for line in lines:
+        parsed = _safe_parse_jsonl_line(line)
+        if parsed is None:
+            skipped_lines += 1
+            continue
+        round_entry = parse_round_entry(parsed)
+        if round_entry is None:
+            skipped_lines += 1
+            continue
+        candidate_entries.append(round_entry)
+    actual_session_id, file_path, collision = _resolve_import_target(session_id, overwrite)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    manager = ChatMemoryManager(actual_session_id)
+    with manager._lock:
+        final_entries = list(candidate_entries)
+        merged_meta = _recompute_meta_from_entries(
+            actual_session_id,
+            base_meta,
+            final_entries,
+        )
+        if isinstance(base_meta, dict) and isinstance(base_meta.get("title"), str) and base_meta["title"].strip():
+            merged_meta["title"] = base_meta["title"].strip()
+        imported_summary = (
+            _normalize_context_summary(base_meta.get("context_summary"))
+            if isinstance(base_meta, dict) else None
+        )
+        imported_source_count = 0
+        if imported_summary is not None:
+            try:
+                imported_source_count = int(imported_summary.get("source_round_count", 0) or 0)
+            except (TypeError, ValueError):
+                imported_source_count = 0
+        if imported_summary is not None and 0 <= imported_source_count <= len(candidate_entries):
+            # 保真索引只覆盖已压缩轮次（游标之前），未压缩轮次以完整对话回传
+            imported_question_items, _raw = _split_context_window(
+                candidate_entries, imported_source_count, _default_context_history_rounds()
+            )
+            imported_summary["recent_questions"] = [
+                question for _number, question in imported_question_items
+            ]
+            imported_summary["recent_question_numbers"] = [
+                number for number, _question in imported_question_items
+            ]
+            imported_summary["recent_questions_scope"] = "all_history"
+            merged_meta["context_summary"] = imported_summary
+        else:
+            # 不能证明摘要游标与导入轮次对应时，宁可下次重建，也不要静默跳过历史。
+            merged_meta["context_summary"] = None
+        _write_meta_and_entries(file_path, merged_meta, final_entries)
+    return {
+        "state": "succeed",
+        "session_id": actual_session_id,
+        "filename": file_path.name,
+        "total_lines": total_lines,
+        "imported_rounds": len(candidate_entries),
+        "skipped_lines": skipped_lines,
+        "record_count": merged_meta.get("record_count", len(final_entries)),
+        "completion_count": merged_meta.get("completion_count", 0),
+        "title": merged_meta.get("title"),
+        "overwrite": bool(overwrite),
+        "collision": bool(collision),
+        "meta": merged_meta,
+    }
+
+
+def _safe_parse_jsonl_line(line: str) -> Any:
+    """把单行 jsonl 安全解析为对象；解析失败返回 None。"""
+    try:
+        return json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 # 会话管理器注册表（用于缓存不同 session_id 的管理器实例）
@@ -461,6 +1316,19 @@ async def get_chat_memory_manager(session_id: str) -> ChatMemoryManager:
         if session_id not in _session_managers:
             _session_managers[session_id] = ChatMemoryManager(session_id)
         return _session_managers[session_id]
+
+
+def chat_memory_file_exists(session_id: str) -> bool:
+    """判断会话历史文件是否已存在（只读检查，绝不创建文件/目录）。
+
+    供查询类接口（如 /chat_context/token_stats）在实例化管理器前使用：
+    ChatMemoryManager.__init__ 会 touch 文件并写入 _meta，若查询接口直接
+    get_chat_memory_manager，会让"仅查询"的会话凭空产生空历史文件。
+    """
+    try:
+        return _get_chat_history_file(normalize_session_id(session_id)).exists()
+    except Exception:
+        return False
 
 
 async def cleanup_chat_memory_manager(session_id: str) -> None:

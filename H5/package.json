@@ -1,0 +1,14 @@
+{
+  "name": "ytools-h5",
+  "version": "1.0.0",
+  "private": true,
+  "description": "类似 ChatGPT 风格对话主页（SCSS + 原生 JS）",
+  "scripts": {
+    "build:css": "sass style/scss/main.scss style/css/main.css --style=expanded --no-source-map",
+    "watch:css": "sass style/scss/main.scss style/css/main.css --style=expanded --watch --no-source-map",
+    "test": "node --test \"test_h5/*.test.js\""
+  },
+  "devDependencies": {
+    "sass": "^1.102.0"
+  }
+}

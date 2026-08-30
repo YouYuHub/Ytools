@@ -1,0 +1,728 @@
+// 聊天区：消息 / 思考块 / 工具事件 / 代码块 / Markdown 排版
+//
+// 嵌套约定：折叠块家族（think/tool/compaction/codeblock/md）按 DOM 层级嵌套；
+// .msg-time / .stage-time / .round-usage / .notice-bar 会被 JS 直接挂到
+// #chatInner（不一定在 .msg 内），必须保持顶层扁平。
+
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+// ---------- 消息 ----------
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: msg-in 0.25s ease;
+  scroll-margin-top: 12px;
+
+  // 用户消息：气泡靠右，时间戳右对齐
+  &.msg-user {
+    align-items: flex-end;
+
+    .msg-time {
+      text-align: right;
+    }
+  }
+
+  .msg-bubble {
+    max-width: 90%;
+    background: var(--bg-bubble-user);
+    border-radius: 22px;
+    padding: 10px 18px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .msg-assistant-body {
+    width: 100%;
+    word-break: break-word;
+  }
+}
+
+// ---------- 思考块 ----------
+.think-block {
+  border-left: 2px solid var(--border-strong);
+  padding: 2px 0 2px 14px;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 14px;
+
+  .think-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-tertiary);
+    font-size: 13px;
+    padding: 4px 0;
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+
+    .icon {
+      width: 14px;
+      height: 14px;
+      transition: transform 0.15s ease;
+    }
+  }
+
+  // 展开后箭头转向
+  &.open .think-toggle .icon {
+    transform: rotate(90deg);
+  }
+
+  .think-content {
+    display: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+    opacity: 0.85;
+  }
+
+  // 思考中：三个呼吸小点；结束后才显示下拉箭头
+  .think-dots {
+    display: none;
+    align-items: center;
+    gap: 3px;
+
+    i {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: think-dot 1.2s ease-in-out infinite;
+
+      &:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+
+      &:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+    }
+  }
+
+  &.is-streaming {
+    .think-dots {
+      display: inline-flex;
+    }
+
+    .think-toggle > svg {
+      display: none;
+    }
+  }
+
+  &.open .think-content {
+    display: block;
+  }
+}
+
+@keyframes think-dot {
+
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+
+  50% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+// ---------- 工具调用块（可展开查看输入/输出） ----------
+.tool-block {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  margin: 4px 0;
+  overflow: hidden;
+
+  .tool-block-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    text-align: left;
+    transition: background-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    .icon {
+      width: 15px;
+      height: 15px;
+    }
+  }
+
+  .tool-block-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tool-block-chevron {
+    margin-left: auto;
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  &.open .tool-block-chevron {
+    transform: rotate(180deg);
+  }
+
+  .tool-block-body {
+    display: none;
+    border-top: 1px solid var(--border);
+    padding: 10px 14px 12px;
+  }
+
+  &.open .tool-block-body {
+    display: block;
+  }
+
+  .tool-io-label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin: 6px 0 4px;
+  }
+
+  .tool-io {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    background: var(--bg-code);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    margin: 0;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+}
+
+.tool-spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+// ---------- 时间戳 / 轮次用量 ----------
+// 注意：stage-time / round-usage 由 JS 直接 append 到 #chatInner，不在 .msg 内
+.msg-time {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-bottom: 2px;
+}
+
+.stage-time {
+  align-self: flex-start;
+  margin-top: -16px;
+  margin-bottom: -18px;
+  line-height: 1.35;
+}
+
+.round-usage {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  padding: 2px 4px 0;
+}
+
+// ---------- 上下文压缩进度块 ----------
+.compaction-bar {
+  width: 100%;
+  margin: 4px 0;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  animation: msg-in 0.2s ease;
+
+  .compaction-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 38px;
+    padding: 8px 14px;
+    color: var(--text-secondary);
+    text-align: left;
+    font-size: 13px;
+    transition: background-color 0.15s ease;
+
+    &:not(:disabled):hover {
+      background: var(--bg-hover);
+    }
+
+    &:disabled {
+      cursor: default;
+    }
+
+    .icon {
+      width: 15px;
+      height: 15px;
+    }
+  }
+
+  &.is-running .compaction-icon {
+    animation: spin 1.2s linear infinite;
+  }
+
+  &.is-done .compaction-icon {
+    color: var(--text-tertiary);
+  }
+
+  .compaction-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .compaction-chevron {
+    margin-left: auto;
+    flex-shrink: 0;
+    transition: transform 0.15s ease;
+  }
+
+  &.open .compaction-chevron {
+    transform: rotate(180deg);
+  }
+
+  .compaction-body {
+    display: none;
+    padding: 0 14px 12px;
+    border-top: 1px solid var(--border);
+  }
+
+  &.open .compaction-body {
+    display: block;
+  }
+
+  .compaction-label {
+    margin: 10px 0 4px;
+    color: var(--text-tertiary);
+    font-size: 12px;
+  }
+
+  .compaction-preview {
+    max-height: 180px;
+    margin: 0;
+    padding: 8px 10px;
+    overflow: auto;
+    border-radius: var(--radius-sm);
+    background: var(--bg-code);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  // 压缩模型流式思考过程：弱化显示、更矮的滚动区
+  .compaction-think {
+    max-height: 140px;
+    color: var(--text-tertiary);
+  }
+
+  .compaction-detail,
+  .compaction-usage {
+    margin-top: 8px;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .compaction-usage {
+    color: var(--text-secondary);
+  }
+
+  &.is-running .compaction-detail {
+    color: var(--text-tertiary);
+  }
+}
+
+// ---------- 警告条 ----------
+// notice-bar 会同时出现在 .msg 内与 #chatInner 直下，保持顶层扁平
+.notice-bar {
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+// ---------- 代码块（语言标题栏 + 复制） ----------
+.codeblock {
+  position: relative;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin: 0 0 12px;
+  // 用 clip 而非 hidden：hidden 会建立滚动容器，导致复制按钮的 sticky 相对代码块自身钉住而失效
+  overflow: clip;
+
+  // 标题栏：左侧语言徽标 + 右侧复制按钮组成稳定的工具栏；
+  // 复制按钮是 .codeblock 的直系子元素——sticky 的包含块是整个代码块（够高，可随页面滚动钉住）
+  .codeblock-head {
+    height: 34px;
+    display: flex;
+    align-items: center;
+    padding: 0 clamp(12px, 2vw, 18px);
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--bg-hover), transparent);
+  }
+
+  .codeblock-lang {
+    display: inline-flex;
+    align-items: center;
+    // gap: 6px;
+    min-width: 0;
+    max-width: min(220px, calc(50% - 48px));
+    height: 22px;
+    // padding: 0 6px;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 18px;
+    letter-spacing: 0.02em;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    // border: 1px solid var(--border);
+    border-radius: 7px;
+    background: transparent;
+
+    &::before {
+      content: "";
+      flex: 0 0 5px;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      // background: var(--text-tertiary);
+    }
+  }
+
+  .copy-btn {
+    // 正常态靠右，形成与左侧语言徽标的左右工具栏；钉住态由 JS 一次性平移到代码块中线，避开 topbar 分享按钮
+    position: sticky;
+    top: 8px;
+    z-index: 5;
+    width: fit-content;
+    max-width: calc(100% - 24px);
+    min-width: 0;
+    height: 30px;
+    line-height: 1;
+    // 负上边距把按钮拉回标题栏同一水平带（语言标签在左、按钮在右）
+    margin: -30px 12px 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 18px;
+    color: var(--text-secondary);
+    padding: 2px 9px;
+    // border: 1px solid var(--border);
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    transition: transform 0.16s ease, background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+      border-color: var(--border-strong);
+    }
+
+    .icon {
+      flex: 0 0 auto;
+      width: 18px;
+      height: 18px;
+    }
+
+    .copy-label {
+      margin-top: -2px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    // 钉住态：右上角会被页面固定分享按钮占用，改为代码块水平中线
+    &.is-pinned {
+      transform: translateX(var(--pin-shift, 0px));
+    }
+
+    // 代码块可见部分（下边框可见高度）小于按钮自身高度时隐藏
+    &.is-hidden {
+      visibility: hidden;
+    }
+  }
+
+  pre {
+    padding: 10px 16px 14px;
+    // 限制代码块高度：超长代码在块内滚动，不把整页撑到无限高。
+    // vh 随窗口/屏幕尺寸变化自动重算（改窗口、换屏、软键盘弹出都跟随）；
+    // 滚动容器是 pre 自身，.codeblock 保持 overflow: clip，复制按钮的
+    // sticky 钉住行为不受影响
+    max-height: 70vh;
+    overflow: auto;
+    // 滚到代码区边界时不把滚动传导给页面，阅读长代码时滚动位置更稳定
+    overscroll-behavior: contain;
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.6;
+      // 覆盖 .md code 行内代码样式（padding/背景/圆角）对块级代码的泄漏，
+      // 否则代码每行会多出约 1 字符的左内边距
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .codeblock-head {
+      height: 32px;
+      padding: 0 10px;
+    }
+
+    .codeblock-lang {
+      max-width: calc(50% - 28px);
+      padding: 0 7px;
+    }
+
+    .copy-btn {
+      height: 28px;
+      margin-top: -28px;
+      margin-right: 8px;
+      padding: 3px 7px;
+      gap: 0;
+
+      .copy-label {
+        display: none;
+      }
+    }
+
+    pre {
+      padding: 8px 10px 12px;
+    }
+  }
+}
+
+// 流式阶段 DOM 会按 chunk 重建，禁止位移动画，避免重建瞬间把位置过渡成肉眼可见的闪切
+// （.msg-cursor 是 .copy-btn 的远祖，无法收进上面的嵌套块，保持独立规则）
+.msg-cursor .copy-btn {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+// ---------- Markdown ----------
+.md {
+  p {
+    margin: 0 0 12px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    margin: 20px 0 10px;
+    line-height: 1.4;
+  }
+
+  h1 {
+    font-size: 22px;
+  }
+
+  h2 {
+    font-size: 19px;
+  }
+
+  h3 {
+    font-size: 17px;
+  }
+
+  h4 {
+    font-size: 16px;
+  }
+
+  ul,
+  ol {
+    margin: 0 0 12px;
+    padding-left: 22px;
+  }
+
+  li {
+    margin: 4px 0;
+  }
+
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.86em;
+    background: var(--bg-code);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  blockquote {
+    border-left: 3px solid var(--border-strong);
+    padding-left: 14px;
+    margin: 0 0 12px;
+    color: var(--text-secondary);
+  }
+
+  table {
+    border-collapse: collapse;
+    margin: 0 0 12px;
+    width: 100%;
+    font-size: 14px;
+  }
+
+  th,
+  td {
+    border: 1px solid var(--border-strong);
+    padding: 7px 12px;
+    text-align: left;
+  }
+
+  th {
+    background: var(--bg-code);
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border-strong);
+    margin: 16px 0;
+  }
+}
+
+// 用户气泡内的附件图片（多模态消息与其历史回放）
+.msg-user-media {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+
+  .msg-user-media-thumb {
+    max-width: 180px;
+    max-height: 140px;
+    border-radius: 10px;
+    object-fit: cover;
+    display: block;
+  }
+}
+
+// 用户气泡内的音频/视频徽标（不内联播放，标注附件类型与名称）
+.msg-user-media-audio,
+.msg-user-media-video {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// 用户气泡内的文档徽标（file_memory 文档随消息发送时的展示块；
+// 内容经系统提示词注入，不进消息 content 部件）
+.msg-user-media-doc {
+  display: inline-flex;
+  align-items: center;
+  max-width: 240px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// ---------- md 表格：独立水平滚动块 + hover 复制操作 ----------
+.md-table-block {
+  position: relative;
+  margin: 0 0 12px;
+}
+
+.md-table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  // 表格自身不再带外边距（由滚动块统一控制），宽度超限时容器内滚动
+  table {
+    margin: 0;
+  }
+}
+
+.md-table-actions {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.md-table-block:hover .md-table-actions {
+  opacity: 1;
+}
+
+.md-table-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-composer);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--bg-hover);
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+}
