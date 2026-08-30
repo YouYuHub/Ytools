@@ -20,7 +20,7 @@
   },
   "DeepSeek Completions": {
     "vendor": "deepseek",
-    "apiKey": "sk-8500d1b9eb864472873d68d742b6981d",
+    "apiKey": "sk-deepseek-api-key",
     "apiType": "chat-completions",
     "models": {
       "Deepseek V4 Flash": {
@@ -43,7 +43,7 @@
   },
   "ZaiOrg Completions": {
     "vendor": "zai-org",
-    "apiKey": "sk-47f2721927cd49daa90519fdfcac27a1.uCNtnLUbyK2Stz9r",
+    "apiKey": "sk-zaiOrg-api-key",
     "apiType": "chat-completions",
     "models": {
       "GLM 5.3": {
@@ -66,7 +66,7 @@
   },
   "ApiYi Claude": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-5hy8CxLaeSBHbvN33a22C3Ad05254c9287D182772aFc7c25",
+    "apiKey": "sk-apiYi-api-key",
     "apiType": "messages",
     "models": {
       "Claude Opus 4.8": {
@@ -81,7 +81,7 @@
   },
   "Qwen Completions": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-ws-H.ERIPRHL.BEn5.MEUCIQCV_xiEF4o8znEZf2swBfTBYVbFyd268ogBMzf7wwmzQAIgFzUIGbjHaPLnB2JU5_soPOZTs7VFuoiA1dzJN66Uf8Q",
+    "apiKey": "sk-ws-qwen-api-key",
     "apiType": "chat-completions",
     "models": {
       "GLM 5.2": {
@@ -128,7 +128,7 @@
   },
   "OpenCode Message": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-UrqQMlHKTxWFX0rMHnIIyyfHnIemztMm1H5tsxyOFVH4H02KtIbMOilIWjtv52BF",
+    "apiKey": "sk-opencode-api-key",
     "apiType": "messages",
     "models": {
       "Qwen3.7 Max": {
@@ -159,7 +159,7 @@
   },
   "OpenCode Completions": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-UrqQMlHKTxWFX0rMHnIIyyfHnIemztMm1H5tsxyOFVH4H02KtIbMOilIWjtv52BF",
+    "apiKey": "sk-opencode-api-key",
     "apiType": "chat-completions",
     "models": {
       "GPT-5.6 Luna": {
