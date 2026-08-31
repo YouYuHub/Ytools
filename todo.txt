@@ -1,0 +1,6 @@
+1、文件 diff 逻辑实现。困难，还需要向微软多学习
+2、subagent实现，简单，后续考虑
+3、增加全局线程/进程，实时轮询读取 setting/mcp_servers.json 文件也可以增加读取 models.json，模型可自己写工具自己使用(马上可用)，简单，排队后续
+4、messages、responses 等 api 适配，中等难度，改动大，带 completions api 调试成熟在补
+5、任务进行中向模型补充说明或队列消息，简单，排队
+
