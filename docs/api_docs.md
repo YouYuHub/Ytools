@@ -146,6 +146,8 @@
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?}` | `{state, message, current, effective_parameter, selection}`；`current` 含 `model_id` 与 `api_type`；`effective_parameter` 为按回退链解析后的生效参数；组合不存在报 400 |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
+| /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时 |
+| /chat_config/mcp_tools | POST | Body `{call_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
 | /chat_config/tool_selection | GET | - | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]` |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}}` | `{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置（否则 400）；全量替换语义，未提及的已配置服务保存为 `[]`；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键） |
 
@@ -163,6 +165,22 @@
 - `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 2048）：本轮思考过程（`reasoning_content`）随带工具调用的 assistant 消息回传时保留末尾 N 字符。
 - `tool_result_max_length`（对应 env `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH`，默认 0）：后端历史轮次重建上下文时，单个工具结果回传前 N 字符；回传格式符合 Chat Completions 规范（`assistant.tool_calls` → `tool.tool_call_id`）。
 - 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。
+
+### MCP 工具执行超时配置
+
+`GET/POST /chat_config/mcp_tools` 控制单次 MCP 工具调用的总超时，覆盖连接服务器、初始化会话和实际调用过程。配置写入项目 `.env` 的 `MCP_TOOL_CALL_TIMEOUT_SECONDS`，并同步运行时内存，下一次工具调用立即使用新值：
+
+```json
+{
+  "call_timeout_seconds": 300
+}
+```
+
+- 正数：超过指定秒数后中止本次调用，并将超时错误作为工具结果反馈给模型；
+- `0`：不设置超时，工具若自身永久阻塞仍可能无法返回，不建议用于不可控的本地终端工具；
+- 负数：请求接口返回 400，不会覆盖已有配置。
+
+工具执行已放入工作线程，因此工具阻塞期间事件循环仍可处理 `GET /chat_context/token_stats` 和 `POST /stop_chat`。手动停止会同时设置会话停止标记、取消后台生成任务并等待其完成收尾；正在执行的同步工具线程无法被 Python 强制杀死，会由上述超时配置最终释放，推荐将超时设置为合理的正数。
 
 ### 模型选择（三种模型 + 参数）
 

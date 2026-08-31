@@ -207,6 +207,25 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
+  /**
+   * 获取 MCP 工具执行配置（单次工具执行超时秒数）
+   */
+  function getMcpToolConfig() {
+    return request("/chat_config/mcp_tools");
+  }
+
+  /**
+   * 更新 MCP 工具执行超时秒数
+   * @param {{call_timeout_seconds: number}} config 0=不限制，正数=超时秒数
+   */
+  function updateMcpToolConfig(config) {
+    return request("/chat_config/mcp_tools", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
   // ---------- 停止 ----------
   function stopChat(sessionId) {
     return request("/stop_chat?session_id=" + encodeURIComponent(sessionId || "default"), { method: "POST" });

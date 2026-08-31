@@ -1,6 +1,13 @@
+import asyncio
 import unittest
+from unittest.mock import patch
 
-from factory.agent_runtime.tool_executor import normalize_tool_calls, parse_tool_call, prepare_tool_execution
+from factory.agent_runtime.tool_executor import (
+    _invoke_tool_function,
+    normalize_tool_calls,
+    parse_tool_call,
+    prepare_tool_execution,
+)
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -59,6 +66,15 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIsNotNone(plan.over_task_call)
         self.assertEqual(plan.parsed_tools[0][2], "format_current_time")
         self.assertFalse(plan.has_parse_error)
+
+    def test_invoke_tool_function_honors_configured_timeout(self):
+        async def slow_call(**_kwargs):
+            await asyncio.sleep(0.05)
+
+        with patch("factory.agent_runtime.tool_executor.load_var", return_value="0.01"), \
+                patch("factory.agent_runtime.tool_executor.call_mcp_tool", slow_call):
+            with self.assertRaises(TimeoutError):
+                _invoke_tool_function("slow_tool", {}, {"slow_tool": "server"})
 
 
 if __name__ == "__main__":

@@ -139,6 +139,7 @@ agent_tool_sse/
 - **切换工作目录**：`POST /change_chat_dir` → `os.chdir()` + 持久化 CHAT_WORK_DIR 到 .env
 - **历史压缩参数**：`POST /chat_config/history_compaction` → 跨轮保留数/触发比例/每次压缩轮数/单轮压缩比例（ratio）与摘要预算比例/超大拒绝系数与上限；单轮阈值由聊天与压缩模型窗口及比例共同决定；压缩模型由 models/select（role=compaction_model）统一管理
 - **回传长度**：`POST /chat_config/context_return` → 思考过程（reasoning_content）与历史工具结果的最大回传长度（0=不回传、负数=全部、正数=截断），写回 .env 即时生效
+- **MCP 工具超时**：`GET/POST /chat_config/mcp_tools` → 配置单次 MCP 工具调用（连接/初始化/执行全过程）的超时秒数，写入 `MCP_TOOL_CALL_TIMEOUT_SECONDS`；正数超时后返回工具错误，0 表示不限制。工具执行在工作线程中，停止接口会取消后台生成任务并等待收尾
 
 ---
 

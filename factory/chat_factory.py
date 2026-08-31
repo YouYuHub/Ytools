@@ -18,7 +18,11 @@ from config import (
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_current_dir,
 )
-from memory.chat_memory import get_chat_memory_manager, cleanup_chat_memory_manager
+from memory.chat_memory import (
+    get_chat_memory_manager,
+    cleanup_chat_memory_manager,
+    normalize_session_id,
+)
 from memory.file_memory import (
     cleanup_file_memory_manager,
     get_file_memory_manager,
@@ -328,6 +332,7 @@ class _SessionStream:
         self.round_start_seq = 0  # 当前生成轮次的第一条事件序号（重连回放起点）
         self.done = False
         self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
+        self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.cond = asyncio.Condition()
 
     def emit(self, chunk: str) -> None:
@@ -1207,12 +1212,17 @@ async def _run_chat_generation(
                 else:
                     external_parsed_tools.append((idx, tc, tn, ta))
             tool_results = []
-            # 使用线程池并发执行 MCP 工具
+            # 使用线程池并发执行 MCP 工具。
+            # execute_tool_round 是同步阻塞函数（内部 ThreadPoolExecutor +
+            # future.result 等待），必须放到工作线程执行：直接在事件循环里
+            # 调用会冻结整个服务（工具卡住时 token_stats/stop_chat 等所有
+            # 请求无响应），手动停止也无法生效。
             if external_parsed_tools:
                 max_workers = min(int(load_var(
                     "ONE_TASK_MAX_WORKERS", 3)),
                     len(external_parsed_tools))  # 默认最多 3 个线程
-                tool_results.extend(execute_tool_round(
+                tool_results.extend(await asyncio.to_thread(
+                    execute_tool_round,
                     parsed_tools=external_parsed_tools,
                     tool_mcp_servers=round_tool_servers,
                     max_workers=max_workers,
@@ -1395,9 +1405,18 @@ async def _run_chat_generation(
         except Exception as exc:
             print(f"[WARN] 结束后的历史压缩跳过：{exc}")
     except asyncio.CancelledError:
-        # 服务端关停或被新消息打断：尽力把已生成内容落盘后重新抛出
+        # 服务端关停/新消息打断/用户手动停止取消：尽力把已生成内容落盘。
+        # 手动停止（stream.user_stop_requested）时以 stopped 状态收尾轮次，
+        # 与生成流中的优雅停止路径同构；其余取消保持 interrupted 语义
+        # （error 事件落盘，进程重启后同样可恢复）。
         try:
-            await session_chat_memory.add_chat_history({"role": "assistant", "error": "生成任务已取消（新消息打断或服务停止）"})
+            if getattr(stream, "user_stop_requested", False):
+                await session_chat_memory.stop_current_round()
+            else:
+                await session_chat_memory.add_chat_history({
+                    "role": "assistant",
+                    "error": "生成任务已取消（新消息打断或服务停止）",
+                })
         except Exception:
             pass
         raise
@@ -1442,6 +1461,9 @@ async def tool_chat_server(
         # 事件收尾当前轮次并落盘已积累的工具调用/思考，避免新旧两个生成
         # 循环交错写入同一 pending 轮次（仅靠 run_task 标记存在竞态窗口：
         # 新任务会把标记置回 True，旧循环可能继续运行）。
+        # 新消息打断不是手动停止：先清掉可能残留的 user_stop_requested，
+        # 保证旧任务按 interrupted 语义落盘。
+        stream.user_stop_requested = False
         old_task = stream.task
         try:
             (await get_chat_memory_manager(session_id)).run_task = False
@@ -1490,8 +1512,34 @@ async def tool_chat_server(
 
 
 async def stop_chat_task(session_id):
-    ''' 手动优雅停止当前会话的聊天任务 '''
+    ''' 手动停止当前会话的聊天任务。
+
+    两步停止：
+    1. 置 run_task=False：生成循环在下一次检查点（流式事件/工具结果处理）主动退出；
+    2. 取消后台生成任务（asyncio.Task.cancel）：工具执行已挪到工作线程，事件循环
+       不再被阻塞，即使当前正卡在工具调用上，取消也能在 await 点生效并触发
+       CancelledError 收尾（user_stop_requested 标记使其按"手动停止"落盘）。
+    取消只作用于生成任务本身，不影响 SSE 消费端连接。
+    '''
+    session_id = normalize_session_id(session_id)
     try:
         (await get_chat_memory_manager(session_id)).run_task = False
-    except Exception as e:
-        raise e
+    except Exception:
+        pass
+    stream = _get_session_stream(session_id)
+    if stream is None:
+        return
+    stream.user_stop_requested = True
+    task = stream.task
+    if task is not None and not task.done():
+        task.cancel()
+        # 不要在这里立即返回：调用方需要确认后台任务已经退出，避免停止后
+        # 仍有 finally/历史写入在后台运行，重载或启动下一轮时与旧任务交错。
+        # 工具执行在工作线程中时，cancel 会先让生成协程退出；工具线程本身
+        # 由其超时配置收尾，不再阻塞本请求的事件循环。
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"[WARN] 停止会话任务时忽略后台异常: {exc}")

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from config import (
     DEFAULT_HISTORY_TRIGGER_RATIO,
     DEFAULT_MAX_OVERSIZED_REJECTIONS,
+    DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
     DEFAULT_OVERSIZED_REJECT_FACTOR,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUMMARY_BUDGET_RATIO,
@@ -23,6 +24,7 @@ from config import (
     HistoryCompactionConfig,
     ChatModelSelection,
     ContextReturnConfig,
+    McpToolConfig,
     McpToolSelection,
 )
 import env_manager
@@ -270,6 +272,73 @@ async def update_context_return_config(payload: ContextReturnConfig):
         "updated": updated,
         "config": _context_return_config_payload(),
         "memory_state": _context_return_memory_state(),
+    })
+
+
+# ---------- MCP 工具执行配置 ----------
+
+_MCP_TOOL_ENV_NAME = "MCP_TOOL_CALL_TIMEOUT_SECONDS"
+
+
+def _parse_tool_call_timeout(value: Any, default: float) -> float:
+    """解析工具执行超时秒数；非法或负数回退默认值（0 合法=不限制）。"""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if parsed >= 0 else float(default)
+
+
+def _mcp_tool_config_payload() -> dict:
+    return {
+        "call_timeout_seconds": _parse_tool_call_timeout(
+            load_var(_MCP_TOOL_ENV_NAME, DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS),
+            DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+        ),
+        "defaults": {
+            "call_timeout_seconds": DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+        },
+        "semantics": {
+            "0": "不限制超时（工具可能永久阻塞）",
+            "positive": "单次工具执行（含连接/初始化/调用）超过 N 秒后中止，"
+                        "超时错误会作为工具结果反馈给模型",
+        },
+        "env_names": {"call_timeout_seconds": _MCP_TOOL_ENV_NAME},
+        "memory_state": env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+    }
+
+
+@api_chat_config_router.get("/chat_config/mcp_tools")
+async def get_mcp_tool_config():
+    """获取 MCP 工具执行超时配置。"""
+    return JSONResponse(content=_mcp_tool_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/mcp_tools")
+async def update_mcp_tool_config(payload: McpToolConfig):
+    """实时更新 MCP 工具执行超时并持久化。
+
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次工具调用立即生效
+    - 0 表示不限制（保持旧行为，工具卡死时只能靠手动停止取消任务）
+    """
+    timeout_seconds = _parse_tool_call_timeout(
+        payload.call_timeout_seconds, DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS
+    )
+    if payload.call_timeout_seconds < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="call_timeout_seconds 不能为负数；0 表示不限制，正数为超时秒数",
+        )
+    try:
+        updated = set_env_vars({
+            _MCP_TOOL_ENV_NAME: timeout_seconds,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content={
+        "state": "succeed",
+        "updated": updated,
+        "config": _mcp_tool_config_payload(),
     })
 
 

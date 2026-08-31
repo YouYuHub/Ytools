@@ -423,6 +423,10 @@
                         <span>工具结果回传长度<small>0=不回传 · 负数=全部 · 正数=保留开头 N 字符</small></span>
                         <input id="toolResultMaxLength" type="number" step="1">
                     </label>
+                    <label class="chat-setting-field">
+                        <span>工具执行超时（秒）<small>单次 MCP 工具执行超过该秒数后中止并反馈模型；0=不限制</small></span>
+                        <input id="toolCallTimeoutSeconds" type="number" min="0" step="1">
+                    </label>
                 </section>
                 <section class="chat-settings-section">
                     <h3>历史压缩策略</h3>

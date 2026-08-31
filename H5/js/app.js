@@ -161,6 +161,7 @@
   const chatSettingsReset = $("#chatSettingsReset");
   const reasoningMaxLength = $("#reasoningMaxLength");
   const toolResultMaxLength = $("#toolResultMaxLength");
+  const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
   const keepRounds = $("#keepRounds");
   const triggerRatio = $("#triggerRatio");
   const summaryBudgetRatio = $("#summaryBudgetRatio");
@@ -196,6 +197,7 @@
   const CHAT_SETTINGS_DEFAULTS = {
     reasoning_max_length: -1,
     tool_result_max_length: -1,
+    call_timeout_seconds: 300,
     keep_rounds: 20,
     trigger_ratio: 0.8,
     summary_budget_ratio: 0.2,
@@ -2922,11 +2924,14 @@
     const results = await Promise.all([
       API.getContextReturnConfig().catch(function () { return null; }),
       API.getHistoryCompactionConfig().catch(function () { return null; }),
+      API.getMcpToolConfig().catch(function () { return null; }),
     ]);
     chatSettingsConfirm.disabled = false;
     const ctx = results[0];
     const comp = results[1];
-    const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, comp && comp.defaults || {});
+    const mcp = results[2];
+    const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, comp && comp.defaults || {},
+      mcp && mcp.defaults || {});
     if (ctx && ctx.defaults) {
       Object.assign(defaults, ctx.defaults);
     }
@@ -2934,13 +2939,17 @@
     // 加载失败时回退到后端文档默认值，用户仍可编辑保存
     reasoningMaxLength.value = ctx && ctx.reasoning_max_length != null ? ctx.reasoning_max_length : defaults.reasoning_max_length;
     toolResultMaxLength.value = ctx && ctx.tool_result_max_length != null ? ctx.tool_result_max_length : defaults.tool_result_max_length;
+    toolCallTimeoutSeconds.value = mcp && mcp.call_timeout_seconds != null
+      ? mcp.call_timeout_seconds : defaults.call_timeout_seconds;
     keepRounds.value = comp && comp.keep_rounds != null ? comp.keep_rounds : defaults.keep_rounds;
     triggerRatio.value = comp && comp.trigger_ratio != null ? comp.trigger_ratio : defaults.trigger_ratio;
     summaryBudgetRatio.value = comp && comp.summary_budget_ratio != null ? comp.summary_budget_ratio : defaults.summary_budget_ratio;
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
-    if (!ctx || !comp) {
-      toast((ctx ? "" : "回传长度配置加载失败；") + (comp ? "" : "压缩策略配置加载失败"));
+    if (!ctx || !comp || !mcp) {
+      toast((ctx ? "" : "回传长度配置加载失败；") +
+        (comp ? "" : "压缩策略配置加载失败；") +
+        (mcp ? "" : "MCP 工具超时配置加载失败"));
     }
   }
 
@@ -2953,6 +2962,7 @@
     const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, state.chatSettingsDefaults || {});
     reasoningMaxLength.value = defaults.reasoning_max_length;
     toolResultMaxLength.value = defaults.tool_result_max_length;
+    toolCallTimeoutSeconds.value = defaults.call_timeout_seconds;
     keepRounds.value = defaults.keep_rounds;
     triggerRatio.value = defaults.trigger_ratio;
     summaryBudgetRatio.value = defaults.summary_budget_ratio;
@@ -2968,11 +2978,12 @@
   // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
   // - 触发比例/摘要预算比例/连续拒绝上限：>0
-  function collectInvalidChatSettings(ctxConfig, compConfig) {
+  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig) {
     const isNum = function (v) { return v != null && Number.isFinite(v); };
     const rows = [
       ["思考过程回传长度", ctxConfig.reasoning_max_length, function (v) { return isNum(v); }],
       ["工具结果回传长度", ctxConfig.tool_result_max_length, function (v) { return isNum(v); }],
+      ["工具执行超时", mcpConfig.call_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
       ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
       ["触发比例", compConfig.trigger_ratio, function (v) { return isNum(v) && v > 0; }],
       ["摘要预算比例", compConfig.summary_budget_ratio, function (v) { return isNum(v) && v > 0; }],
@@ -2994,7 +3005,10 @@
       oversized_reject_factor: readSettingNumber(oversizedRejectFactor),
       max_oversized_rejections: readSettingNumber(maxOversizedRejections),
     };
-    const invalid = collectInvalidChatSettings(ctxConfig, compConfig);
+    const mcpConfig = {
+      call_timeout_seconds: readSettingNumber(toolCallTimeoutSeconds),
+    };
+    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig);
     if (invalid.length) {
       toast("请填写有效数值：" + invalid.join("、"));
       return;
@@ -3003,6 +3017,7 @@
     const results = await Promise.allSettled([
       API.updateContextReturnConfig(ctxConfig),
       API.updateHistoryCompactionConfig(compConfig),
+      API.updateMcpToolConfig(mcpConfig),
     ]);
     chatSettingsConfirm.disabled = false;
     const failed = results.filter(function (r) { return r.status === "rejected"; });

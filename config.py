@@ -23,6 +23,7 @@ DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模�
 DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务
 DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符
 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
+DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制
 
 
 
@@ -129,6 +130,15 @@ class ContextReturnConfig(BaseModel):
     tool_result_max_length: int = Field(
         DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
         description="历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符",
+    )
+
+
+class McpToolConfig(BaseModel):
+    """MCP 工具执行配置。"""
+
+    call_timeout_seconds: float = Field(
+        DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+        description="MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制",
     )
 
 

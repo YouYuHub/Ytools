@@ -463,6 +463,29 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env_vars.get("REASONING_RETURN_MAX_LENGTH"), "0")
         self.assertEqual(env_vars.get("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH"), "-1")
 
+    async def test_mcp_tool_timeout_config_get_and_post(self) -> None:
+        before = await self.router.get_mcp_tool_config()
+        before_body = json.loads(before.body.decode("utf-8"))
+        self.assertEqual(before.status_code, 200)
+        self.assertEqual(before_body["call_timeout_seconds"], 300)
+        self.assertEqual(before_body["env_names"]["call_timeout_seconds"], "MCP_TOOL_CALL_TIMEOUT_SECONDS")
+
+        response = await self.router.update_mcp_tool_config(
+            self.router.McpToolConfig(call_timeout_seconds=12)
+        )
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["config"]["call_timeout_seconds"], 12)
+        self.assertEqual(body["memory_state"], "12.0")
+        self.assertIn("MCP_TOOL_CALL_TIMEOUT_SECONDS=12.0", (self._temp_path / ".env").read_text(encoding="utf-8"))
+
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            await self.router.update_mcp_tool_config(
+                self.router.McpToolConfig(call_timeout_seconds=-1)
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

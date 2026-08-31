@@ -104,6 +104,7 @@ H5/
 | 模型配置 | `getModels(role)` / `selectModel(provider, model, role, parameter)` | `/chat_config/models[/select]` |
 | 聊天设置 | `getHistoryCompactionConfig` / `updateHistoryCompactionConfig` / `getContextReturnConfig` / `updateContextReturnConfig` | `/chat_config/history_compaction`、`/chat_config/context_return` |
 | 工作目录 | `getWorkDirConfig` / `changeChatDir` | `/chat_config/work_dir`、`/change_chat_dir` |
+| MCP 工具执行 | `getMcpToolConfig` / `updateMcpToolConfig` | `/chat_config/mcp_tools` |
 | 文件 | `uploadSessionFiles` / `getSessionFiles` / `deleteSessionFile` | `/file/*` |
 | 控制 | `stopChat(sessionId)` | `/stop_chat` |
 | 聊天流 | `chatStream(payload, onEvent, signal)` | `POST /chat_with_tool`（SSE） |
@@ -177,7 +178,7 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | 输入区（app.js:1541） | textarea 自增高；Enter 发送 / Shift 换行（排除中文输入法组合态）；发送/语音/停止三态按钮只反映当前会话状态；建议 chip 点击即发送 |
 | 模型参数面板 enhancePanel（app.js:1596） | boost 按钮开关；三角色选项卡（聊天模型/压缩模型/标题模型）；自绘模型 picker 按 provider 分组，附能力标签（视觉/工具）与 api_type/url；选新模型未手调过 max tokens 时随其 max_output_tokens 重设范围；任一参数改动置 dirty，「恢复默认」按 api_type 协议预设 + 角色默认；确定时仅 dirty 才组装 parameter 提交 `selectModel`（responses 协议字段为 max_output_tokens） |
 | “+”功能菜单（app.js:1924） | 上传文件 / 选择工具 / 聊天设置三个入口 |
-| 聊天设置弹窗（app.js:1941） | 并行读写两组配置：回传长度（思考过程/工具结果，0=不回传、负数=全部回传、正数=N 字符）与历史压缩策略（历史轮数/统一触发比例、累计摘要预算比例、超大拒绝系数等）；逐项数值校验，全成功才关闭 |
+| 聊天设置弹窗（app.js:1941） | 并行读写三组配置：回传长度（思考过程/工具结果，0=不回传、负数=全部回传、正数=N 字符）、MCP 工具执行超时（正数为秒数、0=不限制）与历史压缩策略（历史轮数/统一触发比例、累计摘要预算比例、超大拒绝系数等）；逐项数值校验，全成功才关闭 |
 | 文件 chips（app.js:2054） | 上传限制 ≤10 个、单个 ≤10MB（超出 toast 截断/跳过）；chip 可单独删除；解析文本下一轮注入系统提示词 |
 | 发送与停止（app.js:2110） | 见下节 SSE 管线；停止 = 先调后端 `/stop_chat` 再本地 abort |
 | 工具选择弹窗（app.js:2581） | 打开时快照草稿集合；按 MCP server 分组三态全选 checkbox、折叠、搜索（名称+描述）、悬浮描述 tooltip、刷新剔除失效工具；确定才把草稿落为生效集合并刷新上下文统计 |
