@@ -25,7 +25,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # 自定义模块
-from config import FunctionDefinition
+from config import DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS, FunctionDefinition
+from env_manager import load_var
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -88,19 +89,19 @@ def _resolve_project_command(value: str) -> str:
     return value
 
 
-def _resolve_mcp_server_ref(mcp_service: str) -> str:
-    if not mcp_service:
-        return mcp_service
-    configured = _get_configured_server_command(mcp_service)
-    if configured is not None:
-        command, args = configured
-        resolved_parts = [_resolve_project_command(command)]
-        resolved_parts.extend(_resolve_project_file(item) for item in args)
-        resolved_parts = [item.replace("\\", "/") for item in resolved_parts]
-        # 用 shell quoting 保留带空格参数的边界；build_stdio_server_parameters
-        # 会再次拆分为 command/args 传给 stdio 客户端。
-        return shlex.join(resolved_parts)
-    return mcp_service
+# def _resolve_mcp_server_ref(mcp_service: str) -> str:
+#     if not mcp_service:
+#         return mcp_service
+#     configured = _get_configured_server_command(mcp_service)
+#     if configured is not None:
+#         command, args = configured
+#         resolved_parts = [_resolve_project_command(command)]
+#         resolved_parts.extend(_resolve_project_file(item) for item in args)
+#         resolved_parts = [item.replace("\\", "/") for item in resolved_parts]
+#         # 用 shell quoting 保留带空格参数的边界；build_stdio_server_parameters
+#         # 会再次拆分为 command/args 传给 stdio 客户端。
+#         return shlex.join(resolved_parts)
+#     return mcp_service
 
 
 def _split_command_line(command_line: str) -> list[str]:
@@ -296,10 +297,28 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
     except Exception as e:
         detail = _format_mcp_error(e)
         print(f"⚠️ MCP 服务器 [{mcp_server}] 连接失败：{detail}")
-        raise f"error: {detail}"
+        # Python 不能 raise 字符串；保留真实异常链，避免工具发现失败时
+        # 二次变成“exceptions must derive from BaseException”而丢失根因。
+        raise RuntimeError(f"MCP 服务器 [{mcp_server}] 连接失败: {detail}") from e
 
 
-async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
+def _mcp_call_timeout_seconds() -> float:
+    """读取 MCP 调用总超时；0 或负数表示不限制。
+
+    tool_executor 也会在同步工作线程外层施加超时。这里再次保护直接调用
+    mcp_client 的路径（调试脚本、其他业务代码），避免绕过统一配置后永久
+    等待 MCP 服务端响应。
+    """
+    try:
+        return float(load_var(
+            "MCP_TOOL_CALL_TIMEOUT_SECONDS",
+            DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+        ))
+    except (TypeError, ValueError):
+        return float(DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS)
+
+
+async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
     """ 通过 MCP 客户端调用 MCP 服务器上的工具
     Args:
         function_name: 工具名称
@@ -345,7 +364,7 @@ async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service:
                     last_error: Optional[Exception] = None
                     for attempt in range(1, max_pipe_retries + 1):
                         # 调用工具
-                        result = await session.call_tool(function_name, arguments)
+                        result = await session.call_tool(function_name, arguments or {})
                         # 解析结果
                         # 注意：即使 result.content 为空，也可能是合法的返回值（如空列表 []）
                         # 2.0 协议优先，auto 兼容 1.x（isError）
@@ -399,6 +418,14 @@ async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service:
         # 其他异常直接抛出
         raise e
 
+
+async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
+    """通过 MCP 客户端调用工具，并对完整生命周期施加配置的总超时。"""
+    timeout_seconds = _mcp_call_timeout_seconds()
+    call = _call_mcp_tool_impl(function_name, arguments, mcp_service)
+    if timeout_seconds > 0:
+        return await asyncio.wait_for(call, timeout=timeout_seconds)
+    return await call
 
 
 if __name__ == '__main__':

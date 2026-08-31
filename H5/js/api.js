@@ -399,6 +399,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateToolSelection,
     getContextReturnConfig,
     updateContextReturnConfig,
+    getMcpToolConfig,
+    updateMcpToolConfig,
     getWorkDirConfig,
     changeChatDir,
     stopChat,

@@ -8,6 +8,7 @@ from factory.agent_runtime.tool_executor import (
     parse_tool_call,
     prepare_tool_execution,
 )
+import util.mcp_client as mcp_client
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -75,6 +76,18 @@ class ToolExecutorTests(unittest.TestCase):
                 patch("factory.agent_runtime.tool_executor.call_mcp_tool", slow_call):
             with self.assertRaises(TimeoutError):
                 _invoke_tool_function("slow_tool", {}, {"slow_tool": "server"})
+
+    def test_mcp_client_direct_call_honors_timeout(self):
+        async def slow_call(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+
+        async def run():
+            with patch.object(mcp_client, "load_var", return_value="0.01"), \
+                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await mcp_client.call_mcp_tool("slow_tool", {})
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
