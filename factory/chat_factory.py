@@ -111,16 +111,57 @@ def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MA
     return parse_return_length(load_var("REASONING_RETURN_MAX_LENGTH", default), default)
 
 
-def build_runtime_system_text() -> str:
-    """构造运行时系统提示附加文本（工作路径 + 系统提示）。
+def _retain_latest_reasoning(messages: List[dict[str, Any]]) -> None:
+    """只保留当前任务最近一条 assistant 思考，避免思考过程跨轮累积。"""
+    latest_index = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            latest_index = index
+            break
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if index != latest_index:
+            message.pop("reasoning_content", None)
 
-    与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
-    token 统计接口用它单独估算系统提示词开销。
-    """
-    return (
-        f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
-        + _build_sys_prompt()
-    )
+
+def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
+    """用一条紧凑的任务状态 system 消息替换历史 todo 调用与结果。"""
+    todo_call_ids = set()
+    compacted: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            compacted.append(message)
+            continue
+        if message.get("_todo_summary"):
+            continue
+        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
+            kept_calls = []
+            for tool_call in message["tool_calls"]:
+                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                if function.get("name") == TODO_TOOL_NAME:
+                    if tool_call.get("id"):
+                        todo_call_ids.add(tool_call["id"])
+                else:
+                    kept_calls.append(tool_call)
+            if kept_calls:
+                message["tool_calls"] = kept_calls
+            elif not message.get("content"):
+                continue
+        if (
+            message.get("role") == "tool"
+            and (message.get("_tool_name") == TODO_TOOL_NAME
+                 or message.get("tool_call_id") in todo_call_ids)
+        ):
+            continue
+        compacted.append(message)
+    if todos:
+        symbols = {"done": "✓", "in_progress": "→", "pending": "○"}
+        lines = ["当前任务："]
+        lines.extend(f"{symbols.get(item.get('status'), '○')} {item.get('content', '')}" for item in todos)
+        compacted.append({"role": "system", "content": "\n".join(lines), "_todo_summary": True})
+    messages[:] = compacted
 
 
 # 当前工作路径为<{_format_tool_result(get_current_dir())}>
@@ -139,6 +180,7 @@ def _build_sys_prompt() -> str:
     )
     notes = [
         "工具由用户选择提供，你只能使用当前可见工具（如果用户提供了）；之前用过的工具不可见则不能使用。",
+        "任务过程中，你的思考过程只保留最近一次，过程中的重要发现需要实时告诉用户，这也是为了后续任务的连贯性。",
     ]
     if tool_result_limit > 0:
         # 与 chat_history_format._truncate_tool_result_text 的"前 N 字符"语义一致
@@ -160,6 +202,18 @@ def _build_sys_prompt() -> str:
         f"{numbered_notes}\n"
     )
 # 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
+
+
+def build_runtime_system_text() -> str:
+    """构造运行时系统提示附加文本（工作路径 + 系统提示）。
+
+    与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
+    token 统计接口用它单独估算系统提示词开销。
+    """
+    return (
+        f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
+        + _build_sys_prompt()
+    )
 
 
 async def load_all_tools() -> None:
@@ -914,6 +968,9 @@ async def _run_chat_generation(
         # while run_task:
         while session_chat_memory.run_task:
             stream.set_round_start()
+            # 每次请求只携带最近一条思考过程；todo 状态在执行更新后会被
+            # 归并为单条 system 消息，避免工具轨迹和思考文本无限增长。
+            _retain_latest_reasoning(messages)
             print(f"massages: [\n\t{',\n\t'.join(map(str, messages))}\n]")
             # 大上下文下整包转储会向控制台刷 MB 级文本并拖慢循环，只打印概要
             # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
@@ -1338,6 +1395,12 @@ async def _run_chat_generation(
                         "_tool_name": tool_name,
                     }
                     messages.append(tool_message)
+                if todo_updated:
+                    try:
+                        latest_todos = await session_chat_memory.get_session_todo()
+                        _replace_todo_context(messages, latest_todos)
+                    except Exception as todo_compact_error:
+                        print(f"[WARN] todo 上下文归并失败：{todo_compact_error}")
                 if oversized_abort:
                     break
                 # 任务内上下文预算管理：全量上下文达到单轮阈值（窗口×比例）时，

@@ -174,6 +174,32 @@ class NoToolNamesRegressionTests(unittest.TestCase):
         joined = "".join(stream.chunks)
         self.assertIn("你好！", joined)
 
+    def test_retain_latest_reasoning_removes_previous_rounds(self):
+        messages = [
+            {"role": "assistant", "content": "旧回答", "reasoning_content": "旧思考"},
+            {"role": "tool", "content": "结果"},
+            {"role": "assistant", "content": "当前工具调用", "reasoning_content": "当前思考"},
+        ]
+        chat_factory._retain_latest_reasoning(messages)
+        self.assertNotIn("reasoning_content", messages[0])
+        self.assertEqual(messages[2]["reasoning_content"], "当前思考")
+
+    def test_replace_todo_context_keeps_one_compact_status(self):
+        messages = [
+            {"role": "system", "content": "基础提示"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "todo_1", "function": {"name": "todo_write", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "todo_1", "_tool_name": "todo_write", "content": "ok"},
+        ]
+        chat_factory._replace_todo_context(messages, [
+            {"content": "准备测试", "status": "done"},
+            {"content": "汇总结果", "status": "in_progress"},
+        ])
+        self.assertEqual(len(messages), 2)
+        self.assertIn("✓ 准备测试", messages[1]["content"])
+        self.assertIn("→ 汇总结果", messages[1]["content"])
+
 
 def _cleanup():
     root = Path(__file__).resolve().parents[1] / "history_files"
