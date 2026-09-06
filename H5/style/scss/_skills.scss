@@ -1,0 +1,448 @@
+// Skills 提示词库：可拖拽对话框（左侧文件列表 + 右侧预览/编辑分栏）
+// 结构与视觉语言对齐 .tool-modal（bg-elevated / border-strong / shadow-menu），
+// z-index 略低于工具弹窗，二者不会同时打开。
+
+.skills-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 170;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+
+  .skills-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.62);
+  }
+
+  .skills-dialog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(980px, 100%);
+    height: min(700px, calc(100vh - 36px));
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-menu);
+    overflow: hidden;
+  }
+
+  // ---------- 拖拽标题栏 ----------
+  .skills-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 46px;
+    padding: 8px 12px 8px 18px;
+    border-bottom: 1px solid var(--border);
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+
+    &:active {
+      cursor: grabbing;
+    }
+
+    strong {
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .skills-dirty-flag {
+      font-size: 12px;
+      color: #e8a33d;
+    }
+
+    .icon-btn {
+      margin-left: auto;
+      width: 30px;
+      height: 30px;
+    }
+  }
+
+  .skills-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  // ---------- 左侧文件列表 ----------
+  .skills-side {
+    flex: 0 0 218px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-right: 1px solid var(--border);
+
+    .skills-side-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px 6px 14px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .skills-side-add {
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 12px;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+
+      &:hover {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+    }
+
+    .skills-new-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px 8px 14px;
+
+      input {
+        flex: 1;
+        min-width: 0;
+        height: 26px;
+        padding: 0 8px;
+        font-size: 12px;
+        color: var(--text);
+        background: var(--bg-composer);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        outline: none;
+
+        &:focus {
+          border-color: var(--border-strong);
+        }
+      }
+    }
+
+    .skills-list {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      margin: 0;
+      padding: 4px 8px 10px;
+      list-style: none;
+
+      .skills-file-item {
+        padding: 7px 10px;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+
+        &:hover {
+          background: var(--bg-hover);
+        }
+
+        &.active {
+          background: var(--bg-hover);
+        }
+
+        .skills-file-name {
+          font-size: 13px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .skills-file-meta {
+          font-size: 11px;
+          color: var(--text-secondary);
+          display: flex;
+          gap: 6px;
+        }
+
+        .skills-dirty-mark {
+          color: #e8a33d;
+        }
+      }
+
+      .skills-list-empty {
+        padding: 18px 12px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        text-align: center;
+      }
+    }
+  }
+
+  .skills-mini-btn {
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+  }
+
+  // ---------- 右侧主区 ----------
+  .skills-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .skills-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+
+    .skills-file-name {
+      flex: 1;
+      min-width: 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+
+  .skills-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+
+    .skills-tab {
+      padding: 4px 12px;
+      font-size: 12px;
+      border: none;
+      border-radius: calc(var(--radius-sm) - 2px);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+
+      &:hover {
+        color: var(--text);
+      }
+
+      &.active {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+    }
+  }
+
+  .skills-act {
+    padding: 5px 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    white-space: nowrap;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    &:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+
+    &.skills-act-primary {
+      background: #0b84d8;
+      border-color: #0b84d8;
+      color: #fff;
+
+      &:hover {
+        background: #0d93ef;
+        color: #fff;
+      }
+    }
+
+    &.skills-act-danger.armed {
+      background: #d8393e;
+      border-color: #d8393e;
+      color: #fff;
+
+      &:hover {
+        background: #e04b50;
+        color: #fff;
+      }
+    }
+  }
+
+  // ---------- 内容区：预览 / 编辑分栏 ----------
+  .skills-content {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  .skills-pane {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+  }
+
+  .skills-preview {
+    padding: 18px 24px 28px;
+  }
+
+  .skills-edit {
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    border-top: none;
+    min-height: 0;
+
+    // ---------- Markdown 格式工具栏（选中文本后应用，Typora 风格基础格式） ----------
+    .skills-md-bar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 2px;
+      padding: 5px 10px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-composer);
+
+      button {
+        padding: 3px 8px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: var(--text-secondary);
+        background: transparent;
+        border: none;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        white-space: nowrap;
+
+        &:hover {
+          background: var(--bg-hover);
+          color: var(--text);
+        }
+      }
+
+      .skills-md-b {
+        font-weight: 700;
+      }
+
+      .skills-md-i {
+        font-style: italic;
+        font-family: Georgia, "Times New Roman", serif;
+      }
+
+      .skills-md-sep {
+        flex: 0 0 auto;
+        width: 1px;
+        height: 14px;
+        margin: 0 4px;
+        background: var(--border);
+      }
+    }
+
+    // ---------- 表格尺寸选择器（划过网格选行列） ----------
+    .skills-table-picker {
+      position: absolute;
+      z-index: 20;
+      padding: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-menu);
+
+      .skills-table-grid {
+        display: grid;
+        grid-template-columns: repeat(8, 18px);
+        gap: 3px;
+
+        .skills-grid-cell {
+          width: 18px;
+          height: 18px;
+          border: 1px solid var(--border);
+          border-radius: 3px;
+          background: var(--bg-composer);
+          cursor: pointer;
+
+          &.lit {
+            background: #0b84d8;
+            border-color: #0b84d8;
+          }
+        }
+      }
+
+      .skills-table-size {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        text-align: center;
+      }
+    }
+
+    .skills-editor {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      resize: none;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text);
+      padding: 14px 18px 24px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.7;
+      tab-size: 4;
+    }
+  }
+
+  // 空状态占位（未选择文件时铺在内容区）
+  .skills-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+
+  @media (max-width: 768px) {
+    padding: 8px;
+
+    .skills-dialog {
+      height: calc(100vh - 16px);
+    }
+
+    // 窄屏关掉拖拽语义：列表收窄，编辑区保持「工具栏 + 编辑器」上下结构
+    .skills-head {
+      cursor: default;
+    }
+
+    .skills-side {
+      flex-basis: 132px;
+    }
+
+    .skills-md-bar {
+      padding: 4px 8px;
+    }
+  }
+}
