@@ -7,7 +7,12 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response
 
 # 自定义模块导入
 from config import ChatLLMRequest
-from env_manager import ChatModelConfigurationError, apply_role_parameter_defaults
+from env_manager import (
+    ChatModelConfigurationError,
+    apply_role_parameter_defaults,
+    reset_ambient_model_selection,
+    set_ambient_model_selection,
+)
 from factory.chat_factory import (
     build_runtime_system_text,
     tool_chat_server,
@@ -20,13 +25,20 @@ from factory.agent_runtime.context_compaction import (
     resolve_summary_total_budget,
 )
 from factory.agent_runtime import tool_registry
-from factory.agent_runtime.builtin_tools import inject_builtin_tools
+from factory.agent_runtime.builtin_tools import (
+    ASK_USER_TOOL_NAME,
+    SELECTABLE_BUILTIN_TOOL_NAMES,
+    TODO_TOOL_NAME,
+    inject_builtin_tools,
+)
 from memory.chat_memory import (
     ChatMemoryManager,
     get_chat_memory_manager,
     normalize_session_id,
     cleanup_chat_memory_manager,
     chat_memory_file_exists,
+    resolve_session_work_dir,
+    resolve_session_model_selection,
 )
 from memory.file_memory import cleanup_file_memory_manager
 from routers.chat_config_router import get_chat_work_dir_config
@@ -50,11 +62,26 @@ def _tool_definition_name(tool: object) -> str:
 async def chat_with_tool(request: Request):
     """ 用户聊天信息，流式响应
 
-    参数优先级：请求体显式传参 > model_selection.chat_model.parameter > 默认值。
-    未显式提供的生成参数会按 select 接口配置的 chat_model 参数自动填充。
+    参数优先级：请求体显式传参 > 会话/全局 model_selection.chat_model.parameter > 默认值。
+    未显式提供的生成参数按 select 接口配置的 chat_model 参数自动填充；
+    会话已独立选择模型时（_meta.model_selection），按会话生效模型的参数填充。
     """
     body = await request.json()
-    tool_request = ChatLLMRequest(**apply_role_parameter_defaults(body))
+    # 会话级模型选择：参数默认值填充按会话生效的 chat_model parameter
+    # （失效覆盖按角色回退全局；警告由生成任务内的 MODEL_SELECTION_FALLBACK 事件统一提示）
+    ambient_token = None
+    raw_session_id = body.get("session_id") if isinstance(body, dict) else None
+    if raw_session_id:
+        try:
+            effective_selection, _ = resolve_session_model_selection(normalize_session_id(raw_session_id))
+            ambient_token = set_ambient_model_selection(effective_selection)
+        except Exception:
+            ambient_token = None
+    try:
+        tool_request = ChatLLMRequest(**apply_role_parameter_defaults(body))
+    finally:
+        if ambient_token is not None:
+            reset_ambient_model_selection(ambient_token)
     return StreamingResponse(tool_chat_server(tool_request), media_type='text/event-stream')
 
 
@@ -338,36 +365,54 @@ async def get_chat_context_token_stats(
                 "round_tokens": [],
             })
         manager = await get_chat_memory_manager(normalized_session_id)
-        effective_max_rounds = (
-            max_rounds
-            if max_rounds is not None
-            else load_context_compaction_settings().keep_rounds
+        # 上下文窗口按会话生效模型计算（会话独立模型选择覆盖全局默认），
+        # 与真实生成任务的模型口径一致
+        ambient_token = set_ambient_model_selection(
+            resolve_session_model_selection(normalized_session_id)[0]
         )
-        context_tools = None
-        if include_tools:
-            available_tools = list(tool_registry.ALL_TOOLS)
-            if tool_names is None:
-                context_tools = available_tools
-            else:
-                selected_names = {
-                    name.strip()
-                    for name in tool_names
-                    if isinstance(name, str) and name.strip()
-                }
-                context_tools = [
-                    tool
-                    for tool in available_tools
-                    if _tool_definition_name(tool) in selected_names
-                ]
-                # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
-                # 这里保持 token 统计与真实请求的工具 schema 口径一致。
-                if context_tools:
-                    context_tools, _ = inject_builtin_tools(context_tools, {})
-        stats = await manager.get_context_token_stats(
-            max_rounds=effective_max_rounds,
-            tools=context_tools,
-            system_prompt_text=build_runtime_system_text(),
-        )
+        try:
+            effective_max_rounds = (
+                max_rounds
+                if max_rounds is not None
+                else load_context_compaction_settings().keep_rounds
+            )
+            context_tools = None
+            if include_tools:
+                available_tools = list(tool_registry.ALL_TOOLS)
+                if tool_names is None:
+                    context_tools = available_tools
+                else:
+                    selected_names = {
+                        name.strip()
+                        for name in tool_names
+                        if isinstance(name, str) and name.strip()
+                    }
+                    context_tools = [
+                        tool
+                        for tool in available_tools
+                        if _tool_definition_name(tool) in selected_names
+                    ]
+                    # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
+                    # 内置工具（todo_write / ask_user）按前端勾选显式注入。
+                    # 这里保持 token 统计与真实请求的工具 schema 口径一致。
+                    if context_tools or selected_names & set(SELECTABLE_BUILTIN_TOOL_NAMES):
+                        context_tools, _ = inject_builtin_tools(
+                            context_tools,
+                            {},
+                            include_todo=TODO_TOOL_NAME in selected_names,
+                            include_ask_user=ASK_USER_TOOL_NAME in selected_names,
+                        )
+            stats = await manager.get_context_token_stats(
+                max_rounds=effective_max_rounds,
+                tools=context_tools,
+                # 系统提示词按会话生效目录计算（worker 内由任务开始时 chdir 保证，
+                # 主进程统计侧需显式解析），与真实请求口径一致
+                system_prompt_text=build_runtime_system_text(
+                    work_dir=resolve_session_work_dir(normalized_session_id)[0]
+                ),
+            )
+        finally:
+            reset_ambient_model_selection(ambient_token)
         return JSONResponse(content={
             "state": "succeed",
             "session_id": manager.session_id,
@@ -417,6 +462,13 @@ async def compact_chat_context_manual(
     # Query 实例为 truthy，会把 force/stream 误判为已开启
     force = bool(force) if isinstance(force, bool) else False
     stream = bool(stream) if isinstance(stream, bool) else False
+    # 压缩模型/预算按会话生效模型选择计算（stream=true 的实际压缩在 SSE 生成器
+    # 的新任务中执行，_manual_compaction_event_stream.run 内会重新设置 ambient）
+    try:
+        effective_model_selection, _ = resolve_session_model_selection(session_id)
+    except Exception:
+        effective_model_selection = None
+    ambient_token = set_ambient_model_selection(effective_model_selection)
     try:
         manager = await get_chat_memory_manager(session_id)
         compaction_settings = load_context_compaction_settings()
@@ -480,6 +532,8 @@ async def compact_chat_context_manual(
         raise e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        reset_ambient_model_selection(ambient_token)
 
 
 async def _manual_compaction_event_stream(
@@ -516,6 +570,13 @@ async def _manual_compaction_event_stream(
         await queue.put(payload)
 
     async def run() -> None:
+        # 压缩在新任务中执行（create_task 复制上下文不会带出 handler 的 ambient），
+        # 这里按会话重新设置模型选择覆盖
+        try:
+            effective_selection, _ = resolve_session_model_selection(session_id)
+        except Exception:
+            effective_selection = None
+        ambient_token = set_ambient_model_selection(effective_selection)
         try:
             if precheck_error:
                 result["error"] = precheck_error
@@ -544,6 +605,7 @@ async def _manual_compaction_event_stream(
         except Exception as exc:
             result["error"] = str(exc)
         finally:
+            reset_ambient_model_selection(ambient_token)
             await queue.put(sentinel)
 
     task = asyncio.create_task(run())

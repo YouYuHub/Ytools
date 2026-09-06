@@ -27,7 +27,7 @@ class ChatRouterTests(unittest.TestCase):
         payload = response.body.decode("utf-8")
         self.assertIn('"read_only":true', payload)
         self.assertIn('"source":"project .env"', payload)
-        self.assertIn('"env_name":"CHAT_WORK_DIR"', payload)
+        self.assertIn('"env_name":"DEFAULT_CHAT_WORK_DIR"', payload)
         self.assertIn('"env_value":', payload)
         self.assertIn('"env_file":', payload)
 

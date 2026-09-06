@@ -21,6 +21,4 @@ fitz
 docx
 pandas
 
-# 图片格式转换：ICO/TIFF 等视觉模型不原生接受的格式自动转 PNG
-pillow
 #################### optional end ####################

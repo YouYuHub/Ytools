@@ -261,6 +261,7 @@
                             <div class="enhance-foot">
                                 <div class="enhance-foot-left">
                                     <button id="enhanceReset" type="button">恢复默认</button>
+                                    <button id="enhanceClearOverride" type="button" class="hidden" title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
                                     <span id="enhanceHint">参数未修改时仅切换模型、保留原参数</span>
                                 </div>
                                 <div class="enhance-actions">
@@ -290,12 +291,12 @@
                                 </svg>
                                 <span class="menu-item-label">聊天设置</span>
                             </button>
-                            <button class="menu-item" id="todoToggleItem">
+                            <button class="menu-item" id="skillsItem">
                                 <svg class="icon" viewBox="0 0 24 24">
-                                    <path d="M9 11l3 3 8-8M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                                    <path
+                                        d="m12 3 2.1 5.3 5.7.4-4.4 3.7 1.4 5.6-4.8-3.1-4.8 3.1 1.4-5.6-4.4-3.7 5.7-.4Z" />
                                 </svg>
-                                <span class="menu-item-label">任务计划 (todo)</span>
-                                <span class="menu-item-state" id="todoToggleState">关</span>
+                                <span class="menu-item-label">Skills 提示词</span>
                             </button>
                         </div>
                         <!-- 待发送媒体附件预览区：粘贴/选择图片等媒体后显示在输入框上方 -->
@@ -382,7 +383,7 @@
                 <span class="tool-selected" id="toolSelected">已选 0 项</span>
                 <button class="tool-confirm" id="toolConfirm">确定</button>
             </div>
-            <p class="tool-modal-desc">所选工具仅应用于当前聊天会话。</p>
+            <p class="tool-modal-desc">“内置工具”由服务端本地执行；会话内保存仅对本会话生效，新对话中保存将更新全局默认。</p>
             <div class="tool-groups" id="toolGroups"></div>
         </section>
     </div>
@@ -414,7 +415,7 @@
             </header>
             <div class="chat-settings-body">
                 <section class="chat-settings-section">
-                    <h3>上下文回传长度</h3>
+                    <h3>模型与工具配置</h3>
                     <label class="chat-setting-field">
                         <span>思考过程回传长度<small>0=不回传 · 负数=全部 · 正数=保留末尾 N 字符</small></span>
                         <input id="reasoningMaxLength" type="number" step="1">
@@ -426,6 +427,10 @@
                     <label class="chat-setting-field">
                         <span>工具执行超时（秒）<small>单次 MCP 工具执行超过该秒数后中止并反馈模型；0=不限制</small></span>
                         <input id="toolCallTimeoutSeconds" type="number" min="0" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>网络失败重试次数<small>模型请求连续失败达到该次数才终止任务；0=不限制（一直重试）</small></span>
+                        <input id="networkRetryMaxAttempts" type="number" min="0" step="1">
                     </label>
                 </section>
                 <section class="chat-settings-section">
@@ -461,6 +466,27 @@
         </section>
     </div>
 
+    <!-- 模型提问交互卡片：ask_user 事件触发，逐题点选选项或自由输入，回答作为下一条用户消息发送 -->
+    <div class="tool-modal hidden" id="askModal" aria-hidden="true">
+        <div class="tool-modal-backdrop" id="askModalBackdrop"></div>
+        <section class="tool-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="askModalTitle">
+            <header class="tool-modal-head">
+                <h2 id="askModalTitle">🤖 模型向你提问</h2>
+                <button class="icon-btn" id="askModalClose" title="关闭">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M6 6l12 12M18 6 6 18" />
+                    </svg>
+                </button>
+            </header>
+            <p class="tool-modal-desc">提交后回答将作为你的下一条消息发送给模型，任务据此继续；也可以关闭后自行输入。</p>
+            <div class="ask-questions" id="askQuestions"></div>
+            <footer class="ask-modal-foot">
+                <span class="ask-foot-hint">每题需点选选项或输入回答后才能提交</span>
+                <button class="tool-confirm" id="askSubmit">提交回答</button>
+            </footer>
+        </section>
+    </div>
+
     <div class="confirm-modal hidden" id="deleteModal" aria-hidden="true">
         <div class="confirm-modal-backdrop" id="deleteModalBackdrop"></div>
         <section class="confirm-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
@@ -469,6 +495,84 @@
             <div class="confirm-modal-actions">
                 <button class="confirm-cancel" id="deleteCancel">取消</button>
                 <button class="confirm-danger" id="deleteConfirm">确认删除</button>
+            </div>
+        </section>
+    </div>
+
+    <!-- Skills 提示词库：可拖拽对话框（左侧文件列表 + 右侧预览/编辑分栏） -->
+    <div class="skills-modal hidden" id="skillsModal" aria-hidden="true">
+        <div class="skills-backdrop" id="skillsBackdrop"></div>
+        <section class="skills-dialog" id="skillsDialog" role="dialog" aria-modal="true" aria-label="Skills 提示词库">
+            <header class="skills-head" id="skillsDragBar" title="按住拖动窗口">
+                <strong>Skills 提示词</strong>
+                <span class="skills-dirty-flag hidden" id="skillsDirtyFlag">● 未保存</span>
+                <button class="icon-btn" id="skillsClose" title="关闭 (Esc)">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M6 6l12 12M18 6 6 18" />
+                    </svg>
+                </button>
+            </header>
+            <div class="skills-body">
+                <aside class="skills-side">
+                    <div class="skills-side-head">
+                        <span>提示词文件</span>
+                        <button class="skills-side-add" id="skillsNewBtn" title="新建提示词">＋ 新建</button>
+                    </div>
+                    <div class="skills-new-row hidden" id="skillsNewRow">
+                        <input id="skillsNewName" type="text" placeholder="名称，自动加 .md" maxlength="80">
+                        <button class="skills-mini-btn" id="skillsNewOk" title="创建">✓</button>
+                        <button class="skills-mini-btn" id="skillsNewCancel" title="取消">✕</button>
+                    </div>
+                    <ul class="skills-list" id="skillsList"></ul>
+                </aside>
+                <main class="skills-main">
+                    <div class="skills-toolbar">
+                        <span class="skills-file-name" id="skillsFileName">未选择文件</span>
+                        <div class="skills-tabs" id="skillsTabs">
+                            <button class="skills-tab active" id="skillsTabPreview" type="button">预览</button>
+                            <button class="skills-tab" id="skillsTabEdit" type="button">编辑</button>
+                        </div>
+                        <button class="skills-act" id="skillsUploadBtn" type="button"
+                            title="上传本地 md/txt 文件为提示词">上传</button>
+                        <button class="skills-act skills-act-danger" id="skillsDeleteBtn" type="button"
+                            title="删除当前文件">删除</button>
+                        <button class="skills-act" id="skillsSaveBtn" type="button" title="保存 (Ctrl+S)">保存</button>
+                        <button class="skills-act skills-act-primary" id="skillsLoadBtn" type="button"
+                            title="把内容填进消息框">加载到输入框</button>
+                    </div>
+                    <input type="file" id="skillsUploadInput" accept=".md,.markdown,.txt,text/plain,text/markdown"
+                        hidden>
+                    <div class="skills-content">
+                        <div class="skills-pane skills-preview" id="skillsPreview"></div>
+                        <div class="skills-pane skills-edit hidden" id="skillsEditWrap">
+                            <div class="skills-md-bar" id="skillsMdBar" title="选中文本后点击应用格式">
+                                <button type="button" data-md="h1" title="一级标题">H1</button>
+                                <button type="button" data-md="h2" title="二级标题">H2</button>
+                                <button type="button" data-md="h3" title="三级标题">H3</button>
+                                <span class="skills-md-sep"></span>
+                                <button type="button" data-md="bold" class="skills-md-b" title="加粗 (Ctrl+B)">B</button>
+                                <button type="button" data-md="italic" class="skills-md-i" title="斜体 (Ctrl+I)">I</button>
+                                <button type="button" data-md="code" title="行内代码">&lt;&gt;</button>
+                                <span class="skills-md-sep"></span>
+                                <button type="button" data-md="ul" title="无序列表">• 列表</button>
+                                <button type="button" data-md="ol" title="有序列表">1. 列表</button>
+                                <button type="button" data-md="quote" title="引用">&gt; 引用</button>
+                                <span class="skills-md-sep"></span>
+                                <button type="button" data-md="table" title="插入表格">表格</button>
+                                <button type="button" data-md="codeblock" title="插入代码块">代码块</button>
+                                <button type="button" data-md="hr" title="插入分割线">分割线</button>
+                                <button type="button" data-md="link" title="插入链接">链接</button>
+                                <!-- 表格尺寸选择器：划过网格选行列，点击插入 -->
+                                <div class="skills-table-picker hidden" id="skillsTablePicker">
+                                    <div class="skills-table-grid" id="skillsTableGrid"></div>
+                                    <div class="skills-table-size" id="skillsTableSize">3 行 × 3 列</div>
+                                </div>
+                            </div>
+                            <textarea class="skills-editor" id="skillsEditor" spellcheck="false"
+                                placeholder="# 在这里编写 Markdown 提示词…&#10;&#10;选中文字后用上方工具栏设置加粗、标题、表格等格式"></textarea>
+                        </div>
+                    </div>
+                </main>
             </div>
         </section>
     </div>
@@ -510,6 +614,23 @@
     <script src="js/session_utils.js"></script>
     <script src="js/format_utils.js"></script>
     <script src="js/history_parser.js"></script>
+    <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
+         core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
+         中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
+    <script src="js/app/core.js"></script>
+    <script src="js/app/sessions.js"></script>
+    <script src="js/app/stats.js"></script>
+    <script src="js/app/workdir.js"></script>
+    <script src="js/app/messages.js"></script>
+    <script src="js/app/history.js"></script>
+    <script src="js/app/compaction.js"></script>
+    <script src="js/app/builtin.js"></script>
+    <script src="js/app/media.js"></script>
+    <script src="js/app/skills.js"></script>
+    <script src="js/app/composer.js"></script>
+    <script src="js/app/model_panel.js"></script>
+    <script src="js/app/tools.js"></script>
+    <script src="js/app/chat.js"></script>
     <script src="js/app.js"></script>
 </body>
 

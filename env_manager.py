@@ -13,6 +13,7 @@ SECRET_KEY =   "     your_secret_key      "
 ```
 """
 import base64
+import contextvars
 import ctypes
 import json
 import os
@@ -29,6 +30,16 @@ models_config = {}
 mcp_config = {}
 model_selection = {}
 _env_file_lock = Lock()
+
+# 会话级模型选择的"环境覆盖"（ambient override）：
+# 生成任务/手动压缩等会话内执行单元在任务开始时调用 set_ambient_model_selection
+# 写入该会话的生效选择（_meta.model_selection 覆盖 → 全局默认合并结果），
+# 任务内所有模型配置读取（require_default_chat_config / get_role_selection /
+# get_role_parameter 等）自动按会话生效。ContextVar 保证只在当前 asyncio 任务
+# 内可见（create_task 复制上下文），不影响其他会话与路由层（未设置时=全局）。
+_ambient_model_selection: contextvars.ContextVar = contextvars.ContextVar(
+    "ambient_model_selection", default=None
+)
 
 
 _MODEL_CONFIG_RESERVED_KEYS = frozenset({"variables", "runtime", "model_selection"})
@@ -149,31 +160,26 @@ def get_model_config(provider_name: str | None = None, model_name: str | None = 
     return resolved_config
 
 
-def get_default_chat_config() -> dict[str, Any] | None:
-    chat_selection = model_selection.get("chat_model") if isinstance(model_selection, dict) else None
-    provider_name = None
-    model_name = None
-    if isinstance(chat_selection, dict):
-        provider_name = _normalize_config_name(chat_selection.get("ownership_name"))
-        model_name = _normalize_config_name(chat_selection.get("model_name"))
+def _resolve_chat_role_names() -> tuple[str | None, str | None]:
+    """解析当前生效的聊天模型 (provider, model)：ambient 会话覆盖 → 全局选择 → .env 回退。"""
+    chat_selection = get_model_selection().get("chat_model") or {}
+    provider_name = _normalize_config_name(chat_selection.get("ownership_name"))
+    model_name = _normalize_config_name(chat_selection.get("model_name"))
     if not provider_name or not model_name:
-        provider_name = _normalize_config_name(env_vars.get("CHAT_OWNERSHIP_NANE"))
-        model_name = _normalize_config_name(env_vars.get("CHAT_MODEL_NAME"))
+        provider_name = provider_name or _normalize_config_name(env_vars.get("CHAT_OWNERSHIP_NANE"))
+        model_name = model_name or _normalize_config_name(env_vars.get("CHAT_MODEL_NAME"))
+    return provider_name, model_name
+
+
+def get_default_chat_config() -> dict[str, Any] | None:
+    provider_name, model_name = _resolve_chat_role_names()
     if not provider_name or not model_name:
         return None
     return get_model_config(provider_name, model_name)
 
 
 def require_default_chat_config() -> dict[str, Any]:
-    chat_selection = model_selection.get("chat_model") if isinstance(model_selection, dict) else None
-    provider_name = None
-    model_name = None
-    if isinstance(chat_selection, dict):
-        provider_name = _normalize_config_name(chat_selection.get("ownership_name"))
-        model_name = _normalize_config_name(chat_selection.get("model_name"))
-    if not provider_name or not model_name:
-        provider_name = _normalize_config_name(env_vars.get("CHAT_OWNERSHIP_NANE"))
-        model_name = _normalize_config_name(env_vars.get("CHAT_MODEL_NAME"))
+    provider_name, model_name = _resolve_chat_role_names()
     if not provider_name or not model_name:
         raise ChatModelConfigurationError(
             f"models.json 的 model_selection.chat_model（或 .env 的 CHAT_OWNERSHIP_NANE/CHAT_MODEL_NAME）"
@@ -235,6 +241,10 @@ def _default_model_selection() -> dict[str, dict[str, Any]]:
         role: {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None}
         for role in ("chat_model", "compaction_model", "title_model")
     }
+
+
+# 已知模型角色集合（新增 subAgent 等角色时在 _default_model_selection 中扩展即自动生效）
+MODEL_SELECTION_ROLES = tuple(_default_model_selection().keys())
 
 
 def _normalize_parameter_buckets(parameter: Any) -> dict[str, dict[str, Any]]:
@@ -310,8 +320,53 @@ def _backfill_selection_api_type() -> None:
             entry["api_type"] = _derive_api_type(chat_config)
 
 
+def normalize_model_selection(raw: Any) -> dict[str, dict[str, Any]]:
+    """把任意结构归一化为 {role: {ownership_name, model_name, parameter, api_type}}（公开入口）。
+
+    供会话级模型选择（_meta.model_selection）的存取与规整复用；
+    parameter 为按 api_type 分桶结构，旧版扁平格式自动迁移为 chat_completions 桶。
+    """
+    return _normalize_model_selection(raw)
+
+
+def set_ambient_model_selection(selection: dict[str, dict[str, Any]] | None):
+    """设置当前任务内生效的会话级模型选择（仅覆盖已配置的角色）。
+
+    传入 None 表示清除覆盖（恢复纯全局）。返回 token 供 reset 使用；
+    不 reset 时随当前 asyncio 任务结束自动失效（任务上下文隔离）。
+    """
+    if selection is None:
+        return _ambient_model_selection.set(None)
+    normalized = _normalize_model_selection(selection)
+    override = {
+        role: entry for role, entry in normalized.items()
+        if entry.get("ownership_name") and entry.get("model_name")
+    }
+    return _ambient_model_selection.set(override or None)
+
+
+def reset_ambient_model_selection(token) -> None:
+    _ambient_model_selection.reset(token)
+
+
 def get_model_selection() -> dict[str, dict[str, Any]]:
-    """返回内存中的三模型选择（深拷贝，调用方修改不影响全局状态）。"""
+    """返回当前生效的三模型选择（深拷贝）。
+
+    叠加顺序：全局 model_selection（models.json）→ 当前任务的会话级覆盖
+    （set_ambient_model_selection 写入的角色条目）。未设置覆盖时等价于全局。
+    """
+    import copy
+    merged = copy.deepcopy(model_selection if isinstance(model_selection, dict) else {})
+    ambient = _ambient_model_selection.get()
+    if isinstance(ambient, dict):
+        for role, entry in ambient.items():
+            if isinstance(entry, dict) and entry.get("ownership_name") and entry.get("model_name"):
+                merged[role] = copy.deepcopy(entry)
+    return merged
+
+
+def get_global_model_selection() -> dict[str, dict[str, Any]]:
+    """返回纯全局的三模型选择（不含会话级覆盖，深拷贝）。"""
     import copy
     return copy.deepcopy(model_selection if isinstance(model_selection, dict) else {})
 
@@ -335,18 +390,14 @@ _CHAT_PARAMETER_FIELDS = (
 )
 
 
-def get_role_parameter(role: str = "chat_model") -> dict[str, Any]:
-    """按角色的模型 api_type 取 parameter 桶。
+def _parameter_from_buckets(buckets: Any, api_type: str | None) -> dict[str, Any]:
+    """按 api_type 从分桶 parameter 中取生效参数（回退链：当前桶 → chat_completions 桶 → 任意非空桶）。
 
-    回退链：当前 api_type 的桶 -> chat_completions 桶 -> 任意第一个非空桶 -> 空。
     返回新字典，调用方修改不影响全局状态。
     """
-    selection = get_role_selection(role)
-    buckets = selection.get("parameter")
     if not isinstance(buckets, dict) or not buckets:
         return {}
-    api_type = selection.get("api_type") or "chat_completions"
-    bucket = buckets.get(api_type)
+    bucket = buckets.get(api_type or "chat_completions")
     if isinstance(bucket, dict) and bucket:
         return dict(bucket)
     fallback = buckets.get("chat_completions")
@@ -356,6 +407,16 @@ def get_role_parameter(role: str = "chat_model") -> dict[str, Any]:
         if isinstance(candidate, dict) and candidate:
             return dict(candidate)
     return {}
+
+
+def get_role_parameter(role: str = "chat_model") -> dict[str, Any]:
+    """按角色的模型 api_type 取 parameter 桶。
+
+    回退链：当前 api_type 的桶 -> chat_completions 桶 -> 任意第一个非空桶 -> 空。
+    返回新字典，调用方修改不影响全局状态。
+    """
+    selection = get_role_selection(role)
+    return _parameter_from_buckets(selection.get("parameter"), selection.get("api_type"))
 
 
 def apply_role_parameter_defaults(body: dict[str, Any], role: str = "chat_model") -> dict[str, Any]:
@@ -448,6 +509,67 @@ def _derive_api_type(chat_config: dict[str, Any]) -> str:
     return raw.replace("-", "_")
 
 
+def _resolve_selection_target(provider_name: str, model_name: str, role: str) -> tuple[dict[str, Any], str]:
+    """校验 provider/model 组合存在且符合角色协议约束，返回 (chat_config, api_type)。
+
+    供全局 select_chat_model 与会话级模型选择共用同一套校验规则。
+    Raises:
+        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+    """
+    normalized_provider = _normalize_config_name(provider_name)
+    normalized_model = _normalize_config_name(model_name)
+    if not normalized_provider or not normalized_model:
+        raise ChatModelConfigurationError("provider 和 model 均不能为空")
+    chat_config = get_model_config(normalized_provider, normalized_model)
+    if chat_config is None:
+        raise ChatModelConfigurationError(
+            f"models.json 中找不到模型：{normalized_provider} / {normalized_model}"
+        )
+    if role == "compaction_model" and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
+        raise ChatModelConfigurationError(
+            f"压缩模型必须为 chat-completions 协议，{normalized_model} 配置为 {chat_config.get('apiType')}"
+        )
+    return chat_config, _derive_api_type(chat_config)
+
+
+def resolve_selection_target(provider_name: str, model_name: str, role: str) -> tuple[dict[str, Any], str]:
+    """校验 provider/model 组合存在且符合角色协议约束，返回 (chat_config, api_type)。
+
+    供全局 select_chat_model 与会话级模型选择共用同一套校验规则（公开入口）。
+    Raises:
+        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+    """
+    return _resolve_selection_target(provider_name, model_name, role)
+
+
+def build_model_selection_entry(
+    provider_name: str,
+    model_name: str,
+    role: str,
+    parameter: dict[str, Any] | None = None,
+    inherit_parameter: Any = None,
+) -> dict[str, Any]:
+    """校验并构建单个角色的模型选择条目（全局 select 与会话级 select 共用）。
+
+    - parameter 为 None 时沿用 inherit_parameter（调用方传入该角色现有参数桶，
+      "仅切换模型、参数保持不变"语义）；
+    - parameter 提供时按该模型 api_type 分桶全量替换该桶，其余桶保留自 inherit。
+    Raises:
+        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+    """
+    chat_config, api_type = _resolve_selection_target(provider_name, model_name, role)
+    buckets = dict(_normalize_parameter_buckets(inherit_parameter))
+    if parameter is not None:
+        normalized_fields = {key: value for key, value in parameter.items() if key in _CHAT_PARAMETER_FIELDS}
+        buckets[api_type] = normalized_fields
+    return {
+        "ownership_name": _normalize_config_name(provider_name),
+        "model_name": _normalize_config_name(chat_config.get("selected_model_name") or model_name),
+        "parameter": buckets,
+        "api_type": api_type,
+    }
+
+
 def select_chat_model(
     provider_name: str,
     model_name: str,
@@ -475,36 +597,17 @@ def select_chat_model(
     if parameter is not None and not isinstance(parameter, dict):
         raise ChatModelConfigurationError("parameter 必须是字典")
 
-    chat_config = get_model_config(normalized_provider, normalized_model)
-    if chat_config is None:
-        raise ChatModelConfigurationError(
-            f"models.json 中找不到模型：{normalized_provider} / {normalized_model}"
-        )
-    if role == "compaction_model" and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
-        raise ChatModelConfigurationError(
-            f"压缩模型必须为 chat-completions 协议，{normalized_model} 配置为 {chat_config.get('apiType')}"
-        )
-
-    api_type = _derive_api_type(chat_config)
-    current = get_model_selection()
+    chat_config, api_type = _resolve_selection_target(normalized_provider, normalized_model, role)
+    # 写全局配置必须基于纯全局选择（不叠加任何会话级 ambient 覆盖）
+    current = get_global_model_selection()
     existing = current.get(role) or {}
-    buckets = dict(existing.get("parameter")) if isinstance(existing.get("parameter"), dict) else {}
-    if parameter is not None:
-        normalized_fields = {key: value for key, value in parameter.items() if key in _CHAT_PARAMETER_FIELDS}
-        buckets[api_type] = normalized_fields
-        current[role] = {
-            "ownership_name": normalized_provider,
-            "model_name": _normalize_config_name(chat_config.get("selected_model_name") or normalized_model),
-            "parameter": buckets,
-            "api_type": api_type,
-        }
-    else:
-        current[role] = {
-            "ownership_name": normalized_provider,
-            "model_name": _normalize_config_name(chat_config.get("selected_model_name") or normalized_model),
-            "parameter": buckets,
-            "api_type": api_type,
-        }
+    current[role] = build_model_selection_entry(
+        normalized_provider,
+        normalized_model,
+        role,
+        parameter=parameter,
+        inherit_parameter=existing.get("parameter"),
+    )
     save_model_selection(current)
     selected = get_model_selection()[role]
     return {
@@ -709,6 +812,63 @@ def get_env_file_path() -> str | None:
     return str(Path(env_file).resolve()).replace("\\", "/")
 
 
+def _load_models_setting(setting_candidate: Path) -> tuple[dict, dict, dict[str, str]]:
+    """读取 models.json 并归一化为 (models_config, model_selection, setting_vars)。
+
+    只做纯计算、不改全局状态；init_path 与 reload_models_config 共用，
+    便于先构建完整的新配置、再一次性原子替换内存全局变量。
+    """
+    raw_models = _load_setting_array_or_dict(setting_candidate)
+    new_models_config = _normalize_loaded_value(raw_models)
+    new_model_selection = _normalize_model_selection(
+        new_models_config.get("model_selection") if isinstance(new_models_config, dict) else None
+    )
+    new_setting_vars: dict[str, str] = {}
+    if isinstance(new_models_config, dict):
+        variables = new_models_config.get("variables")
+        if isinstance(variables, dict):
+            normalized_setting_vars = _normalize_to_str_dict(variables)
+            for var_name, raw_value in normalized_setting_vars.items():
+                new_setting_vars[var_name] = _resolve_variable_references(raw_value, normalized_setting_vars)
+        runtime = new_models_config.get("runtime")
+        if isinstance(runtime, dict):
+            for key, value in runtime.items():
+                if isinstance(value, bool):
+                    new_setting_vars[key] = "true" if value else "false"
+                elif isinstance(value, (int, float)):
+                    new_setting_vars[key] = str(value)
+                elif value is not None:
+                    new_setting_vars[key] = str(value)
+    return new_models_config, new_model_selection, new_setting_vars
+
+
+def _apply_models_setting(models: dict, selection: dict, setting_vars_map: dict[str, str]) -> None:
+    """原子替换内存中的 models 配置三个全局变量（先构建后赋值，读方不会看到中间态）。"""
+    global models_config, model_selection, setting_vars
+    models_config = models
+    model_selection = selection
+    setting_vars = setting_vars_map
+    _backfill_selection_api_type()
+
+
+def reload_models_config() -> bool:
+    """重新读取 setting/models.json 并同步内存（供配置热重载线程调用）。
+
+    只重载 models.json（models_config/model_selection/setting_vars），不触碰 .env；
+    解析失败时保留内存现状并返回 False。模型选择等写接口（save_model_selection）
+    与本函数都是“先构建后整体替换”，读方（请求协程）要么看到旧配置要么看到新配置。
+    """
+    if not setting_file:
+        return False
+    try:
+        new_models, new_selection, new_setting_vars = _load_models_setting(Path(setting_file))
+    except Exception as exc:
+        print(f"[config-watch] models.json 重新加载失败，保留内存配置: {exc}")
+        return False
+    _apply_models_setting(new_models, new_selection, new_setting_vars)
+    return True
+
+
 def init_path(
     path: str = None, /,
     filename: str = ".env",
@@ -720,7 +880,7 @@ def init_path(
     :param path: 文件路径
     :return: None
     """
-    global env_file, env_vars, setting_file, setting_vars, models_config, mcp_config, model_selection
+    global env_file, env_vars, setting_file, models_config, mcp_config, model_selection
     if path is None:
         path = Path.cwd() / filename
     p = Path(path)
@@ -736,28 +896,8 @@ def init_path(
             setting_root = setting_root.parent
     setting_candidate = setting_root / "models.json"
     setting_file = str(setting_candidate)
-    raw_models = _load_setting_array_or_dict(setting_candidate)
-    models_config = _normalize_loaded_value(raw_models)
-    model_selection = _normalize_model_selection(
-        models_config.get("model_selection") if isinstance(models_config, dict) else None
-    )
-    _backfill_selection_api_type()
-    setting_vars = {}
-    if isinstance(models_config, dict):
-        variables = models_config.get("variables")
-        if isinstance(variables, dict):
-            normalized_setting_vars = _normalize_to_str_dict(variables)
-            for var_name, raw_value in normalized_setting_vars.items():
-                setting_vars[var_name] = _resolve_variable_references(raw_value, normalized_setting_vars)
-        runtime = models_config.get("runtime")
-        if isinstance(runtime, dict):
-            for key, value in runtime.items():
-                if isinstance(value, bool):
-                    setting_vars[key] = "true" if value else "false"
-                elif isinstance(value, (int, float)):
-                    setting_vars[key] = str(value)
-                elif value is not None:
-                    setting_vars[key] = str(value)
+    new_models, new_selection, new_setting_vars = _load_models_setting(setting_candidate)
+    _apply_models_setting(new_models, new_selection, new_setting_vars)
     if not env_path.exists():
         env_vars = {}
         return
@@ -770,9 +910,11 @@ def init_path(
                 if not var_name.strip().startswith("#"):
                     raw_vars[var_name.strip().strip("\"").strip("\'").strip()] = var_value.strip().strip("\"").strip("'").strip()
     # .env配置读取第二阶段：解析所有变量引用
-    env_vars = {}
+    # 先在局部构建完整字典、再一次性绑定全局，避免并发读方看到部分初始化的 env_vars
+    resolved_env_vars = {}
     for var_name, raw_value in raw_vars.items():
-        env_vars[var_name] = _resolve_variable_references(raw_value, raw_vars)
+        resolved_env_vars[var_name] = _resolve_variable_references(raw_value, raw_vars)
+    env_vars = resolved_env_vars
 
 
 def load_var(var_name: str, default: str = None,

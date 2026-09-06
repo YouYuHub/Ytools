@@ -3,13 +3,19 @@
 import asyncio
 import copy
 import json
+import time
 import uuid
 from collections import deque
 # import inspect
 from typing import Any, Dict, List, AsyncGenerator
 
 # 自定义模块导入
-from env_manager import ChatModelConfigurationError, load_var, require_default_chat_config
+from env_manager import (
+    ChatModelConfigurationError,
+    load_var,
+    require_default_chat_config,
+    set_ambient_model_selection,
+)
 from chat.chat_llm import ChatLLM
 from config import (
     ChatLLMRequest,
@@ -31,10 +37,13 @@ from memory.file_memory import (
 from memory.chat_history_format import content_part_to_text
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
+    ASK_ANSWER_PREFIX,
+    ASK_USER_TOOL_NAME,
     TODO_TOOL_NAME,
     execute_builtin_tool,
     inject_builtin_tools,
     is_builtin_tool,
+    normalize_ask_questions,
     normalize_todo_items,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -67,6 +76,11 @@ from factory.agent_runtime.tool_executor import (
     execute_tool_round,
     normalize_tool_calls,
     prepare_tool_execution,
+)
+from factory.session_worker import (
+    get_worker_proxy,
+    peek_worker_proxy,
+    sweep_dead_worker_proxies,
 )
 
 
@@ -204,20 +218,31 @@ def _build_sys_prompt() -> str:
 # 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
 
 
-def build_runtime_system_text() -> str:
+def build_runtime_system_text(work_dir: str | None = None) -> str:
     """构造运行时系统提示附加文本（工作路径 + 系统提示）。
 
     与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
     token 统计接口用它单独估算系统提示词开销。
+
+    work_dir 缺省时取当前进程 cwd：worker 进程内已在任务开始时 chdir 到
+    会话目录，天然正确；主进程调用方（token 统计等）应显式传入按会话
+    解析的目录（resolve_session_work_dir），避免跨会话读到全局 cwd。
     """
+    dir_text = work_dir if isinstance(work_dir, str) and work_dir.strip() else get_current_dir()
     return (
-        f"当前工作路径为<{_format_tool_result(get_current_dir())}>\n"
+        f"当前工作路径为<{_format_tool_result(dir_text)}>\n"
         + _build_sys_prompt()
     )
 
 
 async def load_all_tools() -> None:
     """加载并过滤工具，同时构建 MCP 映射。"""
+    # 发送路径复用工具探测缓存：缓存新鲜时不再逐服务拉起 MCP 子进程重探
+    # （子进程冷启动可能耗时数秒，逐消息探测会拖慢每条消息的首字节），
+    # 过期才重探；servers 配置变更时热重载线程会强制刷新缓存
+    ttl = tool_registry.tools_cache_ttl_seconds()
+    if ttl > 0 and tool_registry.get_cached_tools_payload(ttl) is not None:
+        return
     await tool_registry.refresh_tools_from_mcp(get_current_dir())
     print(f"✅ 已加载 {len(tool_registry.ALL_TOOLS)} 个工具，构建 {len(tool_registry.TOOL_MCP_SERVERS)} 个MCP映射")
 print("[INFO] 工具将按需实时刷新（来源: setting/mcp_servers.json）")
@@ -404,6 +429,15 @@ class _SessionStream:
         except RuntimeError:
             pass
 
+    def notify_threadsafe(self, loop: asyncio.AbstractEventLoop | None) -> None:
+        """供 worker 事件 reader 线程调用：把唤醒调度回主事件循环。"""
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self.notify)
+        except RuntimeError:
+            pass
+
     def set_round_start(self) -> None:
         # 每轮循环开始处调用，确保重连时只回放当前轮
         self.round_start_seq = self.seq
@@ -569,13 +603,30 @@ async def _run_chat_generation(
     stream: _SessionStream,
 ) -> None:
     """后台独立任务：执行完整 Agent 生成循环，事件写入 stream 缓冲。"""
+    # 从请求中获取 session_id
+    session_id = getattr(tool_request, 'session_id', 'default')
+    # 会话级模型选择：_meta.model_selection 按角色覆盖 → 全局默认；
+    # 失效覆盖（模型已从 models.json 删除）发 warning 并回退该角色全局默认。
+    # ambient 覆盖仅在本 asyncio 任务上下文内生效（create_task 复制上下文，任务结束自动失效），
+    # 任务内聊天/压缩模型与参数的读取（require_default_chat_config、get_role_selection 等）按会话生效
+    try:
+        from memory.chat_memory import resolve_session_model_selection
+        effective_model_selection, model_warnings = resolve_session_model_selection(session_id)
+    except Exception as selection_exc:
+        effective_model_selection, model_warnings = None, [f"会话模型选择解析失败: {selection_exc}"]
+    for model_warning in model_warnings:
+        selection_warning_event = {
+            "warning": {"code": "MODEL_SELECTION_FALLBACK", "message": model_warning}
+        }
+        await _stream_emit(
+            stream, f"data: {json.dumps(selection_warning_event, ensure_ascii=False)}\n\n"
+        )
+    set_ambient_model_selection(effective_model_selection)
     try:
         require_default_chat_config()
     except ChatModelConfigurationError as exc:
         await _stream_emit(stream, _sse_error_payload(str(exc)))
         return
-    # 从请求中获取 session_id
-    session_id = getattr(tool_request, 'session_id', 'default')
     await load_all_tools()
     # 计算本轮允许使用的工具：后端实时工具为唯一真相；前端仅允许传 tool_names
     configured_tools = list(tool_registry.ALL_TOOLS)
@@ -587,6 +638,32 @@ async def _run_chat_generation(
     }
     configured_tool_names = set(configured_tool_by_name)
     requested_tool_names = getattr(tool_request, "tool_names", None)
+    # 请求未携带 tool_names（None，区别于显式空列表）时回退会话工具选择：
+    # _meta.tool_selection 覆盖 → mcp_servers.json 的 inputs 全局默认；
+    # 前端显式传 [] 仍表示无工具模式，不受影响
+    if requested_tool_names is None:
+        try:
+            from memory.chat_memory import resolve_session_tool_selection
+            effective_selection, selection_warning = resolve_session_tool_selection(session_id)
+        except Exception as selection_exc:
+            effective_selection, selection_warning = None, f"会话工具选择解析失败: {selection_exc}"
+        if selection_warning:
+            fallback_warning_event = {
+                "warning": {"code": "TOOL_SELECTION_FALLBACK", "message": selection_warning}
+            }
+            await _stream_emit(
+                stream, f"data: {json.dumps(fallback_warning_event, ensure_ascii=False)}\n\n"
+            )
+        if effective_selection:
+            fallback_names = [
+                str(name).strip()
+                for tool_names in effective_selection.values()
+                for name in (tool_names if isinstance(tool_names, list) else [])
+                if isinstance(name, str) and str(name).strip()
+            ]
+            if fallback_names:
+                requested_tool_names = fallback_names
+                tool_request.tool_names = fallback_names
     # 先初始化：未携带 tool_names（无工具模式）时下游引用（todo_requested 等）也要可用
     requested_names: list[str] = []
     if isinstance(requested_tool_names, list):
@@ -641,10 +718,12 @@ async def _run_chat_generation(
         round_tools = []
         round_tool_servers = {}
     # 当且仅当前端有工具选择时，注入本地工具；无工具时不向上游发送 tools 字段。
-    # todo_write 例外：用户显式启用（plus 菜单开关）即注入，即使未选择任何 MCP 工具。
+    # todo_write / ask_user 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
     todo_requested = TODO_TOOL_NAME in (requested_names or [])
+    ask_requested = ASK_USER_TOOL_NAME in (requested_names or [])
     round_tools, round_tool_servers = inject_builtin_tools(
-        round_tools, round_tool_servers, include_todo=todo_requested
+        round_tools, round_tool_servers, include_todo=todo_requested,
+        include_ask_user=ask_requested,
     )
     tool_request.tools = round_tools or None
     messages: List[dict] = []
@@ -666,6 +745,21 @@ async def _run_chat_generation(
     # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
     session_chat_memory.run_task = True
     try:
+        # 覆盖式重新回答：新消息是对最新 ask_user 提问的回答时，先截断该提问
+        # 轮之后的旧回答轮，保证一个问题只有一个答案轮次。截断方法内置保护：
+        # 提问轮之后若已开启普通新任务（非回答轮），则不动历史按追加处理。
+        try:
+            latest_answer_text = ""
+            for msg in reversed(incoming_messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    latest_answer_text = content_part_to_text(msg.get("content")).strip()
+                    break
+            if latest_answer_text.startswith(ASK_ANSWER_PREFIX):
+                removed_rounds = await session_chat_memory.truncate_rounds_for_reanswer()
+                if removed_rounds:
+                    print(f"[INFO] 覆盖式重新回答：已截断提问后的 {removed_rounds} 个旧轮次")
+        except Exception as trunc_error:
+            print(f"[WARN] 覆盖式回答截断失败（按追加处理）: {trunc_error}")
         use_backend_history = parse_bool_like(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
@@ -1003,7 +1097,27 @@ async def _run_chat_generation(
                     break
                 if event.get("error") is not None:
                     await _stream_emit(stream, sse_chunk)
+                    if event.get("retrying"):
+                        # 网络失败重试帧：ChatLLM 内部正在按配置自动重试，
+                        # 只透传给前端提示，不终止任务；连续失败达到重试上限时
+                        # 上游会改发 retrying=False 的终止性错误帧。
+                        # 每次失败原始错误实时落盘到当前轮次（带 retry 次数），
+                        # 页面关闭/服务重启后仍可在历史中追溯完整重试过程。
+                        try:
+                            await session_chat_memory.add_chat_history({
+                                "role": "assistant",
+                                "event": "network_retry",
+                                "error": str(event.get("error")),
+                                "error_detail": str(event.get("error_detail") or event.get("error")),
+                                "step": str(event.get("step") or "unknown"),
+                                "retry": int(event.get("retry") or 0),
+                                "max_attempts": int(event.get("max_attempts") or 0) or None,
+                            })
+                        except Exception as retry_log_error:
+                            print(f"[WARN] 网络重试事件落盘失败：{retry_log_error}")
+                        continue
                     stream_error = event.get("error")
+                    stream_error_meta = event if isinstance(event, dict) else {}
                     session_chat_memory.run_task = False
                     break
                 # ChatLLM 做了统一处理，会单独发送 usage 事件（不带 finish_reason / choices）
@@ -1083,8 +1197,20 @@ async def _run_chat_generation(
                     await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
                 if full_response:
                     await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
-                # 记录真实错误，便于事后追溯
-                await session_chat_memory.add_chat_history({"role": "assistant", "error": str(stream_error)})
+                # 记录真实错误，便于事后追溯；附带重试统计（本次流内的失败次数
+                # 与重试上限），与逐次落盘的 network_retry 事件互相印证
+                error_record: dict[str, Any] = {"role": "assistant", "error": str(stream_error)}
+                final_retry_count = stream_error_meta.get("retry")
+                final_max_attempts = stream_error_meta.get("max_attempts")
+                if final_retry_count is not None:
+                    error_record["retry"] = final_retry_count
+                if final_max_attempts is not None:
+                    error_record["max_attempts"] = final_max_attempts
+                if stream_error_meta.get("step"):
+                    error_record["step"] = stream_error_meta.get("step")
+                if stream_error_meta.get("error_detail"):
+                    error_record["error_detail"] = stream_error_meta.get("error_detail")
+                await session_chat_memory.add_chat_history(error_record)
                 break  # 任务因错误结束，退出循环
             # 模型回复过程中用户手动停止任务
             if not session_chat_memory.run_task:
@@ -1236,6 +1362,8 @@ async def _run_chat_generation(
             builtin_results = []
             external_parsed_tools = []
             todo_updated = False
+            ask_user_pending = False
+            ask_user_questions: list[dict[str, Any]] = []
             for idx, tc, tn, ta in parsed_tools:
                 if tn == TODO_TOOL_NAME:
                     # 模型自我规划：校验并写入会话 todo（_meta.todo），随后推 SSE 给前端
@@ -1248,6 +1376,36 @@ async def _run_chat_generation(
                         "tool_name": tn,
                         "tool_args": ta,
                         "result": todo_result,
+                        "error": None,
+                    })
+                    continue
+                if tn == ASK_USER_TOOL_NAME:
+                    # 向用户提问：落一个占位工具结果保持 tool_calls 消息契约完整，
+                    # 推 SSE 事件给前端渲染交互卡片；用户回答将作为下一条用户
+                    # 消息开启新任务，届时模型基于回答继续
+                    questions = normalize_ask_questions(
+                        ta.get("questions") if isinstance(ta, dict) else None)
+                    if questions is None:
+                        ask_result: dict[str, Any] = {
+                            "error": "questions 参数无效：需要 1-3 个对象数组，每个对象包含"
+                                     "非空 question（≤200 字符）与可选 options（0-6 个非空字符串，每项 ≤100 字符）",
+                        }
+                    else:
+                        ask_result = {
+                            "status": "waiting_user",
+                            "message": "问题已展示给用户，当前任务已暂停；用户的回答将作为下一条用户消息到达，"
+                                       "收到后请基于回答继续任务",
+                            "questions": questions,
+                        }
+                        ask_user_pending = True
+                        # 并行多个 ask_user 调用时问题合并推送，不互相覆盖
+                        ask_user_questions.extend(questions)
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": ask_result,
                         "error": None,
                     })
                     continue
@@ -1401,6 +1559,20 @@ async def _run_chat_generation(
                         _replace_todo_context(messages, latest_todos)
                     except Exception as todo_compact_error:
                         print(f"[WARN] todo 上下文归并失败：{todo_compact_error}")
+                if ask_user_pending and not oversized_abort:
+                    # 推送提问事件：前端渲染问题/选项/自由输入卡片；
+                    # 回答作为下一条用户消息发送，与本轮任务解耦
+                    try:
+                        ask_event = {"event": "ask_user", "questions": ask_user_questions}
+                        await _stream_emit(
+                            stream,
+                            f"data: {json.dumps(ask_event, ensure_ascii=False)}\n\n",
+                        )
+                    except Exception as ask_emit_error:
+                        print(f"[WARN] ask_user 事件推送失败: {ask_emit_error}")
+                    # 本轮任务到此暂停：占位工具结果已落盘、消息契约完整，
+                    # 置 run_task=False 后循环正常退出（done 标记 + 收尾压缩）
+                    session_chat_memory.run_task = False
                 if oversized_abort:
                     break
                 # 任务内上下文预算管理：全量上下文达到单轮阈值（窗口×比例）时，
@@ -1502,46 +1674,138 @@ async def _run_chat_generation(
         await stream.finish()
 
 
+# 生成任务执行模式：process（默认，每会话独立 worker 进程 + os.chdir 会话目录）
+# 或 inline（生成循环留在主进程，全局 cwd 语义，供测试与故障兜底）。
+# 懒加载 .env 的 CHAT_WORKER_MODE；测试可直接补丁本变量。
+_CHAT_WORKER_MODE: str | None = None
+
+
+def _generation_use_worker() -> bool:
+    global _CHAT_WORKER_MODE
+    mode = (_CHAT_WORKER_MODE or "").strip().casefold()
+    if not mode:
+        try:
+            mode = str(load_var("CHAT_WORKER_MODE", "process") or "process").strip().casefold()
+        except Exception:
+            mode = "process"
+        _CHAT_WORKER_MODE = mode
+    return mode not in {"inline", "main", "off", "false", "0", "no"}
+
+
+async def _wait_worker_idle(proxy, timeout: float = 15.0) -> None:
+    """等待会话 worker 完全退出当前生成任务；超时强制终止兜底。
+
+    JSONL 写入是「临时文件 + 原子替换」，强制终止不会损坏已落盘数据；
+    未收尾的当前轮由 worker 重启后的检查点恢复机制标记 interrupted。
+    """
+    deadline = time.monotonic() + timeout
+    while proxy.is_generation_running():
+        if time.monotonic() >= deadline:
+            proxy.terminate("等待旧生成任务退出超时")
+            return
+        await asyncio.sleep(0.05)
+
+
+async def _wait_worker_generation(proxy, stream) -> None:
+    """worker 模式下占位 stream.task 的等待任务：worker 报告完成后退出。
+
+    保留 stream.task 的既有语义（可 cancel、done 表示生成结束）。
+    worker 进程 spawn + 初始化有秒级延迟，必须先等到 task_started
+    （is_generation_running 翻转）再判断结束，否则会把"尚未开始"误判成
+    "已完成"，导致流内事件全部丢失；worker 崩溃由 reader 线程合成
+    task_done 兜底收尾。
+    """
+    deadline = time.monotonic() + 60
+    while not proxy.is_generation_running():
+        if stream.done:
+            return
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.05)
+    while not stream.done and proxy.is_generation_running():
+        await asyncio.sleep(0.1)
+    if not stream.done:
+        await stream.finish()
+
+
+async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest) -> bool:
+    """启动一次生成任务。
+
+    worker 模式：把请求序列化派发给会话 worker（懒启动进程），并把等待任务
+    挂到 stream.task；inline 模式：保持旧行为，在主进程内起 asyncio 任务。
+    返回 False 表示启动失败（已向流内写入 error 事件）。
+    """
+    if proxy is not None:
+        proxy.bind_stream(stream)
+        started = proxy.start_generation(tool_request.model_dump())
+        if not started:
+            await _stream_emit(
+                stream,
+                _sse_error_payload("会话 worker 进程启动失败，请查看服务端日志"),
+            )
+            await stream.finish()
+            return False
+        stream.task = asyncio.create_task(_wait_worker_generation(proxy, stream))
+        return True
+    stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+    return True
+
+
 async def tool_chat_server(
     tool_request: ChatLLMRequest
 ) -> AsyncGenerator[str, None]:
     """聊天流式入口：后台生成任务 + 可重连消费。
 
-    - 首个请求启动后台生成任务（asyncio.create_task）；
+    - 首个请求启动后台生成任务（默认派发到会话独立 worker 进程，
+      CHAT_WORKER_MODE=inline 时回退主进程 asyncio 任务）；
     - 页面刷新后的重连请求（无用户消息）只订阅事件缓冲，从当前轮起点回放；
     - 携带新用户消息的请求会先平滑打断旧任务，再重新开始一轮生成。
     """
     session_id = getattr(tool_request, 'session_id', 'default')
+    proxy = get_worker_proxy(session_id) if _generation_use_worker() else None
+    if proxy is not None:
+        proxy.set_loop(asyncio.get_running_loop())
+        sweep_dead_worker_proxies()
     stream = _get_session_stream(session_id)
     creating = False
-    if stream is None or stream.task is None or stream.task.done():
+    if proxy is not None:
+        task_active = proxy.is_generation_running()
+    else:
+        task_active = stream is not None and stream.task is not None and not stream.task.done()
+    if stream is None or stream.done or not task_active:
         stream = _set_session_stream(session_id)
-        stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+        if not await _start_session_generation(proxy, stream, tool_request):
+            return
         creating = True
     elif _request_has_new_user_message(tool_request):
-        # 已存在生成任务且本次请求携带新用户消息：显式取消旧任务并等待其
-        # 完全退出后再启动新任务。旧任务的 CancelledError 处理会以 error
+        # 已存在生成任务且本次请求携带新用户消息：显式打断旧任务并等待其
+        # 完全退出后再启动新任务。旧任务的收尾处理会以 error/interrupted
         # 事件收尾当前轮次并落盘已积累的工具调用/思考，避免新旧两个生成
         # 循环交错写入同一 pending 轮次（仅靠 run_task 标记存在竞态窗口：
         # 新任务会把标记置回 True，旧循环可能继续运行）。
         # 新消息打断不是手动停止：先清掉可能残留的 user_stop_requested，
         # 保证旧任务按 interrupted 语义落盘。
         stream.user_stop_requested = False
-        old_task = stream.task
-        try:
-            (await get_chat_memory_manager(session_id)).run_task = False
-        except Exception:
-            pass
-        if old_task is not None:
-            old_task.cancel()
+        if proxy is not None:
+            proxy.request_stop(reason="interrupt")
+            await _wait_worker_idle(proxy)
+        else:
+            old_task = stream.task
             try:
-                await old_task
-            except asyncio.CancelledError:
+                (await get_chat_memory_manager(session_id)).run_task = False
+            except Exception:
                 pass
-            except Exception as old_error:
-                print(f"[WARN] 旧生成任务退出异常（已忽略）: {old_error}")
+            if old_task is not None:
+                old_task.cancel()
+                try:
+                    await old_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as old_error:
+                    print(f"[WARN] 旧生成任务退出异常（已忽略）: {old_error}")
         stream = _set_session_stream(session_id)
-        stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+        if not await _start_session_generation(proxy, stream, tool_request):
+            return
         creating = True
     try:
         if stream.done:
@@ -1577,7 +1841,10 @@ async def tool_chat_server(
 async def stop_chat_task(session_id):
     ''' 手动停止当前会话的聊天任务。
 
-    两步停止：
+    worker 模式（默认）：向会话 worker 发送 stop 命令，worker 内置
+    run_task=False 并取消生成任务，事件经 IPC 回流收尾；随后确认 worker
+    已完全退出当前任务（超时则强制终止兜底）。
+    inline 模式保持原两步停止：
     1. 置 run_task=False：生成循环在下一次检查点（流式事件/工具结果处理）主动退出；
     2. 取消后台生成任务（asyncio.Task.cancel）：工具执行已挪到工作线程，事件循环
        不再被阻塞，即使当前正卡在工具调用上，取消也能在 await 点生效并触发
@@ -1585,6 +1852,15 @@ async def stop_chat_task(session_id):
     取消只作用于生成任务本身，不影响 SSE 消费端连接。
     '''
     session_id = normalize_session_id(session_id)
+    if _generation_use_worker():
+        proxy = peek_worker_proxy(session_id)
+        stream = _get_session_stream(session_id)
+        if stream is not None:
+            stream.user_stop_requested = True
+        if proxy is not None:
+            proxy.request_stop(reason="user")
+            await _wait_worker_idle(proxy, timeout=15.0)
+        return
     try:
         (await get_chat_memory_manager(session_id)).run_task = False
     except Exception:

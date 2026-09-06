@@ -115,6 +115,11 @@ class ChatRoundStore:
 
         if role == "assistant" and record.get("done") == "[DONE]":
             return self.finalize_round("done")
+        # 网络重试失败事件是过程性记录（自带 error 字段但不终结轮次）：
+        # 只追加到当前轮，不能触发收尾，否则第一次失败就把轮次提前标成
+        # error，后续重试事件与最终错误会因 pending 轮次缺失被整体丢弃。
+        if role == "assistant" and record.get("event") == "network_retry":
+            return None
         if role == "assistant" and record.get("error") is not None:
             return self.finalize_round("error")
         if role == "user" and record.get("content") == "停止任务":

@@ -27,12 +27,14 @@ async def repro_main():
             #   pipe_name     - 命名管道路径，默认 "\\\\.\\pipe\\default_server"
             #   terminal_mode - 终端命令风格，如 "cmd.exe /k chcp 65001" 或 "powershell.exe"，默认 "cmd.exe /k chcp 65001"
             #   first_command - 可选，首条要执行的命令，如 "dir" 或 "ls"
-            "pipe_name": r"\\.\pipe\default_server",
+            "pipe_name": r"\\.\pipe\default_server1",
             "terminal_mode": r"cmd.exe /k chcp 65001",
             # "first_command": "for /l %i in (1,1,10) do (echo count %i & timeout /t 1 /nobreak >nul)",
-            "command": "for /l %i in (1,1,10) do (echo count %i￥ pts & timeout /t 1 /nobreak >nul)",
-            # "wait_milliseconds": 80,
-            "prompt": "pts4|6￥",
+            "command": "ping 127.0.0.1",
+            # "command": "for /l %i in (1,1,10) do (echo count %i￥ pts & timeout /t 1 /nobreak >nul)",
+            "wait_milliseconds": 8000,
+            # "prompt": "pts4|6￥",
+            # "prompt": "c:\\>",
             # "first_command": "ls -lh",
         }, mcp_service=r"C:\Users\Administrator\Desktop\C++学习录\MCP\MCPshell\x64\Release\PipeIpcMCP.exe")
         # res = await call_mcp_tool('read_pipe_output', {
@@ -59,15 +61,15 @@ async def repro_main():
         #     #   first_command - 可选，首条要执行的命令，如 "dir" 或 "ls"
         #     "pipe_name": r"\\.\pipe\default_test_server",
         #     # "terminal_mode": r"powershell",
-        #     "terminal_mode": r"cmd",
-        #     "first_command": "for /l %i in (1,1,10) do (echo count %i & timeout /t 1 /nobreak >nul)",
+        #     "terminal_mode": r"cmd.exe /k chcp 65001",
+        #     "first_command": "chcp 65001",
         #     # "command": "for /l %i in (1,1,10) do (echo count %i￥ pts & timeout /t 1 /nobreak >nul)",
         #     # "max_length": 15000,
         #     # "offset": 1500,
         #     # "wait_milliseconds": 0,
-        #     # "prompt": "pts|6￥",
-        #     # "first_command": "ls -lh",
-        # }, mcp_service=r"C:\Users\Administrator\Desktop\C++学习录\MCP\MCPshell\x64\Release\PipeIpcMCP.exe")
+        #     "prompt": "C:\\>",
+        #     # "first_command": "ls  -lh",
+        # }, mcp_service=r"C:\Users\Administrator\Desktop\python学习录\main_study\large_model\agent_tool_sse\mcp_server\PipeIpcMCP.exe")
         print('RESULT:', res)
     except Exception as e:
         print(f"error: {e}")

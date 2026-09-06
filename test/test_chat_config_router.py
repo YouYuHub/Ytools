@@ -75,7 +75,7 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
                     "sysServer": {
                         "type": "stdio",
                         "command": "python",
-                        "args": ["mcp_server/sys_server.py"],
+                        "args": ["mcp_server/sys_tools_server.py"],
                         "version": "1.0.0",
                     },
                 },
@@ -432,6 +432,72 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.body.decode("utf-8"))
         self.assertEqual(body["inputs"]["pipeIpcMcp"], ["setup_pipe"])
+
+    async def test_tool_selection_builtin_pseudo_server(self) -> None:
+        """内置工具伪服务 __builtin__：全局保存时原样保留，未提及时不写入。"""
+        # __builtin__ 不按未知服务拒绝，且与 MCP 服务一起保存
+        response = await self.router.update_tool_selection(
+            self.router.McpToolSelection(inputs={
+                "__builtin__": ["ask_user", "todo_write"],
+                "pipeIpcMcp": ["setup_pipe"],
+            })
+        )
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(body["inputs"]["__builtin__"], ["ask_user", "todo_write"])
+        saved = json.loads((self._temp_path / "setting" / "mcp_servers.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["inputs"]["__builtin__"], ["ask_user", "todo_write"])
+
+        # 全量替换语义：未提及 __builtin__ 时从 inputs 中移除（未勾选 = 不写入）
+        response = await self.router.update_tool_selection(
+            self.router.McpToolSelection(inputs={"sysServer": ["list_dir"]})
+        )
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertNotIn("__builtin__", body["inputs"])
+
+        # 只有内置工具、无 MCP 服务条目时也允许保存
+        response = await self.router.update_tool_selection(
+            self.router.McpToolSelection(inputs={"__builtin__": ["todo_write"]})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.body.decode("utf-8"))["inputs"],
+            {"__builtin__": ["todo_write"], "pipeIpcMcp": [], "sysServer": []},
+        )
+
+    async def test_tool_selection_builtin_session_override(self) -> None:
+        """会话级内置工具选择：写入 _meta.tool_selection 并被回退解析原样返回。"""
+        from memory.chat_memory import (
+            get_chat_memory_manager,
+            resolve_session_tool_selection,
+        )
+
+        session_id = "builtin_sel_ut"
+        manager = await get_chat_memory_manager(session_id)
+        try:
+            await manager.update_session_tool_selection({
+                "__builtin__": ["ask_user"],
+                "sysServer": ["list_dir"],
+            })
+            effective, warning = resolve_session_tool_selection(session_id)
+            self.assertIsNone(warning)
+            self.assertEqual(effective, {"__builtin__": ["ask_user"], "sysServer": ["list_dir"]})
+
+            # 路由侧回显：is_overridden / session_selection / effective_selection
+            response = await self.router.get_tool_selection(session_id=session_id)
+            body = json.loads(response.body.decode("utf-8"))
+            self.assertTrue(body["is_overridden"])
+            self.assertEqual(body["session_selection"], {"__builtin__": ["ask_user"], "sysServer": ["list_dir"]})
+            self.assertEqual(body["effective_selection"], {"__builtin__": ["ask_user"], "sysServer": ["list_dir"]})
+
+            # 清除覆盖后回退全局默认（临时 inputs 无 __builtin__ 键）
+            await manager.update_session_tool_selection(None)
+            effective, warning = resolve_session_tool_selection(session_id)
+            self.assertIsNone(warning)
+            self.assertNotIn("__builtin__", effective)
+        finally:
+            manager._file_path.unlink(missing_ok=True)
 
     async def test_context_return_config_get_defaults_and_post_updates(self) -> None:
         before = await self.router.get_context_return_config()

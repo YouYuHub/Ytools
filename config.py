@@ -1,4 +1,5 @@
 # 标准库
+import json
 import os
 from pathlib import Path
 
@@ -24,6 +25,7 @@ DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数�
 DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符
 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
 DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制
+DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS = 3       # 模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试）
 
 
 
@@ -75,8 +77,14 @@ class ChatLLMRequest(BaseModel):
 
 
 class ChatModelSelection(BaseModel):
-    provider: str = Field(..., min_length=1, description="顶层 provider 名称")
-    model: str = Field(..., min_length=1, description="模型命名（models.json 中 models 字段的键名）")
+    provider: Optional[str] = Field(
+        None,
+        description="顶层 provider 名称；会话级 clear=true 时可省略，其余场景必填（缺失时由服务端校验报错）",
+    )
+    model: Optional[str] = Field(
+        None,
+        description="模型命名（models.json 中 models 字段的键名）；会话级 clear=true 时可省略",
+    )
     role: str = Field(
         "chat_model",
         description="模型角色：chat_model（聊天）/ compaction_model（压缩）/ title_model（标题），默认 chat_model",
@@ -84,6 +92,15 @@ class ChatModelSelection(BaseModel):
     parameter: Optional[dict[str, Any]] = Field(
         None,
         description="该模型的默认生成参数（如 temperature/max_tokens/top_p 等），全量替换语义；不传表示保持现有配置",
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description="会话ID；携带时写入该会话的 _meta.model_selection（会话级覆盖，仅覆盖该角色），"
+                    "不携带时写入全局默认（models.json 顶层 model_selection）",
+    )
+    clear: bool = Field(
+        False,
+        description="仅会话级有效：为 true 时清除该会话当前角色的独立模型选择，恢复跟随全局默认（忽略 provider/model）",
     )
 
 
@@ -120,6 +137,8 @@ class HistoryCompactionConfig(BaseModel):
         ge=1,
         description="连续超长拒绝达到该次数时终止当前任务；None 表示保持当前 .env 配置",
     )
+
+
 class ContextReturnConfig(BaseModel):
     """思考过程与历史工具结果的最大回传长度配置。"""
 
@@ -142,6 +161,15 @@ class McpToolConfig(BaseModel):
     )
 
 
+class NetworkRetryConfig(BaseModel):
+    """模型网络请求失败重试配置。"""
+
+    max_attempts: int = Field(
+        DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
+        description="模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试直到手动停止）",
+    )
+
+
 class McpToolSelection(BaseModel):
     """MCP 工具选择配置请求：服务名 -> 工具名数组。"""
 
@@ -150,25 +178,55 @@ class McpToolSelection(BaseModel):
         description="工具选择映射：键为 mcp_servers.json 中配置的服务名，值为该服务下选中的工具名数组；"
                     "非法条目（非字符串/空串/重复）由服务端规整时丢弃",
     )
+    session_id: Optional[str] = Field(
+        None,
+        description="会话ID；携带时写入该会话的 _meta.tool_selection（会话级覆盖，"
+                    "空 inputs 表示清除覆盖恢复跟随全局），不携带时写入全局默认（mcp_servers.json 的 inputs 键）",
+    )
+
+
+class SessionWorkDirConfig(BaseModel):
+    """会话级工作目录配置请求（写入 _meta.work_dir）。"""
+
+    session_id: str = Field(..., min_length=1, description="会话ID")
+    work_dir: Optional[str] = Field(
+        "",
+        description="会话独立工作目录；空串/None 表示清除覆盖，恢复跟随全局默认 DEFAULT_CHAT_WORK_DIR",
+    )
 
 
 
 # 函数定义部分
-def set_current_dir(target_directory: str = None) -> bool:
-    if target_directory == __file__ or target_directory is None:
-        return False
+def resolve_work_dir(target_directory: str | None) -> Path | None:
+    """校验并解析目标工作目录，返回可用的绝对路径；无效返回 None（不做 chdir）。
+
+    规则与 set_current_dir 一致：目录 → 本身；存在的文件 → 其父目录；
+    不存在 → None；相对路径按当前进程 cwd 展开。
+    """
+    if not isinstance(target_directory, str) or not target_directory.strip():
+        return None
+    if target_directory == __file__:
+        return None
     target_path = Path(str(target_directory)).expanduser()
     if not target_path.is_absolute():
         target_path = Path.cwd() / target_path
-    resolved_path = target_path.resolve()
+    try:
+        resolved_path = target_path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
     if resolved_path.is_dir():
-        work_dir = resolved_path
-    elif resolved_path.exists():
-        work_dir = resolved_path.parent
-    else:
+        return resolved_path
+    if resolved_path.exists():
+        return resolved_path.parent
+    return None
+
+
+def set_current_dir(target_directory: str = None) -> bool:
+    resolved_path = resolve_work_dir(target_directory)
+    if resolved_path is None:
         return False
-    os.chdir(str(work_dir))
-    # print(f"Current Directory set to: {work_dir}")
+    os.chdir(str(resolved_path))
+    # print(f"Current Directory set to: {resolved_path}")
     return True
 
 
@@ -177,11 +235,100 @@ def get_current_dir() -> str:
 
 
 def get_persisted_work_dir() -> str | None:
-    value = load_var("CHAT_WORK_DIR", None)
+    value = load_var("DEFAULT_CHAT_WORK_DIR", None)
     if not isinstance(value, str):
         return None
     normalized = value.strip()
     return normalized or None
+
+
+# ---------- setting/mcp_servers.json 读取/规整/写入 ----------
+# 会话级工具选择（_meta.tool_selection）与全局默认工具选择（inputs 键）共用这里的
+# 规整逻辑；放在 config.py 是因为它同时被路由层、memory 层与 worker 进程引用，
+# 且只依赖标准库，不会引入循环导入。
+
+
+def get_mcp_servers_config_path() -> Path:
+    return PROJECT_ROOT / "setting" / "mcp_servers.json"
+
+
+def read_mcp_servers_config(target_path: Path | None = None) -> dict:
+    """安全读取 mcp_servers.json；文件缺失/解析失败返回 {}（不抛异常）。"""
+    path = Path(target_path) if target_path is not None else get_mcp_servers_config_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def configured_server_names(data: dict) -> dict:
+    servers = data.get("servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def normalize_tool_inputs(raw: Any) -> dict[str, list[str]]:
+    """规整为 {服务名: [去重工具名]}；非法条目（非字符串/空串/重复）直接丢弃。"""
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, list[str]] = {}
+    for server, tool_names in raw.items():
+        if not isinstance(server, str) or not server.strip() or not isinstance(tool_names, list):
+            continue
+        names: list[str] = []
+        for name in tool_names:
+            if isinstance(name, str) and name.strip() and name not in names:
+                names.append(name)
+        normalized[server] = names
+    return normalized
+
+
+def get_global_tool_inputs(target_path: Path | None = None) -> tuple[dict[str, list[str]], list[str], str | None]:
+    """读取全局默认工具选择（mcp_servers.json 的 inputs 键）。
+
+    Returns:
+        (规整后的 inputs（已配置服务补 []）, 已配置服务名列表, 读取失败原因或 None)
+    """
+    data = read_mcp_servers_config(target_path)
+    if not data:
+        # 文件缺失与解析失败在这里等价：都没有全局默认可选
+        path = Path(target_path) if target_path is not None else get_mcp_servers_config_path()
+        return {}, [], "mcp_servers.json 解析失败" if path.exists() else None
+    servers = configured_server_names(data)
+    inputs = normalize_tool_inputs(data.get("inputs"))
+    for server in servers:
+        inputs.setdefault(str(server), [])
+    return inputs, [str(server) for server in servers], None
+
+
+def write_mcp_servers_inputs(inputs: dict[str, list[str]], target_path: Path | None = None) -> dict:
+    """把规整后的 inputs 写回 mcp_servers.json（仅替换 inputs 键，其余内容原样保留）。
+
+    临时文件 + 原子替换写入，避免配置热重载线程读到半截 JSON。
+    """
+    path = Path(target_path) if target_path is not None else get_mcp_servers_config_path()
+    data = read_mcp_servers_config(path)
+    if not data:
+        data = {}
+    data["inputs"] = normalize_tool_inputs(inputs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    import time
+    for attempt in range(6):
+        try:
+            os.replace(tmp_path, path)
+            return data
+        except OSError:
+            if attempt >= 5:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+    return data  # pragma: no cover - 上面重试耗尽会直接 raise
 
 
 def apply_persisted_work_dir() -> bool:

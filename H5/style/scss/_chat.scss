@@ -115,7 +115,7 @@
       display: inline-flex;
     }
 
-    .think-toggle > svg {
+    .think-toggle>svg {
       display: none;
     }
   }
@@ -378,6 +378,52 @@
   color: var(--text-secondary);
 }
 
+// 网络重试提示条：一行摘要 + 可展开的原始错误详情
+.notice-retry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  border-color: var(--danger);
+
+  .notice-retry-summary {
+    flex: 1 1 auto;
+    min-width: 0;
+    word-break: break-word;
+  }
+
+  .notice-retry-toggle {
+    flex: 0 0 auto;
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    padding: 2px 8px;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+  }
+
+  .notice-retry-detail {
+    flex-basis: 100%;
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-code);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 180px;
+    overflow: auto;
+  }
+}
+
 // ---------- 代码块（语言标题栏 + 复制） ----------
 .codeblock {
   position: relative;
@@ -493,8 +539,11 @@
     // sticky 钉住行为不受影响
     max-height: 70vh;
     overflow: auto;
-    // 滚到代码区边界时不把滚动传导给页面，阅读长代码时滚动位置更稳定
-    overscroll-behavior: contain;
+    // 不设 overscroll-behavior（保持默认 auto 的滚动链）：
+    // 内容不足一屏（无垂直滚动条）时滚轮直接滚动页面；有滚动条时先滚
+    // 块内，到达上下边界后剩余滚动量链式传导给聊天区。
+    // 此前这里的 contain 会无条件阻断链式滚动，导致无滚动条时代码块
+    // 也"吃掉"滚轮、页面无法滚动
 
     code {
       font-family: var(--font-mono);
@@ -724,5 +773,60 @@
   &:disabled {
     opacity: 0.6;
     cursor: default;
+  }
+}
+// ---------- 模型提问卡片（ask_user 事件在聊天流内的静态展示；点击可重新打开回答弹窗） ----------
+.ask-block {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid #0b84d8;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+
+  .ask-block-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #0b84d8;
+  }
+
+  .ask-block-question {
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  .ask-block-hint {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  // 可点击重开回答窗口
+  &.ask-block-clickable {
+    cursor: pointer;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+
+    &:hover {
+      border-color: #0b84d8;
+      background: var(--bg-hover);
+    }
+  }
+
+  // 过期提问：已有后续对话，仅可查看不可再答
+  &.ask-block-stale {
+    cursor: default;
+
+    &:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-elevated);
+    }
+
+    .ask-block-title {
+      color: var(--text-tertiary);
+    }
   }
 }

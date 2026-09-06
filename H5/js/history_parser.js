@@ -107,6 +107,17 @@
           return;
         }
         if (evt.role !== "assistant") return;
+        // 网络重试失败事件（逐次落盘）：历史回放中显示第几次失败与原始错误
+        if (evt.event === "network_retry" && evt.error) {
+          const retryNo = Number(evt.retry || 0);
+          const maxNo = evt.max_attempts != null ? Number(evt.max_attempts) : null;
+          records.push({
+            kind: "notice",
+            content: "网络请求失败（第 " + retryNo + (maxNo ? "/" + maxNo : "") + " 次重试前）：" + evt.error,
+            ts: ts,
+          });
+          return;
+        }
         if (evt.error) {
           records.push({ kind: "notice", content: "出错：" + evt.error, ts: ts });
           return;

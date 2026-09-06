@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import copy
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,16 @@ from memory.chat_round_store import (
     merge_usage_dict,
     parse_round_entry,
 )
+from util.file_lock import cross_process_lock
 from util.timestamp_utils import now_str
-from config import DEFAULT_CONTEXT_HISTORY_ROUNDS, DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH
+from config import (
+    DEFAULT_CONTEXT_HISTORY_ROUNDS,
+    DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+    get_global_tool_inputs,
+    get_persisted_work_dir,
+    normalize_tool_inputs,
+    resolve_work_dir,
+)
 
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
@@ -90,6 +99,16 @@ def _default_meta(session_id: str) -> dict[str, Any]:
         "completion_count": 0,
         "context_summary": None,
         "compress_usage": {},
+        # 会话独立工作目录：None 表示未覆盖，跟随全局默认 DEFAULT_CHAT_WORK_DIR。
+        # 惰性写入——只有用户显式设置过才落盘，新会话不预填
+        "work_dir": None,
+        # 会话独立工具选择：None 表示未覆盖，跟随全局默认（mcp_servers.json 的 inputs 键）。
+        # 结构与 inputs 一致：{服务名: [工具名]}；空选择视为未覆盖（清空即恢复跟随全局）
+        "tool_selection": None,
+        # 会话独立模型选择：None 表示未覆盖，跟随全局默认（models.json 顶层 model_selection）。
+        # 结构为 {角色: {ownership_name, model_name, parameter, api_type}}，仅存已覆盖的角色；
+        # 空选择/非法条目视为未覆盖（清空即恢复跟随全局）
+        "model_selection": None,
     }
 
 
@@ -117,6 +136,109 @@ def _is_meta_record(entry: Any) -> bool:
     return isinstance(entry, dict) and isinstance(entry.get("_meta"), dict)
 
 
+def read_session_meta_value(session_id: str, key: str) -> Any:
+    """只读读取会话首行 _meta 的指定字段（不创建文件/目录，不触发重算落盘）。
+
+    供解析会话工作目录等轻量场景使用；文件不存在或首行非 _meta 返回 None。
+    """
+    try:
+        file_path = _get_chat_history_file(normalize_session_id(session_id))
+    except Exception:
+        return None
+    if not file_path.exists():
+        return None
+    rows = _read_jsonlines(file_path)
+    if rows and _is_meta_record(rows[0]):
+        meta = rows[0].get("_meta")
+        if isinstance(meta, dict):
+            return meta.get(key)
+    return None
+
+
+def resolve_session_work_dir(session_id: str) -> tuple[str | None, str | None]:
+    """解析会话生效工作目录（惰性：不落盘、不 chdir）。
+
+    解析顺序（会话覆盖优先，全局默认兜底）：
+    1. `_meta.work_dir` 存在且目录有效 → 直接生效；
+    2. `_meta.work_dir` 存在但已失效 → 记录警告，回退全局默认；
+    3. `.env` 的 DEFAULT_CHAT_WORK_DIR 有效 → 生效（新会话的初始目录）；
+    4. 都没有 → (None, None)，调用方保持当前进程 cwd。
+
+    Returns:
+        (生效目录绝对路径或 None, 警告消息或 None)
+    """
+    warning: str | None = None
+    override = read_session_meta_value(session_id, "work_dir")
+    if isinstance(override, str) and override.strip():
+        resolved = resolve_work_dir(override)
+        if resolved is not None:
+            return str(resolved), None
+        warning = f"会话工作目录已失效（{override}），已回退默认工作目录"
+    persisted = get_persisted_work_dir()
+    if isinstance(persisted, str) and persisted.strip():
+        resolved = resolve_work_dir(persisted)
+        if resolved is not None:
+            return str(resolved), warning
+        warning = warning or f"默认工作目录已失效（{persisted}），保持当前目录"
+    return None, warning
+
+
+def resolve_session_tool_selection(
+    session_id: str,
+) -> tuple[dict[str, list[str]] | None, str | None]:
+    """解析会话生效工具选择（惰性：只读，不落盘）。
+
+    解析顺序（会话覆盖优先，全局默认兜底）：
+    1. `_meta.tool_selection` 为非空 {服务名: [工具名]} → 直接生效；
+       请求未携带 tool_names 时由生成流程用它作为本轮工具；
+    2. 未覆盖/空选择/非法 → 回退全局默认（mcp_servers.json 的 inputs 键）；
+    3. 全局配置读取失败 → 记录警告，返回 (None, 警告)，调用方按无默认工具处理。
+
+    Returns:
+        (生效工具选择或 None, 警告消息或 None)
+    """
+    override = read_session_meta_value(session_id, "tool_selection")
+    normalized_override = normalize_tool_inputs(override) if override is not None else None
+    if normalized_override:
+        return normalized_override, None
+    inputs, _servers, error = get_global_tool_inputs()
+    if error:
+        return None, f"全局默认工具配置读取失败（{error}），本轮按未配置默认工具处理"
+    return (inputs or None), None
+
+
+def resolve_session_model_selection(
+    session_id: str,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """解析会话生效模型选择（惰性：只读，不落盘；返回全部角色的合并结果）。
+
+    解析顺序（按角色独立覆盖，全局默认兜底）：
+    1. `_meta.model_selection` 中该角色的覆盖条目存在且模型仍在 models.json 目录中 → 生效；
+    2. 覆盖条目引用的模型已不存在（如 models.json 被手工编辑）→ 记录警告，该角色回退全局默认；
+    3. 未覆盖的角色直接使用全局默认（models.json 顶层 model_selection）。
+
+    Returns:
+        ({role: {ownership_name, model_name, parameter, api_type}} 全角色合并结果, 警告消息列表)
+    """
+    effective = _get_global_model_selection()
+    warnings: list[str] = []
+    override = read_session_meta_value(session_id, "model_selection")
+    normalized_override = _normalize_model_selection(override) if override is not None else {}
+    for role in _MODEL_SELECTION_ROLES:
+        entry = normalized_override.get(role) if isinstance(normalized_override, dict) else None
+        if not (isinstance(entry, dict) and entry.get("ownership_name") and entry.get("model_name")):
+            continue
+        provider = entry.get("ownership_name")
+        model = entry.get("model_name")
+        if _get_model_config(provider, model) is None:
+            warnings.append(
+                f"会话独立{role} 已失效（{provider} / {model} 不在 models.json 中），已回退全局默认"
+            )
+            continue
+        effective[role] = entry
+    return effective, warnings
+
+
 # 摘要/历史格式化已迁移到 memory.chat_history_format，本文件仅保留调用入口
 from memory.chat_history_format import (
     normalize_context_summary as _normalize_context_summary,
@@ -132,6 +254,10 @@ from memory.chat_history_format import (
     _round_question as _extract_round_question,
 )
 from env_manager import load_var as _load_var
+from env_manager import normalize_model_selection as _normalize_model_selection
+from env_manager import get_model_config as _get_model_config
+from env_manager import get_global_model_selection as _get_global_model_selection
+from env_manager import MODEL_SELECTION_ROLES as _MODEL_SELECTION_ROLES
 from factory.agent_runtime.chat_runtime import (
     estimate_messages_tokens as _estimate_messages_tokens,
     estimate_request_context_tokens as _estimate_request_context_tokens,
@@ -226,6 +352,35 @@ def _recompute_meta_from_entries(
     meta["compress_usage"] = compress_usage_total
     meta["record_count"] = len(entries)
     meta["completion_count"] = completion_count
+    # 会话工作目录：显式 None 表示未覆盖（保留）；非字符串/空白视为非法清除。
+    # 目录是否存在不在重算时校验（失效由 resolve_session_work_dir 回退处理），
+    # 避免目录临时被占用（如重命名）时静默丢失用户配置
+    work_dir = meta.get("work_dir")
+    if work_dir is not None and (not isinstance(work_dir, str) or not work_dir.strip()):
+        meta.pop("work_dir", None)
+    # 会话工具选择：None 表示未覆盖（保留）；非 dict 或规整后为空（无有效工具条目）
+    # 视为未覆盖清除，恢复跟随全局默认 inputs
+    tool_selection = meta.get("tool_selection")
+    if tool_selection is not None:
+        normalized_selection = normalize_tool_inputs(tool_selection)
+        if normalized_selection:
+            meta["tool_selection"] = normalized_selection
+        else:
+            meta.pop("tool_selection", None)
+    # 会话模型选择：None 表示未覆盖（保留）；仅保留配置完整的角色条目
+    # （模型是否仍存在不在重算时校验，失效由 resolve_session_model_selection 回退全局处理），
+    # 非法结构或空选择视为未覆盖清除
+    model_selection_override = meta.get("model_selection")
+    if model_selection_override is not None:
+        normalized_models = _normalize_model_selection(model_selection_override)
+        valid_models = {
+            role: entry for role, entry in normalized_models.items()
+            if entry.get("ownership_name") and entry.get("model_name")
+        }
+        if valid_models:
+            meta["model_selection"] = valid_models
+        else:
+            meta.pop("model_selection", None)
     # 只有真实写入（追加轮次 / 改标题 / 删除记录 / 导入）才刷新 updated_at；
     # 纯读取（如打开会话列表时逐个拉 meta）不能改动它，
     # 否则“按最近更新排序”会退化为“按最后一次 meta 读取顺序排序”，顺序失真
@@ -243,8 +398,13 @@ def _recompute_meta_from_entries(
     return meta
 
 
-def _load_meta_and_entries(file_path: Path, session_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    rows = _read_jsonlines(file_path)
+def _load_meta_and_entries(
+    file_path: Path,
+    session_id: str,
+    rows: list[Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if rows is None:
+        rows = _read_jsonlines(file_path)
     if rows and _is_meta_record(rows[0]):
         base_meta = rows[0].get("_meta") or _default_meta(session_id)
         entries = [row for row in rows[1:] if isinstance(row, dict)]
@@ -255,24 +415,55 @@ def _load_meta_and_entries(file_path: Path, session_id: str) -> tuple[dict[str, 
     return meta, entries
 
 
+def _read_meta_first_line(file_path: Path) -> dict[str, Any] | None:
+    """只读 jsonl 首行解析 _meta；首行缺失/损坏/非 _meta 记录时返回 None。
+
+    写路径（追加轮次/改标题/删除/导入等）总是把重算后的完整 _meta 落在
+    首行，因此正常文件单行读取即可拿到与全量重算一致的元数据；
+    返回 None 时调用方应回退 _load_meta_and_entries 全量路径兜底。
+    """
+    try:
+        with file_path.open("r", encoding="utf-8") as fp:
+            first_line = fp.readline().strip()
+    except OSError:
+        return None
+    if not first_line:
+        return None
+    try:
+        row = json.loads(first_line)
+    except ValueError:
+        return None
+    if not _is_meta_record(row):
+        return None
+    meta = row.get("_meta")
+    return meta if isinstance(meta, dict) else None
+
+
+# 原子写重试退避序列（秒）：Windows 上刚写入的文件可能被搜索索引、杀软或
+# 其他进程短暂占用（open / os.replace 偶发 WinError 5），指数退避把重试窗口
+# 拉长到约 2.6s 基本覆盖占用时长；仍失败由调用方决定中止还是降级。
+_ATOMIC_WRITE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+
+
 def _write_meta_and_entries(file_path: Path, meta: dict[str, Any], entries: list[dict[str, Any]]) -> None:
     # 先写临时文件再原子替换：流式期间其他请求（如 /chat_history/file 读取）
     # 不会读到写了一半的文件，避免并发竞态导致记录丢失。
-    # Windows 上刚写入的临时文件可能被搜索索引/杀软短暂占用，
-    # os.replace 偶发 WinError 5，重试几次规避。
+    # Windows 上临时文件与目标文件都可能被搜索索引/杀软短暂占用，临时文件
+    # 的 open 与 os.replace 偶发 WinError 5，指数退避重试规避；全部失败则抛出。
     tmp_path = file_path.with_name(file_path.name + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as fp:
-        fp.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
-        for entry in entries:
-            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    for attempt in range(6):
+    last_error: OSError | None = None
+    for delay in _ATOMIC_WRITE_RETRY_DELAYS:
         try:
+            with tmp_path.open("w", encoding="utf-8") as fp:
+                fp.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
+                for entry in entries:
+                    fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
             os.replace(tmp_path, file_path)
             return
-        except OSError:
-            if attempt >= 5:
-                raise
-            time.sleep(0.01 * (attempt + 1))
+        except OSError as err:
+            last_error = err
+            time.sleep(delay)
+    raise last_error
 
 
 def _delete_path_with_retry(path: Path, *, recursive: bool = False, attempts: int = 6) -> None:
@@ -307,11 +498,39 @@ class ChatMemoryManager:
         self._file_path = _get_chat_history_file(session_id)
         self._round_store = ChatRoundStore(session_id)
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file_path.touch(exist_ok=True)
-        with self._lock:
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            _write_meta_and_entries(self._file_path, meta, entries)
+        # 仅在文件缺失时 touch：touch 对已存在的文件也会刷新 mtime，
+        # 服务重启后逐会话实例化会平白搅动所有历史文件的修改时间；
+        # exist_ok=True 兜住"检查后被他进程抢先创建"的竞态窗口
+        if not self._file_path.exists():
+            self._file_path.touch(exist_ok=True)
+        with self._write_guard():
+            rows = _read_jsonlines(self._file_path)
+            stored_meta = rows[0].get("_meta") if (rows and _is_meta_record(rows[0])) else None
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id, rows=rows)
+            # 首行 _meta 与重算结果一致（写路径总是落盘重算后的 _meta）时跳过重写：
+            # 服务重启后每个会话首次实例化都会走到这里，无变化的全量重写
+            # （临时文件 + os.replace）会成批拖慢重启后的首个首屏加载；
+            # 仅新文件/旧格式/内容漂移时才物化 _meta 首行
+            if stored_meta != meta:
+                _write_meta_and_entries(self._file_path, meta, entries)
         self._recover_pending_round_checkpoint()
+
+    @property
+    def _meta_lock_path(self) -> Path:
+        """跨进程写锁文件：与 JSONL 同名加 .lock 后缀（只创建不删除）。"""
+        return self._file_path.with_name(self._file_path.name + ".lock")
+
+    @contextmanager
+    def _write_guard(self):
+        """写路径统一守卫：跨进程文件锁（OS 级，崩溃自动释放）+ 进程内线程锁。
+
+        生成任务在独立 worker 进程写轮次/压缩/usage，主进程写标题/删除/导入/
+        上传记录，双方都是「读全量→改→原子替换」，必须互斥，否则后写者会
+        用自己的旧快照覆盖对方的更新。
+        """
+        with cross_process_lock(self._meta_lock_path):
+            with self._lock:
+                yield
 
     def _recover_pending_round_checkpoint(self) -> None:
         """进程重启后恢复上次未收尾的轮次（工具调用/思考/工具结果不丢）。
@@ -321,7 +540,7 @@ class ChatMemoryManager:
         不会误伤仍在进行中的轮次。恢复为 interrupted 状态的历史轮次，
         user_questions/标题/回放照常可用。
         """
-        with self._lock:
+        with self._write_guard():
             # 新机制：侧车文件（当前轮快照）；兼容清理旧版写入的 _meta 检查点
             recovered = None
             try:
@@ -380,7 +599,7 @@ class ChatMemoryManager:
             record.update(input_text)
         else:
             record["content"] = str(input_text)
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             had_pending_round = self._round_store.pending_round is not None
             completed_round = self._round_store.record_message(record)
@@ -421,20 +640,24 @@ class ChatMemoryManager:
     def _write_pending_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """侧车检查点：只含当前轮快照，写临时文件后原子替换。
 
-        Windows 上刚写入的文件可能被搜索索引/杀软短暂占用导致 os.replace
-        偶发 WinError 5，与 _write_meta_and_entries 同款重试规避。
+        Windows 上刚写入的文件可能被搜索索引/杀软短暂占用导致 open 与
+        os.replace 偶发 WinError 5，按 _ATOMIC_WRITE_RETRY_DELAYS 指数退避重试。
+        检查点只服务崩溃恢复，重试耗尽不抛错：保留旧检查点并打警告继续本轮
+        （丢的只是最近一条事件的恢复点，下一条事件写入会重新覆盖）；若抛错
+        会经 add_chat_history 打断整个生成轮次，把偶发文件占用放大成任务失败。
         """
         tmp_path = self._pending_checkpoint_path.with_name(self._pending_checkpoint_path.name + ".tmp")
-        tmp_path.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(checkpoint, ensure_ascii=False)
         last_error: OSError | None = None
-        for attempt in range(6):
+        for delay in _ATOMIC_WRITE_RETRY_DELAYS:
             try:
+                tmp_path.write_text(payload, encoding="utf-8")
                 os.replace(tmp_path, self._pending_checkpoint_path)
                 return
-            except OSError as replace_error:
-                last_error = replace_error
-                time.sleep(0.01 * (attempt + 1))
-        raise last_error
+            except OSError as err:
+                last_error = err
+                time.sleep(delay)
+        print(f"[WARN] 会话 {self.session_id} 轮次检查点写入失败（保留旧检查点，本轮继续）：{last_error}")
 
     def _clear_pending_checkpoint(self) -> None:
         try:
@@ -444,7 +667,7 @@ class ChatMemoryManager:
 
     async def stop_current_round(self) -> str:
         """用户手动停止任务：直接以 stopped 状态收尾当前轮次，不写入"停止任务"假消息。"""
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             completed_round = self._round_store.finalize_round("stopped")
             if completed_round is not None:
@@ -454,6 +677,54 @@ class ChatMemoryManager:
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
+
+    async def truncate_rounds_for_reanswer(self) -> int:
+        """覆盖式重新回答：删除最近 ask_user 提问轮之后的所有轮次。
+
+        场景：最新提问已经回答过（其后存在旧的回答轮），用户再次回答同一
+        提问时应覆盖而不是追加，保证一个问题只有一个答案轮次。
+
+        保护条件：仅当提问轮之后的第一轮以回答格式（ASK_ANSWER_PREFIX 前缀）
+        开始时才截断——提问后若已开启普通新任务，则不动历史。
+        返回删除的轮次数；无需截断（无提问轮 / 首次回答 / 保护命中）返回 0。
+        """
+        from factory.agent_runtime.builtin_tools import ASK_ANSWER_PREFIX, ASK_USER_TOOL_NAME
+
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            # 从后往前找最近一个包含 ask_user 工具调用的轮次
+            ask_idx = None
+            for idx in range(len(entries) - 1, -1, -1):
+                entry = entries[idx]
+                if not isinstance(entry, dict) or entry.get("event") != "chat_round":
+                    continue
+                has_ask_call = any(
+                    isinstance(event, dict)
+                    and event.get("role") == "assistant"
+                    and any(
+                        isinstance(tool_call, dict)
+                        and isinstance(tool_call.get("function"), dict)
+                        and tool_call["function"].get("name") == ASK_USER_TOOL_NAME
+                        for tool_call in (event.get("tool_calls") or [])
+                    )
+                    for event in (entry.get("events") or [])
+                )
+                if has_ask_call:
+                    ask_idx = idx
+                    break
+            if ask_idx is None:
+                return 0
+            removed = entries[ask_idx + 1:]
+            if not removed:
+                return 0  # 首次回答：提问轮之后还没有任何轮次
+            # 保护：提问轮之后的第一轮必须是回答轮，否则不截断
+            first_question = removed[0].get("question") if isinstance(removed[0], dict) else ""
+            if not str(first_question or "").startswith(ASK_ANSWER_PREFIX):
+                return 0
+            entries = entries[:ask_idx + 1]
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+            return len(removed)
 
     async def update_current_round_usage(
         self,
@@ -481,7 +752,7 @@ class ChatMemoryManager:
         pending round 最终收尾时只会把事件写入 `chat_round.events`；活动期间
         同步写入 `_meta._active_round_compaction`，避免任务中断时压缩状态完全丢失。
         """
-        with self._lock:
+        with self._write_guard():
             if not self._round_store.update_compaction(
                 compress_content,
                 compress_index,
@@ -513,7 +784,7 @@ class ChatMemoryManager:
             return "忽略非法压缩事件"
         record = dict(payload)
         record.setdefault("timestamp", now_str())
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             if record.get("scope") == "round":
                 if not self._round_store.record_compaction_event(record):
@@ -568,7 +839,7 @@ class ChatMemoryManager:
         """把一个未完成的压缩 start 事件标记为 aborted（前端据此失效对应条目）。"""
         scope = orphan.get("scope")
         if scope == "round":
-            with self._lock:
+            with self._write_guard():
                 meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
                 checkpoint = meta.get("_active_round_compaction")
                 if not isinstance(checkpoint, dict):
@@ -599,7 +870,7 @@ class ChatMemoryManager:
     async def add_history_compression_usage(self, usage: dict[str, Any] | None) -> str:
         if not usage:
             return "忽略空压缩 usage"
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             history_usage = meta.get("_history_compress_usage")
             if not isinstance(history_usage, dict):
@@ -615,9 +886,24 @@ class ChatMemoryManager:
         return await self.get_session_meta()
 
     async def get_session_meta(self) -> dict[str, Any]:
+        """读取会话元数据（热点只读路径：优先只读首行，不回写文件）。
+
+        旧实现每次「读全量 → 重算 → 整文件重写回盘」，而 GET /chat_history/meta
+        是首屏按会话并发调用的热点（每个会话一次），全量重写在会话多时既拖慢
+        首屏又产生大量无谓磁盘写。派生字段（标题/提问列表/usage 等）已由写路径
+        随重算结果落盘，正常文件单行读取的响应与全量重算一致；仅当首行不可靠
+        （缺失/损坏/标题仍是默认值/缺 updated_at 或 user_questions）时回退全量
+        重算兜底，两种路径都只读不写。
+        """
         with self._lock:
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            _write_meta_and_entries(self._file_path, meta, entries)
+            meta = _read_meta_first_line(self._file_path)
+            if (
+                meta is None
+                or meta.get("title") == _default_title(self.session_id)
+                or not meta.get("updated_at")
+                or not meta.get("user_questions")
+            ):
+                meta, _entries = _load_meta_and_entries(self._file_path, self.session_id)
         return meta
 
     async def get_session_metadata(self) -> dict[str, Any]:
@@ -634,7 +920,7 @@ class ChatMemoryManager:
         """写入当前任务计划（_meta.todo），供前端展示与跨轮系统提示注入。"""
         if not isinstance(todos, list):
             raise ValueError("todos 必须是列表")
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["todo"] = todos
             _write_meta_and_entries(self._file_path, meta, entries)
@@ -651,7 +937,7 @@ class ChatMemoryManager:
         new_title = (title or "").strip()
         if not new_title:
             raise ValueError("title 不能为空")
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["title"] = new_title
             meta["updated_at"] = now_str()
@@ -673,7 +959,7 @@ class ChatMemoryManager:
         upload_id = (upload_id or "").strip()
         if not upload_id:
             raise ValueError("upload_id 不能为空")
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["upload_id"] = upload_id
             meta["updated_at"] = now_str()
@@ -691,19 +977,19 @@ class ChatMemoryManager:
         if not hasattr(number, "__int__"):
             # 抛出类型不匹配错误
             raise TypeError("number 参数必须为整数")
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
         return entries[-number:] if number > 0 else entries
 
     async def get_context_summary(self) -> dict[str, Any] | None:
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
         return _normalize_context_summary(meta.get("context_summary"))
 
     async def update_context_summary(self, summary: dict[str, Any] | str | None) -> str:
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["context_summary"] = _normalize_context_summary(summary)
             _write_meta_and_entries(self._file_path, meta, entries)
@@ -745,7 +1031,7 @@ class ChatMemoryManager:
                 _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
                 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
             )
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
         context_summary = _normalize_context_summary(meta.get("context_summary"))
@@ -822,7 +1108,7 @@ class ChatMemoryManager:
                 _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
                 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
             )
-        with self._lock:
+        with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
             # 流式任务尚未收到 done 时，当前轮仍只存在于 ChatRoundStore.pending_round；
@@ -973,11 +1259,142 @@ class ChatMemoryManager:
         Returns:
             操作结果字符串
         """
-        with self._lock:
+        with self._write_guard():
             self._round_store.reset()
             meta = _default_meta(self.session_id)
+            # 清空历史只重置对话内容；工作目录/工具选择/模型选择是用户的持久配置，应予保留
+            old_meta, _ = _load_meta_and_entries(self._file_path, self.session_id)
+            old_work_dir = old_meta.get("work_dir")
+            if isinstance(old_work_dir, str) and old_work_dir.strip():
+                meta["work_dir"] = old_work_dir
+            old_tool_selection = normalize_tool_inputs(old_meta.get("tool_selection"))
+            if old_tool_selection:
+                meta["tool_selection"] = old_tool_selection
+            old_model_selection = _normalize_model_selection(old_meta.get("model_selection"))
+            old_model_selection = {
+                role: entry for role, entry in old_model_selection.items()
+                if entry.get("ownership_name") and entry.get("model_name")
+            }
+            if old_model_selection:
+                meta["model_selection"] = old_model_selection
             _write_meta_and_entries(self._file_path, meta, [])
         return "清空成功"
+
+    async def get_session_work_dir(self) -> str | None:
+        """读取会话独立工作目录（_meta.work_dir）；未覆盖返回 None。"""
+        value = read_session_meta_value(self.session_id, "work_dir")
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
+    async def update_session_work_dir(self, work_dir: str | None) -> dict[str, Any]:
+        """写入/清除会话独立工作目录（_meta.work_dir）。
+
+        Args:
+            work_dir: 目录路径；空串/None 表示清除覆盖，恢复跟随全局默认。
+        Returns:
+            更新后的元数据字典
+        Raises:
+            ValueError: 目录不存在或不可访问
+        """
+        raw = (work_dir or "").strip()
+        if raw:
+            resolved = resolve_work_dir(raw)
+            if resolved is None:
+                raise ValueError(f"工作目录不存在或不可访问: {raw}")
+            new_value: str | None = str(resolved)
+        else:
+            new_value = None
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if new_value is None:
+                meta.pop("work_dir", None)
+            else:
+                meta["work_dir"] = new_value
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def get_session_tool_selection(self) -> dict[str, list[str]] | None:
+        """读取会话独立工具选择（_meta.tool_selection）；未覆盖返回 None。"""
+        value = read_session_meta_value(self.session_id, "tool_selection")
+        if value is None:
+            return None
+        return normalize_tool_inputs(value) or None
+
+    async def update_session_tool_selection(
+        self, tool_selection: dict[str, list[Any]] | None
+    ) -> dict[str, Any]:
+        """写入/清除会话独立工具选择（_meta.tool_selection）。
+
+        Args:
+            tool_selection: {服务名: [工具名]}；None/空 dict 表示清除覆盖，
+                恢复跟随全局默认（mcp_servers.json 的 inputs 键）。
+                非法条目（非字符串/空串/重复工具名）由服务端规整时丢弃。
+        Returns:
+            更新后的元数据字典
+        Raises:
+            ValueError: tool_selection 不是字典
+        """
+        if tool_selection is not None and not isinstance(tool_selection, dict):
+            raise ValueError("tool_selection 必须是 {服务名: [工具名]} 形式的字典")
+        normalized = normalize_tool_inputs(tool_selection)
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if normalized:
+                meta["tool_selection"] = normalized
+            else:
+                meta.pop("tool_selection", None)
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def get_session_model_selection(self) -> dict[str, dict[str, Any]] | None:
+        """读取会话独立模型选择（_meta.model_selection）；未覆盖返回 None。"""
+        value = read_session_meta_value(self.session_id, "model_selection")
+        if value is None:
+            return None
+        valid = {
+            role: entry for role, entry in _normalize_model_selection(value).items()
+            if entry.get("ownership_name") and entry.get("model_name")
+        }
+        return valid or None
+
+    async def update_session_model_selection(
+        self, role: str, entry: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """写入/清除会话独立模型选择的单个角色（_meta.model_selection）。
+
+        Args:
+            role: 模型角色（chat_model / compaction_model / title_model，随版本扩展）
+            entry: {ownership_name, model_name, parameter, api_type} 覆盖条目；
+                None 表示清除该角色覆盖（恢复跟随全局默认）
+        Returns:
+            更新后的元数据字典
+        Raises:
+            ValueError: role 未知或 entry 结构非法
+        """
+        if role not in _MODEL_SELECTION_ROLES:
+            raise ValueError(f"未知模型角色: {role!r}；可选: {'/'.join(_MODEL_SELECTION_ROLES)}")
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            stored = dict(meta.get("model_selection")) if isinstance(meta.get("model_selection"), dict) else {}
+            if entry is None:
+                stored.pop(role, None)
+            else:
+                if not isinstance(entry, dict):
+                    raise ValueError("model_selection 覆盖条目必须是字典")
+                normalized = _normalize_model_selection({role: entry}).get(role) or {}
+                if not (normalized.get("ownership_name") and normalized.get("model_name")):
+                    raise ValueError("覆盖条目必须包含 ownership_name 与 model_name")
+                stored[role] = normalized
+            if stored:
+                meta["model_selection"] = stored
+            else:
+                meta.pop("model_selection", None)
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
 
     @staticmethod
     def list_chat_sessions():
@@ -1012,7 +1429,7 @@ class ChatMemoryManager:
         if not chat_history_file.exists():
             raise HTTPException(status_code=404, detail="Chat session file not found")
         manager = ChatMemoryManager(session_id)
-        with manager._lock:
+        with manager._write_guard():
             meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
             _write_meta_and_entries(manager._file_path, meta, entries)
         return meta
@@ -1095,7 +1512,7 @@ class ChatMemoryManager:
         if startline > endline:
             raise ValueError(f"起始行号({startline})不能大于结束行号({endline})")
         manager = ChatMemoryManager(session_id)
-        with manager._lock:
+        with manager._write_guard():
             meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
             total_lines = len(entries)
             if total_lines == 0:
@@ -1239,7 +1656,7 @@ def _import_jsonl_payload(
     actual_session_id, file_path, collision = _resolve_import_target(session_id, overwrite)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     manager = ChatMemoryManager(actual_session_id)
-    with manager._lock:
+    with manager._write_guard():
         final_entries = list(candidate_entries)
         merged_meta = _recompute_meta_from_entries(
             actual_session_id,

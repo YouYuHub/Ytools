@@ -643,19 +643,38 @@ html:not([data-theme="dark"]) #voiceBtn {
 
 // 向下展开的计划面板：挂在 composer-wrap（relative）上，
 // left/right 18px 与 context-token-status 的页边距一致 → 宽度对齐；
-// 窄高度（约 4 行）、11px 小字、每步一行省略、整体溢出隐藏
+// 11px 小字、每步一行省略、最多完整显示 6 条，超出滚动
 .todo-panel {
   // 垂直布局占位：位于状态栏与输入框之间，宽度与状态栏对齐（页边距一致）；
-  // 步骤全部可见（不设高度上限、不裁切），仅保留每行省略
+  // 高度上限 6 条（行高 17px×6 + 行间距 2px×5 + 内边距 12px + 边框 2px = 126px），
+  // 超出部分滚动查看
   display: flex;
   flex-direction: column;
   gap: 2px;
   margin: 0 18px 6px;
   padding: 6px 10px;
+  max-height: 126px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
   background: var(--bg-composer);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: var(--scroll-thumb);
+    border-radius: 3px;
+  }
 }
 
 .todo-row {
@@ -663,6 +682,9 @@ html:not([data-theme="dark"]) #voiceBtn {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  // 固定行高让「6 条上限」的算术不受字体度量影响（126px = 6×17 + 5×2 + 12 + 2）
+  height: 17px;
+  flex: 0 0 auto;
   font-size: 11px;
   line-height: 1.5;
   color: var(--text-secondary);

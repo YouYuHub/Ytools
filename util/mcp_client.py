@@ -445,11 +445,11 @@ if __name__ == '__main__':
         # }, mcp_service=r"mcp_server\PipeCmdMCP.exe"))
         res = asyncio.run(call_mcp_tool('run_pipe_command', {
             # 这里是函数的参数字典，比如 'a': 10, b: 20
-            "command": "sleep 5 && echo hi",
-            "pipe_name": r"\\.\pipe\default_server",
+            "command": "ping 127.0.0.1",
+            "pipe_name": r"\\.\pipe\default_server1",
             "wait_milliseconds": 6000,
             # "prompt": "",
-            "prompt": "agent_tool_sse>",
+            "prompt": "c:\\>",
             # "terminal_mode": r"powershell.exe",
             # "first_command": "ssh root@120.48.43.229",
             "next_command": "123",

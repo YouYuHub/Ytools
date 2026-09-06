@@ -28,6 +28,9 @@ class FakeLLM:
 
 
 def patch_env():
+    # 生成循环默认跑在独立 worker 进程（无法继承本测试的 monkeypatch），
+    # 这里切回 inline 模式让 mock 生效
+    cf._CHAT_WORKER_MODE = "inline"
     cf.ChatLLM.chat_completions = FakeLLM.chat_completions
     cf.load_all_tools = lambda: asyncio.sleep(0)
     cf.tool_registry.ALL_TOOLS = []

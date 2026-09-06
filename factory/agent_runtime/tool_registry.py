@@ -1,6 +1,7 @@
 """MCP 工具发现、schema 过滤和运行时注册表。"""
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -11,6 +12,53 @@ from util.mcp_client import get_mcp_tools
 
 ALL_TOOLS: List[Dict[str, Any]] = []
 TOOL_MCP_SERVERS: Dict[str, str] = {}
+
+# 工具注册表全局交换锁：工具发现既可能跑在事件循环线程（生成任务 / /tools/list），
+# 也可能跑在配置热重载线程（mcp_servers.json 的 servers 变更时），
+# 最终的全局赋值必须原子，避免读方看到半更新的注册表
+_REGISTRY_SWAP_LOCK = threading.Lock()
+
+# 工具探测结果缓存：MCP 工具发现要逐服务拉起子进程做完整握手（Python 服务的
+# 子进程冷启动约 1s，磁盘缓存冷/杀软扫描时可达数十秒），而 /tools/list 与
+# 每条消息的发送路径过去都在逐请求重探。缓存保存最近一次 refresh_tools_from_mcp
+# 的完整响应体，TTL 内直接复用；MCP_TOOLS_CACHE_TTL_SECONDS <= 0 可禁用。
+# 失效时机由两条强制重探路径保证：mcp_servers.json 的 servers 变更触发热重载
+# 重探（main.py 配置监听），前端"配置工具"弹窗的刷新按钮走 /tools/list?refresh=1
+_TOOLS_CACHE: Dict[str, Any] | None = None
+_TOOLS_CACHE_MONO: float = 0.0
+_TOOLS_CACHE_LOCK = threading.Lock()
+
+_DEFAULT_TOOLS_CACHE_TTL_SECONDS = 60.0
+
+
+def tools_cache_ttl_seconds() -> float:
+    """工具探测缓存 TTL（秒）；<=0 表示禁用缓存（每次请求都重新探测）。"""
+    try:
+        ttl = float(load_var("MCP_TOOLS_CACHE_TTL_SECONDS", _DEFAULT_TOOLS_CACHE_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return _DEFAULT_TOOLS_CACHE_TTL_SECONDS
+    return ttl
+
+
+def get_cached_tools_payload(max_age_seconds: float) -> Dict[str, Any] | None:
+    """返回仍在 TTL 内的工具探测缓存；无缓存/已过期/禁用缓存时返回 None。"""
+    if max_age_seconds <= 0:
+        return None
+    with _TOOLS_CACHE_LOCK:
+        if _TOOLS_CACHE is None:
+            return None
+        if time.monotonic() - _TOOLS_CACHE_MONO > max_age_seconds:
+            return None
+        return dict(_TOOLS_CACHE)
+
+
+def _store_tools_cache(payload: Dict[str, Any]) -> None:
+    global _TOOLS_CACHE, _TOOLS_CACHE_MONO
+    # 浅拷贝后再存：调用方（路由层）可能在返回体上追加 mode 等展示字段，
+    # 不能让这些字段渗进缓存
+    with _TOOLS_CACHE_LOCK:
+        _TOOLS_CACHE = dict(payload)
+        _TOOLS_CACHE_MONO = time.monotonic()
 
 
 def _load_mcp_servers(_current_dir: str = "") -> dict:
@@ -145,9 +193,10 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
     global ALL_TOOLS, TOOL_MCP_SERVERS
     server_ids = _read_server_ids(current_dir)
     if not server_ids:
-        ALL_TOOLS = []
-        TOOL_MCP_SERVERS = {}
-        return {
+        with _REGISTRY_SWAP_LOCK:
+            ALL_TOOLS = []
+            TOOL_MCP_SERVERS = {}
+        payload = {
             "tools": [],
             "total": 0,
             "servers": [],
@@ -158,6 +207,8 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
                 "elapsed_ms": 0,
             },
         }
+        _store_tools_cache(payload)
+        return payload
     default_concurrency = min(4, len(server_ids))
     configured_concurrency = _parse_positive_int(
         load_var("MCP_DISCOVERY_MAX_CONCURRENCY", default_concurrency),
@@ -224,8 +275,10 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             filtered_tools.append(filtered_tool)
             # 保留结构化 server_id，交给 mcp_client 解析 command/args 的参数边界。
             tool_mcp_servers[tool_name] = server_id
-    ALL_TOOLS = filtered_tools
-    TOOL_MCP_SERVERS = tool_mcp_servers
+    # 原子交换注册表全局变量：读方（生成任务/工具列表接口）要么看到旧、要么看到新
+    with _REGISTRY_SWAP_LOCK:
+        ALL_TOOLS = filtered_tools
+        TOOL_MCP_SERVERS = tool_mcp_servers
     api_tools = []
     for tool in filtered_tools:
         tool_with_server = dict(tool)
@@ -243,7 +296,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
                 f"   ⚠️ 服务器 [{metric['server_id']}] 加载失败"
                 f"（{metric['elapsed_ms']}ms）：{metric['error']}"
             )
-    return {
+    payload = {
         "tools": api_tools,
         "total": len(filtered_tools),
         "servers": server_ids,
@@ -255,3 +308,5 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
         },
         "server_metrics": server_metrics,
     }
+    _store_tools_cache(payload)
+    return payload

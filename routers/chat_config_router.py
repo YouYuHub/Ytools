@@ -13,6 +13,7 @@ from config import (
     DEFAULT_HISTORY_TRIGGER_RATIO,
     DEFAULT_MAX_OVERSIZED_REJECTIONS,
     DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+    DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
     DEFAULT_OVERSIZED_REJECT_FACTOR,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUMMARY_BUDGET_RATIO,
@@ -20,12 +21,15 @@ from config import (
     set_current_dir,
     get_current_dir,
     get_persisted_work_dir,
+    resolve_work_dir,
     PROJECT_ROOT,
     HistoryCompactionConfig,
     ChatModelSelection,
     ContextReturnConfig,
     McpToolConfig,
     McpToolSelection,
+    NetworkRetryConfig,
+    SessionWorkDirConfig,
 )
 import env_manager
 from env_manager import (
@@ -141,7 +145,10 @@ def _history_compaction_config_payload() -> dict:
 @api_chat_config_router.post("/change_chat_dir")
 async def change_chat_dir(new_dir: str):
     """
-    更改聊天工作目录
+    更改全局默认聊天工作目录（.env 的 DEFAULT_CHAT_WORK_DIR）。
+
+    语义说明：该目录只作为「新会话的初始工作目录 + 未覆盖会话的默认目录」，
+    不影响已显式设置独立目录的会话；会话级目录请用 POST /chat_config/work_dir。
     参数:
         new_dir: 新的目录路径
     返回:
@@ -157,39 +164,108 @@ async def change_chat_dir(new_dir: str):
                 "current_dir": get_current_dir(),
             }
         current_dir = get_current_dir()
-        set_env_vars({"CHAT_WORK_DIR": current_dir})
+        set_env_vars({"DEFAULT_CHAT_WORK_DIR": current_dir})
         return {
             "state": "succeed",
-            "message": f"聊天工作目录已更改为: {current_dir}",
+            "message": f"全局默认聊天工作目录已更改为: {current_dir}",
             "current_dir": current_dir,
-            "persisted_env": load_var("CHAT_WORK_DIR"),
+            "persisted_env": load_var("DEFAULT_CHAT_WORK_DIR"),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @api_chat_config_router.get("/chat_config/work_dir")
-async def get_chat_work_dir_config():
-    """只读返回当前工作目录及项目 .env 中保存的工作目录。"""
+async def get_chat_work_dir_config(session_id: str | None = None):
+    """返回工作目录配置；携带 session_id 时附加该会话的独立目录信息。
+
+    会话字段说明：
+    - session_dir：会话在 _meta.work_dir 中记录的覆盖值（未设置时为 null）；
+    - session_dir_valid：覆盖目录当前是否仍然存在；
+    - effective_dir：会话实际生效的工作目录（覆盖值 → 全局默认 → 进程 cwd）；
+    - is_overridden：会话是否设置了独立目录；
+    - warning：目录失效回退等警告信息。
+    """
     current_dir = get_current_dir()
     persisted_dir = get_persisted_work_dir()
     normalized_current = _normalized_dir_for_compare(current_dir)
     normalized_persisted = _normalized_dir_for_compare(persisted_dir)
-    return JSONResponse(content={
+    payload: dict[str, Any] = {
         "state": "succeed",
         "current_dir": current_dir,
         "persisted_dir": persisted_dir,
+        # 校验后的全局默认目录（新会话的初始目录）：persisted 失效时回退进程 cwd
+        "default_dir": str(resolve_work_dir(persisted_dir) or current_dir),
         "is_consistent": bool(
             normalized_current
             and normalized_persisted
             and normalized_current == normalized_persisted
         ),
-        "env_name": "CHAT_WORK_DIR",
-        "env_value": load_var("CHAT_WORK_DIR"),
+        "env_name": "DEFAULT_CHAT_WORK_DIR",
+        "env_value": load_var("DEFAULT_CHAT_WORK_DIR"),
         "env_file": get_env_file_path(),
         "source": "project .env",
         "read_only": True,
-    })
+    }
+    if session_id:
+        from memory.chat_memory import (
+            read_session_meta_value,
+            resolve_session_work_dir,
+            normalize_session_id,
+        )
+        normalized_session_id = normalize_session_id(session_id)
+        session_dir = read_session_meta_value(normalized_session_id, "work_dir")
+        session_dir = session_dir if isinstance(session_dir, str) and session_dir.strip() else None
+        effective_dir, warning = resolve_session_work_dir(normalized_session_id)
+        payload.update({
+            "session_id": normalized_session_id,
+            "session_dir": session_dir,
+            "session_dir_valid": bool(session_dir and resolve_work_dir(session_dir)),
+            "effective_dir": effective_dir or current_dir,
+            "is_overridden": bool(session_dir and resolve_work_dir(session_dir)),
+            "warning": warning,
+        })
+    return JSONResponse(content=payload)
+
+
+@api_chat_config_router.post("/chat_config/work_dir")
+async def set_chat_session_work_dir(payload: SessionWorkDirConfig):
+    """设置/清除会话独立工作目录（写入会话 _meta.work_dir）。
+
+    - work_dir 非空：校验目录存在后写入 _meta；对正在运行的任务不生效
+      （运行中任务使用启动时解析的目录），下一轮生成任务开始时生效；
+    - work_dir 为空串/None：清除覆盖，恢复跟随全局默认 DEFAULT_CHAT_WORK_DIR；
+    - 会话尚未产生任何历史文件时会顺带创建（写入 _meta 需要落盘）。
+    """
+    from memory.chat_memory import (
+        get_chat_memory_manager,
+        normalize_session_id,
+        resolve_session_work_dir,
+    )
+    try:
+        session_id = normalize_session_id(payload.session_id)
+        manager = await get_chat_memory_manager(session_id)
+        meta = await manager.update_session_work_dir(payload.work_dir or "")
+        effective_dir, warning = resolve_session_work_dir(session_id)
+        return JSONResponse(content={
+            "state": "succeed",
+            "message": (
+                f"会话 [{session_id}] 工作目录已设置为: {meta.get('work_dir')}"
+                if meta.get("work_dir")
+                else f"会话 [{session_id}] 已恢复跟随全局默认工作目录"
+            ),
+            "session_id": session_id,
+            "session_dir": meta.get("work_dir"),
+            "effective_dir": effective_dir,
+            "warning": warning,
+            "updated_at": meta.get("updated_at"),
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @api_chat_config_router.get("/chat_config/history_compaction")
@@ -342,67 +418,140 @@ async def update_mcp_tool_config(payload: McpToolConfig):
     })
 
 
+# ---------- 网络请求失败重试配置 ----------
+
+_NETWORK_RETRY_ENV_NAME = "NETWORK_RETRY_MAX_ATTEMPTS"
+
+
+def _parse_network_retry_max_attempts(value: Any, default: int) -> int:
+    """解析重试次数配置；非整数回退默认值（0 与负数合法=不限制）。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed
+
+
+def _network_retry_config_payload() -> dict:
+    return {
+        "max_attempts": _parse_network_retry_max_attempts(
+            load_var(_NETWORK_RETRY_ENV_NAME, DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS),
+            DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
+        ),
+        "defaults": {
+            "max_attempts": DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
+        },
+        "semantics": {
+            "0_or_negative": "不限制重试次数（连续失败会一直重试，直到手动停止任务）",
+            "positive": "同一轮请求连续失败达到 N 次后终止当前任务",
+        },
+        "env_names": {"max_attempts": _NETWORK_RETRY_ENV_NAME},
+        "memory_state": env_manager.env_vars.get(_NETWORK_RETRY_ENV_NAME),
+    }
+
+
+@api_chat_config_router.get("/chat_config/network_retry")
+async def get_network_retry_config():
+    """获取模型网络请求失败重试次数配置。"""
+    return JSONResponse(content=_network_retry_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/network_retry")
+async def update_network_retry_config(payload: NetworkRetryConfig):
+    """实时更新网络请求失败重试次数并持久化。
+
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次模型请求立即生效
+    - 0 或负数表示不限制（保持旧行为，一直重试直到手动停止）
+    """
+    max_attempts = _parse_network_retry_max_attempts(
+        payload.max_attempts, DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
+    )
+    try:
+        updated = set_env_vars({
+            _NETWORK_RETRY_ENV_NAME: max_attempts,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content={
+        "state": "succeed",
+        "updated": updated,
+        "config": _network_retry_config_payload(),
+    })
+
+
 _MODEL_ROLES = ("chat_model", "compaction_model", "title_model")
 
 
-# ---------- 工具选择（setting/mcp_servers.json 的 inputs 键） ----------
+# ---------- 工具选择（全局默认 = setting/mcp_servers.json 的 inputs 键；会话级 = _meta.tool_selection） ----------
 
-# 内存中的工具选择快照（服务名 -> 工具名数组），与磁盘 mcp_servers.json 实时同步
+# 内存中的全局工具选择快照（服务名 -> 工具名数组）。
+# 由 GET/POST 接口与配置热重载线程（mcp_servers.json 变更回调）共同保持与磁盘一致
 _MCP_TOOL_INPUTS_MEMORY: dict[str, list[str]] | None = None
 
 
 def _mcp_servers_config_path() -> Path:
-    return PROJECT_ROOT / "setting" / "mcp_servers.json"
+    from config import get_mcp_servers_config_path
+    return get_mcp_servers_config_path()
 
 
 def _read_mcp_servers_file() -> dict:
-    path = _mcp_servers_config_path()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_mcp_servers_file(data: dict) -> None:
-    """全量写回 mcp_servers.json（仅替换 inputs 键，其余内容原样保留）。"""
-    path = _mcp_servers_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
-def _configured_server_names(data: dict) -> dict:
-    servers = data.get("servers")
-    return servers if isinstance(servers, dict) else {}
+    from config import read_mcp_servers_config
+    return read_mcp_servers_config()
 
 
 def _normalize_tool_inputs(raw: Any) -> dict[str, list[str]]:
-    """规整为 {服务名: [去重工具名]}；非法条目直接丢弃。"""
-    if not isinstance(raw, dict):
-        return {}
-    normalized: dict[str, list[str]] = {}
-    for server, tool_names in raw.items():
-        if not isinstance(server, str) or not server.strip() or not isinstance(tool_names, list):
-            continue
-        names: list[str] = []
-        for name in tool_names:
-            if isinstance(name, str) and name.strip() and name not in names:
-                names.append(name)
-        normalized[server] = names
-    return normalized
+    from config import normalize_tool_inputs as _normalize
+    return _normalize(raw)
+
+
+def sync_tool_selection_memory(data: dict) -> dict[str, list[str]]:
+    """把磁盘 mcp_servers.json 的 inputs 规整后同步进内存快照（配置热重载回调入口）。
+
+    新增/删除服务时同步补 [] / 移除失效服务，返回同步后的快照。
+    """
+    global _MCP_TOOL_INPUTS_MEMORY
+    servers = configured_server_names(data)
+    inputs = _normalize_tool_inputs(data.get("inputs"))
+    for server in servers:
+        inputs.setdefault(str(server), [])
+    _MCP_TOOL_INPUTS_MEMORY = inputs
+    return inputs
+
+
+# 兼容旧内部引用：规整后的 servers 读取统一走 config.configured_server_names
+def _configured_server_names(data: dict) -> dict:
+    from config import configured_server_names as _configured
+    return _configured(data)
+
+
+def _resolve_session_selection(session_id: str) -> tuple[str, dict[str, list[str]] | None, dict[str, list[str]] | None, bool, str | None]:
+    """解析会话工具选择（供 GET/POST 接口回显）。
+
+    Returns:
+        (规整后的 session_id, 会话覆盖选择或 None, 生效选择或 None, 是否覆盖, 警告或 None)
+    """
+    from memory.chat_memory import (
+        normalize_session_id as _normalize_session_id,
+        read_session_meta_value,
+        resolve_session_tool_selection,
+    )
+    normalized = _normalize_session_id(session_id)
+    override = read_session_meta_value(normalized, "tool_selection")
+    override_normalized = _normalize_tool_inputs(override) if override is not None else None
+    effective, warning = resolve_session_tool_selection(normalized)
+    return normalized, override_normalized, effective, bool(override_normalized), warning
 
 
 @api_chat_config_router.get("/chat_config/tool_selection")
-async def get_tool_selection():
+async def get_tool_selection(session_id: str | None = None):
     """读取已保存的工具选择（前端页面刷新时调用以恢复勾选）。
 
-    每次都以磁盘 mcp_servers.json 的 `inputs` 键为准并同步内存，
-    手工编辑文件后刷新页面即可生效；未出现在 inputs 中的已配置服务补 []。
+    每次都以磁盘 mcp_servers.json 的 `inputs` 键为准并同步内存；
+    携带 `session_id` 时附加该会话的独立选择信息：
+    - session_selection：会话在 _meta.tool_selection 中记录的覆盖值（未设置时为 null）；
+    - effective_selection：会话实际生效的选择（会话覆盖 → 全局 inputs）；
+    - is_overridden：会话是否设置了独立工具选择；
+    - warning：全局配置读取失败等警告信息。
     """
     global _MCP_TOOL_INPUTS_MEMORY
     data = _read_mcp_servers_file()
@@ -411,40 +560,84 @@ async def get_tool_selection():
     for server in servers:
         inputs.setdefault(str(server), [])
     _MCP_TOOL_INPUTS_MEMORY = inputs
-    return JSONResponse(content={
+    payload: dict[str, Any] = {
         "state": "succeed",
         "inputs": inputs,
         "servers": [str(server) for server in servers],
         "config_path": str(_mcp_servers_config_path()),
         "memory_state": _MCP_TOOL_INPUTS_MEMORY,
-    })
+    }
+    if session_id:
+        normalized_id, session_selection, effective_selection, is_overridden, warning = (
+            _resolve_session_selection(session_id)
+        )
+        if normalized_id:
+            payload.update({
+                "session_id": normalized_id,
+                "session_selection": session_selection,
+                "effective_selection": effective_selection if effective_selection is not None else inputs,
+                "is_overridden": is_overridden,
+                "warning": warning,
+            })
+    return JSONResponse(content=payload)
 
 
 @api_chat_config_router.post("/chat_config/tool_selection")
 async def update_tool_selection(payload: McpToolSelection):
-    """保存前端选择的工具：实时更新内存并写回 setting/mcp_servers.json。
+    """保存前端选择的工具。
 
-    Body: {"inputs": {"pipeIpcMcp": ["setup_pipe"], "sysServer": []}}
-    - 键为 `servers` 中已配置的服务名，未知服务报 400
-    - 全量替换语义：未提及的已配置服务保存为 []
-    - 仅替换文件中的 inputs 键，servers 等其余内容保持不变
+    - 不携带 session_id（全局默认，新建会话前的选择）：全量替换写回
+      setting/mcp_servers.json 的 inputs 键，其余内容保持不变；键必须为
+      `servers` 中已配置的服务名，未知服务报 400（伪服务 __builtin__ 除外，
+      其下存放前端在内置工具分组勾选的 todo_write / ask_user 等）；
+    - 携带 session_id（会话内选择）：写入该会话 _meta.tool_selection，
+      不修改全局 inputs；空 inputs 表示清除会话覆盖、恢复跟随全局默认；
+      规整后为空的非法条目会被丢弃。
     """
     global _MCP_TOOL_INPUTS_MEMORY
+    from factory.agent_runtime.builtin_tools import BUILTIN_TOOL_SERVER_KEY
+    incoming = _normalize_tool_inputs(payload.inputs)
+    if payload.session_id and str(payload.session_id).strip():
+        from memory.chat_memory import get_chat_memory_manager, normalize_session_id
+        session_id = normalize_session_id(payload.session_id)
+        manager = await get_chat_memory_manager(session_id)
+        meta = await manager.update_session_tool_selection(incoming or None)
+        session_selection = meta.get("tool_selection")
+        effective = _normalize_tool_inputs(session_selection) if session_selection else None
+        return JSONResponse(content={
+            "state": "succeed",
+            "message": (
+                f"会话 [{session_id}] 工具选择已保存（{sum(len(names) for names in effective.values()) if effective else 0} 项）"
+                if session_selection
+                else f"会话 [{session_id}] 已恢复跟随全局默认工具选择"
+            ),
+            "session_id": session_id,
+            "session_selection": session_selection,
+            "effective_selection": effective or {},
+            "is_overridden": bool(session_selection),
+            "updated_at": meta.get("updated_at"),
+        })
     data = _read_mcp_servers_file()
     servers = _configured_server_names(data)
-    if not servers:
+    # 仅勾选内置工具时也允许保存（此时可以没有配置任何 MCP 服务器）
+    if not servers and not (set(incoming) - {BUILTIN_TOOL_SERVER_KEY}):
         raise HTTPException(status_code=400, detail="setting/mcp_servers.json 未配置任何 MCP 服务器，无法保存工具选择")
-    incoming = _normalize_tool_inputs(payload.inputs)
-    unknown = [server for server in incoming if server not in servers]
+    unknown = [
+        server for server in incoming
+        if server not in servers and server != BUILTIN_TOOL_SERVER_KEY
+    ]
     if unknown:
         raise HTTPException(
             status_code=400,
             detail=f"未知的服务名: {'、'.join(unknown)}；已配置: {'、'.join(str(s) for s in servers)}",
         )
+    # 内置工具伪服务仅在传入时保留（未提及 = 未勾选 = 不写入，保持 inputs 干净）
     inputs = {str(server): incoming.get(str(server), []) for server in servers}
-    data["inputs"] = inputs
+    if BUILTIN_TOOL_SERVER_KEY in incoming:
+        inputs = {BUILTIN_TOOL_SERVER_KEY: incoming[BUILTIN_TOOL_SERVER_KEY], **inputs}
     try:
-        _write_mcp_servers_file(data)
+        from config import write_mcp_servers_inputs
+        write_mcp_servers_inputs(inputs)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"写入 setting/mcp_servers.json 失败: {exc}")
     _MCP_TOOL_INPUTS_MEMORY = inputs
@@ -457,8 +650,12 @@ async def update_tool_selection(payload: McpToolSelection):
     })
 
 
-def _role_info_payload(role: str) -> dict:
-    """单个角色（chat/compaction/title）的完整配置信息，供 GET /chat_config/models 展示。"""
+def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
+    """单个角色（chat/compaction/title）的完整配置信息，供 GET /chat_config/models 展示。
+
+    会话级展示时由调用方先设置 ambient 模型选择覆盖（set_ambient_model_selection），
+    本函数读取的 selection/effective_parameter 即为该会话的生效结果。
+    """
     selection = env_manager.get_role_selection(role)
     models = list_available_models()
     if role == "compaction_model":
@@ -476,6 +673,7 @@ def _role_info_payload(role: str) -> dict:
         api_type = env_manager._derive_api_type(chat_config) if chat_config is not None else None
     payload: dict[str, Any] = {
         "role": role,
+        "is_overridden": is_overridden,
         "selection": {
             "provider": provider,
             "model": model,
@@ -492,13 +690,18 @@ def _role_info_payload(role: str) -> dict:
 
 
 @api_chat_config_router.get("/chat_config/models")
-async def list_chat_models(role: str = "chat_model"):
+async def list_chat_models(role: str = "chat_model", session_id: str | None = None):
     """列出 models.json 中所有可用的 provider / model 组合，并返回指定角色的完整配置。
 
     查询参数 `role`（chat_model / compaction_model / title_model，默认 chat_model）：
     `role_info` 返回该角色的当前选择（provider/model/api_type/parameter 分桶）、
     生效参数（effective_parameter，按回退链解析）与可选模型列表
     （compaction_model 只列 chat-completions 协议）。
+
+    查询参数 `session_id`（可选）：携带时按「会话覆盖 → 全局默认」解析该会话的
+    生效模型选择，`role_info` 展示会话生效结果并附加 `is_overridden`；响应额外
+    返回 `session_selection`（会话覆盖值，未设置为 null）、`effective_selection`
+    （全角色合并结果）与 `warning`（失效覆盖回退提示）。
 
     每次调用都会基于项目根目录重新执行 `init_path()`，
     让前端在编辑 models.json 后能看到最新内容。
@@ -510,27 +713,106 @@ async def list_chat_models(role: str = "chat_model"):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"重新加载 models.json 失败：{exc}")
     models = list_available_models()
-    return JSONResponse(content={
+    payload: dict[str, Any] = {
         "state": "succeed",
         "count": len(models),
         "current": get_current_model_selection(),
-        "selection": env_manager.get_model_selection(),
+        "selection": env_manager.get_global_model_selection(),
         "models": models,
         "role": role,
         "role_info": _role_info_payload(role),
-    })
+    }
+    if session_id and str(session_id).strip():
+        from memory.chat_memory import (
+            normalize_session_id,
+            read_session_meta_value,
+            resolve_session_model_selection,
+        )
+        from env_manager import normalize_model_selection, reset_ambient_model_selection, set_ambient_model_selection
+        normalized = normalize_session_id(session_id)
+        effective_selection, warnings = resolve_session_model_selection(normalized)
+        override = read_session_meta_value(normalized, "model_selection")
+        override_valid = {
+            role_key: entry for role_key, entry in normalize_model_selection(override).items()
+            if entry.get("ownership_name") and entry.get("model_name")
+        } if override is not None else {}
+        ambient_token = set_ambient_model_selection(effective_selection)
+        try:
+            payload["role_info"] = _role_info_payload(role, is_overridden=bool(override_valid.get(role)))
+        finally:
+            reset_ambient_model_selection(ambient_token)
+        payload.update({
+            "session_id": normalized,
+            "session_selection": override_valid or None,
+            "effective_selection": effective_selection,
+            "warning": warnings or None,
+        })
+    return JSONResponse(content=payload)
 
 
 @api_chat_config_router.post("/chat_config/models/select")
 async def select_active_chat_model(payload: ChatModelSelection):
-    """选择三种模型（chat/compaction/title）并配置参数，写入 models.json 顶层 `model_selection` 键。
+    """选择三种模型（chat/compaction/title）并配置参数。
 
+    - 不携带 session_id（全局默认）：写入 models.json 顶层 `model_selection.<role>`
+      （含 parameter），并同步内存，实时生效；
+    - 携带 session_id（会话级）：写入该会话 `_meta.model_selection.<role>`，
+      不修改全局配置；`clear=true` 时清除该角色的会话覆盖、恢复跟随全局默认；
     - 先校验 models.json 目录中存在该组合（compaction_model 必须为 chat-completions 协议）
-    - 写回 setting/models.json 的 model_selection.<role>（含 parameter），并同步内存，实时生效
     - 不再写 .env 的 CHAT_OWNERSHIP_NANE / CHAT_MODEL_NAME
     - parameter 为全量替换语义；不传表示仅切换模型、参数保持不变
+      （会话级未传时：已有会话覆盖沿用其参数，首次覆盖沿用全局该角色的参数）
     - 向后兼容：只传 provider/model（无 role/parameter）时等价于 role=chat_model 且参数不变
     """
+    if payload.session_id and str(payload.session_id).strip():
+        from memory.chat_memory import (
+            get_chat_memory_manager,
+            normalize_session_id,
+            resolve_session_model_selection,
+        )
+        from env_manager import build_model_selection_entry, reset_ambient_model_selection, set_ambient_model_selection
+        session_id = normalize_session_id(payload.session_id)
+        if payload.role not in _MODEL_ROLES:
+            raise HTTPException(status_code=400, detail=f"role 必须是 {'/'.join(_MODEL_ROLES)} 之一，当前为 {payload.role!r}")
+        try:
+            manager = await get_chat_memory_manager(session_id)
+            if payload.clear:
+                meta = await manager.update_session_model_selection(payload.role, None)
+                message = f"会话 [{session_id}] {payload.role} 已恢复跟随全局默认模型"
+            else:
+                existing = (await manager.get_session_model_selection()) or {}
+                inherit = (existing.get(payload.role) or {}).get("parameter")
+                if inherit is None:
+                    inherit = (env_manager.get_global_model_selection().get(payload.role) or {}).get("parameter")
+                entry = build_model_selection_entry(
+                    payload.provider,
+                    payload.model,
+                    payload.role,
+                    parameter=payload.parameter,
+                    inherit_parameter=inherit,
+                )
+                meta = await manager.update_session_model_selection(payload.role, entry)
+                message = f"会话 [{session_id}] {payload.role} 已切换为 {entry['ownership_name']} / {entry['model_name']}"
+        except ChatModelConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        effective_selection, warnings = resolve_session_model_selection(session_id)
+        ambient_token = set_ambient_model_selection(effective_selection)
+        try:
+            role_info = _role_info_payload(payload.role, is_overridden=not payload.clear)
+        finally:
+            reset_ambient_model_selection(ambient_token)
+        return JSONResponse(content={
+            "state": "succeed",
+            "message": message,
+            "session_id": session_id,
+            "session_selection": meta.get("model_selection"),
+            "effective_selection": effective_selection,
+            "warning": warnings or None,
+            "role": payload.role,
+            "role_info": role_info,
+        })
     try:
         selection = select_chat_model(
             payload.provider,
@@ -545,5 +827,5 @@ async def select_active_chat_model(payload: ChatModelSelection):
         "message": f"已切换 {selection['role']} -> {selection['provider']} / {selection['model']}",
         "current": selection,
         "effective_parameter": env_manager.get_role_parameter(selection["role"]),
-        "selection": env_manager.get_model_selection(),
+        "selection": env_manager.get_global_model_selection(),
     })

@@ -109,8 +109,12 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   // ---------- 工具 ----------
-  function listTools() {
-    return request("/tools/list");
+  /**
+   * 列出工具；后端默认复用 TTL 内的探测缓存（首屏毫秒级返回），
+   * refresh 为 true 时要求绕过缓存强制重探（"配置工具"弹窗的刷新按钮）
+   */
+  function listTools(refresh) {
+    return request("/tools/list" + (refresh ? "?refresh=1" : ""));
   }
 
   // ---------- 模型配置 ----------
@@ -118,23 +122,39 @@ const api_url = localStorage.getItem("ytools-api-base")
    * 获取模型列表与指定角色（chat/compaction/title）的选择配置
    * @param {string} [role="chat_model"] 角色：chat_model / compaction_model / title_model
    */
-  function getModels(role) {
+  /**
+   * 列出 models.json 中所有可用的 provider / model 组合，并返回指定角色的完整配置
+   * 传 sessionId 时按「会话覆盖 → 全局默认」返回该会话的生效选择
+   * （role_info 附加 is_overridden，响应含 session_selection/effective_selection/warning）
+   * @param {string} [role] chat_model / compaction_model / title_model，默认 chat_model
+   * @param {string} [sessionId] 会话 ID
+   */
+  function getModels(role, sessionId) {
     const params = new URLSearchParams();
     if (role) params.set("role", role);
+    if (sessionId) params.set("session_id", sessionId);
     return request("/chat_config/models" + (params.toString() ? "?" + params.toString() : ""));
   }
 
   /**
    * 选择模型（可选参数）并保存配置
+   * 不传 sessionId：写全局默认（models.json 顶层 model_selection）
+   * 传 sessionId：写入该会话 _meta.model_selection（仅覆盖该角色）
    * @param {string} provider 服务商名（models.json provider 键）
    * @param {string} model 模型名（models.json models 键）
    * @param {string} [role="chat_model"] 角色
    * @param {object|null} [parameter] 生成参数（按 api_type 分桶）；null 表示仅切换模型、保留原参数桶
+   * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [clear] 仅会话级有效：清除该会话当前角色的独立模型选择，恢复跟随全局默认
    */
-  function selectModel(provider, model, role, parameter) {
+  function selectModel(provider, model, role, parameter, sessionId, clear) {
     const body = { provider: provider, model: model };
     if (role) body.role = role;
     if (parameter !== undefined) body.parameter = parameter;
+    if (sessionId) {
+      body.session_id = sessionId;
+      if (clear) body.clear = true;
+    }
     return request("/chat_config/models/select", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -147,22 +167,30 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
-   * 获取已保存的工具选择（setting/mcp_servers.json 的 inputs 键）
+   * 获取已保存的工具选择
+   * 不传 sessionId：全局默认（setting/mcp_servers.json 的 inputs 键）
+   * 传 sessionId：附加会话独立选择信息
+   * （session_selection/effective_selection/is_overridden/warning，见 docs/api_docs.md）
+   * @param {string} [sessionId] 会话 ID
    * @returns {Promise<{state, inputs: Object<string, string[]>, servers: string[]}>}
    */
-  function getToolSelection() {
-    return request("/chat_config/tool_selection");
+  function getToolSelection(sessionId) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/tool_selection" + query);
   }
 
   /**
-   * 保存工具选择（后端实时更新内存并写回 setting/mcp_servers.json）
+   * 保存工具选择
+   * 不传 sessionId：写回全局默认 setting/mcp_servers.json 的 inputs 键（新建会话前的默认）
+   * 传 sessionId：写入该会话 _meta.tool_selection（空 inputs 表示清除覆盖恢复跟随全局）
    * @param {Object<string, string[]>} inputs 服务名 -> 工具名数组；未提及的已配置服务保存为 []
+   * @param {string} [sessionId] 会话 ID
    */
-  function updateToolSelection(inputs) {
+  function updateToolSelection(inputs, sessionId) {
     return request("/chat_config/tool_selection", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ inputs: inputs || {} }),
+      body: JSON.stringify(sessionId ? { inputs: inputs || {}, session_id: sessionId } : { inputs: inputs || {} }),
     });
   }
 
@@ -179,19 +207,34 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
-   * 获取当前工作目录及项目 .env 中保存的路径
+   * 获取工作目录配置；传 sessionId 时返回该会话的独立目录信息
+   * （session_dir/is_overridden/effective_dir/warning，见 docs/api_docs.md）
    */
-  function getWorkDirConfig() {
-    return request("/chat_config/work_dir");
+  function getWorkDirConfig(sessionId) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/work_dir" + query);
   }
 
   /**
-   * 切换聊天工作目录（写入 .env 并实时生效）
+   * 切换全局默认聊天工作目录（.env DEFAULT_CHAT_WORK_DIR，作为新会话初始目录）
    * @param {string} newDir 新的工作目录路径
    */
   function changeChatDir(newDir) {
     return request("/change_chat_dir?new_dir=" + encodeURIComponent(newDir), {
       method: "POST",
+    });
+  }
+
+  /**
+   * 设置/清除会话独立工作目录（写入会话 _meta.work_dir）
+   * @param {string} sessionId 会话 ID
+   * @param {string} workDir 工作目录；空串表示清除覆盖，恢复跟随全局默认
+   */
+  function setSessionWorkDir(sessionId, workDir) {
+    return request("/chat_config/work_dir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, work_dir: workDir }),
     });
   }
 
@@ -220,6 +263,25 @@ const api_url = localStorage.getItem("ytools-api-base")
    */
   function updateMcpToolConfig(config) {
     return request("/chat_config/mcp_tools", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取模型网络请求失败重试次数配置
+   */
+  function getNetworkRetryConfig() {
+    return request("/chat_config/network_retry");
+  }
+
+  /**
+   * 更新模型网络请求失败重试次数
+   * @param {{max_attempts: number}} config 0 或负数=不限制（一直重试），正数=连续失败 N 次后终止任务
+   */
+  function updateNetworkRetryConfig(config) {
+    return request("/chat_config/network_retry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(config),
@@ -380,6 +442,47 @@ const api_url = localStorage.getItem("ytools-api-base")
     await readSseResponse(res, onEvent);
   }
 
+  // ---------- Skills 提示词库 ----------
+  function listPrompts() {
+    return request("/prompts/list");
+  }
+
+  function readPrompt(name) {
+    return request("/prompts/read?name=" + encodeURIComponent(name));
+  }
+
+  function createPrompt(name, content) {
+    return request("/prompts/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, content: content || "" }),
+    });
+  }
+
+  function savePrompt(name, content) {
+    return request("/prompts/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, content: content }),
+    });
+  }
+
+  function renamePrompt(oldName, newName) {
+    return request("/prompts/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_name: oldName, new_name: newName }),
+    });
+  }
+
+  function deletePrompt(name) {
+    return request("/prompts/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+  }
+
   global.API = {
     BASE,
     listSessions,
@@ -401,8 +504,11 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateContextReturnConfig,
     getMcpToolConfig,
     updateMcpToolConfig,
+    getNetworkRetryConfig,
+    updateNetworkRetryConfig,
     getWorkDirConfig,
     changeChatDir,
+    setSessionWorkDir,
     stopChat,
     uploadSessionFiles,
     uploadSessionMedia,
@@ -412,5 +518,11 @@ const api_url = localStorage.getItem("ytools-api-base")
     deleteSessionFile,
     chatStream,
     compactContextStream,
+    listPrompts,
+    readPrompt,
+    createPrompt,
+    savePrompt,
+    renamePrompt,
+    deletePrompt,
   };
 })(window);

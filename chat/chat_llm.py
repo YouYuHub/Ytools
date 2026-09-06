@@ -25,12 +25,29 @@ from contextlib import suppress
 
 # 自己的模块
 try:
-    from env_manager import ChatModelConfigurationError, require_default_chat_config
+    from env_manager import ChatModelConfigurationError, load_var, require_default_chat_config
 except ImportError:
     ChatModelConfigurationError = RuntimeError
+
+    def load_var(name, default=None):  # type: ignore[misc]
+        return default
+
     require_default_chat_config = None
 # 导入配置模型
-from config import ChatLLMRequest
+from config import ChatLLMRequest, DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
+
+
+def _resolve_network_retry_max_attempts() -> int:
+    """解析网络请求连续失败重试上限（聊天设置可配，持久化在 .env）。
+
+    返回值语义：0 或负数 = 不限制（保持旧行为，一直重试直到手动停止）；
+    正数 = 同一轮流式请求连续失败达到该次数后不再重试，直接报错。
+    """
+    raw = load_var("NETWORK_RETRY_MAX_ATTEMPTS", DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
 
 
 @dataclass
@@ -435,6 +452,7 @@ class ChatLLM:
         timeout_connect, timeout_read, timeout_drain = ChatLLM._resolve_timeouts(request, 300, 1800, 120)
         last_step = "none"
         retry_count = 0
+        retry_max_attempts = _resolve_network_retry_max_attempts()
         while True:
             try:
                 chat_config = ChatLLM._resolve_chat_config(model_config)
@@ -448,7 +466,7 @@ class ChatLLM:
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
-                path = parsed.path or "/v1/chat/completions"
+                path = parsed.path or "/chat/completions"
                 use_ssl = parsed.scheme == "https"
                 if port is None:
                     port = 443 if use_ssl else 80
@@ -568,13 +586,25 @@ class ChatLLM:
                 return
             except (socket.timeout, OSError) as e:
                 retry_count += 1
-                yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'retry': retry_count}, ensure_ascii=False)}\n\n"
-                print(f"[WARN] API 请求失败，进入重试 #{retry_count}（直到用户手动停止）")
+                if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                    print(f"[ERROR] API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                print(f"[WARN] API 请求失败，进入重试 #{retry_count}"
+                      + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
             except Exception as e:
                 retry_count += 1
-                yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'retry': retry_count}, ensure_ascii=False)}\n\n"
-                print(f"[WARN] API 请求异常，进入重试 #{retry_count}（直到用户手动停止）")
+                if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                    print(f"[ERROR] API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                print(f"[WARN] API 请求异常，进入重试 #{retry_count}"
+                      + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
 
     @staticmethod
@@ -603,6 +633,7 @@ class ChatLLM:
         timeout_connect, timeout_read, timeout_drain = ChatLLM._resolve_timeouts(request, 300, 1800, 120)
         last_step = "none"
         retry_count = 0
+        retry_max_attempts = _resolve_network_retry_max_attempts()
         while True:
             if ChatLLM._should_stop(stop_checker):
                 yield "data: [DONE]\n\n"
@@ -619,7 +650,7 @@ class ChatLLM:
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
-                path = parsed.path or "/v1/chat/completions"
+                path = parsed.path or "/chat/completions"
                 use_ssl = parsed.scheme == "https"
                 if port is None:
                     port = 443 if use_ssl else 80
@@ -742,18 +773,32 @@ class ChatLLM:
                 return
             except (asyncio.TimeoutError, OSError) as e:
                 retry_count += 1
-                yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'retry': retry_count}, ensure_ascii=False)}\n\n"
-                print(f"[WARN] API 请求失败，进入重试 #{retry_count}（直到用户手动停止）")
+                if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                    # 连续失败达到配置上限：发终止性错误帧（retrying=False），
+                    # 上游据此结束任务并落盘最终失败记录
+                    print(f"[ERROR] API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                print(f"[WARN] API 请求失败，进入重试 #{retry_count}"
+                      + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
             except asyncio.CancelledError:
                 yield "data: [DONE]\n\n"
                 return
             except Exception as e:
                 retry_count += 1
-                yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'retry': retry_count}, ensure_ascii=False)}\n\n"
-                print(f"[WARN] API 请求异常，进入重试 #{retry_count}（直到用户手动停止）")
+                if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                    print(f"[ERROR] API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                print(f"[WARN] API 请求异常，进入重试 #{retry_count}"
+                      + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
-            
+
     @staticmethod
     def chat_completions(
         request: ChatLLMRequest = None,
@@ -797,7 +842,7 @@ class ChatLLM:
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
         port = parsed.port
-        path = parsed.path or "/v1/chat/completions"
+        path = parsed.path or "/chat/completions"
         use_ssl = parsed.scheme == "https"
         if port is None:
             port = 443 if use_ssl else 80

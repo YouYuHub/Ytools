@@ -2,7 +2,7 @@
 
 之前 `now_str`/`_now_str` 在 `memory/chat_round_store.py` 与
 `memory/chat_memory.py` 各定义一份，另外 `memory/file_memory.py`
-与 `mcp_server/sys_server.py` 又直接写 `strftime` 字面量。
+与 `mcp_server/sys_tools_server.py` 又直接写 `strftime` 字面量。
 集中到本模块后，全仓库的写入格式只有一处定义。
 """
 # from __future__ import annotations

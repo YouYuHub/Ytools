@@ -17,6 +17,56 @@
   }
 }
 
+// 圆角面板安全滚动条：自定义 ::-webkit-scrollbar 的直角轨道不受圆角裁剪，
+// 会顶出面板圆角外——轨道/角落保持透明，只画圆角滑块；上下端提供可点击的
+// 小箭头按钮（透明底 + 居中箭头，箭头远离圆角不越界），点击滚动一格。
+@mixin panel-scrollbar {
+  &::-webkit-scrollbar {
+    width: 12px;
+  }
+
+  &::-webkit-scrollbar-track,
+  &::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    min-height: 36px;
+    background: var(--scroll-thumb);
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    border-radius: 8px;
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background-color: var(--text-tertiary);
+  }
+
+  &::-webkit-scrollbar-button {
+    display: block;
+    height: 16px;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 10px 6px;
+
+    &:vertical:decrement {
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 5l4-4 4 4' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+
+      &:hover {
+        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 5l4-4 4 4' fill='none' stroke='%23c9c9c9' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+      }
+    }
+
+    &:vertical:increment {
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+
+      &:hover {
+        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23c9c9c9' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+      }
+    }
+  }
+}
+
 // ---------- 弹出菜单 ----------
 .menu {
   position: absolute;
@@ -561,6 +611,8 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-menu);
     padding: 6px;
+
+    @include panel-scrollbar;
   }
 
   &:hover .qnav-panel {
@@ -612,18 +664,7 @@
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-menu);
 
-  &::-webkit-scrollbar {
-    width: 10px;
-  }
-
-  &::-webkit-scrollbar-track {
-    border-radius: var(--radius-lg);
-  }
-
-  &::-webkit-scrollbar-thumb {
-    border: 2px solid var(--scroll-track);
-    border-radius: 9px;
-  }
+  @include panel-scrollbar;
 
   .enhance-head,
   .enhance-field,
@@ -892,7 +933,9 @@
     }
   }
 
-  #enhanceReset {
+  // "恢复默认参数"与"清除会话模型覆盖"共用同一套轻量按钮样式
+  #enhanceReset,
+  #enhanceClearOverride {
     flex-shrink: 0;
     padding: 3px 10px;
     border: 1px solid var(--border-strong);
@@ -1336,4 +1379,118 @@
       filter: brightness(1.08);
     }
   }
+}
+
+// ---------- 模型提问交互弹窗（ask_user：逐题点选选项或自由输入） ----------
+.ask-questions {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 20px 16px;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+
+  .ask-question {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .ask-question-text {
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.5;
+    word-break: break-word;
+  }
+
+  // “可多选”小标签
+  .ask-multi-tag {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(11, 132, 216, 0.14);
+    color: #0b84d8;
+    font-size: 11px;
+    font-weight: 500;
+    vertical-align: 1px;
+  }
+
+  .ask-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .ask-option {
+    padding: 6px 14px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    font-size: 13.5px;
+    color: var(--text-secondary);
+    transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    &.selected {
+      background: rgba(11, 132, 216, 0.14);
+      border-color: #0b84d8;
+      color: #0b84d8;
+      font-weight: 600;
+    }
+  }
+
+  .ask-custom {
+    height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg-code);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+
+    &:focus {
+      border-color: #0b84d8;
+    }
+
+    &::placeholder {
+      color: var(--text-tertiary);
+    }
+  }
+}
+
+.ask-modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px 16px;
+
+  .ask-foot-hint {
+    flex: 1;
+    color: var(--text-tertiary);
+    font-size: 12.5px;
+  }
+
+  // 有未作答题目时提交按钮禁用
+  .tool-confirm:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+}
+
+// 弹层锚定触发按钮时的固定定位覆盖：由 JS 在打开时计算视口坐标并内联
+// top/bottom/left（见 composer.js placeAbove / placeEnhancePanel）。
+// 必须放在 .menu / .enhance-panel（position:absolute）之后才能赢得级联。
+.fixed-flyout {
+  position: fixed;
 }

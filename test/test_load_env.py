@@ -43,7 +43,7 @@ class LoadEnvTests(unittest.TestCase):
             env_path = temp_path / ".env"
             target_dir = temp_path / "workspace_a"
             target_dir.mkdir(parents=True, exist_ok=True)
-            env_path.write_text(f"CHAT_WORK_DIR={target_dir.as_posix()}\n", encoding="utf-8")
+            env_path.write_text(f"DEFAULT_CHAT_WORK_DIR={target_dir.as_posix()}\n", encoding="utf-8")
 
             try:
                 init_path(str(temp_path))
@@ -53,7 +53,7 @@ class LoadEnvTests(unittest.TestCase):
                     Path(get_current_dir()).resolve(),
                     target_dir.resolve(),
                 )
-                self.assertEqual(load_var("CHAT_WORK_DIR"), target_dir.as_posix())
+                self.assertEqual(load_var("DEFAULT_CHAT_WORK_DIR"), target_dir.as_posix())
             finally:
                 init_path(str(repo_root))
                 try:
