@@ -121,6 +121,54 @@ def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
 
 
 # 思考过程（reasoning_content）回传长度：0=不回传，负数=全部回传，正数=保留末尾 N 字符
+def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
+    """单行概要描述每条消息（角色+内容形态），供模型调用前的调试打印。
+
+    媒体部件只显示 media:// 引用名或 data: 前缀，绝不输出 base64 数据：
+    旧实现直接 str(messages) 整包打印，带图轮次每次模型调用都会向控制台
+    刷出 MB 级 base64，且同一张图在任务循环的多次调用中反复出现，
+    容易被误判为"历史重复携带图片"。
+    """
+    lines: list[str] = []
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            lines.append(f"[{index}]<非dict:{type(msg).__name__}>")
+            continue
+        role = msg.get("role") or "?"
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    parts.append(f"<{type(part).__name__}>")
+                    continue
+                part_type = str(part.get("type") or "?")
+                if part_type == "text":
+                    text = str(part.get("text") or "")
+                    parts.append(f"text({len(text)}字)")
+                elif part_type == "image_url":
+                    url = str((part.get("image_url") or {}).get("url") or "")
+                    if url.startswith("data:"):
+                        url = url.split(",", 1)[0] + ",<base64省略>"
+                    parts.append(f"image({url[:80]})")
+                elif part_type == "input_audio":
+                    parts.append("audio(<base64省略>)")
+                else:
+                    parts.append(part_type)
+            content_desc = "[" + ", ".join(parts) + "]"
+        else:
+            text = "" if content is None else str(content)
+            extra = ""
+            if msg.get("tool_calls"):
+                extra += f"+{len(msg['tool_calls'])}个工具调用"
+            if msg.get("tool_call_id"):
+                extra += f" tool_call_id={msg['tool_call_id']}"
+            preview = text[:60].replace("\n", "\\n")
+            content_desc = f"{len(text)}字'{preview}'{extra}"
+        lines.append(f"[{index}]{role}:{content_desc}")
+    return "; ".join(lines)
+
+
 def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MAX_LENGTH) -> int:
     return parse_return_length(load_var("REASONING_RETURN_MAX_LENGTH", default), default)
 
@@ -1065,7 +1113,9 @@ async def _run_chat_generation(
             # 每次请求只携带最近一条思考过程；todo 状态在执行更新后会被
             # 归并为单条 system 消息，避免工具轨迹和思考文本无限增长。
             _retain_latest_reasoning(messages)
-            print(f"massages: [\n\t{',\n\t'.join(map(str, messages))}\n]")
+            # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
+            # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
+            print(f"[DEBUG] 模型调用消息概要：{_messages_debug_summary(messages)}")
             # 大上下文下整包转储会向控制台刷 MB 级文本并拖慢循环，只打印概要
             # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
             full_response = ""

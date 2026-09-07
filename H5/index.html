@@ -440,9 +440,11 @@
                         <input id="keepRounds" type="number" min="0" max="200" step="1">
                     </label>
                     <label class="chat-setting-field">
-                        <span>触发比例<small>历史上下文达到聊天窗口的该比例时触发压缩</small></span>
+                        <span>触发比例<small>历史上下文达到压缩阈值时触发压缩；阈值=两模型窗口较小者×该比例</small></span>
                         <input id="triggerRatio" type="number" min="0.01" max="0.95" step="0.01">
                     </label>
+                    <!-- 有效压缩阈值提示：独占一行，避免挤占字段描述的横向空间 -->
+                    <p id="effectiveThresholdHint" class="chat-settings-threshold-hint" hidden></p>
                     <label class="chat-setting-field">
                         <span>摘要预算比例<small>累计摘要总预算=聊天窗口×比例，最大 0.5</small></span>
                         <input id="summaryBudgetRatio" type="number" min="0.01" max="0.5" step="0.05">

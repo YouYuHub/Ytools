@@ -15,7 +15,7 @@
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
     networkRetryMaxAttempts, keepRounds, triggerRatio, summaryBudgetRatio,
-    oversizedRejectFactor, maxOversizedRejections
+    oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint
   } = App;
 
   // ---------- 输入区 ----------
@@ -206,6 +206,7 @@
     summaryBudgetRatio.value = comp && comp.summary_budget_ratio != null ? comp.summary_budget_ratio : defaults.summary_budget_ratio;
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
+    renderEffectiveThresholdHint(comp);
     if (!ctx || !comp || !mcp || !retry) {
       toast((ctx ? "" : "回传长度配置加载失败；") +
         (comp ? "" : "压缩策略配置加载失败；") +
@@ -217,6 +218,30 @@
   function readSettingNumber(input) {
     const value = Number(input.value);
     return Number.isFinite(value) ? value : null;
+  }
+
+  // 有效压缩阈值提示：阈值取聊天/压缩模型窗口较小者×触发比例，
+  // 压缩模型窗口更小时实际触发点会低于"聊天窗口×比例"的直觉预期。
+  function renderEffectiveThresholdHint(comp) {
+    if (!effectiveThresholdHint) { return; }
+    const detail = comp && comp.effective_threshold;
+    if (!detail || !detail.value) {
+      effectiveThresholdHint.textContent = "";
+      effectiveThresholdHint.hidden = true;
+      return;
+    }
+    const fmt = function (n) {
+      return n >= 1000000 ? (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M"
+        : n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
+    };
+    let text = "有效压缩阈值≈" + fmt(detail.value) + " tokens（"
+      + fmt(detail.window) + " × " + detail.trigger_ratio + "）";
+    if (detail.compaction_window < detail.chat_window) {
+      text += "；受压缩模型窗口限制（聊天 " + fmt(detail.chat_window)
+        + " / 压缩 " + fmt(detail.compaction_window) + " 取较小者）";
+    }
+    effectiveThresholdHint.textContent = text;
+    effectiveThresholdHint.hidden = false;
   }
 
   function applyChatSettingsDefaults() {

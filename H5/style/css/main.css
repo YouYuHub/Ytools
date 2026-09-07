@@ -3134,6 +3134,13 @@ html:not([data-theme=dark]) #voiceBtn {
 .chat-settings-dialog .chat-setting-field input:focus {
   border-color: #0b84d8;
 }
+/* 触发比例字段下方的有效压缩阈值提示（独占一行，后端 effective_threshold 计算结果） */
+.chat-settings-dialog .chat-settings-threshold-hint {
+  margin: 2px 0 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
 .chat-settings-dialog .chat-settings-note {
   margin-top: 8px;
   padding-top: 8px;

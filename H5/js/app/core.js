@@ -181,6 +181,7 @@ window.App = window.App || {};
   const summaryBudgetRatio = $("#summaryBudgetRatio");
   const oversizedRejectFactor = $("#oversizedRejectFactor");
   const maxOversizedRejections = $("#maxOversizedRejections");
+  const effectiveThresholdHint = $("#effectiveThresholdHint");
 
   const THEME_LABEL = { system: "跟随系统", light: "浅色", dark: "深色" };
   const SESSION_TITLE_KEY = "ytools-session-title-overrides";
@@ -438,7 +439,7 @@ window.App = window.App || {};
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
   toolCallTimeoutSeconds, networkRetryMaxAttempts, keepRounds,
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
-  maxOversizedRejections, state, $,
+  maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
   scrollToBottom, nearBottom, setEmpty,
   updateScrollBottomOffset, refreshThemeUI, closeMenus,

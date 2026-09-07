@@ -42,12 +42,17 @@ from env_manager import (
     select_chat_model,
     set_env_vars,
 )
-from factory.agent_runtime.chat_runtime import parse_return_length
+from factory.agent_runtime.chat_runtime import (
+    parse_return_length,
+    resolve_model_max_input_tokens,
+)
 from factory.agent_runtime.context_compaction import (
     get_context_compaction_defaults,
     get_context_compaction_model_status,
     load_context_compaction_settings,
+    resolve_config_max_input_tokens,
     resolve_context_compaction_model_config,
+    resolve_context_compaction_threshold,
     resolve_summary_total_budget,
 )
 
@@ -119,6 +124,32 @@ def _available_compaction_models() -> list[dict]:
     ]
 
 
+def _effective_threshold_payload(settings) -> dict:
+    """有效压缩阈值明细，前端据此展示真实触发点。
+
+    阈值 = max(1024, min(聊天模型窗口, 压缩模型窗口) × trigger_ratio)：
+    取两者较小窗口保证摘要能同时放进两边上下文；因此当压缩模型窗口
+    小于聊天模型窗口时，实际触发点会低于"聊天窗口 × 比例"的直觉预期
+    （例如 428k 聊天 + 100k 压缩模型 × 0.7 → 70k，而非 300k）。
+    """
+    chat_window = resolve_model_max_input_tokens(default=8192)
+    try:
+        compaction_window = resolve_config_max_input_tokens(
+            resolve_context_compaction_model_config(settings),
+            default=8192,
+        )
+    except ChatModelConfigurationError:
+        compaction_window = chat_window
+    return {
+        "value": resolve_context_compaction_threshold(settings),
+        "chat_window": chat_window,
+        "compaction_window": compaction_window,
+        "window": min(chat_window, compaction_window),
+        "trigger_ratio": settings.trigger_ratio,
+        "formula": "max(1024, min(聊天窗口, 压缩模型窗口) × trigger_ratio)",
+    }
+
+
 def _history_compaction_config_payload() -> dict:
     settings = load_context_compaction_settings()
     return {
@@ -126,6 +157,7 @@ def _history_compaction_config_payload() -> dict:
         "trigger_ratio": settings.trigger_ratio,
         "summary_budget_ratio": settings.summary_budget_ratio,
         "summary_total_budget": resolve_summary_total_budget(settings),
+        "effective_threshold": _effective_threshold_payload(settings),
         "oversized_reject_factor": settings.oversized_reject_factor,
         "max_oversized_rejections": settings.max_oversized_rejections,
         "defaults": get_context_compaction_defaults(),
@@ -415,6 +447,8 @@ async def update_mcp_tool_config(payload: McpToolConfig):
         "state": "succeed",
         "updated": updated,
         "config": _mcp_tool_config_payload(),
+        # 与其他配置接口一致：返回内存 env 中的原始值，便于调用方核对落盘结果
+        "memory_state": env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
     })
 
 
