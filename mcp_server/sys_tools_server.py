@@ -8,7 +8,7 @@
     write_file    写入文件（整文件覆盖/追加，自动创建多级目录）
     edit_file     按精确字符串替换编辑文件（查找替换，自动适配 CRLF/LF）
     search_files  跨文件正则搜索（类似 grep，支持文件名通配符与上下文行）
-    run_command   执行终端命令（超时保护、输出截断、编码自适应）
+    run_command   执行终端命令（多 shell：cmd/powershell/pwsh/bash/sh/zsh；超时保护、输出截断、编码自适应）
     fetch_url     抓取网页/HTTP 接口（纯文本提取、标签/正则抽取、截断）
     web_search    网页搜索（解析 Bing 网页版，返回标题/链接/摘要）
 
@@ -22,11 +22,13 @@
 """
 # 标准库
 import asyncio
+import difflib
 import fnmatch
 import gzip
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -35,7 +37,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -344,7 +346,7 @@ def _list_dir_impl(dir_path, pattern, search_mode, max_depth) -> str:
     return text
 
 
-def _read_file_impl(full_file_name, start_line, end_line, encoding, show_line_numbers) -> str:
+def _read_file_impl(full_file_name, start_line, end_line, encoding, show_line_numbers, char_offset=0) -> str:
     path = Path(str(full_file_name)).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在")
@@ -367,6 +369,19 @@ def _read_file_impl(full_file_name, start_line, end_line, encoding, show_line_nu
     if len(selected) > _READ_FILE_MAX_LINES:
         selected = selected[:_READ_FILE_MAX_LINES]
         limited = True
+    # 单行超长（如压缩过的大 JSON/日志）时按字符分块返回，避免头尾截断丢失中间内容
+    if len(selected) == 1 and len(selected[0]) > _READ_FILE_MAX_CHARS:
+        line_text = selected[0]
+        offset = max(0, int(char_offset or 0))
+        chunk = line_text[offset:offset + _READ_FILE_MAX_CHARS]
+        if not chunk:
+            return f"[read_file] char_offset={offset} 已超出该行长度 {len(line_text)}，无内容可读"
+        next_offset = offset + len(chunk)
+        footer = (f"[read_file] {_display_path(path)} | 单行超长（共 {len(line_text)} 字符，编码 {used_encoding}）"
+                  f" | 本次返回第 {offset + 1}-{next_offset} 字符")
+        if next_offset < len(line_text):
+            footer += f" | 未读完，请用 char_offset={next_offset} 继续读取"
+        return chunk + "\n" + footer
     if show_line_numbers:
         width = len(str(start + len(selected) - 1))
         body = "\n".join(f"{no:>{width}}| {line}" for no, line in enumerate(selected, start=start))
@@ -411,7 +426,13 @@ def _edit_file_impl(full_file_name, old_string, new_string, replace_all, encodin
     new_norm = str(new_string).replace("\r\n", "\n")
     count = text.count(old_norm)
     if count == 0:
-        raise ValueError("old_string 在文件中 0 处匹配；请先用 read_file 核对内容（空格/缩进/换行必须完全一致）")
+        # 0 匹配时给出最接近的候选行，帮助模型快速定位"凭记忆写错"的差异
+        hint = ""
+        close = difflib.get_close_matches(old_norm.strip(), [line.strip() for line in text.split("\n")], n=2, cutoff=0.6)
+        if close:
+            shown = " / ".join(f"「{c[:120]}」" for c in close)
+            hint = f"；文件中最相似的行：{shown}（注意空格/缩进/全角差异）"
+        raise ValueError(f"old_string 在文件中 0 处匹配；请先用 read_file 核对内容（空格/缩进/换行必须完全一致）{hint}")
     if count > 1 and not replace_all:
         raise ValueError(f"old_string 在文件中匹配到 {count} 处，存在歧义；请提供更长的上下文使其唯一，或传 replace_all=true 全部替换")
     updated = text.replace(old_norm, new_norm) if replace_all else text.replace(old_norm, new_norm, 1)
@@ -444,7 +465,7 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
 
 
 def _search_files_impl(pattern, dir_path, file_pattern, ignore_case, is_regex,
-                       context_lines, max_results, max_depth) -> str:
+                       context_lines, max_results, max_depth, max_file_mb=2) -> str:
     pattern = (pattern or "").strip()
     if not pattern:
         raise ValueError("pattern 不能为空")
@@ -460,18 +481,27 @@ def _search_files_impl(pattern, dir_path, file_pattern, ignore_case, is_regex,
     context = max(0, min(int(context_lines), 5))
     limit = max(1, min(int(max_results), 200))
     name_filter = (file_pattern or "").strip()
+    try:
+        size_limit = float(max_file_mb) if max_file_mb else 0.0
+    except (TypeError, ValueError):
+        size_limit = 2.0
+    if size_limit <= 0:
+        size_limit = 0.0
     blocks = []
     total_matches = 0
     files_scanned = 0
     files_matched = 0
+    skipped_large = 0
     for path, kind in _walk_entries(root, max(0, int(max_depth))):
         if kind != "file":
             continue
         if name_filter and not fnmatch.fnmatch(path.name, name_filter):
             continue
         try:
-            if path.stat().st_size > 2 * 1024 * 1024:
-                continue  # 跳过超过 2MB 的大文件
+            file_size = path.stat().st_size
+            if size_limit and file_size > size_limit * 1024 * 1024:
+                skipped_large += 1
+                continue  # 跳过超过大小上限的文件
             data = path.read_bytes()
         except OSError:
             continue
@@ -490,6 +520,8 @@ def _search_files_impl(pattern, dir_path, file_pattern, ignore_case, is_regex,
             blocks.extend(block_group[:room])
     header = (f"[search_files] 正则: {regex.pattern} | 目录: {_display_path(root)}"
               f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
+    if skipped_large:
+        header += f" | 跳过 {skipped_large} 个超过 {size_limit:g}MB 的文件（可用 max_file_mb 调整）"
     if not blocks:
         return header + "\n（无匹配结果）"
     result = [header] + blocks
@@ -498,24 +530,87 @@ def _search_files_impl(pattern, dir_path, file_pattern, ignore_case, is_regex,
     return "\n".join(result)
 
 
-def _run_command_impl(command, timeout_seconds, cwd, encoding) -> str:
+_SHELL_ALIASES = {
+    "auto": "auto", "": "auto",
+    "cmd": "cmd", "cmd.exe": "cmd", "batch": "cmd",
+    "powershell": "powershell", "powershell.exe": "powershell", "ps": "powershell", "ps1": "powershell",
+    "pwsh": "pwsh", "pwsh.exe": "pwsh", "powershell7": "pwsh",
+    "bash": "bash", "sh": "sh", "zsh": "zsh", "dash": "sh",
+}
+
+
+def _resolve_shell(shell: str, is_nt: bool) -> tuple:
+    """把 shell 名称解析为 (exe, shell 标识, 额外 argv 前缀)。
+
+    - auto: Windows → cmd.exe；非 Windows → bash 可用则 bash，否则 sh；
+    - 返回 exe 为绝对路径时走 Popen 列表形式，否则仅作为提示由 shell=True 使用。
+    - 找不到可执行文件时抛 ValueError。
+    """
+    key = str(shell or "auto").strip().lower()
+    kind = _SHELL_ALIASES.get(key)
+    if kind is None:
+        raise ValueError(
+            f"shell 仅支持 auto/cmd/powershell/pwsh/bash/sh/zsh，当前为 {shell!r}")
+    if kind == "auto":
+        if is_nt:
+            return os.environ.get("COMSPEC") or "cmd.exe", "cmd", []
+        bash_path = shutil.which("bash")
+        return (bash_path or "/bin/sh"), ("bash" if bash_path else "sh"), []
+    if kind == "cmd":
+        if not is_nt:
+            raise ValueError("shell=cmd 仅在 Windows 上可用；Linux/macOS 请使用 bash/sh/zsh")
+        return os.environ.get("COMSPEC") or "cmd.exe", "cmd", []
+    if kind == "powershell":
+        if not is_nt:
+            raise ValueError("shell=powershell 仅在 Windows 上可用（非 Windows 请使用 pwsh/bash/sh）")
+        exe = shutil.which("powershell") or "powershell.exe"
+        return exe, "powershell", ["-NoProfile", "-NonInteractive", "-Command"]
+    if kind == "pwsh":
+        exe = shutil.which("pwsh") or ("pwsh.exe" if is_nt else None)
+        if not exe or not shutil.which(exe) and not Path(exe).exists():
+            raise ValueError("未找到 PowerShell 7 (pwsh)；可安装 https://aka.ms/powershell 或改用 shell=powershell/bash")
+        return exe, "pwsh", ["-NoProfile", "-NonInteractive", "-Command"]
+    # bash / sh / zsh
+    exe = shutil.which(kind)
+    if not exe:
+        exe = f"/bin/{kind}" if Path(f"/bin/{kind}").exists() else None
+    if not exe:
+        hint = "Windows 上可通过 Git for Windows / WSL 获取 bash" if is_nt else f"系统未安装 {kind}"
+        raise ValueError(f"未找到 {kind} 可执行文件（{hint}）")
+    if is_nt:
+        # Windows 侧的 bash（Git Bash/WSL 登录 shell）：-c 形式最稳，避免 MSYS 路径转换干扰
+        return exe, kind, ["-c"]
+    return exe, kind, ["-c"]
+
+
+def _run_command_impl(command, timeout_seconds, cwd, encoding, shell="auto") -> str:
     command = str(command or "").strip()
     if not command:
         raise ValueError("command 不能为空")
     try:
         timeout = min(max(float(timeout_seconds), 1.0), 240.0)
     except (TypeError, ValueError):
-        timeout = 60.0
+        timeout = 45.0
     work_dir = None
     if cwd and str(cwd).strip():
         candidate = Path(str(cwd).strip()).expanduser()
         if not candidate.is_dir():
             raise NotADirectoryError(f"cwd 不是有效目录: {candidate}")
         work_dir = str(candidate)
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    is_nt = os.name == "nt"
+    shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if is_nt else 0
+    if shell_prefix:
+        # 直接启动指定 shell：[exe, "-c", command] / powershell [-Command] 形式
+        popen_args = [shell_exe, *shell_prefix, command]
+        use_shell = False
+    else:
+        popen_args = command
+        use_shell = True
     try:
         proc = subprocess.Popen(
-            command, shell=True, cwd=work_dir,
+            popen_args, shell=use_shell, cwd=work_dir,
+            stdin=subprocess.DEVNULL,  # 防交互：等待输入的命令立即得到 EOF 而非挂起
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=creationflags,
         )
@@ -537,7 +632,7 @@ def _run_command_impl(command, timeout_seconds, cwd, encoding) -> str:
     candidates = _command_output_candidates()
     stdout_text = _decode_bytes(out_bytes or b"", encoding, candidates)
     stderr_text = _decode_bytes(err_bytes or b"", encoding, candidates)
-    parts = [f"[run_command] exit_code={proc.returncode} | 耗时 {elapsed:.1f}s"
+    parts = [f"[run_command] exit_code={proc.returncode} | 耗时 {elapsed:.1f}s | shell={shell_kind}"
              + (" | 命令超时被强制终止" if timed_out else "")]
     if stdout_text.strip():
         parts.append("[stdout]\n" + _truncate_text(stdout_text.rstrip(), _RUN_COMMAND_MAX_CHARS, "命令输出过长已截断"))
@@ -583,14 +678,16 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
         blocks = _extract_tag_blocks(html_text, str(tag))
         content = "\n----\n".join(blocks)
     else:
-        content = "\n".join(
-            (" | ".join(group if group is not None else "" for group in found.groups())
-             if found.groups() else found.group(0))[:500]
-            for found in regex.finditer(html_text)
-        )
-        # finditer 无上限，这里手动截断到 100 条
-        lines = content.split("\n")
-        content = "\n".join(lines[:100])
+        # regex 模式：单条匹配展示上限 = max_chars/4，钳制在 [200, 2000]（默认 8000 → 每条 2000 字符）
+        per_match_cap = max(200, min(2000, (int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS) // 4))
+        matches = []
+        for found in regex.finditer(html_text):
+            piece = (" | ".join(g if g is not None else "" for g in found.groups())
+                     if found.groups() else found.group(0))
+            matches.append(piece[:per_match_cap])
+            if len(matches) >= 200:
+                break
+        content = "\n".join(matches)
     limit = min(max(int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS, 200), 100000)
     original_len = len(content)
     content = _truncate_text(content, limit, "网页内容过长已截断")
@@ -616,30 +713,53 @@ def _web_search_impl(query, max_results) -> str:
     limit = max(1, min(int(max_results) if max_results else 8, _WEB_SEARCH_MAX_RESULTS))
     search_url = "https://www.bing.com/search?" + urlencode(
         {"q": query, "count": min(limit * 3, 30), "mkt": "zh-CN"})
-    _, _, content_type, raw = _http_request(search_url, timeout_seconds=15)
-    charset = _pick_web_charset(content_type, raw, "")
-    html_text = raw.decode(charset, errors="replace")
-    blocks = re.findall(r'<li class="b_algo[^"]*"[^>]*>(.*?)</li>', html_text,
-                        re.IGNORECASE | re.DOTALL)
-    results = []
-    for block in blocks:
-        link_match = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-                               block, re.IGNORECASE | re.DOTALL)
-        if not link_match:
-            continue
-        url = unescape(link_match.group(1)).strip()
-        title = _strip_tags(link_match.group(2))
-        snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.IGNORECASE | re.DOTALL)
-        snippet = _strip_tags(snippet_match.group(1))[:300] if snippet_match else ""
-        if url.startswith("http"):
-            results.append((title, url, snippet))
-        if len(results) >= limit:
-            break
+    try:
+        _, _, content_type, raw = _http_request(search_url, timeout_seconds=15)
+        charset = _pick_web_charset(content_type, raw, "")
+        html_text = raw.decode(charset, errors="replace")
+        blocks = re.findall(r'<li class="b_algo[^"]*"[^>]*>(.*?)</li>', html_text,
+                            re.IGNORECASE | re.DOTALL)
+        results = []
+        for block in blocks:
+            link_match = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                                   block, re.IGNORECASE | re.DOTALL)
+            if not link_match:
+                continue
+            url = unescape(link_match.group(1)).strip()
+            title = _strip_tags(link_match.group(2))
+            snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.IGNORECASE | re.DOTALL)
+            snippet = _strip_tags(snippet_match.group(1))[:300] if snippet_match else ""
+            if url.startswith("http"):
+                results.append((title, url, snippet))
+            if len(results) >= limit:
+                break
+    except (ValueError, OSError):
+        results = []  # 网络异常时走 DuckDuckGo 回退，而不是直接失败
+    engine = "Bing 网页版解析"
     if not results:
-        raise ValueError(
-            "未从 Bing 解析到搜索结果（站点改版或访问受限时会发生）。"
-            "可直接用 fetch_url 打开 https://www.bing.com/search?q=关键词 ，用 mode=text/regex 自行提取。")
-    lines = [f"[web_search] 查询: {query} | 共 {len(results)} 条结果（Bing 网页版解析，链接正文可用 fetch_url 抓取）"]
+        # 回退：DuckDuckGo HTML 版（无需 API Key，结构稳定）
+        ddg_url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
+        _, _, content_type, raw = _http_request(ddg_url, timeout_seconds=15)
+        charset = _pick_web_charset(content_type, raw, "")
+        html_text = raw.decode(charset, errors="replace")
+        ddg_blocks = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                                html_text, re.IGNORECASE | re.DOTALL)
+        for url, title_html in ddg_blocks:
+            url = unquote(url)
+            # DDG 重定向链接 //duckduckgo.com/l/?uddg=<真实URL>
+            uddg = re.search(r"uddg=([^&]+)", url)
+            if uddg:
+                url = unquote(uddg.group(1))
+            if url.startswith("http"):
+                results.append((_strip_tags(title_html), url, ""))
+            if len(results) >= limit:
+                break
+        engine = "DuckDuckGo 回退（Bing 无结果/不可达）"
+        if not results:
+            raise ValueError(
+                "Bing 与 DuckDuckGo 均未解析到结果（站点改版或访问受限）。"
+                "可直接用 fetch_url 打开 https://www.bing.com/search?q=关键词 ，用 mode=text/regex 自行提取。")
+    lines = [f"[web_search] 查询: {query} | 共 {len(results)} 条结果（{engine}，链接正文可用 fetch_url 抓取）"]
     for index, (title, url, snippet) in enumerate(results, start=1):
         lines.append(f"{index}. {title}\n   链接: {url}" + (f"\n   摘要: {snippet}" if snippet else ""))
     return "\n".join(lines)
@@ -665,7 +785,7 @@ async def list_dir(dir_path: str = ".", pattern: str = "", search_mode: str = "a
 
 @sys_mcp_server.tool()
 async def read_file(full_file_name: str, start_line: int = 1, end_line: int = 0,
-                    encoding: str = "", show_line_numbers: bool = True) -> str:
+                    encoding: str = "", show_line_numbers: bool = True, char_offset: int = 0) -> str:
     """读取文本文件内容（自动尝试 utf-8/gbk 编码，带行号与读取进度提示）
     参数：
         full_file_name:    文件路径，相对路径基于会话工作目录；传入目录会报错
@@ -673,12 +793,14 @@ async def read_file(full_file_name: str, start_line: int = 1, end_line: int = 0,
         end_line:          结束行（包含该行），0 或负数表示读到文件末尾；默认 0
         encoding:          指定文件编码（如 utf-8、gbk）；留空自动尝试 utf-8 → gbk
         show_line_numbers: 是否带 "行号| 内容" 前缀显示，默认 true；行号可用于后续 edit_file 定位
+        char_offset:       单行超长时的字符偏移（按返回的 char_offset 提示续读）；普通文件忽略该参数
     返回：
         文件内容；末尾附 [read_file] 摘要（总行数/本次范围/编码），未读完会提示分段读取。
-        单次最多返回 2000 行；二进制文件拒绝读取
+        单次最多返回 2000 行；二进制文件拒绝读取；
+        单行超过 6 万字符（如压缩大 JSON）时自动转为字符分块模式，按提示的 char_offset 续读
     """
     return await asyncio.to_thread(
-        _read_file_impl, full_file_name, start_line, end_line, encoding, show_line_numbers)
+        _read_file_impl, full_file_name, start_line, end_line, encoding, show_line_numbers, char_offset)
 
 
 @sys_mcp_server.tool()
@@ -715,7 +837,8 @@ async def edit_file(full_file_name: str, old_string: str, new_string: str,
 @sys_mcp_server.tool()
 async def search_files(pattern: str, dir_path: str = ".", file_pattern: str = "",
                        ignore_case: bool = False, is_regex: bool = True,
-                       context_lines: int = 0, max_results: int = 50, max_depth: int = 6) -> str:
+                       context_lines: int = 0, max_results: int = 50, max_depth: int = 6,
+                       max_file_mb: float = 2) -> str:
     """跨文件正则搜索（类似 grep）：在目录下的文本文件中逐行匹配
     参数：
         pattern:       正则表达式（is_regex=false 时按普通文本查找）
@@ -726,30 +849,37 @@ async def search_files(pattern: str, dir_path: str = ".", file_pattern: str = ""
         context_lines: 每处匹配附带上下文行数（0-5），默认 0
         max_results:   最多返回的匹配区块数（1-200），默认 50
         max_depth:     递归深度，0=仅当前目录；默认 6
+        max_file_mb:   单文件大小上限 MB（默认 2；设 0 表示不限制，可搜索大 JSON/日志）
     返回：
         "文件路径:行号" 区块列表，> 前缀标记命中行；头部附扫描/命中统计。
-        自动跳过二进制文件、超过 2MB 的大文件、隐藏目录及 node_modules/__pycache__/.git 等目录
+        自动跳过二进制文件、隐藏目录及 node_modules/__pycache__/.git 等目录；
+        超过 max_file_mb 的文件默认跳过并在头部统计中提示
     """
     return await asyncio.to_thread(
         _search_files_impl, pattern, dir_path, file_pattern, ignore_case, is_regex,
-        context_lines, max_results, max_depth)
+        context_lines, max_results, max_depth, max_file_mb)
 
 
 @sys_mcp_server.tool()
-async def run_command(command: str, timeout_seconds: float = 60.0, cwd: str = "", encoding: str = "") -> str:
-    """执行一条终端命令并返回退出码与输出（Windows 经 cmd.exe 由 shell 解释）
+async def run_command(command: str, timeout_seconds: float = 60.0, cwd: str = "", encoding: str = "",
+                      shell: str = "auto") -> str:
+    """执行一条终端命令并返回退出码与输出（支持多 shell：cmd/powershell/pwsh/bash/sh/zsh）
     参数：
-        command:         命令字符串，例如 dir /b、python --version、pip list；支持管道与重定向
+        command:         命令字符串；支持管道与重定向（由所选 shell 解释）
         timeout_seconds: 超时秒数（1-240，默认 60）；超时强制杀掉整个进程树
         cwd:             命令工作目录；留空使用当前目录（会话工作目录）
         encoding:        指定输出编码（如 gbk、utf-8）；留空自动尝试（Windows 先 gbk 后 utf-8），乱码时请显式指定
+        shell:           解释器（默认 auto=Windows 用 cmd，Linux/macOS 优先 bash，无则 sh）；
+                         可选 cmd / powershell（Win 自带 5.1）/ pwsh（PowerShell 7）/ bash / sh / zsh
     返回：
-        "[run_command] exit_code=... | 耗时 ..." 头部 + [stdout]/[stderr] 分段（超长自动截断）
+        "[run_command] exit_code=... | 耗时 ... | shell=..." 头部 + [stdout]/[stderr] 分段（超长自动截断）
     注意：
         非零退出码不算工具错误，会作为正常结果返回，请根据 exit_code 判断成败；
-        不要执行交互式或长期驻留的命令（如进入 REPL、启动服务器），它们会一直等到超时被杀
+        stdin 已重定向为空（DEVNULL），等待交互输入的命令会立即得到 EOF 而非挂起；
+        powershell/pwsh 以 -NoProfile -NonInteractive 运行；bash/sh/zsh 以 -c 运行；
+        仍建议避免交互式或长期驻留命令（如进入 REPL、启动服务器），它们会等到超时被杀
     """
-    return await asyncio.to_thread(_run_command_impl, command, timeout_seconds, cwd, encoding)
+    return await asyncio.to_thread(_run_command_impl, command, timeout_seconds, cwd, encoding, shell)
 
 
 @sys_mcp_server.tool()
@@ -760,7 +890,8 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
     参数：
         url:             完整链接，仅支持 http/https
         mode:            提取模式：text=正文纯文本（默认）、html=原始 HTML、tag=按标签抽取、regex=按正则抽取
-        pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
+        pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）；
+                         每条匹配展示长度与 max_chars 联动（不再固定 500 字符）
         tag:             mode=tag 时必填，标签选择器，支持 div、div#id、div.class（同名标签嵌套时按最短块匹配）
         max_chars:       返回内容最大字符数（200-100000）；默认 8000
         timeout_seconds: 请求超时秒数（1-120），默认 30

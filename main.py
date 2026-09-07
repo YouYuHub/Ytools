@@ -1,12 +1,18 @@
+import asyncio
+import threading
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 # 加载 env 环境变量
-from config import apply_persisted_work_dir, PROJECT_ROOT
+from config import apply_persisted_work_dir, get_current_dir , PROJECT_ROOT
+from util import config_watcher
+from factory.agent_runtime import tool_registry
 from env_manager import init_path
 init_path(PROJECT_ROOT)
 apply_persisted_work_dir()
+
 
 # 引入路由，需要在 init_path() 之后
 from routers.chat_router import api_chat_router
@@ -76,7 +82,6 @@ app.include_router(api_prompt_router, tags=["Skills"])
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------
 def _start_config_hot_reload() -> None:
-    from util import config_watcher
 
     def _reload_mcp_servers(data: dict, meta: dict) -> None:
         # inputs / servers 变化都同步工具选择内存快照（服务集合可能增删）
@@ -85,22 +90,18 @@ def _start_config_hot_reload() -> None:
             chat_config_router.sync_tool_selection_memory(data)
         except Exception as exc:
             print(f"[config-watch] 同步工具选择内存失败: {exc}")
+
+        def _rediscover() -> None:
+            try:
+                asyncio.run(tool_registry.refresh_tools_from_mcp(get_current_dir()))
+            except Exception as exc:
+                print(f"[config-watch] mcp_servers.json 变更后重新发现工具失败: {exc}")
+
         # 仅 servers 键变化才重新探测 MCP 工具（inputs 保存不应触发昂贵的工具发现）。
         # 工具发现要拉起 MCP 子进程，极端情况下可能卡住（如子进程握手挂起），
         # 放到临时线程执行并限时：超时放弃本次重探（临时线程为 daemon，随进程退出），
         # 保证热重载轮询线程本身永不冻结
         if meta.get("servers_changed"):
-            import asyncio
-            import threading
-            from config import get_current_dir
-            from factory.agent_runtime import tool_registry
-
-            def _rediscover() -> None:
-                try:
-                    asyncio.run(tool_registry.refresh_tools_from_mcp(get_current_dir()))
-                except Exception as exc:
-                    print(f"[config-watch] mcp_servers.json 变更后重新发现工具失败: {exc}")
-
             rediscover_thread = threading.Thread(
                 target=_rediscover, name="config-watch-mcp-refresh", daemon=True
             )
@@ -152,17 +153,17 @@ if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app='main:app',
         host="0.0.0.0", port=48621,
-        reload=True, reload_dirs=[str(PROJECT_ROOT)],
-        reload_excludes=[
-            # "mcp_server/*",     # 排除 generated 子目录
-            "mcp_server/**",
-            "test/**",          # 递归排除 test 下所有层级
-            "setting/**",
-            "history_files/**",
-            "docs/**",
-            "H5/**",
-            # "*.pyc",            # 也可按模式排除文件
-            "*.md",
-            "*.txt",
-        ],
+        # reload=True, reload_dirs=[str(PROJECT_ROOT)],
+        # reload_excludes=[
+        #     # "mcp_server/*",     # 排除 generated 子目录
+        #     "mcp_server/**",
+        #     "test/**",          # 递归排除 test 下所有层级
+        #     "setting/**",
+        #     "history_files/**",
+        #     "docs/**",
+        #     "H5/**",
+        #     # "*.pyc",            # 也可按模式排除文件
+        #     "*.md",
+        #     "*.txt",
+        # ],
     )

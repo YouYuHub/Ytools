@@ -7,7 +7,6 @@ import re
 import shutil
 import threading
 import time
-import psutil  # type: ignore
 import copy
 from contextlib import contextmanager
 from datetime import datetime
@@ -67,25 +66,43 @@ def _pid_alive(pid: Any) -> bool:
     """判断进程是否存活（Windows/POSIX 通用，尽力而为）。
 
     检查点写者存活校验用：写者进程仍活着时不能把检查点恢复成历史轮次。
-    psutil 不可用时 Windows 退化为 os.kill 探测（MSDN：向不存在的 PID 发
-    信号返回 ERROR_ACCESS_DENIED —— errno EPERM 表示进程存在）。
+    psutil 不可用时 Windows 用 OpenProcess 探测（非破坏性，不向目标进程
+    发信号）；POSIX 用 os.kill(pid, 0) 存在性检查。
     """
     if not isinstance(pid, int) or pid <= 0:
         return False
     try:
+        import psutil  # type: ignore
+
         return psutil.pid_exists(pid)
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            # 打开失败但错误码为拒绝访问 → 进程存在（通常是系统保护进程）
+            return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
-    except PermissionError:
-        # Windows 上目标进程存在但无权限发信号 → 进程存活
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     except OSError:
         return False
-    return True
 
 
 # def _write_jsonline(file_path: Path, data: dict[str, Any]) -> None:
@@ -713,6 +730,33 @@ class ChatMemoryManager:
     def _pending_checkpoint_path(self) -> Path:
         return self._file_path.with_name(self._file_path.name + ".pending")
 
+    def _read_pending_round_snapshot(self) -> dict[str, Any] | None:
+        """读取侧车检查点中的进行中轮次快照（只读，供主进程 token 统计兜底）。
+
+        生成任务在会话 worker 进程中执行时，pending_round 只存在于 worker
+        内存，主进程读 JSONL 只能看到已完成轮次——任务过程中上下文统计
+        永远不增长。检查点由 worker 逐事件原子覆盖写入，这里只读该文件，
+        把进行中轮次纳入统计（绝不修改文件，不参与崩溃恢复）。
+        """
+        try:
+            if not self._pending_checkpoint_path.exists():
+                return None
+            raw = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict) or raw.get("event") != "chat_round":
+            return None
+        if raw.get("status") != "running":
+            return None
+        writer_pid = raw.get("writer_pid")
+        # 写者已死亡仍残留的检查点是崩溃遗留（等恢复流程清理），不计入统计；
+        # _pid_alive 对无效/负数/不存在 PID 一律返回 False，无需额外判断
+        if isinstance(writer_pid, int) and not _pid_alive(writer_pid):
+            return None
+        snapshot = dict(raw)
+        snapshot.pop("writer_pid", None)
+        return snapshot
+
     def _write_pending_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """侧车检查点：只含当前轮快照，写临时文件后原子替换。
 
@@ -1195,6 +1239,12 @@ class ChatMemoryManager:
             # 流式任务尚未收到 done 时，当前轮仍只存在于 ChatRoundStore.pending_round；
             # 复制快照供 token_stats 纳入统计，避免轮询只能看到上一轮的旧数据。
             pending_round = copy.deepcopy(self._round_store.pending_round)
+            if pending_round is None:
+                # 生成任务跑在会话 worker 进程时，pending_round 在 worker 内存，
+                # 主进程实例里恒为 None；兜底读取 worker 逐事件写入的检查点
+                # 侧车快照，让任务进行中（无 usage/压缩事件的静默间隔）统计
+                # 也能实时反映当前轮增量。
+                pending_round = self._read_pending_round_snapshot()
         context_summary = _normalize_context_summary(meta.get("context_summary"))
         summary_message = (
             _render_context_summary(context_summary)

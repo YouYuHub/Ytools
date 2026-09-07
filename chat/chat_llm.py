@@ -8,6 +8,7 @@ import json
 import urllib.parse
 import socket
 import ssl
+# import uuid
 from dataclasses import dataclass #, field
 from typing import(
     List,
@@ -516,12 +517,22 @@ class ChatLLM:
                             resp_headers[h_key.strip().lower()] = h_val.strip()
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
                     if "200" not in status_str and "201" not in status_str:
+                        # 网关偶发 4xx/5xx（如瞬时 400 Bad Request）与网络错误同源：
+                        # 纳入 NETWORK_RETRY_MAX_ATTEMPTS 重试（语义见异步版注释）
                         last_step = "read_error_body"
                         error_body = ChatLLM._read_full_response_body(f, is_chunked)
                         error_text = error_body.decode("utf-8", errors="replace")
-                        yield f"data: {json.dumps({'error': f'HTTP Error: {status_str}: {error_text}'}, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                        http_error = f"HTTP Error: {status_str}: {error_text}"
+                        retry_count += 1
+                        if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                            print(f"[ERROR] API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step}): {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                        print(f"[WARN] API 返回 {status_str}，进入重试 #{retry_count}"
+                              + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
+                        continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
                     for line in ChatLLM._iter_sse_body_lines(f, is_chunked):
                         line = line.strip()
@@ -668,6 +679,8 @@ class ChatLLM:
                     header_lines = (
                         f"Host: {host}\r\n"
                         f"Content-Type: application/json\r\n"
+                        # opencode 需要携带 x-opencode-session 头部，值为 session id
+                        f"x-opencode-session: lolicon1314\r\n"
                         f"Authorization: Bearer {api_key}\r\n"
                         f"Content-Length: {len(body_bytes)}\r\n"
                         f"Connection: close\r\n"
@@ -700,14 +713,26 @@ class ChatLLM:
                             resp_headers[h_key.strip().lower()] = h_val.strip()
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
                     if "200" not in status_str and "201" not in status_str:
+                        # 网关偶发 4xx/5xx（如瞬时 400 Bad Request）与网络错误同源：
+                        # 纳入 NETWORK_RETRY_MAX_ATTEMPTS 重试。未达上限发
+                        # retrying=True 重试帧（仅推送前端提示，不落盘）后重连重发；
+                        # 达到上限才发 retrying=False 终止帧（由调用方落盘）。
                         last_step = "read_error_body"
                         error_body = await ChatLLM._aread_full_response_body(
                             reader, is_chunked, timeout_read, stop_checker
                         )
                         error_text = error_body.decode("utf-8", errors="replace")
-                        yield f"data: {json.dumps({'error': f'HTTP Error: {status_str}: {error_text}'}, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                        http_error = f"HTTP Error: {status_str}: {error_text}"
+                        retry_count += 1
+                        if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                            print(f"[ERROR] API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step}): {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                        print(f"[WARN] API 返回 {status_str}，进入重试 #{retry_count}"
+                              + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
+                        continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
                     async for line in ChatLLM._aiter_sse_body_lines(reader, is_chunked, timeout_read, stop_checker):
                         line = line.strip()
@@ -823,6 +848,7 @@ class ChatLLM:
             120,
         )
         if stream:
+
             async def _stream_generator():
                 async for chunk in ChatLLM.async_std_completions_sse(
                     request=request,
@@ -830,6 +856,7 @@ class ChatLLM:
                     model_config=model_config,
                 ):
                     yield chunk
+
             return _stream_generator()
         chat_config = ChatLLM._resolve_chat_config(model_config)
         url = ChatLLM.confirm_completions_url(chat_config["url"])

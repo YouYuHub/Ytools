@@ -1101,20 +1101,10 @@ async def _run_chat_generation(
                         # 网络失败重试帧：ChatLLM 内部正在按配置自动重试，
                         # 只透传给前端提示，不终止任务；连续失败达到重试上限时
                         # 上游会改发 retrying=False 的终止性错误帧。
-                        # 每次失败原始错误实时落盘到当前轮次（带 retry 次数），
-                        # 页面关闭/服务重启后仍可在历史中追溯完整重试过程。
-                        try:
-                            await session_chat_memory.add_chat_history({
-                                "role": "assistant",
-                                "event": "network_retry",
-                                "error": str(event.get("error")),
-                                "error_detail": str(event.get("error_detail") or event.get("error")),
-                                "step": str(event.get("step") or "unknown"),
-                                "retry": int(event.get("retry") or 0),
-                                "max_attempts": int(event.get("max_attempts") or 0) or None,
-                            })
-                        except Exception as retry_log_error:
-                            print(f"[WARN] 网络重试事件落盘失败：{retry_log_error}")
+                        # 重试是瞬态过程（多数情况下下一次就成功），中间失败
+                        # 不落盘——只保留前端实时提示；最终失败由下方终止帧
+                        # 统一落盘（附带完整重试统计），避免轮次被过程性
+                        # 事件塞满。注意此处不能 continue 掉任务状态维护。
                         continue
                     stream_error = event.get("error")
                     stream_error_meta = event if isinstance(event, dict) else {}
@@ -1189,7 +1179,9 @@ async def _run_chat_generation(
             if pending_finish_payload is not None:
                 await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                 pending_finish_payload = None
-            # 上游模型流出错（如连接被切断）：记录真实错误原因，而不是伪装成"用户停止任务"
+            # 上游模型流出错（如连接被切断/重试达到上限）：记录真实错误原因，
+            # 而不是伪装成"用户停止任务"。中间重试过程不落盘（仅前端提示），
+            # 这里是唯一落盘点：附带完整重试统计，追溯信息不丢。
             if stream_error is not None:
                 print(f"\n[ERROR] 模型流式响应出错: {stream_error}")
                 # 记录 ai 已生成的内容
@@ -1198,7 +1190,7 @@ async def _run_chat_generation(
                 if full_response:
                     await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
                 # 记录真实错误，便于事后追溯；附带重试统计（本次流内的失败次数
-                # 与重试上限），与逐次落盘的 network_retry 事件互相印证
+                # 与重试上限），重试过程本身不落盘、由该终止记录统一呈现
                 error_record: dict[str, Any] = {"role": "assistant", "error": str(stream_error)}
                 final_retry_count = stream_error_meta.get("retry")
                 final_max_attempts = stream_error_meta.get("max_attempts")

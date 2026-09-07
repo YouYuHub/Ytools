@@ -282,6 +282,11 @@
         if (activeToolBlocks && Array.from(activeToolBlocks.values()).every(function (toolBlock) { return toolBlock.done; })) {
           activeToolBlocks = null;
         }
+        // 工具结果已写入后端历史并计入当前轮上下文：刷新统计增量
+        // （防抖合并，流式期间多次结果只产生一次请求）
+        if (state.sessionId === sessionId) {
+          App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
+        }
       }
       // token 用量：每次 LLM 调用一份独立统计，按 completion id 去重后累加为本轮累计
       if (data.usage && typeof data.usage === "object") {
@@ -444,7 +449,11 @@
       if (shouldReloadVisibleSession) {
         setTimeout(function () { App.openSession(streamSessionId); }, 0);
       }
-      if (state.sessionId === streamSessionId) App.refreshContextTokenStats(streamSessionId);
+      // 流结束（含 [DONE]/出错/停止）：后端已收尾当前轮，刷新一次统计。
+      // 用防抖合并：与 usage 事件触发的刷新合并成一个请求
+      if (state.sessionId === streamSessionId) {
+        App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, streamSessionId);
+      }
       // 流结束后刷新提问卡片可答性：出现过普通用户消息/更新提问后旧卡片转为过期
       App.refreshAskBlockStates();
     }
@@ -555,7 +564,10 @@
       }
       if (state.sessionId === sessionId) App.clearContextStatsTimer();
       App.refreshComposerButtons();
-      if (state.sessionId === sessionId) App.refreshContextTokenStats(sessionId);
+      // 附接流结束：同样用防抖合并刷新一次统计增量
+      if (state.sessionId === sessionId) {
+        App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
+      }
     }
   }
 
