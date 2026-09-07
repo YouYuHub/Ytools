@@ -52,7 +52,10 @@ class CheckpointWriteRetryTests(unittest.TestCase):
 
         pending = manager._pending_checkpoint_path
         self.assertTrue(pending.exists())
-        self.assertEqual(json.loads(pending.read_text(encoding="utf-8")), checkpoint)
+        stored = json.loads(pending.read_text(encoding="utf-8"))
+        # 快照会附带 writer_pid（写者存活校验用），比较时排除
+        stored.pop("writer_pid", None)
+        self.assertEqual(stored, checkpoint)
         self.assertFalse(pending.with_name(pending.name + ".tmp").exists())
         self.assertEqual(calls["n"], 4)
 

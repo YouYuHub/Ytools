@@ -376,7 +376,13 @@ class RoundCheckpointTests(unittest.TestCase):
         asyncio.run(manager.add_chat_history({
             "role": "tool", "tool_call_id": "call_1", "content": "16:00", "_tool_name": "format_current_time",
         }))
-        # 模拟崩溃重启：新建管理器实例触发检查点恢复
+        # 模拟崩溃重启：把检查点写者 PID 改成已不存在的进程，再新建管理器
+        # 实例触发检查点恢复（写者存活校验要求写进程已死亡才恢复，
+        # 同进程内直接新建管理器会被判定为"轮次仍在生成中"而跳过恢复）
+        sidecar = manager._pending_checkpoint_path
+        checkpoint = json.loads(sidecar.read_text(encoding="utf-8"))
+        checkpoint["writer_pid"] = -2147483000
+        sidecar.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
         recovered_manager = ChatMemoryManager(TEST_SESSION)
         raw_meta, _, entries = self._read_meta(recovered_manager)
         self.assertIsNone(raw_meta.get("_pending_round_checkpoint"))

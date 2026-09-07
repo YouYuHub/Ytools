@@ -1769,7 +1769,18 @@ async def tool_chat_server(
     stream = _get_session_stream(session_id)
     creating = False
     if proxy is not None:
-        task_active = proxy.is_generation_running()
+        # worker 模式的"活跃"判断：worker 命令循环按顺序处理命令，同一会话的
+        # 请求天然串行（pipelined），start_generation 只是把 generate 命令排入
+        # 队列——首次请求发出后到 task_started 事件回流前的窗口内
+        # is_generation_running 仍是 False，此时绝不能把任务判为不活跃。
+        # （并发重连 + 发送竞争时误判会让同一消息被派发两次，轮次里出现
+        # 两条相同 user 事件。）
+        task_active = (
+            proxy.is_generation_running()
+            or stream is not None
+            and stream.task is not None
+            and not stream.task.done()
+        )
     else:
         task_active = stream is not None and stream.task is not None and not stream.task.done()
     if stream is None or stream.done or not task_active:

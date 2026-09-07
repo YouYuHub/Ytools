@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import time
+import psutil  # type: ignore
 import copy
 from contextlib import contextmanager
 from datetime import datetime
@@ -17,6 +18,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
+from factory.agent_runtime.builtin_tools import ASK_ANSWER_PREFIX, ASK_USER_TOOL_NAME
 from memory.chat_round_store import (
     ChatRoundStore,
     compression_usage_values,
@@ -59,6 +61,31 @@ def _safe_session_id(session_id: str) -> str:
 def _get_chat_history_file(session_id: str) -> Path:
     safe_id = _safe_session_id(session_id)
     return HISTORY_ROOT / f"{safe_id}_chat.jsonl"
+
+
+def _pid_alive(pid: Any) -> bool:
+    """判断进程是否存活（Windows/POSIX 通用，尽力而为）。
+
+    检查点写者存活校验用：写者进程仍活着时不能把检查点恢复成历史轮次。
+    psutil 不可用时 Windows 退化为 os.kill 探测（MSDN：向不存在的 PID 发
+    信号返回 ERROR_ACCESS_DENIED —— errno EPERM 表示进程存在）。
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        return psutil.pid_exists(pid)
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        # Windows 上目标进程存在但无权限发信号 → 进程存活
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    return True
 
 
 # def _write_jsonline(file_path: Path, data: dict[str, Any]) -> None:
@@ -539,15 +566,27 @@ class ChatMemoryManager:
         一定持有缓存的管理器实例——走到新建，即说明写入它的进程已结束，
         不会误伤仍在进行中的轮次。恢复为 interrupted 状态的历史轮次，
         user_questions/标题/回放照常可用。
+
+        写者存活校验：生成任务在每会话独立 worker 进程中执行（与主进程
+        内存隔离），主进程因读接口新建管理器时不能假设"写进程已结束"。
+        检查点记录写入方 PID，恢复前确认该进程已不存在（重启后 PID 复用
+        的窗口极小，且必须恰好是本主进程/另一 worker 才可能误判）；写者
+        仍存活时说明轮次仍在生成，保留检查点交由真正的收尾逻辑处理。
         """
         with self._write_guard():
-            # 新机制：侧车文件（当前轮快照）；兼容清理旧版写入的 _meta 检查点
             recovered = None
             try:
                 if self._pending_checkpoint_path.exists():
                     recovered = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 recovered = None
+            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
+                return
+            # 写者进程仍存活：轮次还在生成中（多进程架构下主进程读接口
+            # 新建管理器会走到这里），绝不能恢复成 interrupted 历史
+            writer_pid = recovered.get("writer_pid")
+            if isinstance(writer_pid, int) and _pid_alive(writer_pid):
+                return
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             legacy_checkpoint = meta.pop("_pending_round_checkpoint", None)
             if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
@@ -558,10 +597,47 @@ class ChatMemoryManager:
             if normalized.get("status") == "running":
                 normalized["status"] = "interrupted"
             normalized.setdefault("ended_at", normalized.get("started_at"))
-            entries.append(normalized)
+            # 幂等去重：同轮（started_at + 首个用户事件一致）已存在于历史时
+            # 不再追加，只清理残留检查点。避免恢复逻辑异常路径下产生重复轮次
+            if not self._round_already_recorded(entries, normalized):
+                entries.append(normalized)
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)
         self._clear_pending_checkpoint()
+
+    @staticmethod
+    def _round_already_recorded(entries: list[dict[str, Any]], recovered_round: dict[str, Any]) -> bool:
+        """判断恢复轮次是否已完整落盘过（按 started_at + 首个用户事件匹配）。
+
+        正常收尾的轮次 events 应为恢复快照的超集（恢复后收尾只会继续追加）。
+        """
+        started_at = recovered_round.get("started_at")
+        if not started_at:
+            return False
+        recovered_user = next(
+            (
+                event for event in (recovered_round.get("events") or [])
+                if isinstance(event, dict) and event.get("role") == "user"
+            ),
+            None,
+        )
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("event") != "chat_round":
+                continue
+            if entry.get("started_at") != started_at:
+                continue
+            if recovered_user is None:
+                return True
+            existing_user = next(
+                (
+                    event for event in (entry.get("events") or [])
+                    if isinstance(event, dict) and event.get("role") == "user"
+                ),
+                None,
+            )
+            if existing_user is not None and existing_user == recovered_user:
+                return True
+        return False
 
     @property
     def run_task(self) -> bool:
@@ -640,14 +716,21 @@ class ChatMemoryManager:
     def _write_pending_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """侧车检查点：只含当前轮快照，写临时文件后原子替换。
 
+        快照附带 writer_pid（当前写进程 PID）：恢复方据此判断写者是否仍
+        存活——多进程架构下主进程读接口新建管理器时，不能把仍被 worker
+        写入中的轮次误恢复成 interrupted 历史。
+
         Windows 上刚写入的文件可能被搜索索引/杀软短暂占用导致 open 与
         os.replace 偶发 WinError 5，按 _ATOMIC_WRITE_RETRY_DELAYS 指数退避重试。
         检查点只服务崩溃恢复，重试耗尽不抛错：保留旧检查点并打警告继续本轮
         （丢的只是最近一条事件的恢复点，下一条事件写入会重新覆盖）；若抛错
         会经 add_chat_history 打断整个生成轮次，把偶发文件占用放大成任务失败。
         """
+        payload_checkpoint = dict(checkpoint)
+        if payload_checkpoint.get("event") == "chat_round":
+            payload_checkpoint.setdefault("writer_pid", os.getpid())
         tmp_path = self._pending_checkpoint_path.with_name(self._pending_checkpoint_path.name + ".tmp")
-        payload = json.dumps(checkpoint, ensure_ascii=False)
+        payload = json.dumps(payload_checkpoint, ensure_ascii=False)
         last_error: OSError | None = None
         for delay in _ATOMIC_WRITE_RETRY_DELAYS:
             try:
@@ -688,8 +771,6 @@ class ChatMemoryManager:
         开始时才截断——提问后若已开启普通新任务，则不动历史。
         返回删除的轮次数；无需截断（无提问轮 / 首次回答 / 保护命中）返回 0。
         """
-        from factory.agent_runtime.builtin_tools import ASK_ANSWER_PREFIX, ASK_USER_TOOL_NAME
-
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             # 从后往前找最近一个包含 ask_user 工具调用的轮次
