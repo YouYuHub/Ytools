@@ -18,8 +18,9 @@
 }
 
 // 圆角面板安全滚动条：自定义 ::-webkit-scrollbar 的直角轨道不受圆角裁剪，
-// 会顶出面板圆角外——轨道/角落保持透明，只画圆角滑块；上下端提供可点击的
-// 小箭头按钮（透明底 + 居中箭头，箭头远离圆角不越界），点击滚动一格。
+// 会顶出面板圆角外——轨道/角落保持透明，只画圆角滑块；仅顶端保留一个向上
+// 箭头按钮、底端保留一个向下箭头按钮（其余两片按钮隐藏），点击滚动一格；
+// 悬停时箭头提亮并衬淡色圆角底。
 @mixin panel-scrollbar {
   &::-webkit-scrollbar {
     width: 12px;
@@ -44,24 +45,37 @@
 
   &::-webkit-scrollbar-button {
     display: block;
-    height: 16px;
+    height: 18px;
     background-repeat: no-repeat;
     background-position: center;
-    background-size: 10px 6px;
+    background-size: 12px 7px;
+    border-radius: 6px;
 
-    &:vertical:decrement {
-      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 5l4-4 4 4' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    // Chromium 默认双按钮模式：每端有 decrement/increment 两片按钮，
+    // 不区分 :start/:end 会四片全渲染（上下各一对↑↓）。这里只保留
+    // 顶端的外侧减号片（向上）与底端的外侧加号片（向下），其余隐藏。
+    &:vertical:decrement:end,
+    &:vertical:increment:start {
+      display: none;
+    }
+
+    // 顶端：向上箭头
+    &:vertical:decrement:start {
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M1.5 5.5l4.5-4 4.5 4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 
       &:hover {
-        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 5l4-4 4 4' fill='none' stroke='%23c9c9c9' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M1.5 5.5l4.5-4 4.5 4' fill='none' stroke='%23c9c9c9' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+        background-color: rgba(128, 128, 128, 0.16);
       }
     }
 
-    &:vertical:increment {
-      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    // 底端：向下箭头
+    &:vertical:increment:end {
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M1.5 1.5l4.5 4 4.5-4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 
       &:hover {
-        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23c9c9c9' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+        background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M1.5 1.5l4.5 4 4.5-4' fill='none' stroke='%23c9c9c9' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+        background-color: rgba(128, 128, 128, 0.16);
       }
     }
   }

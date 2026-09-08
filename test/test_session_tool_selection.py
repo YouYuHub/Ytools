@@ -30,7 +30,7 @@ def _new_sid() -> str:
 def _cleanup(sid: str) -> None:
     asyncio.run(cleanup_chat_memory_manager(sid))
     ChatMemoryManager.delete_chat_session_file(sid)
-    lock_file = Path("history_files") / f"{sid}_chat.jsonl.lock"
+    lock_file = Path("history_files") / "lock" / f"{sid}_chat.jsonl.lock"
     if lock_file.exists():
         lock_file.unlink()
 

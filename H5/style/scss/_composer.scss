@@ -147,6 +147,12 @@
     }
   }
 
+  // 引导/队列暂存指示器可见时同样换行：composer 启用 wrap（.has-outbox
+  // 由 JS 在 renderPendingOutbox 切换），outbox 占满输入框上方一整行
+  &.has-outbox {
+    flex-wrap: wrap;
+  }
+
   // 超过 1 行（.grow）：输入框在上占满整行，功能条在其下
   &.grow {
     flex-direction: column;
@@ -218,7 +224,7 @@
 
     #voiceBtn,
     #sendBtn,
-    #stopBtn {
+    #stopGroup {
       order: 6;
     }
   }
@@ -261,10 +267,10 @@
       order: 2;
     }
 
-    // 语音 / 发送 / 停止 保持在功能条右侧（列布局下生效）
+    // 语音 / 发送 / 停止组 保持在功能条右侧（列布局下生效）
     &.grow #voiceBtn,
     &.grow #sendBtn,
-    &.grow #stopBtn {
+    &.grow #stopGroup {
       order: 6;
     }
   }
@@ -306,7 +312,8 @@
     &.grow #boostBtn,
     &:not(.grow) #voiceBtn,
     &:not(.grow) #sendBtn,
-    &:not(.grow) #stopBtn {
+    &:not(.grow) #stopGroup,
+    &.grow #stopGroup {
       order: 6;
     }
   }
@@ -418,6 +425,161 @@ html:not([data-theme="dark"]) #voiceBtn {
   height: 12px;
   border-radius: 2px;
   background: currentColor;
+}
+
+// ---------- 运行中组合按钮：停止 + 发送选项上拉 ----------
+// 方形停止钮与窄上拉钮拼合为一组（VS Code 风格），仅当前会话运行中显示；
+// 上拉钮弹出菜单（消息引导/加入队列），菜单项整体可点击直接执行
+.stop-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+
+  // 显式固定内部顺序：[■ 停止][▲ 上拉]（主操作在左、下拉在右）
+  #stopBtn { order: 1; }
+  .stop-menu-btn { order: 2; }
+
+  // 停止钮右缘与上拉钮左缘拼合：整体一个胶囊
+  #stopBtn {
+    border-radius: 50% 0 0 50%;
+    width: 38px;
+    height: 38px;
+  }
+
+  .stop-menu-btn {
+    border-radius: 0 50% 50% 0;
+    width: 26px;
+    height: 38px;
+    background: var(--accent);
+    color: var(--accent-contrast);
+
+    .icon { width: 18px; height: 18px; }
+
+    &:hover {
+      opacity: 0.9;
+      transform: none;
+      box-shadow: none;
+    }
+  }
+
+  // 压缩期间仅显示停止钮：恢复正圆（.compact-only 由 JS 在 refreshComposerButtons 切换）
+  &.compact-only #stopBtn {
+    border-radius: 50%;
+  }
+}
+
+// 菜单条目：图标 + 右侧列（功能描述上、快捷键下），避免横向挤压换行
+.queue-menu {
+  bottom: calc(100% + 8px);
+  right: 0;
+  left: auto;
+  min-width: 230px;
+
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  // 功能描述与快捷键上下两行
+  .menu-item-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .menu-item-label {
+    white-space: nowrap;
+  }
+
+  .menu-item-hint {
+    font-size: 11px;
+    color: var(--text-tertiary, var(--text-secondary));
+    white-space: nowrap;
+  }
+}
+
+// ---------- 引导 / 队列消息暂存指示器 ----------
+// 显示在输入框上方（flex-wrap 换行占满一整行，不挤入输入行）：
+// 引导条目 + 队列条目，可立即发送或移除放回输入框修改
+.pending-outbox {
+  order: 0;
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+
+  .pending-outbox-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-md, 10px);
+    background: var(--bg-elevated);
+    font-size: 13px;
+
+    // 运行中已注入的引导消息提示：纯状态展示，弱化边框
+    &.injected {
+      border-style: solid;
+      border-color: var(--border);
+      opacity: 0.85;
+
+      .pending-outbox-badge {
+        background: var(--accent);
+        color: var(--accent-contrast);
+      }
+    }
+
+    .pending-outbox-badge {
+      flex-shrink: 0;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--bg-active);
+      color: var(--text-secondary);
+      font-size: 11px;
+    }
+
+    .pending-outbox-text {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text-secondary);
+    }
+
+    .pending-outbox-send {
+      flex-shrink: 0;
+      padding: 3px 12px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: var(--accent-contrast);
+      font-size: 12px;
+
+      &:hover { opacity: 0.9; }
+    }
+
+    .pending-outbox-remove {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      color: var(--text-secondary);
+      font-size: 14px;
+      line-height: 1;
+
+      &:hover {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+    }
+  }
 }
 
 // “+” 弹出菜单

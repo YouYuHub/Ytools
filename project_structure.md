@@ -103,7 +103,7 @@ agent_tool_sse/
    ├─ ③ 工具白名单过滤：前端只允许传 tool_names，后端实时工具为唯一真相
    │     - 未注册工具名 → 忽略并发 warning 事件
    │     - 未选择工具 → 无工具模式继续
-   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存 _meta.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）
+   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存 _meta.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索：服务端本地执行、语义对齐 MCP 同名工具，相对路径基于会话工作目录；write/edit/read 返回结构化 dict 携带 path/action/replacements/total_lines 等字段，为文件 diff 功能预留）
    ├─ ④ 上下文构建：
    │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS，默认跟随 HISTORY_COMPACT_KEEP_ROUNDS，前端提供完整历史则跳过）
    │     - 注入系统提示词（含当前工作路径、思考过程回传长度说明）+ 会话已上传文件解析内容
@@ -139,6 +139,9 @@ agent_tool_sse/
 媒体：/file/upload_session_media —— 图片/音频/视频原始字节存 media/ 目录
   （图片/音频 ≤20MB；视频 ≤500MB 流式落盘；ico/tif/tiff 自动转 PNG）
   → 返回 media:// 引用，聊天消息 content 部件引用，发送上游前解析为 base64
+  → **大图降采样**：>2MB 图片（GIF 除外）解析时改发 JPEG 缩略图（长边≤1568、
+    质量85，缓存 thumbs/<原名>.thumb.jpg，按 mtime+size 指纹失效重建，失败回退原图）；
+    前端发送前 canvas 同等压缩（无收益保留原文件）
 读取：/file/get_session_media、/file/get_session_document 均支持 HTTP Range（206），
   音频/视频进度条即时拖动跳转；/file/get_session_document 供 PDF/文本预览与下载
 ```
@@ -171,7 +174,7 @@ agent_tool_sse/
 - **SSE 事件归一化**：流式 `tool_calls` 按 index 增量合并，兼容老模型 `function_call`；透传前过滤 id/type 字段
 - **usage 汇总**：`UsageAccumulator` 按 completion_id + 指纹去重，合并后挂到当前 chat_round
 - **首调用预算检查**：请求发起前估算「消息 + 工具定义」token，超当前模型窗口时优先把文件记忆降级为 3000 字符摘要（发 warning 事件），仍超窗则发 error 并终止，避免上游 400/静默截断
-- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入——`check_tool_exists` 查后端实时工具列表（选了外部工具时自动注入）；`todo_write` 模型自我规划（落盘 `_meta.todo`）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）
+- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入——`check_tool_exists` 检查工具在当前轮次任务中是否可用（区分"后端不存在"与"已注册但被用户禁用"，后者返回 exists=True + disabled=True 并提示本轮无法使用；选了外部工具时自动注入）；`todo_write` 模型自我规划（落盘 `_meta.todo`）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）
    - **上下文压缩**：由 `agent_runtime/context_compaction.py` 统一负责。压缩模型调用支持**流式接口**：传入 `event_emitter` 时以 `stream=True` 请求，模型思考/正文增量经 `phase="delta"` 事件（`reasoning_content`/`content` 与聊天 SSE 同名字段）实时推 SSE，delta 帧不落盘；done 事件携带 `summary_text` 最终累计摘要全文并随同一 payload 落盘 JSONL，前端刷新后可在压缩块回放摘要。跨轮历史与单轮工具轨迹达到「`min(聊天窗口,压缩窗口)×ratio`」时，使用压缩模型输出普通文本摘要，并归并为一个累计摘要块；已完成原始轮次只存储在 JSONL，不再回传给模型，全部历史原始用户问题保留最近 ≤10k tokens（`context_summary.recent_questions`），渲染为独立 system 消息；单次超大工具结果也会在下一次模型调用前触发；原始结果仍写入 JSONL 与 SSE。
 - **超大结果拒绝**：单次工具结果估算 token 超过 `min(聊天窗口,压缩窗口)×系数`（默认 1.5）时，结果不进入模型上下文，改写"输出过长，请重新考虑工具"反馈并让模型重新规划；JSONL 只落头尾节选预览（`result_preview`）。连续超长拒绝达到上限（默认 3）时终止任务并写入说明。
 - **错误处理**：上游流错误/用户停止/异常分别记录不同状态，避免误记；服务端取消（CancelledError）尽力落盘后重抛

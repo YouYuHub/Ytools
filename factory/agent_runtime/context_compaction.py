@@ -769,8 +769,13 @@ async def _build_cumulative_summary(
     new_summary: SummaryBuildResult,
     tool_request: ChatLLMRequest,
     settings: ContextCompactionSettings,
+    delta_emitter: Any = None,
 ) -> tuple[str, dict[str, Any]]:
-    """把新摘要并入一个有界累计摘要，避免旧摘要块只取最近几块。"""
+    """把新摘要并入一个有界累计摘要，避免旧摘要块只取最近几块。
+
+    `delta_emitter` 透传合并调用的流式增量：合并大历史时这也是一次完整的
+    模型调用，不透传会让前端在第一批摘要结束后经历数分钟静默，看起来像卡死。
+    """
     previous_text = render_context_summary(previous_summary) or ""
     usage: dict[str, Any] = {}
     if isinstance(new_summary.usage, dict):
@@ -789,6 +794,7 @@ async def _build_cumulative_summary(
         scope="累计历史摘要",
         settings=settings,
         output_token_budget=resolve_summary_total_budget(settings),
+        delta_emitter=delta_emitter,
     )
     if isinstance(merge_result.usage, dict):
         _merge_usage_dict(usage, merge_result.usage)
@@ -1011,27 +1017,99 @@ async def compact_session_history_if_needed(
                 })
             except Exception as exc:
                 print(f"[WARN] 跨轮压缩开始事件推送失败：{exc}")
-        summary_result = await summarize_context_text(
-            chunk_source,
-            tool_request,
-            scope="跨轮会话历史",
-            settings=settings,
-            output_token_budget=resolve_summary_total_budget(settings),
-            delta_emitter=session_delta_emitter,
-        )
+        # 压缩调用带一次自动重试：上游偶发超时/断流时直接重试而不是立即失败；
+        # 重试仍失败才视为本批失败——失败不落盘任何摘要（update_context_summary
+        # 只在成功路径执行），并补发 aborted 闭合 start 事件。
+        summary_result = None
+        last_error: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                summary_result = await summarize_context_text(
+                    chunk_source,
+                    tool_request,
+                    scope="跨轮会话历史",
+                    settings=settings,
+                    output_token_budget=resolve_summary_total_budget(settings),
+                    delta_emitter=session_delta_emitter,
+                )
+                break
+            except asyncio.CancelledError:
+                # 任务中断（客户端断开等）：不补 aborted，交由既有孤儿 start
+                # 标记机制在下一次请求开始时统一收尾。
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == 1:
+                    print(f"[WARN] 跨轮压缩第 1 次尝试失败（{exc}），自动重试")
+                    continue
+        if summary_result is None:
+            # 压缩失败：补发 aborted 使 start 有闭合事件（前端据此把压缩块
+            # 标记为失败态），否则 JSONL 会遗留"永远转圈"的孤儿 start 行。
+            if event_emitter is not None:
+                try:
+                    await event_emitter({
+                        "event": "context_compaction",
+                        "scope": "session",
+                        "phase": "aborted",
+                        "role": "assistant",
+                        "reason": "compaction_failed",
+                        "error": str(last_error)[:500],
+                    })
+                except Exception as emit_exc:
+                    print(f"[WARN] 跨轮压缩中止事件推送失败：{emit_exc}")
+            if compacted_rounds > 0:
+                print(
+                    f"[INFO] 本批跨轮压缩失败，此前已成功压缩 {compacted_rounds} 轮"
+                    "（游标与累计摘要已落盘，重试将从剩余轮次继续）"
+                )
+                # 把进度附加进异常文案：手动压缩等调用方能把"部分成功"
+                # 传达给用户，避免"摘要已生成却整体报错"的困惑。
+                last_error.args = (
+                    f"{last_error}（此前已成功压缩 {compacted_rounds} 轮并写入累计摘要，"
+                    "重试将从剩余轮次继续）",
+                )
+            raise last_error
         previous_count = _summary_source_round_count(summary_state)
-        cumulative_text, cumulative_usage = await _build_cumulative_summary(
-            summary_state,
-            summary_result,
-            tool_request,
-            settings,
-        )
-        summary_state = _make_cumulative_summary_state(
-            cumulative_text,
-            previous_count + len(chunk_rounds),
-            recent_questions,
-        )
-        await session_chat_memory.update_context_summary(summary_state)
+        try:
+            cumulative_text, cumulative_usage = await _build_cumulative_summary(
+                summary_state,
+                summary_result,
+                tool_request,
+                settings,
+                delta_emitter=session_delta_emitter,
+            )
+            summary_state = _make_cumulative_summary_state(
+                cumulative_text,
+                previous_count + len(chunk_rounds),
+                recent_questions,
+            )
+            await session_chat_memory.update_context_summary(summary_state)
+        except asyncio.CancelledError:
+            # 任务中断（客户端断开等）：不补 aborted，交由既有孤儿 start
+            # 标记机制在下一次请求开始时统一收尾。
+            raise
+        except Exception as exc:
+            # 合并累计摘要（第二次模型调用）或落盘失败：同样补发 aborted，
+            # 保证 start 总有闭合事件；本批未写入任何摘要（update 在异常点之后）。
+            last_error = exc
+            if event_emitter is not None:
+                try:
+                    await event_emitter({
+                        "event": "context_compaction",
+                        "scope": "session",
+                        "phase": "aborted",
+                        "role": "assistant",
+                        "reason": "compaction_failed",
+                        "error": str(exc)[:500],
+                    })
+                except Exception as emit_exc:
+                    print(f"[WARN] 跨轮压缩中止事件推送失败：{emit_exc}")
+            if compacted_rounds > 0:
+                exc.args = (
+                    f"{exc}（此前已成功压缩 {compacted_rounds} 轮并写入累计摘要，"
+                    "重试将从剩余轮次继续）",
+                )
+            raise
         if cumulative_usage:
             update_history_usage = getattr(session_chat_memory, "add_history_compression_usage", None)
             if callable(update_history_usage):

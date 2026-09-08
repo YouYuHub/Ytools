@@ -42,6 +42,31 @@ HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 # 会话上传文件的根目录（与 memory.file_memory.HISTORY_ROOT 保持一致）
 UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "upload"
 
+# 跨进程写锁文件的统一存放目录：避免 *.lock 散落在历史文件根目录
+# （与 <session>_chat.jsonl、<session>_chat.jsonl.pending 混在一起）
+LOCK_ROOT = HISTORY_ROOT / "lock"
+
+
+def _migrate_legacy_lock_files() -> None:
+    """把旧版散落在 history_files 根目录的 *.lock 迁移到 lock/ 子目录。
+
+    锁文件内容为空、只承载句柄互斥语义，迁移后新旧路径不要求互通：
+    服务重启（部署本改动）后所有进程统一使用新路径。个别文件正被
+    其他进程持有时 Windows 会拒绝移动，静默跳过留待下次启动再迁。
+    """
+    try:
+        LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+        for legacy in HISTORY_ROOT.glob("*.lock"):
+            try:
+                legacy.replace(LOCK_ROOT / legacy.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+_migrate_legacy_lock_files()
+
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -561,8 +586,9 @@ class ChatMemoryManager:
 
     @property
     def _meta_lock_path(self) -> Path:
-        """跨进程写锁文件：与 JSONL 同名加 .lock 后缀（只创建不删除）。"""
-        return self._file_path.with_name(self._file_path.name + ".lock")
+        """跨进程写锁文件：统一放 history_files/lock/ 下（只创建不删除），
+        避免与 JSONL、.pending 检查点混在同一目录。"""
+        return LOCK_ROOT / (self._file_path.name + ".lock")
 
     @contextmanager
     def _write_guard(self):
@@ -1674,6 +1700,63 @@ class ChatMemoryManager:
             "describe": f"已删除第 {valid_start} 到 {valid_end} 行,共 {deleted_count} 行。原始记录数 {total_lines},剩余记录数 {len(remaining_entries)}",
             "meta_after": meta,
             "usage_after": meta.get("usage", {})
+        }
+
+    @staticmethod
+    def replace_content_in_chat_session(
+        session_id: str,
+        find_text: str,
+        replace_text: str,
+    ) -> dict[str, Any]:
+        """在会话 JSONL 全部业务记录中把 find_text 替换为 replace_text。
+
+        供前端媒体伪标签删除使用：用户删除消息中渲染的媒体控件后，把历史
+        记录里对应的标签原文替换为占位说明（如"用户已删除/文件不存在"）。
+        递归遍历每条记录的所有字符串字段（events[].content 等）；未命中时
+        不重写文件；轮次数量与顺序不变，摘要游标保持有效，无需重置。
+        """
+        if not isinstance(find_text, str) or not find_text.strip():
+            raise ValueError("find_text 不能为空")
+        if not isinstance(replace_text, str):
+            replace_text = ""
+        manager = ChatMemoryManager(session_id)
+        replaced_total = 0
+        touched_entries = 0
+
+        def _walk(value: Any) -> Any:
+            nonlocal replaced_total
+            if isinstance(value, str):
+                count = value.count(find_text)
+                if count:
+                    replaced_total += count
+                    return value.replace(find_text, replace_text)
+                return value
+            if isinstance(value, list):
+                return [_walk(item) for item in value]
+            if isinstance(value, dict):
+                return {key: _walk(item) for key, item in value.items()}
+            return value
+
+        with manager._write_guard():
+            meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
+            new_entries: list[Any] = []
+            for entry in entries:
+                new_entry = _walk(entry)
+                if new_entry is not entry:
+                    touched_entries += 1
+                new_entries.append(new_entry)
+            if replaced_total <= 0:
+                return {
+                    "state": "failed",
+                    "describe": "未在会话历史中找到对应内容",
+                    "replaced": 0,
+                }
+            meta = _recompute_meta_from_entries(manager.session_id, meta, new_entries)
+            _write_meta_and_entries(manager._file_path, meta, new_entries)
+        return {
+            "state": "succeed",
+            "describe": f"已替换 {replaced_total} 处（涉及 {touched_entries} 条记录）",
+            "replaced": replaced_total,
         }
 
     @staticmethod

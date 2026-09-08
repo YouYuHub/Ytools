@@ -4,6 +4,7 @@ from typing import Any, Optional, List
 # fastapi 库导入
 from fastapi import APIRouter, Query, HTTPException, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
+from pydantic import BaseModel
 
 # 自定义模块导入
 from config import ChatLLMRequest
@@ -27,8 +28,12 @@ from factory.agent_runtime.context_compaction import (
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
+    EDIT_FILE_NAME,
+    READ_FILE_NAME,
+    SEARCH_FILES_NAME,
     SELECTABLE_BUILTIN_TOOL_NAMES,
     TODO_TOOL_NAME,
+    WRITE_FILE_NAME,
     inject_builtin_tools,
 )
 from memory.chat_memory import (
@@ -94,6 +99,36 @@ async def stop_chat(session_id: str = "default"):
         return {'stop_chat': 'stopped'}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_chat_router.post('/inject_message')
+async def inject_message(request: Request):
+    """运行中注入用户消息（消息引导）。
+
+    任务运行中：把消息投递给会话 worker，生成循环在下一轮检查点（工具结果
+    处理完毕后）取出并作为新一轮用户消息继续；任务未运行时返回 not_running，
+    前端回退为普通发送。
+    请求体：{"session_id": str, "content": 多模态部件列表或字符串}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON")
+    session_id = normalize_session_id(str((body or {}).get("session_id") or "default"))
+    content = (body or {}).get("content")
+    if isinstance(content, str):
+        if not content.strip():
+            raise HTTPException(status_code=400, detail="content 不能为空")
+        message_content: Any = content
+    elif isinstance(content, list) and content:
+        message_content = content
+    else:
+        raise HTTPException(status_code=400, detail="content 必须为非空字符串或多模态部件列表")
+    from factory.chat_factory import inject_user_message
+    result = await inject_user_message(session_id, {"role": "user", "content": message_content})
+    if not result.get("ok"):
+        return JSONResponse(content={"ok": False, "reason": result.get("reason", "not_running")})
+    return JSONResponse(content={"ok": True})
 
 
 @api_chat_router.get('/chat_stream/status')
@@ -234,6 +269,36 @@ async def delete_chat_history_lines(
     try:
         result = ChatMemoryManager.delete_chat_session_file_line(
             normalize_session_id(session_id), startline, endline
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content=result)
+
+
+class MediaTagRemoveRequest(BaseModel):
+    """删除消息媒体伪标签的请求体。"""
+    tag: str
+    replacement: str = "用户已删除/文件不存在"
+    session_id: str = "default"
+
+
+@api_chat_router.post("/chat_history/remove_media_tag")
+async def remove_media_tag_from_history(payload: MediaTagRemoveRequest):
+    """
+    在会话历史 JSONL 中把指定媒体伪标签原文替换为占位说明文本。
+
+    前端删除消息中渲染的 <image>/<audio>/<video>/<pdf> 控件时调用：
+    tag 为模型输出的完整标签原文（前端渲染时随控件保存），替换后该轮
+    历史回传给模型时只看到占位说明，不再引用已删除/不存在的文件。
+    """
+    tag = (payload.tag or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="tag 不能为空")
+    try:
+        result = ChatMemoryManager.replace_content_in_chat_session(
+            normalize_session_id(payload.session_id),
+            tag,
+            payload.replacement or "用户已删除/文件不存在",
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -393,7 +458,8 @@ async def get_chat_context_token_stats(
                         if _tool_definition_name(tool) in selected_names
                     ]
                     # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
-                    # 内置工具（todo_write / ask_user）按前端勾选显式注入。
+                    # 内置工具（todo_write / ask_user / write_file / edit_file /
+                    # read_file / search_files）按前端勾选显式注入。
                     # 这里保持 token 统计与真实请求的工具 schema 口径一致。
                     if context_tools or selected_names & set(SELECTABLE_BUILTIN_TOOL_NAMES):
                         context_tools, _ = inject_builtin_tools(
@@ -401,6 +467,10 @@ async def get_chat_context_token_stats(
                             {},
                             include_todo=TODO_TOOL_NAME in selected_names,
                             include_ask_user=ASK_USER_TOOL_NAME in selected_names,
+                            include_write_file=WRITE_FILE_NAME in selected_names,
+                            include_edit_file=EDIT_FILE_NAME in selected_names,
+                            include_read_file=READ_FILE_NAME in selected_names,
+                            include_search_files=SEARCH_FILES_NAME in selected_names,
                         )
             stats = await manager.get_context_token_stats(
                 max_rounds=effective_max_rounds,
@@ -601,6 +671,24 @@ async def _manual_compaction_event_stream(
         except ChatModelConfigurationError as exc:
             result["error"] = f"压缩模型配置无效: {exc}"
         except asyncio.CancelledError:
+            # 客户端断开（页面刷新/关闭/网络抖动）触发 task.cancel()：
+            # 立即补写 aborted 事件闭合 start 行，不等下一次聊天任务开始时
+            # 由孤儿标记机制延迟收尾（此前会留下数分钟的"永远转圈"块）。
+            # shield 保护落盘本身不被二次取消；shield 也失败则放弃，
+            # 交由孤儿机制兜底。
+            try:
+                add_event = getattr(manager, "add_context_compaction_event", None)
+                if callable(add_event):
+                    await asyncio.shield(add_event({
+                        "event": "context_compaction",
+                        "scope": "session",
+                        "phase": "aborted",
+                        "role": "assistant",
+                        "reason": "task_interrupted",
+                        "error": None,
+                    }))
+            except Exception as shield_exc:
+                print(f"[WARN] 手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
             raise
         except Exception as exc:
             result["error"] = str(exc)
@@ -611,7 +699,14 @@ async def _manual_compaction_event_stream(
     task = asyncio.create_task(run())
     try:
         while True:
-            payload = await queue.get()
+            try:
+                # 心跳：压缩模型长时间无增量输出时（合并大历史等），每 30 秒
+                # 发一帧 SSE 注释（": ping"），前端按规范自动忽略注释行；
+                # 既防止代理/浏览器把静默连接判死，也让用户确认任务仍在进行。
+                payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
             if payload is sentinel:
                 break
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

@@ -7,9 +7,10 @@
 (function (App) {
   "use strict";
   const {
-    state, toast, $, closeMenus,
+    state, toast, $, closeMenus, el,
     updateScrollBottomOffset, input, composer, composerWrap,
     sendBtn, voiceBtn, stopBtn, app,
+    stopGroup, stopMenuBtn, queueMenu, pendingOutbox,
     enhancePanel, plusMenu, plusBtn, boostBtn,
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
@@ -24,12 +25,21 @@
     // 按钮只反映“当前会话”的任务状态，其他会话在后台流式不影响本会话的发送/停止按钮
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
     // 手动压缩进行中：发送会打断压缩任务并交错写入会话历史，隐藏发送入口
-    // （键盘发送由 send() 内的同名守卫拦截）
+    // （键盘发送由 send() 内的同名守卫拦截）；终止按钮接管，点击可中止压缩。
+    // 压缩期间引导/队列也不可用：必须等压缩完成后才能发消息
     const compacting = state.manualCompactRunning;
+    // 运行中组合按钮：仅当前会话流式/压缩时显示；上拉钮只在流式（非压缩）时可用
+    const showStopGroup = currentStreaming || compacting;
     composer.classList.toggle("has-text", hasText);
     sendBtn.classList.toggle("hidden", !hasText || currentStreaming || compacting);
-    voiceBtn.classList.toggle("hidden", hasText || currentStreaming);
-    stopBtn.classList.toggle("hidden", !currentStreaming);
+    voiceBtn.classList.toggle("hidden", hasText || currentStreaming || compacting);
+    stopGroup.classList.toggle("hidden", !showStopGroup);
+    stopGroup.classList.toggle("compact-only", compacting);
+    stopMenuBtn.classList.toggle("hidden", !currentStreaming || compacting);
+    if (!showStopGroup) {
+      queueMenu.classList.add("hidden");
+      state.composerSendMode = "";
+    }
     requestAnimationFrame(updateScrollBottomOffset);
   }
 
@@ -62,11 +72,200 @@
 
   input.addEventListener("input", autosize);
   input.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-      e.preventDefault();
-      App.send();
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    // 流式进行中（当前会话、非压缩）：Enter=消息引导，Alt+Enter=加入队列
+    const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
+    if (currentStreaming && !state.manualCompactRunning) {
+      submitSteerOrQueue(e.altKey ? "queue" : "steer");
+      return;
     }
+    App.send();
   });
+
+  // ---------- 流式期间的引导 / 队列消息 ----------
+  /**
+   * 提交引导或队列消息：快照当前输入与附件后清空输入框。
+   * - steer：任务运行中优先走后端注入接口（下一轮检查点立即生效）；
+   *   注入不可用时回退本地暂存（当前 SSE 流结束后派发）
+   * - queue：FIFO 累积，当前任务完成后逐条自动发送
+   */
+  async function submitSteerOrQueue(mode) {
+    const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
+    if (!currentStreaming) return;
+    if (state.manualCompactRunning) {
+      toast("正在压缩对话上下文，请等待压缩完成后再发送");
+      return;
+    }
+    const text = input.value.trim();
+    const mediaSnapshot = state.pendingMedia.map(function (m) { return Object.assign({}, m); });
+    if (!text && !mediaSnapshot.length) return;
+    const message = { text: text, media: mediaSnapshot, sessionId: state.sessionId };
+    // 从待发区移除但保留快照中的 objUrl（移除放回输入框后预览仍可用）；
+    // objUrl 的最终释放在消息成功上传后（send 内）
+    state.pendingMedia = [];
+    App.renderComposerAttachments();
+    input.value = "";
+    App.autosize();
+    if (mode === "queue") {
+      state.pendingQueue.push(message);
+      toast("已加入队列，当前任务完成后自动发送");
+      renderPendingOutbox();
+      return;
+    }
+    // 消息引导：附件需要先上传才能注入，纯文本直接注入；带附件时回退暂存
+    if (!mediaSnapshot.length && state.sessionId) {
+      try {
+        const res = await API.injectMessage(state.sessionId, text);
+        if (res && res.ok) {
+          toast("已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
+          renderPendingOutbox();
+          return;
+        }
+        // 任务未运行/注入失败：回退本地暂存（流结束后派发）
+      } catch (_) { /* 网络异常同样回退暂存 */ }
+    }
+    const replaced = Boolean(state.steerMessage);
+    state.steerMessage = message;
+    toast(replaced ? "已替换消息引导内容，回复结束后发送" : "已设为消息引导，当前回复结束后立即发送");
+    renderPendingOutbox();
+  }
+
+  /** 暂存指示器：仅显示属于当前会话的引导/队列条目，可移除并放回输入框。 */
+  function renderPendingOutbox() {
+    pendingOutbox.innerHTML = "";
+    const rows = [];
+    if (state.steerMessage && state.steerMessage.sessionId === state.sessionId) {
+      rows.push({ kind: "steer", label: "引导", message: state.steerMessage });
+    }
+    state.pendingQueue.forEach(function (m, i) {
+      if (m.sessionId === state.sessionId) {
+        rows.push({ kind: "queue", label: "队列 " + (i + 1), message: m });
+      }
+    });
+    if (!rows.length && !state.injectedNotice) {
+      pendingOutbox.classList.add("hidden");
+      composer.classList.remove("has-outbox");
+      return;
+    }
+    rows.forEach(function (row) {
+      const item = el("div", "pending-outbox-item");
+      item.appendChild(el("span", "pending-outbox-badge", row.label));
+      item.appendChild(el("span", "pending-outbox-text", row.message.text || "[图片/附件]"));
+      // 立即发送：手动停止后任务已结束，暂存消息可手动发出（与自动派发同链路）
+      const sendNow = el("button", "pending-outbox-send", "发送");
+      sendNow.type = "button";
+      sendNow.title = "立即发送该条消息";
+      sendNow.addEventListener("click", async function () {
+        if (state.streaming && state.streamingSession === state.sessionId) {
+          toast("当前会话仍在生成中，请等待结束后再发送");
+          return;
+        }
+        if (state.manualCompactRunning) {
+          toast("正在压缩对话上下文，请稍后再发送");
+          return;
+        }
+        // 先从暂存区移除再派发，避免 flush 内部重复取
+        if (row.kind === "steer") {
+          state.steerMessage = null;
+        } else {
+          const idx = state.pendingQueue.indexOf(row.message);
+          if (idx >= 0) state.pendingQueue.splice(idx, 1);
+        }
+        renderPendingOutbox();
+        await App.send({ text: row.message.text || "", media: row.message.media || [] });
+      });
+      item.appendChild(sendNow);
+      const remove = el("button", "pending-outbox-remove", "×");
+      remove.type = "button";
+      remove.title = "移除并放回输入框修改";
+      remove.addEventListener("click", function () { cancelPendingMessage(row); });
+      item.appendChild(remove);
+      pendingOutbox.appendChild(item);
+    });
+    // 运行中已注入的引导消息提示（非待发消息，仅状态展示，可手动关闭）
+    if (state.injectedNotice && state.injectedNotice.sessionId === state.sessionId) {
+      const item = el("div", "pending-outbox-item injected");
+      item.appendChild(el("span", "pending-outbox-badge", "已注入"));
+      item.appendChild(el("span", "pending-outbox-text", state.injectedNotice.text || ""));
+      const close = el("button", "pending-outbox-remove", "×");
+      close.type = "button";
+      close.title = "关闭提示";
+      close.addEventListener("click", function () {
+        state.injectedNotice = null;
+        renderPendingOutbox();
+      });
+      item.appendChild(close);
+      pendingOutbox.appendChild(item);
+    }
+    pendingOutbox.classList.remove("hidden");
+    composer.classList.add("has-outbox");
+  }
+
+  // 注入提示：message_injected SSE 事件到达时调用（消息已由后端落盘，
+  // 下一轮模型调用会看到）；下一轮模型输出开始后由 chat.js 清除
+  App.showInjectedNotice = function (text) {
+    state.injectedNotice = { sessionId: state.sessionId, text: text || "" };
+    renderPendingOutbox();
+  };
+
+  App.clearInjectedNotice = function () {
+    if (state.injectedNotice) {
+      state.injectedNotice = null;
+      renderPendingOutbox();
+    }
+  };
+
+  function cancelPendingMessage(row) {
+    if (row.kind === "steer") {
+      state.steerMessage = null;
+    } else {
+      const idx = state.pendingQueue.indexOf(row.message);
+      if (idx >= 0) state.pendingQueue.splice(idx, 1);
+    }
+    // 放回输入框/附件区便于修改后重新提交
+    const restored = row.message;
+    if (restored.text) {
+      input.value = input.value ? input.value + "\n" + restored.text : restored.text;
+    }
+    if (restored.media.length) {
+      state.pendingMedia = restored.media.concat(state.pendingMedia);
+      App.renderComposerAttachments();
+    }
+    App.autosize();
+    renderPendingOutbox();
+  }
+
+  /**
+   * 派发暂存消息：流结束/压缩结束时调用。
+   * 引导优先于队列；只派发属于 finishedSessionId 会话的消息；
+   * 压缩进行中或存在待回答提问时跳过（等待下一次触发）；
+   * 用户已切到其他会话时也跳过（等重新打开该会话再派发，避免发错目标）。
+   * 每次只发一条，后续条目由该轮 send 结束时的 finally 链式继续派发。
+   */
+  async function flushPendingMessages(finishedSessionId) {
+    if (state.suppressFlushOnce) {
+      state.suppressFlushOnce = false;
+      return;
+    }
+    if (state.manualCompactRunning) return;
+    if (state.pendingAskQuestions) return; // ask_user 等待用户回答，不抢占
+    const target = finishedSessionId || state.sessionId;
+    // 用户已切走：留在暂存区，重新打开该会话时再派发
+    if (state.sessionId !== target) return;
+    if (state.streaming && state.streamingSession === target) return;
+    let next = null;
+    if (state.steerMessage && state.steerMessage.sessionId === target) {
+      next = state.steerMessage;
+      state.steerMessage = null;
+    } else {
+      const idx = state.pendingQueue.findIndex(function (m) { return m.sessionId === target; });
+      if (idx >= 0) next = state.pendingQueue.splice(idx, 1)[0];
+    }
+    renderPendingOutbox();
+    if (!next) return;
+    await App.send(next);
+  }
 
   document.querySelectorAll(".suggest-chip").forEach(function (chip) {
     chip.addEventListener("click", function () {
@@ -142,6 +341,29 @@
 
   // 语音类按钮：占位
   voiceBtn.addEventListener("click", function () { toast("语音输入暂未开放"); });
+
+  // ---------- 运行中发送选项（上拉菜单） ----------
+  // 上拉钮点击弹出菜单；菜单项整体可点击，直接执行对应动作
+  function toggleQueueMenu(mode) {
+    const opening = queueMenu.classList.contains("hidden");
+    closeMenus();
+    if (opening) {
+      queueMenu.classList.remove("hidden");
+      state.composerSendMode = mode;
+    }
+  }
+  stopMenuBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    toggleQueueMenu("steer");
+  });
+  $("#steerMenuItem").addEventListener("click", function () {
+    closeMenus();
+    submitSteerOrQueue("steer");
+  });
+  $("#queueMenuItem").addEventListener("click", function () {
+    closeMenus();
+    submitSteerOrQueue("queue");
+  });
 
   // ---------- “+” 功能菜单 ----------
   plusBtn.addEventListener("click", function (e) {
@@ -328,9 +550,51 @@
   chatSettingsBackdrop.addEventListener("click", closeChatSettings);
 
 
+  // ---------- 每会话独立的输入草稿 ----------
+  /**
+   * 保存当前输入到该会话的草稿（文本 + 待发附件快照，附件保留 objUrl 引用）。
+   * 切换会话前调用；新对话（sessionId=null）存到 "" 键。
+   */
+  function saveSessionDraft() {
+    const key = state.sessionId || "";
+    const text = input.value;
+    const media = state.pendingMedia.map(function (m) { return Object.assign({}, m); });
+    if (!text.trim() && !media.length) {
+      delete state.sessionDrafts[key];
+      return;
+    }
+    state.sessionDrafts[key] = { text: text, media: media };
+  }
+
+  /**
+   * 恢复指定会话的草稿到输入框/待发区；无草稿时清空输入框与待发区。
+   * 切换会话后调用。注意：不吊销任何 objUrl——被替换掉的旧会话草稿
+   * 仍持有其附件引用，切回时还要用。
+   */
+  function restoreSessionDraft(sessionId) {
+    const key = sessionId || "";
+    const draft = state.sessionDrafts[key];
+    // 先把当前待发区从渲染中摘除（不动 state.pendingMedia 的对象）
+    composerAttachments.innerHTML = "";
+    if (draft) {
+      input.value = draft.text || "";
+      state.pendingMedia = (draft.media || []).map(function (m) { return Object.assign({}, m); });
+    } else {
+      input.value = "";
+      state.pendingMedia = [];
+    }
+    App.renderComposerAttachments();
+    App.autosize();
+  }
+
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.refreshComposerButtons = refreshComposerButtons;
   App.autosize = autosize;
   App.fitEnhancePanel = fitEnhancePanel;
   App.closeChatSettings = closeChatSettings;
+  App.submitSteerOrQueue = submitSteerOrQueue;
+  App.renderPendingOutbox = renderPendingOutbox;
+  App.flushPendingMessages = flushPendingMessages;
+  App.saveSessionDraft = saveSessionDraft;
+  App.restoreSessionDraft = restoreSessionDraft;
 })(window.App);

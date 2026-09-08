@@ -87,7 +87,7 @@ class ChatHistoryFormatTests(unittest.TestCase):
             [{"role": "user", "content": "以上是ssh配置，帮忙测试远程命令多行情况"}],
         )
 
-    def test_interrupted_multimodal_round_keeps_user_question_with_media_label(self):
+    def test_interrupted_multimodal_round_keeps_user_question_with_media_part(self):
         round_entry = {
             "event": "chat_round",
             "question": "描述这个图片",
@@ -105,8 +105,8 @@ class ChatHistoryFormatTests(unittest.TestCase):
         messages = round_entry_to_context_messages(round_entry, max_tool_result_length=-1)
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["role"], "user")
-        self.assertIn("描述这个图片", messages[0]["content"])
-        self.assertIn("[图片]", messages[0]["content"])
+        # 中断轮次的用户消息为纯文本口径：媒体部件替换为 [图片] 占位引用
+        self.assertEqual(messages[0]["content"], "描述这个图片\n[图片]")
 
     def test_stop_task_only_round_still_dropped(self):
         """仅剩"停止任务"的轮次没有可回传内容，不应产生消息。"""

@@ -13,7 +13,9 @@ import asyncio
 import base64
 import io
 import json
+import os
 import shutil
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -256,7 +258,8 @@ class MultimodalHistoryReplayTests(unittest.TestCase):
         }
         messages = round_entry_to_context_messages(round_entry, 0)
         self.assertEqual(messages[0]["role"], "user")
-        # 文本部件保留，媒体部件以占位符提示模型该轮发过图
+        # 历史轮次用户消息为纯文本口径：媒体部件（media:// 引用）替换为
+        # [图片] 占位引用，不回传图片数据；仅当前轮消息保留多部件并解析
         self.assertEqual(messages[0]["content"], "这是什么图\n[图片]")
         self.assertEqual(messages[1]["role"], "assistant")
 
@@ -568,6 +571,115 @@ class StreamMediaTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             fm.save_session_media(TEST_SESSION, "big.png", b"0" * (21 * 1024 * 1024))
         self.assertIn("超过限制", str(ctx.exception))
+
+
+def _make_png_bytes(width: int, height: int) -> bytes:
+    """生成真实 PNG 字节（逐像素伪随机噪声，压缩率低），供缩略图降采样测试。"""
+    import random
+
+    from PIL import Image as _Image
+
+    rng = random.Random(42)
+    img = _Image.new("RGB", (width, height))
+    img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                 for _ in range(width * height)])
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+class ImageThumbnailTests(unittest.TestCase):
+    """大图发送上游前自动降采样：>2MB 生成 JPEG 缩略图，原图落盘不变。"""
+
+    def setUp(self):
+        _cleanup_test_session()
+
+    def tearDown(self):
+        _cleanup_test_session()
+
+    def test_oversized_image_resolves_to_jpeg_thumbnail(self):
+        # 2400×800 随机噪声 PNG：真实超过 2MB 且长边需要降采样
+        big_png = _make_png_bytes(2400, 800)
+        self.assertGreater(len(big_png), fm.IMAGE_THUMBNAIL_THRESHOLD_BYTES)
+        saved = fm.save_session_media(TEST_SESSION, "大截图.png", big_png)
+        content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
+        resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
+        self.assertEqual(unresolved, [])
+        url = resolved[0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:40])
+        raw = base64.b64decode(url.split(",", 1)[1])
+        # 缩略图应显著小于原图（长边压到 1568 + JPEG 压缩）
+        self.assertLess(len(raw), fm.IMAGE_THUMBNAIL_THRESHOLD_BYTES)
+        from PIL import Image as _Image
+        thumb = _Image.open(io.BytesIO(raw))
+        self.assertLessEqual(max(thumb.size), fm.IMAGE_THUMBNAIL_MAX_EDGE)
+        self.assertEqual(max(thumb.size), fm.IMAGE_THUMBNAIL_MAX_EDGE)
+        # 原图完整保留
+        stored = fm.resolve_media_path(TEST_SESSION, saved["media_ref"])
+        self.assertTrue(stored.name.endswith(".png"))
+
+    def test_small_image_keeps_original_format(self):
+        saved = fm.save_session_media(TEST_SESSION, "小图.png", PNG_BYTES)
+        content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
+        resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
+        self.assertEqual(unresolved, [])
+        url = resolved[0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+
+    def test_thumbnail_cache_reused_and_invalidated(self):
+        # 用小阈值 + 小尺寸噪声图验证缓存逻辑（避免测试构造超大文件）
+        saved = fm.save_session_media(
+            TEST_SESSION, "缓存图.png", _make_png_bytes(300, 300)
+        )
+        ref = saved["media_ref"]
+        content = [{"type": "image_url", "image_url": {"url": ref}}]
+        media_path = fm.resolve_media_path(TEST_SESSION, ref)
+        with patch.object(fm, "IMAGE_THUMBNAIL_THRESHOLD_BYTES", 8192):
+            first, _ = fm.resolve_media_content_parts(TEST_SESSION, content)
+            second, _ = fm.resolve_media_content_parts(TEST_SESSION, content)
+            self.assertEqual(
+                first[0]["image_url"]["url"], second[0]["image_url"]["url"]
+            )
+            thumbs_dir = fm.HISTORY_ROOT / TEST_SESSION / "thumbs"
+            thumbs = list(thumbs_dir.glob("*.thumb.jpg"))
+            self.assertEqual(len(thumbs), 1)
+            cached_before = thumbs[0].read_text(encoding="ascii")
+            # 原图被替换为不同尺寸内容（字节指纹变化）后缓存失效重建
+            media_path.write_bytes(_make_png_bytes(360, 260))
+            os.utime(media_path, (time.time() + 5, time.time() + 5))
+            third, _ = fm.resolve_media_content_parts(TEST_SESSION, content)
+            self.assertTrue(third[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+            self.assertEqual(len(list(thumbs_dir.glob("*.thumb.jpg"))), 1)
+            self.assertNotEqual(
+                cached_before, thumbs[0].read_text(encoding="ascii")
+            )
+
+    def test_gif_skips_thumbnail(self):
+        # 小阈值下的小 GIF：动图跳过缩略图，保持原格式发送
+        from PIL import Image as _Image
+
+        out = io.BytesIO()
+        _Image.new("P", (64, 48), color=3).save(out, format="GIF")
+        gif_bytes = out.getvalue()
+        self.assertGreater(len(gif_bytes), 32)
+        saved = fm.save_session_media(TEST_SESSION, "动图.gif", gif_bytes)
+        content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
+        with patch.object(fm, "IMAGE_THUMBNAIL_THRESHOLD_BYTES", 16):
+            resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
+        self.assertEqual(unresolved, [])
+        url = resolved[0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/gif;base64,"))
+
+    def test_corrupt_large_image_falls_back_to_original(self):
+        # 超过阈值但不是合法图片：缩略图失败应回退原样发送
+        junk = b"\x89PNG\r\n\x1a\n" + b"corrupt" * (fm.IMAGE_THUMBNAIL_THRESHOLD_BYTES // 7 + 1)
+        saved = fm.save_session_media(TEST_SESSION, "损坏.png", junk)
+        content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
+        resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
+        self.assertEqual(unresolved, [])
+        url = resolved[0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(url.split(",", 1)[1]), junk)
 
 
 if __name__ == "__main__":

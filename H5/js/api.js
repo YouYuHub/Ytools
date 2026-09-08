@@ -293,6 +293,20 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/stop_chat?session_id=" + encodeURIComponent(sessionId || "default"), { method: "POST" });
   }
 
+  /**
+   * 运行中注入用户消息（消息引导）：任务运行中投递给后端，生成循环在
+   * 下一轮检查点（工具结果处理完毕后）取出并作为新一轮继续。
+   * 返回 {ok: boolean}；ok=false 表示任务未运行（前端回退为普通发送）。
+   */
+  async function injectMessage(sessionId, content) {
+    const res = await request("/inject_message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, content: content }),
+    });
+    return res && typeof res === "object" ? res : { ok: false };
+  }
+
   // ---------- 会话文件 ----------
   function uploadSessionFiles(sessionId, fileList) {
     const fd = new FormData();
@@ -391,6 +405,29 @@ const api_url = localStorage.getItem("ytools-api-base")
     return BASE + "/file/get_session_document?session_id=" +
       encodeURIComponent(sessionId || "default") +
       "&name=" + encodeURIComponent(storedName || "");
+  }
+
+  /** 本地文件的访问 URL（媒体伪标签本地路径 src；相对路径由后端按会话工作目录解析） */
+  function localFileUrl(sessionId, path) {
+    return BASE + "/file/get_local_file?session_id=" +
+      encodeURIComponent(sessionId || "default") +
+      "&path=" + encodeURIComponent(path || "");
+  }
+
+  /**
+   * 删除消息中的媒体伪标签：POST /chat_history/remove_media_tag
+   * 把会话历史 JSONL 中该标签原文替换为占位说明（用户已删除/文件不存在）
+   */
+  async function removeMediaTag(sessionId, rawTag) {
+    return request("/chat_history/remove_media_tag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        tag: rawTag || "",
+        replacement: "用户已删除/文件不存在",
+      }),
+    });
   }
 
   /**
@@ -510,10 +547,13 @@ const api_url = localStorage.getItem("ytools-api-base")
     changeChatDir,
     setSessionWorkDir,
     stopChat,
+    injectMessage,
     uploadSessionFiles,
     uploadSessionMedia,
     sessionMediaUrl,
     sessionDocumentUrl,
+    localFileUrl,
+    removeMediaTag,
     getSessionFiles,
     deleteSessionFile,
     chatStream,

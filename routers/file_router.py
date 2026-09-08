@@ -20,7 +20,11 @@ from memory.file_memory import (
     save_session_media,
     save_session_media_stream,
 )
-from memory.chat_memory import get_chat_memory_manager, normalize_session_id
+from memory.chat_memory import (
+    get_chat_memory_manager,
+    normalize_session_id,
+    resolve_session_work_dir,
+)
 from factory.file_factory import extract_text_from_bytes
 
 # 创建 API 路由器实例
@@ -378,6 +382,34 @@ async def get_session_document(request: Request, name: str, session_id: str = "d
     if path is None:
         raise HTTPException(status_code=404, detail="文档文件不存在")
     return _file_response_with_range(request.headers, path, media_mime_type(path.name))
+
+
+@api_file_router.get("/get_local_file")
+async def get_local_file(request: Request, path: str, session_id: str = "default"):
+    """
+    读取本地文件原始字节：媒体伪标签 <image>/<audio>/<video>/<pdf> 的本地
+    路径 src 解析出口（前端 markdown 渲染时把本地路径改写为本端点 URL）。
+
+    path 支持两种取值：
+    - 绝对路径：全设备任意路径直接读取（授权控制后续通过用户授权机制实现，
+      当前不做限制）；
+    - 相对路径：按会话生效工作目录解析（_meta.work_dir → DEFAULT_CHAT_WORK_DIR
+      → 进程 cwd），与模型/工具的相对路径语义一致。
+
+    支持 HTTP Range 请求（206），音频/视频进度条可即时跳转；文件不存在返回 404。
+    """
+    normalized = normalize_session_id(session_id)
+    raw = (path or "").strip().strip('"').strip("'")
+    if not raw:
+        raise HTTPException(status_code=400, detail="path 不能为空")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        work_dir, _warning = resolve_session_work_dir(normalized)
+        base_dir = Path(work_dir) if work_dir else Path.cwd()
+        candidate = base_dir / raw
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return _file_response_with_range(request.headers, candidate, media_mime_type(candidate.name))
 
 
 @api_file_router.get("/get_session_file_memory")

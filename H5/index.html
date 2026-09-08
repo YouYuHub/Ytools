@@ -301,6 +301,8 @@
                         </div>
                         <!-- 待发送媒体附件预览区：粘贴/选择图片等媒体后显示在输入框上方 -->
                         <div class="composer-attachments hidden" id="composerAttachments"></div>
+                        <!-- 流式期间引导/队列消息暂存指示器：显示待发条目，可移除放回输入框 -->
+                        <div class="pending-outbox hidden" id="pendingOutbox"></div>
                         <textarea class="composer-input" id="input" rows="1" placeholder="应该做什么"></textarea>
                         <div class="composer-bar">
                             <button class="composer-btn" id="plusBtn" title="更多功能">
@@ -333,9 +335,38 @@
                                     <path d="M12 19V5m-7 7 7-7 7 7" />
                                 </svg>
                             </button>
-                            <button class="round-btn hidden" id="stopBtn" title="停止生成">
-                                <span class="stop-square"></span>
-                            </button>
+                            <!-- 运行中组合按钮：停止（方形）+ 发送选项上拉钮（消息引导/加入队列）；
+                                 压缩期间仅显示停止（终止压缩），上拉钮隐藏 -->
+                            <div class="stop-group hidden" id="stopGroup">
+                                <button class="round-btn" id="stopBtn" title="停止生成">
+                                    <span class="stop-square"></span>
+                                </button>
+                                <button class="round-btn round-btn-sub stop-menu-btn hidden" id="stopMenuBtn" title="发送选项">
+                                    <svg class="icon" viewBox="0 0 24 24">
+                                        <path d="m18 15-6-6-6 6" />
+                                    </svg>
+                                </button>
+                                <div class="menu queue-menu hidden" id="queueMenu">
+                                    <button class="menu-item" id="steerMenuItem">
+                                        <svg class="icon" viewBox="0 0 24 24">
+                                            <path d="M12 19V5m-7 7 7-7 7 7" />
+                                        </svg>
+                                        <span class="menu-item-text">
+                                            <span class="menu-item-label">通过消息引导</span>
+                                            <span class="menu-item-hint">Enter</span>
+                                        </span>
+                                    </button>
+                                    <button class="menu-item" id="queueMenuItem">
+                                        <svg class="icon" viewBox="0 0 24 24">
+                                            <path d="M12 5v14M5 12h14" />
+                                        </svg>
+                                        <span class="menu-item-text">
+                                            <span class="menu-item-label">添加到队列</span>
+                                            <span class="menu-item-hint">Alt+Enter</span>
+                                        </span>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <div class="file-chips hidden" id="fileChips"></div>

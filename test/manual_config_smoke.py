@@ -61,7 +61,7 @@ def main() -> None:
     mcp_backup = mcp_path.read_bytes()
     models_backup = models_path.read_bytes()
     history_file = ROOT / "history_files" / f"{sid}_chat.jsonl"
-    lock_file = ROOT / "history_files" / f"{sid}_chat.jsonl.lock"
+    lock_file = ROOT / "history_files" / "lock" / f"{sid}_chat.jsonl.lock"
 
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     proc = subprocess.Popen(

@@ -102,11 +102,24 @@
           after_tokens: rec.after_tokens,
           compress_index: rec.compress_index,
           block_count: rec.block_count,
+          error: rec.error || "",
         };
         const scope = compactionPayload.scope === "session" ? "session" : "round";
         const pendingQueue = pendingCompactions[scope];
         const compactionUsage = compactionPayload.compress_usage || compactionPayload.summary_usage;
         const isMergeEvent = compactionUsage && Number(compactionUsage.merge_block_count) > 0;
+        if (compactionPayload.phase === "aborted") {
+          // 失败记录：把此前未闭合的运行块转为失败态（无则直接新建失败块）
+          appendTime(rec.ts);
+          if (pendingQueue && pendingQueue.length) {
+            pendingQueue.shift().update({ phase: "aborted", error: compactionPayload.error });
+            pendingCompactions[scope] = [];
+          } else {
+            const failedUi = buildCompactionBlock(compactionPayload);
+            chatInner.appendChild(failedUi.wrap);
+          }
+          return;
+        }
         if (compactionPayload.phase === "done" && !isMergeEvent && pendingQueue && pendingQueue.length) {
           pendingQueue.shift().update(compactionPayload);
           if (!pendingQueue.length) delete pendingCompactions[scope];
@@ -240,7 +253,8 @@
 
     function render(next) {
       latestCompaction = Object.assign({}, latestCompaction, next || {});
-      const nextPhase = latestCompaction.phase === "done" ? "done" : "start";
+      const isAborted = latestCompaction.phase === "aborted";
+      const nextPhase = !isAborted && latestCompaction.phase === "done" ? "done" : (isAborted ? "aborted" : "start");
       const usage = next && (next.compress_usage || next.summary_usage || next.usage);
       const preview = next && (next.compress_context || next.context_summary);
       if (preview) previewText = String(preview);
@@ -251,12 +265,17 @@
       summaryPre = null;
       box.classList.toggle("is-running", nextPhase === "start");
       box.classList.toggle("is-done", nextPhase === "done");
+      box.classList.toggle("is-failed", isAborted);
       iconWrap.innerHTML = nextPhase === "start"
         ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>'
-        : '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+        : nextPhase === "aborted"
+          ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M12 8v5"/><circle cx="12" cy="16.5" r="0.6" fill="currentColor"/><circle cx="12" cy="12" r="9.2"/></svg>'
+          : '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
       title.textContent = nextPhase === "start"
         ? "正在压缩 · " + scopeLabel
-        : "上下文压缩完成 · " + scopeLabel;
+        : nextPhase === "aborted"
+          ? "压缩失败 · " + scopeLabel
+          : "上下文压缩完成 · " + scopeLabel;
       body.innerHTML = "";
 
       if (previewText) {
@@ -266,6 +285,19 @@
         pre.className = "compaction-preview";
         pre.textContent = previewText;
         body.appendChild(pre);
+      }
+
+      if (isAborted) {
+        // 失败态：展示错误信息与已生成部分（若有），原始对话未受影响
+        body.appendChild(el("div", "compaction-detail compaction-error-detail",
+          String(latestCompaction.error || "压缩模型调用失败，本次未写入任何摘要；历史对话保持不变，可稍后重试")));
+        if (reasoningText) {
+          appendLabeledPre("已生成的思考（未生效）", "compaction-think").textContent = reasoningText;
+        }
+        if (liveSummaryText) {
+          appendLabeledPre("已生成的摘要（未生效）", "compaction-summary").textContent = liveSummaryText;
+        }
+        return;
       }
 
       if (nextPhase === "start") {
@@ -363,7 +395,8 @@
         .filter(function (t) { return t.trim(); })
         .join("\n");
     }
-    if (text) bubble.appendChild(el("div", "msg-user-text", text));
+    // 布局：媒体（图片/视频/音频/文档）在上、文字在下——媒体是视觉主体先入眼，
+    // 配文紧随其后（GPT Web / Claude 同款顺序）
     if (parts) {
       const mediaRow = el("div", "msg-user-media");
       parts.forEach(function (part) {
@@ -431,6 +464,7 @@
       });
       if (mediaRow.childNodes.length) bubble.appendChild(mediaRow);
     }
+    if (text) bubble.appendChild(el("div", "msg-user-text", text));
     msg.appendChild(bubble);
     chatInner.appendChild(msg);
     scrollToBottom();
@@ -527,6 +561,62 @@
       setTimeout(function () { btn.querySelector(".copy-label").textContent = "复制"; }, 1500);
     });
   });
+
+  // ---------- 媒体伪标签控件（<image>/<audio>/<video>/<pdf>）交互 ----------
+  // 删除：把会话历史 JSONL 中该标签原文替换为"用户已删除/文件不存在"，
+  // 之后历史回放与回传给模型的内容都不再引用该文件
+  async function deleteMediaWidget(widget) {
+    const rawTag = widget.dataset.mediaRaw || "";
+    if (!rawTag) {
+      App.toast("缺少标签原文，无法从历史中移除");
+      return;
+    }
+    if (!window.confirm("确定删除该媒体引用吗？\n历史记录中将替换为「用户已删除/文件不存在」。")) return;
+    try {
+      const result = await API.removeMediaTag(App.state.sessionId, rawTag);
+      if (result && result.state === "succeed") {
+        const placeholder = el("div", "md-media-removed", "用户已删除/文件不存在");
+        widget.replaceWith(placeholder);
+        App.toast("已从历史记录中移除该媒体引用");
+      } else {
+        App.toast((result && result.describe) || "移除失败");
+      }
+    } catch (err) {
+      App.toast("移除失败：" + err.message);
+    }
+  }
+
+  // 事件委托：markdown 渲染会重建节点，点击行为必须挂在容器上
+  chatInner.addEventListener("click", function (e) {
+    const mediaBtn = e.target.closest("[data-media-action]");
+    if (!mediaBtn) return;
+    const widget = mediaBtn.closest(".md-media");
+    if (!widget) return;
+    const action = mediaBtn.dataset.mediaAction;
+    if (action === "delete") {
+      deleteMediaWidget(widget);
+      return;
+    }
+    if (action === "preview") {
+      const kind = widget.dataset.mediaKind || "image";
+      const url = widget.dataset.mediaUrl || "";
+      const src = widget.dataset.mediaSrc || "";
+      if (!url) {
+        App.toast("文件不存在或路径无法解析：" + src);
+        return;
+      }
+      App.openMediaPreview({ type: kind, src: url, title: src });
+    }
+  });
+
+  // 媒体元素加载失败（404/路径失效等）：capture 捕获 media error 事件
+  // （error 不冒泡），控件整体标记为不可用并显示占位说明
+  document.addEventListener("error", function (e) {
+    const target = e.target;
+    if (!target || !target.classList || !target.classList.contains("md-media-el")) return;
+    const widget = target.closest(".md-media");
+    if (widget) widget.classList.add("is-broken");
+  }, true);
 
   // ---------- md 表格：复制文本（TSV+HTML 双格式）与复制为图片 ----------
   function tableToMatrix(table) {

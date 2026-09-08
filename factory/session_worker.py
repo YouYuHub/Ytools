@@ -98,6 +98,16 @@ class _WorkerStreamAdapter:
         self.user_stop_requested = False
         self.done = False
         self._finish_sent = False
+        # 运行中注入的用户消息队列（消息引导）：生成循环在每轮检查点取出，
+        # 作为新一轮用户消息追加进 messages 并落盘（inject 命令写入）
+        self.injected_messages: "queue.Queue" = queue.Queue()
+
+    def pop_injected_message(self) -> dict | None:
+        """非阻塞取一条运行中注入的用户消息；队列为空返回 None。"""
+        try:
+            return self.injected_messages.get_nowait()
+        except queue.Empty:
+            return None
 
     @property
     def question_text(self) -> str:
@@ -249,6 +259,15 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                     current_task = asyncio.create_task(
                         _worker_generate(session_id, raw.get("request") or {}, adapter)
                     )
+                elif ctype == "inject":
+                    # 运行中注入用户消息（消息引导）：投递到当前适配器队列，
+                    # 生成循环在下一轮检查点取出并作为新一轮继续
+                    message = raw.get("message")
+                    if adapter is not None and isinstance(message, dict):
+                        adapter.injected_messages.put(message)
+                        evt_queue.put({"type": "injected", "ok": True})
+                    else:
+                        evt_queue.put({"type": "injected", "ok": False})
                 elif ctype == "stop":
                     reason = "user" if raw.get("reason") == "user" else "interrupt"
                     if current_task is not None and not current_task.done():
@@ -445,6 +464,15 @@ class SessionWorkerProxy:
         if not self.is_alive():
             return False
         return self._send({"type": "stop", "reason": reason})
+
+    def inject_message(self, message: dict) -> bool:
+        """向运行中的生成任务注入一条用户消息（消息引导）。
+
+        worker 未运行或无活动任务时返回 False（调用方回退为普通发送）。
+        """
+        if not self.is_alive() or not self.is_generation_running():
+            return False
+        return self._send({"type": "inject", "message": message or {}})
 
     def shutdown(self, timeout: float = 8.0) -> None:
         """优雅关停：通知 worker 收尾后回收进程。"""

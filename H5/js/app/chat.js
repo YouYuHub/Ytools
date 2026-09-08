@@ -15,6 +15,45 @@
   // ---------- 发送 / 停止 ----------
 
   /**
+   * 构造多模态消息内容部件：纯文本保持字符串；带附件时为 OpenAI 兼容部件列表。
+   * pendingMedia 为 [{file,name,kind,media_ref...}] 快照（须已上传，含 media_ref）。
+   */
+  function buildUserContent(text, uploadedMedia) {
+    const contentParts = [];
+    if (text) contentParts.push({ type: "text", text: text });
+    (uploadedMedia || []).forEach(function (m) {
+      if (m.kind === "image") {
+        contentParts.push({ type: "image_url", image_url: { url: m.media_ref } });
+      } else if (m.kind === "audio") {
+        contentParts.push({
+          type: "input_audio",
+          input_audio: { data: m.media_ref, format: (m.stored_name.split(".").pop() || "").toLowerCase() },
+        });
+      } else if (m.kind === "video") {
+        contentParts.push({ type: "video_url", video_url: { url: m.media_ref } });
+      }
+    });
+    return contentParts.length === 1 && contentParts[0].type === "text" ? text : contentParts;
+  }
+
+  /**
+   * 上传媒体附件到 history_files/upload/<session>/media/，换回 media:// 引用；
+   * 后端发送上游前会把引用解析为 data URL / base64（兼容 Chat Completions 格式）
+   */
+  async function uploadMediaFiles(streamSessionId, files) {
+    const uploadedMedia = [];
+    const uploadRes = await API.uploadSessionMedia(
+      streamSessionId,
+      files
+    );
+    (uploadRes.results || []).forEach(function (result) {
+      if (result.status === "success") uploadedMedia.push(result);
+      else toast("附件上传失败：" + result.filename + "：" + (result.message || "未知原因"));
+    });
+    return uploadedMedia;
+  }
+
+  /**
    * 构建一条 SSE 流式事件的 DOM 渲染管线（思考/回答/工具/usage 分块处理）。
    * send() 与 attachStreamSession() 共用，保证刷新重连后渲染行为一致。
    */
@@ -33,6 +72,8 @@
     const usageByCompletion = new Map();
     const usageWithoutId = new Map();
     let roundUsageAcc = null;
+    // 注入提示待清除标记：message_injected 后置位，下一轮模型输出开始清除
+    let injectedNoticePending = false;
 
     function sealTextBlocks() {
       if (curThink) curThink.done();
@@ -96,6 +137,12 @@
       if (evt.type === "done") return;
       const data = evt.data || {};
 
+      // 上一轮注入提示：下一轮模型输出（思考/正文/工具调用）开始即清除
+      if (injectedNoticePending && (data.content || data.reasoning_content || (data.tool_calls && data.tool_calls.length))) {
+        injectedNoticePending = false;
+        App.clearInjectedNotice();
+      }
+
       // 事件不含 reasoning_content 字段 = 当前思考阶段已结束
       const hasReasoning = typeof data.reasoning_content === "string" && data.reasoning_content;
       if (!hasReasoning && curThink) {
@@ -108,6 +155,16 @@
       if (data.event === "todo") {
         // 模型通过 todo_write 更新了任务计划
         App.applySessionTodo(data.todos);
+        return;
+      }
+      if (data.event === "message_injected") {
+        // 运行中注入的用户消息（消息引导）：消息已由后端落盘并在下一轮
+        // 模型调用可见；界面上在消息框上方显示提示（同 todo 区域），
+        // 下一轮模型输出开始后清除，不再向消息流追加用户气泡
+        sealTextBlocks();
+        App.showInjectedNotice(typeof data.text === "string" ? data.text : "");
+        injectedNoticePending = true;
+        hasStage = true;
         return;
       }
       if (data.event === "ask_user") {
@@ -152,6 +209,21 @@
         }
         const compactionUsage = compaction.compress_usage || compaction.summary_usage;
         const isMergeEvent = compactionUsage && Number(compactionUsage.merge_block_count) > 0;
+        if (compaction.phase === "aborted") {
+          // 压缩失败：把该 scope 队列中最早的运行块转为失败态并清空队列
+          // （失败不落盘摘要，原始对话不受影响）
+          const queue = activeCompactions[scope] || [];
+          if (queue.length) {
+            queue.shift().update({ phase: "aborted", error: compaction.error || "" });
+            activeCompactions[scope] = [];
+          } else {
+            const failedUi = App.buildCompactionBlock(compaction);
+            hasStage = true;
+            appendStage(failedUi.wrap);
+          }
+          if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+          return;
+        }
         if (compaction.phase === "done" && !isMergeEvent && activeQueue && activeQueue.length) {
           activeQueue.shift().update(compaction);
           if (!activeQueue.length) delete activeCompactions[scope];
@@ -301,6 +373,8 @@
     return {
       handle: handle,
       finish: function () {
+        injectedNoticePending = false;
+        App.clearInjectedNotice();
         if (curAnswer) curAnswer.classList.remove("msg-cursor");
         msg.querySelectorAll(".think-block.is-streaming").forEach(function (think) {
           think.classList.remove("is-streaming");
@@ -315,9 +389,17 @@
     };
   }
 
-  async function send() {
-    const text = input.value.trim();
-    const pendingMedia = state.pendingMedia.slice();
+  /**
+   * 发送一条用户消息并开启新一轮回复。
+   * @param {object} [direct] 直接载荷（引导/队列 flush 调用）：
+   *   { text, media } —— media 为待上传附件快照；缺省时从输入框读取。
+   */
+  async function send(direct) {
+    // 防御：事件监听器直接传引用时，MouseEvent 等非普通对象不算直接载荷
+    if (direct && (typeof direct !== "object" || direct instanceof Event)) direct = undefined;
+    const fromInput = !direct;
+    const text = direct ? (direct.text || "") : input.value.trim();
+    const pendingMedia = direct ? (direct.media || []).slice() : state.pendingMedia.slice();
     // 有附件时允许无文本发送
     if (!text && !pendingMedia.length) return;
     // 仅当“当前会话”正在流式时禁止发送；其他会话在后台流式不影响本会话发送
@@ -342,49 +424,43 @@
     setEmpty(false);
     App.refreshComposerButtons();
 
-    // 上传媒体附件到 history_files/upload/<session>/media/，换回 media:// 引用；
-    // 后端发送上游前会把引用解析为 data URL / base64（兼容 Chat Completions 格式）
+    // 上传媒体附件（输入框路径用 state.pendingMedia 的 file；flush 路径同构）
     const uploadedMedia = [];
     if (pendingMedia.length) {
       try {
-        const uploadRes = await API.uploadSessionMedia(
-          streamSessionId,
-          pendingMedia.map(function (m) { return m.file; })
-        );
-        (uploadRes.results || []).forEach(function (result) {
-          if (result.status === "success") uploadedMedia.push(result);
-          else toast("附件上传失败：" + result.filename + "：" + (result.message || "未知原因"));
-        });
+        const files = pendingMedia.map(function (m) { return m.file; });
+        const results = await uploadMediaFiles(streamSessionId, files);
+        results.forEach(function (result) { uploadedMedia.push(result); });
       } catch (err) {
         toast("附件上传失败：" + err.message);
         state.streaming = false;
         App.refreshComposerButtons();
+        // flush 来源的失败消息放回队列头部，避免丢失
+        if (!fromInput) {
+          state.pendingQueue.unshift({ text: text, media: pendingMedia, sessionId: streamSessionId });
+          App.renderPendingOutbox();
+        }
         return;
+      }
+      // 上传成功后附件已换为 media:// 引用：flush 来源的本地预览 URL 不再需要，释放
+      if (!fromInput) {
+        pendingMedia.forEach(function (m) {
+          if (m.objUrl) {
+            try { URL.revokeObjectURL(m.objUrl); } catch (_) { /* ignore */ }
+          }
+        });
       }
     }
 
-    // 构造多模态消息内容：纯文本保持字符串；带附件时为 OpenAI 兼容部件列表
-    const contentParts = [];
-    if (text) contentParts.push({ type: "text", text: text });
-    uploadedMedia.forEach(function (m) {
-      if (m.kind === "image") {
-        contentParts.push({ type: "image_url", image_url: { url: m.media_ref } });
-      } else if (m.kind === "audio") {
-        contentParts.push({
-          type: "input_audio",
-          input_audio: { data: m.media_ref, format: (m.stored_name.split(".").pop() || "").toLowerCase() },
-        });
-      } else if (m.kind === "video") {
-        contentParts.push({ type: "video_url", video_url: { url: m.media_ref } });
-      }
-    });
-    const userContent = contentParts.length === 1 && contentParts[0].type === "text" ? text : contentParts;
+    const userContent = buildUserContent(text, uploadedMedia);
 
     const userNode = App.appendUserMessage(userContent, null, streamSessionId, state.sessionDocs);
     App.upsertLocalSession(streamSessionId, { userText: text || (uploadedMedia.length ? "[图片/附件]" : text) });
     App.rebuildQnav();
-    App.clearPendingMedia();
-    input.value = "";
+    if (fromInput) {
+      App.clearPendingMedia();
+      input.value = "";
+    }
     App.autosize();
     App.refreshComposerButtons();
     // 只做一次首轮刷新，让刚提交的用户消息尽快出现在上下文统计中；
@@ -456,12 +532,22 @@
       }
       // 流结束后刷新提问卡片可答性：出现过普通用户消息/更新提问后旧卡片转为过期
       App.refreshAskBlockStates();
+      // 引导/队列消息派发：本轮结束（含停止/出错）后自动发送下一条。
+      // 延迟到下一轮事件循环，确保 state.streaming 已清理完毕
+      setTimeout(function () { App.flushPendingMessages(streamSessionId); }, 0);
     }
   }
 
-  sendBtn.addEventListener("click", send);
+  sendBtn.addEventListener("click", function () { send(); });
 
   stopBtn.addEventListener("click", async function () {
+    // 手动压缩进行中：终止按钮中止压缩（断开 SSE 连接，后端检测到断开后自行收尾）
+    if (state.manualCompactRunning) {
+      if (state.manualCompactAbort) state.manualCompactAbort.abort();
+      return;
+    }
+    // 用户主动停止：本轮结束后不自动派发引导/队列消息（消费一次后复位）
+    state.suppressFlushOnce = true;
     const streamSessionId = state.activeStream ? state.activeStream.sessionId : state.sessionId;
     if (streamSessionId) {
       try {
@@ -484,6 +570,8 @@
       state.activeStream.completed = true;
       state.activeStream = null;
     }
+    // 切换会话放弃监听：该轮结束不自动派发引导/队列（消费一次后复位）
+    state.suppressFlushOnce = true;
     App.refreshComposerButtons();
   }
 
@@ -568,6 +656,8 @@
       if (state.sessionId === sessionId) {
         App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
       }
+      // 附接的后台流结束：派发该会话暂存的引导/队列消息（用户仍停留在该会话时）
+      setTimeout(function () { App.flushPendingMessages(sessionId); }, 0);
     }
   }
 
@@ -580,9 +670,13 @@
       .then(function (status) {
         if (status && status.running && !(state.streaming && state.streamingSession === sid)) {
           attachStreamSession(sid);
+        } else if (!status || !status.running) {
+          // 后台无生成任务：补发该会话暂存的引导/队列消息（切走期间错过的派发）。
+          // flush 内部校验用户仍停留在该会话，切走则留在暂存区
+          setTimeout(function () { App.flushPendingMessages(sid); }, 0);
         }
       })
-      .catch(function () { /* 状态查询失败则跳过续接 */ });
+      .catch(function () { /* 状态查询失败则跳过续接与补发 */ });
   }
 
   // 发送后刷新侧边栏标题（新会话首条消息会生成历史文件）

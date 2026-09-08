@@ -63,6 +63,25 @@ window.App = window.App || {};
     pendingAskBlock: null,
     // 手动压缩进行中标记：compaction 模块置位，发送守卫与发送按钮据此拦截
     manualCompactRunning: false,
+    // 手动压缩的中止控制器：终止按钮点击时 abort 断开压缩 SSE 连接
+    manualCompactAbort: null,
+    // 流式期间的消息暂存：
+    // steerMessage = 消息引导（当前 SSE 流结束后立即作为新一轮发送，单条后设覆盖前设）
+    // pendingQueue = 队列消息（当前任务完成后 FIFO 逐条自动发送，可累积多条）
+    // 均为 { text, media } 结构；media 为待上传附件快照，空数组表示纯文本
+    steerMessage: null,
+    pendingQueue: [],
+    // 运行中已注入的引导消息提示（在消息框上方展示，下一轮模型输出开始后清除）：
+    // { sessionId, text }；消息本身由后端落盘，历史回放仍显示为用户消息
+    injectedNotice: null,
+    // 引导/队列按钮组当前展开的菜单归属："steer" | "queue" | ""（未展开）
+    composerSendMode: "",
+    // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，
+    // 该轮 send 结束后不触发引导/队列 flush（消费后自动复位）
+    suppressFlushOnce: false,
+    // 每会话独立的输入草稿：{ text, media } —— 切换会话时保存/恢复，
+    // 文本与待发附件都不丢失；key 为会话 ID，"" 对应"新对话"未建号状态
+    sessionDrafts: {},
   };
 
   // 待发送附件上限：数量与单文件大小按类别区分（与后端 MEDIA_SIZE_LIMITS 一致：视频 500MB）
@@ -112,7 +131,11 @@ window.App = window.App || {};
   const sendBtn = $("#sendBtn");
   const stopBtn = $("#stopBtn");
   const voiceBtn = $("#voiceBtn");
+  const stopGroup = $("#stopGroup");
+  const stopMenuBtn = $("#stopMenuBtn");
+  const queueMenu = $("#queueMenu");
   const composerAttachments = $("#composerAttachments");
+  const pendingOutbox = $("#pendingOutbox");
   const contextTokenTodoSlot = $("#contextTokenTodoSlot");
   const todoPanelHost = $("#todoPanel");
   const askModal = $("#askModal");
@@ -310,6 +333,8 @@ window.App = window.App || {};
     plusMenu.classList.add("hidden");
     enhancePanel.classList.add("hidden");
     sessionActionsMenu.classList.add("hidden");
+    queueMenu.classList.add("hidden");
+    state.composerSendMode = "";
   }
 
   function closeToolModal() {
@@ -325,7 +350,7 @@ window.App = window.App || {};
   });
   document.addEventListener("click", function (e) {
     if (!themeMenu.contains(e.target) && !plusMenu.contains(e.target) && !enhancePanel.contains(e.target) &&
-      !sessionActionsMenu.contains(e.target) &&
+      !sessionActionsMenu.contains(e.target) && !queueMenu.contains(e.target) &&
       e.target !== plusBtn && e.target !== boostBtn &&
       !sessionActionsBtn.contains(e.target)) {
       closeMenus();
@@ -416,7 +441,8 @@ window.App = window.App || {};
   chatInner, input, composer,
   composerWrap, contextTokenStatus, contextTokenSummary,
   contextTokenWorkdir, sendBtn, stopBtn,
-  voiceBtn, composerAttachments, contextTokenTodoSlot,
+  voiceBtn, stopGroup, stopMenuBtn, queueMenu,
+  composerAttachments, pendingOutbox, contextTokenTodoSlot,
   todoPanelHost, askModal, askQuestions,
   askSubmit, mediaPreviewModal, mediaPreviewBody,
   mediaPreviewTitle, boostBtn, enhancePanel,

@@ -107,6 +107,19 @@
     return null;
   }
 
+  // 媒体伪标签 src → 可访问 URL（markdown.js 以 (kind, src) 调用）：
+  // media:// → 会话媒体端点；http(s)/data 原样；其它按本地路径交给
+  // /file/get_local_file（后端按会话生效工作目录解析相对路径）
+  function resolveMediaTagSrc(kind, src) {
+    void kind;
+    if (typeof src !== "string" || !src) return "";
+    if (src.indexOf("media://") === 0) {
+      return API.sessionMediaUrl(state.sessionId, src.slice("media://".length));
+    }
+    if (/^(data:|https?:)/i.test(src)) return src;
+    return API.localFileUrl(state.sessionId, src);
+  }
+
   function openMediaPreviewForDocument(doc) {
     if (!doc) return;
     if (!doc.stored_name) {
@@ -133,7 +146,50 @@
     return null;
   }
 
-  function addPendingMediaFiles(files) {
+  // ---------- 发送前图片压缩 ----------
+  // 与后端 IMAGE_THUMBNAIL_* 一致：>2MB 的图片在发送前用 canvas 重采样为
+  // 长边 ≤1568px、JPEG 质量 0.85，通常可缩到原图的 1/5~1/10；GIF 跳过
+  // （canvas 只取第一帧），压缩结果反而更大时保留原文件。
+  const COMPRESS_THRESHOLD_BYTES = 2 * 1024 * 1024;
+  const COMPRESS_MAX_EDGE = 1568;
+  const COMPRESS_JPEG_QUALITY = 0.85;
+
+  function compressImageFile(file) {
+    if (!file || file.size <= COMPRESS_THRESHOLD_BYTES) return Promise.resolve(file);
+    const ext = (file.name.split(".").pop() || "").toLowerCase();
+    if (ext === "gif") return Promise.resolve(file);
+    if (typeof createImageBitmap === "undefined" || typeof document === "undefined") {
+      return Promise.resolve(file);
+    }
+    return createImageBitmap(file).then(function (bitmap) {
+      try {
+        const scale = Math.min(1, COMPRESS_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+        return new Promise(function (resolve) {
+          canvas.toBlob(function (blob) {
+            if (!blob || blob.size >= file.size) {
+              resolve(file);  // 压缩无收益：保留原文件
+              return;
+            }
+            const baseName = file.name.replace(/\.[^.]+$/, "");
+            resolve(new File([blob], baseName + "_compressed.jpg", {
+              type: "image/jpeg", lastModified: Date.now(),
+            }));
+          }, "image/jpeg", COMPRESS_JPEG_QUALITY);
+        });
+      } catch (_) {
+        try { bitmap.close(); } catch (_e) { /* ignore */ }
+        return file;
+      }
+    }).catch(function () { return file; });
+  }
+
+  async function addPendingMediaFiles(files) {
     const added = [];
     for (const file of files || []) {
       if (!file) continue;
@@ -146,15 +202,19 @@
         toast("不支持的媒体类型：" + file.name);
         continue;
       }
+      let finalFile = file;
+      if (kind === "image") {
+        finalFile = await compressImageFile(file);
+      }
       const sizeLimit = MEDIA_SIZE_LIMITS[kind] || MEDIA_SIZE_LIMITS.image;
-      if (file.size > sizeLimit) {
+      if (finalFile.size > sizeLimit) {
         toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
         continue;
       }
       state.pendingMedia.push({
         id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
-        file: file,
-        name: file.name,
+        file: finalFile,
+        name: finalFile.name,
         kind: kind,
         dataUrl: "",
       });
@@ -301,5 +361,11 @@
   App.clearPendingMedia = clearPendingMedia;
   App.openMediaPreview = openMediaPreview;
   App.resolveMediaSrc = resolveMediaSrc;
+  App.resolveMediaTagSrc = resolveMediaTagSrc;
   App.openMediaPreviewForDocument = openMediaPreviewForDocument;
+
+  // 注册 markdown 伪标签 src 解析器（markdown.js 先于本模块加载）
+  if (globalThis.Markdown && typeof Markdown.setMediaResolver === "function") {
+    Markdown.setMediaResolver(resolveMediaTagSrc);
+  }
 })(window.App);

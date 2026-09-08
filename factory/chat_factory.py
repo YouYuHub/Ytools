@@ -39,12 +39,17 @@ from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
+    EDIT_FILE_NAME,
+    READ_FILE_NAME,
+    SEARCH_FILES_NAME,
     TODO_TOOL_NAME,
+    WRITE_FILE_NAME,
     execute_builtin_tool,
     inject_builtin_tools,
     is_builtin_tool,
     normalize_ask_questions,
     normalize_todo_items,
+    try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
     parse_bool_like,
@@ -257,11 +262,36 @@ def _build_sys_prompt() -> str:
         notes.append(f"你的思考过程（reasoning_content）只会保留最后 {reasoning_limit} 字符。")
     # reasoning_limit <= 0：完整回传或不回传，无需提示
     numbered_notes = "\n".join(f"{index}、{note}" for index, note in enumerate(notes, start=1))
+    media_prompt = _build_media_tag_prompt()
     return (
         "当前系统已安装基础 py 环境。\n"
         "程序支持并发工具调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
         "注意：\n"
         f"{numbered_notes}\n"
+        + media_prompt
+    )
+
+
+def _build_media_tag_prompt() -> str:
+    """媒体伪标签输出说明：前端会把 <image>/<audio>/<video>/<pdf> 渲染为可交互控件。
+
+    src 三种取值：网络 URL / media:// 引用（本会话上传媒体）/ 本地路径
+    （相对当前工作路径或绝对路径均可，项目支持路径切换）。仅确认存在的
+    文件才输出标签；标签独立成行；除 src/alt/title 外不要附加其它属性。
+    """
+    return (
+        "## 媒体展示（伪标签）\n"
+        "需要在回复中向用户展示图片/音频/视频/PDF 时，输出以下伪标签（不要输出真实 HTML 标签，前端会负责渲染）：\n"
+        '- <image src="{路径或URL}" alt="{一句话描述}"></image>\n'
+        '- <audio src="{路径或URL}" title="{名称}"></audio>\n'
+        '- <video src="{路径或URL}" title="{名称}"></video>\n'
+        '- <pdf src="{路径或URL}" title="{名称}"></pdf>\n'
+        "src 支持三种取值：\n"
+        "1. 网络 URL：http/https 开头的直链，公共互联网在线资源（如公开图片/音频/视频/PDF 文件直链）均可，前端可直接加载展示；\n"
+        "2. media://文件名（用户本会话上传的媒体文件）；\n"
+        "3. 本地路径：请使用绝对路径（如 C:/data/x.png 或者 /home/user/x.png）；\n"
+        "规则：仅引用你确认存在的文件（必要时先用工具核实路径）；每个标签必须独立成行；"
+        "src 使用双引号；不要附加 style/onclick 等其它属性；无法展示时直接用文字说明路径。\n"
     )
 # 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
 
@@ -461,6 +491,16 @@ class _SessionStream:
         self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.cond = asyncio.Condition()
+        # 运行中注入的用户消息队列（消息引导，inline 模式）：inject 接口写入，
+        # 生成循环每轮检查点经 pop_injected_message 取出；与 worker 模式的
+        # _WorkerStreamAdapter.pop_injected_message 保持鸭子类型一致
+        self.injected_messages: deque = deque(maxlen=16)
+
+    def pop_injected_message(self) -> dict | None:
+        """非阻塞取一条运行中注入的用户消息；队列为空返回 None。"""
+        if self.injected_messages:
+            return self.injected_messages.popleft()
+        return None
 
     def emit(self, chunk: str) -> None:
         if not isinstance(chunk, str):
@@ -641,6 +681,10 @@ async def _compact_task_context_if_needed(
     return rebuilt
 
 
+# 任务内自动压缩连续失败上限：达到后本任务停止自动压缩尝试（推 warning 通知）
+_AUTO_COMPACTION_MAX_CONSECUTIVE_FAILURES = 2
+
+
 def is_chat_stream_running(session_id: str) -> bool:
     stream = _get_session_stream(session_id)
     return bool(stream and stream.is_running())
@@ -766,12 +810,21 @@ async def _run_chat_generation(
         round_tools = []
         round_tool_servers = {}
     # 当且仅当前端有工具选择时，注入本地工具；无工具时不向上游发送 tools 字段。
-    # todo_write / ask_user 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
+    # todo_write / ask_user / write_file / edit_file / read_file / search_files
+    # 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
     todo_requested = TODO_TOOL_NAME in (requested_names or [])
     ask_requested = ASK_USER_TOOL_NAME in (requested_names or [])
+    write_file_requested = WRITE_FILE_NAME in (requested_names or [])
+    edit_file_requested = EDIT_FILE_NAME in (requested_names or [])
+    read_file_requested = READ_FILE_NAME in (requested_names or [])
+    search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
     round_tools, round_tool_servers = inject_builtin_tools(
         round_tools, round_tool_servers, include_todo=todo_requested,
         include_ask_user=ask_requested,
+        include_write_file=write_file_requested,
+        include_edit_file=edit_file_requested,
+        include_read_file=read_file_requested,
+        include_search_files=search_files_requested,
     )
     tool_request.tools = round_tools or None
     messages: List[dict] = []
@@ -910,12 +963,14 @@ async def _run_chat_generation(
             await session_chat_memory.add_chat_history(latest_user_message)
             if not stream.question_text:
                 stream.question_text = latest_user_text
-        # 多媒体引用解析：本轮消息 content 列表里的 media:// 引用替换为上游
-        # 可用的 data URL / base64（image_url.url；input_audio.data 为纯 base64）。
-        # 用户消息此刻已按原始引用落盘，历史 JSONL 不会膨胀；历史轮次的引用
-        # 不解析、不重复注入媒体数据。
+        # 多媒体引用解析：仅解析当前轮消息 content 列表里的 media:// 引用为
+        # 上游可用的 data URL / base64（image_url.url；input_audio.data 为纯
+        # base64）。历史轮次用户消息为纯文本口径（媒体部件为 [图片] 等占位
+        # 引用，见 chat_history_format），不回传图片数据；已压缩轮次（摘要/
+        # 问题索引）不携带媒体。用户消息此刻已按原始引用落盘，历史 JSONL
+        # 不会膨胀。
         try:
-            unresolved_media = resolve_message_media_refs(session_id, incoming_messages)
+            unresolved_media = resolve_message_media_refs(session_id, messages)
             if unresolved_media:
                 print(
                     f"[WARN] {len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
@@ -1105,11 +1160,52 @@ async def _run_chat_generation(
         context_compaction_threshold = resolve_context_compaction_threshold(compaction_settings)
         max_oversized_rejections = compaction_settings.max_oversized_rejections
         consecutive_oversized_count = 0
+        # 任务内自动压缩连续失败熔断：失败不再终止任务，但连续多次失败后停止
+        # 尝试（每批工具结果都会触发检查，避免反复白烧失败的模型调用）
+        auto_compact_failures = 0
+        auto_compact_disabled_notified = False
+        # 运行中注入的用户消息（消息引导）：每轮检查点取出，作为新一轮
+        # 用户消息追加到上下文并落盘；模型在下一轮调用时即可看到。
+        # worker 模式 stream=_WorkerStreamAdapter、inline 模式 stream=_SessionStream，
+        # 两者均提供 pop_injected_message()（鸭子类型，缺省跳过）。
+        async def _consume_injected_message() -> bool:
+            """取出一条注入消息加入上下文/落盘/推 SSE；队列为空返回 False。
+
+            两个调用时机：每轮循环顶部（工具结果处理完毕后），以及任务
+            收尾检查点（模型未调用工具、准备结束任务前）——后者保证注入
+            消息在当前 SSE 结束后立即开启下一轮请求，而不是等到任务结束。
+            """
+            pop_injected = getattr(stream, "pop_injected_message", None)
+            injected_message = pop_injected() if callable(pop_injected) else None
+            if not (isinstance(injected_message, dict) and injected_message.get("content")):
+                return False
+            inject_text = content_part_to_text(injected_message.get("content")).strip()
+            messages.append({
+                "role": "user",
+                "content": injected_message.get("content"),
+                "_internal": True,
+            })
+            await session_chat_memory.add_chat_history({
+                "role": "user",
+                "content": injected_message.get("content"),
+            })
+            await _stream_emit(
+                stream,
+                f"data: {json.dumps({'event': 'message_injected', 'text': inject_text}, ensure_ascii=False)}\n\n",
+            )
+            print(f"[INFO] 已注入运行中用户消息（消息引导）: {inject_text[:80]}")
+            return True
+
         # run_task = True
         # last_tool_ret = ""  # 上一次调用工具的返回值
         # while run_task:
         while session_chat_memory.run_task:
             stream.set_round_start()
+            # 每轮检查点：取出注入消息，本轮模型调用即可看到
+            try:
+                await _consume_injected_message()
+            except Exception as inject_error:
+                print(f"[WARN] 处理注入消息失败（跳过）: {inject_error}")
             # 每次请求只携带最近一条思考过程；todo 状态在执行更新后会被
             # 归并为单条 system 消息，避免工具轨迹和思考文本无限增长。
             _retain_latest_reasoning(messages)
@@ -1299,6 +1395,15 @@ async def _run_chat_generation(
                         )
                     messages.append(assistant_message)
                     await session_chat_memory.add_chat_history(assistant_message)
+                # 任务收尾检查点：注入队列还有待处理消息时不结束任务，
+                # 以该消息立即开启下一轮模型调用（当前 SSE 已结束、下次
+                # 请求发起前生效，避免注入消息要等任务全部完成后才发起）
+                try:
+                    if await _consume_injected_message():
+                        print("[INFO] 注入消息接管任务收尾：继续下一轮模型调用")
+                        continue
+                except Exception as inject_error:
+                    print(f"[WARN] 处理注入消息失败（按任务结束处理）: {inject_error}")
                 session_chat_memory.run_task = False
                 print("\n[INFO] 本轮对话未返回工具调用，任务结束")
                 break
@@ -1456,6 +1561,7 @@ async def _run_chat_generation(
                     ta,
                     configured_tool_names,
                     configured_tool_servers,
+                    enabled_tool_names=set(round_tool_servers),
                 )
                 if builtin_result is not None:
                     builtin_results.append({
@@ -1464,6 +1570,19 @@ async def _run_chat_generation(
                         "tool_name": tn,
                         "tool_args": ta,
                         "result": builtin_result,
+                        "error": None,
+                    })
+                    continue
+                # 内置文件编辑工具（write_file/edit_file）：服务端本地执行，
+                # 结构化结果（path/replacements 等）为后续文件 diff 预留
+                file_tool_result = try_execute_builtin_file_tool(tn, ta)
+                if file_tool_result is not None:
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": file_tool_result,
                         "error": None,
                     })
                 else:
@@ -1632,17 +1751,36 @@ async def _run_chat_generation(
                         file_block_text=active_file_block,
                         event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
                     )
+                except asyncio.CancelledError:
+                    raise
                 except ContextCompactionError as exc:
-                    detail = f"任务内历史压缩失败，任务已终止：{exc}"
-                    print(f"[ERROR] {detail}")
-                    session_chat_memory.run_task = False
-                    await _stream_emit(stream, _sse_error_payload(detail))
-                    break
+                    # 自动压缩失败不再终止任务：此时上下文通常仍在模型窗口内，
+                    # 原样继续生成（超大结果拒绝仍在保护）；下一批工具结果写入后
+                    # 会再次尝试压缩。连续失败达到上限后本任务停止尝试，避免
+                    # 每批都白烧一次失败的模型调用。
+                    auto_compact_failures += 1
+                    detail = f"任务内历史压缩失败（连续第 {auto_compact_failures} 次）：{exc}"
+                    print(f"[WARN] {detail}")
+                    if (
+                        auto_compact_failures >= _AUTO_COMPACTION_MAX_CONSECUTIVE_FAILURES
+                        and not auto_compact_disabled_notified
+                    ):
+                        auto_compact_disabled_notified = True
+                        notify = (
+                            f"自动压缩连续 {auto_compact_failures} 次失败，本次任务将不再自动压缩"
+                            "（对话继续，上下文按原样回传）；请检查压缩模型的 API Key/网络，"
+                            "或稍后使用手动压缩。"
+                        )
+                        await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'CONTEXT_COMPACTION_DISABLED', 'message': notify}}, ensure_ascii=False)}\n\n")
+                    else:
+                        await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'CONTEXT_COMPACTION_FAILED', 'message': f'自动压缩失败，已跳过并继续对话：{exc}'}}, ensure_ascii=False)}\n\n")
+                    rebuilt_messages = None
                 except Exception as exc:
                     print(f"[WARN] 任务内历史压缩跳过：{exc}")
-                else:
-                    if rebuilt_messages is not None:
-                        messages = rebuilt_messages
+                    rebuilt_messages = None
+                if rebuilt_messages is not None:
+                    messages = rebuilt_messages
+                    auto_compact_failures = 0
                 try:
                     current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
                     round_compaction = await compact_active_round_context_if_needed(
@@ -1651,18 +1789,19 @@ async def _run_chat_generation(
                         compression_index=current_tool_result_count,
                         event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
                     )
+                except asyncio.CancelledError:
+                    raise
                 except ContextCompactionError as exc:
-                    # 压缩模型与聊天模型均失败：终止任务，不再降级
-                    detail = f"单轮上下文压缩失败，任务已终止：{exc}"
-                    print(f"[ERROR] {detail}")
-                    session_chat_memory.run_task = False
-                    await _stream_emit(stream, _sse_error_payload(detail))
-                    break
+                    # 单轮压缩失败同样不终止任务：本轮工具轨迹按原样保留，
+                    # 由超大结果拒绝与窗口硬限制兜底。
+                    print(f"[WARN] 单轮上下文压缩失败（本轮轨迹原样保留）：{exc}")
+                    await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'ROUND_COMPACTION_FAILED', 'message': f'本轮工具轨迹压缩失败，已按原样继续：{exc}'}}, ensure_ascii=False)}\n\n")
+                    round_compaction = None
                 except Exception as exc:
                     print(f"[WARN] 单轮工具上下文压缩跳过：{exc}")
-                else:
-                    if round_compaction.triggered:
-                        messages = round_compaction.messages
+                    round_compaction = None
+                if round_compaction is not None and round_compaction.triggered:
+                    messages = round_compaction.messages
                         # 单轮压缩的 start/done 已由 event_emitter 按实际发生顺序
                         # 写入当前 chat_round.events，不再重复保存顶层摘要状态。
         # 写入结束消息到文件
@@ -1889,6 +2028,27 @@ async def tool_chat_server(
     finally:
         if stream.task is not None and stream.task.done() and not stream.done:
             await stream.finish()
+
+
+async def inject_user_message(session_id: str, message: dict) -> dict:
+    """运行中注入用户消息（消息引导）的主进程入口。
+
+    worker 模式：向会话 worker 发送 inject 命令，生成循环在下一轮检查点
+    （工具结果处理完毕后）取出并作为新一轮用户消息继续；
+    inline 模式：直接写入 _SessionStream 的注入队列。
+    返回 {"ok": bool, "reason": str}；任务未运行时 ok=False（前端回退普通发送）。
+    """
+    session_id = normalize_session_id(session_id)
+    if _generation_use_worker():
+        proxy = peek_worker_proxy(session_id)
+        if proxy is None or not proxy.inject_message(message or {}):
+            return {"ok": False, "reason": "not_running"}
+        return {"ok": True}
+    stream = _get_session_stream(session_id)
+    if stream is None or stream.done or not stream.is_running():
+        return {"ok": False, "reason": "not_running"}
+    stream.injected_messages.append(message or {})
+    return {"ok": True}
 
 
 async def stop_chat_task(session_id):

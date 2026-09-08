@@ -70,6 +70,10 @@
     // 内置工具作为伪服务分组始终参与渲染（不依赖 MCP 服务列表）
     groups.set(App.BUILTIN_SERVER_KEY, App.BUILTIN_TOOLS);
     state.tools.forEach(function (tool) {
+      // 与内置工具同名的 MCP 工具不再重复展示（如 SysServer 的
+      // read_file/write_file/edit_file/search_files 已转为内置可选）：
+      // 后端按名称解析时内置版优先，勾选任一条目效果一致，这里只去重视图
+      if (App.isBuiltinToolName(tool.name)) return;
       const key = tool.serverId || "__unassigned__";
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(tool);

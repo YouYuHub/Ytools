@@ -18,6 +18,10 @@
   // 后端按名称识别并注入（与 factory/agent_runtime/builtin_tools.py 对应）
   const TODO_TOOL_NAME = "todo_write";
   const ASK_USER_TOOL_NAME = "ask_user";
+  const WRITE_FILE_TOOL_NAME = "write_file";
+  const EDIT_FILE_TOOL_NAME = "edit_file";
+  const READ_FILE_TOOL_NAME = "read_file";
+  const SEARCH_FILES_TOOL_NAME = "search_files";
   const BUILTIN_SERVER_KEY = "__builtin__";
   const BUILTIN_TOOLS = [
     {
@@ -27,6 +31,22 @@
     {
       name: ASK_USER_TOOL_NAME,
       description: "向用户提问：模型遇到关键分歧时弹出提问卡片，你点选选项或输入回答后任务继续",
+    },
+    {
+      name: WRITE_FILE_TOOL_NAME,
+      description: "写入文件（内置）：整文件覆盖或追加，自动创建目录；相对路径基于会话工作目录",
+    },
+    {
+      name: EDIT_FILE_TOOL_NAME,
+      description: "编辑文件（内置）：按精确字符串替换，比按行号改写更安全；为后续文件 diff 预留",
+    },
+    {
+      name: READ_FILE_TOOL_NAME,
+      description: "读取文件（内置）：带行号与编码探测的分段读取，二进制拒绝；为后续文件 diff 预留",
+    },
+    {
+      name: SEARCH_FILES_TOOL_NAME,
+      description: "跨文件搜索（内置）：类 grep 的正则逐行匹配，跳过依赖目录与大文件",
     },
   ];
 

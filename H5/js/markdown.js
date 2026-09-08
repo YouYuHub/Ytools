@@ -14,6 +14,106 @@
   // 行内占位符前缀/后缀（控制字符，正常文本不会出现）
   const PH_OPEN = "\u0001";
   const PH_CLOSE = "\u0001";
+  // 媒体伪标签占位符（控制字符，与行内代码占位不同前缀）
+  const MEDIA_PH_OPEN = "\u0002";
+
+  // 媒体伪标签解析器：由 App 在启动时注入（media.js），把标签 src 解析为
+  // 可访问 URL（media:// → 会话媒体端点；http(s) 原样；其它按本地路径 →
+  // /file/get_local_file）。未注入时控件仍渲染但无法加载。
+  let mediaResolver = null;
+
+  function setMediaResolver(fn) { mediaResolver = typeof fn === "function" ? fn : null; }
+
+  // 模型输出的伪标签（转义后形态）：&lt;image ...&gt;...&lt;/image&gt; 或自闭合。
+  // 属性值以 &quot; 包裹（escapeHtml 把 " 转义为 &quot;）。
+  const MEDIA_TAG_RE = /&lt;(image|audio|video|pdf)((?:[^&]|&(?!gt;))*?)(?:\/&gt;|&gt;([\s\S]*?)&lt;\/\1&gt;)/g;
+  const MEDIA_ATTR_RE = /([a-zA-Z_][\w:-]*)\s*=\s*&quot;((?:(?!&quot;).)*)&quot;/g;
+
+  function unescapeTagText(text) {
+    return String(text)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, "&");
+  }
+
+  function parseMediaAttrs(attrText) {
+    const attrs = {};
+    String(attrText || "").replace(MEDIA_ATTR_RE, function (_, name, value) {
+      attrs[name.toLowerCase()] = unescapeTagText(value);
+      return _;
+    });
+    return attrs;
+  }
+
+  function mediaKindLabel(kind) {
+    if (kind === "image") return "🖼️ 图片";
+    if (kind === "audio") return "🎵 音频";
+    if (kind === "video") return "🎬 视频";
+    return "📄 PDF";
+  }
+
+  // 单个伪标签 → 媒体控件 HTML。只注入白名单属性（src/alt/title），
+  // 模型给出的 class/style/事件等一律丢弃；URL 经 escapeHtml 后入属性。
+  function buildMediaWidget(kind, attrs, rawTag) {
+    const src = attrs.src || "";
+    const name = (attrs.alt || attrs.title || "").trim() ||
+      (src ? src.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "") || kind;
+    let resolved = "";
+    try { resolved = mediaResolver ? String(mediaResolver(kind, src) || "") : ""; } catch (_) { resolved = ""; }
+    const esc = escapeHtml;
+    const broken = resolved ? "" : " is-broken";
+    return (
+      '<div class="md-media md-media-' + kind + broken + '"' +
+      ' data-media-kind="' + kind + '"' +
+      ' data-media-src="' + esc(src) + '"' +
+      (resolved ? ' data-media-url="' + esc(resolved) + '"' : "") +
+      ' data-media-raw="' + esc(rawTag) + '">' +
+      (kind === "image"
+        ? '<img class="md-media-el" loading="lazy" alt="' + esc(name) + '"' +
+        (resolved ? ' src="' + esc(resolved) + '"' : "") + '>'
+        : kind === "video"
+          ? '<video class="md-media-el" controls preload="metadata"' +
+          (resolved ? ' src="' + esc(resolved) + '"' : "") + '></video>'
+          : kind === "audio"
+            ? '<div class="md-media-caption">' + mediaKindLabel(kind) + " · " + esc(name) + "</div>" +
+            '<audio class="md-media-el" controls preload="metadata"' +
+            (resolved ? ' src="' + esc(resolved) + '"' : "") + '></audio>'
+            : '<div class="md-media-caption">' + mediaKindLabel(kind) + " · " + esc(name) + "</div>") +
+      '<div class="md-media-actions">' +
+      '<button type="button" class="md-media-btn" data-media-action="preview">预览</button>' +
+      '<button type="button" class="md-media-btn" data-media-action="delete" title="不会删除实际文件">删除</button>' +
+      "</div>" +
+      '<div class="md-media-status">用户已删除/文件不存在</div>' +
+      "</div>"
+    );
+  }
+
+  // 提取全部伪标签为占位符：流式增量重渲染是纯函数，闭合后才成控件，
+  // 未闭合的半截标签按普通文本显示
+  function extractMediaTags(escapedText) {
+    const widgets = [];
+    const out = escapedText.replace(MEDIA_TAG_RE, function (match, kind, attrText, _body) {
+      widgets.push(buildMediaWidget(kind, parseMediaAttrs(attrText), unescapeTagText(match)));
+      return MEDIA_PH_OPEN + (widgets.length - 1) + MEDIA_PH_OPEN;
+    });
+    return { text: out, widgets: widgets };
+  }
+
+  function restoreMediaPlaceholders(html, widgets) {
+    if (!widgets.length) return html;
+    const PH_RE = new RegExp(MEDIA_PH_OPEN + "(\\d+)" + MEDIA_PH_OPEN, "g");
+    // 独立成段的占位（常见形态）：控件替换整个 <p>，避免块级 div 嵌进段落
+    let out = html.replace(new RegExp("<p>" + MEDIA_PH_OPEN + "(\\d+)" + MEDIA_PH_OPEN + "</p>", "g"),
+      function (_, idx) {
+        const widget = widgets[Number(idx)];
+        return widget != null ? widget : "";
+      });
+    return out.replace(PH_RE, function (_, idx) {
+      const widget = widgets[Number(idx)];
+      return widget != null ? widget : "";
+    });
+  }
 
   function renderInline(text) {
     // 先提取行内代码段做占位保护：避免代码内容中的 *、_、[、| 等
@@ -73,11 +173,11 @@
     // hover 显示「复制 / 复制图片」按钮（点击行为在 app.js 事件委托中处理）
     return (
       '<div class="md-table-block">' +
-        '<div class="md-table-scroll">' + html + "</div>" +
-        '<div class="md-table-actions">' +
-          '<button class="md-table-btn" type="button" data-table-action="copy">复制</button>' +
-          '<button class="md-table-btn" type="button" data-table-action="copy-image">复制图片</button>' +
-        "</div>" +
+      '<div class="md-table-scroll">' + html + "</div>" +
+      '<div class="md-table-actions">' +
+      '<button class="md-table-btn" type="button" data-table-action="copy">复制</button>' +
+      '<button class="md-table-btn" type="button" data-table-action="copy-image">复制图片</button>' +
+      "</div>" +
       "</div>"
     );
   }
@@ -151,7 +251,9 @@
   }
 
   function render(src) {
-    const text = escapeHtml(String(src || ""));
+    const escaped = escapeHtml(String(src || ""));
+    const media = extractMediaTags(escaped);
+    const text = media.text;
     const lines = text.split("\n");
     const html = [];
     let i = 0;
@@ -180,12 +282,12 @@
         const cls = prismLang ? ' class="language-' + prismLang + '"' : "";
         html.push(
           '<div class="codeblock"><div class="codeblock-head">' +
-            '<span class="codeblock-lang">' + lang + "</span></div>" +
-            '<button class="copy-btn" type="button" aria-label="复制代码">' +
-              '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' +
-              '<span class="copy-label">复制</span>' +
-            "</button>" +
-            "<pre><code" + cls + ">" + buf.join("\n") + "</code></pre></div>"
+          '<span class="codeblock-lang">' + lang + "</span></div>" +
+          '<button class="copy-btn" type="button" aria-label="复制代码">' +
+          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' +
+          '<span class="copy-label">复制</span>' +
+          "</button>" +
+          "<pre><code" + cls + ">" + buf.join("\n") + "</code></pre></div>"
         );
         continue;
       }
@@ -275,10 +377,11 @@
       html.push("<p>" + buf.map(renderInline).join("<br>") + "</p>");
     }
 
-    return '<div class="md">' + html.join("") + "</div>";
+    return '<div class="md">' +
+      restoreMediaPlaceholders(html.join(""), media.widgets) + "</div>";
   }
 
-  const api = { render };
+  const api = { render, setMediaResolver };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   } else {

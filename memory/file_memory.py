@@ -35,6 +35,17 @@ MEDIA_SIZE_LIMITS = {
 }
 MEDIA_MAX_FILE_SIZE = MEDIA_SIZE_LIMITS["image"]  # 兼容旧引用：图片/音频默认上限
 
+# ---------- 大图缩略图 ----------
+# 超过该字节数的图片在发送上游前自动降采样为 JPEG 缩略图（原图仍完整落盘，
+# 预览/下载不受影响）：视觉 API 按分辨率计费，全屏截图动辄数 MB，直接发
+# base64 会显著浪费 token；长边 1568 是主流视觉模型的高清档分辨率。
+IMAGE_THUMBNAIL_THRESHOLD_BYTES = 2 * 1024 * 1024
+IMAGE_THUMBNAIL_MAX_EDGE = 1568
+IMAGE_THUMBNAIL_JPEG_QUALITY = 85
+# 动图转 JPEG 会丢帧，跳过缩略图按原图发送
+_IMAGE_THUMBNAIL_SKIP_EXTENSIONS = {".gif"}
+_THUMB_DIRECTORY_NAME = "thumbs"
+
 # 主流视觉模型原生接受的图片格式：PNG/JPEG/GIF/WebP（OpenAI 系），
 # Qwen-VL/GLM-4V/Gemini 等另普遍支持 BMP/TIFF
 _IMAGE_MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
@@ -162,6 +173,53 @@ def _media_dir(session_id: str) -> Path:
     directory = _get_session_dir(session_id) / MEDIA_DIRECTORY_NAME
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _thumb_dir(session_id: str) -> Path:
+    directory = _get_session_dir(session_id) / _THUMB_DIRECTORY_NAME
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _load_image_thumbnail_base64(session_id: str, path: Path) -> tuple[str, str] | None:
+    """为大图生成/复用 JPEG 缩略图，返回 (mime, base64)；失败返回 None（回退原图）。
+
+    - 触发条件由调用方判断（文件字节数超过 IMAGE_THUMBNAIL_THRESHOLD_BYTES）；
+    - 缩略图缓存到 <session>/thumbs/<原名>.thumb.jpg，同图多次解析只算一次，
+      原图更新（字节变化）时按 mtime+size 失效重建；
+    - 长边压到 IMAGE_THUMBNAIL_MAX_EDGE、JPEG 质量 IMAGE_THUMBNAIL_JPEG_QUALITY；
+    - 任何失败（Pillow 不支持/磁盘异常）都返回 None，调用方回退原图发送。
+    """
+    thumb_path = _thumb_dir(session_id) / f"{path.name}.thumb.jpg"
+    try:
+        stat = path.stat()
+        fingerprint = f"{stat.st_size}-{int(stat.st_mtime)}"
+        if thumb_path.is_file():
+            cached = thumb_path.read_text(encoding="ascii", errors="ignore").split("\n", 1)
+            if len(cached) == 2 and cached[0] == fingerprint and cached[1]:
+                return "image/jpeg", cached[1]
+        with Image.open(path) as img:
+            img.load()
+            width, height = img.size
+            max_edge = max(width, height)
+            if max_edge > IMAGE_THUMBNAIL_MAX_EDGE:
+                scale = IMAGE_THUMBNAIL_MAX_EDGE / max_edge
+                new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                img = img.resize(new_size, Image.LANCZOS)
+            if img.mode not in ("RGB", "L"):
+                # JPEG 无透明通道：透明区域铺白底，避免黑底突兀
+                rgba = img.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.split()[3])
+                img = background
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=IMAGE_THUMBNAIL_JPEG_QUALITY)
+        encoded = base64.b64encode(out.getvalue()).decode("ascii")
+        # 指纹与数据同行存储：命中校验 + 缓存内容一次读取
+        thumb_path.write_text(f"{fingerprint}\n{encoded}", encoding="ascii")
+        return "image/jpeg", encoded
+    except Exception:
+        return None
 
 
 def _doc_dir(session_id: str) -> Path:
@@ -382,6 +440,21 @@ def resolve_media_content_parts(session_id: str, content: Any) -> tuple[Any, lis
                     unresolved.append(url)
                 else:
                     mime, base64_data = loaded
+                    # 大图降采样：超过阈值的图片改发缩略图（原图完整落盘不受影响），
+                    # 缩略图生成失败或动图（GIF）按原图发送
+                    try:
+                        media_path = resolve_media_path(session_id, url)
+                        oversized = (
+                            media_path is not None
+                            and media_path.stat().st_size > IMAGE_THUMBNAIL_THRESHOLD_BYTES
+                            and Path(media_path.name).suffix.lower() not in _IMAGE_THUMBNAIL_SKIP_EXTENSIONS
+                        )
+                    except OSError:
+                        oversized = False
+                    if oversized and media_path is not None:
+                        thumb = _load_image_thumbnail_base64(session_id, media_path)
+                        if thumb is not None:
+                            mime, base64_data = thumb
                     new_part[key] = {**value, "url": _media_data_url(mime, base64_data)}
         # 音频部件：input_audio.data 需要纯 base64
         audio = new_part.get("input_audio")

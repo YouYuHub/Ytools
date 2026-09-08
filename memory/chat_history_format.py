@@ -299,7 +299,13 @@ def _resolve_round_user_content(round_entry: dict[str, Any]) -> str | None:
 
 
 def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[dict[str, Any]]:
-    """默认模式：工具结果不回传，仅把工具调用参数渲染成 assistant 文本行。"""
+    """默认模式：工具结果不回传，仅把工具调用参数渲染成 assistant 文本行。
+
+    用户消息为纯文本口径：多模态消息的媒体部件替换为 [图片] 等占位引用
+    （content_part_to_text），不回传图片数据本身；仅当前轮用户消息保留
+    原始多部件 content 并在发送上游前解析为 base64。media:// 落盘引用
+    不膨胀历史 JSONL。
+    """
     events = round_entry.get("events")
     if not isinstance(events, list):
         return []
@@ -337,7 +343,7 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
             if tool_call_line:
                 assistant_fragments.append(tool_call_line)
     if not assistant_fragments:
-        # 轮次被中断/停止/出错且没有任何助手输出时，仍要回传该轮用户问题：
+        # 轮次被中断/停止/出错且没有任何助手输出时，仍要回传该轮用户消息：
         # 数据已落盘（含崩溃恢复的 interrupted 轮），丢掉它会让"请继续上面的
         # 任务"这类后续提问在模型侧完全失忆。仅剩"停止任务"等无效内容时
         # round_user_content 为空，仍返回空列表。
@@ -349,6 +355,8 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
         if not merged_assistant_fragments or merged_assistant_fragments[-1] != text:
             merged_assistant_fragments.append(text)
     messages: list[dict[str, Any]] = []
+    # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用）；轮次无 events
+    # 中的 user 消息时回退 question 字段的纯文本
     if round_user_content:
         messages.append({"role": "user", "content": round_user_content})
     messages.append({"role": "assistant", "content": "\n".join(merged_assistant_fragments)})
@@ -413,6 +421,8 @@ def _round_entry_to_tool_result_context_messages(
         return []
     round_user_content = _resolve_round_user_content(round_entry)
     messages: list[dict[str, Any]] = []
+    # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用），历史轮次不回传
+    # 图片数据；仅当前轮用户消息保留原始多部件 content 并在发送前解析
     if round_user_content:
         messages.append({"role": "user", "content": round_user_content})
     compression_content, compress_index = _round_compression_state(round_entry)

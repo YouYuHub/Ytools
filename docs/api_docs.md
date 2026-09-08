@@ -376,6 +376,7 @@
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status, stored_name, media_ref, kind(image/audio/video), mime, size}`
 - 聊天消息引用方式：`content` 部件列表中 `{"type":"image_url","image_url":{"url":"media://<stored_name>"}}`（音频为 `{"type":"input_audio","input_audio":{"data":"media://<stored_name>","format":"wav"}}`，视频 `video_url`）。
   后端发送上游前把 `media://` 引用解析为 OpenAI 兼容格式：URL 类部件 → `data:<mime>;base64,<b64>`，`input_audio.data` → 纯 base64；`https://` 与已内联 `data:`/base64 原样透传（url 与 base64 双格式兼容）。
+  **大图自动降采样**：超过 2MB 的图片（GIF 动图除外）在解析时改发 JPEG 缩略图——长边 ≤1568px、质量 85，缓存到 `<session>/thumbs/<原名>.thumb.jpg`（按原文件 mtime+size 指纹失效重建）；生成失败回退原图。原图仍完整落盘，预览/下载不受影响。前端在**发送前**也做同等压缩（canvas 重采样，压缩无收益保留原文件），双保险进一步降低上传体积与视觉 token 计费。
 - 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位。
 
 ### GET /file/get_session_media

@@ -297,6 +297,8 @@
 
   function startNewChat() {
     sessionOpenSeq++;
+    // 保存当前会话的输入草稿（文本+附件），再进入"待开始"状态
+    App.saveSessionDraft();
     // 只进入"待开始"状态，不生成本地 ID；首次发送消息时才由 ensureSessionId() 分配
     state.sessionId = null;
     App.loadWorkDir(); // 新对话未覆盖目录：显示全局默认
@@ -307,7 +309,8 @@
     state.todoTodos = [];
     state.todoPanelOpen = false;
     App.renderTodoWidget();
-    App.clearPendingMedia();
+    // 恢复"新对话"的草稿（通常为空；未发送就切走的内容不会丢）
+    App.restoreSessionDraft(null);
     App.resetContextTokenStats();
     state.hasConversation = false;
     state.importedHistoryText = null;
@@ -328,13 +331,16 @@
 
   async function openSession(id) {
     const seq = ++sessionOpenSeq;
+    // 保存当前会话的输入草稿（文本+附件），再切换到目标会话
+    App.saveSessionDraft();
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
     App.loadWorkDir();
     App.loadToolSelection(); // 按会话加载独立工具选择（未覆盖则应用全局默认）
     // 模型面板打开中时按新会话的生效选择刷新
     if (!enhancePanel.classList.contains("hidden")) App.openModelPanel();
-    App.clearPendingMedia();
+    // 恢复目标会话的输入草稿（文本+附件；无草稿则清空）
+    App.restoreSessionDraft(id);
     App.resetContextTokenStats();
     state.hasConversation = false;
     state.importedHistoryText = null;
@@ -355,6 +361,8 @@
     App.loadSessionFiles();
     // 切换会话后按“当前会话”重新计算发送/停止按钮（其他会话后台流式不影响本会话）
     App.refreshComposerButtons();
+    // 刷新引导/队列暂存指示器：只显示属于当前会话的条目
+    App.renderPendingOutbox();
     try {
       const text = await API.fetchSessionFile(id);
       // 等待期间用户已切到其他会话，丢弃过期响应，避免误覆盖

@@ -296,6 +296,25 @@
     color: var(--text-tertiary);
   }
 
+  // 压缩失败态：红色警示边框与图标，错误信息弱化展示
+  &.is-failed {
+    border-color: rgba(220, 80, 80, 0.55);
+
+    .compaction-icon {
+      color: #d9534f;
+    }
+
+    .compaction-title {
+      color: #e07a76;
+    }
+  }
+
+  .compaction-error-detail {
+    color: #e08581;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   .compaction-title {
     min-width: 0;
     overflow: hidden;
@@ -676,12 +695,13 @@
   }
 }
 
-// 用户气泡内的附件图片（多模态消息与其历史回放）
+// 用户气泡内的附件图片（多模态消息与其历史回放）：
+// 布局为媒体在上、文字在下，媒体行用 margin-bottom 与下方文字隔开
 .msg-user-media {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 6px;
+  margin-bottom: 6px;
 
   .msg-user-media-thumb {
     max-width: 180px;
@@ -774,6 +794,116 @@
     opacity: 0.6;
     cursor: default;
   }
+}
+
+// ---------- md 媒体伪标签控件（<image>/<audio>/<video>/<pdf> 渲染产物） ----------
+// .md 作为 inline-size 容器：内容区宽度 >680px 时媒体控件两列排布，
+// 否则一行一个。控件宽度取固定计算值，媒体元素（尤其音频）稳定占满。
+.md {
+  container-type: inline-size;
+}
+
+.md-media {
+  position: relative;
+  display: inline-block;
+  vertical-align: top;
+  width: 100%;
+  max-width: 520px;
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+
+  .md-media-el {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    max-height: 360px;
+    object-fit: contain;
+  }
+
+  // 音频控件稍矮，不套用 360px 高度上限
+  audio.md-media-el {
+    max-height: none;
+    padding: 8px 10px 2px;
+    box-sizing: border-box;
+  }
+
+  .md-media-caption {
+    padding: 8px 12px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  .md-media-actions {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 3;
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  &:hover .md-media-actions {
+    opacity: 1;
+  }
+
+  .md-media-btn {
+    padding: 3px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--bg-composer);
+    color: var(--text-secondary);
+    font-size: 11px;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+  }
+
+  // 加载失败/路径无法解析：隐藏媒体元素，显示占位说明
+  .md-media-status {
+    display: none;
+    padding: 10px 12px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  &.is-broken {
+    .md-media-el,
+    .md-media-caption {
+      display: none;
+    }
+
+    .md-media-status {
+      display: block;
+    }
+  }
+}
+
+// 容器宽度 >680px：两列排布（宽度 50% - 右间距，恰好放下两个不换行）
+@container (min-width: 680.02px) {
+  .md-media {
+    width: calc(50% - 12px);
+    max-width: none;
+    margin: 0 12px 12px 0;
+  }
+}
+
+// 删除媒体引用后在消息流中的占位
+.md-media-removed {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
 }
 // ---------- 模型提问卡片（ask_user 事件在聊天流内的静态展示；点击可重新打开回答弹窗） ----------
 .ask-block {

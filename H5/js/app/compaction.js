@@ -117,7 +117,8 @@
   async function runManualCompactionStream() {
     if (state.manualCompactRunning) return;
     state.manualCompactRunning = true;
-    // 压缩期间隐藏发送按钮，结束后恢复（send() 内有对应的键盘发送守卫）
+    // 压缩期间隐藏发送按钮、终止按钮接管（点击可中止压缩），结束后恢复
+    state.manualCompactAbort = new AbortController();
     App.refreshComposerButtons();
     let ui = null;
     let sawStart = false;
@@ -151,6 +152,16 @@
           setEmpty(false);
         } else if (data.phase === "delta" && ui) {
           ui.appendDelta(data);
+        } else if (data.phase === "aborted") {
+          // 压缩失败：块转为失败态（错误信息 + 已生成部分标注未生效），
+          // 不再伪装成完成态
+          if (ui) {
+            ui.update({ phase: "aborted", error: data.error || "" });
+            ui = null;
+          } else {
+            const failed = App.buildCompactionBlock(Object.assign({ scope: "session" }, data));
+            chatInner.appendChild(failed.wrap);
+          }
         } else if (data.phase === "done") {
           if (ui) ui.update(data);
           else {
@@ -160,15 +171,30 @@
           }
         }
         if (state.sessionId && nearBottom()) scrollToBottom();
-      });
+      }, state.manualCompactAbort.signal);
     } catch (err) {
-      if (err.name !== "AbortError") toast("手动压缩失败：" + err.message);
-      if (ui) ui.update({ phase: "done" });
+      const aborted = err.name === "AbortError";
+      if (!aborted) {
+        const message = String(err.message || "");
+        const networkLike = /fetch|network|failed to|aborted|timed?\s?out|connection/i.test(message);
+        toast(networkLike
+          ? "压缩连接中断，本次压缩已中止且未写入任何摘要；历史对话保持不变，可稍后重试"
+          : "手动压缩失败：" + message);
+      } else {
+        // 用户点击终止按钮主动中止：SSE 连接断开即取消，不弹网络错误提示
+        toast("已终止压缩：本次压缩未写入任何摘要，历史对话保持不变");
+      }
+      // 连接异常中断且后端未推 aborted 时：本地把块标记为失败态
+      // （原始对话不受影响；若后端实际已成功，刷新页面会按 done 记录回放）
+      if (ui) ui.update({ phase: "aborted", error: aborted ? "用户手动终止" : (err.message || "连接中断") });
     } finally {
       state.manualCompactRunning = false;
+      state.manualCompactAbort = null;
       App.refreshComposerButtons();
       App.refreshSessionUsage(state.sessionId);
       App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, state.sessionId);
+      // 压缩结束后派发暂存的引导/队列消息（压缩期间发送被禁止，此处补发）
+      setTimeout(function () { App.flushPendingMessages(state.sessionId); }, 0);
     }
   }
 
