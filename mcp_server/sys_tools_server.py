@@ -93,6 +93,12 @@ _BOM_TABLE = (
 # UTF-8 误按 GBK 解码则表现为成对"锟斤拷/烫烫烫"类噪声，两者都可用比例识别。
 _REPLACEMENT_CHARS = ("\ufffd", "�")
 
+# UTF-8 中文被误按 GBK 解码的高频特征字（如"中"→"涓"、"："→"锛"、"的"→"鐨"）。
+# 这些字大多落在常用汉字区 U+4E00-9FFF，仅靠扩展区惩罚无法识别，需单独计罚。
+_GBK_MISDECODE_SIGNS = frozenset(
+    "锛涓鐨璁璁鐢ㄦ浣鍚鍦ㄧ笉鑷姝ソ鈥銆銉鏄鍙涔浠鏂鎴戣澶娈鎷瀹寮"
+)
+
 
 def _mojibake_score(text: str) -> float:
     """估计一段文本的乱码程度（0=干净，越高越乱）。
@@ -111,6 +117,9 @@ def _mojibake_score(text: str) -> float:
         if ch in _REPLACEMENT_CHARS:
             penalty += 2
         elif 0x3400 <= code <= 0x4DBF or 0xE000 <= code <= 0xF8FF or 0xFE30 <= code <= 0xFE4F:
+            penalty += 1
+        elif ch in _GBK_MISDECODE_SIGNS:
+            # UTF-8 中文被误按 GBK 解码的高频特征字（如"中"→"涓"、全角冒号→"锛"）
             penalty += 1
         elif 0x9FA6 <= code <= 0x9FFF:
             # U+9FA6-9FFF 属于 GBK 有映射但 Unicode 主区少用的字，GBK 串被 utf-8 硬解时高频出现
@@ -155,9 +164,168 @@ def _decode_bytes(data: bytes, encoding: str = "", candidates: tuple = ("utf-8",
     return _decode_bytes_used(data, encoding, candidates)[0]
 
 
+# Windows 控制台代码页 → Python 编解码器名
+_CONSOLE_CP_TO_CODEC = {
+    65001: "utf-8",    # UTF-8（开启"Beta: 使用 Unicode UTF-8 提供全球语言支持"后）
+    936: "gbk",        # 简体中文（CP936/GBK）
+    950: "big5",       # 繁体中文
+    932: "shift_jis",  # 日语
+    949: "cp949",      # 韩语
+    1252: "cp1252",    # 西文 ANSI
+    850: "cp850",      # 西文 OEM
+    437: "cp437",      # 美式 OEM
+}
+
+_windows_console_cp_cache = None
+
+
+def _windows_console_cp() -> int:
+    """取控制台输出代码页（无控制台时返回新控制台的默认值，失败返回 0）。结果缓存。"""
+    global _windows_console_cp_cache
+    if _windows_console_cp_cache is None:
+        value = 0
+        try:
+            import ctypes
+            value = int(ctypes.windll.kernel32.GetConsoleOutputCP())
+        except Exception:
+            value = 0
+        _windows_console_cp_cache = value
+    return _windows_console_cp_cache
+
+
 def _command_output_candidates() -> tuple:
-    """终端命令输出的候选编码：中文 Windows 的 cmd 默认代码页为 GBK，故优先尝试。"""
-    return ("gbk", "utf-8") if os.name == "nt" else ("utf-8", "gbk")
+    """终端命令输出的候选编码：优先匹配系统实际代码页，再回退常见候选。
+
+    cmd 与 PowerShell 5.1 把输出重定向到管道时按控制台输出代码页编码：
+    - 中文 Windows 默认 GBK(936)，优先尝试 gbk；
+    - 若系统开启了"Beta: 使用 Unicode UTF-8"，代码页为 65001，必须优先 utf-8，
+      否则中文会被误判成 GBK 乱码（"涓枃"类乱码的根源）。
+    pwsh 7 / Git Bash 通常直接输出 UTF-8，由多候选乱码评分兜底。
+    """
+    ordered = []
+
+    def _push(name):
+        if name and name not in ordered:
+            ordered.append(name)
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            _push(_CONSOLE_CP_TO_CODEC.get(_windows_console_cp()))
+            _push(_CONSOLE_CP_TO_CODEC.get(int(kernel32.GetACP())))    # ANSI 代码页
+            _push(_CONSOLE_CP_TO_CODEC.get(int(kernel32.GetOEMCP())))  # OEM 代码页
+        except Exception:
+            pass
+    _push("utf-8")
+    _push("gbk")
+    return tuple(ordered) or ("utf-8", "gbk")
+
+
+_child_env_cache = None
+
+
+def _merged_child_env():
+    """构建子进程环境变量（Windows 返回 dict，POSIX 返回 None 表示默认继承）。
+
+    MCP 宿主可能以裁剪过的环境块启动本服务（缺 COMPUTERNAME/USERNAME、PATH
+    不完整等），子进程随之继承残缺环境。这里从注册表补全系统级与用户级环境
+    变量后合并：进程内显式设置 > 用户级 > 系统级；PATH 三方拼接去重而非覆盖。
+    结果缓存，避免每次调用都读注册表。
+    """
+    global _child_env_cache
+    if os.name != "nt":
+        return None
+    if _child_env_cache is not None:
+        return _child_env_cache
+
+    def _expand(text, mapping):
+        # 展开 %VAR% 引用（REG_EXPAND_SZ 类型），支持有限次嵌套
+        pattern = re.compile(r"%([^%]+)%")
+        prev = None
+        while prev != text:
+            prev = text
+            text = pattern.sub(
+                lambda m: mapping.get(m.group(1).upper(), m.group(0)), text)
+        return text
+
+    raw_system, raw_user = {}, {}
+    try:
+        import winreg
+        for hive, subkey, bucket in (
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+             raw_system),
+            (winreg.HKEY_CURRENT_USER, "Environment", raw_user),
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    index = 0
+                    while True:
+                        try:
+                            name, value, _vtype = winreg.EnumValue(key, index)
+                        except OSError:
+                            break
+                        index += 1
+                        if isinstance(name, str) and isinstance(value, str):
+                            bucket[name.upper()] = value
+            except OSError:
+                continue
+    except ImportError:
+        pass
+
+    # 补充"易失变量"：COMPUTERNAME 与登录用户信息不落盘在上述键中，
+    # 由系统在启动/登录时动态生成，需从专门位置读取（存在则不覆盖已有值）。
+    try:
+        import winreg
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName") as key:
+                value, _vtype = winreg.QueryValueEx(key, "ComputerName")
+                if isinstance(value, str) and value.strip():
+                    raw_system.setdefault("COMPUTERNAME", value.strip())
+        except OSError:
+            pass
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Volatile Environment") as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, _vtype = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    if isinstance(name, str) and isinstance(value, str):
+                        raw_user.setdefault(name.upper(), value)
+        except OSError:
+            pass
+    except ImportError:
+        pass
+
+    lookup = {**raw_system, **raw_user,
+              **{k.upper(): v for k, v in os.environ.items()}}
+    for bucket in (raw_system, raw_user):
+        for name in list(bucket):
+            bucket[name] = _expand(bucket[name], lookup)
+
+    merged = dict(raw_system)
+    sys_path = merged.pop("PATH", "")
+    user_path = raw_user.pop("PATH", "")
+    merged.update(raw_user)
+    proc_path = os.environ.get("PATH", "")
+    seen, deduped = set(), []
+    for part in ";".join(p for p in (sys_path, user_path, proc_path) if p).split(";"):
+        key = part.rstrip("\\").lower()
+        if part and key not in seen:
+            seen.add(key)
+            deduped.append(part)
+    merged["PATH"] = ";".join(deduped)
+    # 进程内其余变量最优先（PATH 已在上面三方合并，此处跳过避免覆盖）
+    merged.update({k: v for k, v in os.environ.items() if k.upper() != "PATH"})
+    _child_env_cache = merged
+    return merged
 
 
 def _is_probably_binary(data: bytes) -> bool:
@@ -269,6 +437,52 @@ def _html_to_text(html_text: str) -> str:
     except Exception:
         return html_text
     return parser.get_text()
+
+
+# text 模式默认跳过的导航/页脚类标签：这些内容对"读网页正文"几乎没有信息量，
+# 却经常占满 max_chars 截断预算，把真正有用的正文挤掉
+_NOISE_TAG_NAMES = ("nav", "header", "footer", "aside", "noscript", "template")
+# 常见正文容器 id/class 关键词（依次尝试，命中即整块抽取）
+_MAIN_CONTENT_HINTS = (
+    ("id", "content"), ("id", "main-content"), ("id", "main"),
+    ("class", "main-content"), ("class", "post-content"), ("class", "article-content"),
+    ("class", "markdown-body"), ("class", "article"), ("class", "content"),
+)
+
+
+def _extract_main_text(html_text: str) -> tuple:
+    """text 模式的正文优先提取：跳过导航噪音、优先取正文容器。
+
+    返回 (文本, 提取模式说明)。策略：
+      1) 剥掉 nav/header/footer/aside 等噪音块后整体转文本；
+      2) 若存在常见正文容器（article / #content 等），改用容器内文本（更干净）；
+      3) 容器文本过短（不足 200 字符且不超过全文）时回退方案 1，避免误伤小页面。
+    """
+    cleaned = html_text
+    for tag_name in _NOISE_TAG_NAMES:
+        cleaned = re.sub(
+            rf"<{tag_name}\b[^>]*>.*?</{tag_name}\s*>",
+            " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    full_text = _html_to_text(cleaned)
+    container_blocks = _extract_tag_blocks(html_text, "article")
+    used_hint = ""
+    if not container_blocks:
+        for key, hint in _MAIN_CONTENT_HINTS:
+            spec = f"div#{hint}" if key == "id" else f"div.{hint}"
+            try:
+                candidate_blocks = _extract_tag_blocks(html_text, spec)
+            except ValueError:
+                continue
+            if candidate_blocks:
+                container_blocks = candidate_blocks
+                used_hint = spec
+                break
+    if container_blocks:
+        inner_text = "\n".join(_html_to_text(block) for block in container_blocks)
+        if inner_text and len(inner_text) >= min(200, len(full_text)):
+            label = f"正文容器 {used_hint}" if used_hint else "正文容器 article"
+            return inner_text, label
+    return full_text, "全文（已剥离导航噪音）"
 
 
 def _strip_tags(fragment: str) -> str:
@@ -656,15 +870,17 @@ _BG_NAME_SEQ = itertools.count(1)
 
 
 def _prune_old_bg_files() -> None:
-    """清理后台日志目录中超过 24 小时的旧文件（忽略一切错误）。"""
+    """清理后台日志/WMI 中转临时文件中超过 24 小时的旧文件（忽略一切错误）。"""
     try:
         cutoff = time.time() - 24 * 3600
-        for item in _BG_LOG_DIR.glob("bg_*"):
-            try:
-                if item.stat().st_mtime < cutoff:
-                    item.unlink()
-            except OSError:
-                continue
+        patterns = ("bg_*", "fg_*")  # bg_=后台日志；fg_=前台命令 WMI 中转的临时文件
+        for pattern in patterns:
+            for item in _BG_LOG_DIR.glob(pattern):
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink()
+                except OSError:
+                    continue
     except OSError:
         pass
 
@@ -685,11 +901,36 @@ def _pid_alive_windows(pid: int) -> bool:
     return bool(ok) and exit_code.value == STILL_ACTIVE
 
 
+def _batch_env_lines() -> list:
+    """把合并后的子进程环境转为批处理 set 行（供 WMI 中转/后台启动器注入环境）。
+
+    WMI 创建的进程不继承本进程环境块，必须显式注入才能让命令拿到完整 PATH 等。
+    规则：批处理内 % 需写成 %%；含换行的值无法在单行 set 中表达则跳过；
+    单条超长超过 cmd 单行长度限制时也跳过，避免整条命令被截断失效。
+    """
+    lines = []
+    for name, value in (_merged_child_env() or {}).items():
+        if (isinstance(name, str) and isinstance(value, str)
+                and "\n" not in value and "\r" not in value
+                and len(name) + len(value) <= 4000):
+            lines.append(f'set "{name}={value.replace("%", "%%")}"')
+    return lines
+
+
 def _wmi_create_process(command_line: str) -> int:
-    """通过 WMI Win32_Process.Create 启动进程，返回新进程 PID。
+    """通过 WMI Win32_Process.Create 以【默认方式】启动进程，返回新进程 PID。
 
     新进程的父进程是系统服务（WmiPrvSE），完全脱离本工具的进程树，
-    因此不受宿主环境"命令结束后清理整棵进程树"的影响。
+    因此不受宿主环境"命令结束后清理整棵进程树"的影响，也不继承本进程
+    所在的受限 Job 对象（部分原生程序如 nvidia-smi 在该 Job 内初始化会失败）。
+
+    为什么不用 Win32_ProcessStartup 定制窗口（实测结论）：
+      - CREATE_NO_WINDOW(0x08000000)：WMI 拒绝，Create 返回错误码 21；
+      - DETACHED_PROCESS(0x8)：无窗口，但子进程完全没有控制台，python/ping 等
+        控制台程序标准句柄环境被破坏，输出丢失甚至挂起；
+      - 默认启动：分配新控制台 → 程序全部正常，但 cmd 会闪现窗口。
+    因此本函数固定默认启动，窗口问题交由上层用 VBS vbHide 链路解决
+    （wscript 为 GUI 程序自身无窗口，见 _write_relay_script）。
     优先用 pywin32 COM（无额外进程开销）；未安装时回退 PowerShell Invoke-CimMethod。
     """
     try:
@@ -732,139 +973,212 @@ def _wmi_create_process(command_line: str) -> int:
     return int(text)
 
 
-def _run_command_background(command, work_dir, shell_exe, shell_kind, shell_prefix, is_nt) -> str:
-    """后台分离模式：以脱离主进程的方式启动命令，立即返回 PID 与日志路径。
+def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, prefix):
+    """生成"WMI → wscript → VBS(vbHide) → cmd"隐藏执行链的脚本文件并启动，返回信息字典。
 
-    Windows：把命令写入启动器批处理（含 cd 与输出重定向），再用 WMI
-    Win32_Process.Create 启动 —— 新进程父进程是系统服务 WmiPrvSE，
-    彻底脱离本 MCP 进程树，不受"MCP 结束即清理子进程树"的影响；
-    POSIX：start_new_session=True（setsid）建立新会话，摆脱父进程组与控制终端。
-    stdout/stderr 合并写入 ~/.mcp_bg_logs/bg_时间戳.log，之后可用 read_file 查看输出。
+    为什么经 VBS 中转（实测结论）：
+      - WMI 默认启动 cmd：分配新控制台 → 控制台程序正常，但窗口闪现；
+      - WMI + DETACHED_PROCESS：无窗口，但子进程完全没有控制台，
+        python/ping 等控制台程序输出丢失甚至挂起；
+      - WMI + CREATE_NO_WINDOW：Win32_ProcessStartup 不接受该值（Create 返回 21）；
+      - WMI 启动 wscript（GUI 程序自身无窗口）→ VBS 以 vbHide(0) 隐藏运行 cmd：
+        cmd 拥有【隐藏的】控制台 → 控制台程序正常工作 + 全程无可见窗口。✔
+        （即资源管理器/VBS 启动思路：由 GUI 中介拉起，天然脱离受限 Job 与进程树）
+
+    文件三件套（均写入 _BG_LOG_DIR，24h 自动清理）：
+      <prefix>_*.run.cmd   用户命令原文（仅 cmd 家族需要；其他 shell 用括号分组内联）
+      <prefix>_*.cmd       启动器：环境注入 + cd + 执行命令并整体重定向到 out
+      <prefix>_*.vbs       包装器：vbHide 运行启动器、等待结束、把退出码写入 done
+    返回 dict：pid/out/done/launcher/runner/vbs 路径。
     """
-    try:
-        _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ValueError(f"无法创建后台日志目录 {_BG_LOG_DIR}: {exc}")
-    _prune_old_bg_files()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     seq = next(_BG_NAME_SEQ) % 10000
-    log_path = _BG_LOG_DIR / f"bg_{stamp}_{seq:04d}_{os.getpid()}.log"
-    posix_prefix = " ".join(shell_prefix) if shell_prefix else ""
-    if is_nt:
-        # 启动器批处理：切目录 + 执行命令并合并重定向输出；mbcs(ANSI) 编码保证中文路径可被 cmd 解析
-        effective_dir = work_dir or os.getcwd()
-        launcher_path = _BG_LOG_DIR / f"bg_{stamp}_{seq:04d}_{os.getpid()}.cmd"
-        launcher_text = (
-            "@echo off\r\n"
-            f'cd /d "{effective_dir}"\r\n'
-            f"{command} > \"{log_path}\" 2>&1\r\n"
-        )
-        try:
-            launcher_path.write_text(launcher_text, encoding="mbcs")
-        except (OSError, LookupError):
-            launcher_path.write_text(launcher_text, encoding="utf-8", errors="replace")
-        # 启动器路径由我们生成（无空格），直接传路径即可，避免引号被 list2cmdline 二次转义
-        popen_args = [shell_exe, "/c", str(launcher_path)]
-        use_shell = False
-    else:
-        log_file = open(log_path, "wb")
-        try:
-            proc = subprocess.Popen(
-                [*([shell_exe, posix_prefix, command] if posix_prefix else [command])],
-                shell=not posix_prefix, cwd=work_dir,
-                stdin=subprocess.DEVNULL,  # 防交互：等待输入的命令立即得到 EOF 而非挂起
-                stdout=log_file, stderr=subprocess.STDOUT,
-                start_new_session=True,  # 新会话：脱离父进程组与控制终端
-            )
-        finally:
-            # 子进程已继承自己的句柄副本，父进程随即关闭不影响其继续写日志
-            log_file.close()
-        pid = proc.pid
-    if is_nt:
-        try:
-            pid = _wmi_create_process(
-                subprocess.list2cmdline(popen_args) if isinstance(popen_args, list) else popen_args)
-        except Exception as exc:
-            raise ValueError(f"后台命令启动失败: {exc}")
-    time.sleep(0.5)  # 短暂观察，捕捉"秒退"的命令（如命令拼写错误）
-    alive = (_pid_alive_windows(pid) if is_nt else proc.poll() is None)
-    parts = [
-        "[run_command] 已以后台分离模式启动（独立于本 MCP 进程运行，服务结束/超时不会被关闭）",
-        f"PID: {pid}" + ("（外层 shell 的进程 id）" if is_nt else ""),
-        f"shell: {shell_kind} | 工作目录: {work_dir or os.getcwd()}",
-        f"启动时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"命令: {command}",
-        f"日志文件: {_display_path(log_path)}（stdout+stderr 合并写入原始字节）",
-    ]
-    if alive:
-        parts.append("状态: 运行中（启动 0.5s 后仍存活）；稍后用 read_file 读取日志查看输出与结果")
-    else:
-        parts.append("状态: 进程已结束（快速命令可能已正常完成）；请用 read_file 读日志查看结果或报错")
-    parts.append(
-        '管理: Windows 用 tasklist /FI "PID eq <PID>" 查存活、taskkill /F /T /PID <PID> 结束；'
-        "Linux/macOS 用 ps -p <PID> / kill <PID>；后台模式忽略 timeout_seconds 与 encoding 参数")
-    return "\n".join(parts)
-
-
-def _run_command_impl(command, timeout_seconds, cwd, encoding, shell="auto", background=False) -> str:
-    command = str(command or "").strip()
-    if not command:
-        raise ValueError("command 不能为空")
-    try:
-        timeout = min(max(float(timeout_seconds), 1.0), 240.0)
-    except (TypeError, ValueError):
-        timeout = 45.0
-    work_dir = None
-    if cwd and str(cwd).strip():
-        candidate = Path(str(cwd).strip()).expanduser()
-        if not candidate.is_dir():
-            raise NotADirectoryError(f"cwd 不是有效目录: {candidate}")
-        work_dir = str(candidate)
-    is_nt = os.name == "nt"
-    shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
-    if background:
-        return _run_command_background(command, work_dir, shell_exe, shell_kind, shell_prefix, is_nt)
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if is_nt else 0
+    base = f"{prefix}_{stamp}_{seq:04d}_{os.getpid()}"
+    out_path = _BG_LOG_DIR / f"{base}.out.txt"
+    done_path = _BG_LOG_DIR / f"{base}.done.txt"
+    launcher_path = _BG_LOG_DIR / f"{base}.cmd"
+    vbs_path = _BG_LOG_DIR / f"{base}.vbs"
     if shell_prefix:
-        # 直接启动指定 shell：[exe, "-c", command] / powershell [-Command] 形式
-        popen_args = [shell_exe, *shell_prefix, command]
-        use_shell = False
+        # 非 cmd shell：还原为 "[exe, 前缀..., 命令]" 的调用形式，括号分组后整体重定向
+        # （命令内部的 |、& 等在引号内由目标 shell 解释，不会被外层 cmd 拆段）
+        exec_line = f'( {subprocess.list2cmdline([shell_exe, *shell_prefix, command])} )'
+        runner_path = None
     else:
-        popen_args = command
-        use_shell = True
+        # cmd 家族：命令原文写入独立 runner 文件，规避引号/管道等特殊字符的二次解析；
+        # 直接写 "命令 < nul > 文件" 时重定向只绑定最后一个管道段/链式命令，
+        # 会丢掉前段输出（如 echo）甚至覆盖管道输入（如 dir|findstr 变空）
+        runner_path = _BG_LOG_DIR / f"{base}.run.cmd"
+        exec_line = f'call "{runner_path}"'
+    launcher_text = (
+        "@echo off\r\n"
+        + "".join(line + "\r\n" for line in _batch_env_lines())
+        + f'cd /d "{work_dir or os.getcwd()}"\r\n'
+        + f'{exec_line} < nul > "{out_path}" 2>&1\r\n'
+    )
+    # VBS 包装器：0=vbHide 隐藏窗口；True=等待结束拿退出码；退出码写入 done 供轮询读取
+    vbs_text = (
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'code = sh.Run("cmd /c ""{launcher_path}""", 0, True)\r\n'
+        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        'Set f = fso.CreateTextFile("' + str(done_path) + '", True)\r\n'
+        'f.Write code\r\n'
+        'f.Close\r\n'
+    )
     try:
-        proc = subprocess.Popen(
-            popen_args, shell=use_shell, cwd=work_dir,
-            stdin=subprocess.DEVNULL,  # 防交互：等待输入的命令立即得到 EOF 而非挂起
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        raise ValueError(f"命令启动失败: {exc}")
-    started = time.perf_counter()
+        launcher_path.write_text(launcher_text, encoding="mbcs")
+        vbs_path.write_text(vbs_text, encoding="mbcs")
+        if runner_path is not None:
+            runner_path.write_text("@echo off\r\n" + command.rstrip() + "\r\n", encoding="mbcs")
+    except (OSError, LookupError):
+        launcher_path.write_text(launcher_text, encoding="utf-8", errors="replace")
+        vbs_path.write_text(vbs_text, encoding="utf-8", errors="replace")
+        if runner_path is not None:
+            runner_path.write_text(
+                "@echo off\r\n" + command.rstrip() + "\r\n", encoding="utf-8", errors="replace")
+    # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
+    pid = _wmi_create_process(f'wscript.exe //nologo "{vbs_path}"')
+    return {
+        "pid": pid, "out": out_path, "done": done_path,
+        "launcher": launcher_path, "runner": runner_path, "vbs": vbs_path,
+    }
+
+
+def _cleanup_relay_files(info: dict) -> None:
+    """清理中转脚本临时文件（out 输出文件由调用方负责）。"""
+    for key in ("launcher", "runner", "vbs", "done"):
+        path = info.get(key)
+        if path is None:
+            continue
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+
+
+def _kill_process_tree(proc: subprocess.Popen, is_nt: bool) -> None:
+    """超时后终止进程及其子树（Windows 用 taskkill /T，POSIX 用进程组 SIGKILL）。"""
+    try:
+        if is_nt:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
+                            cwd, timeout, is_nt) -> tuple:
+    """前台执行命令，返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒)。"""
+    if shell_kind == "cmd":
+        # cmd 用列表形式避免 shell=True 的二次解析歧义；/d 忽略 AutoRun、/s 规范引号处理
+        argv = [shell_exe, "/d", "/s", "/c", command]
+    else:
+        argv = [shell_exe, *shell_prefix, command]
+    popen_kwargs = dict(
+        stdin=subprocess.DEVNULL, cwd=cwd,
+        env=_merged_child_env() if is_nt else None,
+    )
+    if is_nt:
+        # 不弹新控制台窗口；输出仍可正常通过管道捕获
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        # 独立进程组：超时后可整组 SIGKILL，不留孤儿孙进程
+        popen_kwargs["start_new_session"] = True
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs)
     timed_out = False
     try:
         out_bytes, err_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        if os.name == "nt":
-            # 杀掉整个进程树（shell=True 时 cmd 及其子进程都要清理）
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, creationflags=creationflags)
-        proc.kill()
-        out_bytes, err_bytes = proc.communicate()
-    elapsed = time.perf_counter() - started
+        _kill_process_tree(proc, is_nt)
+        try:
+            out_bytes, err_bytes = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out_bytes, err_bytes = b"", b""
+    elapsed = time.monotonic() - started
+    # 按系统代码页自适应解码（candidates 已含控制台代码页优先级与乱码评分兜底）
     candidates = _command_output_candidates()
-    stdout_text = _decode_bytes(out_bytes or b"", encoding, candidates)
-    stderr_text = _decode_bytes(err_bytes or b"", encoding, candidates)
-    parts = [f"[run_command] exit_code={proc.returncode} | 耗时 {elapsed:.1f}s | shell={shell_kind}"
-             + (" | 命令超时被强制终止" if timed_out else "")]
-    if stdout_text.strip():
-        parts.append("[stdout]\n" + _truncate_text(stdout_text.rstrip(), _RUN_COMMAND_MAX_CHARS, "命令输出过长已截断"))
-    if stderr_text.strip():
-        parts.append("[stderr]\n" + _truncate_text(stderr_text.rstrip(), 4000, "stderr 过长已截断"))
-    if not stdout_text.strip() and not stderr_text.strip():
-        parts.append("（命令无输出）")
+    stdout_text = _decode_bytes(out_bytes or b"", candidates=candidates).replace("\r\n", "\n")
+    stderr_text = _decode_bytes(err_bytes or b"", candidates=candidates).replace("\r\n", "\n")
+    return proc.returncode, stdout_text, stderr_text, timed_out, elapsed
+
+
+def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt) -> str:
+    """后台分离模式：立即返回，输出落盘到日志文件供轮询。"""
+    try:
+        _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f"无法创建后台日志目录 {_BG_LOG_DIR}: {exc}")
+    if is_nt:
+        # Windows：WMI → wscript → VBS(vbHide) → shell 隐藏执行链，
+        # 新进程脱离本进程树与受限 Job，不受宿主"命令结束后清理进程树"影响
+        info = _write_relay_script(command, cwd, shell_exe, shell_kind, shell_prefix, "bg")
+        alive = _pid_alive_windows(info["pid"])
+        return "\n".join([
+            f"[run_command] 后台模式{'已启动' if alive else '已启动（进程状态未知，可能瞬间结束）'}"
+            f" | shell={shell_kind} | pid={info['pid']}",
+            f"输出文件: {_display_path(info['out'])}",
+            f"结束标记: {_display_path(info['done'])}（命令结束后写入退出码；该文件出现即已结束）",
+            "轮询建议: 用 read_file 读取输出文件，或再次 run_command 执行 type 查看尾部；"
+            "确认退出码时读取结束标记文件内容",
+        ])
+    # POSIX：setsid 分离 + 输出重定向到日志文件
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    base = f"bg_{stamp}_{next(_BG_NAME_SEQ) % 10000}_{os.getpid()}"
+    out_path = _BG_LOG_DIR / f"{base}.out.txt"
+    with open(out_path, "ab") as log_file:
+        proc = subprocess.Popen(
+            [shell_exe, *shell_prefix, command],
+            stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            cwd=cwd, start_new_session=True)
+    return "\n".join([
+        f"[run_command] 后台模式已启动 | shell={shell_kind} | pid={proc.pid}",
+        f"输出文件: {_display_path(out_path)}（stdout+stderr 合并追加）",
+        "轮询建议: 用 read_file 读取输出文件，或用 ps -p <pid> 确认进程仍在运行",
+    ])
+
+
+def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> str:
+    command = str(command or "").strip()
+    if not command:
+        raise ValueError("command 不能为空")
+    is_nt = os.name == "nt"
+    shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
+    work_text = str(work_dir or "").strip()
+    cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
+    try:
+        timeout = min(max(float(timeout_seconds), 1.0), 1800.0)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    if background:
+        return _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt)
+    exit_code, stdout_text, stderr_text, timed_out, elapsed = _run_command_foreground(
+        command, shell_exe, shell_kind, shell_prefix, cwd, timeout, is_nt)
+    stdout_text = _truncate_text(stdout_text, _RUN_COMMAND_MAX_CHARS, "stdout 过长已截断")
+    stderr_text = _truncate_text(stderr_text, 3000, "stderr 过长已截断")
+    header = (f"[run_command] shell={shell_kind} | cwd={_display_path(Path(cwd))}"
+              f" | exit={exit_code} | 耗时 {elapsed:.1f}s"
+              + (" | 命令超时，进程树已被强制终止" if timed_out else ""))
+    if not stdout_text and not stderr_text:
+        return f"{header}\n（无输出）"
+    parts = [header]
+    if stdout_text:
+        parts.append("--- stdout ---\n" + stdout_text)
+    if stderr_text:
+        parts.append("--- stderr ---\n" + stderr_text)
+    if timed_out:
+        parts.append(
+            f"[run_command] 已超过 timeout={timeout:g}s；长任务请改用 background=true，"
+            "随后用输出文件路径轮询结果")
     return "\n".join(parts)
 
 
@@ -913,8 +1227,9 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
     if title_match:
         title = _strip_tags(title_match.group(1))
+    extract_note = ""
     if mode == "text":
-        content = _html_to_text(html_text)
+        content, extract_note = _extract_main_text(html_text)
     elif mode == "html":
         content = html_text
     elif mode == "tag":
@@ -937,6 +1252,8 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     header = (f"[fetch_url] HTTP {status} | {str(final_url)}\n"
               f"[fetch_url] Content-Type: {content_type or '未知'} | 编码: {charset}"
               f" | 原始 {len(raw)} 字节 | 提取后 {original_len} 字符")
+    if extract_note:
+        header += f" | 提取模式: {extract_note}"
     if title:
         header += f" | 标题: {title}"
     notes = []
@@ -1019,6 +1336,70 @@ def _bing_block_result(block: str) -> Optional[tuple]:
     return title, url, _first_p_snippet(block)
 
 
+def _search_keywords(query: str) -> set:
+    """从查询中提取关键词集合：整词 + 英文/数字分词（≥2 字符）。"""
+    keywords = set()
+    for token in re.split(r"[\s,，、]+", str(query or "").strip()):
+        if not token:
+            continue
+        keywords.add(token.lower())
+        keywords.update(
+            part.lower() for part in re.findall(r"[A-Za-z0-9]+", token) if len(part) >= 2
+        )
+    return keywords
+
+
+def _has_weak_relevance(results: list, query: str) -> bool:
+    """判断候选结果是否与查询的「特征关键词」脱节（用于触发多引擎合并召回）。
+
+    特征关键词 = 含数字或非 ASCII 字符的词（如版本号 3.14、中文词 新特性），
+    这类词最能区分结果相关性；纯英文通用词（如语言名 python）几乎每条结果
+    都会命中，不参与判断。没有任何一条结果覆盖全部特征词即视为弱相关。
+    查询没有特征词时恒返回 False（无法判断时不折腾）。
+    """
+    specific = [
+        keyword for keyword in _search_keywords(query)
+        if re.search(r"[0-9]", keyword) or any(ord(ch) > 127 for ch in keyword)
+    ]
+    if not specific:
+        return False
+    for item in results:
+        haystack = f"{item[0]} {item[2]} {item[1]}".lower()
+        if all(keyword in haystack for keyword in specific):
+            return False
+    return True
+
+
+def _keyword_score(item: tuple, keywords: set) -> float:
+    """单条结果的相关性得分：标题命中权重最高，摘要次之，URL 再次；
+    文档/参考类路径（docs、changelog、whatsnew 等）小幅加权。"""
+    title, url, snippet = str(item[0]), str(item[1]), str(item[2])
+    hay_title, hay_snippet, hay_url = title.lower(), snippet.lower(), url.lower()
+    s = 0.0
+    for keyword in keywords:
+        if keyword in hay_title:
+            s += 3.0
+        if keyword in hay_snippet:
+            s += 1.5
+        if keyword in hay_url:
+            s += 1.0
+    if re.search(r"(docs?|developer|guide|reference|changelog|whatsnew|release)", hay_url):
+        s += 0.8
+    return s
+
+
+def _relevance_rank(results: list, query: str, limit: int) -> list:
+    """把去重后的候选结果按与 query 的相关性重排后截断到 limit 条。
+
+    以原始顺序作为稳定平手依据，避免无关键词时乱序。
+    """
+    keywords = _search_keywords(query)
+    ranked = sorted(
+        enumerate(results),
+        key=lambda pair: (-_keyword_score(pair[1], keywords), pair[0]))
+    return [item for _, item in ranked[:limit]]
+
+
 def _dedupe_results(results: list, limit: int) -> list:
     """按 URL 去重（忽略结尾斜杠），保持原有顺序，截断到 limit 条。"""
     seen = set()
@@ -1035,7 +1416,11 @@ def _dedupe_results(results: list, limit: int) -> list:
 
 
 def _fetch_bing_results(query: str, limit: int) -> list:
-    """请求并解析 Bing 网页版搜索结果，返回 [(标题, 链接, 摘要)]。"""
+    """请求并解析 Bing 网页版搜索结果，返回 [(标题, 链接, 摘要)]。
+
+    多抓 3 倍候选后按相关性重排截断：网页版结果常混入首页/下载页等
+    泛化条目，直接取前 N 条会挤掉真正相关的文档链接。
+    """
     search_url = "https://www.bing.com/search?" + urlencode(
         {"q": query, "count": min(limit * 3, 30), "mkt": "zh-CN"})
     _, _, content_type, raw = _http_request(search_url, timeout_seconds=15)
@@ -1046,9 +1431,10 @@ def _fetch_bing_results(query: str, limit: int) -> list:
         item = _bing_block_result(block)
         if item:
             collected.append(item)
-        if len(collected) >= limit * 2:
+        if len(collected) >= limit * 3:
             break
-    return _dedupe_results(collected, limit)
+    # 返回完整排序池（≤3×limit），由调用方决定展示条数，便于多引擎合并
+    return _relevance_rank(_dedupe_results(collected, limit * 3), query, limit * 3)
 
 
 def _fetch_ddg_results(query: str, limit: int) -> list:
@@ -1080,7 +1466,8 @@ def _fetch_ddg_results(query: str, limit: int) -> list:
             current[2] = _strip_tags(inner)[:300]
     if current:
         collected.append(tuple(current))
-    return _dedupe_results(collected, limit)
+    # 返回完整排序池（≤3×limit），由调用方决定展示条数，便于多引擎合并
+    return _relevance_rank(_dedupe_results(collected, limit * 3), query, limit * 3)
 
 
 def _web_search_impl(query, max_results, engine="auto") -> str:
@@ -1105,6 +1492,18 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
             raise ValueError(
                 "Bing 未解析到结果（站点改版或访问受限）。可改用 engine=ddg 重试，"
                 "或直接用 fetch_url 打开 https://www.bing.com/search?q=关键词 自行提取。")
+        # auto 模式下结果与查询特征词脱节或候选池偏薄时，并入 DuckDuckGo 候选
+        # 统一重排扩大召回面；DDG 失败或无增量不影响已有结果
+        if engine_key == "auto" and results and (
+                _has_weak_relevance(results, query) or len(results) < limit):
+            try:
+                ddg_pool = _fetch_ddg_results(query, limit)
+                merged = _dedupe_results(list(results) + list(ddg_pool), limit * 3)
+                if len(merged) > len(results):
+                    results = _relevance_rank(merged, query, limit * 3)
+                    engine_name = "Bing+DuckDuckGo 合并重排"
+            except (ValueError, OSError):
+                pass
     if not results:
         try:
             results = _fetch_ddg_results(query, limit)
@@ -1115,8 +1514,9 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
                 "Bing 与 DuckDuckGo 均未解析到结果（站点改版或访问受限）" + detail +
                 "。可直接用 fetch_url 打开 https://www.bing.com/search?q=关键词 ，"
                 "用 mode=text/regex 自行提取。") from exc
-    lines = [f"[web_search] 查询: {query} | 共 {len(results)} 条结果（{engine_name}，链接正文可用 fetch_url 抓取）"]
-    for index, (title, url, snippet) in enumerate(results, start=1):
+    shown = results[:limit]
+    lines = [f"[web_search] 查询: {query} | 共 {len(shown)} 条结果（{engine_name}，链接正文可用 fetch_url 抓取）"]
+    for index, (title, url, snippet) in enumerate(shown, start=1):
         lines.append(f"{index}. {title}\n   链接: {url}" + (f"\n   摘要: {snippet}" if snippet else ""))
     return "\n".join(lines)
 
@@ -1224,34 +1624,35 @@ async def list_items(dir_path: str = ".", pattern: str = "", search_mode: str = 
 
 
 @sys_mcp_server.tool()
-async def run_command(command: str, timeout_seconds: float = 60.0, cwd: str = "", encoding: str = "",
-                      shell: str = "auto", background: bool = False) -> str:
+async def run_command(command: str, shell: str = "auto", work_dir: str = "",
+                      timeout_seconds: float = 120.0, background: bool = False) -> str:
     """执行一条终端命令并返回退出码与输出（支持多 shell：cmd/powershell/pwsh/bash/sh/zsh）
     参数：
-        command:         命令字符串；支持管道与重定向（由所选 shell 解释）
-        timeout_seconds: 超时秒数（1-240，默认 60）；超时强制杀掉整个进程树
-        cwd:             命令工作目录；留空使用当前目录（会话工作目录）
-        encoding:        指定输出编码（如 gbk、utf-8）；留空自动尝试（Windows 先 gbk 后 utf-8），乱码时请显式指定
-        shell:           解释器（默认 auto=Windows 用 cmd，Linux/macOS 优先 bash，无则 sh）；
-                         可选 cmd / powershell（Win 自带 5.1）/ pwsh（PowerShell 7）/ bash / sh / zsh
-        background:      后台分离模式（默认 false）；true 时命令在完全脱离本 MCP 进程的子进程中运行，
-                         不受 MCP 结束/超时影响，立即返回进程 PID 与日志文件路径（stdout+stderr 合并写入该日志）；
-                         之后用 read_file 查看输出；适合服务器/监听器/长任务等长期驻留程序。
-                         该模式忽略 timeout_seconds 与 encoding 参数
+        command:         要执行的命令原文，由目标 shell 直接解释（管道、重定向、链式命令均可）；
+                         空串报错。Windows PowerShell 中用 `;` 与 if ($?) 串联依赖命令，
+                         不要用 &&（PowerShell 5.1 不支持）
+        shell:           解释器：auto=Windows 用 cmd、非 Windows 用 bash/sh（默认）；
+                         cmd=Windows 批处理；powershell=Windows PowerShell 5.1；
+                         pwsh=PowerShell 7+（未安装报错）；bash/sh/zsh=POSIX shell（Windows 上需 Git Bash/WSL）
+        work_dir:        工作目录，默认当前目录（生成任务中即会话工作目录）；相对/绝对路径均可；
+                         目录不存在时报错
+        timeout_seconds: 前台超时秒数（1-1800），默认 120；超时后强制终止整棵进程树并返回已捕获的输出
+        background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径，适合构建、
+                         训练、常驻服务等长任务；默认 false 前台等待
     返回：
-         "[run_command] exit_code=... | 耗时 ... | shell=..." 头部 + [stdout]/[stderr] 分段（超长自动截断）；
-         background=true 时返回 "[run_command] 已以后台分离模式启动" + PID/启动时间/日志路径/状态/管理命令提示
-    注意：
-        非零退出码不算工具错误，会作为正常结果返回，请根据 exit_code 判断成败；
-        stdin 已重定向为空（DEVNULL），等待交互输入的命令会立即得到 EOF 而非挂起；
-        powershell/pwsh 以 -NoProfile -NonInteractive 运行；bash/sh/zsh 以 -c 运行；
-        非后台模式下仍建议避免交互式或长期驻留命令（如进入 REPL、启动服务器），它们会等到超时被杀
-    选型指引（与持久终端工具的关系）：
-        需要跨调用保留 shell 状态（cd/环境变量）、实时观察输出、交互式确认 → 用持久终端三件套；
-        跑完即走的一次性脚本/构建/查询 → 用本工具；长期驻留的服务器/监听器 → background=true
+        头部（shell/工作目录/退出码/耗时）+ stdout 与 stderr 分段内容；
+        输出过长截断（保留头 2/3 + 尾 1/3）；无输出时明确标注。
+        后台模式返回输出文件与结束标记文件路径：结束标记文件出现即命令已结束（内容为退出码），
+        可用 read_file 或再次 run_command 轮询输出
+    说明：
+        - 输出按系统代码页自适应解码（GBK/UTF-8 互串已做乱码评分兜底），跨 shell 编码稳定；
+        - Windows 前台执行不弹出控制台窗口；后台经 WMI+VBS 隐藏链路启动，脱离本进程树，
+          不受宿主"命令结束后清理整棵进程树"影响；
+        - 文件浏览/读写/搜索请优先使用专用工具，本工具用于真正需要终端的能力（安装依赖、
+          运行脚本、git、进程管理等）
     """
     return await asyncio.to_thread(
-        _run_command_impl, command, timeout_seconds, cwd, encoding, shell, background)
+        _run_command_impl, command, shell, work_dir, timeout_seconds, background)
 
 
 @sys_mcp_server.tool()
@@ -1261,7 +1662,8 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
     """抓取网页或 HTTP 接口内容：支持纯文本提取、按标签/正则抽取，超长自动截断
     参数：
         url:             完整链接，仅支持 http/https
-        mode:            提取模式：text=正文纯文本（默认）、html=原始 HTML、tag=按标签抽取、regex=按正则抽取
+        mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音并优先正文容器）、
+                         html=原始 HTML、tag=按标签抽取、regex=按正则抽取
         pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）；
                          每条匹配展示长度与 max_chars 联动（不再固定 500 字符）
         tag:             mode=tag 时必填，标签选择器，支持 div、div#id、div.class（同名标签嵌套时按最短块匹配）
@@ -1272,7 +1674,7 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
         body:            请求体（POST 等使用），默认按 application/json 发送
         headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}；覆盖默认浏览器头中的同名项
     返回：
-        头部（状态码/最终 URL/Content-Type/标题/长度）+ 提取的内容；
+        头部（状态码/最终 URL/Content-Type/标题/提取模式/长度）+ 提取的内容；
         内容过长会截断并提示，网页太大时建议用 tag/regex 只抽取需要的部分
     """
     return await asyncio.to_thread(
@@ -1290,9 +1692,11 @@ async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> 
                      bing=仅用 Bing（失败即报错）、ddg=仅用 DuckDuckGo
     返回：
         编号结果列表，每条含标题、链接、摘要；头部标注实际使用的引擎；
+        结果已按与 query 的关键词相关性重排（标题命中 > 摘要 > URL，文档类路径加权）；
         需要正文时把链接交给 fetch_url 抓取
     说明：
         无 API Key，通过解析搜索引擎网页版实现；已做 Bing 重定向解包、广告过滤与 URL 去重；
+        多抓候选后按相关性排序，泛化首页/下载页会排到相关文档之后；
         站点改版或访问受限时可能失败并给出替代建议
     """
     return await asyncio.to_thread(_web_search_impl, query, max_results, engine)

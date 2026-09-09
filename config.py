@@ -59,7 +59,7 @@ class ChatLLMRequest(BaseModel):
     temperature: float = 0.7                    # 用于控制生成文本的随机性，默认为 1.0。较高的温度会使生成的文本更加随机，而较低的温度则会使文本更加确定。
     top_p: float = 1.0                          # 用于控制生成文本的多样性，默认为 1.0。这个参数是核采样（nucleus sampling）的一部分，用于过滤掉概率低于阈值的 token。
     stream: bool = False                        # 是否使用流式响应
-    reasoning_effort: str = "medium"            # 思考深度，默认为 medium，可选值有 "low", "medium", "high" 等
+    reasoning_effort: str = "medium"            # 思考深度，默认为 medium；GPT-6 Astra 官方档位为 low/medium/high/xhigh/max（max 为最高档，API 无 ultra 档）
     presence_penalty: float = 2.0               # 这个参数用于控制模型对重复内容的惩罚程度，官方推荐非思考模式文本任务使用 2.0
     timeout_connect: int = 300                  # 建立连接超时秒数
     timeout_read: int = 1800                    # 读取响应超时秒数

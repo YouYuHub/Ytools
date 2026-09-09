@@ -34,6 +34,7 @@
 
   // 无会话上下文时只隐藏 token 摘要（工作路径仍常显）
   &.ctx-hidden {
+
     .context-token-summary,
     .context-token-todo-slot {
       display: none;
@@ -397,6 +398,14 @@
   flex-shrink: 0;
   transition: opacity 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 
+  .stop-square {
+    width: 16px;
+    height: 16px;
+    border-radius: 2px;
+    margin-left: 2px;
+    background: currentColor;
+  }
+
   .icon {
     width: 30px;
     height: 30px;
@@ -420,13 +429,6 @@ html:not([data-theme="dark"]) #voiceBtn {
   color: #757575;
 }
 
-.stop-square {
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
-  background: currentColor;
-}
-
 // ---------- 运行中组合按钮：停止 + 发送选项上拉 ----------
 // 方形停止钮与窄上拉钮拼合为一组（VS Code 风格），仅当前会话运行中显示；
 // 上拉钮弹出菜单（消息引导/加入队列），菜单项整体可点击直接执行
@@ -436,8 +438,13 @@ html:not([data-theme="dark"]) #voiceBtn {
   align-items: center;
 
   // 显式固定内部顺序：[■ 停止][▲ 上拉]（主操作在左、下拉在右）
-  #stopBtn { order: 1; }
-  .stop-menu-btn { order: 2; }
+  #stopBtn {
+    order: 1;
+  }
+
+  .stop-menu-btn {
+    order: 2;
+  }
 
   // 停止钮右缘与上拉钮左缘拼合：整体一个胶囊
   #stopBtn {
@@ -453,12 +460,9 @@ html:not([data-theme="dark"]) #voiceBtn {
     background: var(--accent);
     color: var(--accent-contrast);
 
-    .icon { width: 18px; height: 18px; }
-
-    &:hover {
-      opacity: 0.9;
-      transform: none;
-      box-shadow: none;
+    .icon {
+      width: 18px;
+      height: 22px;
     }
   }
 
@@ -521,11 +525,10 @@ html:not([data-theme="dark"]) #voiceBtn {
     background: var(--bg-elevated);
     font-size: 13px;
 
-    // 运行中已注入的引导消息提示：纯状态展示，弱化边框
+    // 已提交后端、等待检查点消费的引导消息：纯状态展示
     &.injected {
       border-style: solid;
       border-color: var(--border);
-      opacity: 0.85;
 
       .pending-outbox-badge {
         background: var(--accent);
@@ -559,7 +562,9 @@ html:not([data-theme="dark"]) #voiceBtn {
       color: var(--accent-contrast);
       font-size: 12px;
 
-      &:hover { opacity: 0.9; }
+      &:hover {
+        opacity: 0.9;
+      }
     }
 
     .pending-outbox-remove {

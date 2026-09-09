@@ -118,8 +118,12 @@
       try {
         const res = await API.injectMessage(state.sessionId, text);
         if (res && res.ok) {
-          toast("已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
+          // 先在消息框上方挂"待注入"提示；气泡等后端 SSE message_injected
+          // 事件（检查点消费）再插入——那一刻节点末尾恰好在当前轮工具结果
+          // 之后，位置与后端 messages 顺序一致
+          state.injectedPending = { sessionId: state.sessionId, text: text };
           renderPendingOutbox();
+          toast("已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
           return;
         }
         // 任务未运行/注入失败：回退本地暂存（流结束后派发）
@@ -143,7 +147,7 @@
         rows.push({ kind: "queue", label: "队列 " + (i + 1), message: m });
       }
     });
-    if (!rows.length && !state.injectedNotice) {
+    if (!rows.length && !state.injectedPending) {
       pendingOutbox.classList.add("hidden");
       composer.classList.remove("has-outbox");
       return;
@@ -152,19 +156,17 @@
       const item = el("div", "pending-outbox-item");
       item.appendChild(el("span", "pending-outbox-badge", row.label));
       item.appendChild(el("span", "pending-outbox-text", row.message.text || "[图片/附件]"));
-      // 立即发送：手动停止后任务已结束，暂存消息可手动发出（与自动派发同链路）
+      // 立即发送：当前会话流式中则打断该轮（后端收尾 + 本地中止），以本条消息
+      // 立即开启新一轮；无进行中的流时直接派发（与自动 flush 同链路）
       const sendNow = el("button", "pending-outbox-send", "发送");
       sendNow.type = "button";
-      sendNow.title = "立即发送该条消息";
+      sendNow.title = "立即发送该条消息（生成中则打断当前回复并以此消息重发）";
       sendNow.addEventListener("click", async function () {
-        if (state.streaming && state.streamingSession === state.sessionId) {
-          toast("当前会话仍在生成中，请等待结束后再发送");
-          return;
-        }
         if (state.manualCompactRunning) {
           toast("正在压缩对话上下文，请稍后再发送");
           return;
         }
+        const interrupting = state.streaming && state.streamingSession === state.sessionId;
         // 先从暂存区移除再派发，避免 flush 内部重复取
         if (row.kind === "steer") {
           state.steerMessage = null;
@@ -173,6 +175,31 @@
           if (idx >= 0) state.pendingQueue.splice(idx, 1);
         }
         renderPendingOutbox();
+        if (interrupting) {
+          // 抑制旧流结束时的自动派发：本次点击接管发送次序，
+          // 防止被打断轮次的 finally 抢先把队列头发出
+          state.suppressFlushOnce = true;
+          try {
+            await API.stopChat(state.streamingSession);
+          } catch (_) { /* 后端停止失败也继续本地中止 */ }
+          if (state.abort) state.abort.abort();
+          // 等待旧流的 send() finally 清理完流状态（AbortError 异步传播）；
+          // 超时兜底：放回暂存区原位，不丢消息
+          const deadline = Date.now() + 5000;
+          while (state.streaming && state.streamingSession === state.sessionId && Date.now() < deadline) {
+            await new Promise(function (r) { setTimeout(r, 50); });
+          }
+          if (state.streaming && state.streamingSession === state.sessionId) {
+            if (row.kind === "steer") {
+              state.steerMessage = row.message;
+            } else {
+              state.pendingQueue.unshift(row.message);
+            }
+            renderPendingOutbox();
+            toast("当前任务未能及时停止，消息已放回暂存区");
+            return;
+          }
+        }
         await App.send({ text: row.message.text || "", media: row.message.media || [] });
       });
       item.appendChild(sendNow);
@@ -183,37 +210,56 @@
       item.appendChild(remove);
       pendingOutbox.appendChild(item);
     });
-    // 运行中已注入的引导消息提示（非待发消息，仅状态展示，可手动关闭）
-    if (state.injectedNotice && state.injectedNotice.sessionId === state.sessionId) {
+    // 已提交后端、等待检查点消费的引导消息：可点 × 撤回（从后端注入
+    // 队列移除）并放回输入框最前；已被消费时后端拒绝，仅提示
+    if (state.injectedPending && state.injectedPending.sessionId === state.sessionId) {
       const item = el("div", "pending-outbox-item injected");
-      item.appendChild(el("span", "pending-outbox-badge", "已注入"));
-      item.appendChild(el("span", "pending-outbox-text", state.injectedNotice.text || ""));
-      const close = el("button", "pending-outbox-remove", "×");
-      close.type = "button";
-      close.title = "关闭提示";
-      close.addEventListener("click", function () {
-        state.injectedNotice = null;
-        renderPendingOutbox();
+      item.title = "已提交后端，将在本轮工具结果处理后注入上下文";
+      item.appendChild(el("span", "pending-outbox-badge", "引导"));
+      item.appendChild(el("span", "pending-outbox-text", state.injectedPending.text || ""));
+      const remove = el("button", "pending-outbox-remove", "×");
+      remove.type = "button";
+      remove.title = "撤回并放回输入框修改";
+      remove.addEventListener("click", async function () {
+        const pending = state.injectedPending;
+        if (!pending) return;
+        let cancelled = false;
+        try {
+          const res = await API.cancelInjectMessage(pending.sessionId, pending.text);
+          cancelled = Boolean(res && res.ok);
+        } catch (_) { /* 网络异常按撤回失败处理 */ }
+        if (!cancelled) {
+          toast("引导消息已被模型消费（或后端不可达），无法撤回");
+          return;
+        }
+        if (state.injectedPending === pending) {
+          state.injectedPending = null;
+          prependToInput(pending.text);
+          renderPendingOutbox();
+        }
       });
-      item.appendChild(close);
+      item.appendChild(remove);
       pendingOutbox.appendChild(item);
     }
     pendingOutbox.classList.remove("hidden");
     composer.classList.add("has-outbox");
   }
 
-  // 注入提示：message_injected SSE 事件到达时调用（消息已由后端落盘，
-  // 下一轮模型调用会看到）；下一轮模型输出开始后由 chat.js 清除
-  App.showInjectedNotice = function (text) {
-    state.injectedNotice = { sessionId: state.sessionId, text: text || "" };
-    renderPendingOutbox();
-  };
+  /** 把文本放回输入框最前面（撤回/移除暂存消息时，先看到早提交的内容）。 */
+  function prependToInput(text) {
+    if (!text) return;
+    input.value = input.value ? text + "\n" + input.value : text;
+    App.autosize();
+  }
 
-  App.clearInjectedNotice = function () {
-    if (state.injectedNotice) {
-      state.injectedNotice = null;
-      renderPendingOutbox();
-    }
+  // 注入消费信号（chat.js 收到 message_injected SSE 时调用）：
+  // 清除待注入提示；气泡由 chat.js 在该时机插入消息流正确位置
+  App.clearInjectedPending = function (sessionId) {
+    const pending = state.injectedPending;
+    if (!pending) return;
+    if (sessionId && pending.sessionId !== sessionId) return;
+    state.injectedPending = null;
+    renderPendingOutbox();
   };
 
   function cancelPendingMessage(row) {
@@ -223,10 +269,10 @@
       const idx = state.pendingQueue.indexOf(row.message);
       if (idx >= 0) state.pendingQueue.splice(idx, 1);
     }
-    // 放回输入框/附件区便于修改后重新提交
+    // 放回输入框最前/附件区最前（先提交的内容排在前面），便于修改后重新提交
     const restored = row.message;
     if (restored.text) {
-      input.value = input.value ? input.value + "\n" + restored.text : restored.text;
+      prependToInput(restored.text);
     }
     if (restored.media.length) {
       state.pendingMedia = restored.media.concat(state.pendingMedia);

@@ -2,8 +2,11 @@
 import asyncio
 import json
 import os
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from factory.agent_runtime import builtin_tools
 from memory.chat_memory import ChatMemoryManager

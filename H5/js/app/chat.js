@@ -72,8 +72,6 @@
     const usageByCompletion = new Map();
     const usageWithoutId = new Map();
     let roundUsageAcc = null;
-    // 注入提示待清除标记：message_injected 后置位，下一轮模型输出开始清除
-    let injectedNoticePending = false;
 
     function sealTextBlocks() {
       if (curThink) curThink.done();
@@ -137,12 +135,6 @@
       if (evt.type === "done") return;
       const data = evt.data || {};
 
-      // 上一轮注入提示：下一轮模型输出（思考/正文/工具调用）开始即清除
-      if (injectedNoticePending && (data.content || data.reasoning_content || (data.tool_calls && data.tool_calls.length))) {
-        injectedNoticePending = false;
-        App.clearInjectedNotice();
-      }
-
       // 事件不含 reasoning_content 字段 = 当前思考阶段已结束
       const hasReasoning = typeof data.reasoning_content === "string" && data.reasoning_content;
       if (!hasReasoning && curThink) {
@@ -158,13 +150,20 @@
         return;
       }
       if (data.event === "message_injected") {
-        // 运行中注入的用户消息（消息引导）：消息已由后端落盘并在下一轮
-        // 模型调用可见；界面上在消息框上方显示提示（同 todo 区域），
-        // 下一轮模型输出开始后清除，不再向消息流追加用户气泡
+        // 运行中注入的用户消息（消息引导）在检查点被消费：此刻消息节点
+        // 末尾恰好在当前轮工具结果之后，在此插入气泡与后端 messages
+        // 顺序一致；同时清除消息框上方的待注入提示
         sealTextBlocks();
-        App.showInjectedNotice(typeof data.text === "string" ? data.text : "");
-        injectedNoticePending = true;
+        App.clearInjectedPending(sessionId);
+        App.appendUserMessage(
+          typeof data.text === "string" ? data.text : "",
+          null,
+          sessionId,
+          null,
+          msg
+        );
         hasStage = true;
+        if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
         return;
       }
       if (data.event === "ask_user") {
@@ -309,7 +308,9 @@
         // 流式整块重建后立即同步设置钉住态，避免 MutationObserver 延迟到下一帧造成左右闪切
         App.updateCodeblockCopyButtons();
       }
-      // 工具调用增量：按 index 合并，参数 JSON 流式展示
+      // 工具调用增量：按 index 合并，参数 JSON 逐帧流式展示。
+      // 模型生成 arguments（命令文本/文件内容等）的每个增量帧都会实时
+      // 追加到工具块输入区并自动滚动；首次收到增量时自动展开该块。
       if (Array.isArray(data.tool_calls)) {
         sealTextBlocks();
         if (!activeToolBlocks) activeToolBlocks = new Map();
@@ -325,14 +326,34 @@
           const tb = activeToolBlocks.get(idx);
           const fn = d.function || {};
           if (fn.name) tb.ui.setName(tb.name = fn.name);
-          if (typeof fn.arguments === "string") {
+          // 首个参数数据到达：进入流式展示态（自动展开 + 执行中样式）
+          if (!tb.streamStarted && fn.arguments) {
+            tb.streamStarted = true;
+            tb.ui.beginStream();
+          }
+          if (typeof fn.arguments === "string" && fn.arguments) {
             tb.argsText += fn.arguments;
-            tb.ui.setInput(tb.argsText);
+            tb.ui.addInputDelta(fn.arguments);
           } else if (fn.arguments && typeof fn.arguments === "object") {
             tb.argsText = JSON.stringify(fn.arguments, null, 2);
-            tb.ui.setInput(tb.argsText);
+            tb.ui.setInputText(tb.argsText);
           }
         });
+      }
+      // 工具开始执行：参数已完整、后端正在调用（等待结果阶段的可感知状态）
+      if (data.tool_start && data.tool_start.function_name) {
+        const ts = data.tool_start;
+        const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
+        let tb = activeBlocks.find(function (t) { return t && !t.done && t.name === ts.function_name; })
+          || activeBlocks.find(function (t) { return t && !t.done; });
+        if (!tb) {
+          tb = { ui: App.buildToolBlock(ts.function_name), argsText: "", done: false };
+          toolBlocks.push(tb);
+          hasStage = true;
+          appendStage(tb.ui.wrap);
+        }
+        tb.ui.setName(ts.function_name);
+        tb.ui.executing();
       }
       // 工具结果：填充到对应块
       if (data.tool_return && data.tool_return.function_name) {
@@ -373,8 +394,8 @@
     return {
       handle: handle,
       finish: function () {
-        injectedNoticePending = false;
-        App.clearInjectedNotice();
+        // 流结束仍未收到消费信号：清除待注入提示（避免停止/异常时残留）
+        App.clearInjectedPending(sessionId);
         if (curAnswer) curAnswer.classList.remove("msg-cursor");
         msg.querySelectorAll(".think-block.is-streaming").forEach(function (think) {
           think.classList.remove("is-streaming");

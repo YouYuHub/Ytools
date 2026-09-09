@@ -155,6 +155,32 @@
     });
   }
 
+  // 整行媒体占位行（提取伪标签后的常见形态）：一行恰好一个占位符
+  const MEDIA_LINE_RE = new RegExp("^" + MEDIA_PH_OPEN + "\\d+" + MEDIA_PH_OPEN + "$");
+
+  // 段落冲刷：连续的「整行媒体占位」各自独立成段（行间不插 <br>），渲染后
+  // 媒体控件成为相邻 inline-block 兄弟节点，容器 >680px 时可两列并排；
+  // 其余行仍合并为一个段落（行间 <br> 保持换行语义）
+  function flushParagraph(buf) {
+    const out = [];
+    let textBuf = [];
+    buf.forEach(function (line) {
+      if (MEDIA_LINE_RE.test(line.trim())) {
+        if (textBuf.length) {
+          out.push("<p>" + textBuf.map(renderInline).join("<br>") + "</p>");
+          textBuf = [];
+        }
+        out.push("<p>" + line.trim() + "</p>");
+      } else {
+        textBuf.push(line);
+      }
+    });
+    if (textBuf.length) {
+      out.push("<p>" + textBuf.map(renderInline).join("<br>") + "</p>");
+    }
+    return out.join("");
+  }
+
   function renderTable(lines) {
     const rows = lines.map(splitTableRow);
     const isDivider = rows.length > 1 && rows[1].every(function (c) { return /^:?-{2,}:?$/.test(c); });
@@ -363,7 +389,7 @@
         continue;
       }
 
-      // 普通段落（合并连续行）
+      // 普通段落（合并连续行；整行媒体占位各自独立成段，便于两列并排）
       const buf = [line];
       i++;
       while (
@@ -374,7 +400,7 @@
         buf.push(lines[i]);
         i++;
       }
-      html.push("<p>" + buf.map(renderInline).join("<br>") + "</p>");
+      html.push(flushParagraph(buf));
     }
 
     return '<div class="md">' +

@@ -307,6 +307,19 @@ const api_url = localStorage.getItem("ytools-api-base")
     return res && typeof res === "object" ? res : { ok: false };
   }
 
+  /**
+   * 撤回一条尚未消费的注入消息（消息引导提示行 ×）：
+   * 按文本匹配从后端注入队列移除；已被消费时 {ok:false}（不可撤回）。
+   */
+  async function cancelInjectMessage(sessionId, text) {
+    const res = await request("/cancel_inject_message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, text: text }),
+    });
+    return res && typeof res === "object" ? res : { ok: false };
+  }
+
   // ---------- 会话文件 ----------
   function uploadSessionFiles(sessionId, fileList) {
     const fd = new FormData();
@@ -548,6 +561,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     setSessionWorkDir,
     stopChat,
     injectMessage,
+    cancelInjectMessage,
     uploadSessionFiles,
     uploadSessionMedia,
     sessionMediaUrl,

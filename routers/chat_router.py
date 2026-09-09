@@ -131,6 +131,28 @@ async def inject_message(request: Request):
     return JSONResponse(content={"ok": True})
 
 
+@api_chat_router.post('/cancel_inject_message')
+async def cancel_inject_message(request: Request):
+    """撤回一条尚未消费的运行中注入消息（消息引导提示行 ×）。
+
+    按文本匹配从注入队列移除；已被生成循环消费时返回 ok=False（不可撤回）。
+    请求体：{"session_id": str, "text": str}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON")
+    session_id = normalize_session_id(str((body or {}).get("session_id") or "default"))
+    text = str((body or {}).get("text") or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text 不能为空")
+    from factory.chat_factory import cancel_injected_message
+    result = await cancel_injected_message(session_id, text)
+    if not result.get("ok"):
+        return JSONResponse(content={"ok": False, "reason": result.get("reason", "not_found")})
+    return JSONResponse(content={"ok": True})
+
+
 @api_chat_router.get('/chat_stream/status')
 async def chat_stream_status(session_id: str = "default"):
     """

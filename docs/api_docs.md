@@ -30,6 +30,7 @@
 - `warning`：提示（如未选工具）
 - `reasoning_content` / `content`：思考与正文增量
 - `tool_calls`：工具调用增量（按 index 合并）
+- `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{content,status(pending|in_progress|done)}]}`；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）

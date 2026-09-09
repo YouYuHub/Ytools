@@ -96,7 +96,7 @@ _FIRST_CALL_FILE_MEMORY_MAX_CHARS = 3000
 # 记录当前后台运行的会话生成任务（session_id -> _SessionStream）
 # 前端刷新/断开 SSE 连接时，后台任务不会被取消，事件持续写入缓冲与 JSONL
 _SESSION_STREAMS: dict[str, "_SessionStream"] = {}
-_SESSION_STREAM_MAX_BUFFER = 4000  # 有界环形缓冲：防止长时间无消费时内存膨胀
+_SESSION_STREAM_MAX_BUFFER = 20000  # 有界环形缓冲：防止长时间无消费时内存膨胀
 
 
 def _format_tool_result(result: Any) -> str:
@@ -265,7 +265,7 @@ def _build_sys_prompt() -> str:
     media_prompt = _build_media_tag_prompt()
     return (
         "当前系统已安装基础 py 环境。\n"
-        "程序支持并发工具调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
+        "程序所有工具支持都并发调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
         "注意：\n"
         f"{numbered_notes}\n"
         + media_prompt
@@ -477,7 +477,9 @@ class _SessionStream:
     """一次后台 Agent 生成任务的环形事件缓冲 + 订阅管理。
 
     - 生成循环独立任务运行：页面刷新不再中止生成；
-    - 后到的消费者回放"当前轮"起的事件（含 reconnect 标记）；
+    - 后到的消费者回放"任务起点"起的全部事件（含 reconnect 标记）：
+      运行中任务的 chat_round 在任务收尾才写 JSONL，历史读不到，
+      回放必须覆盖整个任务才能在刷新后重建此前轮次的界面；
     - emit 为非阻塞追加（有界 deque），消费端断线不影响生产端。
     """
 
@@ -486,7 +488,8 @@ class _SessionStream:
         self.task: asyncio.Task | None = None
         self.buffer = deque(maxlen=_SESSION_STREAM_MAX_BUFFER)
         self.seq = 0              # 已放入缓冲的事件总条数
-        self.round_start_seq = 0  # 当前生成轮次的第一条事件序号（重连回放起点）
+        self.round_start_seq = 0  # 任务回放起点（首个循环检查点记录，此后不变）
+        self._round_start_set = False
         self.done = False
         self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
@@ -527,8 +530,13 @@ class _SessionStream:
             pass
 
     def set_round_start(self) -> None:
-        # 每轮循环开始处调用，确保重连时只回放当前轮
-        self.round_start_seq = self.seq
+        # 每轮循环开始处都会调用，但只有首次生效（任务起点）。运行中任务
+        # 的 chat_round 尚未落盘（任务收尾才写 JSONL），刷新重连必须回放
+        # 整个任务的事件才能重建此前轮次的界面；若每轮都重置起点，前端
+        # 只能收到当前轮的实时数据，任务早期步骤会全部丢失
+        if not self._round_start_set:
+            self.round_start_seq = self.seq
+            self._round_start_set = True
 
     async def finish(self) -> None:
         self.done = True
@@ -669,7 +677,7 @@ async def _compact_task_context_if_needed(
         rebuilt = [{
             "role": "system",
             "content": (
-                "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
+                "你是一个聪明的助手，正在使用 Ytools 程序帮忙用户，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
                 + runtime_sys_text
                 + file_block_text
             ),
@@ -1505,6 +1513,24 @@ async def _run_chat_generation(
                 print("[WARNING] 没有可执行的有效工具，退出循环")
                 break
             print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具")
+            # 工具开始执行事件：参数已完整、即将调用。前端据此把对应工具块
+            # 置为"执行中"，等待结果期间有可感知状态。内置工具（write_file/
+            # edit_file/read_file/search_files/todo_write 等）与外部 MCP 工具
+            # 统一推送；被拦截的未授权工具不推送（它们会立即返回拒绝结果）。
+            try:
+                for _, start_tc, start_tn, start_ta in parsed_tools:
+                    start_event = {
+                        "tool_start": {
+                            "function_name": start_tn,
+                            "arguments": start_ta,
+                        }
+                    }
+                    await _stream_emit(
+                        stream,
+                        f"data: {json.dumps(start_event, ensure_ascii=False)}\n\n",
+                    )
+            except Exception as start_emit_error:
+                print(f"[WARN] tool_start 事件推送失败: {start_emit_error}")
             # 内置工具与 MCP 工具分开执行
             builtin_results = []
             external_parsed_tools = []
@@ -1939,7 +1965,7 @@ async def tool_chat_server(
 
     - 首个请求启动后台生成任务（默认派发到会话独立 worker 进程，
       CHAT_WORKER_MODE=inline 时回退主进程 asyncio 任务）；
-    - 页面刷新后的重连请求（无用户消息）只订阅事件缓冲，从当前轮起点回放；
+    - 页面刷新后的重连请求（无用户消息）只订阅事件缓冲，从任务起点回放；
     - 携带新用户消息的请求会先平滑打断旧任务，再重新开始一轮生成。
     """
     session_id = getattr(tool_request, 'session_id', 'default')
@@ -2049,6 +2075,40 @@ async def inject_user_message(session_id: str, message: dict) -> dict:
         return {"ok": False, "reason": "not_running"}
     stream.injected_messages.append(message or {})
     return {"ok": True}
+
+
+async def cancel_injected_message(session_id: str, text: str) -> dict:
+    """撤回一条尚未消费的运行中注入消息（消息引导提示行的 × 按钮）。
+
+    worker 模式：向会话 worker 发送 cancel_inject 命令，按文本匹配移除
+    注入队列中未消费的一条；inline 模式：直接从 _SessionStream 注入队列
+    移除。消息已被生成循环取走（已消费）时返回 ok=False，前端提示不可撤回。
+    """
+    session_id = normalize_session_id(session_id)
+    target = (text or "").strip()
+    if not target:
+        return {"ok": False, "reason": "empty"}
+    if _generation_use_worker():
+        proxy = peek_worker_proxy(session_id)
+        if proxy is None or not proxy.cancel_injected_message(target):
+            return {"ok": False, "reason": "not_running"}
+        return {"ok": True}
+    stream = _get_session_stream(session_id)
+    if stream is None:
+        return {"ok": False, "reason": "not_running"}
+    removed = False
+    remaining: deque = deque()
+    while stream.injected_messages:
+        item = stream.injected_messages.popleft()
+        item_text = ""
+        if isinstance(item, dict):
+            item_text = content_part_to_text(item.get("content")).strip()
+        if not removed and item_text == target:
+            removed = True
+            continue
+        remaining.append(item)
+    stream.injected_messages.extend(remaining)
+    return {"ok": removed, "reason": "" if removed else "not_found"}
 
 
 async def stop_chat_task(session_id):

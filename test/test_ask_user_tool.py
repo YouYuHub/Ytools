@@ -1,6 +1,10 @@
 """内置 ask_user 工具（向用户提问）测试。"""
 import asyncio
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from factory.agent_runtime import builtin_tools
 from memory.chat_memory import ChatMemoryManager, _load_meta_and_entries

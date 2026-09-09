@@ -8,9 +8,12 @@
 """
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from factory.agent_runtime import builtin_tools as bt
 
@@ -256,6 +259,24 @@ class BuiltinFileToolTests(unittest.TestCase):
             bt.execute_search_files({"pattern": "("})  # 非法正则
         with self.assertRaises(ValueError):
             bt.execute_search_files({"pattern": ""})
+
+    def test_search_files_default_max_depth_recurses(self):
+        # 不传 max_depth 时应按 schema 默认值递归子目录（而非只扫当前目录一层）
+        Path(self._tmp, "sub", "deep").mkdir(parents=True)
+        Path(self._tmp, "sub", "deep", "nested.txt").write_text(
+            "DEEP_TARGET\n", encoding="utf-8")
+        result = bt.execute_search_files({"pattern": r"DEEP_TARGET"})
+        self.assertEqual(result["files_matched"], 1)
+
+    def test_search_files_is_regex_false_is_literal(self):
+        # is_regex=False 必须按字面匹配：正则语义会把 "a.c" 匹配到 "abc"
+        self._make_file("lit.txt", "abc x\na.c x\n")
+        literal = bt.execute_search_files({
+            "pattern": "a.c", "is_regex": False,
+        })
+        self.assertEqual(literal["total_matches"], 1)   # 仅字面行命中
+        regex = bt.execute_search_files({"pattern": "a.c"})
+        self.assertEqual(regex["total_matches"], 2)     # 正则两行都命中
 
     def test_search_files_max_results_cap(self):
         for i in range(5):

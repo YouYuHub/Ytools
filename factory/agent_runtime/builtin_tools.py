@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
-import io
+# import io
 import json
 import os
 import re
-
 from pathlib import Path
 from typing import Any
 
@@ -100,11 +99,11 @@ TODO_TOOL_DEFINITION = {
     "function": {
       "name": TODO_TOOL_NAME,
       "description": (
-          "写入/更新当前任务计划（todo list）。每次调用提交完整的计划列表（全量覆盖），"
-          "系统会把计划展示给用户并帮助你跟踪多步骤任务。"
+          "写入/更新当前任务计划（todo list）。调用请提交完整的计划列表（全量覆盖），"
+          "计划会展示给用户并帮助你跟踪多步骤任务。"
           # "任务包含多个步骤、需要长期规划或用户要求制定计划时使用；简单一次性任务不要使用。"
-          "开始一个步骤前先把该步骤置为 in_progress，完成后置为 done，并按最新进展调整后续步骤。"
-          "不建议简单任务使用，复杂任务完成时建议调用一次更新进度。"
+          "开始一个步骤前先把该步骤置为 in_progress，完成后置为 done，按最新进展调整后续步骤。"
+          "不建议简单任务使用。"
       ),
       "parameters": {
         "type": "object",
@@ -177,7 +176,15 @@ def execute_builtin_tool(
     query_name = ""
     if isinstance(tool_args, dict):
         query_name = str(tool_args.get("tool_name", "")).strip()
-    exists = bool(query_name in available_tool_names) if query_name else False
+    # 内置工具不进 MCP 注册表（调用方传入的 available_tool_names 只含 MCP 工具），
+    # 但它们真实存在、可在工具选择中勾选：这里并入内置工具全集一起识别，
+    # 避免查询 ask_user / todo_write / read_file 等时误报"不存在"。
+    all_known_names = (
+        {str(n).strip() for n in available_tool_names if str(n).strip()}
+        | set(SELECTABLE_BUILTIN_TOOL_NAMES)
+        | {CHECK_TOOL_EXISTS_NAME}
+    )
+    exists = bool(query_name in all_known_names) if query_name else False
     # 当前轮启用集合缺省回退全集（旧调用方未传时行为不变）
     enabled_names = (
         {str(n).strip() for n in enabled_tool_names if str(n).strip()}
@@ -187,6 +194,12 @@ def execute_builtin_tool(
     disabled = exists and enabled_names is not None and query_name not in enabled_names
     if not exists:
         message = f"后端实时工具列表中不存在名为 {query_name} 的工具"
+        # 模型常因大小写/下划线写错工具名：给出最接近候选帮助一次纠正
+        close = difflib.get_close_matches(
+            query_name, sorted(all_known_names), n=3, cutoff=0.6
+        )
+        if close:
+            message += f"；名称最接近的已有工具：{'、'.join(close)}（注意大小写与下划线）"
     elif disabled:
         message = (
             f"{query_name} 在后端已注册但未被当前轮次任务启用（用户禁用了该工具），"
@@ -194,11 +207,19 @@ def execute_builtin_tool(
         )
     else:
         message = f"{query_name} 当前轮次任务中可用"
+    if not exists:
+        server_value = ""
+    elif query_name in available_tool_servers:
+        server_value = available_tool_servers[query_name]
+    elif query_name in SELECTABLE_BUILTIN_TOOL_NAMES or query_name == CHECK_TOOL_EXISTS_NAME:
+        server_value = BUILTIN_TOOL_SERVER_KEY
+    else:
+        server_value = ""
     return {
         "tool_name": query_name,
         "exists": exists,
         "disabled": disabled,
-        "server": available_tool_servers.get(query_name, "") if exists else "",
+        "server": server_value,
         "message": message,
     }
 
@@ -213,7 +234,7 @@ ASK_USER_TOOL_DEFINITION = {
             "向用户提问并等待回答：前端会弹出交互卡片，用户可点选选项或在输入框自由作答，"
             "回答会作为下一条用户消息发送给你。"
             "适用场景：任务存在关键分歧（方案二选一、缺失必要参数、执行不可逆操作前确认）；"
-            "一次提出 1-3 个问题，问题要具体、选项要互斥且可直接执行；"
+            "一次提出 1-5 个问题，问题要具体、选项要互斥且可直接执行；"
             "需要用户同时选择多项时把该题的 multiple 设为 true。"
             "注意：调用后当前任务会暂停等待用户回答，收到用户的回答消息后再继续任务；"
             "不要用本工具进行闲聊或询问常识性问题。"
@@ -223,7 +244,7 @@ ASK_USER_TOOL_DEFINITION = {
             "properties": {
                 "questions": {
                     "type": "array",
-                    "description": "问题列表（1-3 个）",
+                    "description": "问题列表（1-5 个）",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -521,6 +542,10 @@ _READ_FILE_MAX_CHARS = 60000
 _SEARCH_MAX_RESULTS_LIMIT = 200
 _SEARCH_CONTEXT_MAX = 5
 _SEARCH_DEFAULT_FILE_MB = 2.0
+# 模型未传 max_depth 时的默认递归深度（与 schema 描述一致）。
+# 注意：内置工具走 dict 参数分发，schema 的 default 不会被框架自动应用，
+# 缺省值必须在这里显式兜底，否则会退化成 0（只扫当前目录一层）。
+_SEARCH_DEFAULT_MAX_DEPTH = 6
 # 跨文件搜索/遍历时默认跳过的目录名（含各语言依赖与构建产物目录）
 _SKIP_DIR_NAMES = {
     ".git", ".idea", ".vscode", "__pycache__", "node_modules",
@@ -755,23 +780,24 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
 
 def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 search_files 实现：语义对齐 MCP 同名工具，返回纯文本结果。"""
-    import fnmatch
-    import re as _re
-
     args = tool_args or {}
     pattern = (str(args.get("pattern") or "")).strip()
     if not pattern:
         raise ValueError("pattern 不能为空")
     root = _resolve_dir_path(args.get("dir_path") or ".")
-    flags = _re.IGNORECASE if bool(args.get("ignore_case")) else 0
-    is_regex = bool(args.get("is_regex", True))
-    if is_regex:
+    flags = re.IGNORECASE if bool(args.get("ignore_case")) else 0
+    # 键名兼容：schema 定义为 is_regex；旧实现误读 isregex 导致该参数被静默忽略
+    is_regex_raw = args.get("is_regex")
+    if is_regex_raw is None:
+        is_regex_raw = args.get("isregex")
+    isregex = True if is_regex_raw is None else bool(is_regex_raw)
+    if isregex:
         try:
-            regex = _re.compile(pattern, flags)
-        except _re.error as exc:
+            regex = re.compile(pattern, flags)
+        except re.error as exc:
             raise ValueError(f"正则表达式不合法: {exc}")
     else:
-        regex = _re.compile(_re.escape(pattern), flags)
+        regex = re.compile(re.escape(pattern), flags)
     context = max(0, min(int(args.get("context_lines") or 0), _SEARCH_CONTEXT_MAX))
     limit = max(1, min(int(args.get("max_results") or 50), _SEARCH_MAX_RESULTS_LIMIT))
     name_filter = (str(args.get("file_pattern") or "")).strip()
@@ -786,7 +812,12 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     files_scanned = 0
     files_matched = 0
     skipped_large = 0
-    for path, kind in _walk_entries(root, max(0, int(args.get("max_depth") or 0))):
+    try:
+        raw_depth = args.get("max_depth")
+        max_depth = int(raw_depth) if raw_depth is not None else _SEARCH_DEFAULT_MAX_DEPTH
+    except (TypeError, ValueError):
+        max_depth = _SEARCH_DEFAULT_MAX_DEPTH
+    for path, kind in _walk_entries(root, max(0, max_depth)):
         if kind != "file":
             continue
         if name_filter and not fnmatch.fnmatch(path.name, name_filter):

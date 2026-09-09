@@ -54,6 +54,44 @@ class CheckToolExistsTests(unittest.TestCase):
         self.assertFalse(result["disabled"])
         self.assertIn("不存在", result["message"])
 
+    def test_builtin_tool_not_in_mcp_registry_still_exists(self):
+        # 真实场景：调用方传入的注册表只含 MCP 工具；内置工具必须仍被识别为存在
+        result = builtin_tools.execute_builtin_tool(
+            "check_tool_exists",
+            {"tool_name": "ask_user"},
+            {"fetch_url", "run_command"},          # 不含任何内置工具名
+            {"fetch_url": "sys", "run_command": "sys"},
+            enabled_tool_names={"fetch_url", "ask_user"},
+        )
+        self.assertTrue(result["exists"])
+        self.assertFalse(result["disabled"])
+        self.assertEqual(result["server"], "__builtin__")
+
+    def test_unselected_builtin_tool_reports_disabled(self):
+        # 内置工具存在但本轮未勾选 → disabled 而非"不存在"
+        result = builtin_tools.execute_builtin_tool(
+            "check_tool_exists",
+            {"tool_name": "todo_write"},
+            {"fetch_url"},
+            {"fetch_url": "sys"},
+            enabled_tool_names={"fetch_url"},
+        )
+        self.assertTrue(result["exists"])
+        self.assertTrue(result["disabled"])
+        self.assertIn("未被当前轮次任务启用", result["message"])
+
+    def test_typo_query_suggests_closest_tool_names(self):
+        # 大小写/下划线写错时给出最接近候选，帮助模型一次纠正
+        result = builtin_tools.execute_builtin_tool(
+            "check_tool_exists",
+            {"tool_name": "todo_writ"},
+            {"fetch_url"},
+            {"fetch_url": "sys"},
+            enabled_tool_names={"fetch_url"},
+        )
+        self.assertFalse(result["exists"])
+        self.assertIn("todo_write", result["message"])
+
     def test_legacy_call_without_enabled_set_keeps_old_behavior(self):
         # 不传 enabled_tool_names：视为全部启用（旧调用方兼容，不误报 disabled）
         result = builtin_tools.execute_builtin_tool(

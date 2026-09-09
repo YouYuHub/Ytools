@@ -268,6 +268,25 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         evt_queue.put({"type": "injected", "ok": True})
                     else:
                         evt_queue.put({"type": "injected", "ok": False})
+                elif ctype == "cancel_inject":
+                    # 撤回尚未消费的注入消息（前端提示行 ×）：按文本匹配移除
+                    # 一条；已被生成循环取走（已消费）时回报 ok=False
+                    target = str(raw.get("text") or "").strip()
+                    removed = False
+                    if adapter is not None and target:
+                        kept = []
+                        while True:
+                            try:
+                                item = adapter.injected_messages.get_nowait()
+                            except queue.Empty:
+                                break
+                            if not removed and _injected_content_text(item) == target:
+                                removed = True
+                                continue
+                            kept.append(item)
+                        for item in kept:
+                            adapter.injected_messages.put(item)
+                    evt_queue.put({"type": "injected_cancelled", "ok": removed})
                 elif ctype == "stop":
                     reason = "user" if raw.get("reason") == "user" else "interrupt"
                     if current_task is not None and not current_task.done():
@@ -474,6 +493,16 @@ class SessionWorkerProxy:
             return False
         return self._send({"type": "inject", "message": message or {}})
 
+    def cancel_injected_message(self, text: str) -> bool:
+        """撤回一条尚未消费的注入消息（按文本匹配）。
+
+        发送即视为已受理（worker 内部按匹配结果移除）；worker 未运行或
+        无活动任务时返回 False。
+        """
+        if not self.is_alive() or not self.is_generation_running():
+            return False
+        return self._send({"type": "cancel_inject", "text": text})
+
     def shutdown(self, timeout: float = 8.0) -> None:
         """优雅关停：通知 worker 收尾后回收进程。"""
         if self.is_alive():
@@ -540,6 +569,19 @@ def sweep_dead_worker_proxies() -> None:
                     proxy.shutdown()
                 except Exception:
                     pass
+
+
+def _injected_content_text(message: Any) -> str:
+    """提取注入消息的纯文本（撤回匹配用；与主进程 content_part_to_text 口径一致）。"""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        ).strip()
+    return ""
 
 
 def peek_worker_proxy(session_id: str) -> Optional[SessionWorkerProxy]:

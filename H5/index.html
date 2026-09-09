@@ -240,28 +240,31 @@
                                     <span><b>Presence penalty</b><output id="presencePenaltyValue">2</output></span>
                                     <input id="presencePenalty" type="range" min="-2" max="2" step="0.1" value="2">
                                 </label>
-                                <label class="enhance-field">
-                                    <span>思考深度</span>
-                                    <select id="reasoningEffort">
-                                        <option value="none">none</option>
-                                        <option value="minimal">minimal</option>
-                                        <option value="low">low</option>
-                                        <option value="medium">medium</option>
-                                        <option value="high">high</option>
-                                        <option value="xhigh">xhigh</option>
-                                        <option value="max">max</option>
-                                    </select>
-                                </label>
-                                <label class="enhance-check">
-                                    <input type="checkbox" id="enableThinking">
-                                    <span>启用 thinking</span>
-                                    <small>通过 extra_body.enable_thinking 传递</small>
-                                </label>
+                                <div class="enhance-row">
+                                    <label class="enhance-field">
+                                        <span>思考深度</span>
+                                        <select id="reasoningEffort">
+                                            <option value="none">none</option>
+                                            <option value="minimal">minimal</option>
+                                            <option value="low">low</option>
+                                            <option value="medium">medium</option>
+                                            <option value="high">high</option>
+                                            <option value="xhigh">xhigh</option>
+                                            <option value="max">max</option>
+                                        </select>
+                                    </label>
+                                    <label class="enhance-check enhance-check-inline"
+                                        title="通过 extra_body.enable_thinking 传递">
+                                        <input type="checkbox" id="enableThinking">
+                                        <span>启用 thinking</span>
+                                    </label>
+                                </div>
                             </div>
                             <div class="enhance-foot">
                                 <div class="enhance-foot-left">
                                     <button id="enhanceReset" type="button">恢复默认</button>
-                                    <button id="enhanceClearOverride" type="button" class="hidden" title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
+                                    <button id="enhanceClearOverride" type="button" class="hidden"
+                                        title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
                                     <span id="enhanceHint">参数未修改时仅切换模型、保留原参数</span>
                                 </div>
                                 <div class="enhance-actions">
@@ -341,9 +344,23 @@
                                 <button class="round-btn" id="stopBtn" title="停止生成">
                                     <span class="stop-square"></span>
                                 </button>
-                                <button class="round-btn round-btn-sub stop-menu-btn hidden" id="stopMenuBtn" title="发送选项">
-                                    <svg class="icon" viewBox="0 0 24 24">
-                                        <path d="m18 15-6-6-6 6" />
+                                <button class="round-btn round-btn-sub stop-menu-btn hidden" id="stopMenuBtn"
+                                    title="发送选项">
+                                    <svg class="icon" preserveAspectRatio="none" viewBox="0 0 24 24">
+                                        <path d="
+                                            M12 2
+                                            L3 11
+                                            L5.8 13.8
+                                            L10 9.6
+                                            L10 21
+                                            Q10 22 11 22
+                                            L13 22
+                                            Q14 22 14 21
+                                            L14 9.6
+                                            L18.2 13.8
+                                            L21 11
+                                            Z
+                                        " fill="currentColor" />
                                     </svg>
                                 </button>
                                 <div class="menu queue-menu hidden" id="queueMenu">
@@ -584,7 +601,8 @@
                                 <button type="button" data-md="h3" title="三级标题">H3</button>
                                 <span class="skills-md-sep"></span>
                                 <button type="button" data-md="bold" class="skills-md-b" title="加粗 (Ctrl+B)">B</button>
-                                <button type="button" data-md="italic" class="skills-md-i" title="斜体 (Ctrl+I)">I</button>
+                                <button type="button" data-md="italic" class="skills-md-i"
+                                    title="斜体 (Ctrl+I)">I</button>
                                 <button type="button" data-md="code" title="行内代码">&lt;&gt;</button>
                                 <span class="skills-md-sep"></span>
                                 <button type="button" data-md="ul" title="无序列表">• 列表</button>

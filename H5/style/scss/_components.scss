@@ -742,8 +742,42 @@
   .enhance-field {
     justify-content: space-between;
     gap: 12px;
-    padding: 8px 0;
+    padding: 5px 0;
     font-size: 13px;
+
+    select {
+      min-width: 0;
+      max-width: 200px;
+      padding: 4px 8px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg-code);
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+    }
+  }
+
+  // 思考深度（select）与启用 thinking（checkbox）同行；窄屏放不下自动换行
+  .enhance-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+
+    .enhance-field {
+      flex: 1 1 auto;
+    }
+  }
+
+  // 行内紧凑版 check（去掉独立行的上下留白，small 提示移到 title 悬停）
+  .enhance-check-inline {
+    display: inline-flex;
+    gap: 6px;
+    padding: 5px 0;
+    white-space: nowrap;
+    cursor: pointer;
   }
 
   // 模型选择按钮：面板内展开列表（替代原生 select 弹出层，窄屏可完整显示/滚动）
@@ -868,13 +902,13 @@
 
   .enhance-range {
     display: block;
-    padding: 8px 0;
+    padding: 4px 0;
     color: var(--text-secondary);
     font-size: 12px;
 
     > span {
       justify-content: space-between;
-      margin-bottom: 5px;
+      margin-bottom: 3px;
     }
 
     b {

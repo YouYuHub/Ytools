@@ -71,9 +71,9 @@ window.App = window.App || {};
     // 均为 { text, media } 结构；media 为待上传附件快照，空数组表示纯文本
     steerMessage: null,
     pendingQueue: [],
-    // 运行中已注入的引导消息提示（在消息框上方展示，下一轮模型输出开始后清除）：
-    // { sessionId, text }；消息本身由后端落盘，历史回放仍显示为用户消息
-    injectedNotice: null,
+    // 已提交后端、等待检查点消费的引导消息：{ sessionId, text }，
+    // 在消息框上方展示；SSE message_injected（消费信号）到达时清除
+    injectedPending: null,
     // 引导/队列按钮组当前展开的菜单归属："steer" | "queue" | ""（未展开）
     composerSendMode: "",
     // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，

@@ -381,7 +381,7 @@
   // 首帧（浏览器原生 <video>，#t=0.1 确保首帧绘制）；input_audio 渲染固定
   // 格式音频徽标；docs 为发送时随消息的会话文档快照（file_memory，仅前端
   // 展示，不进入消息内容部件）
-  function appendUserMessage(content, ts, sessionId, docs) {
+  function appendUserMessage(content, ts, sessionId, docs, container) {
     const msg = el("div", "msg msg-user");
     if (ts) msg.appendChild(el("div", "msg-time", FormatUtils.fmtTime(ts)));
     const bubble = el("div", "msg-bubble");
@@ -466,7 +466,9 @@
     }
     if (text) bubble.appendChild(el("div", "msg-user-text", text));
     msg.appendChild(bubble);
-    chatInner.appendChild(msg);
+    // container 缺省追加到会话流末尾；传入正在流式的助手消息节点时，
+    // 气泡嵌入其当前内容之后（工具结果位置），保持注入消息的时间顺序
+    (container || chatInner).appendChild(msg);
     scrollToBottom();
     return msg;
   }
@@ -510,6 +512,9 @@
   }
 
   // 工具调用块：头部（名称+状态）+ 可展开主体（输入 JSON / 输出文本）
+  // 默认折叠，不自动展开（避免流式期间反复撑高页面）；用户点开即可看到
+  // 逐帧流入的参数数据。上游把 arguments 整段一次性下发时（部分供应商
+  // 不分片），由打字机揭示器按节奏逐步显示，模拟逐帧生成的观感。
   function buildToolBlock(name) {
     const wrap = el("div", "tool-block");
     const head = el("button", "tool-block-head");
@@ -525,11 +530,50 @@
     const inLabel = el("span", "tool-io-label", "输入");
     const inPre = el("pre", "tool-io", "");
     const outLabel = el("span", "tool-io-label", "输出");
-    const outPre = el("pre", "tool-io", "执行中…");
+    const outPre = el("pre", "tool-io", "");
     body.appendChild(inLabel);
     body.appendChild(inPre);
     body.appendChild(outLabel);
     body.appendChild(outPre);
+
+    let streaming = false;
+    // 打字机揭示器：小增量（真分片流式）直接追加；大增量（整段下发）进入
+    // 揭示队列按固定节奏逐步显示。折叠态下照常消费，用户展开时看到的是
+    // 进行中的生成过程。
+    let revealQueue = "";      // 待揭示的剩余文本
+    let revealTimer = null;
+    const REVEAL_CHARS_PER_TICK = 6;   // 每 tick 揭示的字符数
+    const REVEAL_INTERVAL_MS = 16;     // tick 间隔（约每秒 375 字符）
+
+    function stopReveal() {
+      if (revealTimer) {
+        clearInterval(revealTimer);
+        revealTimer = null;
+      }
+    }
+
+    function startReveal() {
+      if (revealTimer) return;
+      revealTimer = setInterval(function () {
+        if (!revealQueue.length) {
+          stopReveal();
+          return;
+        }
+        const piece = revealQueue.slice(0, REVEAL_CHARS_PER_TICK);
+        revealQueue = revealQueue.slice(REVEAL_CHARS_PER_TICK);
+        inPre.textContent += piece;
+        inPre.scrollTop = inPre.scrollHeight;
+      }, REVEAL_INTERVAL_MS);
+    }
+
+    function flushReveal() {
+      stopReveal();
+      if (revealQueue) {
+        inPre.textContent += revealQueue;
+        revealQueue = "";
+        inPre.scrollTop = inPre.scrollHeight;
+      }
+    }
 
     head.addEventListener("click", function () { wrap.classList.toggle("open"); });
     // 展开态下双击主体区域即可折叠（展开仍走头部按钮）
@@ -541,12 +585,63 @@
     return {
       wrap: wrap,
       setName: function (n) { head.querySelector(".tool-block-name").textContent = n || "tool"; },
-      setInput: function (t) { inPre.textContent = t || "{}"; },
+      setInput: function (t) {
+        // 整体重设（结果返回/历史回放路径）：清空揭示队列直接显示最终文本
+        stopReveal();
+        revealQueue = "";
+        inPre.textContent = t || "{}";
+      },
       setOutput: function (t) { outPre.textContent = t || "(无输出)"; },
+      // 流式参数生成开始：标记状态并清空输出占位（不改变折叠态）
+      beginStream: function () {
+        streaming = true;
+        wrap.classList.add("is-streaming");
+        outPre.textContent = "";
+        inPre.textContent = "";
+        revealQueue = "";
+      },
+      // 追加一帧参数增量（模型逐 token 生成的 arguments 文本）
+      addInputDelta: function (delta) {
+        if (!delta) return;
+        if (delta.length <= REVEAL_CHARS_PER_TICK * 2) {
+          inPre.textContent += delta;
+          inPre.scrollTop = inPre.scrollHeight;
+        } else {
+          revealQueue += delta;
+          startReveal();
+        }
+      },
+      // 整体重设输入文本（对象参数路径），同样走揭示队列保持观感一致
+      setInputText: function (t) {
+        const text = t || "";
+        if (!streaming) {
+          inPre.textContent = text;
+          return;
+        }
+        stopReveal();
+        revealQueue = text;
+        inPre.textContent = "";
+        startReveal();
+      },
+      // 参数已完整、工具开始执行：等待结果阶段。若揭示动画未播完，
+      // 立即放行剩余文本（参数实际已完整）
+      executing: function () {
+        streaming = false;
+        flushReveal();
+        wrap.classList.remove("is-streaming");
+        wrap.classList.add("is-executing");
+        outPre.textContent = "执行中…";
+      },
       finish: function () {
+        streaming = false;
+        flushReveal();
+        wrap.classList.remove("is-streaming");
+        wrap.classList.remove("is-executing");
         head.querySelector(".tool-spin").outerHTML =
           '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
-        if (outPre.textContent === "执行中…") outPre.textContent = "(无输出)";
+        if (!outPre.textContent || outPre.textContent === "执行中…") {
+          outPre.textContent = "(无输出)";
+        }
       },
     };
   }

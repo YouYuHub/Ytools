@@ -2043,6 +2043,13 @@ html[data-theme=dark] .context-token-status.is-warning .context-token-summary {
   flex-shrink: 0;
   transition: opacity 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 }
+.round-btn .stop-square {
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  margin-left: 2px;
+  background: currentColor;
+}
 .round-btn .icon {
   width: 30px;
   height: 30px;
@@ -2060,13 +2067,6 @@ html[data-theme=dark] .context-token-status.is-warning .context-token-summary {
 html:not([data-theme=dark]) #voiceBtn {
   background: #e0e0e0;
   color: #757575;
-}
-
-.stop-square {
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
-  background: currentColor;
 }
 
 .stop-group {
@@ -2094,12 +2094,7 @@ html:not([data-theme=dark]) #voiceBtn {
 }
 .stop-group .stop-menu-btn .icon {
   width: 18px;
-  height: 18px;
-}
-.stop-group .stop-menu-btn:hover {
-  opacity: 0.9;
-  transform: none;
-  box-shadow: none;
+  height: 22px;
 }
 .stop-group.compact-only #stopBtn {
   border-radius: 50%;
@@ -2152,7 +2147,6 @@ html:not([data-theme=dark]) #voiceBtn {
 .pending-outbox .pending-outbox-item.injected {
   border-style: solid;
   border-color: var(--border);
-  opacity: 0.85;
 }
 .pending-outbox .pending-outbox-item.injected .pending-outbox-badge {
   background: var(--accent);
@@ -3121,8 +3115,36 @@ html:not([data-theme=dark]) #voiceBtn {
 .enhance-panel .enhance-field {
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 0;
+  padding: 5px 0;
   font-size: 13px;
+}
+.enhance-panel .enhance-field select {
+  min-width: 0;
+  max-width: 200px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-code);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.enhance-panel .enhance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.enhance-panel .enhance-row .enhance-field {
+  flex: 1 1 auto;
+}
+.enhance-panel .enhance-check-inline {
+  display: inline-flex;
+  gap: 6px;
+  padding: 5px 0;
+  white-space: nowrap;
+  cursor: pointer;
 }
 .enhance-panel .model-picker {
   display: flex;
@@ -3230,13 +3252,13 @@ html:not([data-theme=dark]) #voiceBtn {
 }
 .enhance-panel .enhance-range {
   display: block;
-  padding: 8px 0;
+  padding: 4px 0;
   color: var(--text-secondary);
   font-size: 12px;
 }
 .enhance-panel .enhance-range > span {
   justify-content: space-between;
-  margin-bottom: 5px;
+  margin-bottom: 3px;
 }
 .enhance-panel .enhance-range b {
   color: var(--text-secondary);
