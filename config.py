@@ -13,6 +13,9 @@ from env_manager import load_var       # 环境变量加载
 
 # 程序的根目录，通常用于相对路径的计算
 PROJECT_ROOT = Path(__file__).resolve().parent
+# 默认服务启动宿主、端口
+DEFAULT_SERVICE_HOST = load_var("DEFAULT_SERVICE_HOST", "0.0.0.0")
+DEFAULT_SERVICE_PORT = load_var("DEFAULT_SERVICE_PORT", 48621)
 
 # 兼容旧版原始历史上下文与统计的默认轮数；摘要-only 模式下已完成轮次不再按轮回传。
 # 历史压缩设置中的 keep_rounds 仍保留为兼容配置，避免旧客户端字段失效。
@@ -26,7 +29,6 @@ DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content�
 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
 DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制
 DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS = 3       # 模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试）
-
 
 
 class Message(BaseModel):

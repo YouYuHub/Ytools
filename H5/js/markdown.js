@@ -37,6 +37,16 @@
       .replace(/&amp;/g, "&");
   }
 
+  // 还原被 escapeHtml 转义的文本到原始内容（用于 data-table-raw 等属性回读）
+  function unescapeHtml(text) {
+    return String(text)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+
   function parseMediaAttrs(attrText) {
     const attrs = {};
     String(attrText || "").replace(MEDIA_ATTR_RE, function (_, name, value) {
@@ -181,6 +191,28 @@
     return out.join("");
   }
 
+  // 表格操作按钮组：常驻「复制」+「更多」下拉（复制 Markdown / 复制图片 / 下载 Excel）。
+  // more 菜单展开/收起与点击行为在 app/messages.js 的事件委托中处理；
+  // 原始 md 表格文本经 escapeHtml 后存入 data-table-raw，复制/下载时还原使用
+  //（复制图片用不到 raw，保持菜单结构统一）。
+  function buildTableActions(rawTable) {
+    const rawAttr = escapeHtml(rawTable);
+    return (
+      '<div class="md-table-actions">' +
+      '<button class="md-table-btn" type="button" data-table-action="copy">复制</button>' +
+      '<div class="md-table-more">' +
+      '<button class="md-table-btn md-table-more-btn" type="button" data-table-action="more"' +
+      ' aria-haspopup="menu" aria-expanded="false">更多 ▾</button>' +
+      '<div class="md-table-menu hidden" role="menu">' +
+      '<button type="button" role="menuitem" data-table-action="copy-md" data-table-raw="' + rawAttr + '">复制 Markdown</button>' +
+      '<button type="button" role="menuitem" data-table-action="copy-image">复制图片</button>' +
+      '<button type="button" role="menuitem" data-table-action="download-xlsx" data-table-raw="' + rawAttr + '">下载 Excel</button>' +
+      "</div>" +
+      "</div>" +
+      "</div>"
+    );
+  }
+
   function renderTable(lines) {
     const rows = lines.map(splitTableRow);
     const isDivider = rows.length > 1 && rows[1].every(function (c) { return /^:?-{2,}:?$/.test(c); });
@@ -195,15 +227,11 @@
       html += "</tr>";
     });
     html += "</tbody></table>";
-    // 独立滚动块：宽表格在自身容器内水平滚动，不撑破消息宽度；
-    // hover 显示「复制 / 复制图片」按钮（点击行为在 app.js 事件委托中处理）
+    // 独立滚动块：宽表格在自身容器内水平滚动，不撑破消息宽度
     return (
       '<div class="md-table-block">' +
       '<div class="md-table-scroll">' + html + "</div>" +
-      '<div class="md-table-actions">' +
-      '<button class="md-table-btn" type="button" data-table-action="copy">复制</button>' +
-      '<button class="md-table-btn" type="button" data-table-action="copy-image">复制图片</button>' +
-      "</div>" +
+      buildTableActions(lines.join("\n")) +
       "</div>"
     );
   }
@@ -407,7 +435,7 @@
       restoreMediaPlaceholders(html.join(""), media.widgets) + "</div>";
   }
 
-  const api = { render, setMediaResolver };
+  const api = { render, setMediaResolver, unescapeHtml };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   } else {

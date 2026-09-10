@@ -157,8 +157,20 @@
   // 超过 1 行（.grow）：输入框在上占满整行，功能条在其下
   &.grow {
     flex-direction: column;
+    // 关键修复：单行态用 flex-wrap 把附件行/暂存条换到上方一整行；
+    // 但 wrap 保留到 column 布局下会变成“多列”排布——附件列以 basis:100%
+    // 占满整列高度，输入框装不下被换到下一列（渲染到容器右侧、屏幕外）。
+    // grow 态本身就是纵向堆叠（换行它来承担），必须禁止换列
+    flex-wrap: nowrap;
     align-items: stretch;
     gap: 4px;
+
+    // column 主轴是纵向，附件/暂存行的 flex-basis:100% 会变成“高度100%”，
+    // 把输入框挤出容器：grow 态复位为 auto（宽度仍由 width:100% 保证）
+    .composer-attachments,
+    .pending-outbox {
+      flex-basis: auto;
+    }
 
     .composer-input {
       width: 100%;
@@ -174,12 +186,13 @@
   }
 
   // 输入框：空态/输入第一行都是单行（38px），
-  // 文字换行放不下时才由 autosize() 按行增高（60px、84px…），上限 200px
+  // 文字换行放不下时才由 autosize() 按行增高（60px、84px…）；
+  // 行高 22px×1.5=33px，max-height 168px = 5 行（5×33+2px padding），超出行内滚动
   .composer-input {
     flex: 1;
     min-width: 0;
     min-height: 38px;
-    max-height: 200px;
+    max-height: 168px;
     border: none;
     outline: none;
     resize: none;
@@ -691,17 +704,17 @@ html:not([data-theme="dark"]) #voiceBtn {
 // （composer 通过 .has-media 切为列布局，附件行在输入框之上，输入框随之变高）
 .composer-attachments {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-wrap: wrap; // 多个附件/窄容器时自动换行成多行缩略图
+  gap: 6px;
   width: 100%;
-  padding: 8px 8px 2px;
+  padding: 6px 8px 2px;
 }
 
 .media-chip {
   position: relative;
-  width: 72px;
-  height: 72px;
-  border-radius: 12px;
+  width: 52px; // 粘贴图片占位压低：56 → 52 方形，点击可进入大图预览
+  height: 52px;
+  border-radius: 10px;
   border: 1px solid var(--border);
   overflow: hidden;
   background: var(--bg-code);
@@ -709,7 +722,9 @@ html:not([data-theme="dark"]) #voiceBtn {
   .media-thumb {
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    // contain 而非 cover：截图/表格等宽长条图完整显示（不裁成中间一条），
+    // 缩略图区域以外的部分以 chip 背景色垫底
+    object-fit: contain;
     display: block;
   }
 
@@ -718,21 +733,21 @@ html:not([data-theme="dark"]) #voiceBtn {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-secondary);
   }
 
   .media-remove {
     position: absolute;
-    top: 3px;
-    right: 3px;
-    width: 20px;
-    height: 20px;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
     border: none;
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.6);
     color: #fff;
-    font-size: 12px;
+    font-size: 11px;
     line-height: 1;
     cursor: pointer;
     display: flex;

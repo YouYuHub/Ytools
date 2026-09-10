@@ -193,7 +193,7 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | 工作路径（app/workdir.js） | 常显工作目录，双击内联编辑调用 `changeChatDir` 实时切换，hover tooltip 显示完整路径 |
 | 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接 |
 | 历史渲染（app/messages.js） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对）、轮次 usage 行、提示/出错横幅、压缩块（含中断态） |
-| 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
+| 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——复制=原始 Markdown，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
 | 问题导航 qnav（app/messages.js） | 用户问题 ≥2 条出现：右侧虚线轨（上限 40 根）hover 展开编号面板，点击瞬跳，滚动 rAF 节流高亮当前位置 |
 | 导出/加载（app/history.js） | 顶栏为图标按钮：空态点击直接进入"加载 JSONL"文件选择；有会话内容时点击展开三选项菜单——**分享对话**（下载 `<id>_chat.jsonl`）、**加载 JSONL**（校验后上传导入，重名自动另存，导入失败本地预览兜底）、**压缩对话**（见下） |
 | 手动压缩（app/compaction.js） | 点击"压缩对话"后：① 并行读取 token_stats 与历史压缩配置，仅用于确认弹窗展示当前上下文和摘要预算；② 二次确认（仅防误点击）；③ 确认后 POST `compact_manual?stream=true` 的 SSE 流，事件结构与自动压缩一致（start/delta/done + summary_text），复用 `buildCompactionBlock` 实时渲染压缩模型思考与累计摘要正文，结尾 result 帧提示纳入累计摘要的轮数并刷新用量/上下文统计。后端手动压缩与自动压缩共用多轮流程，覆盖全部已完成轮次，原始历史只存储不回传；模型上下文为累计摘要 + 全历史最近 10k tokens 用户问题 + 当前任务 |

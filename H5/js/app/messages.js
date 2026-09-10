@@ -713,99 +713,60 @@
     if (widget) widget.classList.add("is-broken");
   }, true);
 
-  // ---------- md 表格：复制文本（TSV+HTML 双格式）与复制为图片 ----------
+  // ---------- md 表格：复制（原始 Markdown）与复制为图片 / 下载 Excel ----------
+  // 矩阵转换与 canvas 网格绘制抽到 js/table_canvas.js（TableCanvas 全局，纯函数可单测）
   function tableToMatrix(table) {
-    return Array.from(table.rows).map(function (row) {
-      return Array.from(row.cells).map(function (cell) { return cell.textContent.trim(); });
-    });
+    return TableCanvas.tableToMatrix(table);
   }
 
-  function tableToTsv(matrix) {
-    return matrix.map(function (row) { return row.join("\t"); }).join("\n");
-  }
-
-  async function copyTableText(table) {
-    const matrix = tableToMatrix(table);
-    const tsv = tableToTsv(matrix);
-    // 优先双格式（text/html 保留表格结构，粘贴到 Excel/文档即成表格）；降级纯 TSV
-    if (navigator.clipboard && window.ClipboardItem) {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          "text/plain": new Blob([tsv], { type: "text/plain" }),
-          "text/html": new Blob(["<table>" + table.innerHTML + "</table>"], { type: "text/html" }),
-        }),
-      ]);
+  // 复制原始 markdown 表格文本（渲染时保存在 data-table-raw，含 \\| 转义与行内代码原貌）
+  async function copyTableMarkdown(rawMarkdown) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(rawMarkdown);
       return;
     }
-    await navigator.clipboard.writeText(tsv);
+    // 兜底：隐藏 textarea + execCommand（非安全上下文等场景）
+    const helper = document.createElement("textarea");
+    helper.value = rawMarkdown;
+    helper.setAttribute("readonly", "");
+    helper.style.position = "fixed";
+    helper.style.opacity = "0";
+    document.body.appendChild(helper);
+    helper.select();
+    try { document.execCommand("copy"); } finally { helper.remove(); }
   }
 
-  // 把表格绘制为 PNG canvas（手工网格绘制，无外部依赖）；超大表返回 null
-  function drawTableCanvas(table) {
-    const matrix = tableToMatrix(table);
-    if (!matrix.length) return null;
-    const probe = document.createElement("canvas").getContext("2d");
-    const font = "12px " + (getComputedStyle(document.body).fontFamily || "system-ui");
-    probe.font = font;
-    const padding = 10;
-    const rowHeight = 24;
-    const maxColWidth = 320;
-    const colCount = Math.max.apply(null, matrix.map(function (row) { return row.length; }));
-    const colWidths = [];
-    for (let c = 0; c < colCount; c++) {
-      let width = 0;
-      matrix.forEach(function (row) {
-        width = Math.max(width, probe.measureText(row[c] || "").width);
-      });
-      colWidths.push(Math.min(Math.ceil(width) + padding * 2, maxColWidth));
-    }
-    const width = colWidths.reduce(function (sum, w) { return sum + w; }, 0) + 1;
-    const height = rowHeight * matrix.length + 1;
-    if (width > 8000 || height > 8000) return null;
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    // 白底黑字：粘贴到浅色文档/聊天中最通用，不随主题变化
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
-    ctx.font = font;
-    ctx.textBaseline = "middle";
-    ctx.strokeStyle = "#d0d0d0";
-    matrix.forEach(function (row, r) {
-      const y = r * rowHeight;
-      if (r === 0) {
-        ctx.fillStyle = "#f0f0f0";
-        ctx.fillRect(0, y, width, rowHeight);
-      }
-      ctx.fillStyle = r === 0 ? "#111111" : "#222222";
-      ctx.font = (r === 0 ? "600 " : "") + font;
-      let x = 0;
-      for (let c = 0; c < colCount; c++) {
-        let text = row[c] || "";
-        const maxWidth = colWidths[c] - padding;
-        if (ctx.measureText(text).width > maxWidth) {
-          while (text.length > 1 && ctx.measureText(text + "…").width > maxWidth) text = text.slice(0, -1);
-          text += "…";
-        }
-        ctx.fillText(text, x + padding, y + rowHeight / 2);
-        x += colWidths[c];
-      }
-      ctx.beginPath();
-      ctx.moveTo(0.5, y + 0.5);
-      ctx.lineTo(width - 0.5, y + 0.5);
-      ctx.stroke();
+  // 下载表格为 Excel（后端解析原始 md 表格并生成 xlsx，见 /export/table/xlsx）
+  async function downloadTableXlsx(rawMarkdown) {
+    const res = await fetch(API.BASE + "/export/table/xlsx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown: rawMarkdown }),
     });
-    let x = 0;
-    for (let c = 0; c <= colCount; c++) {
-      ctx.beginPath();
-      ctx.moveTo(x + 0.5, 0);
-      ctx.lineTo(x + 0.5, height - 0.5);
-      ctx.stroke();
-      x += colWidths[c] || 0;
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.detail || body.message || detail;
+      } catch (_) { /* 非 JSON 响应 */ }
+      throw new Error(detail);
     }
-    ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
-    return canvas;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "table.xlsx";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  // 把表格绘制为 PNG canvas：实现抽到 js/table_canvas.js（TableCanvas 全局）。
+  // 列宽两轮收敛 + 行高自适应，长文本逐字换行完整可见，不再截断加省略号；
+  // 换行/布局纯函数在 Node 单测覆盖（test_h5/table_export.test.js）。
+  function drawTableCanvas(table) {
+    return TableCanvas.drawTableCanvas(table);
   }
 
   async function copyTableImage(table) {
@@ -826,27 +787,97 @@
     return "已保存 table.png";
   }
 
+  // 关闭所有表格「更多」菜单
+  function closeAllTableMenus(exceptWrap) {
+    document.querySelectorAll(".md-table-menu").forEach(function (menu) {
+      if (menu !== exceptWrap) menu.classList.add("hidden");
+    });
+    document.querySelectorAll(".md-table-more-btn").forEach(function (btn) {
+      if (btn.closest(".md-table-actions") === exceptWrap?.closest(".md-table-actions")) return;
+      btn.setAttribute("aria-expanded", "false");
+    });
+  }
+
   // 表格操作按钮（事件委托：markdown 渲染会重建节点）
   chatInner.addEventListener("click", async function (e) {
     const btn = e.target.closest(".md-table-btn");
-    if (!btn || btn.disabled) return;
-    const table = btn.closest(".md-table-block")?.querySelector("table");
-    if (!table) return;
-    const original = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "…";
+    if (btn && btn.dataset.tableAction === "more") {
+      // 「更多」菜单展开/收起；同时互斥关闭其它表格的菜单
+      const menu = btn.parentElement.querySelector(".md-table-menu");
+      const willOpen = menu.classList.contains("hidden");
+      closeAllTableMenus();
+      if (willOpen) {
+        menu.classList.remove("hidden");
+        btn.setAttribute("aria-expanded", "true");
+      } else {
+        btn.setAttribute("aria-expanded", "false");
+      }
+      return;
+    }
+    // 点击菜单外的其它区域时收起全部菜单
+    closeAllTableMenus();
+    let target = btn;
+    if (!target) {
+      const menuBtn = e.target.closest('[role="menuitem"]');
+      if (!menuBtn) return;
+      target = menuBtn;
+      // 点击菜单项后收起本表格菜单
+      target.closest(".md-table-more")?.querySelector(".md-table-menu")?.classList.add("hidden");
+      target.closest(".md-table-more")?.querySelector(".md-table-more-btn")?.setAttribute("aria-expanded", "false");
+    }
+    if (target.disabled) return;
+    const block = target.closest(".md-table-block");
+    if (!block) return;
+    const table = block.querySelector(".md-table-scroll table");
+    const rawAttr = target.getAttribute("data-table-raw") || "";
+    const rawMarkdown = Markdown.unescapeHtml(rawAttr);
+    if (!table && !rawMarkdown) return;
+    const action = target.dataset.tableAction;
+    const original = target.textContent;
+    target.disabled = true;
+    target.textContent = "…";
     try {
-      const message = btn.dataset.tableAction === "copy-image"
-        ? await copyTableImage(table)
-        : (await copyTableText(table), "已复制表格");
-      btn.textContent = "✓ " + message;
+      let message = "";
+      if (action === "copy-md") {
+        await copyTableMarkdown(rawMarkdown);
+        message = "已复制 Markdown";
+      } else if (action === "download-xlsx") {
+        await downloadTableXlsx(rawMarkdown);
+        message = "已下载 table.xlsx";
+      } else if (action === "copy-image") {
+        message = await copyTableImage(table);
+      } else {
+        const tsv = tableToMatrix(table).map(function (row) { return row.join("\t"); }).join("\n");
+        // 兜底「复制」：优先纯文本 TSV + HTML 双格式（文档/Excel 粘贴仍保留表格）
+        if (navigator.clipboard && window.ClipboardItem) {
+          await navigator.clipboard.write([
+            new ClipboardItem({
+              "text/plain": new Blob([tsv], { type: "text/plain" }),
+              "text/html": new Blob(["<table>" + table.innerHTML + "</table>"], { type: "text/html" }),
+            }),
+          ]);
+        } else {
+          await navigator.clipboard.writeText(tsv);
+        }
+        message = "已复制表格";
+      }
+      target.textContent = "✓ " + message;
     } catch (err) {
-      btn.textContent = "复制失败";
+      target.textContent = action === "download-xlsx" ? "下载失败" : "复制失败";
     }
     setTimeout(function () {
-      btn.textContent = original;
-      btn.disabled = false;
+      target.textContent = original;
+      target.disabled = false;
     }, 1500);
+  });
+
+  // 点击表格区外时收起「更多」菜单（捕获阶段，避免先命中其它交互）
+  document.addEventListener("click", function (e) {
+    if (e.target.closest(".md-table-more")) return;
+    closeAllTableMenus();
+  }, true);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeAllTableMenus();
   });
 
   // ---------- 右侧问题导航 ----------

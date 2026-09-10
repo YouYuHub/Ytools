@@ -95,7 +95,7 @@
     const actions = el("button", "session-actions");
     actions.type = "button";
     actions.title = "会话操作";
-    actions.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>';
+    actions.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>';
     actions.addEventListener("click", function (event) {
       event.stopPropagation();
       toggleSessionMenu(id, item, actions);

@@ -43,7 +43,18 @@
     requestAnimationFrame(updateScrollBottomOffset);
   }
 
+  // 单行视口高度：scrollHeight ≤ 此值视为一行（padding 上下 1px + 33px 行高 + 3px 容差）
+  var AUTOSIZE_ONE_LINE_HEIGHT = 38;
+  // 最大可见行数：5 行（5×33px 行高 + 上下 2px padding = 167px，取整 168px）
+  var AUTOSIZE_MAX_HEIGHT = 168;
+
   function autosize() {
+    // 先记住当前可视首行位置：textarea 在“文本恰好填满一行”的边界状态下，
+    // 输入会瞬时把视口滚到第 2 行（autosize 还未把高度算出来），然后又因
+    // 高度不足以展示第 2 行而回滚——浏览器内部状态会停在第 2 行的滚动值
+    // 上，视觉呈现为“行末多出一个空白行”。保存/恢复 scrollTop 可把视口
+    // 钉回真实首行，彻底消除幽灵空行。
+    var savedScrollTop = input.scrollTop;
     input.style.height = "auto";
     if (composer.classList.contains("grow")) {
       // 已处于“输入在上、按钮在下”布局：用单行（窄）宽度测量决定是否回退，
@@ -51,14 +62,26 @@
       composer.classList.remove("grow");
       const narrowH = input.scrollHeight;
       composer.classList.add("grow");
-      if (narrowH <= 38) composer.classList.remove("grow");
+      if (narrowH <= AUTOSIZE_ONE_LINE_HEIGHT) composer.classList.remove("grow");
     } else {
       // 单行：输入第一行不变高（scrollHeight=36px），换行放不下才切列布局
-      composer.classList.toggle("grow", input.scrollHeight > 38);
+      composer.classList.toggle("grow", input.scrollHeight > AUTOSIZE_ONE_LINE_HEIGHT);
     }
     // 高度始终按最终布局下的实际宽度测量，紧贴内容，底部不留空白行
     input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 200) + "px";
+    input.style.height = Math.min(input.scrollHeight, AUTOSIZE_MAX_HEIGHT) + "px";
+    // 高度始终按最终布局下的实际宽度测量，紧贴内容，底部不留空白行
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, AUTOSIZE_MAX_HEIGHT) + "px";
+    // 双保险：只要全部内容都装进了当前视口（无滚动必要），就把视口钉回首行。
+    // 行末“恰好装下”的边界状态下，Chromium 会在 caret 定位瞬间产生一次向下的
+    // 幽灵滚动/空行盒（下一次按键即恢复正常），导致视觉上多出一个空白行；
+    // 内容可完整展示时置顶滚动可直接消除该状态。
+    if (input.scrollHeight <= input.clientHeight + 1) {
+      input.scrollTop = 0;
+    } else if (input.scrollTop !== savedScrollTop) {
+      input.scrollTop = savedScrollTop;
+    }
     refreshComposerButtons();
   }
 

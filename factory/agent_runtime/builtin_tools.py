@@ -1,5 +1,5 @@
 """由服务端本地执行的内置工具。"""
-from __future__ import annotations
+# from __future__ import annotations
 
 import difflib
 import fnmatch
@@ -99,21 +99,33 @@ TODO_TOOL_DEFINITION = {
     "function": {
       "name": TODO_TOOL_NAME,
       "description": (
-          "写入/更新当前任务计划（todo list）。调用请提交完整的计划列表（全量覆盖），"
-          "计划会展示给用户并帮助你跟踪多步骤任务。"
-          # "任务包含多个步骤、需要长期规划或用户要求制定计划时使用；简单一次性任务不要使用。"
-          "开始一个步骤前先把该步骤置为 in_progress，完成后置为 done，按最新进展调整后续步骤。"
-          "不建议简单任务使用。"
+          "写入或更新当前任务计划（todo list）。"
+          "用于跟踪需要多个步骤、较长时间或多次工具调用才能完成的任务。"
+          "简单的一次性任务不要使用。"
+          "每次调用必须提交完整的 Todo 列表，新的列表会全量覆盖旧列表。"
+          "开始执行某个步骤前将其设为 in_progress，完成后设为 done，"
+          "根据实际执行结果及时调整后续步骤。"
+          "除非计划发生变化，否则保留已有步骤和已完成步骤。"
+          "执行过程中可以新增、删除或调整后续步骤；保持正确步骤的 id 不变。"
+          "同一时间最多只能有一个步骤处于 in_progress 状态。"
       ),
       "parameters": {
         "type": "object",
         "properties": {
           "todos": {
             "type": "array",
-            "description": "完整的任务计划列表（每次全量覆盖，最多 20 项）",
+            "description": (
+                "当前完整的任务计划列表。"
+                "每次调用都会全量覆盖之前的列表，最多 20 项。"
+            ),
+            "maxItems": 20,
             "items": {
               "type": "object",
               "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Todo 唯一标识。创建后保持不变，用于标识同一个任务步骤。",
+                },
                 "content": {
                   "type": "string",
                   "description": "步骤内容（一句话，祈使句，≤200 字符）",
@@ -124,7 +136,7 @@ TODO_TOOL_DEFINITION = {
                   "description": "pending=待办 in_progress=进行中 done=已完成",
                 },
               },
-              "required": ["content", "status"],
+              "required": ["id", "content", "status"],
             },
           }
         },
@@ -138,24 +150,100 @@ _TODO_MAX_ITEMS = 20
 _TODO_MAX_CONTENT_CHARS = 200
 
 
-def normalize_todo_items(raw: Any) -> list[dict[str, str]] | None:
-    """校验并规整模型提交的 todo 列表；任何一项非法整体拒绝（返回 None）。"""
+def _next_todo_id(existing: set[str]) -> str:
+    """分配下一个未占用的自增数字 id（字符串形式，"1"、"2"...）。"""
+    num = 1
+    while str(num) in existing:
+        num += 1
+    return str(num)
+
+
+def normalize_todo_items(
+    raw: Any,
+    prev_items: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, str]] | None, list[str] | None, str | None]:
+    """校验并规整模型提交的 todo 列表（唯一校验入口）。
+
+    返回 ``(items, notices, error_reason)``：
+    - 成功：items 为规整后的计划（保证 id 唯一且非空、in_progress ≤ 1），
+      notices 为自动修正告警，error_reason 为 None；
+    - 失败：items/notices 为 None，error_reason 描述首个硬性错误（含条目
+      序号与具体值），供工具结果直接回传，帮助模型一次性纠正。
+
+    硬性校验（拒绝并给原因）：非数组/条目非对象/content 为空或超长/
+    status 非法/超过 20 项。自动修复（放行并告警）：id 缺失或为空
+    （同 content+status 匹配上一版计划则继承其 id，否则本地自增分配）、
+    id 重复（为重复者重新分配）、多个 in_progress（保留首个，其余改
+    pending）。兼容旧模型不按新 Schema 提交时缺失 id 的情况。
+    """
     if not isinstance(raw, list):
-        return None
+        return None, None, "todos 需要是对象数组，且每次调用提交完整列表（全量覆盖）"
     if len(raw) > _TODO_MAX_ITEMS:
-        return None
+        return None, None, (
+            f"todo 数量超过上限：收到 {len(raw)} 项，最多 {_TODO_MAX_ITEMS} 项，"
+            "请合并同类步骤或拆分任务"
+        )
+    # 上一版计划索引 (content, status) -> id，供缺失 id 的条目继承
+    prev_by_key: dict[tuple[str, str], str] = {}
+    for prev in prev_items or []:
+        if not isinstance(prev, dict):
+            continue
+        prev_id = str(prev.get("id") or "").strip()
+        prev_content = str(prev.get("content") or "").strip()
+        prev_status = str(prev.get("status") or "pending").strip()
+        if prev_id and prev_content:
+            prev_by_key[(prev_content, prev_status)] = prev_id
     items: list[dict[str, str]] = []
-    for entry in raw:
+    notices: list[str] = []
+    used_ids: set[str] = set()
+    id_missing = id_duplicated = in_progress_fixed = 0
+    for index, entry in enumerate(raw, start=1):
         if not isinstance(entry, dict):
-            return None
+            return None, None, f"第 {index} 项必须是对象（含 id/content/status 字段）"
         content = str(entry.get("content") or "").strip()
-        status = str(entry.get("status") or "pending").strip()
-        if not content or len(content) > _TODO_MAX_CONTENT_CHARS:
-            return None
+        if not content:
+            return None, None, f"第 {index} 项 content 不能为空"
+        if len(content) > _TODO_MAX_CONTENT_CHARS:
+            return None, None, (
+                f"第 {index} 项 content 超长（{len(content)} > "
+                f"{_TODO_MAX_CONTENT_CHARS} 字符），请压缩为一句祈使句"
+            )
+        status = str(entry.get("status") or "pending").strip().lower()
         if status not in _TODO_VALID_STATUSES:
-            return None
-        items.append({"content": content, "status": status})
-    return items
+            return None, None, (
+                f"第 {index} 项 status 非法：{status!r}，"
+                "仅支持 pending / in_progress / done"
+            )
+        raw_id = str(entry.get("id") or "").strip()
+        if raw_id:
+            if raw_id in used_ids:
+                id_duplicated += 1
+                raw_id = _next_todo_id(used_ids)
+        else:
+            inherited = prev_by_key.get((content, status))
+            if inherited and inherited not in used_ids:
+                raw_id = inherited
+            else:
+                raw_id = _next_todo_id(used_ids)
+            id_missing += 1
+        used_ids.add(raw_id)
+        if status == "in_progress" and any(i["status"] == "in_progress" for i in items):
+            in_progress_fixed += 1
+            status = "pending"
+        items.append({"id": raw_id, "content": content, "status": status})
+    if id_missing:
+        notices.append(
+            f"{id_missing} 个步骤未携带 id，已自动分配/继承"
+            "（下次调用请保持相同步骤的 id 不变）"
+        )
+    if id_duplicated:
+        notices.append(f"{id_duplicated} 个步骤 id 重复，已为重复项重新分配")
+    if in_progress_fixed:
+        notices.append(
+            f"{in_progress_fixed} 个步骤多余地标记为 in_progress"
+            "（同一时间最多一个），仅保留首个，其余已改为 pending"
+        )
+    return items, notices, None
 
 
 def execute_builtin_tool(

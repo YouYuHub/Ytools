@@ -1553,6 +1553,63 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
         return meta
 
+    async def ensure_session_config_snapshot(self) -> tuple[bool, dict[str, Any]]:
+        """会话配置快照：首次正式开始任务时把当前全局默认配置固化为会话独立配置。
+
+        幂等：`_meta.config_snapshot_at` 已存在时直接返回（快照一次后不再重写，
+        用户后续的手动会话级修改不受影响，清除单键的「恢复跟随全局」语义也不变）。
+
+        固化内容（仅在会话尚无对应覆盖时写入，已有覆盖键保持不动）：
+          - work_dir        ← 全局默认工作目录（.env DEFAULT_CHAT_WORK_DIR，目录有效才写入）
+          - tool_selection  ← mcp_servers.json 的 inputs（规整后，非空才写入）
+          - model_selection ← models.json 顶层 model_selection（全角色有效条目）
+        单项读取失败只跳过该项，不阻断快照与聊天。
+
+        Returns:
+            (本次是否真正写入快照, 快照后的元数据字典)
+        """
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if meta.get("config_snapshot_at"):
+                return False, meta
+            # 全局默认工作目录
+            try:
+                persisted = get_persisted_work_dir()
+                existing_work_dir = meta.get("work_dir")
+                if (
+                    isinstance(persisted, str) and persisted.strip()
+                    and not (isinstance(existing_work_dir, str) and existing_work_dir.strip())
+                ):
+                    resolved = resolve_work_dir(persisted)
+                    if resolved is not None:
+                        meta["work_dir"] = str(resolved)
+            except Exception as work_error:
+                print(f"[WARN] 会话配置快照（work_dir）失败，已跳过该项: {work_error}")
+            # 全局默认工具选择
+            try:
+                inputs, _servers, tool_error = get_global_tool_inputs()
+                if tool_error is None:
+                    normalized_inputs = normalize_tool_inputs(inputs)
+                    if normalized_inputs and meta.get("tool_selection") is None:
+                        meta["tool_selection"] = normalized_inputs
+            except Exception as tool_error:
+                print(f"[WARN] 会话配置快照（tool_selection）失败，已跳过该项: {tool_error}")
+            # 全局默认模型选择（全部角色）
+            try:
+                global_selection = _get_global_model_selection()
+                valid_selection = {
+                    role: entry for role, entry in (global_selection or {}).items()
+                    if isinstance(entry, dict) and entry.get("ownership_name") and entry.get("model_name")
+                }
+                if valid_selection and not isinstance(meta.get("model_selection"), dict):
+                    meta["model_selection"] = valid_selection
+            except Exception as model_error:
+                print(f"[WARN] 会话配置快照（model_selection）失败，已跳过该项: {model_error}")
+            meta["config_snapshot_at"] = now_str()
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return True, meta
+
     @staticmethod
     def list_chat_sessions():
         """

@@ -246,7 +246,7 @@ def _build_sys_prompt() -> str:
         DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     )
     notes = [
-        "工具由用户选择提供，你只能使用当前可见工具（如果用户提供了）；之前用过的工具不可见则不能使用。",
+        "工具由用户选择提供，你只能使用最近一次 user 角色给你的（如果用户提供了）；之前用过的工具不一定能使用。",
         "任务过程中，你的思考过程只保留最近一次，过程中的重要发现需要实时告诉用户，这也是为了后续任务的连贯性。",
     ]
     if tool_result_limit > 0:
@@ -593,21 +593,41 @@ async def _emit_compaction_event(
 
 
 async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict[str, Any], list[dict[str, str]] | None]:
-    """校验并落盘模型提交的任务计划；返回 (工具结果, 规整后的列表或 None)。"""
+    """校验并落盘模型提交的任务计划；返回 (工具结果, 规整后的列表或 None)。
+
+    校验不依赖模型自觉：id 缺失/重复、多个 in_progress 等模型常见违约由
+    normalize_todo_items 自动修复并随结果告警（提示下次保持稳定 id）；
+    上一版计划直接读会话 _meta.todo（不信任模型自报的旧状态），保证全量
+    更新时未携带 id 的同内容步骤继承原 id；硬性错误（content 空/超长、
+    status 非法、超 20 项）返回带条目序号的纠错原因，帮助模型一次修正。
+    """
     raw_todos = tool_args.get("todos") if isinstance(tool_args, dict) else None
-    items = normalize_todo_items(raw_todos)
+    try:
+        prev_items = await session_chat_memory.get_session_todo()
+    except Exception:
+        prev_items = []
+    items, notices, error_reason = normalize_todo_items(
+        raw_todos, prev_items=prev_items)
     if items is None:
-        return {
-            "error": "todos 参数无效：需要 {content, status(pending|in_progress|done)} 对象数组"
-                     "（≤20 项，content ≤200 字符），每次调用全量覆盖"
-        }, None
+        return {"error": error_reason or "todos 参数无效"}, None
     await session_chat_memory.update_session_todo(items)
     done_count = sum(1 for item in items if item["status"] == "done")
-    return {
-        "message": f"任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项）",
-        "total": len(items),
-        "done": done_count,
-    }, items
+    in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
+    result: dict[str, Any] = {
+        "message": f"任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项，进行中 {in_progress_count} 项）",
+        "current plan state": {
+            "total": len(items),
+            "done": done_count,
+            "in_progress": in_progress_count,
+            "pending": len(items) - done_count - in_progress_count,
+        },
+        # 回写规整后的完整列表：模型据此对齐自动分配/继承出的最终 id，
+        # 避免长对话中工具结果被截断后丢失 id 记忆
+        "todos": items,
+    }
+    if notices:
+        result["warnings"] = notices
+    return result, items
 
 
 def _request_has_new_user_message(tool_request: ChatLLMRequest) -> bool:
@@ -913,7 +933,7 @@ async def _run_chat_generation(
             messages.insert(0, {
                 "role": "system",
                 "content": (
-                    "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
+                    "你是一个聪明的助手，正在使用 Ytools 程序帮忙用户，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
                     + runtime_sys_text
                 ),
             })
@@ -1097,7 +1117,6 @@ async def _run_chat_generation(
 
                     # 继续用累计摘要视图重建候选；runtime_sys_text / active_file_block
                     # 复用任务级变量，不能回退为原始历史轮次。
-
                     def _assemble_candidate(backend_msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         # 复用任务已合成的主 system（persona+运行时文本+文件块，
                         # 含预算降级后的版本）：摘要/最近问题排在其后，
@@ -1112,7 +1131,7 @@ async def _run_chat_generation(
                             main_system = {
                                 "role": "system",
                                 "content": (
-                                    "你是一个聪明的助手，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
+                                    "你是一个聪明的助手，正在使用 Ytools 程序帮忙用户，你需要自行判断是否需要调用工具，并结合你之前使用的工具（如果有）的结果，调用工具的结果只有你可见，请根据用户使用的语言回答用户问题。\n"
                                     + runtime_sys_text
                                     + active_file_block
                                 ),
@@ -1132,7 +1151,6 @@ async def _run_chat_generation(
                             if question_budget != question_budgets[0]:
                                 print("[INFO] 摘要上下文已按窗口收紧最近问题索引")
                             break
-
                     if degraded_messages is not None:
                         messages = degraded_messages
                         first_call_tokens = estimate_request_context_tokens(messages, tool_request.tools)
@@ -1172,6 +1190,7 @@ async def _run_chat_generation(
         # 尝试（每批工具结果都会触发检查，避免反复白烧失败的模型调用）
         auto_compact_failures = 0
         auto_compact_disabled_notified = False
+
         # 运行中注入的用户消息（消息引导）：每轮检查点取出，作为新一轮
         # 用户消息追加到上下文并落盘；模型在下一轮调用时即可看到。
         # worker 模式 stream=_WorkerStreamAdapter、inline 模式 stream=_SessionStream，
@@ -1470,7 +1489,7 @@ async def _run_chat_generation(
             blocked_tools = [item for item in parsed_tools if item[2] not in round_tool_servers]
             parsed_tools = [item for item in parsed_tools if item[2] in round_tool_servers]
             if blocked_tools:
-                print(f"[WARN] 检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
+                print(f"[WARNING] 检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
                 for _, blocked_tool_call, blocked_tool_name, blocked_tool_args in blocked_tools:
                     blocked_tool_call_id = blocked_tool_call.get("id", "") if isinstance(blocked_tool_call, dict) else ""
                     blocked_ret = f"工具 {blocked_tool_name} 未在本轮授权列表中，禁止调用"
@@ -1530,7 +1549,7 @@ async def _run_chat_generation(
                         f"data: {json.dumps(start_event, ensure_ascii=False)}\n\n",
                     )
             except Exception as start_emit_error:
-                print(f"[WARN] tool_start 事件推送失败: {start_emit_error}")
+                print(f"[WARNING] tool_start 事件推送失败: {start_emit_error}")
             # 内置工具与 MCP 工具分开执行
             builtin_results = []
             external_parsed_tools = []
@@ -1942,6 +1961,15 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest)
     挂到 stream.task；inline 模式：保持旧行为，在主进程内起 asyncio 任务。
     返回 False 表示启动失败（已向流内写入 error 事件）。
     """
+    # 会话配置快照：首次正式开始任务时把当前全局默认（模型/工具/工作目录）
+    # 固化为会话独立配置，此后该会话不再跟随全局设置变化（幂等，快照过即跳过）。
+    try:
+        session_chat_memory = await get_chat_memory_manager(
+            normalize_session_id(getattr(tool_request, "session_id", "default"))
+        )
+        await session_chat_memory.ensure_session_config_snapshot()
+    except Exception as snapshot_error:
+        print(f"[WARN] 会话配置快照失败（不影响本轮对话）: {snapshot_error}")
     if proxy is not None:
         proxy.bind_stream(stream)
         started = proxy.start_generation(tool_request.model_dump())

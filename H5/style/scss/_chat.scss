@@ -796,6 +796,42 @@
   }
 }
 
+// 「更多」下拉（复制 Markdown / 下载 Excel）
+.md-table-more {
+  position: relative;
+}
+
+.md-table-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow-menu);
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 12px;
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+  }
+}
+
 // ---------- md 媒体伪标签控件（<image>/<audio>/<video>/<pdf> 渲染产物） ----------
 // .md 作为 inline-size 容器：内容区宽度 >680px 时媒体控件两列排布，
 // 否则一行一个。控件宽度取固定计算值，媒体元素（尤其音频）稳定占满。

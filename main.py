@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import sys
 import threading
 
 from fastapi import FastAPI
@@ -6,13 +9,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 # 加载 env 环境变量
-from config import apply_persisted_work_dir, get_current_dir , PROJECT_ROOT
+from config import (
+    apply_persisted_work_dir,
+    get_current_dir,
+    PROJECT_ROOT,
+)
 from util import config_watcher
 from factory.agent_runtime import tool_registry
 from env_manager import init_path
 init_path(PROJECT_ROOT)
 apply_persisted_work_dir()
-
+# 初始化 env 路径后才能正确加载到变量
+from config import DEFAULT_SERVICE_HOST, DEFAULT_SERVICE_PORT
 
 # 引入路由，需要在 init_path() 之后
 from routers.chat_router import api_chat_router
@@ -20,6 +28,7 @@ from routers.chat_config_router import api_chat_config_router
 from routers.tools_manage_router import api_tools_manage_router
 from routers.file_router import api_file_router
 from routers.prompt_router import api_prompt_router
+from routers.export_router import api_export_router
 
 
 # FastAPI 实例化
@@ -69,7 +78,7 @@ app.add_middleware(
 @app.get("/", tags=["Root"])
 async def root():
     """ 根路由 """
-    return {"message": "欢迎使用大模型智能体工具接口"}
+    return {"message": "欢迎使用智能体工具项目(Ytools)接口"}
 
 
 # 包含路由
@@ -78,6 +87,7 @@ app.include_router(api_chat_config_router, tags=["ChatConfig"])
 app.include_router(api_tools_manage_router, tags=["ToolsManage"])
 app.include_router(api_file_router, tags=["FileUpload"])
 app.include_router(api_prompt_router, tags=["Skills"])
+app.include_router(api_export_router, tags=["Export"])
 
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------
@@ -129,8 +139,6 @@ _start_config_hot_reload()
 
 # ---------- 工具注册表预热：启动即后台探测一次，首个页面加载/首条消息直接命中缓存 ----------
 def _prewarm_tool_registry() -> None:
-    import asyncio
-    import threading
     from config import get_current_dir
     from factory.agent_runtime import tool_registry
 
@@ -149,10 +157,36 @@ _prewarm_tool_registry()
 
 
 
+# # ---------- 服务自我快照（restart_service 重启工具的定位依据） ----------
+# # mcp_server/restart_tools_server.py 与 restart_helper.py 靠该文件定位主进程
+# # pid / 端口 / 项目根 / 解释器，实现模型自驱动的跨进程重启。helper 杀-启之间
+# # 不重写此文件：新旧 pid 语义由 pending（old_pid）区分，重启后新进程会覆盖更新。
+# def _write_service_state_snapshot() -> None:
+#     """把主进程 pid/port/project_root/python_exe 快照到 history_files/lock/。"""
+#     try:
+#         lock_dir = PROJECT_ROOT / "history_files" / "lock"
+#         lock_dir.mkdir(parents=True, exist_ok=True)
+#         payload = {
+#             "pid": os.getpid(),
+#             "port": DEFAULT_SERVICE_PORT,
+#             "project_root": str(PROJECT_ROOT),
+#             "python_exe": sys.executable,
+#         }
+#         snapshot = lock_dir / "service_state.json"
+#         tmp = snapshot.with_suffix(".json.tmp")
+#         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+#         os.replace(tmp, snapshot)
+#         print(f"[INFO] 服务快照已写入: {snapshot}")
+#     except Exception as exc:
+#         # 快照失败不阻断启动；restart_service 调用时会给"未找到快照"的可读报错
+#         print(f"[WARN] 写入服务快照失败（restart_service 将不可用）: {exc}")
+
+
 if __name__ == '__main__':
     import uvicorn
+    # _write_service_state_snapshot()
     uvicorn.run(app='main:app',
-        host="0.0.0.0", port=48621,
+        host=DEFAULT_SERVICE_HOST, port=DEFAULT_SERVICE_PORT,
         # reload=True, reload_dirs=[str(PROJECT_ROOT)],
         # reload_excludes=[
         #     # "mcp_server/*",     # 排除 generated 子目录

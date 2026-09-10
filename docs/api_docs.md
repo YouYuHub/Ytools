@@ -33,7 +33,7 @@
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
-- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{content,status(pending|in_progress|done)}]}`；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
+- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `_meta.todo` 同结构数据）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
 - `context_compaction`：单轮工具轨迹被压缩后的状态，含 `{scope:"round", before_tokens, after_tokens, fallback, compress_index, block_count, usage}`；`usage` 为压缩模型调用返回的 token 统计（部分服务端不返回时为 null）；新模式 `block_count` 通常为 1 个累计摘要块；工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
 - `context_compaction`（**实时压缩事件**，开始/完成两个阶段，见下方"压缩事件格式"）：单轮与跨轮压缩均实时推送，**同一份 payload 同时落盘 JSONL 独立事件行**（`event="context_compaction"`），保证前端"加载历史"与"实时显示"字段完全一致
@@ -71,6 +71,12 @@
 > **会话标识以文件名为准**：历史文件位于 `history_files/<session_id>_chat.jsonl`，`session_id` 即文件名去掉 `_chat.jsonl` 后缀的部分。
 > 所有接口的 `session_id` 参数均可直接传文件名（后端自动去掉 `_chat.jsonl` / `.jsonl` 后缀并规整非法字符，空值回退 `"default"`）。
 > `_meta` 元数据**不再包含 `session_id` 字段**，避免文件名与元数据不一致导致错乱。
+>
+> **会话配置快照**：会话**首次正式开始任务**（第一次 `/chat_with_tool` 生成，幂等）时，后端把当时的全局默认配置固化为会话独立覆盖——
+> `_meta.work_dir`（← .env `DEFAULT_CHAT_WORK_DIR`）、`_meta.tool_selection`（← mcp_servers.json `inputs`）、
+> `_meta.model_selection`（← models.json 顶层 `model_selection` 全角色），并写入 `_meta.config_snapshot_at` 标记。
+> 此后该会话**不再跟随全局设置变化**（改动全局只影响未开始任务的新会话）；快照不会覆盖用户已手动设置的会话覆盖；
+> 会话内手动改某项仍即时生效，清除单键覆盖的「恢复跟随全局」语义不变。
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
@@ -426,3 +432,69 @@
 
 ## 8. 根路由
 - `GET /` → `{"message": "欢迎使用大模型智能体工具接口"}`
+
+## 9. 重启维护工具（RestartMcp，mcp_server/restart_tools_server.py）
+
+模型可调用的开发运维 MCP 工具（工具选择中勾选 `RestartMcp` 分组即授权），用于
+「修改代码后自驱动重启服务，并在重启完成后续接同一会话任务」。三个工具均为
+MCP 工具链路调用，返回 JSON 字符串：
+
+### restart_service
+- 参数: `session_id`（必填）、`follow_up`（必填，≤500 字符续任务指令）、
+  `delay_seconds`（10-180 默认 25：派发到强制终止的延迟秒数）
+- 行为: 校验（follow_up 非空 / service_state.json 快照存在且 pid 存活 / 60s 冷却 /
+  无残留调度）→ 写 `history_files/lock/restart_pending.json` 与
+  `restart_pipeline.cmd` → 以分离进程派发流水线后**立即返回 scheduled**；
+  流水线延迟 delay 后 `taskkill /F /T` 树杀主进程（含会话 worker 防孤儿），
+  拉起项目根 `restart_helper.py`：等端口释放 → 分离启动 main.py → 健康轮询 →
+  向 `POST /chat_with_tool` 注入 follow_up 作为该会话最新用户消息
+  （`use_backend_history` 默认 true，服务端自动拼接全部历史；注入成功后
+  删除 pending 文件）。
+- 返回: 成功 `{"ok": true, "status": "scheduled", main_pid, new_port,
+  delay_seconds, message, pending, log}`（此刻进程尚未被杀）；失败
+  `{"ok": false, "reason"}`（含冷却期 / already_scheduled / 快照缺失 /
+  pid 已不存活 / 参数非法等原因，请先按 reason 处理勿盲重试）。
+- 使用约定: 调用前把当前进展与下一步计划写入 follow_up；调用后**立即结束本轮**
+  （不再调用其它工具），等流水线在后台完成杀/启/注入；结果查证
+  读 `history_files/lock/restart_done.json`（ok=true 且 injected=true 为成功）。
+
+### restart_cancel
+- 参数: 无
+- 行为: 撤销尚未执行的重启调度（删除 restart_pending.json 与 restart_pipeline.cmd）；
+  已进入 helper 恢复阶段（pending 被消费）时无法撤销。
+
+### restart_status
+- 参数: 无
+- 行为: 只读返回 `{"cooldown_remaining", "state"(service_state.json),
+  "pending", "done"}`，供模型或人工排障。
+
+落盘文件（均位于 `history_files/lock/`）：`service_state.json`（main.py 启动时写的
+pid/port/project_root/python_exe 快照）、`restart_pending.json`、
+`restart_pipeline.cmd`、`restart_done.json`、`restart_helper.log`、
+`restart_pipeline.log`、`restart_cooldown.json`。测试: `test/test_restart_tool.py`
+（18 用例，调度全部模拟派发不真杀进程）、`test/restart_stdio_smoke.py`（stdio
+协议冒烟）、`test/manual_restart_e2e.py`(真机人工验证清单)。
+
+## 10. 表格导出 Export
+
+聊天里 md 表格「更多」菜单（复制 Markdown / 下载 Excel）的后端支撑。
+xlsx 生成器为纯标准库实现（`factory/xlsx_export.py`，zipfile + XML，零第三方依赖），
+md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代码/转义竖线不切断分列、
+行内标记清理、链接取 URL）。
+
+### POST /export/table/xlsx
+- Body: `{"markdown": md表格原文(必填, ≤200KB), "filename": 下载文件名(可选, ≤60字符)}`。
+  `markdown` 为渲染时保存在 `data-table-raw` 里的原始表格文本（含表头行 + 分隔行）。
+- 返回: xlsx 文件字节流（Content-Type
+  `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`），
+  响应头 `Content-Disposition`（filename* UTF-8 中文文件名）、
+  `X-Export-Rows` / `X-Export-Cols`（实际行列数）；解析失败 422 `{detail}` 中文原因
+  （非表格文本 / 缺分隔行 / 规模超限：行 ≤5000 列 ≤64 总格 ≤200000）。
+- xlsx 特性：Sheet 名 `Sheet`；首行表头加粗样式；数字单元格原生数值类型；
+  单元格内换行转义为 `_x000A_`；清洗异常单元格写入灰色底红字错误占位样式
+  （显示「原值 + 导出失败说明」，不拖垮整表）。
+- 前端交互：`H5/js/app/messages.js`（表格按钮事件与下载）、`H5/js/markdown.js`
+  （`data-table-raw` 保存原文与「复制 / 更多」按钮组：更多菜单含
+  复制 Markdown / 复制图片 / 下载 Excel）、`H5/js/table_canvas.js`
+  （复制图片 canvas：列宽两轮收敛 + 行高自适应，长文本逐字换行不再截断）。
+  测试: `test/test_table_export.py`（17 用例）、`H5/test_h5/table_export.test.js`。
