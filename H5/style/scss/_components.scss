@@ -1088,6 +1088,18 @@
     }
   }
 
+  // 有效压缩阈值提示行（触发比例字段下方，独占一行）：
+  // 对齐字段描述 small 的弱化视觉，避免浏览器默认 <p> 16px 大字
+  .chat-settings-threshold-hint {
+    margin: 0 0 6px;
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-code);
+    color: var(--text-tertiary);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+
   .chat-settings-note {
     margin-top: 8px;
     padding-top: 8px;

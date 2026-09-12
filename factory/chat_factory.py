@@ -21,6 +21,7 @@ from config import (
     ChatLLMRequest,
     DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
+    DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_current_dir,
 )
@@ -44,11 +45,16 @@ from factory.agent_runtime.builtin_tools import (
     SEARCH_FILES_NAME,
     TODO_TOOL_NAME,
     WRITE_FILE_NAME,
+    READ_MEDIA_NAME,
+    collect_media_references,
     execute_builtin_tool,
     inject_builtin_tools,
     is_builtin_tool,
     normalize_ask_questions,
     normalize_todo_items,
+    execute_read_media,
+    load_any_media_model_part,
+    roll_recent_media_parts,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -178,19 +184,185 @@ def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MA
     return parse_return_length(load_var("REASONING_RETURN_MAX_LENGTH", default), default)
 
 
-def _retain_latest_reasoning(messages: List[dict[str, Any]]) -> None:
-    """只保留当前任务最近一条 assistant 思考，避免思考过程跨轮累积。"""
-    latest_index = None
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            latest_index = index
-            break
-    for index, message in enumerate(messages):
+def _load_tool_call_stream_timeout(
+    default: float = DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
+) -> float:
+    """工具调用流式阶段（SSE 输出 tool_calls 期间）无输出超时秒数。
+
+    0 或负数表示不限制。该超时约束的是"模型 SSE 事件间隔"：部分服务商
+    在输出 tool_calls 期间会无限卡住（连接不断、永无后续事件），HTTP 读
+    超时（默认 1800s）既兜不住也不能终止任务；超时后由运行时放弃本次工具
+    调用、以失败结果反馈模型并继续任务（见工具调用分支的
+    tool_phase_timeout_hit 处理）。
+    """
+    raw = load_var("TOOL_CALL_STREAM_TIMEOUT_SECONDS", default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else 0.0
+
+
+# 思考缺失时的占位符：仅用于"最新工具轮"的回传兜底——最新一次 API 调用
+# 没有输出思考、上下文中也回溯不到更早的真实思考（或回传长度配置为 0）
+# 时，带 tool_calls 的最新 assistant 消息仍需携带 reasoning_content 字段
+# （GLM / DeepSeek 等严格上游缺失即 400）；占位符可通过校验，token 开销
+# 可忽略。历史工具轮的思考不回传（请求副本中直接剥离字段，见
+# _copy_for_request）。
+_REASONING_PLACEHOLDER = "..."
+
+
+def _latest_reasoning_content(messages: List[dict[str, Any]]) -> str:
+    """取上下文中最近一条非空 assistant 思考（工具轮回传兜底用；跳过占位符）。"""
+    for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        if index != latest_index:
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
+            return reasoning
+    return ""
+
+
+def _reasoning_content_for_tool_call(source: str, limit: int) -> str:
+    """按回传长度策略生成工具轮 assistant 消息的 reasoning_content。
+
+    思考模式下的工具调用链要求每条 assistant（tool_calls）消息都回传
+    reasoning_content（严格上游缺失即 400），因此这里永远不返回空值：
+    - limit < 0：全量回传；
+    - limit > 0：只保留末尾 N 字符；
+    - limit == 0：只回传占位符（"不回传"语义退化为最小占位，仅满足上游
+      字段校验，避免请求被严格上游拒绝）；
+    来源缺失（模型本轮未输出思考）时同样回退占位符。
+    """
+    if limit == 0:
+        return _REASONING_PLACEHOLDER
+    text = source if isinstance(source, str) else ""
+    if not text.strip():
+        return _REASONING_PLACEHOLDER
+    return text if limit < 0 else text[-limit:]
+
+
+def _retain_latest_reasoning(messages: List[dict[str, Any]]) -> None:
+    """只保留最近一条 assistant 真实思考，避免思考过程跨轮累积。
+
+    严格上游（GLM / DeepSeek 等）要求工具调用链中每条 assistant（tool_calls）
+    消息都回传 reasoning_content，缺失即 400；因此旧工具轮不再直接剥离字段，
+    而是替换为 "..." 占位符（字段必须存在，占位符可通过校验）。最近一条保持
+    真实思考；意外缺失时回退历史最近思考，再兜底占位符。
+    """
+    assistant_indexes = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    if not assistant_indexes:
+        return
+    latest_index = assistant_indexes[-1]
+    # 先收集兜底思考：旧轮随后会被覆盖为占位符，之后再也取不到真实值
+    fallback = ""
+    for index in reversed(assistant_indexes[:-1]):
+        reasoning = messages[index].get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
+            fallback = reasoning
+            break
+    limit = _load_reasoning_return_max_length()
+    for index in assistant_indexes:
+        message = messages[index]
+        if index == latest_index:
+            if not message.get("tool_calls"):
+                continue  # 非工具轮不强制回传思考
+            current = message.get("reasoning_content")
+            if isinstance(current, str) and current.strip():
+                continue  # 最近一条已有思考，保持原样
+            message["reasoning_content"] = _reasoning_content_for_tool_call(fallback, limit)
+            continue
+        if message.get("tool_calls"):
+            # 旧工具轮：字段必须存在；值用占位符避免真实思考跨轮累积
+            message["reasoning_content"] = _REASONING_PLACEHOLDER
+        else:
             message.pop("reasoning_content", None)
+
+
+def _copy_for_request(messages: List[dict[str, Any]]) -> List[dict[str, Any]]:
+    """构造发往上游的请求副本：思考过程只在此处做"回传"整形。
+
+    运行时 messages 始终保持模型原始输出（每轮思考均为原始全文），落盘
+    （record_message 深拷贝）也以真实值为源——历史工具轮的思考全部完整
+    保留，绝不替换为 "..."。本函数只在副本上做回传侧语义：请求里最多只
+    保留一条真实思考（最近一次 API 调用输出的那条），其余一律占位/剥离，
+    既满足严格上游（GLM/DeepSeek）"reasoning_content 必须存在"的校验，
+    又避免真实思考跨轮累积发给上游：
+    - 旧工具轮 / 旧非工具 assistant：剥离 reasoning_content（历史思考
+      一律不回传，只保留运行时/落盘里的原始值）；
+    - 最新工具轮：只回传最近一次 API 调用输出的思考，按
+      REASONING_RETURN_MAX_LENGTH 裁剪；本轮没有输出思考时向前回溯，
+      取上下文中最近一次真实思考按同一规则回传；完全找不到真实思考或
+      limit==0 时回传占位符（字段仅为通过上游校验而存在）；
+    - 最新非工具轮：思考非必须，已有则按长度裁剪，limit==0 直接剥离。
+
+    只对"需要修改"的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
+    直接复用引用——避免对整包 messages（可能含 MB 级 base64 多模态部件）
+    做深拷贝的每轮开销。
+    """
+    assistant_indexes = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    if not assistant_indexes:
+        return list(messages)
+    latest_index = assistant_indexes[-1]
+    # 回退思考：最新一次 API 调用没有输出思考时，向前找最近一次真实思考
+    # （运行时 messages 每轮都保存原始全文，历史值可直接回溯；跳过占位符）
+    fallback = ""
+    for index in reversed(assistant_indexes[:-1]):
+        reasoning = messages[index].get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
+            fallback = reasoning
+            break
+    limit = _load_reasoning_return_max_length()
+
+    def _mutated(message: dict[str, Any], reasoning: Any, drop: bool) -> dict[str, Any]:
+        clone = dict(message)  # 顶层浅拷贝：字符串字段共享不可变值，安全
+        if drop:
+            clone.pop("reasoning_content", None)
+        else:
+            clone["reasoning_content"] = reasoning
+        return clone
+
+    copied: List[dict[str, Any]] = []
+    assistant_set = set(assistant_indexes)
+    for index, message in enumerate(messages):
+        if index not in assistant_set or not isinstance(message, dict):
+            copied.append(message)
+            continue
+        if index == latest_index:
+            if not message.get("tool_calls"):
+                # 非工具轮不强制回传思考：已有思考时按回传长度裁剪
+                # （运行时保存的是原始全文），limit==0 时直接剥离字段
+                reasoning = message.get("reasoning_content")
+                if not (isinstance(reasoning, str) and reasoning.strip()) or limit < 0:
+                    copied.append(message)  # 无思考或全量回传：原样引用
+                elif limit == 0:
+                    copied.append(_mutated(message, None, drop=True))
+                else:
+                    copied.append(_mutated(message, reasoning[-limit:], drop=False))
+                continue
+            current = message.get("reasoning_content")
+            # 只回传一条思考：优先本轮（最近一次 API 调用）输出的思考；
+            # 本轮没有时向前回溯最近一次真实思考（不产生第二条真实思考）；
+            # 都没有或 limit==0 时回传占位符（字段存在即可通过严格上游校验）
+            source = current if isinstance(current, str) and current.strip() else fallback
+            reasoning = _reasoning_content_for_tool_call(source, limit)
+            if isinstance(current, str) and reasoning == current:
+                copied.append(message)  # 回传值与原值一致：复用原对象
+            else:
+                copied.append(_mutated(message, reasoning, drop=False))
+            continue
+        # 旧 assistant（工具轮/非工具轮）：历史思考一律不回传，剥离字段
+        if "reasoning_content" not in message:
+            copied.append(message)
+            continue
+        copied.append(_mutated(message, None, drop=True))
+    return copied
 
 
 def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
@@ -234,83 +406,15 @@ def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, 
 # 当前工作路径为<{_format_tool_result(get_current_dir())}>
 # 本轮工具集合由用户选择并由系统注入，你只能调用当前可见工具（如果用户提供了）；禁止臆造、改名或扩展工具。
 # 如果任务已完成，直接给最终答复。
-def _build_sys_prompt() -> str:
-    """构建系统提示词。
-
-    思考过程/历史工具结果的回传长度提示只在配置为正数（截断回传）时出现：
-    截断会改变模型看到的内容，必须明确告知边界；全量回传与不回传时不提示。
-    """
-    reasoning_limit = _load_reasoning_return_max_length()
-    tool_result_limit = parse_return_length(
-        load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
-        DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
-    )
-    notes = [
-        "工具由用户选择提供，你只能使用最近一次 user 角色给你的（如果用户提供了）；之前用过的工具不一定能使用。",
-        "任务过程中，你的思考过程只保留最近一次，过程中的重要发现需要实时告诉用户，这也是为了后续任务的连贯性。",
-    ]
-    if tool_result_limit > 0:
-        # 与 chat_history_format._truncate_tool_result_text 的"前 N 字符"语义一致
-        notes.append(
-            f"历史轮次中每个工具结果只回传最前面 {tool_result_limit} 字符（超出部分省略）；重要工具结果会由上下文摘要保留。"
-        )
-    elif tool_result_limit == 0:
-        notes.append("后端常规历史上下文只保留工具调用参数；重要工具结果会由上下文摘要保留。")
-    # tool_result_limit < 0：工具结果完整回传，无需提示
-    if reasoning_limit > 0:
-        # 与上方 full_reasoning[-reasoning_limit:] 的"末尾 N 字符"语义一致
-        notes.append(f"你的思考过程（reasoning_content）只会保留最后 {reasoning_limit} 字符。")
-    # reasoning_limit <= 0：完整回传或不回传，无需提示
-    numbered_notes = "\n".join(f"{index}、{note}" for index, note in enumerate(notes, start=1))
-    media_prompt = _build_media_tag_prompt()
-    return (
-        "当前系统已安装基础 py 环境。\n"
-        "程序所有工具支持都并发调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
-        "注意：\n"
-        f"{numbered_notes}\n"
-        + media_prompt
-    )
-
-
-def _build_media_tag_prompt() -> str:
-    """媒体伪标签输出说明：前端会把 <image>/<audio>/<video>/<pdf> 渲染为可交互控件。
-
-    src 三种取值：网络 URL / media:// 引用（本会话上传媒体）/ 本地路径
-    （相对当前工作路径或绝对路径均可，项目支持路径切换）。仅确认存在的
-    文件才输出标签；标签独立成行；除 src/alt/title 外不要附加其它属性。
-    """
-    return (
-        "## 媒体展示（伪标签）\n"
-        "需要在回复中向用户展示图片/音频/视频/PDF 时，输出以下伪标签（不要输出真实 HTML 标签，前端会负责渲染）：\n"
-        '- <image src="{路径或URL}" alt="{一句话描述}"></image>\n'
-        '- <audio src="{路径或URL}" title="{名称}"></audio>\n'
-        '- <video src="{路径或URL}" title="{名称}"></video>\n'
-        '- <pdf src="{路径或URL}" title="{名称}"></pdf>\n'
-        "src 支持三种取值：\n"
-        "1. 网络 URL：http/https 开头的直链，公共互联网在线资源（如公开图片/音频/视频/PDF 文件直链）均可，前端可直接加载展示；\n"
-        "2. media://文件名（用户本会话上传的媒体文件）；\n"
-        "3. 本地路径：请使用绝对路径（如 C:/data/x.png 或者 /home/user/x.png）；\n"
-        "规则：仅引用你确认存在的文件（必要时先用工具核实路径）；每个标签必须独立成行；"
-        "src 使用双引号；不要附加 style/onclick 等其它属性；无法展示时直接用文字说明路径。\n"
-    )
-# 如果你不确定某个工具名是否存在，可调用 check_tool_exists 逐个检查；不要通过遍历猜测全部工具。
-
-
-def build_runtime_system_text(work_dir: str | None = None) -> str:
-    """构造运行时系统提示附加文本（工作路径 + 系统提示）。
-
-    与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
-    token 统计接口用它单独估算系统提示词开销。
-
-    work_dir 缺省时取当前进程 cwd：worker 进程内已在任务开始时 chdir 到
-    会话目录，天然正确；主进程调用方（token 统计等）应显式传入按会话
-    解析的目录（resolve_session_work_dir），避免跨会话读到全局 cwd。
-    """
-    dir_text = work_dir if isinstance(work_dir, str) and work_dir.strip() else get_current_dir()
-    return (
-        f"当前工作路径为<{_format_tool_result(dir_text)}>\n"
-        + _build_sys_prompt()
-    )
+# 系统提示词构建已模块化到 factory/system_prompt.py（工作路径 + 环境说明 +
+# 工具规则 + 回传长度/工具超时等可变配置说明）。此处 re-export 保持既有
+# 导入路径（routers/chat_router 等）不变；build_runtime_system_text 每次构造
+# 都实时读取 load_var，用户改配置后下一轮对话即生效。
+from factory.system_prompt import (  # noqa: F401
+    build_media_tag_prompt,
+    build_runtime_system_text,
+    build_sys_prompt,
+)
 
 
 async def load_all_tools() -> None:
@@ -846,6 +950,7 @@ async def _run_chat_generation(
     edit_file_requested = EDIT_FILE_NAME in (requested_names or [])
     read_file_requested = READ_FILE_NAME in (requested_names or [])
     search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
+    read_media_requested = READ_MEDIA_NAME in (requested_names or [])
     round_tools, round_tool_servers = inject_builtin_tools(
         round_tools, round_tool_servers, include_todo=todo_requested,
         include_ask_user=ask_requested,
@@ -853,6 +958,7 @@ async def _run_chat_generation(
         include_edit_file=edit_file_requested,
         include_read_file=read_file_requested,
         include_search_files=search_files_requested,
+        include_read_media=read_media_requested,
     )
     tool_request.tools = round_tools or None
     messages: List[dict] = []
@@ -991,6 +1097,16 @@ async def _run_chat_generation(
             await session_chat_memory.add_chat_history(latest_user_message)
             if not stream.question_text:
                 stream.question_text = latest_user_text
+        # read_media 的 media:// 引用常规集合（当前任务轮用户消息中出现的引用）；
+        # 当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
+        # 常规过滤传给 execute_read_media（本地/网络来源不在此列、不受过滤）。
+        # 注意：必须在下方 resolve_message_media_refs 之前收集——该解析会把
+        # media:// 就地改写为 data:/base64，改写后再扫描将永远得到空集。
+        try:
+            current_task_media_references = collect_media_references(messages)
+        except Exception as media_collect_error:
+            current_task_media_references = []
+            print(f"[WARN] 当前任务媒体引用收集失败（read_media 将不可用）: {media_collect_error}")
         # 多媒体引用解析：仅解析当前轮消息 content 列表里的 media:// 引用为
         # 上游可用的 data URL / base64（image_url.url；input_audio.data 为纯
         # base64）。历史轮次用户消息为纯文本口径（媒体部件为 [图片] 等占位
@@ -1233,9 +1349,16 @@ async def _run_chat_generation(
                 await _consume_injected_message()
             except Exception as inject_error:
                 print(f"[WARN] 处理注入消息失败（跳过）: {inject_error}")
-            # 每次请求只携带最近一条思考过程；todo 状态在执行更新后会被
-            # 归并为单条 system 消息，避免工具轨迹和思考文本无限增长。
-            _retain_latest_reasoning(messages)
+            # 占位化只作用于"发往上游的请求副本"，不再原地改 messages：
+            # messages 里的 reasoning_content 必须保持模型原始输出——
+            # 每一轮（含旧工具轮）的真实思考都完整保留并随 add_chat_history
+            # 原样落盘，历史回放/审计永远能看到全部思考过程；
+            # 原地占位化会把"数据源"也污染掉，落盘跟着失真成 "..."。
+            # 请求侧语义：副本中最多只保留一条真实思考——最近一次 API 调用
+            # 输出的那条（本轮没有时向前回溯最近一次真实思考），按回传长度
+            # 裁剪；找不到真实思考或 limit==0 时用 "..." 占位。历史 assistant
+            # （含旧工具轮）一律剥离 reasoning_content，严格上游的字段校验
+            # 仍满足（见 _copy_for_request）。
             # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
             # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
             print(f"[DEBUG] 模型调用消息概要：{_messages_debug_summary(messages)}")
@@ -1248,99 +1371,148 @@ async def _run_chat_generation(
             stream_error = None  # 追踪上游流式错误（与用户手动停止区分，避免误记为"停止任务"）
             tool_calls: List[dict] = []
             usage_accumulator = UsageAccumulator()
-            # 将 messages 附加到 tool_request 中
-            tool_request.messages = build_request_messages(messages)
-            # 注意：ChatLLM.chat_completions(stream=True) 返回 async generator，
-            # 外层 tool_chat_server 是 async def，必须用 async for 迭代，
-            # 否则会抛 TypeError: 'async_generator' object is not iterable
-            async for sse_chunk in ChatLLM.chat_completions(
+            # 将 messages 附加到 tool_request 中（请求侧副本占位化，
+            # 运行时 messages 保持模型原始输出）
+            tool_request.messages = build_request_messages(_copy_for_request(messages))
+            # 工具调用流式阶段无输出超时（0=不限制）：部分服务商在 SSE 输出
+            # tool_calls 期间会无限卡住（连接不断、永无后续事件），HTTP 读
+            # 超时（默认 1800s）既兜不住也不该终止任务。首个 tool_calls
+            # 增量到达后开始按"事件间隔"计时（期间任意后续事件都会续期，
+            # finish_reason 到达后停止计时）；超时只放弃本次工具调用（以
+            # 失败结果反馈模型并继续运行），不终止任务。
+            tool_call_stream_timeout = _load_tool_call_stream_timeout()
+            tool_phase_deadline: float | None = None
+            tool_phase_timeout_hit = False
+            # 手动迭代 async generator（而非 async for）：需要对工具调用阶段
+            # 施加"事件间隔"超时；超时/提前退出时显式 aclose 立即断开上游连接
+            sse_iter = ChatLLM.chat_completions(
                 request = tool_request, # 传递完整的 ChatLLMRequest 对象（已包含 messages）
                 stream = True,
                 stop_checker = lambda: (not session_chat_memory.run_task)
-            ):
-                # print(f"sse_chunk: {sse_chunk}")
-                event = _parse_sse_event(sse_chunk)
-                if event is None:
-                    await _stream_emit(stream, sse_chunk)
-                    continue
-                if event.get("done") or not session_chat_memory.run_task:
-                    if pending_finish_payload is not None:
-                        await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
-                        pending_finish_payload = None
-                    break
-                if event.get("error") is not None:
-                    await _stream_emit(stream, sse_chunk)
-                    if event.get("retrying"):
-                        # 网络失败重试帧：ChatLLM 内部正在按配置自动重试，
-                        # 只透传给前端提示，不终止任务；连续失败达到重试上限时
-                        # 上游会改发 retrying=False 的终止性错误帧。
-                        # 重试是瞬态过程（多数情况下下一次就成功），中间失败
-                        # 不落盘——只保留前端实时提示；最终失败由下方终止帧
-                        # 统一落盘（附带完整重试统计），避免轮次被过程性
-                        # 事件塞满。注意此处不能 continue 掉任务状态维护。
+            ).__aiter__()
+            try:
+                while True:
+                    if tool_phase_deadline is None or tool_call_stream_timeout <= 0:
+                        try:
+                            sse_chunk = await sse_iter.__anext__()
+                        except StopAsyncIteration:
+                            break
+                    else:
+                        remaining = tool_phase_deadline - time.monotonic()
+                        if remaining <= 0:
+                            # finish_reason 已到达后的尾部停顿（usage/[DONE]
+                            # 尾帧迟到）不算工具调用失败：按正常收尾处理
+                            tool_phase_timeout_hit = finish_reason is None
+                            break
+                        try:
+                            sse_chunk = await asyncio.wait_for(
+                                sse_iter.__anext__(), timeout=remaining
+                            )
+                        except asyncio.TimeoutError:
+                            tool_phase_timeout_hit = finish_reason is None
+                            break
+                        except StopAsyncIteration:
+                            break
+                    # 工具调用阶段收到任意事件都续期（含 usage/finish 等尾帧）
+                    if tool_phase_deadline is not None and tool_call_stream_timeout > 0:
+                        tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                    # print(f"sse_chunk: {sse_chunk}")
+                    event = _parse_sse_event(sse_chunk)
+                    if event is None:
+                        await _stream_emit(stream, sse_chunk)
                         continue
-                    stream_error = event.get("error")
-                    stream_error_meta = event if isinstance(event, dict) else {}
-                    session_chat_memory.run_task = False
-                    break
-                # ChatLLM 做了统一处理，会单独发送 usage 事件（不带 finish_reason / choices）
-                # 只要本事件携带 usage 就尝试收集，后续由 completion_id/指纹去重
-                usage_accumulator.collect(event)
-                # 捕获 finish_reason 信号（stop/length/tool_calls）
-                if event.get("finish_reason") is not None:
-                    finish_reason = event["finish_reason"]
-                    pending_finish_payload = {"finish_reason": finish_reason}
-                    if event.get("id") is not None:
-                        pending_finish_payload["id"] = event["id"]
-                    if event.get("usage") is not None:
-                        pending_finish_payload["usage"] = event["usage"]
-                    event = event.copy()
-                    event.pop("finish_reason", None)
-                choices = event.get("choices")
-                # 部分服务会在 finish_reason 之后再发一帧 choices:[] + usage 统计帧
-                # 这类帧需要优先透传 usage，然后再发送 finish_reason，避免前端提前收流
-                if isinstance(choices, list) and len(choices) == 0 and event.get("usage") is not None:
-                    usage_event = {"type": "usage", "usage": event["usage"]}
-                    if event.get("id") is not None:
-                        usage_event["id"] = event["id"]
-                    await _stream_emit(stream, f"data: {json.dumps(usage_event, ensure_ascii=False)}\n\n")
-                    if pending_finish_payload is not None:
-                        await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
-                        pending_finish_payload = None
-                    continue
-                content = event.get("content")
-                reasoning_content = event.get("reasoning_content")
-                tool_calls_delta = event.get("tool_calls")
-                function_call_delta = event.get("function_call")  # 兼容老模型
-                if content:
-                    full_response += content
-                    print(f"{content}", end="", flush=True)
-                if reasoning_content:
-                    full_reasoning += reasoning_content
-                    print(f"{reasoning_content}", end="", flush=True)
-                # 优先处理 tool_calls，如果为空再处理 function_call（兼容老模型）
-                if tool_calls_delta:
-                    _merge_tool_call_delta(tool_calls, tool_calls_delta)
-                    # 调试：打印 tool_calls 累积情况
-                    # for delta in tool_calls_delta:
-                    #     if isinstance(delta, dict):
-                    #         idx = delta.get("index", "?")
-                    #         func = delta.get("function", {})
-                    #         name_part = func.get("name") or ""  # 确保不是 None
-                    #         args_part = func.get("arguments") or ""  # 确保不是 None
-                    #         if name_part or args_part:
-                    #             print(f"[STREAM] tool_call[{idx}] += name:'{name_part[:30]}', args_len:{len(args_part)}", flush=True)
-                elif function_call_delta:
-                    # 兼容老模型的 function_call 字段
-                    _merge_function_call_delta(tool_calls, function_call_delta)
-                    print(f"[DEBUG] function_call_delta: {function_call_delta}")
-                    # fc_name = function_call_delta.get("name") or ""
-                    # fc_args = function_call_delta.get("arguments") or ""
-                    # if fc_name or fc_args:
-                    #     print(f"[STREAM] function_call += name:'{fc_name[:30]}', args_len:{len(fc_args)}", flush=True)
-                # 过滤 tool_calls 中的 id 和 type 字段后再输出
-                filtered_event = _filter_tool_calls_fields(event)
-                await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
+                    if event.get("done") or not session_chat_memory.run_task:
+                        if pending_finish_payload is not None:
+                            await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
+                            pending_finish_payload = None
+                        break
+                    if event.get("error") is not None:
+                        await _stream_emit(stream, sse_chunk)
+                        if event.get("retrying"):
+                            # 网络失败重试帧：ChatLLM 内部正在按配置自动重试，
+                            # 只透传给前端提示，不终止任务；连续失败达到重试上限时
+                            # 上游会改发 retrying=False 的终止性错误帧。
+                            # 重试是瞬态过程（多数情况下下一次就成功），中间失败
+                            # 不落盘——只保留前端实时提示；最终失败由下方终止帧
+                            # 统一落盘（附带完整重试统计），避免轮次被过程性
+                            # 事件塞满。注意此处不能 continue 掉任务状态维护。
+                            continue
+                        stream_error = event.get("error")
+                        stream_error_meta = event if isinstance(event, dict) else {}
+                        session_chat_memory.run_task = False
+                        break
+                    # ChatLLM 做了统一处理，会单独发送 usage 事件（不带 finish_reason / choices）
+                    # 只要本事件携带 usage 就尝试收集，后续由 completion_id/指纹去重
+                    usage_accumulator.collect(event)
+                    # 捕获 finish_reason 信号（stop/length/tool_calls）
+                    if event.get("finish_reason") is not None:
+                        finish_reason = event["finish_reason"]
+                        pending_finish_payload = {"finish_reason": finish_reason}
+                        if event.get("id") is not None:
+                            pending_finish_payload["id"] = event["id"]
+                        if event.get("usage") is not None:
+                            pending_finish_payload["usage"] = event["usage"]
+                        # 模型输出已结束（后续只剩 usage/[DONE] 尾帧）：保留
+                        # 计时但标记 finish 已到达——尾帧若停顿按正常收尾，
+                        # 不再判定为工具调用失败（超时分支检查 finish_reason）
+                        event = event.copy()
+                        event.pop("finish_reason", None)
+                    choices = event.get("choices")
+                    # 部分服务会在 finish_reason 之后再发一帧 choices:[] + usage 统计帧
+                    # 这类帧需要优先透传 usage，然后再发送 finish_reason，避免前端提前收流
+                    if isinstance(choices, list) and len(choices) == 0 and event.get("usage") is not None:
+                        usage_event = {"type": "usage", "usage": event["usage"]}
+                        if event.get("id") is not None:
+                            usage_event["id"] = event["id"]
+                        await _stream_emit(stream, f"data: {json.dumps(usage_event, ensure_ascii=False)}\n\n")
+                        if pending_finish_payload is not None:
+                            await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
+                            pending_finish_payload = None
+                        continue
+                    content = event.get("content")
+                    reasoning_content = event.get("reasoning_content")
+                    tool_calls_delta = event.get("tool_calls")
+                    function_call_delta = event.get("function_call")  # 兼容老模型
+                    if content:
+                        full_response += content
+                        print(f"{content}", end="", flush=True)
+                    if reasoning_content:
+                        full_reasoning += reasoning_content
+                        print(f"{reasoning_content}", end="", flush=True)
+                    # 优先处理 tool_calls，如果为空再处理 function_call（兼容老模型）
+                    if tool_calls_delta:
+                        _merge_tool_call_delta(tool_calls, tool_calls_delta)
+                        if tool_call_stream_timeout > 0:
+                            tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                        # 调试：打印 tool_calls 累积情况
+                        # for delta in tool_calls_delta:
+                        #     if isinstance(delta, dict):
+                        #         idx = delta.get("index", "?")
+                        #         func = delta.get("function", {})
+                        #         name_part = func.get("name") or ""  # 确保不是 None
+                        #         args_part = func.get("arguments") or ""  # 确保不是 None
+                        #         if name_part or args_part:
+                        #             print(f"[STREAM] tool_call[{idx}] += name:'{name_part[:30]}', args_len:{len(args_part)}", flush=True)
+                    elif function_call_delta:
+                        # 兼容老模型的 function_call 字段
+                        _merge_function_call_delta(tool_calls, function_call_delta)
+                        if tool_call_stream_timeout > 0:
+                            tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                        print(f"[DEBUG] function_call_delta: {function_call_delta}")
+                        # fc_name = function_call_delta.get("name") or ""
+                        # fc_args = function_call_delta.get("arguments") or ""
+                        # if fc_name or fc_args:
+                        #     print(f"[STREAM] function_call += name:'{fc_name[:30]}', args_len:{len(fc_args)}", flush=True)
+                    # 过滤 tool_calls 中的 id 和 type 字段后再输出
+                    filtered_event = _filter_tool_calls_fields(event)
+                    await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
+            finally:
+                # 显式关闭上游响应流：超时/提前 break 时立即断开连接，
+                # 不让卡死的 SSE 连接残留在后台
+                try:
+                    await sse_iter.aclose()
+                except Exception:
+                    pass
             if usage_accumulator.count > 0:
                 round_usage_total: dict[str, Any] = {}
                 usage_accumulator.merge_to(round_usage_total, _merge_usage_values)
@@ -1391,6 +1563,19 @@ async def _run_chat_generation(
             known_tool_names = list(round_tool_servers.keys())
             # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
             tool_calls = normalize_tool_calls(tool_calls, known_tool_names)
+            # 工具调用流式阶段超时且没积累出任何可用调用（首个增量都没有，
+            # 或者调用结构损坏被归一化丢弃）：不终止任务，以内部消息提示
+            # 模型重新发起工具调用（内部消息不落盘，与截断续写路径一致）
+            if tool_phase_timeout_hit and not tool_calls:
+                timeout_notice = (
+                    f"刚才的工具调用因上游服务在工具调用阶段超过 "
+                    f"{int(tool_call_stream_timeout)} 秒无输出而失败（接口卡死，"
+                    "参数可能不完整），本次调用已放弃。请重新发起工具调用或继续回答。"
+                )
+                print(f"[WARN] 工具调用流式阶段超时（未收到完整调用），提示模型重试")
+                messages.append({"role": "user", "content": timeout_notice, "_internal": True})
+                await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_STREAM_TIMEOUT', 'message': timeout_notice}}, ensure_ascii=False)}\n\n")
+                continue
             # 检查 tool_calls 是否为空
             if not tool_calls:
                 # 如果 finish_reason 是 "length"，说明模型输出因 max_tokens 不足被截断
@@ -1410,16 +1595,12 @@ async def _run_chat_generation(
                     assistant_message = {"role": "assistant", "content": ""}
                 if assistant_message is not None:
                     # 思考模型的最终回答同样落盘思考过程（SSE 已实时展示，
-                    # JSONL 缺失会导致历史回放/审计看不到思考）；回传长度
-                    # 规则与下方 tool_calls 分支保持一致。历史回放不重发
-                    # reasoning，无上游 400 风险。
-                    final_reasoning_limit = _load_reasoning_return_max_length()
-                    if full_reasoning and final_reasoning_limit != 0:
-                        assistant_message["reasoning_content"] = (
-                            full_reasoning
-                            if final_reasoning_limit < 0
-                            else full_reasoning[-final_reasoning_limit:]
-                        )
+                    # JSONL 缺失会导致历史回放/审计看不到思考）。落盘永远
+                    # 保存模型原始思考全文，不按回传长度裁剪——裁剪只是
+                    # "回传"语义，由请求副本（_copy_for_request）承担。
+                    # 历史回放不重发 reasoning，无上游 400 风险。
+                    if full_reasoning:
+                        assistant_message["reasoning_content"] = full_reasoning
                     messages.append(assistant_message)
                     await session_chat_memory.add_chat_history(assistant_message)
                 # 任务收尾检查点：注入队列还有待处理消息时不结束任务，
@@ -1440,12 +1621,15 @@ async def _run_chat_generation(
                 assistant_message["content"] = full_response
             elif full_reasoning:
                 assistant_message["content"] = f"...{full_reasoning[-100:]}"
-            # 思考模型下，带 tool_calls 的 assistant 消息通常需要回传 reasoning_content（否则 DeepSeek 会报 400）
-            # 回传长度可配置：0=不回传，负数=全部回传，正数=保留末尾 N 字符
-            reasoning_limit = _load_reasoning_return_max_length()
-            if full_reasoning and reasoning_limit != 0:
-                reasoning_content = full_reasoning if reasoning_limit < 0 else full_reasoning[-reasoning_limit:]
-                assistant_message["reasoning_content"] = reasoning_content
+            # 带 tool_calls 的 assistant 消息：思考过程落盘模型原始全文
+            # （本轮有思考就存本轮的；没有就不写字段，也不拿历史旧思考
+            # 冒充本轮落盘）。裁剪/占位符只是"回传"语义——严格上游要求
+            # 工具调用链每条 assistant 必须带 reasoning_content——该契约
+            # 完全由请求副本（_copy_for_request）在发请求前补齐：本轮思考
+            # → 回退上下文最近真实思考 → "..." 占位，长度按
+            # REASONING_RETURN_MAX_LENGTH 裁剪（0=只回占位符）。
+            if full_reasoning:
+                assistant_message["reasoning_content"] = full_reasoning
             formatted_tool_calls = []
             for tc in tool_calls:
                 function_info = tc.get("function") or {}
@@ -1463,6 +1647,45 @@ async def _run_chat_generation(
                     }
                 }
                 formatted_tool_calls.append(formatted_tc)
+            # 工具调用流式阶段超时（调用结构已完整/部分可用）：不执行工具，
+            # 把本次调用按失败处理反馈模型并继续运行——assistant（tool_calls）
+            # 消息与每个工具结果成对落盘，保持工具调用链契约完整，模型可
+            # 基于失败结果重试或继续回答
+            if tool_phase_timeout_hit:
+                timeout_message = (
+                    f"工具调用失败：模型服务在输出工具调用的过程中超过 "
+                    f"{int(tool_call_stream_timeout)} 秒无任何响应（上游接口疑似卡死），"
+                    "本次调用已被中止，参数可能不完整，请重新发起工具调用。"
+                )
+                print(f"[WARN] 工具调用流式阶段超时：放弃 {len(formatted_tool_calls)} 个调用，反馈模型继续")
+                if formatted_tool_calls:
+                    assistant_message["tool_calls"] = formatted_tool_calls
+                    messages.append(assistant_message)
+                    await session_chat_memory.add_chat_history(assistant_message)
+                    for formatted_tc in formatted_tool_calls:
+                        timeout_tool_name = formatted_tc["function"]["name"]
+                        timeout_call_id = formatted_tc["id"]
+                        timeout_arguments = formatted_tc["function"]["arguments"]
+                        await session_chat_memory.add_chat_history({
+                            "role": "tool",
+                            "tool_call_id": timeout_call_id,
+                            "tool_name": timeout_tool_name,
+                            "arguments": timeout_arguments,
+                            "result": timeout_message,
+                        })
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": timeout_call_id,
+                            "content": timeout_message,
+                            "_tool_name": timeout_tool_name,
+                        })
+                        await _stream_emit(stream, f"data: {json.dumps({'tool_return': {'function_name': timeout_tool_name, 'arguments': timeout_arguments, 'result': timeout_message, 'timeout': True}}, ensure_ascii=False)}\n\n")
+                else:
+                    # 部分调用连工具名都不完整：不写空 tool_calls 的 assistant
+                    # 消息（回传上游会 400），改用内部消息提示模型重试
+                    messages.append({"role": "user", "content": timeout_message, "_internal": True})
+                await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_STREAM_TIMEOUT', 'message': timeout_message}}, ensure_ascii=False)}\n\n")
+                continue
             assistant_message["tool_calls"] = formatted_tool_calls
             messages.append(assistant_message)
             await session_chat_memory.add_chat_history(assistant_message)
@@ -1556,6 +1779,10 @@ async def _run_chat_generation(
             todo_updated = False
             ask_user_pending = False
             ask_user_questions: list[dict[str, Any]] = []
+            # read_media 已注入的引用与待注入坐标（本轮任务内累计，防止重复读取）；
+            # 坐标为 (reference, quality) 对，注入时现场加载 base64 部件
+            read_media_injected_refs: set[str] = set()
+            read_media_pending_parts: list[tuple[str, Any]] = []
             for idx, tc, tn, ta in parsed_tools:
                 if tn == TODO_TOOL_NAME:
                     # 模型自我规划：校验并写入会话 todo（_meta.todo），随后推 SSE 给前端
@@ -1598,6 +1825,44 @@ async def _run_chat_generation(
                         "tool_name": tn,
                         "tool_args": ta,
                         "result": ask_result,
+                        "error": None,
+                    })
+                    continue
+                if tn == READ_MEDIA_NAME:
+                    # 读取当前任务媒体：把 media:// 引用解析为媒体加载坐标
+                    #（reference+quality），数据本体（base64）不进入工具结果文本
+                    #（避免刷 JSONL / 超大结果截断），在下方统一处理时按坐标
+                    # 现场加载为 user 消息部件（仅内存）
+                    read_media_result = execute_read_media(
+                        ta,
+                        session_id,
+                        current_task_media_references,
+                        already_injected=read_media_injected_refs,
+                    )
+                    if read_media_result.get("ok"):
+                        read_media_injected_refs.update(
+                            read_media_result.get("injected_references") or []
+                        )
+                        loaded_meta = read_media_result.get("loaded") or []
+                        read_media_pending_parts.extend([
+                            (item["reference"], item.get("quality"))
+                            for item in loaded_meta
+                            if item.get("reference")
+                        ])
+                        # 任务内累计滚动窗口：只保留最近 5 个部件；
+                        # 被挤出的引用从已注入集合移除，再次读取可重新注入
+                        evicted_refs: set[str] = set()
+                        read_media_pending_parts = roll_recent_media_parts(
+                            read_media_pending_parts,
+                            evicted=evicted_refs,
+                        )
+                        read_media_injected_refs.difference_update(evicted_refs)
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": read_media_result,
                         "error": None,
                     })
                     continue
@@ -1781,6 +2046,43 @@ async def _run_chat_generation(
                     session_chat_memory.run_task = False
                 if oversized_abort:
                     break
+                # read_media 数据注入：按坐标现场加载媒体 base64 部件，作为 user
+                # 消息追加进 messages（仅内存，不落盘历史——media:// 引用已随用户
+                # 消息落盘，这里只为让模型看到数据）。占位计费口径已覆盖 user 多模
+                # 态部件。加载失败的坐标以占位文本告知模型，避免静默丢失。
+                if read_media_pending_parts and not oversized_abort:
+                    media_parts = []
+                    for reference, quality in read_media_pending_parts:
+                        info = load_any_media_model_part(session_id, reference, quality=quality)
+                        if info is not None and info.get("part") is not None:
+                            media_parts.append(info["part"])
+                        elif isinstance(info, dict) and info.get("error"):
+                            # 加载器带错误说明（如"未找到，可能已删除"）：原样告知模型
+                            media_parts.append({
+                                "type": "text",
+                                "text": f"[媒体 {reference} 读取失败：{info['error']}]",
+                            })
+                        else:
+                            media_parts.append({
+                                "type": "text",
+                                "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
+                            })
+                    media_message: dict[str, Any] = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "以下是你刚才调用 read_media 读取的媒体内容"
+                                    "（按引用顺序排列）："
+                                ),
+                            },
+                            *media_parts,
+                        ],
+                        "_internal": True,
+                    }
+                    messages.append(media_message)
+                    read_media_pending_parts = []
                 # 任务内上下文预算管理：全量上下文达到单轮阈值（窗口×比例）时，
                 # 压缩持久层历史（老轮次→摘要块+最近问题）并重建内存历史部分。
                 # 此前历史只在请求开始/收尾时压缩，长任务中会一路膨胀到窗口上限。
@@ -1938,14 +2240,21 @@ async def _wait_worker_generation(proxy, stream) -> None:
     保留 stream.task 的既有语义（可 cancel、done 表示生成结束）。
     worker 进程 spawn + 初始化有秒级延迟，必须先等到 task_started
     （is_generation_running 翻转）再判断结束，否则会把"尚未开始"误判成
-    "已完成"，导致流内事件全部丢失；worker 崩溃由 reader 线程合成
-    task_done 兜底收尾。
+    "已完成"，导致流内事件全部丢失。等待 started 不设固定时限：进程
+    存活就继续等（重型 MCP 冷启动探测 + 模型长首字延迟可能超过任意
+    固定值，误判会直接终止仍在生成的任务）；进程死亡时 reader 线程
+    会合成 task_done 收尾，短暂等待其兜底后强制 finish，避免流挂死。
     """
-    deadline = time.monotonic() + 60
     while not proxy.is_generation_running():
         if stream.done:
             return
-        if time.monotonic() >= deadline:
+        if not proxy.is_alive():
+            # 进程已退出：正常情况 reader 已合成 task_done 收尾；短暂等待
+            # 兜底后仍未收尾则强制 finish（与旧 60s 超时语义等价但更精准）
+            for _ in range(50):
+                if stream.done:
+                    return
+                await asyncio.sleep(0.1)
             break
         await asyncio.sleep(0.05)
     while not stream.done and proxy.is_generation_running():
@@ -1984,6 +2293,14 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest)
         return True
     stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
     return True
+
+
+# 聊天 SSE 心跳间隔（秒）：生成任务长时间无增量输出（模型长思考/慢工具/
+# 上游网关缓冲）时连接会静默，nginx 等反向代理默认 60s 无数据即断连，
+# 浏览器/中间层也可能把静默连接判死——用户端表现为"任务被错误终止"。
+# 每 _SSE_HEARTBEAT_SECONDS 秒发一帧 SSE 注释（": ping"）保活链路；
+# 前端 readSseResponse 只解析 "data:" 行，注释帧会被自动忽略。
+_SSE_HEARTBEAT_SECONDS = 15.0
 
 
 async def tool_chat_server(
@@ -2072,9 +2389,26 @@ async def tool_chat_server(
                 yield chunk
             if stream.done:
                 break
+            # 心跳：模型长时间无增量输出时（长思考/慢工具/网关缓冲等），
+            # SSE 连接会静默——nginx 等代理默认 60s 无数据即断连、浏览器
+            # 也可能把静默连接判死，用户端表现为"任务被错误终止"。与手动
+            # 压缩流一致，每 SSE_HEARTBEAT_SECONDS 发一帧 SSE 注释
+            # （": ping"），前端按规范自动忽略注释行（readSseResponse 只
+            # 解析 "data:" 行）。后台生成任务不受消费端影响，ping 仅用于
+            # 保活链路与提示"任务仍在进行"。
+            ping_due = False
             async with stream.cond:
                 if seen >= stream.seq and not stream.done:
-                    await stream.cond.wait()
+                    try:
+                        await asyncio.wait_for(
+                            stream.cond.wait(), timeout=_SSE_HEARTBEAT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+            if seen >= stream.seq and not stream.done:
+                ping_due = True
+            if ping_due:
+                yield ": ping\n\n"
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         # 仅消费端被取消（页面刷新/关闭）：后台生成任务不受影响

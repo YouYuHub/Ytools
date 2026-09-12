@@ -8,7 +8,7 @@
 (function (App) {
   "use strict";
   const {
-    el, scrollToBottom, QNAV_MAX_DASHES, chatScroll,
+    el, scrollToBottom, stickToBottom, QNAV_MAX_DASHES, chatScroll,
     chatInner, qnav, qnavRail, qnavPanel,
     scrollBottomBtn
   } = App;
@@ -469,7 +469,9 @@
     // container 缺省追加到会话流末尾；传入正在流式的助手消息节点时，
     // 气泡嵌入其当前内容之后（工具结果位置），保持注入消息的时间顺序
     (container || chatInner).appendChild(msg);
-    scrollToBottom();
+    // 流式注入（attachment 指向流节点）时尊重自动贴底暂停：用户上滚阅读
+    // 时不被拉回；整段历史回放后由 history.js 的 scrollToBottom 置底复位
+    stickToBottom();
     return msg;
   }
 
@@ -704,6 +706,342 @@
     }
   });
 
+  // ---------- SVG 生成控件（```svg 双视图块）交互 ----------
+  // 视图切换/复制代码/复制图片全部事件委托：markdown 流式重渲染会重建节点
+  chatInner.addEventListener("click", async function (e) {
+    const btn = e.target.closest("[data-svg-action]");
+    if (!btn) return;
+    const block = btn.closest(".md-svg-block");
+    if (!block) return;
+    const action = btn.dataset.svgAction;
+    if (action === "view-image" || action === "view-code") {
+      const want = action === "view-image" ? "image" : "code";
+      block.querySelectorAll("[data-svg-view]").forEach(function (view) {
+        view.hidden = view.dataset.svgView !== want;
+      });
+      block.querySelectorAll(".md-svg-tab").forEach(function (tab) {
+        tab.classList.toggle("is-active", tab === btn);
+      });
+      return;
+    }
+    const original = btn.textContent;
+    btn.disabled = true;
+    if (action === "copy-code") {
+      try {
+        const code = Markdown.unescapeHtml(block.dataset.svgCode || "");
+        await navigator.clipboard.writeText(code);
+        btn.textContent = "✓ 已复制";
+      } catch (_) {
+        btn.textContent = "复制失败";
+      }
+    } else if (action === "copy-image") {
+      try {
+        const blob = await svgBlockToPngBlob(block);
+        if (navigator.clipboard && window.ClipboardItem) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+          btn.textContent = "✓ 已复制图片";
+        } else {
+          // 剪贴板写图片不可用（非安全上下文等）：降级为下载 PNG
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "svg-image.png";
+          link.click();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          btn.textContent = "✓ 已下载 PNG";
+        }
+      } catch (_) {
+        btn.textContent = "复制失败";
+      }
+    } else {
+      btn.disabled = false;
+      return;
+    }
+    setTimeout(function () {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 1500);
+  });
+
+  // 把 SVG 双视图块的图片视图光栅化为 PNG：
+  // 内联 SVG → Blob(data:image/svg+xml) → Image 解码 → canvas 绘制 → PNG Blob。
+  // 尺寸优先取实际渲染的显示尺寸（getBoundingClientRect）——mermaid 产物的
+  // svg 根是 width="100%" 且 height 已被移除，直接读属性会得到 100×viewBox
+  // 的崩坏比例；不可见（代码视图激活）时回退 viewBox 基准尺寸。
+  // 按 2x~3x（跟随 devicePixelRatio）超采样导出，粘贴出去不发虚。
+  async function svgBlockToPngBlob(block) {
+    const view = block.querySelector('[data-svg-view="image"] svg');
+    if (!view) throw new Error("svg not found");
+    // 基准尺寸（CSS 像素）：元素盒在 max-height 触顶时会水平 letterbox
+    // （内容按 preserveAspectRatio 居中缩小、两侧留透明），直接用元素盒
+    // 导出会把留白框进 PNG（表现为白色外框）——按 viewBox 比例从元素盒
+    // 中「contain 裁剪」出实际绘制内容的尺寸
+    let baseW = 0, baseH = 0;
+    const visible = !!(view.getClientRects && view.getClientRects().length);
+    const rect = visible ? view.getBoundingClientRect() : null;
+    const vb = (view.getAttribute("viewBox") || "").split(/[\s,]+/).map(parseFloat);
+    const vbOk = vb.length === 4 && isFinite(vb[2]) && isFinite(vb[3]) && vb[2] > 0 && vb[3] > 0;
+    if (rect && rect.width > 2 && rect.height > 2) {
+      if (vbOk) {
+        const ar = vb[2] / vb[3];
+        baseW = Math.min(rect.width, rect.height * ar);
+        baseH = Math.min(rect.height, rect.width / ar);
+      } else {
+        baseW = rect.width;
+        baseH = rect.height;
+      }
+    }
+    if (!(baseW > 2 && baseH > 2)) {
+      if (vbOk) {
+        baseW = vb[2];
+        baseH = vb[3];
+      } else {
+        baseW = 640;
+        baseH = 480;
+      }
+    }
+    baseW = Math.max(2, Math.round(baseW));
+    baseH = Math.max(2, Math.round(baseH));
+    // 高清倍率：2x 起、跟随 devicePixelRatio、上限 3x；长边 6000px 兜底防爆内存
+    let scale = Math.min(Math.max(2, window.devicePixelRatio || 1), 3);
+    let w = Math.round(baseW * scale);
+    let h = Math.round(baseH * scale);
+    const MAX_EDGE = 6000;
+    if (Math.max(w, h) > MAX_EDGE) {
+      const k = MAX_EDGE / Math.max(w, h);
+      w = Math.round(w * k);
+      h = Math.round(h * k);
+      scale = w / baseW;
+    }
+    const clone = view.cloneNode(true);
+    // 去内联样式（mermaid 的 max-width / 自适应 width:100% 在独立解码语境
+    // 无意义且会干扰固有尺寸），改用显式像素尺寸 + viewBox 保证比例
+    clone.removeAttribute("style");
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+    clone.setAttribute("width", baseW);
+    clone.setAttribute("height", baseH);
+    if (!vbOk) clone.setAttribute("viewBox", "0 0 " + baseW + " " + baseH);
+    const blobSrc = new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blobSrc);
+    try {
+      const img = await new Promise(function (resolve, reject) {
+        const image = new Image();
+        image.onload = function () { resolve(image); };
+        image.onerror = function () { reject(new Error("SVG 解码失败")); };
+        image.src = url;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      return await new Promise(function (resolve, reject) {
+        canvas.toBlob(function (b) {
+          b ? resolve(b) : reject(new Error("PNG 导出失败"));
+        }, "image/png");
+      });
+    } finally {
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
+  }
+
+  // ---------- Canvas 沙箱运行时（```canvas 程序块） ----------
+  // 每块独立 <iframe sandbox="allow-scripts">（不给 allow-same-origin →
+  // opaque origin：父页读不到它的 contentDocument，它也访问不到页面
+  // DOM/cookie/存储/同源接口）。通信全走 postMessage：
+  //   1) iframe BOOT 完成 → 回发 canvas-ready；
+  //   2) 父页按 ev.source 匹配 frame，下发 canvas-run{id,code}；
+  //   3) iframe 内 new Function('stage','console',code) 执行，console 收集，
+  //      结束时 canvas-done/canvas-error{logs, shot} 一次性回传（shot 为
+  //      沙箱内 stage.toDataURL 的自报快照——跨源读不到画布像素，截图
+  //      必须由 iframe 自己导出）。
+  // 用户代码不经 srcdoc 注入，避免 HTML 解析转义风险；流式重建的旧
+  // iframe 随节点一起被丢弃，无需显式回收。
+
+  const CANVAS_RUNTIME_CSS =
+    "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" +
+    "#stage{display:block;width:100%;height:100%;}";
+
+  // 沙箱内宿主脚本：监听父页指令，执行用户脚本并回传日志/异常/快照
+  const CANVAS_BOOT_JS = [
+    "var stage=document.getElementById('stage');",
+    "function shot(){",
+    "  try{return stage.toDataURL('image/png');}catch(e){",
+    "    return 'ERR:'+String(e&&e.message||e);",
+    "  }",
+    "}",
+    "function fmt(v){",
+    "  try{return typeof v==='string'?v:JSON.stringify(v);}catch(_){return String(v);}",
+    "}",
+    "function join(args){return Array.prototype.map.call(args,fmt).join(' ');}",
+    "window.addEventListener('message',function(ev){",
+    "  var d=ev.data||{};",
+    "  if(d.type!=='canvas-run')return;",
+    "  var logs=[];",
+    "  var sc={log:function(){logs.push(join(arguments));},",
+    "    info:function(){logs.push(join(arguments));},",
+    "    warn:function(){logs.push('[warn] '+join(arguments));},",
+    "    error:function(){logs.push('[error] '+join(arguments));}};",
+    "  try{",
+    "    new Function('stage','console',d.code)(stage,sc);",
+    "    parent.postMessage({type:'canvas-done',id:d.id,logs:logs,shot:shot()},'*');",
+    "  }catch(err){",
+    "    logs.push('[异常] '+String(err&&err.message||err));",
+    "    parent.postMessage({type:'canvas-error',id:d.id,logs:logs,shot:shot(),error:String(err&&err.message||err)},'*');",
+    "  }",
+    "});",
+    "parent.postMessage({type:'canvas-ready'},'*');",
+  ].join("\n");
+
+  // 生成沙箱 iframe：srcdoc 为受控运行时模板（仅画布 + BOOT，代码走消息）
+  function buildCanvasFrame() {
+    const frame = document.createElement("iframe");
+    frame.className = "md-canvas-frame";
+    frame.setAttribute("sandbox", "allow-scripts");
+    frame.setAttribute("title", "Canvas 沙箱");
+    frame.srcdoc =
+      "<!doctype html><html><head><meta charset=\"utf-8\"><style>" +
+      CANVAS_RUNTIME_CSS + "</style></head><body>" +
+      "<canvas id=\"stage\" width=\"720\" height=\"420\"></canvas>" +
+      "<script>" + CANVAS_BOOT_JS + "<\/script></body></html>";
+    return frame;
+  }
+
+  // 画布快照缓存：canvasId -> {dataUrl, error}（canvas-done/error 时写入）
+  const canvasShots = new Map();
+
+  // 沙箱消息总线：ready → 下发该块源码；done/error → 状态复位 + 日志渲染 + 快照缓存
+  function onCanvasMessage(ev) {
+    const data = ev.data || {};
+    if (data.type === "canvas-ready") {
+      // 按 source 匹配发起方 iframe，取其所在块的源码下发
+      const frames = chatInner.querySelectorAll(".md-canvas-frame");
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i].contentWindow === ev.source) {
+          const block = frames[i].closest(".md-canvas-block");
+          if (block && frames[i].contentWindow) {
+            frames[i].contentWindow.postMessage({
+              type: "canvas-run",
+              id: block.dataset.canvasId || "",
+              code: Markdown.unescapeHtml(block.dataset.svgCode || ""),
+            }, "*");
+          }
+          return;
+        }
+      }
+      return;
+    }
+    if (data.type === "canvas-done" || data.type === "canvas-error") {
+      const block = chatInner.querySelector(
+        '.md-canvas-block[data-canvas-id="' + data.id + '"]');
+      if (!block) return;
+      const shotData = String(data.shot || "");
+      canvasShots.set(data.id || "", {
+        dataUrl: shotData.indexOf("data:image/png") === 0 ? shotData : "",
+        error: shotData.indexOf("data:image/png") === 0 ? "" :
+          (shotData ? shotData.replace(/^ERR:/, "画布被浏览器标记污染，无法导出：") : ""),
+      });
+      renderCanvasLog(block, data.logs || []);
+      // 同步脚本瞬间完成：状态复位，按钮回到「▶ 运行」（再点即重跑）
+      setCanvasState(block, "idle");
+    }
+  }
+  window.addEventListener("message", onCanvasMessage);
+
+  // 日志区：画布下方等宽文本框（textContent 注入，防日志内容注入 HTML）
+  function renderCanvasLog(block, logs) {
+    const view = block.querySelector(".md-canvas-view");
+    if (!view) return;
+    let logBox = view.querySelector(".md-canvas-log");
+    if (!logBox) {
+      logBox = document.createElement("div");
+      logBox.className = "md-canvas-log";
+      view.appendChild(logBox);
+    }
+    logBox.textContent = logs.length ? logs.join("\n") : "(无输出)";
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  // 运行状态辅助：更新 data-canvas-state 并同步「运行/停止」按钮文案
+  function setCanvasState(block, stateName) {
+    block.dataset.canvasState = stateName;
+    const runBtn = block.querySelector("[data-canvas-action='run']");
+    if (!runBtn) return;
+    if (stateName === "running") {
+      runBtn.textContent = "■ 停止";
+      runBtn.classList.add("is-running");
+    } else {
+      runBtn.textContent = "▶ 运行";
+      runBtn.classList.remove("is-running");
+    }
+  }
+
+  // Canvas 控件交互（事件委托，与 SVG 控件同容器挂载）
+  chatInner.addEventListener("click", async function (e) {
+    const btn = e.target.closest("[data-canvas-action]");
+    if (!btn) return;
+    const block = btn.closest(".md-canvas-block");
+    if (!block) return;
+    const action = btn.dataset.canvasAction;
+
+    // 「运行/停止」同一颗按钮：未运行 → 确认后在沙箱执行；运行中 → 停止。
+    // 实际执行由沙箱 ready 握手触发（onCanvasMessage 收到 canvas-ready 后
+    // 下发源码），这里只负责确认 + 建 iframe + 置运行态。
+    if (action === "run") {
+      if (block.dataset.canvasState === "running") {
+        setCanvasState(block, "idle");
+        const frame = block.querySelector(".md-canvas-frame");
+        if (frame) frame.remove();
+        const view = block.querySelector(".md-canvas-view");
+        if (view) {
+          view.innerHTML = '<div class="md-canvas-placeholder">已停止 · 点击「▶ 运行」重新执行</div>';
+        }
+        return;
+      }
+      // 运行确认：沙箱只禁 DOM 访问，脚本体本身无法预检
+      if (!window.confirm("在该沙箱中运行此 Canvas 脚本？\n（脚本在隔离 iframe 中执行，无法访问本页数据，但请注意其绘制/计算内容）")) {
+        return;
+      }
+      const view = block.querySelector(".md-canvas-view");
+      if (!view) return;
+      view.innerHTML = "";
+      view.appendChild(buildCanvasFrame());
+      setCanvasState(block, "running");
+      return;
+    }
+
+    if (action === "shot") {
+      // 截图导出：使用沙箱执行完成时自报的快照（canvasShots 缓存）——
+      // 沙箱是 opaque origin，父页读不到 iframe 内画布像素，截图只能由
+      // iframe 内 stage.toDataURL 自报；未运行/被污染时给出明确提示
+      const id = block.dataset.canvasId || "";
+      const rec = canvasShots.get(id);
+      if (!rec || (!rec.dataUrl && !rec.error)) {
+        App.toast("尚未运行，先点「▶ 运行」");
+        return;
+      }
+      if (rec.error) { App.toast(rec.error); return; }
+      try {
+        const blob = await (await fetch(rec.dataUrl)).blob();
+        if (navigator.clipboard && window.ClipboardItem) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+          App.toast("已复制画布截图");
+        } else {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "canvas-shot.png";
+          link.click();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          App.toast("已下载画布截图 PNG");
+        }
+      } catch (err) {
+        App.toast("截图失败：" + (err && err.message || err));
+      }
+      return;
+    }
+  });
+
   // 媒体元素加载失败（404/路径失效等）：capture 捕获 media error 事件
   // （error 不冒泡），控件整体标记为不可用并显示占位说明
   document.addEventListener("error", function (e) {
@@ -712,6 +1050,70 @@
     const widget = target.closest(".md-media");
     if (widget) widget.classList.add("is-broken");
   }, true);
+
+  // ---------- Mermaid 异步渲染接线 ----------
+  // ```mermaid 控件在 Markdown.render()（同步纯函数）里只产出「渲染中」占位，
+  // mermaid.render 是异步 API 且库 5.5MB 需懒加载——这里在节点挂载后异步回填：
+  // MutationObserver 捕获流式整块重建后的新控件，按 data-mermaid-id 去重渲染。
+  // pending 集合做并发合并：同一控件流式期间重复渲染只保留最后一次。
+  const mermaidPending = new Map(); // id → Promise
+
+  function scheduleMermaidRender(widget) {
+    const id = widget.dataset.mermaidId;
+    const state = widget.dataset.mermaidState;
+    if (!id || state !== "pending" || mermaidPending.has(id)) return;
+    const holder = widget.querySelector('[data-mermaid-holder="' + id + '"]');
+    if (!holder) return;
+    const code = Markdown.unescapeHtml(widget.dataset.svgCode || "");
+    if (!code.trim()) return;
+    widget.dataset.mermaidState = "rendering";
+    const p = Markdown.renderMermaidInto(id, code, holder)
+      .then(function () {
+        widget.dataset.mermaidState = "done";
+        mermaidPending.delete(id);
+      })
+      .catch(function () {
+        widget.dataset.mermaidState = "failed";
+        mermaidPending.delete(id);
+      });
+    mermaidPending.set(id, p);
+  }
+
+  function mountMermaidBlocks(root) {
+    if (!root) return;
+    if (root.nodeType === 1 && root.matches && root.matches(".md-mermaid-block")) {
+      scheduleMermaidRender(root);
+      return;
+    }
+    const nodes = root.querySelectorAll ? root.querySelectorAll(".md-mermaid-block") : [];
+    for (let i = 0; i < nodes.length; i++) scheduleMermaidRender(nodes[i]);
+  }
+
+  // 挂载触发：markdown 重渲染是整体替换 innerHTML/appendChild 混用，
+  // MutationObserver 统一捕获（配置 childList+subtree 足够，无需 attributes）
+  if (typeof MutationObserver !== "undefined") {
+    new MutationObserver(function (mutations) {
+      for (let i = 0; i < mutations.length; i++) {
+        const added = mutations[i].addedNodes;
+        for (let k = 0; k < added.length; k++) {
+          if (added[k].nodeType === 1) mountMermaidBlocks(added[k]);
+        }
+      }
+    }).observe(chatInner, { childList: true, subtree: true });
+  }
+
+  // 流结束兜底：finish() 里清掉仍处于 rendering/pending 的控件状态残留
+  //（渲染失败已在 catch 内落态；这里只把孤儿的"渲染中"文案转错误说明）
+  function finalizeMermaidBlocks() {
+    chatInner.querySelectorAll('.md-mermaid-block[data-mermaid-state="rendering"]').forEach(function (widget) {
+      widget.dataset.mermaidState = "failed";
+      const holder = widget.querySelector("[data-mermaid-holder]");
+      if (holder && !holder.querySelector("svg")) {
+        holder.classList.add("md-mermaid-error");
+        holder.textContent = "Mermaid 渲染未完成（流式被中断），可展开代码视图查看源码";
+      }
+    });
+  }
 
   // ---------- md 表格：复制（原始 Markdown）与复制为图片 / 下载 Excel ----------
   // 矩阵转换与 canvas 网格绘制抽到 js/table_canvas.js（TableCanvas 全局，纯函数可单测）
@@ -997,6 +1399,7 @@
 
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
+  App.finalizeMermaidBlocks = finalizeMermaidBlocks;
   App.renderRecords = renderRecords;
   App.appendTime = appendTime;
   App.buildCompactionBlock = buildCompactionBlock;

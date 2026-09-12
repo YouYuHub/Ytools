@@ -7,6 +7,8 @@ import fnmatch
 import json
 import os
 import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -18,13 +20,14 @@ WRITE_FILE_NAME = "write_file"
 EDIT_FILE_NAME = "edit_file"
 READ_FILE_NAME = "read_file"
 SEARCH_FILES_NAME = "search_files"
+READ_MEDIA_NAME = "read_media"
 # 内置工具在工具选择（_meta.tool_selection / mcp_servers.json inputs）中的伪服务键：
 # 前端把它作为“内置工具”分组渲染在工具模态框首位，保存/加载与 MCP 工具走同一链路
 BUILTIN_TOOL_SERVER_KEY = "__builtin__"
 # 工具选择中允许出现的内置工具名（check_tool_exists 由后端按外部工具自动注入，不开放手选）
 SELECTABLE_BUILTIN_TOOL_NAMES = (
     TODO_TOOL_NAME, ASK_USER_TOOL_NAME, WRITE_FILE_NAME, EDIT_FILE_NAME,
-    READ_FILE_NAME, SEARCH_FILES_NAME,
+    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME,
 )
 # 前端回答 ask_user 提问时的消息前缀（前端 app.js 中同名拼接，需保持一致）；
 # 后端据此识别"覆盖式重新回答"：截断最新提问轮之后的旧回答轮
@@ -56,9 +59,10 @@ def inject_builtin_tools(
     include_edit_file: bool = False,
     include_read_file: bool = False,
     include_search_files: bool = False,
+    include_read_media: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """注入本地内置工具：check_tool_exists（选了外部工具时）、todo_write、
-    ask_user、write_file、edit_file、read_file 与 search_files
+    ask_user、write_file、edit_file、read_file、search_files 与 read_media
     （用户在工具选择中勾选时）。"""
     tools = list(selected_tools)
     servers = dict(selected_tool_servers)
@@ -84,6 +88,9 @@ def inject_builtin_tools(
     if include_search_files and SEARCH_FILES_NAME not in servers:
         tools.append(SEARCH_FILES_TOOL_DEFINITION)
         servers[SEARCH_FILES_NAME] = BUILTIN_TOOL_SERVER_KEY
+    if include_read_media and READ_MEDIA_NAME not in servers:
+        tools.append(READ_MEDIA_TOOL_DEFINITION)
+        servers[READ_MEDIA_NAME] = BUILTIN_TOOL_SERVER_KEY
     return tools, servers
 
 
@@ -91,6 +98,7 @@ def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in (
         CHECK_TOOL_EXISTS_NAME, TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
         WRITE_FILE_NAME, EDIT_FILE_NAME, READ_FILE_NAME, SEARCH_FILES_NAME,
+        READ_MEDIA_NAME,
     )
 
 
@@ -951,4 +959,422 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         "files_matched": files_matched,
         "total_matches": total_matches,
         "truncated": len(blocks) >= limit,
+    }
+
+
+# ------------------- read_media：读取图片/音频/视频（统一入口） -------------------
+# 服务端本地执行的内置媒体读取工具：把媒体来源解析为 base64 回传给多模态
+# 模型，支持三类引用：
+# - media://xxx（会话媒体，含用户上传与 read_media 自行注册的来源）；
+# - 本地路径（相对路径基于会话工作目录，worker 进程已 os.chdir）；
+# - http(s) 网络直链（下载后按魔数嗅探校验）。
+# 工具由用户提供，无内容安全边界（本地/网络来源不做白名单拦截）；
+# 用户授权确认逻辑后续接入：register_media_source 的 source_type 字段
+# 已预留来源审计信息，届时在 load_any_media_model_part 入口挂确认钩子。
+# 规模规则沿用上传链路：单次最多 5 个；图片超过 2MB（或显式传 quality）
+# 自动降采样为 JPEG 缩略图（长边 1568，质量按 quality 参数，默认 85）；
+# GIF 动图跳过降采样；大小上限图片/音频 20MB、视频 500MB。
+
+READ_MEDIA_MAX_ITEMS = 5
+_READ_MEDIA_QUALITY_MIN = 50
+_READ_MEDIA_QUALITY_MAX = 100
+
+READ_MEDIA_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": READ_MEDIA_NAME,
+        "description": (
+            "读取媒体文件（本地/网络/用户上传统一入口），把数据回传给你（多模态部件）"
+            "以便观察内容，最多 5 个。\n"
+            "参数：\n"
+            "    references: 媒体来源列表，支持三类引用（可混用）：\n"
+            "                1) media:// 引用（用户消息附件中已展示的引用，如 "
+            "media://xxx_abc12345.png，不要臆造）；\n"
+            "                2) 本地文件路径（绝对路径如 C:/data/x.png，或相对当前"
+            "工作目录的路径；支持 png/jpg/gif/webp/bmp 等图片与常见音频视频格式）；\n"
+            "                3) http(s) 网络直链（公开可访问的图片/音频/视频文件）；\n"
+            "                单个字符串视为单个引用\n"
+            "    quality:    图片清晰度 50-100（越大越清晰/占用越大，默认 85）；"
+            "仅对超过 2MB 的大图生效（小图按原样回传）\n"
+            "返回：\n"
+            "    文本说明（读取了哪些媒体、来源类型、是否降采样/超限跳过）；"
+            "数据本身以 user 消息多模态部件注入后续请求，不在本文本内\n"
+            "注意：\n"
+            "    视频/音频仅回传元信息与部分模型的有限支持，读取结果以图片为主；\n"
+            "    已读取过的引用无需重复读取（同一轮上下文已注入）"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "references": {
+                    "type": "array",
+                    "description": (
+                        "媒体来源列表（最多 5 个）：media:// 引用 / 本地文件路径 / "
+                        "http(s) 网络直链，可混用"
+                    ),
+                    "items": {"type": "string"},
+                },
+                "quality": {
+                    "type": "integer",
+                    "description": (
+                        "图片清晰度 50-100（默认 85；仅对超过 2MB 的大图降采样生效，"
+                        "小图/动图按原样回传）"
+                    ),
+                },
+            },
+            "required": ["references"],
+        },
+    },
+}
+
+
+def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int | None, str | None]:
+    """校验并规整 read_media 参数：references 列表与可选 quality。
+
+    返回 (references, quality, error_reason)；参数非法时 references 为空列表。
+    - references：字符串/单元素自动包列表；每项接受 media:// 引用、本地路径
+      或 http(s) 直链（仅做前后空白清理与去重，按出现顺序保留）；
+    - quality：50-100 整数，非法时返回 error。
+    """
+    args = tool_args if isinstance(tool_args, dict) else {}
+    raw_references = args.get("references")
+    if raw_references is None:
+        raw_references = args.get("reference")
+    if isinstance(raw_references, str):
+        raw_references = [raw_references]
+    if not isinstance(raw_references, list):
+        return [], None, (
+            "references 参数无效：需要媒体来源的字符串数组（media:// 引用 / 本地路径 / http(s) 直链）"
+        )
+    references: list[str] = []
+    for item in raw_references:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if text not in references:
+            references.append(text)
+    quality = args.get("quality")
+    if quality is not None:
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            return [], None, f"quality 参数无效: {quality!r}（应为 50-100 的整数）"
+        if quality < _READ_MEDIA_QUALITY_MIN or quality > _READ_MEDIA_QUALITY_MAX:
+            return [], None, (
+                f"quality 参数超出范围: {quality}（允许 {_READ_MEDIA_QUALITY_MIN}-"
+                f"{_READ_MEDIA_QUALITY_MAX}）"
+            )
+    if not references:
+        return [], quality, (
+            "references 不能为空：请传入媒体来源（media:// 引用 / 本地文件路径 / http(s) 直链）"
+        )
+    return references, quality, None
+
+
+def roll_recent_media_parts(
+    pairs: list[tuple[str, Any]],
+    evicted: set[str] | None = None,
+) -> list[tuple[str, Any]]:
+    """任务内累计媒体部件的滚动窗口：只保留最近 READ_MEDIA_MAX_ITEMS 个。
+
+    - pairs：[(reference, media_part), ...]，按注入时间排列；
+    - evicted：可选输出集合，被挤出窗口的引用会写入其中（调用方应把它们从
+      already_injected 里移除，这样模型再次读取同一引用时能重新注入）。
+
+    返回裁剪后的列表（末尾 READ_MEDIA_MAX_ITEMS 个）。
+    """
+    limit = max(1, READ_MEDIA_MAX_ITEMS)
+    trimmed = pairs[-limit:] if len(pairs) > limit else list(pairs)
+    if evicted is not None and len(pairs) > limit:
+        evicted.update(reference for reference, _ in pairs[:-limit])
+    return trimmed
+
+
+def _load_network_media_bytes(source: str) -> bytes | None:
+    """下载 http(s) 媒体直链字节；失败（网络错误/非 2xx/超时）返回 None。
+
+    超时 30 秒；UA 伪装浏览器；跟随重定向；不限制大小上限——落盘校验交给
+    register_media_source（与用户上传同规则）。
+    """
+    request = urllib.request.Request(
+        source,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = getattr(response, "status", 200)
+            if not (200 <= int(status) < 300):
+                return None
+            return response.read()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+
+def _media_filename_from_reference(source: str, data: bytes) -> str:
+    """从媒体来源推导入库文件名；扩展名缺失/可疑时按魔数嗅探校准。"""
+    from memory import file_memory as fm
+
+    # 提取文件名：URL 取路径末段（去掉 query）；本地路径取完整文件名
+    name = ""
+    if source.startswith("http://") or source.startswith("https://"):
+        from urllib.parse import urlsplit
+
+        path_part = urlsplit(source).path
+        name = Path(path_part).name
+    else:
+        name = Path(source).name
+    name = name.strip()
+    suffix = Path(name).suffix.lower() if name else ""
+    known = suffix and (fm.media_kind(f"probe{suffix}") is not None)
+    if not known:
+        sniffed = fm._sniff_media_filename(data)
+        if sniffed is not None:
+            return sniffed
+    if not name:
+        return "sniffed_unknown.bin"
+    return name
+
+
+def register_media_source(session_id: str, source: str, source_type: str) -> dict[str, Any]:
+    """获取（下载/读取）媒体来源字节并注册进会话媒体库，返回注册信息。
+
+    - source：本地路径（相对路径基于会话工作目录）或 http(s) 直链；
+    - source_type："network" / "local"，写入返回值供后续授权审计使用；
+    - 下载/读取后按魔数嗅探校准扩展名，再走 save_session_media 入库
+      （与用户上传完全同规则：类型校验、大小上限、ICO/TIFF 自动转 PNG）；
+    - 返回 {ok, reference(media://), source_type, kind, mime, size, stored_name}
+      或 {ok=False, error}。
+
+    用户授权确认逻辑预留：接入时在本函数入口（下载/读盘前）挂确认钩子，
+    当前按"工具由用户提供、无安全边界"策略直接放行。
+    """
+    from memory import file_memory as fm
+
+    source_text = (source or "").strip()
+    try:
+        if source_text.startswith("http://") or source_text.startswith("https://"):
+            data = _load_network_media_bytes(source_text)
+            if data is None:
+                return {"ok": False, "error": f"网络媒体下载失败: {source_text}"}
+        else:
+            # 本地路径：相对路径按会话工作目录解析（worker 已 os.chdir）
+            local_path = Path(source_text)
+            if not local_path.is_file():
+                return {"ok": False, "error": f"本地媒体文件不存在: {source_text}"}
+            data = local_path.read_bytes()
+    except OSError as exc:
+        return {"ok": False, "error": f"读取媒体失败: {exc}"}
+    filename = _media_filename_from_reference(source_text, data)
+    try:
+        saved = fm.register_media_source(session_id, filename, data, source_type)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "reference": saved["media_ref"],
+        "source_type": source_type,
+        "kind": saved["kind"],
+        "mime": saved["mime"],
+        "size": saved["size"],
+        "stored_name": saved["stored_name"],
+    }
+
+
+def load_any_media_model_part(
+    session_id: str,
+    reference: str,
+    quality: int | None = None,
+) -> dict[str, Any] | None:
+    """本地/网络/会话统一媒体加载入口（read_media 数据注入使用）。
+
+    引用即真实位置，不再复制落盘：
+    - media:// 引用 → 会话媒体库加载（load_session_media_model_part）；
+    - 本地路径 → 直接按真实路径读取文件构建部件；文件不存在时返回
+      {"error": "未找到，可能已删除", ...}（调用方转为模型可见提示）；
+    - http(s) 直链 → 不再下载/入库，直接把 URL 作为多模态部件透传给
+      上游模型（由模型供应商自行拉取；拉取失败再考虑恢复下载链路）。
+    成功返回值形态与 load_session_media_model_part 一致，并统一补充来源
+    审计信息：source_type（"session" / "network" / "local"）与 source
+    （本次调用的原始 reference）。
+    """
+    from memory import file_memory as fm
+
+    source = (reference or "").strip()
+    if source.startswith(fm.MEDIA_URL_SCHEME):
+        info = fm.load_session_media_model_part(session_id, source, quality=quality)
+        if info is None:
+            return None
+        return {**info, "source_type": "session", "source": source}
+    if source.startswith("http://") or source.startswith("https://"):
+        # URL 直传：按扩展名推断 kind/mime；未知扩展名按图片处理。
+        from urllib.parse import urlsplit
+
+        name = Path(urlsplit(source).path).name or "remote_media"
+        kind = fm.media_kind(name) or "image"
+        mime = fm.media_mime_type(name) if fm.media_kind(name) else "image/jpeg"
+        part: dict[str, Any]
+        if kind == "image":
+            part = {"type": "image_url", "image_url": {"url": source}}
+        elif kind == "video":
+            part = {"type": "video_url", "video_url": {"url": source}}
+        else:
+            part = {
+                "type": "input_audio",
+                "input_audio": {"data": source, "format": Path(name).suffix.lower().lstrip(".")},
+            }
+        return {
+            "part": part,
+            "kind": kind,
+            "mime": mime,
+            "size": None,
+            "downsampled": False,
+            "quality": None,
+            "stored_name": None,
+            "filename": name,
+            "source_type": "network",
+            "source": source,
+        }
+    # 本地路径：直接读取真实位置（相对路径基于会话工作目录，worker 已 os.chdir）
+    local_path = Path(source)
+    if not local_path.is_file():
+        return {"error": f"未找到，可能已删除: {source}", "source_type": "local", "source": source}
+    info = fm._media_model_part_from_path(local_path, quality)
+    if info is None:
+        return {"error": f"读取失败: {source}", "source_type": "local", "source": source}
+    # 沿途保留来源审计信息（本地直读不落盘，加载内核不携带）
+    info["source_type"] = "local"
+    info["source"] = source
+    return info
+
+
+def collect_media_references(messages: Any) -> list[str]:
+    """按出现顺序收集消息列表里 user 消息部件中的 media:// 引用（去重）。
+
+    兼容旧接线的边界数据源（execute_read_media 的 available_references 参数）。
+    当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
+    常规过滤（非拦截）：execute_read_media 收到空集合时不做任何过滤。
+    解析成功与否都算"出现过"——解析失败的引用仍保留 media:// 原文，同样收集。
+    """
+    collected: list[str] = []
+    seen: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            for key, value in part.items():
+                # URL 类部件：image_url / video_url 等以 _url 结尾的键
+                if str(key).endswith("_url") and isinstance(value, dict):
+                    url = value.get("url")
+                    if (
+                        isinstance(url, str)
+                        and url.startswith("media://")
+                        and url not in seen
+                    ):
+                        seen.add(url)
+                        collected.append(url)
+                # 音频部件：input_audio.data 携带 media:// 引用（解析后为纯 base64）
+                if key == "input_audio" and isinstance(value, dict):
+                    data = value.get("data")
+                    if (
+                        isinstance(data, str)
+                        and data.startswith("media://")
+                        and data not in seen
+                    ):
+                        seen.add(data)
+                        collected.append(data)
+    return collected
+
+
+def execute_read_media(
+    tool_args: dict[str, Any],
+    session_id: str,
+    available_references: list[str] | set[str] | tuple[str, ...] | None = None,
+    already_injected: set[str] | None = None,
+    load_media=None,
+) -> dict[str, Any]:
+    """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
+
+    - references 支持 media:// 引用 / 本地路径 / http(s) 直链，可混用；
+    - available_references：兼容旧接线的会话引用白名单（传 None 或空集合
+      即不做边界过滤——当前策略：工具由用户提供，无安全边界）；传入集合
+      时 media:// 引用仍按旧语义过滤，非 media:// 来源不受影响；
+    - already_injected：本轮已注入过的引用（重复读取直接跳过）；
+    - load_media：媒体加载函数（默认 load_any_media_model_part），便于测试
+      注入桩；签名 (session_id, reference, quality=…) → info|None。
+
+    返回结构：
+    - ok 为 True 时 loaded/injected_references 为成功读取的媒体元信息；
+      数据本体（base64 部件）不进入本返回值——工具结果文本会原样落盘 JSONL，
+      且可能被超大结果逻辑截断，媒体数据由调用方按 loaded 项的 reference+quality
+      经 load_any_media_model_part 以 user 多模态部件注入（仅内存）；
+    - 每个拒绝项给出 reason（已注入/超限/下载或读取失败）。
+    """
+    references, quality, arg_error = normalize_read_media_args(tool_args)
+    if arg_error:
+        return {"ok": False, "error": arg_error, "loaded": [], "skipped": [], "injected_references": []}
+    from memory import file_memory as fm
+
+    available = {str(item) for item in (available_references or [])}
+    injected = {str(item) for item in (already_injected or set())}
+    loader = load_media or load_any_media_model_part
+    allowed, skipped = [], []
+    for reference in references:
+        # 本地/网络来源不做白名单拦截；media:// 引用在传入了边界集合时按旧语义过滤
+        if (
+            available
+            and reference.startswith(fm.MEDIA_URL_SCHEME)
+            and reference not in available
+        ):
+            skipped.append({"reference": reference, "reason": "not_in_current_task"})
+            continue
+        if reference in injected:
+            skipped.append({"reference": reference, "reason": "already_injected"})
+            continue
+        allowed.append(reference)
+    if len(allowed) > READ_MEDIA_MAX_ITEMS:
+        for reference in allowed[READ_MEDIA_MAX_ITEMS:]:
+            skipped.append({"reference": reference, "reason": "limit_5_per_round"})
+        allowed = allowed[:READ_MEDIA_MAX_ITEMS]
+    loaded_items: list[dict[str, Any]] = []
+    for reference in allowed:
+        info = loader(session_id, reference, quality=quality)
+        if info is None:
+            # media:// 引用解析失败 = 会话媒体库中不存在（引用无效或文件已删除）
+            reason = (
+                f"未找到，可能已删除: {reference}"
+                if reference.startswith(fm.MEDIA_URL_SCHEME)
+                else "load_failed"
+            )
+            skipped.append({"reference": reference, "reason": reason})
+            continue
+        if isinstance(info, dict) and info.get("error"):
+            # 加载器带错误说明（如本地文件"未找到，可能已删除"）：作为拒绝项
+            # 透传给模型，不计入成功读取
+            skipped.append({"reference": reference, "reason": info["error"]})
+            continue
+        loaded_items.append({
+            "reference": reference,
+            "source_type": info.get("source_type"),
+            "kind": info.get("kind"),
+            "mime": info.get("mime"),
+            "size": info.get("size"),
+            "downsampled": info.get("downsampled"),
+            "quality": info.get("quality"),
+        })
+    loaded = bool(loaded_items)
+    return {
+        "ok": loaded,
+        "message": (
+            f"已读取 {len(loaded_items)} 个媒体（数据已注入后续请求的多模态部件）"
+            if loaded
+            else "没有可读取的媒体（引用无效/重复或全部被跳过）"
+        ),
+        "loaded": loaded_items,
+        "skipped": skipped,
+        "injected_references": [item["reference"] for item in loaded_items],
     }

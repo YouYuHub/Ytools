@@ -162,8 +162,9 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
-  function getHistoryCompactionConfig() {
-    return request("/chat_config/history_compaction");
+  function getHistoryCompactionConfig(sessionId) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/history_compaction" + query);
   }
 
   /**
@@ -194,8 +195,9 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
-  function updateHistoryCompactionConfig(config) {
-    return request("/chat_config/history_compaction", {
+  function updateHistoryCompactionConfig(config, sessionId) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/history_compaction" + query, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(config),

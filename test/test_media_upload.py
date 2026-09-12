@@ -641,7 +641,7 @@ class ImageThumbnailTests(unittest.TestCase):
                 first[0]["image_url"]["url"], second[0]["image_url"]["url"]
             )
             thumbs_dir = fm.HISTORY_ROOT / TEST_SESSION / "thumbs"
-            thumbs = list(thumbs_dir.glob("*.thumb.jpg"))
+            thumbs = list(thumbs_dir.glob("*.thumb.*.jpg"))
             self.assertEqual(len(thumbs), 1)
             cached_before = thumbs[0].read_text(encoding="ascii")
             # 原图被替换为不同尺寸内容（字节指纹变化）后缓存失效重建
@@ -649,7 +649,7 @@ class ImageThumbnailTests(unittest.TestCase):
             os.utime(media_path, (time.time() + 5, time.time() + 5))
             third, _ = fm.resolve_media_content_parts(TEST_SESSION, content)
             self.assertTrue(third[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
-            self.assertEqual(len(list(thumbs_dir.glob("*.thumb.jpg"))), 1)
+            self.assertEqual(len(list(thumbs_dir.glob("*.thumb.*.jpg"))), 1)
             self.assertNotEqual(
                 cached_before, thumbs[0].read_text(encoding="ascii")
             )

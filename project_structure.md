@@ -1,7 +1,7 @@
 # Ytools 智能体工具使用测试 - 项目结构
 
 ## 概述
-基于 **FastAPI** 的智能体工具服务平台，核心业务：大模型对话（SSE 流式、后台任务 + 断线重连）、MCP 工具调用、**多模态文件上传**（图片/音频/视频，media:// 引用解析为 OpenAI 兼容格式）、文件解析、会话记忆与历史压缩、模型/工作目录动态配置；另附 **H5 前端**（聊天界面，含附件粘贴/预览）与交互测试脚本。
+基于 **FastAPI** 的智能体工具服务平台，核心业务：大模型对话（SSE 流式、后台任务 + 断线重连）、MCP 工具调用、**多模态文件上传**（图片/音频/视频，media:// 引用解析为 OpenAI 兼容格式）、文件解析、会话记忆与历史压缩、模型/工作目录动态配置；另附 **H5 前端**（聊天界面：SSE 流式、多模态附件、富媒体渲染——SVG 生成控件 / KaTeX 数学公式 / Mermaid 图表 / Canvas 沙箱程序块——与历史会话管理）与交互测试脚本。
 
 ---
 
@@ -15,7 +15,8 @@ agent_tool_sse/
 ├── .env                         # 一些全局配置
 ├── project_structure.md         # 本文档
 ├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
-├── tmp_repro.py / _chunk*.txt / _diag.txt   # 调试/问题复现用临时文件
+├── tmp_repro.py                 # 调试/问题复现用临时脚本
+├── game/                        # 小实验：guess_number.py / snake.html
 │
 ├── setting/
 │   ├── models.json              # 模型目录：provider→models（含 apiKey/url/能力），variables/runtime 全局变量，
@@ -29,15 +30,18 @@ agent_tool_sse/
 │   ├── agent_runtime/           # Agent 编排所需的可复用运行时组件
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析
 │   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值
-│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问；工具选择中的伪服务 __builtin__）
+│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体；工具选择中的伪服务 __builtin__）
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
 │   │   └── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
 │   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理
+│   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则+回传长度/工具超时等可变配置实时说明
 │   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝
-│   └── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）
+│   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）
+│   ├── xlsx_export.py           # 纯标准库 xlsx 生成器（zipfile+XML 手拼 OOXML：表头加粗/数字原生/错误占位样式）
+│   └── md_table_export.py       # md 表格文本解析（与前端同语义：行内代码/转义竖线不切断分列、行内标记清理、链接取 URL）
 │
 ├── memory/                      # 记忆持久化层
-│   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘
+│   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘 + 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态）
 │   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、chat_round→上下文消息（含工具结果回传模式）
 │   └── file_memory.py           # FileMemoryManager：上传文件记录管理
@@ -47,7 +51,8 @@ agent_tool_sse/
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
-│   └── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频500MB流式）/Range 读取
+│   ├── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频500MB流式）/Range 读取
+│   └── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
 │
 ├── prompt/                      # Skills 提示词库模块
 │   ├── prompt_manager.py        # md_files 目录初始化（空目录播种示例）、文件名规整与增删改查
@@ -61,18 +66,24 @@ agent_tool_sse/
 │
 ├── mcp_server/
  │   ├── sys_tools_server.py            # 系统 MCP 服务器（文件读写/正则搜索/命令执行/网页抓取与搜索）
+│   ├── restart_tools_server.py  # 重启维护 MCP 服务器（restart_service/restart_cancel/restart_status：跨进程重启 Ytools 并向原会话注入续任务消息；配套项目根 restart_helper.py 恢复进程）
 │   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（setup_pipe/run_pipe_command/read_pipe_history）
 │
 ├── H5/                          # 前端聊天界面（纯静态，由后端同端口静态托管或本地打开）
 │   ├── README.md                # 前端使用说明
 │   ├── index.html               # 单页应用入口（Ytools）
-│   ├── js/                      # theme.js / api.js / markdown.js / session_utils.js 等工具模块 +
-│   │                            # app.js（入口）+ app/（14 个功能模块：core/sessions/stats/workdir/
-│   │                            # messages/history/compaction/builtin/media/skills/composer/
-│   │                            # model_panel/tools/chat；skills=提示词库可拖拽对话框）
-│   │   └── vendor/prism/        # 代码高亮（按语言拆分）
+│   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
+│   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
+│   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
+│   │                            #   session_utils.js 等工具模块 + app.js（入口）+
+│   │                            #   app/（14 个功能模块：core/sessions/stats/workdir/
+│   │                            #   messages/history/compaction/builtin/media/skills/composer/
+│   │                            #   model_panel/tools/chat；skills=提示词库可拖拽对话框）
+│   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
+│   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
-│   └── test_h5/                 # 前端工具函数单元测试（format_utils/history_parser/markdown/session_list_utils/session_utils）
+│   └── test_h5/                 # 前端单元测试（api/format_utils/history_parser/markdown/
+│                                #   session_list_utils/session_utils/table_export，node --test）
 │
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明
@@ -103,7 +114,7 @@ agent_tool_sse/
    ├─ ③ 工具白名单过滤：前端只允许传 tool_names，后端实时工具为唯一真相
    │     - 未注册工具名 → 忽略并发 warning 事件
    │     - 未选择工具 → 无工具模式继续
-   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存 _meta.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索：服务端本地执行、语义对齐 MCP 同名工具，相对路径基于会话工作目录；write/edit/read 返回结构化 dict 携带 path/action/replacements/total_lines 等字段，为文件 diff 功能预留）
+   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存 _meta.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索：服务端本地执行、语义对齐 MCP 同名工具，相对路径基于会话工作目录；write/edit/read 返回结构化 dict 携带 path/action/replacements/total_lines 等字段，为文件 diff 功能预留）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单轮 ≤5、>2MB 大图按 quality 50-100 降采样为长边 1568 JPEG；数据以 user 多模态部件注入后续请求、仅内存不落盘）
    ├─ ④ 上下文构建：
    │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS，默认跟随 HISTORY_COMPACT_KEEP_ROUNDS，前端提供完整历史则跳过）
    │     - 注入系统提示词（含当前工作路径、思考过程回传长度说明）+ 会话已上传文件解析内容
@@ -237,7 +248,11 @@ agent_tool_sse/
 ### 9. H5 前端（`H5/`）
 - 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口
 - 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件）、历史回放、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染
-- 工具函数均有对应单元测试（`H5/test/`）
+- **富媒体渲染**：模型输出的 ```svg（双视图：代码/图片 + 复制代码/复制图片）、```mermaid（懒加载 Mermaid.js 异步渲染，代码/图片双视图）、```canvas（**运行确认 + iframe 沙箱**：sandbox="allow-scripts" 隔离执行，postMessage 握手下发源码、回传 console 日志与画布快照，支持运行/停止/截图）、```svg|mermaid|canvas 栅栏与媒体伪标签均独占一行不参与两列并排
+- 公式：KaTeX 0.18.7 本地 vendor（$…$、$$…$$、\(…\)、\[…\] 四种定界符；代码栅栏先遮蔽防误提取；价格文本防误判；无 katex 环境降级原文）
+- 图片视图自适应：SVG 按 viewBox 比例注入 aspect-ratio 内联样式，默认填满控件宽度（仅极竖长 >1.7 屏才按高度收窄），导出图片按实际渲染尺寸超采样 + contain 裁剪
+- 滚动：自动贴底暂停机制（用户上滚阅读时流式 delta 不再强制拉回，滚回底部或点「回到底部」恢复）
+- 工具函数均有对应单元测试（`H5/test_h5/`，node --test 运行）
 
 ### 10. API 接口总览
 > 完整出入参数说明见 `docs/api_docs.md`，在线文档见 `/docs`

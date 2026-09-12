@@ -16,6 +16,90 @@
   const PH_CLOSE = "\u0001";
   // 媒体伪标签占位符（控制字符，与行内代码占位不同前缀）
   const MEDIA_PH_OPEN = "\u0002";
+  // 数学公式占位符（控制字符，与前两者不同前缀）
+  const MATH_PH_OPEN = "\u0003";
+  const MATH_PH_CLOSE = "\u0003";
+
+  // KaTeX 数学公式渲染（window.katex 由 index.html 提前引入；Node 单测等
+  // 无 katex 环境下降级为原文展示，不影响其余渲染）。
+  // 支持：$…$ 行内 / $$…$$ 块级 / \(…\) 行内 / \[…\] 块级（模型常见四种写法）。
+  // 提取在媒体标签/块级解析之前：公式内的 * _ | 等不能被其它语法误吃。
+  // 定界符歧义防护：美元符行内公式要求内部含 LaTeX 命令（\）或上下标/花括号，
+  // 纯数字价格（如 $5 到 $8）不会被当成公式；未闭合的定界符保持原文。
+  function mathExtract(escapedText) {
+    const items = [];   // {display: bool, tex: string}，tex 为未转义原文
+    function push(display, tex) {
+      items.push({ display: display, tex: tex });
+      return MATH_PH_OPEN + (items.length - 1) + MATH_PH_CLOSE;
+    }
+    let text = String(escapedText || "");
+
+    // 块级 $$…$$（可跨行；贪婪配对，同段两个 $$ 之间为一段公式）
+    text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (_m, tex) {
+      return push(true, unescapeTagText(tex));
+    });
+    // 块级 \[…\]
+    text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (_m, tex) {
+      return push(true, unescapeTagText(tex));
+    });
+    // 行内 \(…\)
+    text = text.replace(/\\\(([\s\S]+?)\\\)/g, function (_m, tex) {
+      return push(false, unescapeTagText(tex));
+    });
+    // 行内 $…$：内部需含 LaTeX 特征（\命令、^、_、花括号包内容）才认作公式，
+    // 避免「两个价格 $5 … $8」被误判；tex 内不允许换行（行内公式单行）
+    text = text.replace(/\$([^$\n]+)\$/g, function (match, tex) {
+      const hasCommand = /\\[a-zA-Z]+/.test(tex);
+      const hasScript = /[\^_]\{?[^{}\s]/.test(tex);
+      if (!hasCommand && !hasScript) return match;
+      return push(false, unescapeTagText(tex));
+    });
+    return { text: text, items: items };
+  }
+
+  // 占位符 → KaTeX HTML；katex 缺失/渲染失败时降级为原文（code 样式）。
+  // 原文随 data-tex 保存（转义一层），便于后续扩展「复制源码」等交互。
+  function buildMathHtml(display, tex) {
+    const esc = escapeHtml;
+    let html = "";
+    let failed = false;
+    if (global.katex && typeof global.katex.renderToString === "function") {
+      try {
+        html = global.katex.renderToString(tex, {
+          displayMode: display,
+          throwOnError: false,
+          strict: false,
+          output: "html",
+        });
+      } catch (_) {
+        failed = true;
+      }
+    } else {
+      failed = true;
+    }
+    const cls = display ? "md-math md-math-display" : "md-math md-math-inline";
+    if (failed || !html) {
+      // 降级：等宽原文 + 占位说明，保持版式可读
+      const body = '<code class="md-math-raw">' + esc(tex) + "</code>";
+      return '<span class="' + cls + ' is-raw" data-tex="' + esc(tex) + '">' + body + "</span>";
+    }
+    return '<span class="' + cls + '" data-tex="' + esc(tex) + '">' + html + "</span>";
+  }
+
+  function restoreMathPlaceholders(html, items) {
+    if (!items.length) return html;
+    const RE = new RegExp(MATH_PH_OPEN + "(\\d+)" + MATH_PH_CLOSE, "g");
+    // 块级公式独占一行时替换整个 <p>，避免 display 块嵌进段落
+    let out = html.replace(new RegExp("<p>" + MATH_PH_OPEN + "(\\d+)" + MATH_PH_CLOSE + "</p>", "g"),
+      function (_, idx) {
+        const item = items[Number(idx)];
+        return item ? buildMathHtml(item.display, item.tex) : "";
+      });
+    return out.replace(RE, function (_, idx) {
+      const item = items[Number(idx)];
+      return item ? buildMathHtml(item.display, item.tex) : "";
+    });
+  }
 
   // 媒体伪标签解析器：由 App 在启动时注入（media.js），把标签 src 解析为
   // 可访问 URL（media:// → 会话媒体端点；http(s) 原样；其它按本地路径 →
@@ -28,6 +112,264 @@
   // 属性值以 &quot; 包裹（escapeHtml 把 " 转义为 &quot;）。
   const MEDIA_TAG_RE = /&lt;(image|audio|video|pdf)((?:[^&]|&(?!gt;))*?)(?:\/&gt;|&gt;([\s\S]*?)&lt;\/\1&gt;)/g;
   const MEDIA_ATTR_RE = /([a-zA-Z_][\w:-]*)\s*=\s*&quot;((?:(?!&quot;).)*)&quot;/g;
+
+  // 解析 <svg> 开标签里的 viewBox，返回宽高比（w/h；非法/缺失返回 null）
+  function viewBoxAspectRatio(open) {
+    const m = /\bviewBox\s*=\s*["']\s*([\d.eE+-]+)[\s,]+([\d.eE+-]+)[\s,]+([\d.eE+-]+)[\s,]+([\d.eE+-]+)/i.exec(open);
+    if (!m) return null;
+    const w = parseFloat(m[3]);
+    const h = parseFloat(m[4]);
+    return w > 0 && h > 0 && Number.isFinite(w) && Number.isFinite(h)
+      ? Number((w / h).toFixed(6)) : null;
+  }
+
+  // 把「填满宽度 + 超长钳制」声明合并进 <svg> 开标签的 style（不覆盖其它内联样式）：
+  // aspect-ratio + width:min(100%, 170vh*比例) —— 默认填满控件宽度（左右仅剩
+  // 视图自身的 4px 窄边距），高度按比例联动；仅当填满宽度后高度会超过约
+  // 1.7 屏（极竖长内容）才按高度收窄，避免页面被无限拉高。
+  // 注意不能把这里钳制值压回 70vh：一旦触顶，等比内容只能居中缩小，
+  // 两侧会重新出现大片透明留白（"图片只占中间一部分宽度"）
+  function applyAdaptiveStyle(open, ar) {
+    const styleVal = "aspect-ratio:" + ar +
+      ";width:min(100%,calc(170vh*" + ar + "));height:auto";
+    const styleMatch = /\sstyle\s*=\s*["']([^"']*)["']/i.exec(open);
+    if (styleMatch) {
+      // 追加到原值末尾：同名声明后写的生效，净化源码自带的 width/height 干扰
+      open = open.replace(styleMatch[0],
+        ' style="' + styleMatch[1].replace(/;\s*$/, "") + ";" + styleVal + '"');
+    } else {
+      open = open.replace(/<svg/i, '<svg style="' + styleVal + '"');
+    }
+    return open;
+  }
+
+  // 内联视图专用 SVG 准备（不影响代码视图与「复制代码」的原文）：
+  // 1) 流式铺满：去掉根节点固定 width/height（缺 viewBox 时由其转出），
+  //    否则 CSS height:auto 会取属性内在高度导致视口压扁、内容居中留白；
+  // 2) 触顶收字框：按 viewBox 比例注入 aspect-ratio 自适应样式（见 applyAdaptiveStyle）；
+  // 3) 渲染净化：移除 <script>、on* 事件属性与 javascript: 链接——
+  //    innerHTML 插入的 SVG <script> 会执行，这里是渲染前唯一防线；
+  //    代码视图/复制始终保留完整原文（净化只作用于图片视图）。
+  function makeDisplaySvg(rawSvg) {
+    let svg = String(rawSvg);
+    svg = svg.replace(/<script\b[\s\S]*?<\/script\s*>/gi, "")
+      .replace(/<script\b[^>]*\/\s*>/gi, "");
+    const openMatch = svg.match(/<svg\b[^>]*>/i);
+    if (openMatch) {
+      let open = openMatch[0];
+      const w = /\bwidth\s*=\s*["']([\d.]+)/i.exec(open);
+      const h = /\bheight\s*=\s*["']([\d.]+)/i.exec(open);
+      if (!/\bviewBox\s*=/i.test(open) && w && h) {
+        open = open.replace(/<svg/i, '<svg viewBox="' + w[1] + " " + h[1] + '"');
+      }
+      const ar = viewBoxAspectRatio(open);
+      if (ar) open = applyAdaptiveStyle(open, ar);
+      open = open.replace(/\s(width|height)\s*=\s*["'][^"']*["']/gi, "");
+      svg = svg.replace(openMatch[0], open);
+    }
+    svg = svg.replace(/\son[a-z]+\s*=\s*["'][^"']*["']/gi, "");
+    svg = svg.replace(/((?:xlink:)?href)\s*=\s*["']\s*javascript:[^"']*["']/gi, '$1="#"');
+    return svg;
+  }
+
+  // SVG 代码 → 双视图控件：头部（名称 + 代码/图片切换 + 复制代码 + 复制图片），
+  // 主体「代码视图」（语法高亮 pre/code，与普通代码块同款复制语义）与
+  // 「图片视图」（inline SVG，整行一张独占显示）二选一显示，默认看图片。
+  // 原始 SVG 源码经 escapeHtml 后存入 data-svg-code，复制/切图时还原使用；
+  // alt 属性作为控件名称，缺省用「SVG 图片」。
+  function buildSvgWidget(svgCode, attrs) {
+    const esc = escapeHtml;
+    const name = (attrs.alt || attrs.title || "").trim() || "SVG 图片";
+    // 图片视图：净化后的 SVG 内联进文档（去除固定尺寸实现流式铺满、
+    // 移除脚本与事件属性防执行）；源码原文完整保留在代码视图与 data-svg-code
+    const svgInline = '<div class="md-svg-view" data-svg-view="image">' + makeDisplaySvg(svgCode) + "</div>";
+    return (
+      '<div class="md-svg-block" data-svg-kind="svg" data-svg-code="' + esc(svgCode) + '">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">' + esc(name) + "</span>" +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">图片</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code class="language-markup">' + esc(svgCode) + "</code></pre>" +
+      "</div>" +
+      svgInline +
+      "</div>"
+    );
+  }
+
+  // Mermaid 图表 → 双视图控件：与 SVG 控件同构（代码/图片切换 + 复制代码 +
+  // 复制图片），差异在于「图片视图」由 Mermaid.js **异步**渲染——初始放
+  // 「渲染中」占位，messages.js 的懒加载链路完成 mermaid.render 后回填 SVG；
+  // 语法错误时标记 failed 并显示错误说明（代码视图始终可看）。
+  // data-mermaid-id/state 供异步渲染链路定位与去重；源码原文存 data-svg-code
+  // （复制代码复用 SVG 控件的复制逻辑，无需新增交互）。
+  let mermaidWidgetSeq = 0;
+  function buildMermaidWidget(code) {
+    const esc = escapeHtml;
+    const id = "md-mermaid-" + (++mermaidWidgetSeq);
+    return (
+      '<div class="md-svg-block md-mermaid-block" data-svg-kind="mermaid"' +
+      ' data-svg-code="' + esc(code) + '"' +
+      ' data-mermaid-id="' + id + '" data-mermaid-state="pending">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">Mermaid 图</span>' +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">图片</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code>' + esc(code) + "</code></pre>" +
+      "</div>" +
+      '<div class="md-svg-view" data-svg-view="image">' +
+      '<div class="md-mermaid-loading" data-mermaid-holder="' + id + '">Mermaid 渲染中…</div>' +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // Canvas 程序块 → 「待运行」控件：```canvas 栅栏内是一段 JS 绘图脚本，
+  // **默认不执行**——先展示预览占位与代码视图，用户点「运行」确认后才在
+  // 沙箱 iframe 中执行（运行时与消息交互在 messages.js 的沙箱链路完成）。
+  // data-canvas-code 存源码原文；图片视图初始为「未运行」占位，代码视图
+  // 与 SVG 控件同款（等宽 + 滚动 + 复制代码）；「截图」按钮在运行后可用，
+  // 复用 SVG 控件的导出链路（canvas 像素直接 toBlob）。
+  let canvasWidgetSeq = 0;
+  function buildCanvasWidget(code) {
+    const esc = escapeHtml;
+    const id = "md-canvas-" + (++canvasWidgetSeq);
+    return (
+      '<div class="md-svg-block md-canvas-block" data-svg-kind="canvas"' +
+      ' data-svg-code="' + esc(code) + '"' +
+      ' data-canvas-id="' + id + '" data-canvas-state="idle">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">Canvas 程序</span>' +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">画布</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      '<button type="button" class="md-svg-btn md-canvas-run" data-canvas-action="run">▶ 运行</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="shot" title="导出当前画布为 PNG">截图</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code class="language-javascript">' + esc(code) + "</code></pre>" +
+      "</div>" +
+      '<div class="md-svg-view md-canvas-view" data-svg-view="image">' +
+      '<div class="md-canvas-placeholder">未运行 · 点击「▶ 运行」在沙箱中执行脚本</div>' +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // 按栅栏语言分发构建双视图控件
+  function buildFenceWidget(kind, code) {
+    if (kind === "mermaid") return buildMermaidWidget(code);
+    if (kind === "canvas") return buildCanvasWidget(code);
+    return buildSvgWidget(code, {});
+  }
+
+  // ---------- Mermaid 懒加载 + 异步渲染（与 messages.js 回填链路配合） ----------
+  // mermaid.min.js 5.5MB：不做首屏静态引入，首次出现 ```mermaid 图时才注入
+  // <script> 动态加载；加载完成后 initialize 一次（startOnLoad=false、
+  // securityLevel=strict 禁用 HTML 标签与点击回调）。
+  const MERMAID_BASE_CONFIG = {
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "default",
+  };
+  let mermaidLoadPromise = null;
+  let mermaidInitPromise = null;
+
+  function ensureMermaidLoaded() {
+    if (global.mermaid && typeof global.mermaid.render === "function") {
+      if (!mermaidInitPromise) {
+        mermaidInitPromise = Promise.resolve().then(function () {
+          if (global.mermaid.initialize) global.mermaid.initialize(MERMAID_BASE_CONFIG);
+        });
+      }
+      return mermaidInitPromise;
+    }
+    if (mermaidLoadPromise) return mermaidLoadPromise;
+    mermaidLoadPromise = new Promise(function (resolve, reject) {
+      const script = document.createElement("script");
+      script.src = "js/vendor/mermaid/mermaid.min.js";
+      script.onload = function () {
+        try {
+          if (global.mermaid && global.mermaid.initialize) {
+            global.mermaid.initialize(MERMAID_BASE_CONFIG);
+          }
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+      script.onerror = function () {
+        mermaidLoadPromise = null;
+        reject(new Error("mermaid.min.js 加载失败"));
+      };
+      (document.head || document.documentElement).appendChild(script);
+    });
+    return mermaidLoadPromise;
+  }
+
+  // mermaid.render 包装：结果 SVG 写入 holder 并做自适应宽度处理；
+  // 渲染失败时 holder 显示错误说明并继续抛出（调用方可做状态标记）。
+  function renderMermaidInto(id, code, holder) {
+    return ensureMermaidLoaded().then(function () {
+      return Promise.resolve(global.mermaid.render(id, code)).then(function (result) {
+        const svg = (result && result.svg) || "";
+        if (!svg) throw new Error("渲染结果为空");
+        holder.innerHTML = svg;
+        const svgEl = holder.querySelector("svg");
+        if (svgEl) {
+          // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
+          // min(100%, 70vh*比例)，高度随比例联动——宽图触 70vh 上限时
+          // 容器跟着收窄，消除 100% 宽 + 居中缩放的两侧透明留白
+          const vb = String(svgEl.getAttribute("viewBox") || "")
+            .trim().split(/[\s,]+/).map(Number);
+          if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
+            Number.isFinite(vb[2]) && Number.isFinite(vb[3])) {
+            // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
+            const ar = Number((vb[2] / vb[3]).toFixed(6));
+            svgEl.style.aspectRatio = String(ar);
+            svgEl.style.width = "min(100%, calc(170vh * " + ar + "))";
+            svgEl.style.maxWidth = "100%";
+            svgEl.style.height = "auto";
+          } else {
+            svgEl.style.maxWidth = "100%";
+            svgEl.style.width = "100%";
+            svgEl.style.height = "auto";
+          }
+          svgEl.style.display = "block";
+          svgEl.style.margin = "0 auto";
+        }
+        return true;
+      });
+    }).catch(function (err) {
+      holder.classList.add("md-mermaid-error");
+      holder.textContent = "Mermaid 渲染失败：" + ((err && err.message) || "语法错误");
+      throw err;
+    });
+  }
+
+  // SVG/Mermaid/Canvas 生成代码块（转义后形态）：```svg / ```mermaid / ```canvas，
+  // 块内是一份完整源码。栅栏遮蔽发生在媒体标签提取/块级解析之前；未闭合的半截
+  // 栅栏不处理（流式中间态按普通代码块展示，闭合后自动变控件）。
+  const MEDIA_FENCE_RE = /^```(svg|mermaid|canvas)\s*$/;
 
   function unescapeTagText(text) {
     return String(text)
@@ -100,14 +442,80 @@
   }
 
   // 提取全部伪标签为占位符：流式增量重渲染是纯函数，闭合后才成控件，
-  // 未闭合的半截标签按普通文本显示
+  // 未闭合的半截标签按普通文本显示。
+  // 随后做 ```svg / ```mermaid 代码块栅栏遮蔽：块内文本置空，媒体标签提取/
+  // 块级解析都不会命中栅栏内内容，代码块解析按完整栅栏正常渲染（提取函数
+  // 只遮蔽并记录源码，双视图控件在块级代码块分支构建）。
   function extractMediaTags(escapedText) {
     const widgets = [];
-    const out = escapedText.replace(MEDIA_TAG_RE, function (match, kind, attrText, _body) {
+    const fenceBlocks = [];  // 各媒体栅栏 {kind:"svg"|"mermaid", code}，文档顺序
+    const text = escapedText.replace(MEDIA_TAG_RE, function (match, kind, attrText, _body) {
       widgets.push(buildMediaWidget(kind, parseMediaAttrs(attrText), unescapeTagText(match)));
       return MEDIA_PH_OPEN + (widgets.length - 1) + MEDIA_PH_OPEN;
     });
-    return { text: out, widgets: widgets };
+    const lines = text.split("\n");
+    let fenceStart = -1;
+    let fenceKind = "";
+    let buf = [];
+    for (let li = 0; li <= lines.length; li++) {
+      const isEnd = li === lines.length;
+      const line = isEnd ? null : lines[li];
+      if (fenceStart < 0) {
+        if (!isEnd) {
+          const m = line.match(MEDIA_FENCE_RE);
+          if (m) {
+            fenceStart = li;
+            fenceKind = m[1].toLowerCase();
+            buf = [line];
+          }
+        }
+        continue;
+      }
+      if (isEnd) {
+        // 未闭合栅栏（流式中间态）：不遮蔽、不提取，整体按普通代码块展示；
+        // 栅栏闭合后（流结束或下一帧）才会升级为双视图控件
+        fenceStart = -1;
+        fenceKind = "";
+        buf = [];
+        continue;
+      }
+      if (/^```/.test(line)) {
+        // 栅栏收尾：闭合
+        buf.push(line);
+        const body = buf.slice(1, buf.length - 1);
+        let code = "";
+        if (fenceKind === "svg") {
+          // SVG：取第一个 <svg 行 → 最后一个 </svg> 行（栅栏内说明文字忽略）
+          let firstSvg = -1;
+          let lastSvgEnd = -1;
+          for (let k = 0; k < body.length; k++) {
+            if (firstSvg < 0 && body[k].indexOf("&lt;svg") !== -1) firstSvg = k;
+            if (body[k].indexOf("&lt;/svg&gt;") !== -1) lastSvgEnd = k;
+          }
+          if (firstSvg >= 0 && lastSvgEnd >= firstSvg) {
+            code = body.slice(firstSvg, lastSvgEnd + 1).join("\n");
+          }
+        } else {
+          // Mermaid / Canvas：取全部非空行（整体源码，去掉首尾空行）
+          let s = 0;
+          let e = body.length - 1;
+          while (s <= e && body[s].trim() === "") s++;
+          while (e >= s && body[e].trim() === "") e--;
+          if (s <= e) code = body.slice(s, e + 1).join("\n");
+        }
+        fenceBlocks.push({ kind: fenceKind, code: code });
+        for (let k = 0; k < buf.length; k++) {
+          // 首尾栅栏行保留，其余块内行遮蔽为空（不删行，保持行号对齐）
+          lines[fenceStart + k] = k === 0 || k === buf.length - 1 ? buf[k] : "";
+        }
+        fenceStart = -1;
+        fenceKind = "";
+        buf = [];
+        continue;
+      }
+      buf.push(line);
+    }
+    return { text: lines.join("\n"), widgets: widgets, fenceBlocks: fenceBlocks };
   }
 
   function restoreMediaPlaceholders(html, widgets) {
@@ -304,13 +712,57 @@
     return "";
   }
 
+  // 代码栅栏内容遮蔽（供数学公式提取防误伤）：``` 围栏内的行临时替换为
+  // \u0004 重复串（控制字符，公式/媒体/块级解析都不会命中），提取完成后
+  // 按记录原样还原。返回待还原记录 [{idx, orig}]；流式未闭合栅栏遮到末尾。
+  function maskFenceLines(lines) {
+    const records = [];
+    let open = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (open < 0) {
+        if (/^```/.test(lines[i])) open = i;
+        continue;
+      }
+      if (/^```/.test(lines[i])) {
+        for (let k = open + 1; k < i; k++) {
+          records.push({ idx: k, orig: lines[k] });
+          lines[k] = MATH_PH_OPEN === "\u0003" ? "\u0004".repeat(lines[k].length) : lines[k];
+        }
+        open = -1;
+      }
+    }
+    if (open >= 0) {
+      for (let k = open + 1; k < lines.length; k++) {
+        records.push({ idx: k, orig: lines[k] });
+        lines[k] = "\u0004".repeat(lines[k].length);
+      }
+    }
+    return records;
+  }
+
   function render(src) {
     const escaped = escapeHtml(String(src || ""));
     const media = extractMediaTags(escaped);
-    const text = media.text;
+    let workText = media.text;
+    let math = { text: workText, items: [] };
+    // 数学公式提取：普通代码栅栏内容先遮蔽（防 $$…$$ 示例被误提取），
+    // 提取后按记录还原栅栏原文，块级解析拿到的是完整栅栏内容
+    const fenceLines = workText.split("\n");
+    const fenceRecords = maskFenceLines(fenceLines);
+    if (fenceRecords.length) {
+      math = mathExtract(fenceLines.join("\n"));
+      const restored = math.text.split("\n");
+      fenceRecords.forEach(function (r) { restored[r.idx] = r.orig; });
+      workText = restored.join("\n");
+    } else {
+      math = mathExtract(workText);
+      workText = math.text;
+    }
+    const text = workText;
     const lines = text.split("\n");
     const html = [];
     let i = 0;
+    let svgBlockIdx = 0;   // 已消费的 ```svg 栅栏序号（与 svgBlocks 文档顺序对应）
 
     while (i < lines.length) {
       const line = lines[i];
@@ -325,6 +777,21 @@
           i++;
         }
         i++; // 跳过结尾 ```
+        // SVG/Mermaid/Canvas 生成代码块：栅栏内文本已被置空遮蔽；源码取自
+        // fenceBlocks（与文档中媒体栅栏按序一一对应，空内容栅栏同样消费
+        // 序号），无完整内容时退回普通代码块展示
+        const langKey = lang.toLowerCase();
+        if (langKey === "svg" || langKey === "mermaid" || langKey === "canvas") {
+          if (svgBlockIdx < media.fenceBlocks.length) {
+            const block = media.fenceBlocks[svgBlockIdx++];
+            if (block.code) {
+              html.push(buildFenceWidget(block.kind, unescapeTagText(block.code)));
+              continue;
+            }
+          } else {
+            svgBlockIdx++;
+          }
+        }
         // 决定 Prism 语言类：diff/patch 推断内层语言（diff-<lang>），其余按标签映射
         let prismLang = "";
         if (lang === "diff" || lang === "patch") {
@@ -432,10 +899,20 @@
     }
 
     return '<div class="md">' +
-      restoreMediaPlaceholders(html.join(""), media.widgets) + "</div>";
+      restoreMathPlaceholders(
+        restoreMediaPlaceholders(html.join(""), media.widgets),
+        math.items
+      ) + "</div>";
   }
 
-  const api = { render, setMediaResolver, unescapeHtml };
+  const api = {
+    render,
+    setMediaResolver,
+    unescapeHtml,
+    buildFenceWidget,
+    ensureMermaidLoaded,
+    renderMermaidInto,
+  };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   } else {

@@ -15,7 +15,7 @@
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
-    networkRetryMaxAttempts, keepRounds, triggerRatio, summaryBudgetRatio,
+    toolStreamTimeoutSeconds, networkRetryMaxAttempts, keepRounds, triggerRatio, summaryBudgetRatio,
     oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint
   } = App;
 
@@ -470,7 +470,8 @@
     chatSettingsConfirm.disabled = true;
     const results = await Promise.all([
       API.getContextReturnConfig().catch(function () { return null; }),
-      API.getHistoryCompactionConfig().catch(function () { return null; }),
+      // 传 session_id：模型窗口按会话生效模型口径计算，与顶部 token 统计一致
+      API.getHistoryCompactionConfig(state.sessionId).catch(function () { return null; }),
       API.getMcpToolConfig().catch(function () { return null; }),
       API.getNetworkRetryConfig().catch(function () { return null; }),
     ]);
@@ -490,6 +491,8 @@
     toolResultMaxLength.value = ctx && ctx.tool_result_max_length != null ? ctx.tool_result_max_length : defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = mcp && mcp.call_timeout_seconds != null
       ? mcp.call_timeout_seconds : defaults.call_timeout_seconds;
+    toolStreamTimeoutSeconds.value = mcp && mcp.stream_timeout_seconds != null
+      ? mcp.stream_timeout_seconds : defaults.stream_timeout_seconds;
     networkRetryMaxAttempts.value = retry && retry.max_attempts != null
       ? retry.max_attempts : defaults.network_retry_max_attempts;
     keepRounds.value = comp && comp.keep_rounds != null ? comp.keep_rounds : defaults.keep_rounds;
@@ -540,6 +543,7 @@
     reasoningMaxLength.value = defaults.reasoning_max_length;
     toolResultMaxLength.value = defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = defaults.call_timeout_seconds;
+    toolStreamTimeoutSeconds.value = defaults.stream_timeout_seconds;
     networkRetryMaxAttempts.value = defaults.network_retry_max_attempts;
     keepRounds.value = defaults.keep_rounds;
     triggerRatio.value = defaults.trigger_ratio;
@@ -555,7 +559,7 @@
   // - 回传长度：任意整数（0=不回传，负数=全部回传，正数=截断）
   // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
-  // - 工具执行超时/网络重试次数：>=0（0=不限制）
+  // - 工具执行超时/工具调用流超时/网络重试次数：>=0（0=不限制）
   // - 触发比例/摘要预算比例/连续拒绝上限：>0
   function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig) {
     const isNum = function (v) { return v != null && Number.isFinite(v); };
@@ -563,6 +567,7 @@
       ["思考过程回传长度", ctxConfig.reasoning_max_length, function (v) { return isNum(v); }],
       ["工具结果回传长度", ctxConfig.tool_result_max_length, function (v) { return isNum(v); }],
       ["工具执行超时", mcpConfig.call_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
+      ["工具调用流超时", mcpConfig.stream_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
       ["网络失败重试次数", retryConfig.max_attempts, function (v) { return isNum(v) && v >= 0; }],
       ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
       ["触发比例", compConfig.trigger_ratio, function (v) { return isNum(v) && v > 0; }],
@@ -587,6 +592,7 @@
     };
     const mcpConfig = {
       call_timeout_seconds: readSettingNumber(toolCallTimeoutSeconds),
+      stream_timeout_seconds: readSettingNumber(toolStreamTimeoutSeconds),
     };
     const retryConfig = {
       max_attempts: readSettingNumber(networkRetryMaxAttempts),
@@ -599,7 +605,7 @@
     chatSettingsConfirm.disabled = true;
     const results = await Promise.allSettled([
       API.updateContextReturnConfig(ctxConfig),
-      API.updateHistoryCompactionConfig(compConfig),
+      API.updateHistoryCompactionConfig(compConfig, state.sessionId),
       API.updateMcpToolConfig(mcpConfig),
       API.updateNetworkRetryConfig(retryConfig),
     ]);

@@ -534,16 +534,22 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         before_body = json.loads(before.body.decode("utf-8"))
         self.assertEqual(before.status_code, 200)
         self.assertEqual(before_body["call_timeout_seconds"], 300)
+        self.assertEqual(before_body["stream_timeout_seconds"], 300)
         self.assertEqual(before_body["env_names"]["call_timeout_seconds"], "MCP_TOOL_CALL_TIMEOUT_SECONDS")
+        self.assertEqual(before_body["env_names"]["stream_timeout_seconds"], "TOOL_CALL_STREAM_TIMEOUT_SECONDS")
 
         response = await self.router.update_mcp_tool_config(
-            self.router.McpToolConfig(call_timeout_seconds=12)
+            self.router.McpToolConfig(call_timeout_seconds=12, stream_timeout_seconds=180)
         )
         body = json.loads(response.body.decode("utf-8"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body["config"]["call_timeout_seconds"], 12)
-        self.assertEqual(body["memory_state"], "12.0")
-        self.assertIn("MCP_TOOL_CALL_TIMEOUT_SECONDS=12.0", (self._temp_path / ".env").read_text(encoding="utf-8"))
+        self.assertEqual(body["config"]["stream_timeout_seconds"], 180)
+        self.assertEqual(body["memory_state"]["MCP_TOOL_CALL_TIMEOUT_SECONDS"], "12.0")
+        self.assertEqual(body["memory_state"]["TOOL_CALL_STREAM_TIMEOUT_SECONDS"], "180.0")
+        content = (self._temp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn("MCP_TOOL_CALL_TIMEOUT_SECONDS=12.0", content)
+        self.assertIn("TOOL_CALL_STREAM_TIMEOUT_SECONDS=180.0", content)
 
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as ctx:
@@ -551,6 +557,11 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
                 self.router.McpToolConfig(call_timeout_seconds=-1)
             )
         self.assertEqual(ctx.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as ctx2:
+            await self.router.update_mcp_tool_config(
+                self.router.McpToolConfig(stream_timeout_seconds=-1)
+            )
+        self.assertEqual(ctx2.exception.status_code, 400)
 
 
 if __name__ == "__main__":

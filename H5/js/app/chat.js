@@ -8,7 +8,7 @@
   "use strict";
   const {
     state, el, toast, input,
-    chatInner, sessionList, scrollToBottom, nearBottom,
+    chatInner, sessionList, scrollToBottom, nearBottom, stickToBottom,
     setEmpty, sendBtn, stopBtn
   } = App;
 
@@ -163,7 +163,7 @@
           msg
         );
         hasStage = true;
-        if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+        if (state.sessionId === sessionId) stickToBottom();
         return;
       }
       if (data.event === "ask_user") {
@@ -202,7 +202,7 @@
           if (activeUi) {
             activeUi.appendDelta(compaction);
             hasStage = true;
-            if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+            if (state.sessionId === sessionId) stickToBottom();
           }
           return;
         }
@@ -220,7 +220,7 @@
             hasStage = true;
             appendStage(failedUi.wrap);
           }
-          if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+          if (state.sessionId === sessionId) stickToBottom();
           return;
         }
         if (compaction.phase === "done" && !isMergeEvent && activeQueue && activeQueue.length) {
@@ -241,7 +241,7 @@
         if (compaction.phase === "done" && state.sessionId === sessionId) {
           App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
         }
-        if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+        if (state.sessionId === sessionId) stickToBottom();
         return;
       }
 
@@ -295,6 +295,10 @@
       }
       // 回答：每段独立一个块
       if (typeof data.content === "string" && data.content) {
+        // 边界帧可能同帧混发 reasoning_content + content（上游透传原样转发）：
+        // 此时上面的"不含 reasoning 字段"检测不会收尾，必须在这里补 done()，
+        // 否则思考块停留在点点点态，直到整条流结束才恢复下拉箭头
+        if (curThink) curThink.done();
         curThink = null;
         if (!curAnswer) {
           curAnswer = el("div", "msg-assistant-body msg-cursor");
@@ -388,7 +392,7 @@
           App.refreshContextTokenStats(sessionId);
         }
       }
-      if (state.sessionId === sessionId && nearBottom()) scrollToBottom();
+      if (state.sessionId === sessionId) stickToBottom();
     }
 
     return {
@@ -524,6 +528,7 @@
       }
     } finally {
       const fin = pipe.finish();
+      if (typeof App.finalizeMermaidBlocks === "function") App.finalizeMermaidBlocks();
       const shouldReloadVisibleSession = state.sessionId === streamSessionId && activeStream.messageNode.parentNode !== chatInner;
       if (fin.empty && !msg.querySelector(".msg-user")) msg.remove();
       const usageReconciled = await App.refreshSessionUsage(streamSessionId);
@@ -657,6 +662,7 @@
       }
     } finally {
       const fin = pipe.finish();
+      if (typeof App.finalizeMermaidBlocks === "function") App.finalizeMermaidBlocks();
       if (fin.empty && !sawReplay) msg.remove();
       const usageReconciled = await App.refreshSessionUsage(sessionId);
       if (!usageReconciled && fin.roundUsage && fin.roundUsage.total_tokens) {

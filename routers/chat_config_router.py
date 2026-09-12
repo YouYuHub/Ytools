@@ -1,5 +1,5 @@
 # coding: utf-8
-from typing import Any
+from typing import Any, Optional
 from pathlib import Path
 import json
 import sys
@@ -7,7 +7,7 @@ from dataclasses import replace
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from config import (
     DEFAULT_HISTORY_TRIGGER_RATIO,
@@ -17,6 +17,7 @@ from config import (
     DEFAULT_OVERSIZED_REJECT_FACTOR,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUMMARY_BUDGET_RATIO,
+    DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     set_current_dir,
     get_current_dir,
@@ -39,7 +40,9 @@ from env_manager import (
     init_path,
     list_available_models,
     load_var,
+    reset_ambient_model_selection,
     select_chat_model,
+    set_ambient_model_selection,
     set_env_vars,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -54,6 +57,10 @@ from factory.agent_runtime.context_compaction import (
     resolve_context_compaction_model_config,
     resolve_context_compaction_threshold,
     resolve_summary_total_budget,
+)
+from memory.chat_memory import (
+    normalize_session_id,
+    resolve_session_model_selection,
 )
 
 # 创建 API 路由器实例
@@ -150,28 +157,44 @@ def _effective_threshold_payload(settings) -> dict:
     }
 
 
-def _history_compaction_config_payload() -> dict:
+def _history_compaction_config_payload(session_id: str | None = None) -> dict:
     settings = load_context_compaction_settings()
-    return {
-        "keep_rounds": settings.keep_rounds,
-        "trigger_ratio": settings.trigger_ratio,
-        "summary_budget_ratio": settings.summary_budget_ratio,
-        "summary_total_budget": resolve_summary_total_budget(settings),
-        "effective_threshold": _effective_threshold_payload(settings),
-        "oversized_reject_factor": settings.oversized_reject_factor,
-        "max_oversized_rejections": settings.max_oversized_rejections,
-        "defaults": get_context_compaction_defaults(),
-        "compaction_model": get_context_compaction_model_status(settings),
-        "available_compaction_models": _available_compaction_models(),
-        "env_names": {
-            "keep_rounds": "HISTORY_COMPACT_KEEP_ROUNDS",
-            "trigger_ratio": "HISTORY_COMPACT_TRIGGER_RATIO",
-            "summary_budget_ratio": "HISTORY_COMPACT_SUMMARY_BUDGET_RATIO",
-            "oversized_reject_factor": "HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR",
-            "max_oversized_rejections": "HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS",
-        },
-        "memory_state": _history_compaction_memory_state(),
-    }
+    # 模型窗口按会话生效口径解析（会话独立模型选择覆盖全局默认），与
+    # token_stats / 生成任务一致；session_id 为空时保持纯全局口径。
+    ambient_token = None
+    if session_id:
+        try:
+            effective_selection, _ = resolve_session_model_selection(
+                normalize_session_id(session_id)
+            )
+            ambient_token = set_ambient_model_selection(effective_selection)
+        except Exception:
+            ambient_token = None
+    try:
+        payload = {
+            "keep_rounds": settings.keep_rounds,
+            "trigger_ratio": settings.trigger_ratio,
+            "summary_budget_ratio": settings.summary_budget_ratio,
+            "summary_total_budget": resolve_summary_total_budget(settings),
+            "effective_threshold": _effective_threshold_payload(settings),
+            "oversized_reject_factor": settings.oversized_reject_factor,
+            "max_oversized_rejections": settings.max_oversized_rejections,
+            "defaults": get_context_compaction_defaults(),
+            "compaction_model": get_context_compaction_model_status(settings),
+            "available_compaction_models": _available_compaction_models(),
+            "env_names": {
+                "keep_rounds": "HISTORY_COMPACT_KEEP_ROUNDS",
+                "trigger_ratio": "HISTORY_COMPACT_TRIGGER_RATIO",
+                "summary_budget_ratio": "HISTORY_COMPACT_SUMMARY_BUDGET_RATIO",
+                "oversized_reject_factor": "HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR",
+                "max_oversized_rejections": "HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS",
+            },
+            "memory_state": _history_compaction_memory_state(),
+        }
+    finally:
+        if ambient_token is not None:
+            reset_ambient_model_selection(ambient_token)
+    return payload
 
 
 @api_chat_config_router.post("/change_chat_dir")
@@ -301,13 +324,24 @@ async def set_chat_session_work_dir(payload: SessionWorkDirConfig):
 
 
 @api_chat_config_router.get("/chat_config/history_compaction")
-async def get_history_compaction_config():
+async def get_history_compaction_config(
+    session_id: Optional[str] = Query(
+        None,
+        description="会话 ID；传入后模型窗口按该会话生效模型口径计算",
+    ),
+):
     """获取跨轮历史与单轮工具上下文的完整压缩策略。"""
-    return JSONResponse(content=_history_compaction_config_payload())
+    return JSONResponse(content=_history_compaction_config_payload(session_id))
 
 
 @api_chat_config_router.post("/chat_config/history_compaction")
-async def update_history_compaction_config(payload: HistoryCompactionConfig):
+async def update_history_compaction_config(
+    payload: HistoryCompactionConfig,
+    session_id: Optional[str] = Query(
+        None,
+        description="会话 ID；传入后返回的配置按该会话生效模型口径计算",
+    ),
+):
     """更新完整压缩策略。
 
     压缩模型选择统一由 POST /chat_config/models/select（role=compaction_model）管理，
@@ -350,7 +384,7 @@ async def update_history_compaction_config(payload: HistoryCompactionConfig):
     return JSONResponse(content={
         "state": "succeed",
         "updated": updated,
-        "config": _history_compaction_config_payload(),
+        "config": _history_compaction_config_payload(session_id),
         "memory_state": _history_compaction_memory_state(),
     })
 
@@ -386,6 +420,7 @@ async def update_context_return_config(payload: ContextReturnConfig):
 # ---------- MCP 工具执行配置 ----------
 
 _MCP_TOOL_ENV_NAME = "MCP_TOOL_CALL_TIMEOUT_SECONDS"
+_TOOL_STREAM_TIMEOUT_ENV_NAME = "TOOL_CALL_STREAM_TIMEOUT_SECONDS"
 
 
 def _parse_tool_call_timeout(value: Any, default: float) -> float:
@@ -403,31 +438,48 @@ def _mcp_tool_config_payload() -> dict:
             load_var(_MCP_TOOL_ENV_NAME, DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS),
             DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
         ),
+        "stream_timeout_seconds": _parse_tool_call_timeout(
+            load_var(_TOOL_STREAM_TIMEOUT_ENV_NAME, DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS),
+            DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
+        ),
         "defaults": {
             "call_timeout_seconds": DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
+            "stream_timeout_seconds": DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
         },
         "semantics": {
             "0": "不限制超时（工具可能永久阻塞）",
             "positive": "单次工具执行（含连接/初始化/调用）超过 N 秒后中止，"
                         "超时错误会作为工具结果反馈给模型",
+            "stream_0": "不限制（上游卡死时只能手动停止任务）",
+            "stream_positive": "模型 SSE 输出 tool_calls 期间超过 N 秒无任何事件"
+                               "（部分服务商接口会无限卡住）时放弃本次工具调用，"
+                               "以失败结果反馈模型并继续任务",
         },
-        "env_names": {"call_timeout_seconds": _MCP_TOOL_ENV_NAME},
-        "memory_state": env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+        "env_names": {
+            "call_timeout_seconds": _MCP_TOOL_ENV_NAME,
+            "stream_timeout_seconds": _TOOL_STREAM_TIMEOUT_ENV_NAME,
+        },
+        "memory_state": {
+            _MCP_TOOL_ENV_NAME: env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+            _TOOL_STREAM_TIMEOUT_ENV_NAME: env_manager.env_vars.get(_TOOL_STREAM_TIMEOUT_ENV_NAME),
+        },
     }
 
 
 @api_chat_config_router.get("/chat_config/mcp_tools")
 async def get_mcp_tool_config():
-    """获取 MCP 工具执行超时配置。"""
+    """获取 MCP 工具执行超时与工具调用流式阶段超时配置。"""
     return JSONResponse(content=_mcp_tool_config_payload())
 
 
 @api_chat_config_router.post("/chat_config/mcp_tools")
 async def update_mcp_tool_config(payload: McpToolConfig):
-    """实时更新 MCP 工具执行超时并持久化。
+    """实时更新 MCP 工具执行超时/工具调用流式超时并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次工具调用立即生效
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下次调用立即生效
     - 0 表示不限制（保持旧行为，工具卡死时只能靠手动停止取消任务）
+    - stream_timeout_seconds 只作用于模型 SSE 输出 tool_calls 阶段：超时
+      不终止任务，而是把本次工具调用标记为失败反馈给模型继续运行
     """
     timeout_seconds = _parse_tool_call_timeout(
         payload.call_timeout_seconds, DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS
@@ -437,9 +489,18 @@ async def update_mcp_tool_config(payload: McpToolConfig):
             status_code=400,
             detail="call_timeout_seconds 不能为负数；0 表示不限制，正数为超时秒数",
         )
+    stream_timeout_seconds = _parse_tool_call_timeout(
+        payload.stream_timeout_seconds, DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS
+    )
+    if payload.stream_timeout_seconds < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="stream_timeout_seconds 不能为负数；0 表示不限制，正数为超时秒数",
+        )
     try:
         updated = set_env_vars({
             _MCP_TOOL_ENV_NAME: timeout_seconds,
+            _TOOL_STREAM_TIMEOUT_ENV_NAME: stream_timeout_seconds,
         })
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -448,7 +509,10 @@ async def update_mcp_tool_config(payload: McpToolConfig):
         "updated": updated,
         "config": _mcp_tool_config_payload(),
         # 与其他配置接口一致：返回内存 env 中的原始值，便于调用方核对落盘结果
-        "memory_state": env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+        "memory_state": {
+            _MCP_TOOL_ENV_NAME: env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+            _TOOL_STREAM_TIMEOUT_ENV_NAME: env_manager.env_vars.get(_TOOL_STREAM_TIMEOUT_ENV_NAME),
+        },
     })
 
 

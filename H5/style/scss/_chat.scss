@@ -911,6 +911,7 @@
   }
 
   &.is-broken {
+
     .md-media-el,
     .md-media-caption {
       display: none;
@@ -919,6 +920,47 @@
     .md-media-status {
       display: block;
     }
+  }
+}
+
+// ---------- KaTeX 数学公式（$…$ 行内 / $$…$$ 块级，KaTeX 输出容器） ----------
+// KaTeX 自带 katex.min.css（字体/排版），这里只做容器间距与降级样式；
+// 容器配色按 currentColor 继承主题文字色，深浅主题无需单独配色
+.md {
+  .katex {
+    color: inherit;
+    font-size: 1.06em;
+  }
+
+  .katex-display {
+    margin: 10px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 0;
+  }
+}
+
+.md-math {
+  display: inline-block;
+  vertical-align: middle;
+  max-width: 100%;
+
+  // 渲染失败/katex 缺失：等宽原文降级展示
+  &.is-raw .md-math-raw {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+    border-radius: 4px;
+    padding: 1px 5px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  &.md-math-display {
+    display: block;
+    margin: 10px 0;
+    text-align: center;
   }
 }
 
@@ -941,6 +983,204 @@
   color: var(--text-secondary);
   background: var(--bg-elevated);
 }
+
+// ---------- SVG 生成控件（```svg 双视图：代码/图片，复制代码/复制图片） ----------
+// 独占一整行（一行一张图），不参与 .md-media 的两列并排规则；
+// 宽度取消息内容宽减左右边距（与页面边缘留出呼吸感，不顶满），
+// 图片按框宽等比缩放（任何比例都窄边距）
+.md-svg-block {
+  display: block;
+  width: auto;
+  margin: 0 16px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+
+  .md-svg-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-composer);
+    flex-wrap: wrap;
+  }
+
+  .md-svg-name {
+    font-size: 12px;
+    color: var(--text-secondary);
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  // 窄屏：外边距与聊天区收窄节奏一致（桌面 16px / 移动端 8px）
+  @media (max-width: 768px) {
+    margin: 0 8px 10px;
+  }
+
+  .md-svg-viewswitch {
+    display: inline-flex;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .md-svg-tab {
+    padding: 3px 12px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+
+    &.is-active {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+  }
+
+  .md-svg-actions {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+  }
+
+  .md-svg-btn {
+    padding: 3px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--bg-composer);
+    color: var(--text-secondary);
+    font-size: 11px;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+
+    &:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+  }
+
+  .md-svg-code {
+    max-height: 420px;
+    overflow: auto;
+
+    .md-svg-pre {
+      margin: 0;
+      padding: 10px 12px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      background: var(--bg-composer);
+
+      code {
+        white-space: pre;
+      }
+    }
+  }
+
+  // 图片视图：内联 SVG 填满控件宽度（图片距边框仅 4px 窄边距），
+  // 高度按 viewBox 比例联动（内联样式注入 aspect-ratio + 宽度钳制）。
+  // 不能照搬代码/文本块的 70vh 块高上限：高度触顶后等比内容只能
+  // 居中缩小，两侧会留出大片空白（"图片只占中间一部分宽度"）；
+  // 超长兜底在内联样式的宽度钳制里（填满宽度后高约 1.7 屏才收窄）
+  .md-svg-view {
+    display: block;
+    padding: 4px;
+    box-sizing: border-box;
+
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      margin: 0 auto;
+    }
+  }
+
+  // Mermaid 异步渲染占位/错误态
+  .md-mermaid-loading {
+    padding: 14px 10px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--text-tertiary);
+  }
+
+  .md-mermaid-error {
+    padding: 12px 10px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--danger, #dc2626);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  // Mermaid 代码视图：等宽 + 滚动（复用 SVG 代码视图容器）
+  .md-svg-code .md-svg-pre code {
+    white-space: pre;
+  }
+}
+
+// ---------- Canvas 程序控件（```canvas 运行确认 + iframe 沙箱） ----------
+// 复用 .md-svg-block 卡片与左右 16px 页边距，仅补充沙箱画布与日志区样式
+.md-canvas-block {
+  .md-canvas-run.is-running {
+    color: var(--danger, #dc2626);
+    border-color: var(--danger, #dc2626);
+  }
+
+  .md-canvas-view {
+    padding: 4px;
+    box-sizing: border-box;
+  }
+
+  // 沙箱 iframe：宽度铺满控件（高度跟随内容自适应方案不可行——跨源读不到
+  // 内容高度，因此固定高度 + 帧内 canvas 铺满 + 日志区独立滚动）
+  .md-canvas-frame {
+    display: block;
+    width: 100%;
+    height: 420px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-composer);
+    box-sizing: border-box;
+  }
+
+  .md-canvas-placeholder {
+    padding: 28px 10px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--text-tertiary);
+  }
+
+  // console.log 回显区（父页渲染，textContent 注入防 HTML 注入）
+  .md-canvas-log {
+    margin-top: 4px;
+    max-height: 120px;
+    overflow: auto;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-composer);
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-secondary);
+  }
+}
+
 // ---------- 模型提问卡片（ask_user 事件在聊天流内的静态展示；点击可重新打开回答弹窗） ----------
 .ask-block {
   width: 100%;

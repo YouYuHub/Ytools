@@ -8,6 +8,8 @@
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js"></script>
     <link rel="stylesheet" href="style/css/main.css">
+    <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
+    <link rel="stylesheet" href="js/vendor/katex/katex.min.css">
 </head>
 
 <body>
@@ -477,6 +479,10 @@
                         <input id="toolCallTimeoutSeconds" type="number" min="0" step="1">
                     </label>
                     <label class="chat-setting-field">
+                        <span>工具调用流超时（秒）<small>模型输出工具调用期间超过该秒数无响应（服务商接口卡死）即放弃本次调用并反馈模型继续；0=不限制</small></span>
+                        <input id="toolStreamTimeoutSeconds" type="number" min="0" step="1">
+                    </label>
+                    <label class="chat-setting-field">
                         <span>网络失败重试次数<small>模型请求连续失败达到该次数才终止任务；0=不限制（一直重试）</small></span>
                         <input id="networkRetryMaxAttempts" type="number" min="0" step="1">
                     </label>
@@ -660,6 +666,8 @@
     <script src="js/vendor/prism/prism-ignore.min.js"></script>
     <script src="js/vendor/prism/prism-diff.min.js"></script>
     <script src="js/vendor/prism/prism-diff-highlight.min.js"></script>
+    <!-- KaTeX 数学公式渲染引擎：须在 markdown.js 之前加载（全局 window.katex） -->
+    <script src="js/vendor/katex/katex.min.js"></script>
     <script src="js/markdown.js"></script>
     <script src="js/table_canvas.js"></script>
     <script src="js/session_list_utils.js"></script>

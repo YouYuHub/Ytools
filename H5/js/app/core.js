@@ -198,6 +198,7 @@ window.App = window.App || {};
   const reasoningMaxLength = $("#reasoningMaxLength");
   const toolResultMaxLength = $("#toolResultMaxLength");
   const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
+  const toolStreamTimeoutSeconds = $("#toolStreamTimeoutSeconds");
   const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
   const keepRounds = $("#keepRounds");
   const triggerRatio = $("#triggerRatio");
@@ -236,6 +237,7 @@ window.App = window.App || {};
     reasoning_max_length: -1,
     tool_result_max_length: -1,
     call_timeout_seconds: 300,
+    stream_timeout_seconds: 300,
     network_retry_max_attempts: 3,
     keep_rounds: 20,
     trigger_ratio: 0.8,
@@ -277,6 +279,8 @@ window.App = window.App || {};
   function scrollToBottom(instant) {
     // 瞬跳：.chat-scroll 的 CSS 是 scroll-behavior: smooth，scrollTop 赋值会继承该属性触发动画，
     // 临时覆盖为 auto 再恢复，保证切换历史会话时瞬间跳到底部
+    // 主动置底（发送消息/点回底按钮/程序跳转）都视为恢复自动贴底
+    autoScrollPaused = false;
     const prev = instant ? chatScroll.style.scrollBehavior : null;
     if (instant) chatScroll.style.scrollBehavior = "auto";
     updateScrollBottomOffset();
@@ -286,6 +290,36 @@ window.App = window.App || {};
 
   function nearBottom() {
     return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 120;
+  }
+
+  // ---------- 自动贴底暂停机制 ----------
+  // 流式 delta 高频调用 scrollToBottom 时，若用户在低速上滚阅读历史，每次滚动
+  // 偏离底部都不超过 nearBottom 的 120px 阈值，会被下一帧强制拉回（表现为
+  // "压缩/流式进行时页面滚不上去"）。这里改为：检测到用户向上滚动即暂停
+  // 自动贴底，滚回底部 24px 内（或点"回到底部"按钮）自动恢复。
+  let autoScrollPaused = false;
+  let lastScrollTop = chatScroll.scrollTop;
+
+  chatScroll.addEventListener("scroll", function () {
+    const top = chatScroll.scrollTop;
+    if (top < lastScrollTop - 1) {
+      // 用户上滚（wheel 上滚/滚动条上拖/键盘 PageUp 都表现为 scrollTop 减小）
+      autoScrollPaused = true;
+    }
+    if (autoScrollPaused &&
+      chatScroll.scrollHeight - top - chatScroll.clientHeight < 24) {
+      autoScrollPaused = false; // 已回到底部附近，恢复跟随
+    }
+    lastScrollTop = top;
+  });
+
+  // 流式追加内容的贴底入口：暂停期间只调整底部 padding 不拉回视口
+  function stickToBottom() {
+    if (autoScrollPaused) {
+      updateScrollBottomOffset();
+      return;
+    }
+    scrollToBottom();
   }
 
   function setEmpty(empty) {
@@ -463,11 +497,11 @@ window.App = window.App || {};
   deleteConfirm, chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
-  toolCallTimeoutSeconds, networkRetryMaxAttempts, keepRounds,
+  toolCallTimeoutSeconds, toolStreamTimeoutSeconds, networkRetryMaxAttempts, keepRounds,
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
-  scrollToBottom, nearBottom, setEmpty,
+  scrollToBottom, nearBottom, stickToBottom, setEmpty,
   updateScrollBottomOffset, refreshThemeUI, closeMenus,
   closeToolModal, setSidebarCollapsed, filterSessions,
   readTitleOverrides, docKindOf, hideToolTip,

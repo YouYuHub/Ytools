@@ -30,6 +30,7 @@ from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
     EDIT_FILE_NAME,
     READ_FILE_NAME,
+    READ_MEDIA_NAME,
     SEARCH_FILES_NAME,
     SELECTABLE_BUILTIN_TOOL_NAMES,
     TODO_TOOL_NAME,
@@ -481,7 +482,7 @@ async def get_chat_context_token_stats(
                     ]
                     # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
                     # 内置工具（todo_write / ask_user / write_file / edit_file /
-                    # read_file / search_files）按前端勾选显式注入。
+                    # read_file / search_files / read_media）按前端勾选显式注入。
                     # 这里保持 token 统计与真实请求的工具 schema 口径一致。
                     if context_tools or selected_names & set(SELECTABLE_BUILTIN_TOOL_NAMES):
                         context_tools, _ = inject_builtin_tools(
@@ -493,6 +494,7 @@ async def get_chat_context_token_stats(
                             include_edit_file=EDIT_FILE_NAME in selected_names,
                             include_read_file=READ_FILE_NAME in selected_names,
                             include_search_files=SEARCH_FILES_NAME in selected_names,
+                            include_read_media=READ_MEDIA_NAME in selected_names,
                         )
             stats = await manager.get_context_token_stats(
                 max_rounds=effective_max_rounds,

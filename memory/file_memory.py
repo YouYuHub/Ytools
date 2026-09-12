@@ -181,16 +181,24 @@ def _thumb_dir(session_id: str) -> Path:
     return directory
 
 
-def _load_image_thumbnail_base64(session_id: str, path: Path) -> tuple[str, str] | None:
+def _load_image_thumbnail_base64(
+    cache_dir: Path,
+    path: Path,
+    max_edge: int = IMAGE_THUMBNAIL_MAX_EDGE,
+    quality: int = IMAGE_THUMBNAIL_JPEG_QUALITY,
+) -> tuple[str, str] | None:
     """为大图生成/复用 JPEG 缩略图，返回 (mime, base64)；失败返回 None（回退原图）。
 
     - 触发条件由调用方判断（文件字节数超过 IMAGE_THUMBNAIL_THRESHOLD_BYTES）；
-    - 缩略图缓存到 <session>/thumbs/<原名>.thumb.jpg，同图多次解析只算一次，
-      原图更新（字节变化）时按 mtime+size 失效重建；
-    - 长边压到 IMAGE_THUMBNAIL_MAX_EDGE、JPEG 质量 IMAGE_THUMBNAIL_JPEG_QUALITY；
+    - 缓存目录由调用方传入（会话链路传 <session>/thumbs/，本地/网络链路传
+      _thumb_dir(session_id) 同目录——按来源文件名隔离，互不覆盖）；
+      缓存文件为 <原名>.thumb.<max_edge>.<quality>.jpg，同图同参数多次解析
+      只算一次，原图更新（字节变化）时按 mtime+size 失效重建，
+      不同 max_edge/quality 参数互相独立缓存、互不覆盖；
+    - 长边压到 max_edge、JPEG 质量 quality；
     - 任何失败（Pillow 不支持/磁盘异常）都返回 None，调用方回退原图发送。
     """
-    thumb_path = _thumb_dir(session_id) / f"{path.name}.thumb.jpg"
+    thumb_path = Path(cache_dir) / f"{path.name}.thumb.{max_edge}.{quality}.jpg"
     try:
         stat = path.stat()
         fingerprint = f"{stat.st_size}-{int(stat.st_mtime)}"
@@ -201,9 +209,9 @@ def _load_image_thumbnail_base64(session_id: str, path: Path) -> tuple[str, str]
         with Image.open(path) as img:
             img.load()
             width, height = img.size
-            max_edge = max(width, height)
-            if max_edge > IMAGE_THUMBNAIL_MAX_EDGE:
-                scale = IMAGE_THUMBNAIL_MAX_EDGE / max_edge
+            longest = max(width, height)
+            if longest > max_edge:
+                scale = max_edge / longest
                 new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
                 img = img.resize(new_size, Image.LANCZOS)
             if img.mode not in ("RGB", "L"):
@@ -213,7 +221,7 @@ def _load_image_thumbnail_base64(session_id: str, path: Path) -> tuple[str, str]
                 background.paste(rgba, mask=rgba.split()[3])
                 img = background
             out = io.BytesIO()
-            img.save(out, format="JPEG", quality=IMAGE_THUMBNAIL_JPEG_QUALITY)
+            img.save(out, format="JPEG", quality=quality)
         encoded = base64.b64encode(out.getvalue()).decode("ascii")
         # 指纹与数据同行存储：命中校验 + 缓存内容一次读取
         thumb_path.write_text(f"{fingerprint}\n{encoded}", encoding="ascii")
@@ -366,6 +374,167 @@ def load_session_media_base64(session_id: str, reference: str) -> tuple[str, str
     return media_mime_type(path.name), base64.b64encode(data).decode("ascii")
 
 
+def _sniff_media_filename(data: bytes) -> str | None:
+    """按魔数嗅探媒体类型，返回可用占位文件名；无法识别返回 None。
+
+    网络下载/本地文件入库统一按扩展名走 media_kind/media_mime_type 链路，
+    因此来源扩展名缺失或错误时用魔数校准文件名（入 sessionStorage 前调用）。
+    """
+    head = bytes(data[:16])
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "sniffed.png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "sniffed.jpg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "sniffed.gif"
+    if head.startswith(b"RIFF") and len(data) >= 12:
+        if data[8:12] == b"WEBP":
+            return "sniffed.webp"
+        if data[8:12] == b"WAVE":
+            return "sniffed.wav"
+    if head.startswith(b"BM"):
+        return "sniffed.bmp"
+    if head.startswith(b"ID3"):
+        return "sniffed.mp3"
+    if head.startswith(b"fLaC"):
+        return "sniffed.flac"
+    if head.startswith(b"OggS"):
+        return "sniffed.ogg"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "sniffed.mp4"
+    return None
+
+
+def register_media_source(
+    session_id: str,
+    filename: str,
+    data: bytes,
+    source_type: str,
+) -> dict[str, Any]:
+    """把模型侧获取的媒体字节（网络下载/本地文件读取）注册进会话媒体库。
+
+    存储规则与用户上传完全一致（save_session_media：类型校验、大小上限、
+    ICO/TIFF 自动转 PNG、唯一 stored_name），返回信息含 media:// 引用；
+    注册后该媒体即走统一的会话媒体加载/降采样链路。
+
+    source_type 备注来源（"network" / "local"），供后续用户授权审计使用；
+    授权确认逻辑就位前不做任何拦截（当前策略：工具由用户提供，无安全边界）。
+    """
+    saved = save_session_media(session_id, filename, data)
+    return {**saved, "source_type": source_type}
+
+
+# read_media 内置工具：给模型读取媒体文件用的降采样/描述参数档位。
+# >2MB 图片默认按此档位降采样（长边/质量），与用户上传链路的固定档位解耦，
+# 支持模型通过 quality 参数（50%-100%）调节回传清晰度。
+MODEL_MEDIA_MAX_EDGE = 1568
+MODEL_MEDIA_DEFAULT_QUALITY = 85
+
+
+def _media_model_part_from_path(
+    path: Path,
+    quality: int | None = None,
+    thumb_cache_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """按文件路径构建 read_media 模型部件（会话引用与 load_any 共用的加载内核）。
+
+    返回 dict：{part, kind, mime, size, downsampled, quality, stored_name,
+    filename}；读取失败返回 None。图片 >2MB（或显式传 quality）走 JPEG
+    缩略图降采样（长边 MODEL_MEDIA_MAX_EDGE、质量按模型参数，默认 85），
+    GIF 动图跳过降采样；非图片媒体按原样回传。
+    thumb_cache_dir：缩略图缓存目录；缺省时按会话媒体目录口径用第一个可用
+    会话目录（避免缓存落进当前进程 cwd），仅影响缓存位置、不影响数据。
+    """
+    kind = media_kind(path.name)
+    mime = media_mime_type(path.name)
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        data = path.read_bytes()
+    except OSError:
+        return None
+    needs_downsample = kind == "image" and (
+        size > IMAGE_THUMBNAIL_THRESHOLD_BYTES or quality is not None
+    ) and Path(path.name).suffix.lower() not in _IMAGE_THUMBNAIL_SKIP_EXTENSIONS
+    downsampled = False
+    if needs_downsample:
+        thumb = _load_image_thumbnail_base64(
+            thumb_cache_dir if thumb_cache_dir is not None else _thumb_dir("media_model_part"),
+            path,
+            max_edge=MODEL_MEDIA_MAX_EDGE,
+            quality=MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality,
+        )
+        if thumb is not None:
+            mime, data_b64 = thumb
+            downsampled = True
+        else:
+            data_b64 = base64.b64encode(data).decode("ascii")
+    else:
+        data_b64 = base64.b64encode(data).decode("ascii")
+    if kind == "image":
+        part = {
+            "type": "image_url",
+            "image_url": {"url": _media_data_url(mime, data_b64)},
+        }
+    elif kind == "video":
+        part = {
+            "type": "video_url",
+            "video_url": {"url": _media_data_url(mime, data_b64)},
+        }
+    else:
+        part = {
+            "type": "input_audio",
+            "input_audio": {"data": data_b64, "format": Path(path.name).suffix.lower().lstrip(".")},
+        }
+    return {
+        "part": part,
+        "kind": kind,
+        "mime": mime,
+        "size": size,
+        "downsampled": downsampled,
+        "quality": (
+            MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality
+        ) if downsampled else None,
+        "stored_name": path.name,
+        "filename": path.name,
+    }
+
+
+def load_session_media_model_part(
+    session_id: str,
+    reference: str,
+    quality: int | None = None,
+) -> dict[str, Any] | None:
+    """为 read_media 内置工具加载一个会话媒体文件，返回可直接放入消息 content 的部件。
+
+    返回 dict：{kind, mime, base64|data_url, stored_name, filename, size,
+    downsampled(bool), quality(实际生效的缩略图质量，未降采样为 None)}；
+    引用非法/文件不存在/读取失败返回 None（调用方转为模型可见错误）。
+    """
+    path = resolve_media_path(session_id, reference)
+    if path is None:
+        return None
+    return _media_model_part_from_path(path, quality, thumb_cache_dir=_thumb_dir(session_id))
+
+
+def describe_session_media_file(session_id: str, reference: str) -> dict[str, Any] | None:
+    """读取媒体文件元信息（不入内存完整字节前可用的轻量探测）。"""
+    path = resolve_media_path(session_id, reference)
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {
+        "filename": path.name,
+        "stored_name": path.name,
+        "kind": media_kind(path.name) or "other",
+        "mime": media_mime_type(path.name),
+        "size": stat.st_size,
+    }
+
+
 def save_session_media_stream(session_id: str, filename: str, file_obj: Any) -> dict[str, Any]:
     """流式保存大媒体文件（如 500MB 视频），边拷贝边计数、超限即中止。
 
@@ -452,7 +621,9 @@ def resolve_media_content_parts(session_id: str, content: Any) -> tuple[Any, lis
                     except OSError:
                         oversized = False
                     if oversized and media_path is not None:
-                        thumb = _load_image_thumbnail_base64(session_id, media_path)
+                        thumb = _load_image_thumbnail_base64(
+                            _thumb_dir(session_id), media_path
+                        )
                         if thumb is not None:
                             mime, base64_data = thumb
                     new_part[key] = {**value, "url": _media_data_url(mime, base64_data)}

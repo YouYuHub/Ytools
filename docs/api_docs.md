@@ -149,14 +149,14 @@
 | /change_chat_dir | POST | Query `new_dir`(必填) | `{state, message, current_dir, persisted_env}`；设置**全局默认**工作目录（.env `DEFAULT_CHAT_WORK_DIR`），仅作为新会话初始目录与未覆盖会话的默认值；空路径 400 |
 | /chat_config/work_dir | GET | `session_id`（可选） | 基础字段 `{state, current_dir, persisted_dir, default_dir, is_consistent, env_name, env_value, env_file, source, read_only}`；携带 `session_id` 时附加 `{session_id, session_dir, session_dir_valid, effective_dir, is_overridden, warning}`：`session_dir` 为会话 `_meta.work_dir` 覆盖值（未设置为 null），`effective_dir` 为会话实际生效目录（覆盖 → 全局默认 → 进程 cwd），目录失效回退时 `warning` 给出提示 |
 | /chat_config/work_dir | POST | Body `{session_id, work_dir}` | `{state, message, session_id, session_dir, effective_dir, warning, updated_at}`；设置/清除会话独立工作目录（写会话 `_meta.work_dir`）。`work_dir` 非空时校验目录存在（不存在 400）；空串/None 清除覆盖恢复跟随默认。对正在运行的任务不生效，下一轮生成任务开始时生效 |
-| /chat_config/history_compaction | GET | - | `{keep_rounds, trigger_ratio, summary_budget_ratio, summary_total_budget, compaction_model, available_compaction_models[], defaults, env_names, memory_state}` |
-| /chat_config/history_compaction | POST | Body 见下方完整策略 | `{state, updated, config, memory_state}` |
+| /chat_config/history_compaction | GET | `session_id`（可选） | `{keep_rounds, trigger_ratio, summary_budget_ratio, summary_total_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
+| /chat_config/history_compaction | POST | Body 见下方完整策略；Query `session_id`（可选） | `{state, updated, config, memory_state}`；返回的 `config.effective_threshold` 同样支持会话口径 |
 | /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present}`；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`，响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示） |
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
-| /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时 |
-| /chat_config/mcp_tools | POST | Body `{call_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
+| /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, stream_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时与工具调用流式阶段超时 |
+| /chat_config/mcp_tools | POST | Body `{call_timeout_seconds, stream_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；空 `inputs` 清除会话覆盖恢复跟随全局默认；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 
@@ -178,7 +178,7 @@
 
 - **全局默认**：`setting/mcp_servers.json` 顶层 `inputs` 键（不携带 `session_id` 的 `POST /chat_config/tool_selection` 修改），作为**新建会话前**选择工具时的默认值（前端在新对话中保存工具选择即写入此处）；
 - **会话级覆盖**：会话历史 JSONL 首行 `_meta.tool_selection`（携带 `session_id` 的 `POST /chat_config/tool_selection` 修改，空 `inputs` 清除覆盖），结构与 `inputs` 一致（`{服务名: [工具名]}`），仅在用户显式设置时落盘（惰性）。
-- **内置工具**（`todo_write` / `ask_user`，后续可扩展 subAgent 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。
+- **内置工具**（`todo_write` / `ask_user` / `write_file` / `edit_file` / `read_file` / `search_files` / `read_media`，后续可扩展 subAgent 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。
 
 生成请求 `tool_names` 字段的语义保持「前端传入优先」；仅当请求**完全未携带** `tool_names`（`null`，区别于显式空列表 `[]`）时，后端回退为该会话的生效工具选择（`_meta.tool_selection` → 全局 `inputs`），并向前端推送 `warning` 事件（`code=TOOL_SELECTION_FALLBACK`，全局配置读取失败时触发）。显式传 `[]` 仍表示无工具模式。清空会话历史时 `_meta.tool_selection` 与 `_meta.work_dir` 一样予以保留。
 
@@ -224,9 +224,9 @@
 }
 ```
 
-- `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 2048）：本轮思考过程（`reasoning_content`）随带工具调用的 assistant 消息回传时保留末尾 N 字符。
+- `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 -1）：思考过程（`reasoning_content`）的回传裁剪长度。**回传规则**：每次请求最多只回传一条真实思考——最近一次 API 调用输出的那条（本轮没有输出时向前回溯最近一次真实思考），负数全量、正数保留末尾 N 字符；配置为 `0` 或回溯不到真实思考时回传 `"..."` 占位符（带 `tool_calls` 的最新 assistant 消息字段必须存在，GLM / DeepSeek 等严格上游缺失即 400）。**落盘与回传解耦**：运行时上下文与 JSONL 历史永远保存每轮思考的原始全文，历史 assistant（含旧工具轮）的思考在请求副本中直接剥离、不回传上游，也不落 `"..."` 假数据。
 - `tool_result_max_length`（对应 env `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH`，默认 0）：后端历史轮次重建上下文时，单个工具结果回传前 N 字符；回传格式符合 Chat Completions 规范（`assistant.tool_calls` → `tool.tool_call_id`）。
-- 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。
+- 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。（思考过程因上游强校验，`0` 实际回传占位符，见上）
 
 ### MCP 工具执行超时配置
 
@@ -234,13 +234,18 @@
 
 ```json
 {
-  "call_timeout_seconds": 300
+  "call_timeout_seconds": 300,
+  "stream_timeout_seconds": 300
 }
 ```
 
 - 正数：超过指定秒数后中止本次调用，并将超时错误作为工具结果反馈给模型；
 - `0`：不设置超时，工具若自身永久阻塞仍可能无法返回，不建议用于不可控的本地终端工具；
 - 负数：请求接口返回 400，不会覆盖已有配置。
+
+`stream_timeout_seconds`（对应 env `TOOL_CALL_STREAM_TIMEOUT_SECONDS`，默认 300）控制**模型 SSE 输出 `tool_calls` 阶段**的无响应超时：部分服务商 API 在该阶段会无限卡住（HTTP 连接不断、永无后续事件），普通 HTTP 读超时既兜不住也不该终止任务。首个 `tool_calls` 增量到达后开始按"事件间隔"计时（期间任意后续事件续期，`finish_reason` 到达后停止计时）；超时后**不终止任务**：本次工具调用按失败处理（assistant 工具调用消息 + 失败工具结果成对落盘，SSE 推送 `tool_return`（`timeout: true`）与 `TOOL_CALL_STREAM_TIMEOUT` warning 帧），模型基于失败结果继续运行（重试或直接回答）。调用结构不可用（工具名未注册等）时退化为内部提示消息，让模型重新发起调用。
+
+超时值还会实时写入**系统提示词**（`factory/system_prompt.py`，每次构造提示词时从 `load_var` 现读）：正数时告知模型「单次执行超时 N 秒，长耗时操作需拆分/缩小范围」；`0` 时告知「不限制超时，需主动拆分并阶段性反馈」——用户在聊天设置中修改超时后，下一轮对话模型即可感知新配置。
 
 工具执行已放入工作线程，因此工具阻塞期间事件循环仍可处理 `GET /chat_context/token_stats` 和 `POST /stop_chat`。手动停止会同时设置会话停止标记、取消后台生成任务并等待其完成收尾；正在执行的同步工具线程无法被 Python 强制杀死，会由上述超时配置最终释放，推荐将超时设置为合理的正数。
 
@@ -289,7 +294,7 @@
 ```json
 {
   "inputs": {
-    "__builtin__": ["ask_user"],
+    "__builtin__": ["ask_user", "read_media"],
     "PipeIpcMcp": ["setup_pipe", "run_pipe_command"],
     "SysServer": []
   }
@@ -398,6 +403,35 @@
 - Query: `name`(必填, 即 stored_name，禁止路径分隔符), `session_id`
 - 支持 HTTP Range 请求（206），大 PDF 按需加载
 - 返回: 文件字节流（Content-Type 按扩展名推断）；不存在 404
+
+### 内置 read_media 工具（factory/agent_runtime/builtin_tools.py）
+模型可调用的媒体读取内置工具（「配置工具」→「内置工具」分组勾选 `read_media`），
+把媒体来源解析为 base64 回传给多模态模型，**本地/网络/用户上传统一入口**：
+
+- `references`：媒体来源数组（可混用）：
+  1) `media://` 会话引用（用户上传或 read_media 自行注册的来源）；
+  2) 本地文件路径（绝对路径或相对会话工作目录的路径，worker 进程已 os.chdir）；
+  3) http(s) 网络直链（下载后按魔数嗅探校准扩展名，30 秒超时、跟随重定向）；
+  本地/网络来源首次读取会自动注册进会话媒体库（`register_media_source`，
+  与用户上传同规则：类型校验、大小上限、ICO/TIFF 自动转 PNG），重复读取走
+  会话链路（无需重复下载/读盘）；重复读取自动去重；
+- `quality`：可选，50-100（默认 85）——仅对超过 2MB 的大图降采样生效
+  （长边 1568、JPEG 质量按该参数；小图/GIF 动图按原样回传）；
+- 规模边界沿用媒体上传规则（图片/音频 20MB、视频 500MB）；
+- **无内容安全边界**（当前策略：工具由用户提供；本地/网络来源不做白名单
+  拦截，本地路径相对会话工作目录解析）；用户授权确认逻辑后续接入：
+  来源审计字段（`source_type` = session/network/local、`source` = 原始引用）
+  已在加载链路沿途携带，届时在 `register_media_source` 入口挂确认钩子；
+- 返回为纯文本元信息（读取了哪些、来源类型、实际生效 quality、是否降采样/
+  跳过原因）；**数据本体（base64）不进入工具结果文本**——工具结果按原样落盘
+  JSONL，媒体数据由后端按 loaded 项的 `reference+quality` 坐标经
+  `load_any_media_model_part` 现场加载为 user 消息多模态部件
+  （`image_url`/`video_url`/`input_audio`），在工具结果处理完成后追加进
+  后续模型请求上下文（仅内存、不落盘历史），token 统计按多模态部件固定
+  占位计费；加载失败时以占位文本告知模型；
+- **单次调用最多 5 个**（超出的引用标记 `limit_5_per_round` 跳过）；任务内多次
+  读取累计时按**滚动窗口只保留最近 5 个部件**，被挤出的引用解除「已注入」标记，
+  模型再次读取同一引用可重新注入。
 
 ## 7. Skills 提示词库 Prompts
 

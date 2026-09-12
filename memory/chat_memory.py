@@ -1146,6 +1146,25 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
 
+    def _load_for_read(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """只读路径的"读全量 + 按需物化"：meta 与首行一致时不再全量重写。
+
+        get_context_messages / get_context_token_stats 等只读查询过去每次都
+        无条件 `_write_meta_and_entries`（临时文件 + os.replace 全文件重写），
+        大会话下轮询/加载会明显变慢；实际上写路径总是把重算后的 _meta 落在
+        首行，仅当读取到的首行 _meta 与重算结果漂移时才需要物化（与
+        __init__ 的惰性物化同口径）。
+        """
+        with self._write_guard():
+            rows = _read_jsonlines(self._file_path)
+            stored_meta = rows[0].get("_meta") if (rows and _is_meta_record(rows[0])) else None
+            meta, entries = _load_meta_and_entries(
+                self._file_path, self.session_id, rows=rows
+            )
+            if stored_meta != meta:
+                _write_meta_and_entries(self._file_path, meta, entries)
+        return meta, entries
+
     async def get_context_messages(
         self,
         max_rounds: int | None = None,
@@ -1182,9 +1201,7 @@ class ChatMemoryManager:
                 _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
                 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
             )
-        with self._write_guard():
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            _write_meta_and_entries(self._file_path, meta, entries)
+        meta, entries = self._load_for_read()
         context_summary = _normalize_context_summary(meta.get("context_summary"))
         summary_message = _render_context_summary(context_summary)
         round_entries = [
@@ -1259,18 +1276,16 @@ class ChatMemoryManager:
                 _load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
                 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
             )
-        with self._write_guard():
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            _write_meta_and_entries(self._file_path, meta, entries)
-            # 流式任务尚未收到 done 时，当前轮仍只存在于 ChatRoundStore.pending_round；
-            # 复制快照供 token_stats 纳入统计，避免轮询只能看到上一轮的旧数据。
-            pending_round = copy.deepcopy(self._round_store.pending_round)
-            if pending_round is None:
-                # 生成任务跑在会话 worker 进程时，pending_round 在 worker 内存，
-                # 主进程实例里恒为 None；兜底读取 worker 逐事件写入的检查点
-                # 侧车快照，让任务进行中（无 usage/压缩事件的静默间隔）统计
-                # 也能实时反映当前轮增量。
-                pending_round = self._read_pending_round_snapshot()
+        meta, entries = self._load_for_read()
+        # 流式任务尚未收到 done 时，当前轮仍只存在于 ChatRoundStore.pending_round；
+        # 复制快照供 token_stats 纳入统计，避免轮询只能看到上一轮的旧数据。
+        pending_round = copy.deepcopy(self._round_store.pending_round)
+        if pending_round is None:
+            # 生成任务跑在会话 worker 进程时，pending_round 在 worker 内存，
+            # 主进程实例里恒为 None；兜底读取 worker 逐事件写入的检查点
+            # 侧车快照，让任务进行中（无 usage/压缩事件的静默间隔）统计
+            # 也能实时反映当前轮增量。
+            pending_round = self._read_pending_round_snapshot()
         context_summary = _normalize_context_summary(meta.get("context_summary"))
         summary_message = (
             _render_context_summary(context_summary)

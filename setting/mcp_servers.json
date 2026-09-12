@@ -1,12 +1,12 @@
 {
   "servers": {
-    "pipeIpcMcp": {
+    "PipeIpcMcp": {
       "type": "stdio",
       "command": "mcp_server/PipeIpcMCP.exe",
       "args": [],
       "version": "2.0.0"
     },
-    "sysServer": {
+    "SysServer": {
       "type": "stdio",
       "command": "python",
       "args": [
@@ -16,7 +16,20 @@
     }
   },
   "inputs": {
-    "pipeIpcMcp": [],
-    "sysServer": []
+    "__builtin__": [
+      "ask_user",
+      "edit_file",
+      "read_file",
+      "read_media",
+      "search_files",
+      "todo_write",
+      "write_file"
+    ],
+    "PipeIpcMcp": [],
+    "SysServer": [
+      "fetch_url",
+      "run_command",
+      "web_search"
+    ]
   }
 }

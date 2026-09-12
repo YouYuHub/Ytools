@@ -8,7 +8,7 @@
   "use strict";
   const {
     state, el, toast, setEmpty,
-    scrollToBottom, nearBottom, chatInner
+    scrollToBottom, stickToBottom, nearBottom, chatInner
   } = App;
 
   // ---------- 手动压缩 ----------
@@ -170,7 +170,7 @@
             sawStart = true;
           }
         }
-        if (state.sessionId && nearBottom()) scrollToBottom();
+        if (state.sessionId) stickToBottom();
       }, state.manualCompactAbort.signal);
     } catch (err) {
       const aborted = err.name === "AbortError";

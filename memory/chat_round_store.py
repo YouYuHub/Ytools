@@ -105,6 +105,13 @@ class ChatRoundStore:
                 )
             self.pending_round = self.new_round(question=initial_question)
 
+        # 深拷贝后再入轮次：持久层持有的事件必须与运行时 messages 的对象引用
+        # 解耦。上游（chat_factory）会把 messages 里的 assistant dict 原地修改
+        # （旧工具轮 reasoning_content 占位化、裁剪、剥离等）——若直接存引用，
+        # 轮次收尾时序列化的是"被运行时改过"的数据，落盘思考过程会失真成
+        # "..."。这里以写入时刻的内容为准，落盘永远是模型原始输出。
+        record = json.loads(json.dumps(record, ensure_ascii=False))
+
         self.pending_round["events"].append(record)
         if role == "user" and not self.pending_round.get("question"):
             question_text = content_part_to_text(

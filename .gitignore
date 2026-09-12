@@ -1,0 +1,13 @@
+# 运行时数据与本地环境（不进仓库）
+.vs/
+__pycache__/
+.pytest_cache/
+history_files/
+node_modules/
+*.log
+
+# 临时调试文件
+tmp_*.py
+_tmp_*.txt
+_sec*.txt
+pytest_out.log

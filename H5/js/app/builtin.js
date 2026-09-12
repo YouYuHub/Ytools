@@ -22,6 +22,7 @@
   const EDIT_FILE_TOOL_NAME = "edit_file";
   const READ_FILE_TOOL_NAME = "read_file";
   const SEARCH_FILES_TOOL_NAME = "search_files";
+  const READ_MEDIA_TOOL_NAME = "read_media";
   const BUILTIN_SERVER_KEY = "__builtin__";
   const BUILTIN_TOOLS = [
     {
@@ -47,6 +48,10 @@
     {
       name: SEARCH_FILES_TOOL_NAME,
       description: "跨文件搜索（内置）：类 grep 的正则逐行匹配，跳过依赖目录与大文件",
+    },
+    {
+      name: READ_MEDIA_TOOL_NAME,
+      description: "读取媒体（内置）：模型读取当前任务消息中的图片/视频（≤5 个）并以视觉形式观察",
     },
   ];
 
