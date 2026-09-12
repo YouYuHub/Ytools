@@ -198,8 +198,9 @@ window.App = window.App || {};
   const reasoningMaxLength = $("#reasoningMaxLength");
   const toolResultMaxLength = $("#toolResultMaxLength");
   const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
-  const toolStreamTimeoutSeconds = $("#toolStreamTimeoutSeconds");
   const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
+  const mcpToolWorkers = $("#mcpToolWorkers");
+  const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
   const keepRounds = $("#keepRounds");
   const triggerRatio = $("#triggerRatio");
   const summaryBudgetRatio = $("#summaryBudgetRatio");
@@ -210,11 +211,12 @@ window.App = window.App || {};
   const THEME_LABEL = { system: "跟随系统", light: "浅色", dark: "深色" };
   const SESSION_TITLE_KEY = "ytools-session-title-overrides";
 
-  // 三个模型角色的配置选项卡
+  // 四个模型角色的配置选项卡（sub_agent_model 未配置时子任务继承父级聊天模型）
   const MODEL_ROLES = [
     { role: "chat_model", label: "聊天模型" },
     { role: "compaction_model", label: "压缩模型" },
     { role: "title_model", label: "标题模型" },
+    { role: "sub_agent_model", label: "子智能体模型" },
   ];
 
   // 各角色生成参数的内置默认值（服务端未配置/解析不到时使用）
@@ -222,6 +224,7 @@ window.App = window.App || {};
     chat_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
     compaction_model: { temperature: 0.2, top_p: 1, presence_penalty: 0, reasoning_effort: "low", enable_thinking: false },
     title_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
+    sub_agent_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
   };
 
   // 各 api_type 的“恢复默认”参数预设。后端暂未按协议细分适配，先按常见默认占位，
@@ -237,8 +240,9 @@ window.App = window.App || {};
     reasoning_max_length: -1,
     tool_result_max_length: -1,
     call_timeout_seconds: 300,
-    stream_timeout_seconds: 300,
     network_retry_max_attempts: 3,
+    mcp_tool_workers: 3,
+    sub_agent_max_concurrent: 3,
     keep_rounds: 20,
     trigger_ratio: 0.8,
     summary_budget_ratio: 0.2,
@@ -497,7 +501,8 @@ window.App = window.App || {};
   deleteConfirm, chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
-  toolCallTimeoutSeconds, toolStreamTimeoutSeconds, networkRetryMaxAttempts, keepRounds,
+  toolCallTimeoutSeconds, networkRetryMaxAttempts, mcpToolWorkers,
+  subAgentMaxConcurrent, keepRounds,
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,

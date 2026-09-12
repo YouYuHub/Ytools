@@ -21,6 +21,7 @@ from config import (
     ChatLLMRequest,
     DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
+    DEFAULT_SUB_AGENT_ENABLED,
     DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_current_dir,
@@ -40,9 +41,13 @@ from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
+    ASK_USER_PLACEHOLDER_DEFINITION,
+    BUILTIN_TOOL_SERVER_KEY,
+    CHECK_TOOL_EXISTS_NAME,
     EDIT_FILE_NAME,
     READ_FILE_NAME,
     SEARCH_FILES_NAME,
+    SUB_AGENT_TOOL_NAME,
     TODO_TOOL_NAME,
     WRITE_FILE_NAME,
     READ_MEDIA_NAME,
@@ -51,6 +56,7 @@ from factory.agent_runtime.builtin_tools import (
     inject_builtin_tools,
     is_builtin_tool,
     normalize_ask_questions,
+    normalize_sub_agent_task,
     normalize_todo_items,
     execute_read_media,
     load_any_media_model_part,
@@ -70,6 +76,16 @@ from factory.agent_runtime.chat_runtime import (
     estimate_tool_definition_tokens,
     resolve_model_max_input_tokens,
     UsageAccumulator,
+    # V1 sub_agent：以下原私有实现迁入 chat_runtime，父/子循环共用
+    parse_sse_event as _parse_sse_event,  # noqa: F401
+    filter_tool_calls_fields as _filter_tool_calls_fields,  # noqa: F401
+    merge_function_call_delta as _merge_function_call_delta,  # noqa: F401
+    merge_tool_call_delta as _merge_tool_call_delta,  # noqa: F401
+    REASONING_PLACEHOLDER as _REASONING_PLACEHOLDER,  # noqa: F401
+    latest_reasoning_content as _latest_reasoning_content,  # noqa: F401
+    reasoning_content_for_tool_call as _reasoning_content_for_tool_call,  # noqa: F401
+    retain_latest_reasoning,
+    copy_for_request,
 )
 from factory.agent_runtime.context_compaction import (
     ContextCompactionError,
@@ -88,6 +104,12 @@ from factory.agent_runtime.tool_executor import (
     normalize_tool_calls,
     prepare_tool_execution,
 )
+from factory.agent_runtime.sub_agent import (
+    SubAgentContext,
+    load_sub_agent_limits,
+    new_agent_id,
+    run_sub_agent_batch,
+)
 from factory.session_worker import (
     get_worker_proxy,
     peek_worker_proxy,
@@ -103,6 +125,38 @@ _FIRST_CALL_FILE_MEMORY_MAX_CHARS = 3000
 # 前端刷新/断开 SSE 连接时，后台任务不会被取消，事件持续写入缓冲与 JSONL
 _SESSION_STREAMS: dict[str, "_SessionStream"] = {}
 _SESSION_STREAM_MAX_BUFFER = 20000  # 有界环形缓冲：防止长时间无消费时内存膨胀
+
+
+# ---- 思考回传 / 工具流超时的配置读取（保留在本命名空间） ----
+# 这些 loader 曾随共享纯函数一起迁入 agent_runtime.chat_runtime，但父循环
+# 走 chat_factory.load_var 的路径（测试/运行时可直接 patch 本命名空间），
+# 因此这里保留本地实现；chat_runtime 侧同签名函数供子任务等独立调用方使用。
+# 思考回传整形函数（_retain_latest_reasoning / _copy_for_request）改为
+# 显式传 limit 的包装，保证 cf.* 打桩对下游行为生效。
+def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MAX_LENGTH) -> int:
+    return parse_return_length(
+        load_var("REASONING_RETURN_MAX_LENGTH", default), default
+    )
+
+
+def _load_tool_call_stream_timeout(
+    default: float = DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
+) -> float:
+    """工具调用流式阶段（SSE 输出 tool_calls 期间）无输出超时秒数（0=不限制）。"""
+    raw = load_var("TOOL_CALL_STREAM_TIMEOUT_SECONDS", default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else 0.0
+
+
+def _retain_latest_reasoning(messages: List[dict]) -> None:
+    retain_latest_reasoning(messages, limit=_load_reasoning_return_max_length())
+
+
+def _copy_for_request(messages: List[dict]) -> List[dict]:
+    return copy_for_request(messages, limit=_load_reasoning_return_max_length())
 
 
 def _format_tool_result(result: Any) -> str:
@@ -180,191 +234,6 @@ def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
     return "; ".join(lines)
 
 
-def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MAX_LENGTH) -> int:
-    return parse_return_length(load_var("REASONING_RETURN_MAX_LENGTH", default), default)
-
-
-def _load_tool_call_stream_timeout(
-    default: float = DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
-) -> float:
-    """工具调用流式阶段（SSE 输出 tool_calls 期间）无输出超时秒数。
-
-    0 或负数表示不限制。该超时约束的是"模型 SSE 事件间隔"：部分服务商
-    在输出 tool_calls 期间会无限卡住（连接不断、永无后续事件），HTTP 读
-    超时（默认 1800s）既兜不住也不能终止任务；超时后由运行时放弃本次工具
-    调用、以失败结果反馈模型并继续任务（见工具调用分支的
-    tool_phase_timeout_hit 处理）。
-    """
-    raw = load_var("TOOL_CALL_STREAM_TIMEOUT_SECONDS", default)
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return float(default)
-    return value if value > 0 else 0.0
-
-
-# 思考缺失时的占位符：仅用于"最新工具轮"的回传兜底——最新一次 API 调用
-# 没有输出思考、上下文中也回溯不到更早的真实思考（或回传长度配置为 0）
-# 时，带 tool_calls 的最新 assistant 消息仍需携带 reasoning_content 字段
-# （GLM / DeepSeek 等严格上游缺失即 400）；占位符可通过校验，token 开销
-# 可忽略。历史工具轮的思考不回传（请求副本中直接剥离字段，见
-# _copy_for_request）。
-_REASONING_PLACEHOLDER = "..."
-
-
-def _latest_reasoning_content(messages: List[dict[str, Any]]) -> str:
-    """取上下文中最近一条非空 assistant 思考（工具轮回传兜底用；跳过占位符）。"""
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
-            return reasoning
-    return ""
-
-
-def _reasoning_content_for_tool_call(source: str, limit: int) -> str:
-    """按回传长度策略生成工具轮 assistant 消息的 reasoning_content。
-
-    思考模式下的工具调用链要求每条 assistant（tool_calls）消息都回传
-    reasoning_content（严格上游缺失即 400），因此这里永远不返回空值：
-    - limit < 0：全量回传；
-    - limit > 0：只保留末尾 N 字符；
-    - limit == 0：只回传占位符（"不回传"语义退化为最小占位，仅满足上游
-      字段校验，避免请求被严格上游拒绝）；
-    来源缺失（模型本轮未输出思考）时同样回退占位符。
-    """
-    if limit == 0:
-        return _REASONING_PLACEHOLDER
-    text = source if isinstance(source, str) else ""
-    if not text.strip():
-        return _REASONING_PLACEHOLDER
-    return text if limit < 0 else text[-limit:]
-
-
-def _retain_latest_reasoning(messages: List[dict[str, Any]]) -> None:
-    """只保留最近一条 assistant 真实思考，避免思考过程跨轮累积。
-
-    严格上游（GLM / DeepSeek 等）要求工具调用链中每条 assistant（tool_calls）
-    消息都回传 reasoning_content，缺失即 400；因此旧工具轮不再直接剥离字段，
-    而是替换为 "..." 占位符（字段必须存在，占位符可通过校验）。最近一条保持
-    真实思考；意外缺失时回退历史最近思考，再兜底占位符。
-    """
-    assistant_indexes = [
-        index for index, message in enumerate(messages)
-        if isinstance(message, dict) and message.get("role") == "assistant"
-    ]
-    if not assistant_indexes:
-        return
-    latest_index = assistant_indexes[-1]
-    # 先收集兜底思考：旧轮随后会被覆盖为占位符，之后再也取不到真实值
-    fallback = ""
-    for index in reversed(assistant_indexes[:-1]):
-        reasoning = messages[index].get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
-            fallback = reasoning
-            break
-    limit = _load_reasoning_return_max_length()
-    for index in assistant_indexes:
-        message = messages[index]
-        if index == latest_index:
-            if not message.get("tool_calls"):
-                continue  # 非工具轮不强制回传思考
-            current = message.get("reasoning_content")
-            if isinstance(current, str) and current.strip():
-                continue  # 最近一条已有思考，保持原样
-            message["reasoning_content"] = _reasoning_content_for_tool_call(fallback, limit)
-            continue
-        if message.get("tool_calls"):
-            # 旧工具轮：字段必须存在；值用占位符避免真实思考跨轮累积
-            message["reasoning_content"] = _REASONING_PLACEHOLDER
-        else:
-            message.pop("reasoning_content", None)
-
-
-def _copy_for_request(messages: List[dict[str, Any]]) -> List[dict[str, Any]]:
-    """构造发往上游的请求副本：思考过程只在此处做"回传"整形。
-
-    运行时 messages 始终保持模型原始输出（每轮思考均为原始全文），落盘
-    （record_message 深拷贝）也以真实值为源——历史工具轮的思考全部完整
-    保留，绝不替换为 "..."。本函数只在副本上做回传侧语义：请求里最多只
-    保留一条真实思考（最近一次 API 调用输出的那条），其余一律占位/剥离，
-    既满足严格上游（GLM/DeepSeek）"reasoning_content 必须存在"的校验，
-    又避免真实思考跨轮累积发给上游：
-    - 旧工具轮 / 旧非工具 assistant：剥离 reasoning_content（历史思考
-      一律不回传，只保留运行时/落盘里的原始值）；
-    - 最新工具轮：只回传最近一次 API 调用输出的思考，按
-      REASONING_RETURN_MAX_LENGTH 裁剪；本轮没有输出思考时向前回溯，
-      取上下文中最近一次真实思考按同一规则回传；完全找不到真实思考或
-      limit==0 时回传占位符（字段仅为通过上游校验而存在）；
-    - 最新非工具轮：思考非必须，已有则按长度裁剪，limit==0 直接剥离。
-
-    只对"需要修改"的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
-    直接复用引用——避免对整包 messages（可能含 MB 级 base64 多模态部件）
-    做深拷贝的每轮开销。
-    """
-    assistant_indexes = [
-        index for index, message in enumerate(messages)
-        if isinstance(message, dict) and message.get("role") == "assistant"
-    ]
-    if not assistant_indexes:
-        return list(messages)
-    latest_index = assistant_indexes[-1]
-    # 回退思考：最新一次 API 调用没有输出思考时，向前找最近一次真实思考
-    # （运行时 messages 每轮都保存原始全文，历史值可直接回溯；跳过占位符）
-    fallback = ""
-    for index in reversed(assistant_indexes[:-1]):
-        reasoning = messages[index].get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != _REASONING_PLACEHOLDER:
-            fallback = reasoning
-            break
-    limit = _load_reasoning_return_max_length()
-
-    def _mutated(message: dict[str, Any], reasoning: Any, drop: bool) -> dict[str, Any]:
-        clone = dict(message)  # 顶层浅拷贝：字符串字段共享不可变值，安全
-        if drop:
-            clone.pop("reasoning_content", None)
-        else:
-            clone["reasoning_content"] = reasoning
-        return clone
-
-    copied: List[dict[str, Any]] = []
-    assistant_set = set(assistant_indexes)
-    for index, message in enumerate(messages):
-        if index not in assistant_set or not isinstance(message, dict):
-            copied.append(message)
-            continue
-        if index == latest_index:
-            if not message.get("tool_calls"):
-                # 非工具轮不强制回传思考：已有思考时按回传长度裁剪
-                # （运行时保存的是原始全文），limit==0 时直接剥离字段
-                reasoning = message.get("reasoning_content")
-                if not (isinstance(reasoning, str) and reasoning.strip()) or limit < 0:
-                    copied.append(message)  # 无思考或全量回传：原样引用
-                elif limit == 0:
-                    copied.append(_mutated(message, None, drop=True))
-                else:
-                    copied.append(_mutated(message, reasoning[-limit:], drop=False))
-                continue
-            current = message.get("reasoning_content")
-            # 只回传一条思考：优先本轮（最近一次 API 调用）输出的思考；
-            # 本轮没有时向前回溯最近一次真实思考（不产生第二条真实思考）；
-            # 都没有或 limit==0 时回传占位符（字段存在即可通过严格上游校验）
-            source = current if isinstance(current, str) and current.strip() else fallback
-            reasoning = _reasoning_content_for_tool_call(source, limit)
-            if isinstance(current, str) and reasoning == current:
-                copied.append(message)  # 回传值与原值一致：复用原对象
-            else:
-                copied.append(_mutated(message, reasoning, drop=False))
-            continue
-        # 旧 assistant（工具轮/非工具轮）：历史思考一律不回传，剥离字段
-        if "reasoning_content" not in message:
-            copied.append(message)
-            continue
-        copied.append(_mutated(message, None, drop=True))
-    return copied
-
-
 def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
     """用一条紧凑的任务状态 system 消息替换历史 todo 调用与结果。"""
     todo_call_ids = set()
@@ -430,136 +299,9 @@ async def load_all_tools() -> None:
 print("[INFO] 工具将按需实时刷新（来源: setting/mcp_servers.json）")
 
 
-def _parse_sse_event(sse_chunk: str) -> dict[str, Any] | None:
-    if not isinstance(sse_chunk, str):
-        return None
-    chunk = sse_chunk.strip()
-    if not chunk.startswith("data:"):
-        return None
-    payload_text = chunk[len("data:"):].strip()
-    if payload_text == "[DONE]":
-        return {"done": True}
-    if not payload_text:
-        return None
-    try:
-        return json.loads(payload_text)
-    except json.JSONDecodeError:
-        return None
-
-
-def _filter_tool_calls_fields(event: dict[str, Any]) -> dict[str, Any]:
-    """过滤 tool_calls 中的 id 和 type 字段
-    只处理 tool_calls 字段, 其他字段直接引用原对象以避免不必要的拷贝
-    """
-    if not isinstance(event, dict):
-        return event
-    # 如果没有 tool_calls 字段,直接返回原对象
-    if "tool_calls" not in event:
-        return event
-    tool_calls = event.get("tool_calls")
-    if not isinstance(tool_calls, list):
-        return event
-    # 只处理 tool_calls 字段,其他字段保持原样
-    filtered_event = event.copy()
-    filtered_tool_calls = []
-    for tc in tool_calls:
-        if isinstance(tc, dict):
-            # 创建新的工具调用对象,排除 id 和 type 字段
-            filtered_tc = {k: v for k, v in tc.items() if k not in ("id", "type")}
-            filtered_tool_calls.append(filtered_tc)
-        else:
-            filtered_tool_calls.append(tc)
-    filtered_event["tool_calls"] = filtered_tool_calls
-    return filtered_event
-
-
-def _merge_function_call_delta(
-    accumulated: List[dict],
-    function_call_delta: dict
-) -> None:
-    """合并流式 function_call 增量数据到累积列表中（兼容老模型）
-    规则：
-    - function_call 是单个对象，不是列表
-    - 累积 name 和 arguments 字符串
-    - 将 function_call 转换为与 tool_calls 相同的格式，index 固定为 0
-    """
-    if not isinstance(function_call_delta, dict):
-        return
-    # 查找是否已存在 function_call 的记录（index=0）
-    existing_fc = None
-    for acc_tc in accumulated:
-        if acc_tc.get("index") == 0 and acc_tc.get("_is_function_call", False):
-            existing_fc = acc_tc
-            break
-    # 如果不存在，创建新记录
-    if existing_fc is None:
-        existing_fc = {
-            "index": 0,
-            "_is_function_call": True,  # 标记这是 function_call 而非 tool_calls
-            "function": {
-                "name": "",
-                "arguments": ""
-            }
-        }
-        accumulated.append(existing_fc)
-    # 累加 function.name
-    fc_name = function_call_delta.get("name")
-    if fc_name:
-        existing_fc["function"]["name"] += fc_name
-    # 累加 function.arguments
-    fc_arguments = function_call_delta.get("arguments")
-    if fc_arguments:
-        existing_fc["function"]["arguments"] += fc_arguments
-
-
-def _merge_tool_call_delta(
-    accumulated: List[dict],
-    tool_calls_delta: list[dict]
-) -> None:
-    """合并流式工具调用增量数据到累积列表中
-    规则：
-    - accumulated 包含所有出现过的 index 对应的工具调用
-    - 如果 delta 的 index 已存在，则累加该 index 的内容（name, arguments 等）
-    - 如果 delta 的 index 不存在，则新增一条记录
-    - index 本身是标识符，直接替换而非累加
-    """
-    if not isinstance(tool_calls_delta, list):
-        return
-    for delta in tool_calls_delta:
-        if not isinstance(delta, dict):
-            continue
-        index = delta.get("index")
-        if index is None:
-            continue
-        # 查找是否已存在该 index 的记录
-        existing_tc = None
-        for acc_tc in accumulated:
-            if acc_tc.get("index") == index:
-                existing_tc = acc_tc
-                break
-        # 如果不存在，创建新记录
-        if existing_tc is None:
-            existing_tc = {
-                "index": index,
-                "id": delta.get("id") or f"call_{uuid.uuid4().hex}",
-                "function": {
-                    "name": "",
-                    "arguments": ""
-                },
-                "type": "function"
-            }
-            accumulated.append(existing_tc)
-        delta_function = delta.get("function", {})
-        if delta.get("id"):
-            existing_tc["id"] = delta["id"]
-        if delta_function.get("name"):
-            existing_tc["function"]["name"] += delta_function["name"]
-        if delta_function.get("arguments"):
-            existing_tc["function"]["arguments"] += delta_function["arguments"]
-        if delta.get("type"):
-            existing_tc["type"] = delta["type"]
-    # 遵守 ai 给的 index 字段排序
-    accumulated.sort(key=lambda x: x["index"])
+# _parse_sse_event / _filter_tool_calls_fields / _merge_function_call_delta /
+# _merge_tool_call_delta 已迁入 factory/agent_runtime/chat_runtime.py，
+# 由上方 import 别名 re-export（父/子 Agent 循环共用，见 docs/sub_agent_v1.md §6.2）
 
 
 def _sse_error_payload(message: str) -> str:
@@ -817,6 +559,95 @@ async def _compact_task_context_if_needed(
 _AUTO_COMPACTION_MAX_CONSECUTIVE_FAILURES = 2
 
 
+async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, Any]) -> None:
+    """sub_agent 事件统一出口：JSONL 落盘（timestamp 补齐 + 检查点快照）+ SSE 推送。
+
+    JSONL 与 SSE 携带同构字段（SSE 另有 delta/heartbeat 推流事件，不落盘）。
+    落盘失败不阻断推流；两次写入都在事件循环内串行完成（子任务事件只在
+    事件循环同步守卫块内写历史，禁止工作线程写历史——_write_guard 跨进程
+    文件锁不可重入）。
+    """
+    try:
+        await session_chat_memory.add_sub_agent_event(payload)
+    except Exception as persist_error:
+        print(f"[WARN] sub_agent 事件落盘失败（phase={payload.get('phase')}）: {persist_error}")
+    try:
+        await _stream_emit(
+            stream,
+            f"data: {json.dumps({'event': 'sub_agent', **payload}, ensure_ascii=False)}\n\n",
+        )
+    except Exception as sse_error:
+        print(f"[WARN] sub_agent 事件推送失败（phase={payload.get('phase')}）: {sse_error}")
+
+
+def _build_sub_agent_contexts(
+    sub_agent_calls: list[tuple[int, dict, str, list[dict] | None]],
+    *,
+    round_tools: list[dict[str, Any]],
+    round_tool_servers: dict[str, str],
+    configured_tool_names: set[str],
+    configured_tool_servers: dict[str, str],
+    session_id: str,
+    session_chat_memory,
+    stream,
+    stop_checker,
+) -> list["SubAgentContext"]:
+    """把父循环收集的 sub_agent 调用转成 SubAgentContext 列表（docs/sub_agent_v1.md §6.1）。
+
+    工具快照在派发时刻固化：
+    - 剔除 sub_agent（V1 禁止嵌套）与 check_tool_exists（子任务工具已知）；
+    - ask_user 替换为占位定义（子任务无用户通道，占位执行返回明确错误）；
+    - read_media 若父级本轮未启用，子级同样不注入。
+    """
+    limits = load_sub_agent_limits()
+    used_agent_ids: set[str] = set()
+    contexts: list["SubAgentContext"] = []
+    for agent_index, (tool_index, tc, task_text, initial_todo) in enumerate(sub_agent_calls):
+        tool_call_id = tc.get("id", "") if isinstance(tc, dict) else ""
+        # 子工具白名单 = 父级本轮工具快照 − sub_agent − check_tool_exists；
+        # ask_user 真实定义替换为占位定义（同名同参，执行返回不可用说明）
+        child_tools: list[dict[str, Any]] = []
+        child_servers: dict[str, str] = {}
+        ask_user_replaced = False
+        for tool_def in round_tools:
+            tool_name = _tool_name_from_definition(tool_def)
+            if not tool_name or tool_name == SUB_AGENT_TOOL_NAME or tool_name == CHECK_TOOL_EXISTS_NAME:
+                continue
+            if tool_name == ASK_USER_TOOL_NAME:
+                child_tools.append(dict(ASK_USER_PLACEHOLDER_DEFINITION))
+                child_servers[ASK_USER_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
+                ask_user_replaced = True
+                continue
+            child_tools.append(tool_def)
+            if tool_name in round_tool_servers:
+                child_servers[tool_name] = round_tool_servers[tool_name]
+        if not ask_user_replaced:
+            # 父级本轮没有 ask_user：仍注入占位定义，避免子模型幻觉出提问工具
+            child_tools.append(dict(ASK_USER_PLACEHOLDER_DEFINITION))
+            child_servers[ASK_USER_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
+        contexts.append(SubAgentContext(
+            agent_id=new_agent_id(used_agent_ids),
+            parent_agent_id="main",
+            parent_tool_call_id=tool_call_id,
+            parent_tool_index=tool_index,
+            agent_index=agent_index,
+            session_id=session_id,
+            task=task_text,
+            initial_todo=initial_todo,
+            tools=child_tools,
+            tool_servers=child_servers,
+            configured_tool_names=configured_tool_names,
+            configured_tool_servers=configured_tool_servers,
+            max_rounds=limits["max_rounds"],
+            timeout_seconds=limits["timeout_seconds"],
+            reply_max_chars=limits["reply_max_chars"],
+            emit_event=lambda payload: _emit_sub_agent_event(session_chat_memory, stream, payload),
+            stop_checker=stop_checker,
+        ))
+        used_agent_ids.add(contexts[-1].agent_id)
+    return contexts
+
+
 def is_chat_stream_running(session_id: str) -> bool:
     stream = _get_session_stream(session_id)
     return bool(stream and stream.is_running())
@@ -942,8 +773,8 @@ async def _run_chat_generation(
         round_tools = []
         round_tool_servers = {}
     # 当且仅当前端有工具选择时，注入本地工具；无工具时不向上游发送 tools 字段。
-    # todo_write / ask_user / write_file / edit_file / read_file / search_files
-    # 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
+    # todo_write / ask_user / write_file / edit_file / read_file / search_files /
+    # sub_agent 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
     todo_requested = TODO_TOOL_NAME in (requested_names or [])
     ask_requested = ASK_USER_TOOL_NAME in (requested_names or [])
     write_file_requested = WRITE_FILE_NAME in (requested_names or [])
@@ -951,6 +782,10 @@ async def _run_chat_generation(
     read_file_requested = READ_FILE_NAME in (requested_names or [])
     search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
     read_media_requested = READ_MEDIA_NAME in (requested_names or [])
+    sub_agent_requested = (
+        SUB_AGENT_TOOL_NAME in (requested_names or [])
+        and load_var("SUB_AGENT_ENABLED", DEFAULT_SUB_AGENT_ENABLED)
+    )
     round_tools, round_tool_servers = inject_builtin_tools(
         round_tools, round_tool_servers, include_todo=todo_requested,
         include_ask_user=ask_requested,
@@ -959,6 +794,7 @@ async def _run_chat_generation(
         include_read_file=read_file_requested,
         include_search_files=search_files_requested,
         include_read_media=read_media_requested,
+        include_sub_agent=sub_agent_requested,
     )
     tool_request.tools = round_tools or None
     messages: List[dict] = []
@@ -979,6 +815,10 @@ async def _run_chat_generation(
     # 新生成任务必须显式置回运行态：上一个被中断的任务可能在 finally 里置 False，
     # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
     session_chat_memory.run_task = True
+    # 父级停止信号（层级取消入口）：run_task=False → 父循环与全部子任务一起停止。
+    # 命名定义供模型调用 stop_checker 与 sub_agent 派发（_build_sub_agent_contexts）共享，
+    # 语义与原先内联 lambda 完全一致。
+    stop_checker = lambda: (not session_chat_memory.run_task)  # noqa: E731
     try:
         # 覆盖式重新回答：新消息是对最新 ask_user 提问的回答时，先截断该提问
         # 轮之后的旧回答轮，保证一个问题只有一个答案轮次。截断方法内置保护：
@@ -1388,7 +1228,7 @@ async def _run_chat_generation(
             sse_iter = ChatLLM.chat_completions(
                 request = tool_request, # 传递完整的 ChatLLMRequest 对象（已包含 messages）
                 stream = True,
-                stop_checker = lambda: (not session_chat_memory.run_task)
+                stop_checker = stop_checker  # 父级停止信号（与 sub_agent 派发共享同一 closure）
             ).__aiter__()
             try:
                 while True:
@@ -1634,10 +1474,16 @@ async def _run_chat_generation(
             for tc in tool_calls:
                 function_info = tc.get("function") or {}
                 tool_name = function_info.get("name")
-                # 只回传已知工具，避免将非法 tool_call 继续发给上游导致 400
-                if tool_name not in round_tool_servers:
-                    print(f"[WARN] 跳过未知工具调用，不回传上游: {tool_name}")
+                if not tool_name:
+                    # 结构损坏（连函数名都没有）：无法形成有意义的调用与
+                    # 结果配对，跳过（下方 prepare 也会跳过它，不产生孤儿）
                     continue
+                # 未知/未授权工具同样保留在 assistant.tool_calls 里：上游对
+                # 「assistant 声明的每个 tool_call_id 必须有配对的 tool 结果
+                # 消息」做严格校验——若这里剔除而下方 blocked_tools 又为它
+                # 生成 tool 结果，会形成"结果无声明"的孤儿 → 上游 400 断流、
+                # 任务直接终止（用户切换工具后模型模仿历史调用旧工具时必现）。
+                # 保留声明 + 下方统一拦截反馈，模型能自我纠正，任务继续。
                 formatted_tc = {
                     "id": tc.get("id", ""),
                     "type": tc.get("type", "function"),
@@ -1686,6 +1532,18 @@ async def _run_chat_generation(
                     messages.append({"role": "user", "content": timeout_message, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_STREAM_TIMEOUT', 'message': timeout_message}}, ensure_ascii=False)}\n\n")
                 continue
+            if not formatted_tool_calls:
+                # 极端防御：本轮所有调用连函数名都无法解析（全部损坏），
+                # 不写带空 tool_calls 的 assistant 消息（回传上游会 400），
+                # 以内部消息提示模型重新发起或直接回答，任务继续不终止
+                broken_notice = (
+                    "刚才的工具调用格式损坏（未能解析出函数名），本次调用已放弃。"
+                    "请重新发起工具调用，或直接回答用户。"
+                )
+                print("[WARN] 工具调用全部损坏（无函数名），提示模型重试")
+                messages.append({"role": "user", "content": broken_notice, "_internal": True})
+                await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_BROKEN', 'message': broken_notice}}, ensure_ascii=False)}\n\n")
+                continue
             assistant_message["tool_calls"] = formatted_tool_calls
             messages.append(assistant_message)
             await session_chat_memory.add_chat_history(assistant_message)
@@ -1715,7 +1573,11 @@ async def _run_chat_generation(
                 print(f"[WARNING] 检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
                 for _, blocked_tool_call, blocked_tool_name, blocked_tool_args in blocked_tools:
                     blocked_tool_call_id = blocked_tool_call.get("id", "") if isinstance(blocked_tool_call, dict) else ""
-                    blocked_ret = f"工具 {blocked_tool_name} 未在本轮授权列表中，禁止调用"
+                    blocked_ret = (
+                        f"工具 {blocked_tool_name} 不在本轮可用工具列表中"
+                        "（可能不存在，或已被用户取消选择），本次调用未执行。"
+                        "请改用本轮可用的工具完成任务，或直接向用户说明该工具当前不可用。"
+                    )
                     await session_chat_memory.add_chat_history(
                         input_text={
                             "role": "tool",
@@ -1744,6 +1606,27 @@ async def _run_chat_generation(
                 if not parsed_tools:
                     continue
             if not parsed_tools and not round_tool_servers:
+                # over_task 语义为"模型宣布任务结束"：先为该声明生成配对的
+                # tool 结果（assistant.tool_call_id 与 tool 结果一一配对的
+                # 契约），再以普通回答收尾——否则历史里留下无结果孤儿，
+                # 下一轮回放发上游时校验失败断流
+                if plan.over_task_call:
+                    _, ot_tc, _, _ = plan.over_task_call
+                    ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
+                    ot_ret = "任务已由模型宣布结束（over_task）。"
+                    await session_chat_memory.add_chat_history({
+                        "role": "tool",
+                        "tool_call_id": ot_id,
+                        "tool_name": "over_task",
+                        "arguments": "{}",
+                        "result": ot_ret,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": ot_id,
+                        "content": ot_ret,
+                        "_tool_name": "over_task",
+                    })
                 assistant_message = {"role": "assistant", "content": full_response} if full_response else None
                 if assistant_message is not None:
                     messages.append(assistant_message)
@@ -1752,6 +1635,25 @@ async def _run_chat_generation(
                 break
             # 如果没有任何有效工具可执行，退出
             if not parsed_tools:
+                # 同上：over_task 结束信号也要生成配对结果再退出，
+                # 避免落盘历史里出现"声明无结果"的孤儿 tool_call
+                if plan.over_task_call:
+                    _, ot_tc, _, _ = plan.over_task_call
+                    ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
+                    ot_ret = "任务已由模型宣布结束（over_task）。"
+                    await session_chat_memory.add_chat_history({
+                        "role": "tool",
+                        "tool_call_id": ot_id,
+                        "tool_name": "over_task",
+                        "arguments": "{}",
+                        "result": ot_ret,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": ot_id,
+                        "content": ot_ret,
+                        "_tool_name": "over_task",
+                    })
                 print("[WARNING] 没有可执行的有效工具，退出循环")
                 break
             print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具")
@@ -1765,6 +1667,12 @@ async def _run_chat_generation(
                         "tool_start": {
                             "function_name": start_tn,
                             "arguments": start_ta,
+                            # V1 sub_agent：补 tool_call_id（additive），
+                            # 前端据此在子任务事件到达前预建独立块；
+                            # 旧前端忽略未知字段不受影响
+                            "tool_call_id": (
+                                start_tc.get("id", "") if isinstance(start_tc, dict) else ""
+                            ),
                         }
                     }
                     await _stream_emit(
@@ -1776,6 +1684,7 @@ async def _run_chat_generation(
             # 内置工具与 MCP 工具分开执行
             builtin_results = []
             external_parsed_tools = []
+            sub_agent_calls: list[tuple[int, dict, str, list[dict] | None]] = []
             todo_updated = False
             ask_user_pending = False
             ask_user_questions: list[dict[str, Any]] = []
@@ -1866,6 +1775,32 @@ async def _run_chat_generation(
                         "error": None,
                     })
                     continue
+                if tn == SUB_AGENT_TOOL_NAME:
+                    # 子智能体派发：解析 task/todo；真正的执行（并发 gather）
+                    # 在下方 external_parsed_tools 阶段统一进行，保证子任务与
+                    # MCP 工具同轮并发（builtin_results 只放校验错误占位）。
+                    task_text, task_error = normalize_sub_agent_task(
+                        ta.get("task") if isinstance(ta, dict) else None)
+                    if task_error is not None:
+                        builtin_results.append({
+                            "index": idx,
+                            "tool_call": tc,
+                            "tool_name": tn,
+                            "tool_args": ta,
+                            "result": {"error": task_error},
+                            "error": None,
+                        })
+                        continue
+                    initial_todo = None
+                    if isinstance(ta, dict) and isinstance(ta.get("todo"), list):
+                        items, _notices, todo_error = normalize_todo_items(
+                            ta.get("todo"), prev_items=[])
+                        if todo_error is None and items is not None:
+                            initial_todo = items
+                        elif todo_error:
+                            print(f"[WARN] sub_agent 预置 todo 无效，忽略：{todo_error}")
+                    sub_agent_calls.append((idx, tc, task_text, initial_todo))
+                    continue
                 builtin_result = execute_builtin_tool(
                     tn,
                     ta,
@@ -1913,6 +1848,22 @@ async def _run_chat_generation(
                     tool_mcp_servers=round_tool_servers,
                     max_workers=max_workers,
                 ))
+            # sub_agent 子任务并发执行：与上面 MCP 线程池调用串行开始（to_thread
+            # 已让出事件循环），但子任务之间 gather 并发；信号量限流在
+            # run_sub_agent_batch 内部。子任务事件经 emit 回调写入 JSONL 并推 SSE。
+            if sub_agent_calls:
+                sub_contexts = _build_sub_agent_contexts(
+                    sub_agent_calls,
+                    round_tools=round_tools,
+                    round_tool_servers=round_tool_servers,
+                    configured_tool_names=configured_tool_names,
+                    configured_tool_servers=configured_tool_servers,
+                    session_id=session_id,
+                    session_chat_memory=session_chat_memory,
+                    stream=stream,
+                    stop_checker=stop_checker,
+                )
+                tool_results.extend(await run_sub_agent_batch(sub_contexts))
             if builtin_results:
                 tool_results.extend(builtin_results)
             if todo_updated:
@@ -2015,6 +1966,11 @@ async def _run_chat_generation(
                             "result": ret
                         }
                     }
+                    if tool_name == SUB_AGENT_TOOL_NAME and isinstance(tool_result.get("_sub_agent"), dict):
+                        # 子任务最终回复：前端不渲染为普通工具气泡，
+                        # 而是在对应子任务块尾部显示"最终回复已返回父智能体"引用条；
+                        # 轨迹数据已由 sub_agent 事件流渲染，这里只带状态聚合
+                        tool_ret["tool_return"]["sub_agent"] = tool_result["_sub_agent"]
                     await _stream_emit(stream, f"data: {json.dumps(tool_ret)}\n\n")
                     # 以 tool role 添加工具结果消息（符合 OpenAI API 规范）
                     tool_message = {

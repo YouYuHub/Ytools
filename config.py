@@ -31,6 +31,16 @@ DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒�
 DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS = 300  # 工具调用流式阶段（模型 SSE 输出 tool_calls 期间）无输出超时秒数；超时按工具调用失败反馈模型并继续任务；0 或负数表示不限制
 DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS = 3       # 模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试）
 
+# sub_agent 子智能体（docs/sub_agent_v1.md §10）
+DEFAULT_SUB_AGENT_ENABLED = True             # 总开关：false 时不注入 sub_agent 工具定义
+DEFAULT_SUB_AGENT_MAX_ROUNDS = 40            # 单个子任务的模型调用轮次上限
+DEFAULT_SUB_AGENT_MAX_CONCURRENT = 3         # 同一父轮并发子任务上限（超出排队执行）
+DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 900      # 单个子任务整体超时秒数；0 或负数表示不限制
+DEFAULT_SUB_AGENT_REPLY_MAX_CHARS = 30000    # 子任务最终回复返回父级前的截断保护（完整轨迹在 JSONL 块内）
+
+# 工具并发执行（前端聊天设置可调，GET/POST /chat_config/tool_concurrency）
+DEFAULT_ONE_TASK_MAX_WORKERS = 3             # 同一轮多个 MCP 工具调用并发执行的线程池大小（实际取值与工具数取较小者）
+
 
 class Message(BaseModel):
     role: str = "user"       # 角色，可以是 "user" 或 "assistant" 或 "system" 或 "tool"
@@ -162,11 +172,6 @@ class McpToolConfig(BaseModel):
         DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
         description="MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制",
     )
-    stream_timeout_seconds: float = Field(
-        DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
-        description="工具调用流式阶段（模型 SSE 输出 tool_calls 期间）无输出超时秒数；"
-                    "超时按工具调用失败反馈模型并继续任务；0 或负数表示不限制",
-    )
 
 
 class NetworkRetryConfig(BaseModel):
@@ -175,6 +180,21 @@ class NetworkRetryConfig(BaseModel):
     max_attempts: int = Field(
         DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
         description="模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试直到手动停止）",
+    )
+
+
+class ToolConcurrencyConfig(BaseModel):
+    """工具并发执行配置：MCP 工具线程池 + 子智能体并发上限。"""
+
+    mcp_tool_workers: int = Field(
+        DEFAULT_ONE_TASK_MAX_WORKERS,
+        ge=1,
+        description="同一轮多个 MCP 工具调用并发执行的线程池大小；实际并发数=该值与工具数取较小者",
+    )
+    sub_agent_max_concurrent: int = Field(
+        DEFAULT_SUB_AGENT_MAX_CONCURRENT,
+        ge=1,
+        description="同一父轮并发子智能体数量上限；超出的子任务排队执行",
     )
 
 

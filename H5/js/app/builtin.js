@@ -12,7 +12,7 @@
     contextTokenTodoSlot, todoPanelHost
   } = App;
 
-  // ---------- 内置工具（服务端本地执行：todo_write / ask_user，后续可扩展 subAgent 等） ----------
+  // ---------- 内置工具（服务端本地执行：todo_write / ask_user / sub_agent 等） ----------
   // 内置工具并入“配置工具”模态框：作为伪服务 __builtin__ 下的第一组参与勾选，
   // 保存/加载与 MCP 工具走同一链路（会话独立 _meta.tool_selection / 全局默认 inputs），
   // 后端按名称识别并注入（与 factory/agent_runtime/builtin_tools.py 对应）
@@ -23,6 +23,7 @@
   const READ_FILE_TOOL_NAME = "read_file";
   const SEARCH_FILES_TOOL_NAME = "search_files";
   const READ_MEDIA_TOOL_NAME = "read_media";
+  const SUB_AGENT_TOOL_NAME = "sub_agent";
   const BUILTIN_SERVER_KEY = "__builtin__";
   const BUILTIN_TOOLS = [
     {
@@ -32,6 +33,10 @@
     {
       name: ASK_USER_TOOL_NAME,
       description: "向用户提问：模型遇到关键分歧时弹出提问卡片，你点选选项或输入回答后任务继续",
+    },
+    {
+      name: SUB_AGENT_TOOL_NAME,
+      description: "子智能体：父任务并发派发独立上下文的子任务（各自思考/工具轨迹完整展示在子任务块内，父模型只看最终回复）；受 .env 的 SUB_AGENT_* 限额控制",
     },
     {
       name: WRITE_FILE_TOOL_NAME,
@@ -330,6 +335,7 @@
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.TODO_TOOL_NAME = TODO_TOOL_NAME;
   App.ASK_USER_TOOL_NAME = ASK_USER_TOOL_NAME;
+  App.SUB_AGENT_TOOL_NAME = SUB_AGENT_TOOL_NAME;
   App.BUILTIN_SERVER_KEY = BUILTIN_SERVER_KEY;
   App.BUILTIN_TOOLS = BUILTIN_TOOLS;
   App.isBuiltinToolName = isBuiltinToolName;

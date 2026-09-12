@@ -37,7 +37,7 @@
     "upload_id": "本会话上传目录名（history_files/upload/ 下），删除会话时连带清理",
     "work_dir": "会话独立工作目录覆盖值（POST /chat_config/work_dir 写入）；null/缺省表示未设置，跟随全局默认 DEFAULT_CHAT_WORK_DIR。生成任务开始时按『会话覆盖 → 全局默认 → 进程 cwd』解析并 chdir；目录失效回退默认并向前端发 warning。clear_chat_history 保留本字段",
     "tool_selection": "会话独立工具选择覆盖值（携带 session_id 的 POST /chat_config/tool_selection 写入）；结构与 mcp_servers.json 的 inputs 键一致（{服务名: [工具名]}）。null/缺省/空表示未覆盖，跟随全局默认 inputs。请求未携带 tool_names（null）时生成流程按『会话覆盖 → 全局默认』解析为本轮工具。clear_chat_history 保留本字段",
-    "model_selection": "会话独立模型选择覆盖值（携带 session_id 的 POST /chat_config/models/select 写入，clear=true 清除）；结构为 {角色: {ownership_name, model_name, parameter, api_type}}，仅存已覆盖的角色。null/缺省/空表示未覆盖，跟随全局默认（models.json 顶层 model_selection）。生成/压缩/参数默认值填充按『会话覆盖 → 全局默认』逐角色解析；覆盖模型失效时回退全局并向前端发 warning。clear_chat_history 保留本字段",
+    "model_selection": "会话独立模型选择覆盖值（携带 session_id 的 POST /chat_config/models/select 写入，clear=true 清除）；结构为 {角色: {ownership_name, model_name, parameter, api_type}}，仅存已覆盖的角色。角色集：chat_model / compaction_model / title_model / sub_agent_model。null/缺省/空表示未覆盖，跟随全局默认（models.json 顶层 model_selection）。生成/压缩/子任务/参数默认值填充按『会话覆盖 → 全局默认』逐角色解析；覆盖模型失效时回退全局并向前端发 warning。sub_agent_model 未配置时子智能体继承聊天模型（ambient 会话覆盖经 asyncio 上下文自动传递）。clear_chat_history 保留本字段",
     "context_summary": "null 或跨轮累计摘要状态，结构见下方 context_summary模板",
     "compress_usage": "全部压缩模型调用的 usage 累计（含 compression_count 与 last 两个字段）",
     "_history_compress_usage": "跨轮历史压缩单独的 usage 累计（已并入 compress_usage，用于区分统计口径）",
@@ -168,6 +168,98 @@
         "reason": "task_interrupted",
         "timestamp": "YYYY-MM-DD HH:MM:SS"
       },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_agent_id": "main",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "start",
+        "task": "子任务描述（自包含：目标/路径/已有结论/验收标准）",
+        "todo": [
+          { "content": "...", "status": "pending | in_progress | done" }
+        ],
+        "tools": ["search_files", "read_file"],
+        "rounds_limit": 40,
+        "timeout_seconds": 900
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_agent_id": "main",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "model_call",
+        "seq": 1,
+        "reasoning_content": "子任务模型思考（原文全量）...",
+        "content": "子任务正文...",
+        "tool_calls": [
+          {
+            "id": "call_child_...",
+            "type": "function",
+            "function": { "name": "...", "arguments": "{...}" }
+          }
+        ]
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "tool_start",
+        "seq": 1,
+        "tool_call_id": "call_child_...",
+        "tool_name": "...",
+        "arguments": "{...}"
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "tool_result",
+        "seq": 1,
+        "tool_call_id": "call_child_...",
+        "tool_name": "...",
+        "arguments": "{...}",
+        "result": "...",
+        "oversized": false,
+        "oversized_estimated_tokens": 0
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "todo",
+        "todos": [
+          { "content": "...", "status": "pending | in_progress | done" }
+        ]
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "event": "sub_agent",
+        "agent_id": "agent_1a2b3c4d",
+        "parent_agent_id": "main",
+        "parent_tool_call_id": "call_...",
+        "agent_index": 0,
+        "phase": "done",
+        "status": "done | error | stopped | interrupted | timeout | max_rounds",
+        "final_reply": "子任务最终回复（返回父智能体的文本）",
+        "rounds": 2,
+        "usage_total": {
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0
+        },
+        "error": null,
+        "ended_at": "YYYY-MM-DD HH:MM:SS"
+      },
       { "timestamp": "YYYY-MM-DD HH:MM:SS", "role": "user", "content": "停止任务" },
       {
         "timestamp": "YYYY-MM-DD HH:MM:SS",
@@ -195,12 +287,22 @@
   },
   "_chat_round字段备注": {
     "question": "本轮原始用户问题（多模态消息取纯文本部件，不含媒体占位符；'停止任务'不作为问题）",
-    "events": "时间顺序事件流；role=user 的第一条非'停止任务'消息即问题；assistant 的 done/error 为收尾标记；role=tool 的数量是单轮压缩游标的计数基准",
+    "events": "时间顺序事件流；role=user 的第一条非'停止任务'消息即问题；assistant 的 done/error 为收尾标记；role=tool 的数量是单轮压缩游标的计数基准（sub_agent 事件不带 role，不参与该计数）",
     "content(media://)": "消息落盘时媒体保持 media:// 引用不膨胀；仅发送上游前解析为 data URL / base64",
     "context_compaction(round)": "单轮工具轨迹压缩事件，写入本轮 events；delta 增量帧仅实时 SSE 推送、不落盘",
     "compress_index": "已纳入摘要的工具结果数量（按 role=tool 计数，不是 events 下标）；历史重建时跳过游标之前的工具轨迹",
     "status(interrupted)": "进程重启后由 .pending 检查点恢复的未收尾轮次",
     "旧版兼容字段": "导入/旧记录可能带顶层 compress_content / compress_index / compress_blocks / compress_usage，加载时兼容读取；新格式只写 events"
+  },
+  "sub_agent事件块备注": {
+    "用途": "父智能体经内置 sub_agent 工具派发的子任务全轨迹块（独立上下文的精简 Agent 循环）。写入当前 chat_round.events 内，按 agent_id 聚合；前端渲染为独立子任务块",
+    "agent_id": "子智能体实例 ID（agent_<8位hex>），轮内唯一；一次工具调用 ≠ 一个 Agent 实例，身份与 parent_tool_call_id 分离（为 V2 嵌套预留 parent_agent_id 层级）",
+    "parent_tool_call_id": "父级 assistant.tool_calls 中该次 sub_agent 调用的 id；子事件归属与父级工具气泡关联都靠它",
+    "phase": "start（任务/预置计划/工具白名单/上限） | model_call（seq + 思考/正文/工具调用轨迹） | tool_start | tool_result | todo（子任务私有计划） | done（状态/最终回复/轮次/子任务 usage）",
+    "delta/heartbeat": "仅实时 SSE 推流（reasoning_delta/content_delta、保活心跳），JSONL 白名单不含，不落盘",
+    "可见性": "子任务的思考/正文/工具轨迹/ todo 只在本事件块内；父级上下文只有 assistant(tool_calls=sub_agent) + role=tool(最终回复文本)。历史重建与压缩文本渲染会排除这些无 role 条目，绝不进入父级模型上下文",
+    "收尾状态": "status 白名单 done|error|stopped|interrupted|timeout|max_rounds；父级停止/进程重启时子事件由父轮兜底补写（stopped/interrupted），块内无 done 事件=中断遗留，前端按 interrupted 渲染",
+    "usage_total": "子任务自身模型调用的 token 累计（块内分桶展示）；父轮 usage_total 另行合并统计"
   },
   "session级压缩事件行": [
     {

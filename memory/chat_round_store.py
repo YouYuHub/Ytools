@@ -13,6 +13,10 @@ from memory.file_memory import content_part_to_text  # 多模态消息的文本�
 _VALID_ROUND_STATUSES = {"done", "error", "stopped", "interrupted"}
 # 合法事件角色：与历史文件中实际出现的 role 字段保持一致
 _VALID_EVENT_ROLES = {"user", "assistant", "tool", "system"}
+# sub_agent 事件 phase 白名单（docs/sub_agent_v1.md §7.1）；
+# delta / heartbeat 仅实时 SSE 推送、不落盘，故不在落盘白名单中
+_VALID_SUB_AGENT_PHASES = {"start", "model_call", "tool_start", "tool_result", "todo", "done"}
+_VALID_SUB_AGENT_STATUSES = {"done", "error", "stopped", "interrupted", "timeout", "max_rounds"}
 
 
 def merge_usage_dict(total: dict[str, Any], delta: dict[str, Any]) -> None:
@@ -254,6 +258,18 @@ class ChatRoundStore:
                 self.update_compression_usage(usage)
         return True
 
+    def record_sub_agent_event(self, record: dict[str, Any]) -> bool:
+        """把 sub_agent 子任务事件追加到当前 `chat_round.events`。
+
+        校验规则见 `_is_valid_sub_agent_event`；子任务只存在于父轮进行中，
+        无 pending round 时静默忽略（轮次收尾后到达的事件无法归属）。
+        本方法不触发任何收尾逻辑：子任务事件永远不改变父轮次状态机。
+        """
+        if self.pending_round is None or not _is_valid_event(record):
+            return False
+        self.pending_round["events"].append(json.loads(json.dumps(record, ensure_ascii=False)))
+        return True
+
     def finalize_round(self, status: str) -> dict[str, Any] | None:
         if self.pending_round is None:
             return None
@@ -269,12 +285,69 @@ class ChatRoundStore:
         self.pending_round = None
 
 
+def _is_valid_sub_agent_event(event: dict[str, Any]) -> bool:
+    """校验 sub_agent 事件条目（docs/sub_agent_v1.md §7.1）。
+
+    必须携带：agent_id（agent_ 前缀字符串）、parent_tool_call_id（父级
+    tool_call id）、phase ∈ 白名单；phase 细分校验：
+    - start：task 非空字符串；
+    - model_call：至少携带 reasoning_content / content / tool_calls 之一；
+    - tool_result：tool_call_id + tool_name + result；
+    - todo：todos 为数组；
+    - done：status ∈ _VALID_SUB_AGENT_STATUSES。
+    """
+    if not isinstance(event, dict):
+        return False
+    if event.get("event") != "sub_agent":
+        return False
+    agent_id = event.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id.startswith("agent_") or not agent_id.strip():
+        return False
+    parent_call_id = event.get("parent_tool_call_id")
+    if not isinstance(parent_call_id, str) or not parent_call_id.strip():
+        return False
+    phase = event.get("phase")
+    if phase not in _VALID_SUB_AGENT_PHASES:
+        return False
+    if phase == "start":
+        task = event.get("task")
+        if not isinstance(task, str) or not task.strip():
+            return False
+    elif phase == "model_call":
+        if not (
+            isinstance(event.get("reasoning_content"), str)
+            or isinstance(event.get("content"), str)
+            or isinstance(event.get("tool_calls"), list)
+        ):
+            return False
+    elif phase == "tool_result":
+        if not (
+            isinstance(event.get("tool_call_id"), str) and event.get("tool_call_id").strip()
+            and isinstance(event.get("tool_name"), str) and event.get("tool_name").strip()
+        ):
+            return False
+        if "result" not in event:
+            return False
+    elif phase == "todo":
+        if not isinstance(event.get("todos"), list):
+            return False
+    elif phase == "done":
+        if event.get("status") not in _VALID_SUB_AGENT_STATUSES:
+            return False
+        if not isinstance(event.get("final_reply"), str):
+            return False
+    return True
+
+
 def _is_valid_event(event: Any) -> bool:
     """判断单条事件是否具备基本结构。允许事件缺少 timestamp（写入时回填）。"""
     if not isinstance(event, dict):
         return False
     role = event.get("role")
     if not isinstance(role, str) or role not in _VALID_EVENT_ROLES:
+        # sub_agent 事件条目不带 role 字段（区别于消息类事件），单独校验
+        if event.get("event") == "sub_agent":
+            return _is_valid_sub_agent_event(event)
         return False
     if event.get("event") == "context_compaction":
         return (

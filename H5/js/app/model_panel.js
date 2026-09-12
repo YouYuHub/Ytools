@@ -241,7 +241,11 @@
     } else {
       scopeTip = "当前跟随全局默认，确定后保存为本会话独立选择";
     }
-    enhanceHint.textContent = base + "；" + scopeTip;
+    let roleTip = "";
+    if (state.activeModelRole === "sub_agent_model") {
+      roleTip = "；未选择时子智能体继承聊天模型";
+    }
+    enhanceHint.textContent = base + "；" + scopeTip + roleTip;
     // 仅会话内且已设置覆盖时提供"清除会话覆盖"入口
     enhanceClearOverride.classList.toggle(
       "hidden",

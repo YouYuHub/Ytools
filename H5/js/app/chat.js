@@ -64,6 +64,11 @@
     let hasStage = false;
     const toolBlocks = [];
     let activeToolBlocks = null;
+    // 子任务块（sub_agent）：按父级 tool_call id / agent_id 双键索引，同一块
+    // 对象同时登记（tool_start 预建 → start 事件续用 → tool_return 收尾）
+    const agentByCall = new Map();
+    const agentById = new Map();
+    const agentBlocksAll = [];
     const activeCompactions = {}; // scope -> [尚未完成的压缩 ui]
     let usageLine = null;
     // 一个模型 completion 可能在多个 SSE 帧重复携带 usage（甚至是逐步增长的快照）。
@@ -131,6 +136,37 @@
       return true;
     }
 
+    // ---------- 子任务块（sub_agent）事件路由 ----------
+    // 同一块对象双键登记：父级 tool_start 只带 tool_call id（预建占位），
+    // 子事件带 agent_id（start 到达后绑定）。done 后保留在索引中，
+    // tool_return(sub_agent) 到达时据此追加"最终回复已返回父智能体"引用条。
+    function handleSubAgentEvent(data) {
+      let block = null;
+      if (data.agent_id && agentById.has(data.agent_id)) block = agentById.get(data.agent_id);
+      if (!block && data.parent_tool_call_id && agentByCall.has(data.parent_tool_call_id)) {
+        block = agentByCall.get(data.parent_tool_call_id);
+      }
+      if (!block) {
+        block = { ui: App.buildSubAgentBlock(), callId: "", agentId: "", done: false };
+        agentBlocksAll.push(block);
+        hasStage = true;
+        appendStage(block.ui.wrap);
+      }
+      if (data.parent_tool_call_id && !block.callId) {
+        block.callId = data.parent_tool_call_id;
+        agentByCall.set(data.parent_tool_call_id, block);
+      } else if (data.parent_tool_call_id && !agentByCall.has(data.parent_tool_call_id)) {
+        agentByCall.set(data.parent_tool_call_id, block);
+      }
+      if (data.agent_id && !block.agentId) {
+        block.agentId = data.agent_id;
+        agentById.set(data.agent_id, block);
+      }
+      block.ui.applyEvent(data);
+      if (data.phase === "done") block.done = true;
+      if (state.sessionId === sessionId) stickToBottom();
+    }
+
     function handle(evt) {
       if (evt.type === "done") return;
       const data = evt.data || {};
@@ -176,6 +212,12 @@
         appendStage(askCard);
         App.refreshAskBlockStates();
         if (state.sessionId === sessionId) App.openAskModal(questions, askCard);
+        return;
+      }
+      if (data.event === "sub_agent") {
+        // 子任务事件：按 agent_id/父级 tool_call id 聚合到独立块
+        //（思考/正文/工具轨迹/todo 都在块内，不进入父级通用渲染管线）
+        handleSubAgentEvent(data);
         return;
       }
       const rawCompaction = data.event === "context_compaction"
@@ -347,6 +389,19 @@
       // 工具开始执行：参数已完整、后端正在调用（等待结果阶段的可感知状态）
       if (data.tool_start && data.tool_start.function_name) {
         const ts = data.tool_start;
+        // 子任务派发：预建子任务块（占位），后续 sub_agent 事件续用同一块；
+        // 不进入普通工具气泡渲染
+        if (ts.function_name === "sub_agent") {
+          const key = ts.tool_call_id || "";
+          if (!key || !agentByCall.has(key)) {
+            const block = { ui: App.buildSubAgentBlock(), callId: key, agentId: "", done: false };
+            if (key) agentByCall.set(key, block);
+            agentBlocksAll.push(block);
+            hasStage = true;
+            appendStage(block.ui.wrap);
+          }
+          return;
+        }
         const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
         let tb = activeBlocks.find(function (t) { return t && !t.done && t.name === ts.function_name; })
           || activeBlocks.find(function (t) { return t && !t.done; });
@@ -362,6 +417,29 @@
       // 工具结果：填充到对应块
       if (data.tool_return && data.tool_return.function_name) {
         const tr = data.tool_return;
+        // 子任务最终回复：轨迹已由 sub_agent 事件渲染到子任务块，
+        // 此处仅在块尾追加引用条；无块可挂时降级为普通工具块
+        if (tr.function_name === "sub_agent") {
+          const info = tr.sub_agent || null;
+          let block = info && info.agent_id ? agentById.get(info.agent_id) : null;
+          if (block) {
+            block.ui.markReturned(info);
+            block.done = true;
+          } else {
+            const tb = { ui: App.buildToolBlock("sub_agent"), argsText: "", done: false };
+            toolBlocks.push(tb);
+            tb.ui.setInput(FormatUtils.prettyJson(tr.arguments));
+            tb.ui.setOutput(typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2));
+            tb.ui.finish();
+            tb.done = true;
+            hasStage = true;
+            appendStage(tb.ui.wrap);
+          }
+          if (state.sessionId === sessionId) {
+            App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
+          }
+          return;
+        }
         const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
         let tb = activeBlocks.find(function (t) { return t && !t.done && t.name === tr.function_name; })
           || activeBlocks.find(function (t) { return t && !t.done; });
@@ -405,6 +483,11 @@
           think.classList.remove("is-streaming");
         });
         toolBlocks.forEach(function (tb) { if (tb && !tb.done) tb.ui.finish(); });
+        // 流结束时仍未收到 done 的子任务块：标记中断态（父级停止/断流时
+        // 后端通常会补写 stopped/interrupted，这里只是前端本地兜底）
+        agentBlocksAll.forEach(function (block) {
+          if (block && !block.done) block.ui.finalizeInterrupted();
+        });
         return {
           hasStage: hasStage,
           roundUsage: roundUsageAcc,

@@ -145,13 +145,17 @@ def build_media_tag_prompt() -> str:
     )
 
 
-def build_sys_prompt() -> str:
+def build_sys_prompt(include_media_prompt: bool = True) -> str:
     """构建系统提示词。
 
     思考过程/历史工具结果的回传长度提示只在配置为正数（截断回传）时出现：
     截断会改变模型看到的内容，必须明确告知边界；全量回传与不回传时不提示。
     MCP 工具执行超时为实时配置（用户可在聊天设置中修改），始终告知模型，
     便于其把长耗时操作拆分/分批，避免单次调用撞上超时被中止。
+
+    include_media_prompt=False 用于子智能体（build_sub_agent_system_text）：
+    媒体伪标签/SVG/KaTeX/Mermaid/Canvas 渲染说明面向用户界面，子任务回复
+    受众是父模型，整段去除。
     """
     reasoning_limit = _load_reasoning_return_max_length()
     tool_result_limit = parse_return_length(
@@ -188,7 +192,7 @@ def build_sys_prompt() -> str:
         notes.append(f"你的思考过程（reasoning_content）只会保留最后 {reasoning_limit} 字符。")
     # reasoning_limit <= 0：完整回传或不回传，无需提示
     numbered_notes = "\n".join(f"{index}、{note}" for index, note in enumerate(notes, start=1))
-    media_prompt = build_media_tag_prompt()
+    media_prompt = build_media_tag_prompt() if include_media_prompt else ""
     return (
         "当前系统已安装基础 py 环境。\n"
         "程序所有工具支持都并发调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
@@ -212,4 +216,48 @@ def build_runtime_system_text(work_dir: str | None = None) -> str:
     return (
         f"当前工作路径为<{_format_tool_result(dir_text)}>\n"
         + build_sys_prompt()
+    )
+
+
+_SUB_AGENT_PERSONA = (
+    "你是一个子智能体（sub agent），被父智能体（Ytools 主 Agent）调度来独立完成一个子任务。"
+    "父智能体看不到你的思考过程与工具轨迹，你的最终回复是它唯一能看到的产出，"
+    "会被作为一次工具调用的结果直接进入父智能体的上下文。\n"
+)
+
+_SUB_AGENT_RULES = (
+    "任务约束：\n"
+    "1、你只服务本次子任务目标，不要尝试联系用户、等待交互或输出面向用户的开场白；\n"
+    "2、无法通过 ask_user 向用户提问（该工具不可用）：遇到必须由用户决定的事项，"
+    "在最终回复中列出阻塞点与所需信息，交给父智能体处理；\n"
+    "3、不要输出媒体伪标签（<image>/<audio>/<video>/<pdf>）、SVG/KaTeX/Mermaid/Canvas "
+    "代码块等富媒体内容——你的回复受众是父智能体（另一个模型），不是用户界面；\n"
+    "4、你的最终回复应写成父智能体可直接引用的结论报告：结论先行，附关键证据/数值、"
+    "涉及文件的绝对路径、未解决事项；不要只描述\"我做了什么\"过程；\n"
+    "5、任务完成或确定无法继续时立即给出最终回复收尾，不要空转；\n"
+    "6、工具由任务派发时给定，只能使用当前可见工具；工具返回 [] 表示空值而不是失败。\n"
+)
+
+
+def build_sub_agent_system_text(work_dir: str | None = None, task: str = "") -> str:
+    """构造子智能体的系统提示（docs/sub_agent_v1.md §6.4）。
+
+    与父级 build_runtime_system_text 的差异：
+    - persona 换成子智能体身份（最终回复 = 交付物）；
+    - 整段去掉 build_media_tag_prompt()（媒体伪标签/SVG/KaTeX/Mermaid/
+      Canvas 渲染说明对子任务无意义，还可能诱导子模型输出父级不需要的格式）；
+    - 追加子任务专属约束（见 _SUB_AGENT_RULES）。
+    其余（工作路径、环境说明、工具规则、回传长度/超时等可变配置说明）与
+    父级同一口径实时求值。
+    """
+    dir_text = work_dir if isinstance(work_dir, str) and work_dir.strip() else get_current_dir()
+    task_block = ""
+    if isinstance(task, str) and task.strip():
+        task_block = f"\n本次子任务目标（由父智能体派发，一切以此为准）：\n{task.strip()}\n"
+    return (
+        _SUB_AGENT_PERSONA
+        + f"当前工作路径为<{_format_tool_result(dir_text)}>\n"
+        + build_sys_prompt(include_media_prompt=False)
+        + _SUB_AGENT_RULES
+        + task_block
     )

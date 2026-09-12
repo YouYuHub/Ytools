@@ -15,7 +15,7 @@
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
-    toolStreamTimeoutSeconds, networkRetryMaxAttempts, keepRounds, triggerRatio, summaryBudgetRatio,
+    networkRetryMaxAttempts, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
     oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint
   } = App;
 
@@ -474,14 +474,16 @@
       API.getHistoryCompactionConfig(state.sessionId).catch(function () { return null; }),
       API.getMcpToolConfig().catch(function () { return null; }),
       API.getNetworkRetryConfig().catch(function () { return null; }),
+      API.getToolConcurrencyConfig().catch(function () { return null; }),
     ]);
     chatSettingsConfirm.disabled = false;
     const ctx = results[0];
     const comp = results[1];
     const mcp = results[2];
     const retry = results[3];
+    const conc = results[4];
     const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, comp && comp.defaults || {},
-      mcp && mcp.defaults || {}, retry && retry.defaults || {});
+      mcp && mcp.defaults || {}, retry && retry.defaults || {}, conc && conc.defaults || {});
     if (ctx && ctx.defaults) {
       Object.assign(defaults, ctx.defaults);
     }
@@ -491,21 +493,24 @@
     toolResultMaxLength.value = ctx && ctx.tool_result_max_length != null ? ctx.tool_result_max_length : defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = mcp && mcp.call_timeout_seconds != null
       ? mcp.call_timeout_seconds : defaults.call_timeout_seconds;
-    toolStreamTimeoutSeconds.value = mcp && mcp.stream_timeout_seconds != null
-      ? mcp.stream_timeout_seconds : defaults.stream_timeout_seconds;
     networkRetryMaxAttempts.value = retry && retry.max_attempts != null
       ? retry.max_attempts : defaults.network_retry_max_attempts;
+    mcpToolWorkers.value = conc && conc.mcp_tool_workers != null
+      ? conc.mcp_tool_workers : defaults.mcp_tool_workers;
+    subAgentMaxConcurrent.value = conc && conc.sub_agent_max_concurrent != null
+      ? conc.sub_agent_max_concurrent : defaults.sub_agent_max_concurrent;
     keepRounds.value = comp && comp.keep_rounds != null ? comp.keep_rounds : defaults.keep_rounds;
     triggerRatio.value = comp && comp.trigger_ratio != null ? comp.trigger_ratio : defaults.trigger_ratio;
     summaryBudgetRatio.value = comp && comp.summary_budget_ratio != null ? comp.summary_budget_ratio : defaults.summary_budget_ratio;
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
     renderEffectiveThresholdHint(comp);
-    if (!ctx || !comp || !mcp || !retry) {
+    if (!ctx || !comp || !mcp || !retry || !conc) {
       toast((ctx ? "" : "回传长度配置加载失败；") +
         (comp ? "" : "压缩策略配置加载失败；") +
         (mcp ? "" : "MCP 工具超时配置加载失败；") +
-        (retry ? "" : "网络重试配置加载失败"));
+        (retry ? "" : "网络重试配置加载失败；") +
+        (conc ? "" : "工具并发配置加载失败"));
     }
   }
 
@@ -543,8 +548,9 @@
     reasoningMaxLength.value = defaults.reasoning_max_length;
     toolResultMaxLength.value = defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = defaults.call_timeout_seconds;
-    toolStreamTimeoutSeconds.value = defaults.stream_timeout_seconds;
     networkRetryMaxAttempts.value = defaults.network_retry_max_attempts;
+    mcpToolWorkers.value = defaults.mcp_tool_workers;
+    subAgentMaxConcurrent.value = defaults.sub_agent_max_concurrent;
     keepRounds.value = defaults.keep_rounds;
     triggerRatio.value = defaults.trigger_ratio;
     summaryBudgetRatio.value = defaults.summary_budget_ratio;
@@ -559,16 +565,18 @@
   // - 回传长度：任意整数（0=不回传，负数=全部回传，正数=截断）
   // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
-  // - 工具执行超时/工具调用流超时/网络重试次数：>=0（0=不限制）
+  // - 工具执行超时/网络重试次数：>=0（0=不限制）
+  // - 工具并发执行两项：>=1
   // - 触发比例/摘要预算比例/连续拒绝上限：>0
-  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig) {
+  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, concConfig) {
     const isNum = function (v) { return v != null && Number.isFinite(v); };
     const rows = [
       ["思考过程回传长度", ctxConfig.reasoning_max_length, function (v) { return isNum(v); }],
       ["工具结果回传长度", ctxConfig.tool_result_max_length, function (v) { return isNum(v); }],
       ["工具执行超时", mcpConfig.call_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
-      ["工具调用流超时", mcpConfig.stream_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
       ["网络失败重试次数", retryConfig.max_attempts, function (v) { return isNum(v) && v >= 0; }],
+      ["MCP 工具并发线程数", concConfig.mcp_tool_workers, function (v) { return isNum(v) && v >= 1; }],
+      ["子智能体并发上限", concConfig.sub_agent_max_concurrent, function (v) { return isNum(v) && v >= 1; }],
       ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
       ["触发比例", compConfig.trigger_ratio, function (v) { return isNum(v) && v > 0; }],
       ["摘要预算比例", compConfig.summary_budget_ratio, function (v) { return isNum(v) && v > 0; }],
@@ -592,12 +600,15 @@
     };
     const mcpConfig = {
       call_timeout_seconds: readSettingNumber(toolCallTimeoutSeconds),
-      stream_timeout_seconds: readSettingNumber(toolStreamTimeoutSeconds),
     };
     const retryConfig = {
       max_attempts: readSettingNumber(networkRetryMaxAttempts),
     };
-    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig);
+    const concConfig = {
+      mcp_tool_workers: readSettingNumber(mcpToolWorkers),
+      sub_agent_max_concurrent: readSettingNumber(subAgentMaxConcurrent),
+    };
+    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, concConfig);
     if (invalid.length) {
       toast("请填写有效数值：" + invalid.join("、"));
       return;
@@ -608,6 +619,7 @@
       API.updateHistoryCompactionConfig(compConfig, state.sessionId),
       API.updateMcpToolConfig(mcpConfig),
       API.updateNetworkRetryConfig(retryConfig),
+      API.updateToolConcurrencyConfig(concConfig),
     ]);
     chatSettingsConfirm.disabled = false;
     const failed = results.filter(function (r) { return r.status === "rejected"; });

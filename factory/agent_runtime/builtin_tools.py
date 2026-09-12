@@ -21,13 +21,14 @@ EDIT_FILE_NAME = "edit_file"
 READ_FILE_NAME = "read_file"
 SEARCH_FILES_NAME = "search_files"
 READ_MEDIA_NAME = "read_media"
+SUB_AGENT_TOOL_NAME = "sub_agent"
 # 内置工具在工具选择（_meta.tool_selection / mcp_servers.json inputs）中的伪服务键：
 # 前端把它作为“内置工具”分组渲染在工具模态框首位，保存/加载与 MCP 工具走同一链路
 BUILTIN_TOOL_SERVER_KEY = "__builtin__"
 # 工具选择中允许出现的内置工具名（check_tool_exists 由后端按外部工具自动注入，不开放手选）
 SELECTABLE_BUILTIN_TOOL_NAMES = (
     TODO_TOOL_NAME, ASK_USER_TOOL_NAME, WRITE_FILE_NAME, EDIT_FILE_NAME,
-    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME,
+    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME, SUB_AGENT_TOOL_NAME,
 )
 # 前端回答 ask_user 提问时的消息前缀（前端 app.js 中同名拼接，需保持一致）；
 # 后端据此识别"覆盖式重新回答"：截断最新提问轮之后的旧回答轮
@@ -60,10 +61,11 @@ def inject_builtin_tools(
     include_read_file: bool = False,
     include_search_files: bool = False,
     include_read_media: bool = False,
+    include_sub_agent: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """注入本地内置工具：check_tool_exists（选了外部工具时）、todo_write、
-    ask_user、write_file、edit_file、read_file、search_files 与 read_media
-    （用户在工具选择中勾选时）。"""
+    ask_user、write_file、edit_file、read_file、search_files、read_media
+    与 sub_agent（用户在工具选择中勾选时）。"""
     tools = list(selected_tools)
     servers = dict(selected_tool_servers)
     if selected_tools and CHECK_TOOL_EXISTS_NAME not in servers:
@@ -91,6 +93,9 @@ def inject_builtin_tools(
     if include_read_media and READ_MEDIA_NAME not in servers:
         tools.append(READ_MEDIA_TOOL_DEFINITION)
         servers[READ_MEDIA_NAME] = BUILTIN_TOOL_SERVER_KEY
+    if include_sub_agent and SUB_AGENT_TOOL_NAME not in servers:
+        tools.append(SUB_AGENT_TOOL_DEFINITION)
+        servers[SUB_AGENT_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
     return tools, servers
 
 
@@ -98,7 +103,7 @@ def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in (
         CHECK_TOOL_EXISTS_NAME, TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
         WRITE_FILE_NAME, EDIT_FILE_NAME, READ_FILE_NAME, SEARCH_FILES_NAME,
-        READ_MEDIA_NAME,
+        READ_MEDIA_NAME, SUB_AGENT_TOOL_NAME,
     )
 
 
@@ -414,6 +419,129 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
             "multiple": bool(entry.get("multiple")),
         })
     return questions
+
+
+# --------------------------- sub_agent：子智能体派发 ---------------------------
+
+# 派发参数长度上限（防超大参数直接进上下文）
+_SUB_AGENT_TASK_MAX_CHARS = 20_000
+
+SUB_AGENT_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": SUB_AGENT_TOOL_NAME,
+        "description": (
+            "派发子任务给一个子智能体（sub agent）执行，并在同一回复中并发派发多个相互独立的子任务。"
+            "子智能体拥有独立的上下文与与你相同的一套工具（MCP 工具、内置文件读写/搜索等），"
+            "会独立完成该子任务并只把最终回复返回给你——它的思考过程、工具轨迹不会进入你的上下文。"
+            "适用场景：可并行的独立调研/检索/批量处理子任务；需要大量中间工具调用而你只关心结论的部分。"
+            "不适用：单次工具调用就能完成的事（直接调用该工具）；需要用户交互的决策（用 ask_user）。"
+            "关键契约：1. task 必须自包含——子智能体看不到对话历史、上传文件内容与你掌握的任何上下文，"
+            "目标、涉及文件/目录的绝对路径、已有事实与结论、约束（如'只读不改'）、期望的回复内容"
+            "（结论+关键证据/数值+文件路径）都必须写进 task；"
+            "2. 你只能通过子智能体的最终回复获取结果，不能与它多轮交互；"
+            "3. 子智能体无法向用户提问，阻塞时它会在回复中说明；"
+            "4. 可选提供 todo 预置子任务计划（元素 {id, content, status}，与 todo_write 同一语义）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "子任务目标（必填，自包含）。必须包含：目标与验收标准、涉及文件/目录的绝对路径、"
+                        "已有事实与结论、执行约束、期望回复的内容结构"
+                    ),
+                },
+                "todo": {
+                    "type": "array",
+                    "description": "可选：为子智能体预置的初始任务计划（每次全量覆盖，最多 20 项）",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "步骤唯一标识"},
+                            "content": {"type": "string", "description": "步骤内容（一句话，≤200 字符）"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "done"],
+                                "description": "pending=待办 in_progress=进行中 done=已完成",
+                            },
+                        },
+                        "required": ["id", "content", "status"],
+                    },
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+# 子智能体侧的 ask_user 占位定义：同名同参 schema，但执行时返回明确错误
+# （子任务没有用户通道，避免子模型反复尝试向用户提问）。
+ASK_USER_PLACEHOLDER_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": ASK_USER_TOOL_NAME,
+        "description": (
+            "不可用：你是被父智能体调度的子智能体，没有与用户交互的通道，无法通过本工具提问。"
+            "遇到必须由用户决定的事项时，请在最终回复中明确说明阻塞点与所需信息，交给父智能体处理。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "无效参数（占位定义，仅用于拦截）",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["questions"],
+        },
+    },
+}
+
+
+def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
+    """校验 sub_agent 的 task 参数；返回 (规整后的 task, 错误原因)。
+
+    容错：task 传成 {text/content/task: ...} 对象或 JSON 字符串时自动提取。
+    """
+    if isinstance(raw, str):
+        task_text = raw.strip()
+    elif isinstance(raw, dict):
+        for key in ("text", "content", "task"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                task_text = value.strip()
+                break
+        else:
+            task_text = ""
+    else:
+        task_text = str(raw or "").strip()
+    if not task_text:
+        return None, "task 参数无效：需要一段非空的子任务描述（自包含目标、路径、约束与期望回复）"
+    if len(task_text) > _SUB_AGENT_TASK_MAX_CHARS:
+        return None, (
+            f"task 超长（{len(task_text)} > {_SUB_AGENT_TASK_MAX_CHARS} 字符）；"
+            "请精简子任务描述，或拆分为多个子任务"
+        )
+    return task_text, None
+
+
+def execute_ask_user_placeholder(tool_args: dict[str, Any]) -> dict[str, Any]:
+    """子智能体侧 ask_user 占位执行：永远返回不可用说明（不阻塞、不提问）。"""
+    questions = normalize_ask_questions(
+        tool_args.get("questions") if isinstance(tool_args, dict) else None)
+    return {
+        "status": "unavailable_in_sub_agent",
+        "message": (
+            "子智能体无法向用户提问（没有用户交互通道）。"
+            "请基于已有信息继续决策；确实需要用户输入的事项，请在最终回复中"
+            "列出阻塞点与所需信息，由父智能体决定是否向用户转达。"
+        ),
+        "questions": questions or [],
+    }
 
 
 # ------------------- write_file / edit_file：内置文件编辑工具 -------------------

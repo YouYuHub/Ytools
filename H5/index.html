@@ -214,6 +214,7 @@
                                 <button class="model-tab active" type="button" data-role="chat_model">聊天模型</button>
                                 <button class="model-tab" type="button" data-role="compaction_model">压缩模型</button>
                                 <button class="model-tab" type="button" data-role="title_model">标题模型</button>
+                                <button class="model-tab" type="button" data-role="sub_agent_model">子智能体</button>
                             </div>
                             <div class="enhance-body">
                                 <label class="enhance-field">
@@ -479,12 +480,16 @@
                         <input id="toolCallTimeoutSeconds" type="number" min="0" step="1">
                     </label>
                     <label class="chat-setting-field">
-                        <span>工具调用流超时（秒）<small>模型输出工具调用期间超过该秒数无响应（服务商接口卡死）即放弃本次调用并反馈模型继续；0=不限制</small></span>
-                        <input id="toolStreamTimeoutSeconds" type="number" min="0" step="1">
-                    </label>
-                    <label class="chat-setting-field">
                         <span>网络失败重试次数<small>模型请求连续失败达到该次数才终止任务；0=不限制（一直重试）</small></span>
                         <input id="networkRetryMaxAttempts" type="number" min="0" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>MCP 工具并发数<small>同一轮多个工具调用并发执行的线程数（实际并发不超过本轮工具数）</small></span>
+                        <input id="mcpToolWorkers" type="number" min="1" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>子智能体并发上限<small>同一轮最多同时运行的子任务数量，超出的排队执行</small></span>
+                        <input id="subAgentMaxConcurrent" type="number" min="1" step="1">
                     </label>
                 </section>
                 <section class="chat-settings-section">

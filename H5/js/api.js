@@ -272,6 +272,25 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
+   * 获取工具并发执行配置（MCP 工具线程池 + 子智能体并发上限）
+   */
+  function getToolConcurrencyConfig() {
+    return request("/chat_config/tool_concurrency");
+  }
+
+  /**
+   * 更新工具并发执行配置
+   * @param {{mcp_tool_workers: number, sub_agent_max_concurrent: number}} config 两者均 >= 1
+   */
+  function updateToolConcurrencyConfig(config) {
+    return request("/chat_config/tool_concurrency", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
    * 获取模型网络请求失败重试次数配置
    */
   function getNetworkRetryConfig() {
@@ -556,6 +575,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateContextReturnConfig,
     getMcpToolConfig,
     updateMcpToolConfig,
+    getToolConcurrencyConfig,
+    updateToolConcurrencyConfig,
     getNetworkRetryConfig,
     updateNetworkRetryConfig,
     getWorkDirConfig,

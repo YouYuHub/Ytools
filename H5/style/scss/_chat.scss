@@ -230,6 +230,296 @@
   }
 }
 
+// ---------- 子任务块（sub_agent） ----------
+// 父智能体派发的子任务独立块：标题条（#序号·任务摘要·状态徽标）+
+// 可折叠区（任务/计划/思考/正文/工具轨迹/最终回复）。左侧缩进边框
+// 视觉上区分父子层级。
+.agent-block {
+  // 左缩进 18px：宽度同步减去该缩进，避免 100% + 18px 溢出消息区右缘
+  width: calc(100% - 18px);
+  margin: 4px 0 4px 18px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  overflow: hidden;
+  animation: msg-in 0.2s ease;
+
+  .agent-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 38px;
+    padding: 8px 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    text-align: left;
+    transition: background-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+  }
+
+  .agent-icon {
+    display: inline-flex;
+    flex-shrink: 0;
+
+    .icon {
+      width: 15px;
+      height: 15px;
+    }
+  }
+
+  &.is-running .agent-icon {
+    color: var(--text-secondary);
+
+    .icon {
+      animation: spin 1.2s linear infinite;
+    }
+  }
+
+  .agent-title {
+    flex-shrink: 0;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .agent-summary {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+  }
+
+  .agent-badge {
+    flex-shrink: 0;
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--bg-hover);
+    color: var(--text-tertiary);
+    white-space: nowrap;
+  }
+
+  &.is-running .agent-badge {
+    color: var(--text-secondary);
+    border: 1px solid var(--border-strong);
+  }
+
+  // 失败/中断/超时等非成功状态：红色警示
+  &.is-error {
+    border-color: rgba(220, 80, 80, 0.55);
+
+    .agent-title {
+      color: #e07a76;
+    }
+
+    .agent-badge {
+      color: #e07a76;
+      border-color: rgba(220, 80, 80, 0.4);
+    }
+  }
+
+  .agent-chevron {
+    margin-left: auto;
+    flex-shrink: 0;
+    transition: transform 0.15s ease;
+  }
+
+  &.open .agent-chevron {
+    transform: rotate(180deg);
+  }
+
+  .agent-body {
+    display: none;
+    border-top: 1px solid var(--border);
+    padding: 10px 14px 12px;
+  }
+
+  &.open .agent-body {
+    display: block;
+  }
+}
+
+.agent-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin: 8px 0 4px;
+
+  &:first-child {
+    margin-top: 0;
+  }
+
+  &.is-empty {
+    display: none;
+  }
+}
+
+.agent-label-think {
+  color: var(--text-tertiary);
+}
+
+.agent-pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  background: var(--bg-code);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+// 思考区：弱化色（与父级思考块观感一致）
+.agent-think {
+  color: var(--text-tertiary);
+}
+
+// 任务区（start.task 原文）
+.agent-task {
+  color: var(--text);
+}
+
+// 每轮分区
+.agent-round {
+  margin: 6px 0 10px;
+
+  .agent-round-label {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin: 4px 0;
+  }
+
+  .agent-round-divider {
+    border-top: 1px dashed var(--border);
+    margin: 8px 0;
+  }
+}
+
+.agent-content {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  word-break: break-word;
+
+  &.is-empty {
+    display: none;
+  }
+
+  &>*:first-child {
+    margin-top: 0;
+  }
+
+  &>*:last-child {
+    margin-bottom: 0;
+  }
+}
+
+// 轮内工具轨迹行：名称 + 参数 + 结果
+.agent-tool-line {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+
+  &.is-pending .agent-tool-name::after {
+    content: " ·执行中";
+    color: var(--text-tertiary);
+  }
+}
+
+.agent-tool-name {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 3px;
+}
+
+.agent-tool-args {
+  max-height: 160px;
+}
+
+.agent-tool-result {
+  margin-top: 4px;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+  max-height: 200px;
+}
+
+// 子任务计划（todo）
+.agent-todo {
+  margin: 2px 0 4px;
+
+  .agent-todo-item {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+
+    .agent-todo-mark {
+      flex-shrink: 0;
+      width: 14px;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    &.is-done {
+      color: var(--text-tertiary);
+
+      .agent-todo-text {
+        text-decoration: line-through;
+      }
+    }
+
+    &.is-in_progress {
+      color: var(--text);
+    }
+  }
+}
+
+// 最终回复与收尾信息
+.agent-final-reply {
+  color: var(--text);
+}
+
+.agent-usage {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 8px;
+}
+
+.agent-error-detail {
+  font-size: 12px;
+  color: #e08581;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 6px;
+}
+
+// tool_return(sub_agent) 后的引用条：最终回复已返回父智能体
+.agent-returned {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  border-top: 1px solid var(--border);
+  padding: 6px 14px 7px;
+  background: var(--bg-code);
+}
+
 // ---------- 时间戳 / 轮次用量 ----------
 // 注意：stage-time / round-usage 由 JS 直接 append 到 #chatInner，不在 .msg 内
 .msg-time {

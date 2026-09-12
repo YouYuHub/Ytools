@@ -955,6 +955,30 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
 
+    async def add_sub_agent_event(self, payload: dict[str, Any]) -> str:
+        """追加 sub_agent 子任务事件到当前 pending `chat_round.events`。
+
+        调用契约（docs/sub_agent_v1.md §6.3/§7.1）：子任务 Runner 不直接持有
+        chat_memory，事件一律经父循环提供的 emit 回调进入本方法——保证写入
+        发生在事件循环的同步 `_write_guard()` 块内（跨进程文件锁不可重入，
+        禁止工作线程写历史）。timestamp 由本方法补充；追加后同步刷新 `.pending`
+        侧车检查点快照（子任务事件随快照落盘，崩溃恢复不丢轨迹）。
+        """
+        if not isinstance(payload, dict) or payload.get("event") != "sub_agent":
+            return "忽略非法 sub_agent 事件"
+        record = dict(payload)
+        record.setdefault("timestamp", now_str())
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if not self._round_store.record_sub_agent_event(record):
+                return "忽略无进行中轮次或非法 sub_agent 事件"
+            # 检查点快照（与 add_chat_history 相同模式）：仅覆盖侧车文件，
+            # 不做全历史重写；meta 重算开销为零（子事件不带 role，不影响聚合）
+            checkpoint = self._round_store.snapshot_pending_round()
+            if checkpoint is not None:
+                self._write_pending_checkpoint(checkpoint)
+        return "记录成功"
+
     async def find_orphan_compaction_events(self) -> list[dict[str, Any]]:
         """返回未完成的压缩 start 事件（任务中断遗留：有 start、无对应 done/aborted）。
 

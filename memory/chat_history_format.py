@@ -318,6 +318,10 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
     for event in events:
         if not isinstance(event, dict):
             continue
+        # sub_agent 子任务事件条目（event="sub_agent"，不带 role）不属于父轮
+        # 对话，绝不进入父上下文（docs/sub_agent_v1.md §7.2）
+        if event.get("event") == "sub_agent":
+            continue
         if event.get("role") != "assistant":
             continue
         tool_calls = event.get("tool_calls")
@@ -482,6 +486,8 @@ def _round_entry_to_tool_result_context_messages(
             })
             continue
         if role != "assistant":
+            # sub_agent 子任务事件条目（event="sub_agent"，不带 role）不属于
+            # 父轮对话，绝不进入父上下文（docs/sub_agent_v1.md §7.2）
             continue
         if event.get("done") == "[DONE]" or event.get("error") is not None:
             continue
@@ -1023,6 +1029,10 @@ def round_entry_to_compaction_text(round_entry: dict[str, Any]) -> str:
     tool_result_position = 0
     for event in events:
         if not isinstance(event, dict):
+            continue
+        # sub_agent 子任务事件条目不属于父轮对话，压缩输入显式排除
+        # （docs/sub_agent_v1.md §7.2；子轨迹只存块内，不进入父摘要）
+        if event.get("event") == "sub_agent":
             continue
         role = event.get("role")
         if role == "user":

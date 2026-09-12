@@ -225,6 +225,7 @@
       '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
       "</div>" +
       '<div class="md-svg-actions">' +
+      '<button type="button" class="md-svg-btn" data-svg-action="rerender" title="重新渲染此图">↻ 重渲染</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
       "</div>" +
@@ -244,7 +245,8 @@
   // 沙箱 iframe 中执行（运行时与消息交互在 messages.js 的沙箱链路完成）。
   // data-canvas-code 存源码原文；图片视图初始为「未运行」占位，代码视图
   // 与 SVG 控件同款（等宽 + 滚动 + 复制代码）；「截图」按钮在运行后可用，
-  // 复用 SVG 控件的导出链路（canvas 像素直接 toBlob）。
+  // 复用 SVG 控件的导出链路（canvas 像素直接 toBlob）；「重置」清空画布
+  // 回到未运行占位（与「停止」的区别：不移除已执行的判断，纯视觉复位）。
   let canvasWidgetSeq = 0;
   function buildCanvasWidget(code) {
     const esc = escapeHtml;
@@ -262,6 +264,7 @@
       '<div class="md-svg-actions">' +
       '<button type="button" class="md-svg-btn md-canvas-run" data-canvas-action="run">▶ 运行</button>' +
       '<button type="button" class="md-svg-btn" data-canvas-action="shot" title="导出当前画布为 PNG">截图</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="reset" title="清空画布回到未运行状态">↺ 重置</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       "</div>" +
       "</div>" +
@@ -293,6 +296,30 @@
   };
   let mermaidLoadPromise = null;
   let mermaidInitPromise = null;
+
+  // 渲染结果缓存（code → svg 文本）：流式期间整块重建会为同一张图换新控件
+  // id 并重复调度 mermaid.render，命中缓存可直接复用上次 SVG，省去重复解析
+  // （也顺带规避高频并发下 mermaid 内部临时节点的隐患）；仅记成功结果，
+  // 失败不缓存以便重试；上限 40 篇防长会话内存膨胀（近似 LRU：命中挪队尾）。
+  const MERMAID_CACHE_MAX = 40;
+  const mermaidResultCache = new Map();
+
+  function mermaidCacheGet(code) {
+    if (!mermaidResultCache.has(code)) return null;
+    const svg = mermaidResultCache.get(code);
+    mermaidResultCache.delete(code);
+    mermaidResultCache.set(code, svg);
+    return svg;
+  }
+
+  function mermaidCacheSet(code, svg) {
+    if (mermaidResultCache.has(code)) mermaidResultCache.delete(code);
+    mermaidResultCache.set(code, svg);
+    if (mermaidResultCache.size > MERMAID_CACHE_MAX) {
+      const oldest = mermaidResultCache.keys().next().value;
+      mermaidResultCache.delete(oldest);
+    }
+  }
 
   function ensureMermaidLoaded() {
     if (global.mermaid && typeof global.mermaid.render === "function") {
@@ -326,37 +353,57 @@
     return mermaidLoadPromise;
   }
 
+  // 结果 SVG 写入 holder 并做自适应宽度处理（渲染失败态也在这里统一落）
+  function applyMermaidSvg(holder, svg) {
+    holder.innerHTML = svg;
+    const svgEl = holder.querySelector("svg");
+    if (svgEl) {
+      // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
+      // min(100%, 70vh*比例)，高度随比例联动——宽图触 70vh 上限时
+      // 容器跟着收窄，消除 100% 宽 + 居中缩放的两侧透明留白
+      const vb = String(svgEl.getAttribute("viewBox") || "")
+        .trim().split(/[\s,]+/).map(Number);
+      if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
+        Number.isFinite(vb[2]) && Number.isFinite(vb[3])) {
+        // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
+        const ar = Number((vb[2] / vb[3]).toFixed(6));
+        svgEl.style.aspectRatio = String(ar);
+        svgEl.style.width = "min(100%, calc(170vh * " + ar + "))";
+        svgEl.style.maxWidth = "100%";
+        svgEl.style.height = "auto";
+      } else {
+        svgEl.style.maxWidth = "100%";
+        svgEl.style.width = "100%";
+        svgEl.style.height = "auto";
+      }
+      svgEl.style.display = "block";
+      svgEl.style.margin = "0 auto";
+    }
+  }
+
   // mermaid.render 包装：结果 SVG 写入 holder 并做自适应宽度处理；
   // 渲染失败时 holder 显示错误说明并继续抛出（调用方可做状态标记）。
-  function renderMermaidInto(id, code, holder) {
+  // opts.renderId：换用其它 DOM id 调 mermaid.render（流式重建后同一图已换
+  // 新控件 id，重试/重渲染要用当次控件的 id，避免与旧临时节点冲突）；
+  // opts.cachedCode：以该 key 查写结果缓存（同 code 的重建直接复用上次 SVG）。
+  function renderMermaidInto(id, code, holder, opts) {
+    opts = opts || {};
+    const cacheKey = opts.cachedCode || "";
+    if (cacheKey) {
+      const cached = mermaidCacheGet(cacheKey);
+      if (cached) {
+        holder.classList.remove("md-mermaid-error");
+        applyMermaidSvg(holder, cached);
+        return Promise.resolve(true);
+      }
+    }
+    const renderId = opts.renderId || id;
     return ensureMermaidLoaded().then(function () {
-      return Promise.resolve(global.mermaid.render(id, code)).then(function (result) {
+      return Promise.resolve(global.mermaid.render(renderId, code)).then(function (result) {
         const svg = (result && result.svg) || "";
         if (!svg) throw new Error("渲染结果为空");
-        holder.innerHTML = svg;
-        const svgEl = holder.querySelector("svg");
-        if (svgEl) {
-          // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
-          // min(100%, 70vh*比例)，高度随比例联动——宽图触 70vh 上限时
-          // 容器跟着收窄，消除 100% 宽 + 居中缩放的两侧透明留白
-          const vb = String(svgEl.getAttribute("viewBox") || "")
-            .trim().split(/[\s,]+/).map(Number);
-          if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
-            Number.isFinite(vb[2]) && Number.isFinite(vb[3])) {
-            // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
-            const ar = Number((vb[2] / vb[3]).toFixed(6));
-            svgEl.style.aspectRatio = String(ar);
-            svgEl.style.width = "min(100%, calc(170vh * " + ar + "))";
-            svgEl.style.maxWidth = "100%";
-            svgEl.style.height = "auto";
-          } else {
-            svgEl.style.maxWidth = "100%";
-            svgEl.style.width = "100%";
-            svgEl.style.height = "auto";
-          }
-          svgEl.style.display = "block";
-          svgEl.style.margin = "0 auto";
-        }
+        if (cacheKey) mermaidCacheSet(cacheKey, svg);
+        applyMermaidSvg(holder, svg);
         return true;
       });
     }).catch(function (err) {

@@ -65,6 +65,16 @@
         chatInner.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage)));
         return;
       }
+      if (rec.kind === "agentBlock") {
+        // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
+        appendTime(rec.started_at);
+        const agentUi = buildSubAgentBlock();
+        agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit });
+        agentUi.hydrate(rec);
+        agentUi.markReturned(rec);
+        chatInner.appendChild(agentUi.wrap);
+        return;
+      }
       if (rec.kind === "notice") {
         chatInner.appendChild(el("div", "notice-bar", rec.content));
         return;
@@ -648,6 +658,356 @@
     };
   }
 
+  // ---------- 子任务块（sub_agent） ----------
+  // 父智能体经 sub_agent 工具派发的子任务独立渲染块：完整保存思考/正文/
+  // 工具轨迹/todo，按 agent_id 聚合。SSE（start/delta/model_call/tool_start/
+  // tool_result/todo/done）与历史回放（history_parser 聚合的 agentBlock
+  // 记录）共用同一状态机；done 后折叠为摘要态，点击头部可再展开。
+
+  const SUB_AGENT_STATUS_TEXT = {
+    done: "已完成",
+    error: "出错",
+    stopped: "已停止",
+    interrupted: "已中断",
+    timeout: "超时",
+    max_rounds: "轮次上限",
+  };
+  const SUB_AGENT_ERROR_STATUSES = ["error", "stopped", "interrupted", "timeout", "max_rounds"];
+
+  function subAgentTaskSummary(task) {
+    const text = String(task || "");
+    const firstLine = text.split("\n").find(function (line) { return line.trim(); }) || "";
+    return firstLine.trim().slice(0, 80) || "子任务";
+  }
+
+  function buildSubAgentBlock() {
+    const wrap = el("div", "agent-block is-running");
+    const head = el("button", "agent-head");
+    head.type = "button";
+    const iconWrap = el("span", "agent-icon");
+    const title = el("span", "agent-title", "子任务");
+    const summary = el("span", "agent-summary");
+    const badge = el("span", "agent-badge", "运行中");
+    const chevron = el("span", "agent-chevron");
+    chevron.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
+    head.appendChild(iconWrap);
+    head.appendChild(title);
+    head.appendChild(summary);
+    head.appendChild(badge);
+    head.appendChild(chevron);
+    const body = el("div", "agent-body");
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+
+    let taskSummary = "";
+    let todoItems = null;
+    let rounds = [];          // [{seq, el, reasoningPre, contentEl, toolEntries: Map}]
+    let status = "running";
+    let finalReplyText = "";
+    let usageTotal = null;
+    let errorText = "";
+    let roundsLimit = null;
+    let isDone = false;
+
+    head.addEventListener("click", function () {
+      if (!body.children.length) return;
+      wrap.classList.toggle("open");
+    });
+    body.title = "双击折叠";
+    body.addEventListener("dblclick", function () {
+      if (!wrap.classList.contains("open")) return;
+      wrap.classList.remove("open");
+    });
+
+    function appendLabeledPre(labelText, cls) {
+      body.appendChild(el("div", "agent-label", labelText));
+      const pre = el("pre", "agent-pre" + (cls ? " " + cls : ""));
+      body.appendChild(pre);
+      return pre;
+    }
+
+    function autoOpen() {
+      if (!wrap.classList.contains("open")) {
+        wrap.classList.add("open");
+      }
+    }
+
+    function scrollToPreBottom(pre) {
+      if (pre) pre.scrollTop = pre.scrollHeight;
+    }
+
+    /** 状态徽标与块级状态类。 */
+    function applyStatus(nextStatus) {
+      status = nextStatus;
+      isDone = nextStatus !== "running";
+      wrap.classList.remove("is-running", "is-done", "is-error");
+      if (nextStatus === "running") wrap.classList.add("is-running");
+      else if (SUB_AGENT_ERROR_STATUSES.indexOf(nextStatus) >= 0) wrap.classList.add("is-error");
+      else wrap.classList.add("is-done");
+      badge.textContent = nextStatus === "running" ? "运行中" : (SUB_AGENT_STATUS_TEXT[nextStatus] || nextStatus);
+    }
+
+    function findRound(seq) {
+      for (let i = rounds.length - 1; i >= 0; i -= 1) {
+        if (rounds[i].seq === seq) return rounds[i];
+      }
+      return null;
+    }
+
+    /** model_call：新开一轮分区（思考弱化区 + 正文区 + 工具轨迹容器）。 */
+    function beginRound(evt) {
+      let round = findRound(evt.seq);
+      if (!round) {
+        const section = el("div", "agent-round");
+        if (rounds.length) section.appendChild(el("div", "agent-round-divider"));
+        section.appendChild(el("div", "agent-round-label", "第 " + (evt.seq != null ? evt.seq : rounds.length + 1) + " 轮"));
+        const reasoningLabel = el("div", "agent-label agent-label-think", "思考");
+        const reasoningPre = el("pre", "agent-pre agent-think");
+        const contentLabel = el("div", "agent-label", "正文");
+        const contentEl = el("div", "agent-content");
+        const toolsWrap = el("div", "agent-tools");
+        section.appendChild(reasoningLabel);
+        section.appendChild(reasoningPre);
+        section.appendChild(contentLabel);
+        section.appendChild(contentEl);
+        section.appendChild(toolsWrap);
+        round = { seq: evt.seq, el: section, reasoningPre: reasoningPre, contentEl: contentEl, toolsWrap: toolsWrap, toolEntries: new Map() };
+        rounds.push(round);
+        body.appendChild(section);
+      }
+      if (typeof evt.reasoning_content === "string" && evt.reasoning_content) {
+        round.reasoningPre.textContent += evt.reasoning_content;
+        round.reasoningLabel = round.el.querySelector(".agent-label-think");
+      } else {
+        // 无思考内容：隐藏思考占位，避免空标题
+        const thinkLabel = round.el.querySelector(".agent-label-think");
+        if (thinkLabel && !round.reasoningPre.textContent) thinkLabel.classList.add("is-empty");
+      }
+      if (typeof evt.content === "string" && evt.content) {
+        round.contentEl.innerHTML = Markdown.render(evt.content);
+        App.highlightCodeBlocks(round.contentEl);
+        App.updateCodeblockCopyButtons();
+      } else if (!round.contentEl.textContent && !(evt.content == null)) {
+        round.contentEl.classList.add("is-empty");
+      }
+      (evt.tool_calls || []).forEach(function (call) {
+        const fn = call.function || {};
+        addToolLine(round, fn.name || call.name || "tool", fn.arguments || "", null, null);
+      });
+      return round;
+    }
+
+    /** 轮内工具轨迹行（tool_calls 声明 / tool_start / tool_result 共用）。 */
+    function addToolLine(round, name, argsText, resultText, opts) {
+      const line = el("div", "agent-tool-line");
+      const nameEl = el("span", "agent-tool-name", name);
+      const argsPre = el("pre", "agent-pre agent-tool-args");
+      argsPre.textContent = argsText || "";
+      line.appendChild(nameEl);
+      line.appendChild(argsPre);
+      let resultPre = null;
+      if (resultText != null) {
+        resultPre = el("pre", "agent-pre agent-tool-result");
+        resultPre.textContent = resultText;
+        line.appendChild(resultPre);
+      }
+      if (opts && opts.pending) {
+        line.classList.add("is-pending");
+      }
+      round.toolsWrap.appendChild(line);
+      return { line: line, resultPre: resultPre };
+    }
+
+    function findToolEntry(round, toolCallId) {
+      if (toolCallId && round.toolEntries.has(toolCallId)) return round.toolEntries.get(toolCallId);
+      return null;
+    }
+
+    function currentRound() {
+      return rounds.length ? rounds[rounds.length - 1] : null;
+    }
+
+    /** SSE phase=delta：实时追加到最新轮（无轮则建隐式轮）。 */
+    function appendLiveDelta(evt) {
+      let round = currentRoundBySeq(evt);
+      if (!round) {
+        round = beginRound({ seq: null });
+      }
+      const rc = typeof evt.reasoning_delta === "string" ? evt.reasoning_delta : "";
+      const ct = typeof evt.content_delta === "string" ? evt.content_delta : "";
+      if (rc) {
+        round.reasoningPre.textContent += rc;
+        scrollToPreBottom(round.reasoningPre);
+      }
+      if (ct) {
+        round.contentEl.textContent += ct;
+        round.contentEl.scrollTop = round.contentEl.scrollHeight;
+      }
+    }
+
+    function currentRoundBySeq(evt) {
+      if (evt.seq != null) {
+        const match = findRound(evt.seq);
+        if (match) return match;
+      }
+      return rounds.length ? rounds[rounds.length - 1] : null;
+    }
+
+    /** tool_start：执行中占位行（tool_result 到达时回填）。 */
+    function addToolEntry(evt) {
+      const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq });
+      const entry = addToolLine(round, evt.tool_name || "tool", evt.arguments || "", null, { pending: true });
+      if (evt.tool_call_id) round.toolEntries.set(evt.tool_call_id, entry);
+    }
+
+    /** tool_result：按 tool_call_id 回填结果（缺 start 时补建整行）。 */
+    function fillToolEntry(evt) {
+      const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq });
+      let entry = findToolEntry(round, evt.tool_call_id);
+      if (!entry) {
+        entry = addToolLine(round, evt.tool_name || "tool", evt.arguments || "", null, {});
+        if (evt.tool_call_id) round.toolEntries.set(evt.tool_call_id, entry);
+      }
+      entry.line.classList.remove("is-pending");
+      const resultText = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2);
+      if (entry.resultPre) {
+        entry.resultPre.textContent = resultText;
+      } else {
+        entry.resultPre = el("pre", "agent-pre agent-tool-result");
+        entry.resultPre.textContent = resultText;
+        entry.line.appendChild(entry.resultPre);
+      }
+    }
+
+    function renderTodo(items) {
+      if (!items || !items.length) return null;
+      const box = el("div", "agent-todo");
+      items.forEach(function (item) {
+        const row = el("div", "agent-todo-item is-" + (item.status || "pending"));
+        const mark = item.status === "done" ? "✓" : (item.status === "in_progress" ? "○" : "·");
+        row.appendChild(el("span", "agent-todo-mark", mark));
+        row.appendChild(el("span", "agent-todo-text", String(item.content || item.text || "")));
+        box.appendChild(row);
+      });
+      return box;
+    }
+
+    /** start / todo / done 统一重渲染头部与任务/计划/收尾区。 */
+    function renderBody() {
+      // 任务区 + 计划区固定在最前：重建时保留 rounds 区与最终回复区
+      const keep = [];
+      while (body.firstChild) {
+        keep.push(body.removeChild(body.firstChild));
+      }
+      if (taskSummary) {
+        appendLabeledPre("任务", "agent-task").textContent = taskSummary;
+      }
+      if (todoItems && todoItems.length) {
+        body.appendChild(el("div", "agent-label", "计划"));
+        const todoBox = renderTodo(todoItems);
+        if (todoBox) body.appendChild(todoBox);
+      }
+      keep.forEach(function (node) { body.appendChild(node); });
+    }
+
+    function applyDone(evt) {
+      if (isDone) return;
+      if (evt && evt.status) applyStatus(evt.status);
+      finalReplyText = evt && typeof evt.final_reply === "string" ? evt.final_reply : finalReplyText;
+      usageTotal = evt && evt.usage_total && typeof evt.usage_total === "object" ? evt.usage_total : usageTotal;
+      errorText = evt && typeof evt.error === "string" ? evt.error : errorText;
+      // 收尾区：最终回复（受众是父智能体，按纯文本展示）
+      if (finalReplyText) {
+        appendLabeledPre("最终回复 → 父智能体", "agent-final-reply").textContent = finalReplyText;
+      }
+      if (usageTotal && Number(usageTotal.total_tokens) > 0) {
+        body.appendChild(el("div", "agent-usage", FormatUtils.usageText(usageTotal)));
+      }
+      if (errorText) {
+        body.appendChild(el("div", "agent-error-detail", errorText));
+      }
+      // 头部徽标补充轮次（已完成 · 3 轮）
+      if (evt && evt.rounds != null) {
+        badge.textContent = badge.textContent + " · " + evt.rounds + " 轮";
+      }
+      wrap.classList.remove("open"); // done 后折叠为摘要态（可点头部展开）
+      head.setAttribute("aria-expanded", "false");
+    }
+
+    /** tool_return.sub_agent 到达：块尾追加"已返回父智能体"引用条。 */
+    function markReturned(subInfo) {
+      if (wrap.querySelector(".agent-returned")) return;
+      const bar = el("div", "agent-returned", "✔ 最终回复已返回父智能体");
+      wrap.appendChild(bar);
+      const info = subInfo && subInfo.usage_total && Number(subInfo.usage_total.total_tokens) > 0
+        ? " · " + FormatUtils.usageText(subInfo.usage_total)
+        : "";
+      if (info) bar.title = "子任务消耗 " + info;
+    }
+
+    return {
+      wrap: wrap,
+      applyEvent: function (evt) {
+        if (!evt || typeof evt !== "object") return;
+        const phase = evt.phase;
+        if (phase === "start") {
+          taskSummary = subAgentTaskSummary(evt.task);
+          summary.textContent = taskSummary;
+          if (Array.isArray(evt.todo) && evt.todo.length) todoItems = evt.todo;
+          if (evt.rounds_limit != null) roundsLimit = Number(evt.rounds_limit);
+          renderBody();
+          autoOpen();
+          return;
+        }
+        if (phase === "delta") { appendLiveDelta(evt); return; }
+        if (phase === "model_call") { beginRound(evt); return; }
+        if (phase === "tool_start") { addToolEntry(evt); return; }
+        if (phase === "tool_result") { fillToolEntry(evt); return; }
+        if (phase === "todo") {
+          todoItems = Array.isArray(evt.todos) ? evt.todos : todoItems;
+          renderBody();
+          return;
+        }
+        if (phase === "done") { applyDone(evt); return; }
+      },
+      /** 历史回放：entries 逐条重放 + done 聚合字段。 */
+      hydrate: function (record) {
+        if (!record) return;
+        (record.entries || []).forEach(function (entry) {
+          const evt = Object.assign({}, entry, { phase: entry.phase });
+          if (entry.phase === "model_call") {
+            beginRound(evt);
+          } else if (entry.phase === "tool_start") {
+            addToolEntry(evt);
+          } else if (entry.phase === "tool_result") {
+            fillToolEntry(evt);
+          } else if (entry.phase === "todo") {
+            applyEventTodo(evt);
+          }
+        });
+        applyDone({
+          status: record.status || "interrupted",
+          final_reply: record.final_reply || "",
+          rounds: record.rounds,
+          usage_total: record.usage_total,
+          error: record.error || "",
+          ended_at: record.ended_at,
+        });
+      },
+      markReturned: markReturned,
+      isDone: function () { return isDone; },
+      /** 流中断兜底：未收到 done 的块标记中断态。 */
+      finalizeInterrupted: function () {
+        if (!isDone) applyDone({ status: "interrupted" });
+      },
+    };
+
+    function applyEventTodo(evt) {
+      todoItems = Array.isArray(evt.todos) ? evt.todos : todoItems;
+      renderBody();
+    }
+  }
+
   // 代码块复制（事件委托）
   chatInner.addEventListener("click", function (e) {
     const btn = e.target.closest(".copy-btn");
@@ -714,6 +1074,12 @@
     const block = btn.closest(".md-svg-block");
     if (!block) return;
     const action = btn.dataset.svgAction;
+    // Mermaid 失败/显示异常时的手动重渲染（仅 mermaid 控件有此按钮）：
+    // 重新走调度链路（命中缓存瞬时复用，未命中则重新 mermaid.render）
+    if (action === "rerender") {
+      rerenderMermaid(block);
+      return;
+    }
     if (action === "view-image" || action === "view-code") {
       const want = action === "view-image" ? "image" : "code";
       block.querySelectorAll("[data-svg-view]").forEach(function (view) {
@@ -735,13 +1101,23 @@
         btn.textContent = "复制失败";
       }
     } else if (action === "copy-image") {
+      let blob = null;
+      let firstErr = "";
       try {
-        const blob = await svgBlockToPngBlob(block);
-        if (navigator.clipboard && window.ClipboardItem) {
-          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-          btn.textContent = "✓ 已复制图片";
-        } else {
-          // 剪贴板写图片不可用（非安全上下文等）：降级为下载 PNG
+        blob = await svgBlockToPngBlob(block);
+      } catch (err) {
+        firstErr = (err && err.message) || String(err);
+      }
+      if (blob) {
+        try {
+          if (navigator.clipboard && window.ClipboardItem) {
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+            btn.textContent = "✓ 已复制图片";
+          } else {
+            throw new Error("剪贴板图片接口不可用");
+          }
+        } catch (err) {
+          // 写剪贴板失败（焦点丢失/权限拒绝等）：导出本身成功，降级为下载 PNG
           const url = URL.createObjectURL(blob);
           const link = document.createElement("a");
           link.href = url;
@@ -749,9 +1125,12 @@
           link.click();
           setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
           btn.textContent = "✓ 已下载 PNG";
+          App.toast("写入剪贴板失败（" + ((err && err.message) || err) + "），已降级为下载");
         }
-      } catch (_) {
+      } else {
+        // 导出环节失败（图未渲染/解码失败等）：按钮 + toast 透出具体原因
         btn.textContent = "复制失败";
+        App.toast("复制图片失败：" + (firstErr || "未知错误"));
       }
     } else {
       btn.disabled = false;
@@ -763,6 +1142,47 @@
     }, 1500);
   });
 
+  // 导出专用净化：foreignObject → <text>/<tspan>。mermaid 12 用 foreignObject
+  // 承载节点/边标签（HTML 内容），SVG 一经 Image 解码 + canvas 绘制就会被浏览器
+  // 判定为「污染画布」，toBlob/toDataURL 抛 SecurityError（headless Chrome 实测：
+  // 去 foreignObject 即干净，仅去 <style> 无效，htmlLabels:false 配置在 12 上也不
+  // 生效）。把 HTML 标签替换为等价纯 SVG 文本后即可安全导出——只处理导出克隆，
+  // 页面显示用的 SVG 不动；产物样式表里的 .label text 规则会为生成文本补齐
+  // 颜色/字号，视觉与显示基本一致。多行标签（多个 <p>）转多个 <tspan> 分行。
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function sanitizeSvgForExport(svgEl) {
+    svgEl.querySelectorAll("foreignObject").forEach(function (fo) {
+      const w = parseFloat(fo.getAttribute("width")) || 0;
+      const h = parseFloat(fo.getAttribute("height")) || 0;
+      const ps = fo.querySelectorAll("p");
+      let lines;
+      if (ps.length) {
+        lines = [];
+        ps.forEach(function (p) { lines.push((p.textContent || "").trim()); });
+      } else {
+        lines = (fo.textContent || "").trim().split(/\n+/).map(function (s) { return s.trim(); });
+      }
+      const text = document.createElementNS(SVG_NS, "text");
+      text.setAttribute("x", w / 2);
+      text.setAttribute("y", h / 2);
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("dominant-baseline", "middle");
+      const lineH = 18; // 16px 默认字号的近似行高
+      const startY = -(lineH * (lines.length - 1)) / 2;
+      lines.forEach(function (line, i) {
+        const tspan = document.createElementNS(SVG_NS, "tspan");
+        tspan.setAttribute("x", w / 2);
+        tspan.setAttribute("y", h / 2 + startY + i * lineH);
+        tspan.textContent = line;
+        text.appendChild(tspan);
+      });
+      fo.parentNode.replaceChild(text, fo);
+    });
+    // 其它潜在脏源（iframe/object/embed/script）一并移除，防二次污染
+    svgEl.querySelectorAll("iframe,object,embed,script").forEach(function (n) { n.remove(); });
+    return svgEl;
+  }
+
   // 把 SVG 双视图块的图片视图光栅化为 PNG：
   // 内联 SVG → Blob(data:image/svg+xml) → Image 解码 → canvas 绘制 → PNG Blob。
   // 尺寸优先取实际渲染的显示尺寸（getBoundingClientRect）——mermaid 产物的
@@ -771,7 +1191,13 @@
   // 按 2x~3x（跟随 devicePixelRatio）超采样导出，粘贴出去不发虚。
   async function svgBlockToPngBlob(block) {
     const view = block.querySelector('[data-svg-view="image"] svg');
-    if (!view) throw new Error("svg not found");
+    if (!view) {
+      // mermaid 渲染失败/被中断时图片视图没有 svg——给出可操作的提示
+      if (block.dataset.svgKind === "mermaid" && block.dataset.mermaidState !== "done") {
+        throw new Error("图片尚未渲染成功，点「↻ 重渲染」恢复后再试");
+      }
+      throw new Error("找不到可导出的 SVG");
+    }
     // 基准尺寸（CSS 像素）：元素盒在 max-height 触顶时会水平 letterbox
     // （内容按 preserveAspectRatio 居中缩小、两侧留透明），直接用元素盒
     // 导出会把留白框进 PNG（表现为白色外框）——按 viewBox 比例从元素盒
@@ -813,6 +1239,15 @@
       h = Math.round(h * k);
       scale = w / baseW;
     }
+    // 总像素上限：超宽图长边钳制后面积仍可能爆表，canvas 尺寸过大会让
+    // toBlob 静默返回 null（表现为复制失败无报错）——按面积再钳一次
+    const MAX_PIXELS = 40000000; // 40MP，远超常规图，仅拦截极端长条图
+    if (w * h > MAX_PIXELS) {
+      const k = Math.sqrt(MAX_PIXELS / (w * h));
+      w = Math.round(w * k);
+      h = Math.round(h * k);
+      scale = w / baseW;
+    }
     const clone = view.cloneNode(true);
     // 去内联样式（mermaid 的 max-width / 自适应 width:100% 在独立解码语境
     // 无意义且会干扰固有尺寸），改用显式像素尺寸 + viewBox 保证比例
@@ -822,26 +1257,41 @@
     clone.setAttribute("width", baseW);
     clone.setAttribute("height", baseH);
     if (!vbOk) clone.setAttribute("viewBox", "0 0 " + baseW + " " + baseH);
-    const blobSrc = new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml;charset=utf-8" });
-    const url = URL.createObjectURL(blobSrc);
-    try {
-      const img = await new Promise(function (resolve, reject) {
-        const image = new Image();
-        image.onload = function () { resolve(image); };
-        image.onerror = function () { reject(new Error("SVG 解码失败")); };
-        image.src = url;
-      });
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-      return await new Promise(function (resolve, reject) {
-        canvas.toBlob(function (b) {
-          b ? resolve(b) : reject(new Error("PNG 导出失败"));
-        }, "image/png");
-      });
-    } finally {
-      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    // 两段式导出：先按原始克隆保真导出（保留 foreignObject 的 HTML 标签）；
+    // toBlob 抛 SecurityError（画布被污染）时做净化（foreignObject→<text>）
+    // 重导一次——净化牺牲一点排版保真，换取完整文字与干净画布。
+    let clean = false;
+    for (;;) {
+      const source = clean ? sanitizeSvgForExport(clone) : clone;
+      const blobSrc = new Blob([new XMLSerializer().serializeToString(source)], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blobSrc);
+      try {
+        const img = await new Promise(function (resolve, reject) {
+          const image = new Image();
+          image.onload = function () { resolve(image); };
+          image.onerror = function () { reject(new Error("SVG 解码失败")); };
+          image.src = url;
+        });
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        const blob = await new Promise(function (resolve, reject) {
+          canvas.toBlob(function (b) {
+            b ? resolve(b) : reject(new Error("PNG 导出失败"));
+          }, "image/png");
+        });
+        return blob;
+      } catch (err) {
+        const msg = String((err && err.message) || err);
+        if (!clean && /taint|secur/i.test(msg)) {
+          clean = true; // 画布污染：净化克隆后重导一次
+          continue;
+        }
+        throw err;
+      } finally {
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      }
     }
   }
 
@@ -1010,6 +1460,20 @@
       return;
     }
 
+    // 「重置」：任意状态下清空画布回到未运行占位（区别于「停止」：不要求
+    // 处于运行态），同时清掉上次运行的截图缓存，防止重置后截到旧图
+    if (action === "reset") {
+      const frame = block.querySelector(".md-canvas-frame");
+      if (frame) frame.remove();
+      canvasShots.delete(block.dataset.canvasId || "");
+      setCanvasState(block, "idle");
+      const view = block.querySelector(".md-canvas-view");
+      if (view) {
+        view.innerHTML = '<div class="md-canvas-placeholder">未运行 · 点击「▶ 运行」在沙箱中执行脚本</div>';
+      }
+      return;
+    }
+
     if (action === "shot") {
       // 截图导出：使用沙箱执行完成时自报的快照（canvasShots 缓存）——
       // 沙箱是 opaque origin，父页读不到 iframe 内画布像素，截图只能由
@@ -1061,22 +1525,37 @@
   function scheduleMermaidRender(widget) {
     const id = widget.dataset.mermaidId;
     const state = widget.dataset.mermaidState;
-    if (!id || state !== "pending" || mermaidPending.has(id)) return;
+    if (!id || (state !== "pending" && state !== "rerender") || mermaidPending.has(id)) return;
     const holder = widget.querySelector('[data-mermaid-holder="' + id + '"]');
     if (!holder) return;
     const code = Markdown.unescapeHtml(widget.dataset.svgCode || "");
     if (!code.trim()) return;
     widget.dataset.mermaidState = "rendering";
-    const p = Markdown.renderMermaidInto(id, code, holder)
-      .then(function () {
-        widget.dataset.mermaidState = "done";
-        mermaidPending.delete(id);
-      })
-      .catch(function () {
-        widget.dataset.mermaidState = "failed";
-        mermaidPending.delete(id);
-      });
-    mermaidPending.set(id, p);
+    holder.classList.remove("md-mermaid-error");
+    // 渲染参数：换用当前控件 id 调 mermaid.render（流式重建后同图已换新 id，
+    // 沿用旧临时节点 id 可能撞上上次的孤儿节点导致渲染不出）；源码原文做
+    // 缓存 key——同 code 的重建命中缓存直接复用上次 SVG，不再重复 render。
+    const opts = { renderId: id, cachedCode: code };
+    const attempt = function (isRetry) {
+      const p = Markdown.renderMermaidInto(id, code, holder, opts)
+        .then(function () {
+          widget.dataset.mermaidState = "done";
+          mermaidPending.delete(id);
+        })
+        .catch(function () {
+          mermaidPending.delete(id);
+          // 失败自动重试一次（mermaid.render 偶发瞬时失败，重试常能成功）；
+          // 重试仍失败才落 failed 态，交给「↻ 重渲染」按钮手动恢复
+          if (!isRetry && widget.isConnected &&
+            widget.dataset.mermaidState === "rendering") {
+            return attempt(true);
+          }
+          widget.dataset.mermaidState = "failed";
+        });
+      mermaidPending.set(id, p);
+      return p;
+    };
+    attempt(false);
   }
 
   function mountMermaidBlocks(root) {
@@ -1102,17 +1581,45 @@
     }).observe(chatInner, { childList: true, subtree: true });
   }
 
-  // 流结束兜底：finish() 里清掉仍处于 rendering/pending 的控件状态残留
-  //（渲染失败已在 catch 内落态；这里只把孤儿的"渲染中"文案转错误说明）
+  // 流结束兜底：finish() 里清掉仍处于渲染中的控件状态残留。
+  // 竞态修复：只处理 promise 不在飞且无 svg 的孤儿控件——流结束的瞬间
+  // 渲染 promise 往往仍在异步执行（懒加载/解析耗时），直接强置 failed
+  // 会误杀几秒后正常完成的渲染（表现：提示失败但刷新后正常）。
   function finalizeMermaidBlocks() {
     chatInner.querySelectorAll('.md-mermaid-block[data-mermaid-state="rendering"]').forEach(function (widget) {
-      widget.dataset.mermaidState = "failed";
+      if (mermaidPending.has(widget.dataset.mermaidId)) return; // 在飞：等回填/重试收尾
       const holder = widget.querySelector("[data-mermaid-holder]");
-      if (holder && !holder.querySelector("svg")) {
+      if (holder && holder.querySelector("svg")) {
+        widget.dataset.mermaidState = "done"; // 已有结果：仅纠正状态标记
+        return;
+      }
+      widget.dataset.mermaidState = "failed";
+      if (holder && !holder.classList.contains("md-mermaid-error")) {
         holder.classList.add("md-mermaid-error");
-        holder.textContent = "Mermaid 渲染未完成（流式被中断），可展开代码视图查看源码";
+        holder.textContent = "Mermaid 渲染未完成（流式被中断），点「↻ 重渲染」恢复";
       }
     });
+    // pending（未开始渲染）的控件：正常情况下流结束后 MutationObserver 会补
+    // 渲染，但若最终 DOM 重建早于观察回调则可能永远停留——这里补一枪。
+    chatInner.querySelectorAll('.md-mermaid-block[data-mermaid-state="pending"]').forEach(function (widget) {
+      scheduleMermaidRender(widget);
+    });
+  }
+
+  // 手动重渲染（↻ 重渲染按钮）：失败态或显示异常时重建渲染
+  function rerenderMermaid(block) {
+    if (!block) return;
+    const id = block.dataset.mermaidId;
+    if (!id) return;
+    const holder = block.querySelector('[data-mermaid-holder="' + id + '"]');
+    if (!holder) return;
+    // 去掉上次失败文案，回占位态后按 pending 重新调度（若 promise 在飞则跳过）
+    holder.classList.remove("md-mermaid-error");
+    if (!holder.querySelector("svg")) {
+      holder.innerHTML = "Mermaid 渲染中…";
+    }
+    block.dataset.mermaidState = "pending";
+    scheduleMermaidRender(block);
   }
 
   // ---------- md 表格：复制（原始 Markdown）与复制为图片 / 下载 Excel ----------
@@ -1407,6 +1914,7 @@
   App.appendUserMessage = appendUserMessage;
   App.buildThinkBlock = buildThinkBlock;
   App.buildToolBlock = buildToolBlock;
+  App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
 })(window.App);

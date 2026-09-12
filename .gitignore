@@ -2,7 +2,6 @@
 .vs/
 __pycache__/
 .pytest_cache/
-history_files/
 node_modules/
 *.log
 

@@ -346,3 +346,129 @@ test("api: renderMermaidInto 在无 DOM 环境安全导出", function () {
     );
   }
 });
+
+// ---------- Mermaid 缓存 / 重渲染链路（模拟 mermaid 全局） ----------
+
+function makeFakeHolder() {
+  const svgEl = {
+    getAttribute: function (name) { return name === "viewBox" ? "0 0 10 5" : null; },
+    setAttribute: function () {},
+    style: {},
+  };
+  return {
+    classList: {
+      _set: new Set(),
+      add: function (c) { this._set.add(c); },
+      remove: function (c) { this._set.delete(c); },
+      contains: function (c) { return this._set.has(c); },
+    },
+    set innerHTML(v) { this._html = v; },
+    get innerHTML() { return this._html; },
+    textContent: "",
+    querySelector: function (sel) { return sel === "svg" ? svgEl : null; },
+  };
+}
+
+test("mermaid: 相同源码重复渲染命中缓存（不重复调 mermaid.render）", async function () {
+  let renderCalls = 0;
+  global.mermaid = {
+    initialize: function () {},
+    render: function () {
+      renderCalls++;
+      return Promise.resolve({ svg: '<svg viewBox="0 0 10 5" width="100" height="50"></svg>' });
+    },
+  };
+  try {
+    const code = "graph TD\nA-->B";
+    const h1 = makeFakeHolder();
+    await Markdown.renderMermaidInto("md-mermaid-t1", code, h1, { renderId: "md-mermaid-t1", cachedCode: code });
+    assert.strictEqual(renderCalls, 1);
+    const h2 = makeFakeHolder();
+    await Markdown.renderMermaidInto("md-mermaid-t2", code, h2, { renderId: "md-mermaid-t2", cachedCode: code });
+    // 命中缓存：render 不再被调用，svg 直接复用
+    assert.strictEqual(renderCalls, 1);
+    assert.ok(h2.querySelector("svg"), "holder2 应写入缓存的 svg");
+    assert.ok(!h2.classList.contains("md-mermaid-error"), "缓存命中不应带错误态");
+  } finally {
+    delete global.mermaid;
+  }
+});
+
+test("mermaid: 重渲染换用当次控件 id 调 mermaid.render", async function () {
+  const ids = [];
+  global.mermaid = {
+    render: function (id) {
+      ids.push(id);
+      return Promise.resolve({ svg: '<svg viewBox="0 0 4 2"></svg>' });
+    },
+  };
+  try {
+    const h = makeFakeHolder();
+    // 用例间共享模块级缓存：改用本用例专属源码，避免命中上一个用例的缓存
+    await Markdown.renderMermaidInto("md-mermaid-x1", "graph TD\nX1-->Y1", h, { renderId: "md-mermaid-x1", cachedCode: "graph TD\nX1-->Y1" });
+    await Markdown.renderMermaidInto("md-mermaid-x2", "graph LR\nX2-->Y2", h, { renderId: "md-mermaid-x2", cachedCode: "graph LR\nX2-->Y2" });
+    assert.deepStrictEqual(ids, ["md-mermaid-x1", "md-mermaid-x2"]);
+  } finally {
+    delete global.mermaid;
+  }
+});
+
+test("mermaid: 渲染失败不写缓存（重试会真正再渲染）", async function () {
+  let calls = 0;
+  global.mermaid = {
+    render: function () {
+      calls++;
+      return Promise.reject(new Error("语法错误"));
+    },
+  };
+  try {
+    const code = "完全不是图表语法";
+    const h1 = makeFakeHolder();
+    await Markdown.renderMermaidInto("md-mermaid-e1", code, h1, { renderId: "md-mermaid-e1", cachedCode: code })
+      .then(function () { throw new Error("应失败"); }, function () { /* 预期失败 */ });
+    assert.strictEqual(calls, 1);
+    assert.ok(h1.classList.contains("md-mermaid-error"), "失败应落错误态");
+    const h2 = makeFakeHolder();
+    await Markdown.renderMermaidInto("md-mermaid-e2", code, h2, { renderId: "md-mermaid-e2", cachedCode: code })
+      .then(function () { throw new Error("应失败"); }, function () { /* 预期失败 */ });
+    // 失败未缓存：第二次仍真正调用 render（可重试）
+    assert.strictEqual(calls, 2);
+  } finally {
+    delete global.mermaid;
+  }
+});
+
+test("mermaid: 缓存按 LRU 淘汰（超上限后最早条目重新渲染）", async function () {
+  let renderCalls = 0;
+  global.mermaid = {
+    render: function () {
+      renderCalls++;
+      return Promise.resolve({ svg: '<svg viewBox="0 0 2 1"></svg>' });
+    },
+  };
+  try {
+    for (let i = 0; i < 45; i++) {
+      const code = "graph TD\nN" + i + "-->M" + i;
+      await Markdown.renderMermaidInto("id-" + i, code, makeFakeHolder(), { renderId: "id-" + i, cachedCode: code });
+    }
+    const callsAfterFill = renderCalls; // 45 次全新渲染
+    // 最早写入的条目已被淘汰：再次渲染应真正调用 render
+    const oldCode = "graph TD\nN0-->M0";
+    await Markdown.renderMermaidInto("id-again", oldCode, makeFakeHolder(), { renderId: "id-again", cachedCode: oldCode });
+    assert.strictEqual(renderCalls, callsAfterFill + 1);
+  } finally {
+    delete global.mermaid;
+  }
+});
+
+test("render: mermaid 控件带 ↻ 重渲染按钮（失败自恢复入口）", function () {
+  const html = Markdown.render("```mermaid\ngraph TD\nA-->B\n```");
+  assert.ok(html.includes('data-svg-action="rerender"'), html);
+  assert.ok(html.includes("↻ 重渲染"), html);
+});
+
+test("render: canvas 控件带 ↺ 重置按钮", function () {
+  const html = Markdown.render("```canvas\nconsole.log(1);\n```");
+  assert.ok(html.includes('data-canvas-action="reset"'), html);
+  assert.ok(html.includes("↺ 重置"), html);
+});

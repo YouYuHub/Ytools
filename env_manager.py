@@ -230,16 +230,21 @@ def list_available_models() -> list[dict[str, Any]]:
 
 
 def _default_model_selection() -> dict[str, dict[str, Any]]:
-    """三种模型选择的空结构（chat/compaction/title）。
+    """模型角色选择的空结构（chat/compaction/title/sub_agent 四种角色）。
 
     api_type 为只读回显字段：由后端根据 models.json 中对应模型的 apiType 自动确定
     （chat_completions / messages / responses），前端不传。
     parameter 为按 api_type 分桶结构：{"chat_completions": {...}, "messages": {...}, "responses": {...}}，
     字段名即各协议原生字段；取参时按当前模型 api_type 定位桶，缺失回退 chat_completions 桶。
+
+    sub_agent_model 为子智能体（sub_agent 工具派发的子任务）专用角色：
+    - 全局/会话未配置（ownership_name/model_name 为空）时，子任务继承父级聊天模型；
+    - 配置后子任务模型调用使用该角色的端点与参数（apiType 必须为 chat-completions，
+      其他协议回退父级聊天模型并打印警告）。
     """
     return {
         role: {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None}
-        for role in ("chat_model", "compaction_model", "title_model")
+        for role in ("chat_model", "compaction_model", "title_model", "sub_agent_model")
     }
 
 
@@ -514,7 +519,8 @@ def _resolve_selection_target(provider_name: str, model_name: str, role: str) ->
 
     供全局 select_chat_model 与会话级模型选择共用同一套校验规则。
     Raises:
-        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+        ChatModelConfigurationError: 组合不存在，或角色要求的协议不匹配
+        （compaction_model / sub_agent_model 必须为 chat-completions 协议）
     """
     normalized_provider = _normalize_config_name(provider_name)
     normalized_model = _normalize_config_name(model_name)
@@ -525,9 +531,10 @@ def _resolve_selection_target(provider_name: str, model_name: str, role: str) ->
         raise ChatModelConfigurationError(
             f"models.json 中找不到模型：{normalized_provider} / {normalized_model}"
         )
-    if role == "compaction_model" and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
+    if role in ("compaction_model", "sub_agent_model") and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
+        role_label = "压缩模型" if role == "compaction_model" else "子智能体模型"
         raise ChatModelConfigurationError(
-            f"压缩模型必须为 chat-completions 协议，{normalized_model} 配置为 {chat_config.get('apiType')}"
+            f"{role_label}必须为 chat-completions 协议，{normalized_model} 配置为 {chat_config.get('apiType')}"
         )
     return chat_config, _derive_api_type(chat_config)
 

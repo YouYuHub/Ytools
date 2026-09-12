@@ -30,8 +30,8 @@
 - `warning`：提示（如未选工具）
 - `reasoning_content` / `content`：思考与正文增量
 - `tool_calls`：工具调用增量（按 index 合并）
-- `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期
-- `tool_return`：工具执行结果 `{function_name, arguments, result}`
+- `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
+- `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `_meta.todo` 同结构数据）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
@@ -55,6 +55,27 @@
 - 单轮压缩的 `before_tokens` 为全量上下文（历史+系统提示+当前轮+工具定义）；当前轮轨迹不足阈值一半时跳过压缩（防空转，超窗主要来自历史时交由跨轮压缩/首调用预算检查处理）。
 - **压缩失败策略**：压缩模型未配置或配置不可用时自动使用当前聊天模型压缩；压缩模型调用失败时换聊天模型重试一次；聊天模型仍失败则抛出终止级错误，**任务终止**（不再节选降级）——请求前/单轮压缩失败会立即推送错误帧并停止生成。
 - **任务中断恢复**：压缩结果采用"完成后一次性写入"，中断不会留下半成品数据。若上次任务在压缩进行中被终止（有 `start` 无 `done`），下次请求开始时会自动补一条 `aborted` 事件（前端把对应条目置为中断态），未覆盖的轮次由常规压缩按预算**重新压缩**。
+
+#### 子智能体事件格式（`event="sub_agent"`，SSE 实时推送 = JSONL 落盘字段一致）
+
+内置工具 `sub_agent`（「内置工具」分组勾选，V1 不支持嵌套派发）让父智能体一次并发派发多个独立上下文的子任务：子任务有专属系统提示词、复用父级本轮工具（剔除 `sub_agent`/`check_tool_exists`，`ask_user` 替换为占位定义），全轨迹按 `agent_id` 聚合写入当前 `chat_round.events`（无 `role` 字段，不参与父级压缩游标计数），父模型只能看到子任务最终回复（`role=tool` 文本）。完整设计见 `docs/sub_agent_v1.md`。事件阶段：
+
+| 阶段 | payload 关键字段 |
+|---|---|
+| `start` | `{agent_id, parent_agent_id:"main", parent_tool_call_id, agent_index, task, todo?, tools[], rounds_limit, timeout_seconds}` |
+| `delta` | `{agent_id, ..., reasoning_delta / content_delta}`（仅 SSE 实时推流，**不落盘**） |
+| `model_call` | `{agent_id, seq, reasoning_content, content, tool_calls[]}`（子任务本轮完整轨迹落盘） |
+| `tool_start` | `{agent_id, seq, tool_call_id, tool_name, arguments}` |
+| `tool_result` | `{agent_id, seq, tool_call_id, tool_name, arguments, result, oversized?}` |
+| `todo` | `{agent_id, todos[]}`（子任务私有计划，只存事件块内） |
+| `done` | `{agent_id, status, final_reply, rounds, usage_total, error, ended_at}`；status ∈ `done|error|stopped|interrupted|timeout|max_rounds` |
+
+- 身份模型：`agent_id`（`agent_<8hex>`，子智能体实例 ID，轮内唯一）与 `parent_tool_call_id`（父级 tool_call id，用于归属父轮与关联父级工具气泡）分离；同一父级 tool_call 一次重派不会复用旧 `agent_id`。
+- 并发与限额：父循环用 `asyncio.gather` 并发执行全部子任务，`SUB_AGENT_MAX_CONCURRENT`（默认 3）信号量限流；每个子任务受 `SUB_AGENT_MAX_ROUNDS`（40）、`SUB_AGENT_TIMEOUT_SECONDS`（900，超时被取消并兜底补写 `done(timeout)`）、`SUB_AGENT_REPLY_MAX_CHARS`（30000，父侧最终回复截断，完整轨迹始终在 JSONL）保护。
+- 层级取消：父级停止（`/stop_chat`、新消息打断、worker 退出、上游错误）会取消全部子任务并补写 `done(stopped)`；子任务自身的超时/轮次上限/流错误只终止自己，不影响父任务与兄弟任务。子任务事件仅在事件循环的同步 `_write_guard()` 块内写历史（跨进程文件锁不可重入，禁止工作线程直写）。
+- 可见性：父级上下文只包含 `assistant(tool_calls=sub_agent)` 与 `role=tool(最终回复)`；子任务思考/正文/工具轨迹/todo 永不进入父模型上下文（历史重建与压缩文本渲染显式排除无 `role` 的 sub_agent 条目），父轮 `usage_total` 另行合并子任务 usage。
+- 模型：子智能体使用独立角色 `sub_agent_model`（见"模型选择"，未配置时继承聊天模型）；子任务请求副本同样经过思考回传整形与参数填充。
+- 前端渲染：按 `agent_id` 聚合为独立子任务块（标题条 #序号·任务摘要·状态徽标 + 可折叠的思考/正文/工具轨迹/计划区），done 后折叠为摘要态；历史回放按 JSONL 中事件块原样重建；旧前端遇未知事件走默认分支忽略、降级为普通 `tool_return` 文本。
 
 ### POST /stop_chat
 停止指定会话的聊天任务（**按会话隔离**，仅停止该 `session_id` 的后台生成任务，不影响其他会话仍在进行的任务）。
@@ -227,6 +248,21 @@
 - `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 -1）：思考过程（`reasoning_content`）的回传裁剪长度。**回传规则**：每次请求最多只回传一条真实思考——最近一次 API 调用输出的那条（本轮没有输出时向前回溯最近一次真实思考），负数全量、正数保留末尾 N 字符；配置为 `0` 或回溯不到真实思考时回传 `"..."` 占位符（带 `tool_calls` 的最新 assistant 消息字段必须存在，GLM / DeepSeek 等严格上游缺失即 400）。**落盘与回传解耦**：运行时上下文与 JSONL 历史永远保存每轮思考的原始全文，历史 assistant（含旧工具轮）的思考在请求副本中直接剥离、不回传上游，也不落 `"..."` 假数据。
 - `tool_result_max_length`（对应 env `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH`，默认 0）：后端历史轮次重建上下文时，单个工具结果回传前 N 字符；回传格式符合 Chat Completions 规范（`assistant.tool_calls` → `tool.tool_call_id`）。
 - 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。（思考过程因上游强校验，`0` 实际回传占位符，见上）
+- 该配置同时作用于父循环与子智能体（`sub_agent`）：子任务请求副本经过同一份思考回传整形（共享 `copy_for_request`，可显式传 limit），子任务工具超长结果同样走 `tool_result` 超长反馈路径。
+
+### 子智能体（sub_agent）配置
+
+配置项写入项目 `.env`（默认值由 `config.py` 的 `DEFAULT_SUB_AGENT_*` 提供），每次派发时现读：
+
+```env
+SUB_AGENT_ENABLED=true          # 总开关；关闭时本轮工具不注入 sub_agent 定义
+SUB_AGENT_MAX_ROUNDS=40         # 子任务工具调用轮次上限，达到后收尾并返回进展说明
+SUB_AGENT_MAX_CONCURRENT=3      # 一批子任务的并发信号量
+SUB_AGENT_TIMEOUT_SECONDS=900   # 子任务整体超时（0=不限制），超时取消并兜底补写 done(timeout)
+SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（完整轨迹始终在 JSONL 事件块）
+```
+
+启用方式：「配置工具」模态框「内置工具」分组勾选 `sub_agent`（伪服务 `__builtin__`）。父智能体调用参数：`task`（必填，自包含任务描述：目标/路径/已有结论/验收标准）+ `todo`（可选，预置计划数组，最多 20 项，随 start 事件显示在子任务块内）。子任务自身的 todo 独立存储（只显示在子任务块内，不写入父会话 `_meta.todo`）。
 
 ### MCP 工具执行超时配置
 
@@ -265,14 +301,15 @@
       "api_type": "chat_completions"
     },
     "compaction_model": {"ownership_name": null, "model_name": null, "parameter": {}, "api_type": null},
-    "title_model": {"ownership_name": null, "model_name": null, "parameter": {}, "api_type": null}
+    "title_model": {"ownership_name": null, "model_name": null, "parameter": {}, "api_type": null},
+    "sub_agent_model": {"ownership_name": null, "model_name": null, "parameter": {}, "api_type": null}
   }
 }
 ```
 
 `POST /chat_config/models/select` 新增参数：
 
-- `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）。`compaction_model` 必须为 `chat-completions` 协议。
+- `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）/ `sub_agent_model`（子智能体）。`compaction_model` / `sub_agent_model` 必须为 `chat-completions` 协议。
 - `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议专属 `thinking`（messages）、`max_output_tokens / instructions`（responses）。
 - `api_type`（只读回显，前端不传）：后端根据 models.json 中该模型的 `apiType` 自动确定，可选值 `chat_completions` / `messages` / `responses`（连字符归一为下划线、小写；`apiType` 缺失时默认 `chat_completions`）。
 - 向后兼容：只传 `{provider, model}` 等价于 `role=chat_model` 且参数不变。
@@ -282,6 +319,8 @@
 **聊天参数优先级**：请求体显式传参 > `model_selection.chat_model.parameter`（按当前聊天模型的 api_type 取桶）> 默认值（`/chat_with_tool` 对未显式提供的生成参数自动按配置填充）。
 
 **压缩模型参数**：`model_selection.compaction_model.parameter`（按压缩模型 api_type 取桶）> 压缩内置默认值（temperature 0.2 / top_p 1.0 / presence_penalty 0.0 / reasoning_effort low / max_tokens 摘要长度预算）。未配置 `compaction_model` 时跟随当前聊天模型（参数仍用压缩配置或内置默认）。
+
+**子智能体模型**：`model_selection.sub_agent_model`（未配置时子智能体继承当前聊天模型——含 ambient 会话覆盖，经 asyncio 上下文自动传递；配置后使用该角色端点与 `parameter` 填充，协议必须为 `chat-completions`）。前端聊天设置面板新增「子智能体模型」选项卡（与聊天/压缩/标题模型同级），未选择时提示"子智能体继承聊天模型"。
 
 **压缩模型优先级**：`model_selection.compaction_model`（未配置时跟随当前聊天模型）。压缩模型完全由 models.json 的 `model_selection` 管理，**不再从 `.env` 读取或写入**（`HISTORY_COMPACT_MODEL_PROVIDER/NAME` 已移除）。
 
