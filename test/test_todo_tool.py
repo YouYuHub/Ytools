@@ -149,6 +149,9 @@ class TodoApplyTests(unittest.TestCase):
         self.assertEqual(result["current plan state"],
                          {"total": 2, "done": 1, "in_progress": 1, "pending": 0})
         self.assertEqual([i["id"] for i in result["todos"]], ["1", "2"])
+        # 三态文案：首次创建走「已创建」，非完成态 plan_complete=False
+        self.assertIn("任务计划已创建", result["message"])
+        self.assertFalse(result["plan_complete"])
         self.assertNotIn("warnings", result)  # 提交合规时无告警
         todo = asyncio.run(self.manager.get_session_todo())
         self.assertEqual([item["content"] for item in todo], ["读取配置", "执行分析"])
@@ -158,6 +161,41 @@ class TodoApplyTests(unittest.TestCase):
         with self.manager._lock:
             meta, _ = cm._load_meta_and_entries(self.manager._file_path, TEST_SESSION)
         self.assertEqual(meta["todo"][0]["status"], "done")
+
+    def test_apply_session_todo_update_and_complete_states(self):
+        from factory import chat_factory
+
+        # 首次提交：建立计划（铺垫 prev_items）
+        asyncio.run(chat_factory._apply_session_todo(
+            self.manager,
+            {"todos": [
+                {"id": "1", "content": "读取配置", "status": "in_progress"},
+                {"id": "2", "content": "执行分析", "status": "pending"},
+            ]},
+        ))
+        # 第二次提交：非全完成 → 「已更新」
+        result, items = asyncio.run(chat_factory._apply_session_todo(
+            self.manager,
+            {"todos": [
+                {"id": "1", "content": "读取配置", "status": "done"},
+                {"id": "2", "content": "执行分析", "status": "in_progress"},
+            ]},
+        ))
+        self.assertIn("任务计划已更新", result["message"])
+        self.assertFalse(result["plan_complete"])
+
+        # 全部完成 → 「全部完成」提示 + plan_complete=True
+        result_all_done, items_all_done = asyncio.run(chat_factory._apply_session_todo(
+            self.manager,
+            {"todos": [
+                {"id": "1", "content": "读取配置", "status": "done"},
+                {"id": "2", "content": "执行分析", "status": "done"},
+            ]},
+        ))
+        self.assertIn("任务规划全部完成", result_all_done["message"])
+        self.assertIn("汇总执行结果", result_all_done["message"])
+        self.assertTrue(result_all_done["plan_complete"])
+        self.assertEqual(items_all_done[1]["status"], "done")
 
     def test_apply_session_todo_missing_id_inherits_prev(self):
         from factory import chat_factory

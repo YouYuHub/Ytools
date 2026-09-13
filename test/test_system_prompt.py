@@ -75,9 +75,10 @@ class ToolCallTimeoutNoteTests(unittest.TestCase):
         self.assertIn("MCP 工具单次执行超时为 7.5 秒", prompt)
 
     def test_timeout_note_is_numbered(self):
-        # 超时说明应作为编号注意事项出现（模型可按序读取）
+        # 超时说明应作为编号注意事项出现（模型可按序读取）；
+        # 序号不写死：notes 列表新增条目时序号会后移，只断言"N、MCP 工具单次执行超时"形态
         prompt = self._prompt(120)
-        self.assertRegex(prompt, r"3、MCP 工具单次执行超时为 120 秒")
+        self.assertRegex(prompt, r"\d+、MCP 工具单次执行超时为 120 秒")
 
 
 class ConditionalNoteTests(unittest.TestCase):

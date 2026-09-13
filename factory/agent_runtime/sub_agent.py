@@ -193,6 +193,9 @@ def _collect_usage(accumulator: UsageAccumulator) -> dict[str, Any]:
 
 
 def _format_result_text(result: Any) -> str:
+    if isinstance(result, dict) and "_file_diff" in result:
+        # 内置文件工具的展示用 diff：只推送前端与落盘，不进入子模型上下文
+        result = {k: v for k, v in result.items() if k != "_file_diff"}
     if isinstance(result, str):
         return result
     try:
@@ -471,9 +474,10 @@ class SubAgentRunner:
         external_tools: list[tuple[int, dict, str, dict]] = []
         for idx, tc, tn, ta in parsed_tools:
             if tn == TODO_TOOL_NAME:
+                prev_snapshot = list(self.todo)
                 items, notices, error_reason = normalize_todo_items(
                     ta.get("todos") if isinstance(ta, dict) else None,
-                    prev_items=list(self.todo),
+                    prev_items=prev_snapshot,
                 )
                 if items is None:
                     todo_result: dict[str, Any] = {"error": error_reason or "todos 参数无效"}
@@ -481,8 +485,35 @@ class SubAgentRunner:
                     self.todo = items
                     await self._emit("todo", todos=items)
                     done_count = sum(1 for item in items if item["status"] == "done")
+                    in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
+                    pending_count = len(items) - done_count - in_progress_count
+                    sub_plan_complete = bool(items) and done_count == len(items)
+                    # 与父级 todo 结果同构：三态文案 + plan_complete 机器可读标记
+                    if sub_plan_complete:
+                        sub_message = (
+                            f"子任务规划全部完成（{done_count}/{len(items)} 项）："
+                            "请汇总执行结果作为最终回复返回父智能体；"
+                            "如无新的计划，无需再调用本工具"
+                        )
+                    elif not prev_snapshot:
+                        sub_message = (
+                            f"子任务计划已创建（共 {len(items)} 项，进行中 {in_progress_count} 项，"
+                            f"待办 {pending_count} 项）：开始执行某步骤前将其设为 in_progress"
+                        )
+                    else:
+                        sub_message = (
+                            f"子任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项，"
+                            f"进行中 {in_progress_count} 项，待办 {pending_count} 项）"
+                        )
                     todo_result = {
-                        "message": f"子任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项）",
+                        "message": sub_message,
+                        "current plan state": {
+                            "total": len(items),
+                            "done": done_count,
+                            "in_progress": in_progress_count,
+                            "pending": pending_count,
+                        },
+                        "plan_complete": sub_plan_complete,
                         "todos": items,
                     }
                     if notices:
@@ -762,6 +793,12 @@ class SubAgentRunner:
                         return self._make_result()
                     continue
                 self._consecutive_oversized = 0
+                # 内置文件工具的展示用 diff：随 tool_result 事件分发（JSONL+SSE），
+                # 模型上下文中的剥离已在 _format_result_text 完成
+                sub_raw_result = tool_result["result"]
+                sub_file_diff = (
+                    sub_raw_result.get("_file_diff") if isinstance(sub_raw_result, dict) else None
+                )
                 await self._emit(
                     "tool_result",
                     tool_call_id=tool_call_id,
@@ -769,6 +806,7 @@ class SubAgentRunner:
                     arguments=arguments_text,
                     result=ret,
                     oversized=False,
+                    **({"file_diff": sub_file_diff} if sub_file_diff else {}),
                     seq=self._seq,
                 )
                 self.messages.append({

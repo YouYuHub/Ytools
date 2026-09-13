@@ -33,7 +33,7 @@
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
-- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `_meta.todo` 同结构数据）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
+- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `_meta.todo` 同结构数据）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
 - `context_compaction`：单轮工具轨迹被压缩后的状态，含 `{scope:"round", before_tokens, after_tokens, fallback, compress_index, block_count, usage}`；`usage` 为压缩模型调用返回的 token 统计（部分服务端不返回时为 null）；新模式 `block_count` 通常为 1 个累计摘要块；工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
 - `context_compaction`（**实时压缩事件**，开始/完成两个阶段，见下方"压缩事件格式"）：单轮与跨轮压缩均实时推送，**同一份 payload 同时落盘 JSONL 独立事件行**（`event="context_compaction"`），保证前端"加载历史"与"实时显示"字段完全一致
@@ -176,8 +176,10 @@
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
-| /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, stream_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时与工具调用流式阶段超时 |
-| /chat_config/mcp_tools | POST | Body `{call_timeout_seconds, stream_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
+| /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时 |
+| /chat_config/mcp_tools | POST | Body `{call_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
+| /chat_config/tool_concurrency | GET | - | `{mcp_tool_workers, sub_agent_max_concurrent, defaults, semantics, env_names, memory_state}`；MCP 工具并发线程数与子智能体并发上限 |
+| /chat_config/tool_concurrency | POST | Body `{mcp_tool_workers, sub_agent_max_concurrent}`（均 ≥1，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次工具执行立即生效 |
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；空 `inputs` 清除会话覆盖恢复跟随全局默认；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 
@@ -270,8 +272,7 @@ SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（�
 
 ```json
 {
-  "call_timeout_seconds": 300,
-  "stream_timeout_seconds": 300
+  "call_timeout_seconds": 300
 }
 ```
 
@@ -279,11 +280,34 @@ SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（�
 - `0`：不设置超时，工具若自身永久阻塞仍可能无法返回，不建议用于不可控的本地终端工具；
 - 负数：请求接口返回 400，不会覆盖已有配置。
 
-`stream_timeout_seconds`（对应 env `TOOL_CALL_STREAM_TIMEOUT_SECONDS`，默认 300）控制**模型 SSE 输出 `tool_calls` 阶段**的无响应超时：部分服务商 API 在该阶段会无限卡住（HTTP 连接不断、永无后续事件），普通 HTTP 读超时既兜不住也不该终止任务。首个 `tool_calls` 增量到达后开始按"事件间隔"计时（期间任意后续事件续期，`finish_reason` 到达后停止计时）；超时后**不终止任务**：本次工具调用按失败处理（assistant 工具调用消息 + 失败工具结果成对落盘，SSE 推送 `tool_return`（`timeout: true`）与 `TOOL_CALL_STREAM_TIMEOUT` warning 帧），模型基于失败结果继续运行（重试或直接回答）。调用结构不可用（工具名未注册等）时退化为内部提示消息，让模型重新发起调用。
+后端仍保留**工具调用流式阶段超时**（env `TOOL_CALL_STREAM_TIMEOUT_SECONDS`，默认 300；该项已从配置接口移除，只能手工改 `.env`）控制**模型 SSE 输出 `tool_calls` 阶段**的无响应超时：部分服务商 API 在该阶段会无限卡住（HTTP 连接不断、永无后续事件），普通 HTTP 读超时既兜不住也不该终止任务。首个 `tool_calls` 增量到达后开始按"事件间隔"计时（期间任意后续事件续期，`finish_reason` 到达后停止计时）；超时后**不终止任务**：本次工具调用按失败处理（assistant 工具调用消息 + 失败工具结果成对落盘，SSE 推送 `tool_return`（`timeout: true`）与 `TOOL_CALL_STREAM_TIMEOUT` warning 帧），模型基于失败结果继续运行（重试或直接回答）。调用结构不可用（工具名未注册等）时退化为内部提示消息，让模型重新发起调用。
 
 超时值还会实时写入**系统提示词**（`factory/system_prompt.py`，每次构造提示词时从 `load_var` 现读）：正数时告知模型「单次执行超时 N 秒，长耗时操作需拆分/缩小范围」；`0` 时告知「不限制超时，需主动拆分并阶段性反馈」——用户在聊天设置中修改超时后，下一轮对话模型即可感知新配置。
 
 工具执行已放入工作线程，因此工具阻塞期间事件循环仍可处理 `GET /chat_context/token_stats` 和 `POST /stop_chat`。手动停止会同时设置会话停止标记、取消后台生成任务并等待其完成收尾；正在执行的同步工具线程无法被 Python 强制杀死，会由上述超时配置最终释放，推荐将超时设置为合理的正数。
+
+### 文件变更 diff（内置 write_file / edit_file）
+
+内置 `write_file` / `edit_file` 执行成功后，结果 dict 会附加 `_file_diff` 顶级键（`factory/agent_runtime/builtin_tools.py` 生成，标准 unified diff 文本）：
+
+```json
+{
+  "diff": "--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n-value = 1\n+value = 2\n+print(value)",
+  "lines_added": 2,
+  "lines_removed": 1,
+  "diff_truncated": false,
+  "diff_skipped": ""
+}
+```
+
+- **不进入模型上下文**：`_format_tool_result` / `_format_result_text` 组装模型可见文本时统一剥离该键，模型只在 message 里看到「diff +N -M 行」统计摘要，token 零负担；
+- **SSE 事件**：`tool_return` 消息附带 `file_diff` 字段（与 result 并列），前端工具块输出区渲染彩色 diff 视图；
+- **JSONL 落盘**：tool 历史记录附带 `file_diff` 字段，刷新/重开会话历史回放同样渲染；
+- **边界降级**：新旧文本任一超过 256KB 时跳过逐行 diff（`diff_skipped: "file_too_large"`）；diff 文本超过 20000 字符时截断（`diff_truncated: true`）；内容无变化时 `diff_skipped: "unchanged"`；
+- **content_hash**：`write_file`/`edit_file`/`read_file` 结果均含 `content_hash`（解码后全文 sha256 前 16 位），为后续「文件版本校验」（edit 时校验 expected_hash，检测读后文件被外部修改）预留；
+- **子任务块**：sub_agent 内部调用的文件工具同样在 tool_result 子事件中携带 `file_diff`，渲染行为一致。
+
+MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结果，不带 `file_diff`，前端自动回退普通文本渲染，无需处理。
 
 ### 模型选择（三种模型 + 参数）
 

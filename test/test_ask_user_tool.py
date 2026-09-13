@@ -91,8 +91,11 @@ class AskUserToolDefinitionTests(unittest.TestCase):
         self.assertIsNone(builtin_tools.normalize_ask_questions(
             [{"question": "x" * 201}]))
         self.assertIsNone(builtin_tools.normalize_ask_questions(["纯字符串"]))
+        # 上限 5：6 个问题拒绝，5 个问题放行
         self.assertIsNone(builtin_tools.normalize_ask_questions(
-            [{"question": str(i)} for i in range(4)]))  # 超过 3 个问题
+            [{"question": str(i)} for i in range(6)]))
+        self.assertEqual(len(builtin_tools.normalize_ask_questions(
+            [{"question": str(i)} for i in range(5)])), 5)
 
     def test_normalize_ask_questions_options_truncated_to_six(self):
         raw = [{"question": "选一个", "options": [f"选项{i}" for i in range(10)]}]

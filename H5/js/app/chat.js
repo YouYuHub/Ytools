@@ -429,7 +429,11 @@
             const tb = { ui: App.buildToolBlock("sub_agent"), argsText: "", done: false };
             toolBlocks.push(tb);
             tb.ui.setInput(FormatUtils.prettyJson(tr.arguments));
-            tb.ui.setOutput(typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2));
+            App.applyToolResult(
+              tb.ui, tr.function_name,
+              typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2),
+              tr.file_diff
+            );
             tb.ui.finish();
             tb.done = true;
             hasStage = true;
@@ -451,7 +455,11 @@
         }
         tb.ui.setName(tr.function_name);
         tb.ui.setInput(FormatUtils.prettyJson(tr.arguments));
-        tb.ui.setOutput(typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2));
+        App.applyToolResult(
+          tb.ui, tr.function_name,
+          typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2),
+          tr.file_diff
+        );
         tb.ui.finish();
         tb.done = true;
         if (activeToolBlocks && Array.from(activeToolBlocks.values()).every(function (toolBlock) { return toolBlock.done; })) {

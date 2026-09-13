@@ -57,7 +57,7 @@
           ui.setInput(FormatUtils.prettyJson(rec.args));
           chatInner.appendChild(ui.wrap);
         }
-        ui.setOutput(rec.result);
+        applyToolResult(ui, rec.name, rec.result, rec.file_diff);
         ui.finish();
         return;
       }
@@ -524,7 +524,9 @@
     let previewTimer = null;
     const PREVIEW_THROTTLE_MS = 200;
 
-    // 取累积文本的最后一个非空行作为预览（新行替代旧行）；全部空白则清空
+    // 取累积文本的最后一个非空行作为预览（新行替代旧行）；全部空白则清空。
+    // 截断到 160 字符兜底：即使环境样式异常（按钮内容宽度计算不受控），
+    // DOM 文本也不会超长
     function latestLine() {
       const text = content.textContent;
       let tail = "";
@@ -536,7 +538,7 @@
         }
         tail = ch + tail;
       }
-      return tail.trim();
+      return tail.trim().slice(0, 160);
     }
 
     function renderPreview() {
@@ -598,6 +600,7 @@
       statusIcon +
       "<span>调用工具</span>" +
       '<span class="tool-block-name"></span>' +
+      '<span class="tool-block-diff" hidden></span>' +
       '<svg class="icon tool-block-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
     head.querySelector(".tool-block-name").textContent = name || "tool";
 
@@ -605,7 +608,7 @@
     const inLabel = el("span", "tool-io-label", "输入");
     const inPre = el("pre", "tool-io", "");
     const outLabel = el("span", "tool-io-label", "输出");
-    const outPre = el("pre", "tool-io", "");
+    const outPre = el("pre", "tool-io tool-io-out", "");
     body.appendChild(inLabel);
     body.appendChild(inPre);
     body.appendChild(outLabel);
@@ -619,6 +622,15 @@
     let revealTimer = null;
     const REVEAL_CHARS_PER_TICK = 6;   // 每 tick 揭示的字符数
     const REVEAL_INTERVAL_MS = 16;     // tick 间隔（约每秒 375 字符）
+
+    // 输出区上方的展示用 diff 视图（由 setDiff 注入；clearDiff 在文本重设时移除）
+    let diffView = null;
+    function clearDiff() {
+      if (diffView && diffView.parentNode) {
+        diffView.parentNode.removeChild(diffView);
+      }
+      diffView = null;
+    }
 
     function stopReveal() {
       if (revealTimer) {
@@ -667,6 +679,40 @@
         inPre.textContent = t || "{}";
       },
       setOutput: function (t) { outPre.textContent = t || "(无输出)"; },
+      // 附带展示用 diff 视图（write_file/edit_file 结果）：渲染在输出区上方，
+      // 并在块标题栏挂 +N/-M 徽标（块默认折叠时也能一眼看到文件变更）
+      setDiff: function (diff) {
+        clearDiff();
+        if (!diff) return;
+        diffView = buildDiffView(diff);
+        body.insertBefore(diffView, outLabel);
+        const badge = head.querySelector(".tool-block-diff");
+        if (badge) {
+          const added = Number(diff.lines_added) || 0;
+          const removed = Number(diff.lines_removed) || 0;
+          const skipped = diff.diff_skipped || "";
+          badge.textContent = skipped === "unchanged" ? "无变化"
+            : skipped === "file_too_large" ? "文件过大"
+            : "+" + added + " -" + removed;
+          badge.classList.toggle("is-add", added > 0 && removed === 0);
+          badge.classList.toggle("is-del", removed > 0 && added === 0);
+          badge.hidden = false;
+          wrap.classList.add("has-diff");
+        }
+      },
+      clearDiff: function () {
+        if (diffView && diffView.parentNode) {
+          diffView.parentNode.removeChild(diffView);
+        }
+        diffView = null;
+        const badge = head.querySelector(".tool-block-diff");
+        if (badge) {
+          badge.textContent = "";
+          badge.classList.remove("is-add", "is-del");
+          badge.hidden = true;
+        }
+        wrap.classList.remove("has-diff");
+      },
       // 流式参数生成开始：标记状态并清空输出占位（不改变折叠态）
       beginStream: function () {
         streaming = true;
@@ -674,6 +720,7 @@
         outPre.textContent = "";
         inPre.textContent = "";
         revealQueue = "";
+        clearDiff();
       },
       // 追加一帧参数增量（模型逐 token 生成的 arguments 文本）
       addInputDelta: function (delta) {
@@ -719,6 +766,111 @@
         }
       },
     };
+  }
+
+  // ---------- 展示用 diff 视图（write_file / edit_file 结果） ----------
+  // 解析 unified diff 文本：@@ hunk 头（淡化分隔）、+ 添加（绿）、- 删除（红）、
+  // 空格行上下文；首字符规则解析，与后端 difflib 输出格式强约定。
+  function buildDiffView(diffObj) {
+    const box = el("div", "diff-view");
+    const statsBits = [];
+    const added = Number(diffObj && diffObj.lines_added) || 0;
+    const removed = Number(diffObj && diffObj.lines_removed) || 0;
+    if (added) statsBits.push('+' + added);
+    if (removed) statsBits.push('-' + removed);
+    const truncated = !!(diffObj && diffObj.diff_truncated);
+    const skipped = (diffObj && diffObj.diff_skipped) || "";
+
+    const bar = el("div", "diff-bar");
+    bar.appendChild(el("span", "diff-title", "文件变更"));
+    const stats = el("span", "diff-stats");
+    if (statsBits.length) {
+      statsBits.forEach(function (bit) {
+        stats.appendChild(el("span", bit.charAt(0) === "+" ? "diff-num is-add" : "diff-num is-del", bit));
+      });
+    } else if (skipped === "unchanged") {
+      stats.appendChild(el("span", "diff-num", "内容无变化"));
+    } else if (skipped === "file_too_large") {
+      stats.appendChild(el("span", "diff-num", "文件过大，跳过 diff"));
+    }
+    if (truncated) {
+      stats.appendChild(el("span", "diff-num", "diff 已截断"));
+    }
+    bar.appendChild(stats);
+    box.appendChild(bar);
+
+    const text = String((diffObj && diffObj.diff) || "");
+    if (text) {
+      const pre = el("pre", "diff-code");
+      const lines = text.split("\n");
+      let oldNo = 0;
+      let newNo = 0;
+      lines.forEach(function (line) {
+        if (line.indexOf("@@") === 0) {
+          const hunk = el("div", "diff-line is-hunk", line);
+          const match = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?/.exec(line);
+          if (match) {
+            oldNo = parseInt(match[1], 10);
+            newNo = parseInt(match[2], 10);
+          }
+          pre.appendChild(hunk);
+          return;
+        }
+        if (line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0) {
+          pre.appendChild(el("div", "diff-line is-file", line));
+          return;
+        }
+        const kind = line.charAt(0);
+        const cls = kind === "+" ? "is-add" : (kind === "-" ? "is-del" : "is-ctx");
+        const row = el("div", "diff-line " + cls);
+        const gutter = el("span", "diff-no");
+        const oldText = kind === "+" ? "" : String(oldNo);
+        const newText = kind === "-" ? "" : String(newNo);
+        gutter.textContent = (oldText + " " + newText).trim();
+        row.appendChild(gutter);
+        row.appendChild(el("span", "diff-sign", kind === " " ? "" : kind));
+        row.appendChild(el("span", "diff-text", line.slice(1)));
+        if (kind === "+") {
+          newNo += 1;
+        } else if (kind === "-") {
+          oldNo += 1;
+        } else {
+          oldNo += 1;
+          newNo += 1;
+        }
+        pre.appendChild(row);
+      });
+      box.appendChild(pre);
+    }
+    return box;
+  }
+
+  /** 工具输出统一入口：带 file_diff 的结构化结果渲染 diff 视图 + 统计摘要文本，
+   * 其余一律按原文纯文本输出（MCP 版同名工具 / 旧历史无 diff 自动回退）。 */
+  function applyToolResult(block, name, resultText, fileDiff) {
+    let parsed = null;
+    if (fileDiff && typeof fileDiff === "object") {
+      try {
+        const obj = JSON.parse(resultText);
+        if (obj && typeof obj === "object" && obj.path != null) parsed = obj;
+      } catch (_) { /* 回退纯文本 */ }
+    }
+    if (parsed) {
+      const statsBits = [];
+      if (parsed.lines_added || parsed.lines_removed) {
+        statsBits.push("diff +" + parsed.lines_added + " -" + parsed.lines_removed + " 行");
+      } else if (parsed.diff_skipped) {
+        statsBits.push(parsed.diff_skipped === "unchanged" ? "内容无变化" : "文件过大，跳过 diff");
+      } else if (parsed.created != null) {
+        statsBits.push(parsed.created ? "新建文件" : "全文覆盖");
+      }
+      const head = String(parsed.message || "[write_file] 已写入");
+      const note = statsBits.length ? head + "（" + statsBits.join("，") + "）" : head;
+      block.setOutput(note);
+      block.setDiff(fileDiff);
+    } else {
+      block.setOutput(resultText);
+    }
   }
 
   // ---------- 子任务块（sub_agent） ----------
@@ -982,7 +1134,7 @@
       }
       entry.finish();
       const resultText = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2);
-      entry.setOutput(resultText);
+      applyToolResult(entry, evt.tool_name, resultText, evt.file_diff);
     }
 
     function renderTodo(items) {
@@ -2037,6 +2189,7 @@
   App.appendUserMessage = appendUserMessage;
   App.buildThinkBlock = buildThinkBlock;
   App.buildToolBlock = buildToolBlock;
+  App.applyToolResult = applyToolResult;
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;

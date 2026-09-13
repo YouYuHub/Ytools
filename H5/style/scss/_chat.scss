@@ -64,6 +64,10 @@
     font-size: 13px;
     padding: 4px 0;
     min-width: 0;
+    // button 是表单控件：宽度默认按内容收缩（预览行 nowrap 会把整页撑出
+    // 横向滚动），必须显式占满父容器宽度，让预览行只能在容器内省略
+    width: 100%;
+    text-align: left;
 
     &:hover {
       color: var(--text-secondary);
@@ -224,6 +228,27 @@
     margin: 6px 0 4px;
   }
 
+  // 标题栏文件变更徽标（setDiff 挂载）：块折叠时也能看到「+N -M」
+  .tool-block-diff {
+    display: inline-flex;
+    margin-left: 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-tertiary);
+
+    &[hidden] {
+      display: none;
+    }
+
+    &.is-add {
+      color: #1a7f37;
+    }
+
+    &.is-del {
+      color: #cf222e;
+    }
+  }
+
   .tool-io {
     font-family: var(--font-mono);
     font-size: 12px;
@@ -237,6 +262,116 @@
     overflow: auto;
     white-space: pre-wrap;
     word-break: break-all;
+  }
+}
+
+// ---------- 工具结果展示用 diff 视图（write_file / edit_file） ----------
+.diff-view {
+  margin: 8px 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.diff-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-code);
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.diff-stats {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.diff-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+
+  &.is-add {
+    color: #1a7f37;
+  }
+
+  &.is-del {
+    color: #cf222e;
+  }
+}
+
+.diff-code {
+  margin: 0;
+  padding: 4px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.diff-line {
+  display: flex;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 0 12px;
+
+  &.is-add {
+    background: rgba(46, 160, 67, 0.16);
+  }
+
+  &.is-del {
+    background: rgba(248, 81, 73, 0.16);
+  }
+
+  &.is-hunk {
+    color: var(--text-tertiary);
+    background: var(--bg-code);
+    margin: 4px 0;
+  }
+
+  &.is-file {
+    color: var(--text-tertiary);
+  }
+}
+
+.diff-no {
+  flex: 0 0 auto;
+  min-width: 56px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-tertiary);
+  opacity: 0.75;
+  user-select: none;
+}
+
+.diff-sign {
+  flex: 0 0 auto;
+  width: 12px;
+  font-weight: 600;
+}
+
+.diff-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+html[data-theme="dark"] {
+  .diff-num.is-add,
+  .tool-block-diff.is-add {
+    color: #7ee787;
+  }
+
+  .diff-num.is-del,
+  .tool-block-diff.is-del {
+    color: #ff9492;
   }
 }
 

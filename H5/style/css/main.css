@@ -692,6 +692,8 @@ html[data-theme=dark] .panel .session-list .session-item.active {
   font-size: 13px;
   padding: 4px 0;
   min-width: 0;
+  width: 100%;
+  text-align: left;
 }
 .think-block .think-toggle:hover {
   color: var(--text-secondary);
@@ -818,6 +820,22 @@ html[data-theme=dark] .panel .session-list .session-item.active {
   color: var(--text-tertiary);
   margin: 6px 0 4px;
 }
+.tool-block .tool-block-diff {
+  display: inline-flex;
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.tool-block .tool-block-diff[hidden] {
+  display: none;
+}
+.tool-block .tool-block-diff.is-add {
+  color: #1a7f37;
+}
+.tool-block .tool-block-diff.is-del {
+  color: #cf222e;
+}
 .tool-block .tool-io {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -831,6 +849,106 @@ html[data-theme=dark] .panel .session-list .session-item.active {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.diff-view {
+  margin: 8px 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.diff-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-code);
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.diff-stats {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.diff-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.diff-num.is-add {
+  color: #1a7f37;
+}
+.diff-num.is-del {
+  color: #cf222e;
+}
+
+.diff-code {
+  margin: 0;
+  padding: 4px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.diff-line {
+  display: flex;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 0 12px;
+}
+.diff-line.is-add {
+  background: rgba(46, 160, 67, 0.16);
+}
+.diff-line.is-del {
+  background: rgba(248, 81, 73, 0.16);
+}
+.diff-line.is-hunk {
+  color: var(--text-tertiary);
+  background: var(--bg-code);
+  margin: 4px 0;
+}
+.diff-line.is-file {
+  color: var(--text-tertiary);
+}
+
+.diff-no {
+  flex: 0 0 auto;
+  min-width: 56px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-tertiary);
+  opacity: 0.75;
+  user-select: none;
+}
+
+.diff-sign {
+  flex: 0 0 auto;
+  width: 12px;
+  font-weight: 600;
+}
+
+.diff-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+html[data-theme=dark] .diff-num.is-add,
+html[data-theme=dark] .tool-block-diff.is-add {
+  color: #7ee787;
+}
+html[data-theme=dark] .diff-num.is-del,
+html[data-theme=dark] .tool-block-diff.is-del {
+  color: #ff9492;
 }
 
 .tool-spin {

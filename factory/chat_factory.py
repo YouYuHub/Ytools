@@ -4,7 +4,7 @@ import asyncio
 import copy
 import json
 import time
-import uuid
+# import uuid
 from collections import deque
 # import inspect
 from typing import Any, Dict, List, AsyncGenerator
@@ -160,6 +160,9 @@ def _copy_for_request(messages: List[dict]) -> List[dict]:
 
 
 def _format_tool_result(result: Any) -> str:
+    if isinstance(result, dict) and "_file_diff" in result:
+        # 内置文件工具的展示用 diff：只推送前端与落盘，不进入模型上下文
+        result = {k: v for k, v in result.items() if k != "_file_diff"}
     if isinstance(result, str):
         return result
     try:
@@ -459,14 +462,35 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
     await session_chat_memory.update_session_todo(items)
     done_count = sum(1 for item in items if item["status"] == "done")
     in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
+    pending_count = len(items) - done_count - in_progress_count
+    plan_complete = bool(items) and done_count == len(items)
+    # 首次创建 vs 后续更新：给模型不同的语境反馈
+    is_new_plan = not prev_items
+    if plan_complete:
+        message = (
+            f"任务规划全部完成（{done_count}/{len(items)} 项）："
+            "请汇总执行结果直接答复用户；如无新的计划，无需再调用本工具"
+        )
+    elif is_new_plan:
+        message = (
+            f"任务计划已创建（共 {len(items)} 项，进行中 {in_progress_count} 项，"
+            f"待办 {pending_count} 项）：开始执行某步骤前将其设为 in_progress"
+        )
+    else:
+        message = (
+            f"任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项，"
+            f"进行中 {in_progress_count} 项，待办 {pending_count} 项）"
+        )
     result: dict[str, Any] = {
-        "message": f"任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项，进行中 {in_progress_count} 项）",
+        "message": message,
         "current plan state": {
             "total": len(items),
             "done": done_count,
             "in_progress": in_progress_count,
-            "pending": len(items) - done_count - in_progress_count,
+            "pending": pending_count,
         },
+        # 机器可读完成标记：模型无需解析 message 即可判断计划是否收官
+        "plan_complete": plan_complete,
         # 回写规整后的完整列表：模型据此对齐自动分配/继承出的最终 id，
         # 避免长对话中工具结果被截断后丢失 id 记忆
         "todos": items,
@@ -827,7 +851,9 @@ async def _run_chat_generation(
             latest_answer_text = ""
             for msg in reversed(incoming_messages):
                 if isinstance(msg, dict) and msg.get("role") == "user":
-                    latest_answer_text = content_part_to_text(msg.get("content")).strip()
+                    latest_answer_text = content_part_to_text(
+                        msg.get("content"), include_media_labels=False
+                    ).strip()
                     break
             if latest_answer_text.startswith(ASK_ANSWER_PREFIX):
                 removed_rounds = await session_chat_memory.truncate_rounds_for_reanswer()
@@ -929,7 +955,9 @@ async def _run_chat_generation(
             if isinstance(msg, dict) and msg.get("role") == "user":
                 # 多模态消息 content 为部件列表：取文本部件作为问题文本，
                 # 原始消息（含 media:// 媒体引用）原样落盘
-                latest_user_text = content_part_to_text(msg.get("content")).strip()
+                latest_user_text = content_part_to_text(
+                    msg.get("content"), include_media_labels=False
+                ).strip()
                 if latest_user_text:
                     latest_user_message = msg
                 break
@@ -949,10 +977,10 @@ async def _run_chat_generation(
             print(f"[WARN] 当前任务媒体引用收集失败（read_media 将不可用）: {media_collect_error}")
         # 多媒体引用解析：仅解析当前轮消息 content 列表里的 media:// 引用为
         # 上游可用的 data URL / base64（image_url.url；input_audio.data 为纯
-        # base64）。历史轮次用户消息为纯文本口径（媒体部件为 [图片] 等占位
-        # 引用，见 chat_history_format），不回传图片数据；已压缩轮次（摘要/
-        # 问题索引）不携带媒体。用户消息此刻已按原始引用落盘，历史 JSONL
-        # 不会膨胀。
+        # base64）。历史轮次用户消息为纯文本口径（媒体部件为 [图片 media://…]
+        # 等带引用的占位标注，见 chat_history_format/file_memory），不回传图片
+        # 数据；已压缩轮次（摘要/问题索引）不携带媒体。用户消息此刻已按原始
+        # 引用落盘，历史 JSONL 不会膨胀。
         try:
             unresolved_media = resolve_message_media_refs(session_id, messages)
             if unresolved_media:
@@ -1715,7 +1743,7 @@ async def _run_chat_generation(
                         ta.get("questions") if isinstance(ta, dict) else None)
                     if questions is None:
                         ask_result: dict[str, Any] = {
-                            "error": "questions 参数无效：需要 1-3 个对象数组，每个对象包含"
+                            "error": "questions 参数无效：需要 1-5 个对象数组，每个对象包含"
                                      "非空 question（≤200 字符）与可选 options（0-6 个非空字符串，每项 ≤100 字符）",
                         }
                     else:
@@ -1887,7 +1915,11 @@ async def _run_chat_generation(
                     tool_call_id = tool_call.get("id", "")
                     tool_name = tool_result['tool_name']
                     tool_args = tool_result['tool_args']
-                    ret = _format_tool_result(tool_result['result'])
+                    # _file_diff（内置文件工具的展示用 diff）不进模型上下文：
+                    # _format_tool_result 已统一剥离，仅 JSONL 落盘与 SSE 事件中附带
+                    raw_result = tool_result['result']
+                    ret = _format_tool_result(raw_result)
+                    file_diff = raw_result.get("_file_diff") if isinstance(raw_result, dict) else None
                     # 超大结果拒绝：超过阈值时结果不进入模型上下文，
                     # 改为写入"输出过长"反馈让模型重新考虑工具使用；
                     # 原始结果只保留截断预览到 JSONL，连续超长达到上限后终止任务
@@ -1949,15 +1981,17 @@ async def _run_chat_generation(
                         continue
                     # 正常结果：重置连续超长计数，按原逻辑落盘
                     consecutive_oversized_count = 0
-                    await session_chat_memory.add_chat_history(
-                        input_text={
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "tool_name": tool_name,
-                            "arguments": json.dumps(tool_args, ensure_ascii=False),
-                            "result": ret
-                        }
-                    )
+                    history_record = {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "arguments": json.dumps(tool_args, ensure_ascii=False),
+                        "result": ret
+                    }
+                    if file_diff:
+                        # diff 落盘供历史回放渲染（history_parser 已透传该字段）
+                        history_record["file_diff"] = file_diff
+                    await session_chat_memory.add_chat_history(input_text=history_record)
                     # 发送工具调用结果到前端 SSE
                     tool_ret = {
                         "tool_return": {
@@ -1966,6 +2000,8 @@ async def _run_chat_generation(
                             "result": ret
                         }
                     }
+                    if file_diff:
+                        tool_ret["tool_return"]["file_diff"] = file_diff
                     if tool_name == SUB_AGENT_TOOL_NAME and isinstance(tool_result.get("_sub_agent"), dict):
                         # 子任务最终回复：前端不渲染为普通工具气泡，
                         # 而是在对应子任务块尾部显示"最终回复已返回父智能体"引用条；

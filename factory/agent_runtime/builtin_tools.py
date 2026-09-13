@@ -1,8 +1,9 @@
 """由服务端本地执行的内置工具。"""
 # from __future__ import annotations
-
+from urllib.parse import urlsplit
 import difflib
 import fnmatch
+import hashlib
 # import io
 import json
 import os
@@ -11,6 +12,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Any
+
+
+from memory import file_memory
 
 
 CHECK_TOOL_EXISTS_NAME = "check_tool_exists"
@@ -116,11 +120,14 @@ TODO_TOOL_DEFINITION = {
           "用于跟踪需要多个步骤、较长时间或多次工具调用才能完成的任务。"
           "简单的一次性任务不要使用。"
           "每次调用必须提交完整的 Todo 列表，新的列表会全量覆盖旧列表。"
-          "开始执行某个步骤前将其设为 in_progress，完成后设为 done，"
+          "合并状态变更以减少调用次数：某步骤完成后，在下一次调用中同时把"
+          "它设为 done 并将下一待办步骤设为 in_progress（每步一次调用即可）。"
           "根据实际执行结果及时调整后续步骤。"
           "除非计划发生变化，否则保留已有步骤和已完成步骤。"
           "执行过程中可以新增、删除或调整后续步骤；保持正确步骤的 id 不变。"
           "同一时间最多只能有一个步骤处于 in_progress 状态。"
+          "返回 plan_complete=true 表示全部步骤已完成：直接汇总执行结果答复用户，"
+          "除非需要新建后续计划，否则不要再调用本工具。"
       ),
       "parameters": {
         "type": "object",
@@ -326,7 +333,6 @@ def execute_builtin_tool(
 
 
 # --------------------------- ask_user：向用户提问 ---------------------------
-
 ASK_USER_TOOL_DEFINITION = {
     "type": "function",
     "function": {
@@ -372,7 +378,7 @@ ASK_USER_TOOL_DEFINITION = {
     },
 }
 
-_ASK_MAX_QUESTIONS = 3
+_ASK_MAX_QUESTIONS = 5
 _ASK_MAX_QUESTION_CHARS = 200
 _ASK_MAX_OPTIONS = 6
 _ASK_MAX_OPTION_CHARS = 100
@@ -422,7 +428,6 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
 
 
 # --------------------------- sub_agent：子智能体派发 ---------------------------
-
 # 派发参数长度上限（防超大参数直接进上下文）
 _SUB_AGENT_TASK_MAX_CHARS = 20_000
 
@@ -547,7 +552,9 @@ def execute_ask_user_placeholder(tool_args: dict[str, Any]) -> dict[str, Any]:
 # ------------------- write_file / edit_file：内置文件编辑工具 -------------------
 # 与 MCP sys_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录，
 # worker 进程已 os.chdir），但结果为结构化 dict：除人类可读 message 外携带
-# path/action/changed_bytes 等机器可读字段，为后续文件 diff 功能预留数据基础。
+# path/action/changed_bytes 等机器可读字段；edit/写改类结果另带 _file_diff
+# 顶级键（unified diff + 行数统计，仅前端展示与 JSONL 落盘，不进模型上下文）
+# 与 content_hash（read_file 亦可获取，为阶段 2 文件版本校验预留）。
 
 _WRITE_EDIT_MAX_CHARS = 2 * 1024 * 1024   # 单次写入/替换内容上限（防超大参数）
 _READ_CHUNK = 8 * 1024 * 1024             # 文件读取上限：超过按二进制拒绝前先截断
@@ -632,6 +639,84 @@ def _display_path(path: Path) -> str:
     return str(path).replace("\\", "/")
 
 
+# ------------------- 文件 diff 生成（edit_file / write_file 共用） -------------------
+# diff 仅供前端展示：工具结果先带 _file_diff 顶级键，由 chat_factory / sub_agent
+# 消费时摘取进 SSE 事件与 JSONL 落盘，不进入模型上下文（模型只看 message 中的
+# +N/-M 统计），故 diff 文本可给到较大上限；仍设保险丝防止超大 diff 撑爆 JSONL。
+_FILE_DIFF_MAX_TEXT_CHARS = 256 * 1024   # 新旧文本超过该大小时跳过逐行 diff
+_FILE_DIFF_MAX_DIFF_CHARS = 20000        # diff 文本上限，超限截断
+_FILE_DIFF_CONTEXT_LINES = 2             # hunk 上下文行数
+
+
+def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
+    """生成 unified diff 与行数统计（前端展示用）。
+
+    返回 {diff, lines_added, lines_removed, diff_truncated, diff_skipped}：
+    - 文本超限时整体跳过（diff 置空，diff_skipped=file_too_large）；
+    - diff 超过字符上限时提前截断（diff_truncated=True）；
+    - 新旧文本在比较前统一换行为 \n，展示行不含行尾符。
+    """
+    skipped = {
+        "diff": "",
+        "lines_added": 0,
+        "lines_removed": 0,
+        "diff_truncated": False,
+        "diff_skipped": "file_too_large",
+    }
+    if len(old_text) > _FILE_DIFF_MAX_TEXT_CHARS or len(new_text) > _FILE_DIFF_MAX_TEXT_CHARS:
+        return skipped
+
+    def _norm(text: str) -> list:
+        unified = text.replace("\r\n", "\n").replace("\r", "\n")
+        return unified.splitlines(keepends=True)
+
+    display = _display_path(path)
+    diff_gen = difflib.unified_diff(
+        _norm(old_text),
+        _norm(new_text),
+        fromfile=f"a/{display}",
+        tofile=f"b/{display}",
+        n=_FILE_DIFF_CONTEXT_LINES,
+        lineterm="",
+    )
+    parts: list = []
+    added = removed = 0
+    truncated = False
+    for index, line in enumerate(diff_gen):
+        if index < 2:
+            # --- a/path / +++ b/path 文件头（仅内容有变化时输出）
+            parts.append(line.rstrip("\r\n"))
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+        parts.append(line.rstrip("\r\n"))
+        if sum(len(part) + 1 for part in parts) > _FILE_DIFF_MAX_DIFF_CHARS:
+            truncated = True
+            break
+    if not parts:
+        return {
+            "diff": "",
+            "lines_added": 0,
+            "lines_removed": 0,
+            "diff_truncated": False,
+            "diff_skipped": "unchanged",
+        }
+    return {
+        "diff": "\n".join(parts),
+        "lines_added": added,
+        "lines_removed": removed,
+        "diff_truncated": truncated,
+        "diff_skipped": "",
+    }
+
+
+def _content_hash(text: str) -> str:
+    """内容指纹（阶段 2 文件版本校验预留）：解码后全文的 sha256 前 16 位。"""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
 def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 write_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
     full_file_name = str((tool_args or {}).get("full_file_name") or "").strip()
@@ -650,12 +735,27 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         dir_path.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
     size_before = path.stat().st_size if existed else 0
+    # 旧内容仅用于 diff 生成（成功失败均不中断写入主流程）
+    old_text = ""
+    if existed:
+        old_data = path.read_bytes()[:_READ_CHUNK]
+        if not _is_probably_binary(old_data):
+            old_text, _ = _decode_bytes_used(old_data, "")
     mode = "a" if append else "w"
     with open(path, mode, encoding=encoding, newline="") as file:
         file.write(content)
     action = "追加" if append else "写入"
+    # 追加模式的新文本 = 旧内容 + 新内容（diff 才能正确反映最终文件变化）
+    new_text_for_diff = old_text + content if append else content
+    file_diff = _build_file_diff(old_text, new_text_for_diff, path)
+    hash_note = f"，内容指纹 {_content_hash(content)}" if content else ""
     return {
-        "message": f"[write_file] 已{action} {len(content)} 字符 → {_display_path(path.resolve())}",
+        "message": (
+            f"[write_file] 已{action} {len(content)} 字符 → {_display_path(path.resolve())}"
+            f"{hash_note}"
+            + (f"（diff +{file_diff['lines_added']} -{file_diff['lines_removed']} 行）"
+               if (file_diff["lines_added"] or file_diff["lines_removed"]) and not file_diff["diff_skipped"] else "")
+        ),
         "path": _display_path(path.resolve()),
         "action": "append" if append else "overwrite",
         "created": not existed,
@@ -663,6 +763,8 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "size_after": path.stat().st_size,
         "chars_written": len(content),
         "encoding": encoding,
+        "content_hash": _content_hash(content),
+        "_file_diff": file_diff,
     }
 
 
@@ -670,7 +772,8 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 edit_file 实现：语义对齐 MCP 同名工具，返回结构化结果。
 
     换行归一化匹配 + 原风格写回、0 匹配给最接近候选行提示等行为均与 MCP 版一致；
-    额外返回 replacements/eol_style/encoding/matched_lines 等字段供后续 diff 使用。
+    额外返回 replacements/eol_style/encoding/content_hash 与 _file_diff（unified diff
+    + 行数统计，chat_factory/sub_agent 摘取后仅推送前端与落盘，不进模型上下文）。
     """
     args = tool_args or {}
     old_string = args.get("old_string")
@@ -714,15 +817,22 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             f"old_string 在文件中匹配到 {count} 处，存在歧义；请提供更长的上下文使其唯一，或传 replace_all=true 全部替换"
         )
     updated = text.replace(old_norm, new_norm) if replace_all else text.replace(old_norm, new_norm, 1)
+    file_diff = _build_file_diff(text, updated, path)
     with open(path, "w", encoding=used_encoding, newline="") as file:
         file.write(updated.replace("\n", eol))
     replaced = count if replace_all else 1
     style = "CRLF" if eol == "\r\n" else "LF"
     matched_lines = len(old_norm.split("\n"))
+    diff_note = (
+        f"，diff +{file_diff['lines_added']} -{file_diff['lines_removed']} 行"
+        if not file_diff["diff_skipped"] and (file_diff["lines_added"] or file_diff["lines_removed"])
+        else ""
+    )
     return {
         "message": (
             f"[edit_file] 已在 {_display_path(path)} 中替换 {replaced} 处"
-            f"（换行风格 {style}，编码 {used_encoding}）"
+            f"（换行风格 {style}，编码 {used_encoding}{diff_note}），"
+            f"内容指纹 {_content_hash(updated)}"
         ),
         "path": _display_path(path),
         "action": "replace",
@@ -731,6 +841,8 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "eol_style": style,
         "encoding": used_encoding,
         "matched_lines": matched_lines,
+        "content_hash": _content_hash(updated),
+        "_file_diff": file_diff,
     }
 
 
@@ -849,29 +961,6 @@ SEARCH_FILES_TOOL_DEFINITION = {
 }
 
 
-def _decode_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> tuple:
-    """按候选编码依次尝试严格解码，返回 (文本, 实际使用的编码)。
-    显式指定 encoding 时直接按该编码宽松解码（保证不抛异常）。"""
-    if encoding:
-        return data.decode(encoding, errors="replace"), encoding
-    for candidate in candidates:
-        try:
-            return data.decode(candidate), candidate
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return data.decode(candidates[-1], errors="replace"), candidates[-1]
-
-
-def _is_probably_binary(data: bytes) -> bool:
-    """前 8KB 中出现空字节即视为二进制文件。"""
-    return b"\x00" in data[:8192]
-
-
-def _display_path(path: Path) -> str:
-    """统一用 / 作为路径分隔符展示，避免模型转义反斜杠出错。"""
-    return str(path).replace("\\", "/")
-
-
 def _resolve_dir_path(dir_path: Any) -> Path:
     """解析目录参数：空串回退当前目录（生成任务中即会话工作目录）。"""
     text = str(dir_path).strip() if dir_path else ""
@@ -952,6 +1041,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "char_offset": offset,
             "next_char_offset": next_offset if next_offset < len(line_text) else None,
             "line_length": len(line_text),
+            "content_hash": _content_hash(text),
         }
     if bool(args.get("show_line_numbers", True)):
         width = len(str(start + len(selected) - 1))
@@ -978,6 +1068,9 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "range_end": last_line,
         "truncated": bool(limited or char_limited),
         "has_more": last_line < total,
+        # 全文（非本次区间）的内容指纹：模型可在 edit_file 时以 expected_hash
+        # 引用（阶段 2 版本校验），用于检测读后文件被外部修改的竞态
+        "content_hash": _content_hash(text),
     }
 
 
@@ -1240,12 +1333,9 @@ def _load_network_media_bytes(source: str) -> bytes | None:
 
 def _media_filename_from_reference(source: str, data: bytes) -> str:
     """从媒体来源推导入库文件名；扩展名缺失/可疑时按魔数嗅探校准。"""
-    from memory import file_memory as fm
-
     # 提取文件名：URL 取路径末段（去掉 query）；本地路径取完整文件名
     name = ""
     if source.startswith("http://") or source.startswith("https://"):
-        from urllib.parse import urlsplit
 
         path_part = urlsplit(source).path
         name = Path(path_part).name
@@ -1253,9 +1343,9 @@ def _media_filename_from_reference(source: str, data: bytes) -> str:
         name = Path(source).name
     name = name.strip()
     suffix = Path(name).suffix.lower() if name else ""
-    known = suffix and (fm.media_kind(f"probe{suffix}") is not None)
+    known = suffix and (file_memory.media_kind(f"probe{suffix}") is not None)
     if not known:
-        sniffed = fm._sniff_media_filename(data)
+        sniffed = file_memory._sniff_media_filename(data)
         if sniffed is not None:
             return sniffed
     if not name:
@@ -1276,8 +1366,6 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
     用户授权确认逻辑预留：接入时在本函数入口（下载/读盘前）挂确认钩子，
     当前按"工具由用户提供、无安全边界"策略直接放行。
     """
-    from memory import file_memory as fm
-
     source_text = (source or "").strip()
     try:
         if source_text.startswith("http://") or source_text.startswith("https://"):
@@ -1294,7 +1382,7 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
         return {"ok": False, "error": f"读取媒体失败: {exc}"}
     filename = _media_filename_from_reference(source_text, data)
     try:
-        saved = fm.register_media_source(session_id, filename, data, source_type)
+        saved = file_memory.register_media_source(session_id, filename, data, source_type)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     return {
@@ -1325,21 +1413,17 @@ def load_any_media_model_part(
     审计信息：source_type（"session" / "network" / "local"）与 source
     （本次调用的原始 reference）。
     """
-    from memory import file_memory as fm
-
     source = (reference or "").strip()
-    if source.startswith(fm.MEDIA_URL_SCHEME):
-        info = fm.load_session_media_model_part(session_id, source, quality=quality)
+    if source.startswith(file_memory.MEDIA_URL_SCHEME):
+        info = file_memory.load_session_media_model_part(session_id, source, quality=quality)
         if info is None:
             return None
         return {**info, "source_type": "session", "source": source}
     if source.startswith("http://") or source.startswith("https://"):
         # URL 直传：按扩展名推断 kind/mime；未知扩展名按图片处理。
-        from urllib.parse import urlsplit
-
         name = Path(urlsplit(source).path).name or "remote_media"
-        kind = fm.media_kind(name) or "image"
-        mime = fm.media_mime_type(name) if fm.media_kind(name) else "image/jpeg"
+        kind = file_memory.media_kind(name) or "image"
+        mime = file_memory.media_mime_type(name) if file_memory.media_kind(name) else "image/jpeg"
         part: dict[str, Any]
         if kind == "image":
             part = {"type": "image_url", "image_url": {"url": source}}
@@ -1366,7 +1450,7 @@ def load_any_media_model_part(
     local_path = Path(source)
     if not local_path.is_file():
         return {"error": f"未找到，可能已删除: {source}", "source_type": "local", "source": source}
-    info = fm._media_model_part_from_path(local_path, quality)
+    info = file_memory._media_model_part_from_path(local_path, quality)
     if info is None:
         return {"error": f"读取失败: {source}", "source_type": "local", "source": source}
     # 沿途保留来源审计信息（本地直读不落盘，加载内核不携带）
@@ -1445,7 +1529,6 @@ def execute_read_media(
     references, quality, arg_error = normalize_read_media_args(tool_args)
     if arg_error:
         return {"ok": False, "error": arg_error, "loaded": [], "skipped": [], "injected_references": []}
-    from memory import file_memory as fm
 
     available = {str(item) for item in (available_references or [])}
     injected = {str(item) for item in (already_injected or set())}
@@ -1455,7 +1538,7 @@ def execute_read_media(
         # 本地/网络来源不做白名单拦截；media:// 引用在传入了边界集合时按旧语义过滤
         if (
             available
-            and reference.startswith(fm.MEDIA_URL_SCHEME)
+            and reference.startswith(file_memory.MEDIA_URL_SCHEME)
             and reference not in available
         ):
             skipped.append({"reference": reference, "reason": "not_in_current_task"})
@@ -1475,7 +1558,7 @@ def execute_read_media(
             # media:// 引用解析失败 = 会话媒体库中不存在（引用无效或文件已删除）
             reason = (
                 f"未找到，可能已删除: {reference}"
-                if reference.startswith(fm.MEDIA_URL_SCHEME)
+                if reference.startswith(file_memory.MEDIA_URL_SCHEME)
                 else "load_failed"
             )
             skipped.append({"reference": reference, "reason": reason})

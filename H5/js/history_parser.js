@@ -192,13 +192,16 @@
           return;
         }
         if (evt.role === "tool") {
-          records.push({
+          const toolRec = {
             kind: "toolResult",
             name: evt.tool_name || "tool",
             args: evt.arguments || "",
             result: typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2),
             ts: ts,
-          });
+          };
+          // 内置文件工具的展示用 diff（write_file/edit_file）：透传给渲染层
+          if (evt.file_diff) toolRec.file_diff = evt.file_diff;
+          records.push(toolRec);
           return;
         }
         if (evt.role !== "assistant") return;

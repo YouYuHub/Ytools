@@ -658,13 +658,44 @@ def resolve_message_media_refs(session_id: str, messages: list[Any]) -> list[str
     return unresolved_all
 
 
+def _media_reference_label(part: dict[str, Any]) -> str | None:
+    """把单个媒体部件转为文本口径的占位标注（历史回放/压缩用）。
+
+    - 带可定位引用（media:// 会话相对引用 / http(s) URL / 本地路径）时输出
+      「[图片 media://x.png]」形态——模型可据此调用 read_media 重新查看，
+      不再是纯视觉占位；
+    - base64 内嵌数据（data: 前缀）无引用可用，退回纯类型占位；
+    - 非媒体部件返回 None。
+    """
+    part_type = str(part.get("type") or "")
+    label = MEDIA_PART_LABELS.get(part_type)
+    if not label:
+        return None
+    reference: Any = None
+    if part_type == "image_url":
+        value = part.get("image_url")
+        reference = value.get("url") if isinstance(value, dict) else None
+    elif part_type == "input_audio":
+        value = part.get("input_audio")
+        reference = value.get("data") if isinstance(value, dict) else None
+    elif part_type == "video_url":
+        value = part.get("video_url")
+        reference = value.get("url") if isinstance(value, dict) else None
+    text = str(reference or "").strip()
+    if not text or text.startswith("data:"):
+        return label
+    # 「[图片 media://x.png]」：引用放括号内，便于模型一眼识别为可回读引用
+    return f"[{label.strip('[]')} {text}]"
+
+
 def content_part_to_text(content: Any, include_media_labels: bool = True) -> str:
     """把消息 content 规整为纯文本（历史回放/压缩/标题等文本口径统一入口）。
 
     - 字符串原样返回；
-    - 多部件列表抽取 text 部件；媒体部件默认替换为 [图片]/[音频]/[视频] 占位
-      （历史回放用，提示模型该轮发过媒体），`include_media_labels=False`
-      时跳过媒体部件（轮次问题/会话标题用，只要纯文本）；
+    - 多部件列表抽取 text 部件；媒体部件默认替换为带引用的可回溯占位
+      （如「[图片 media://x.png]」，模型可用 read_media 重新查看；base64
+      内嵌数据退化为「[图片]」纯占位），`include_media_labels=False` 时
+      跳过媒体部件（轮次问题/会话标题用，只要纯文本）；
     - None 返回空串。
     """
     if content is None:
@@ -684,7 +715,7 @@ def content_part_to_text(content: Any, include_media_labels: bool = True) -> str
                 parts.append(part["text"])
                 continue
             if include_media_labels:
-                label = MEDIA_PART_LABELS.get(part_type)
+                label = _media_reference_label(part)
                 if label:
                     parts.append(label)
         return "\n".join(part for part in parts if part.strip())

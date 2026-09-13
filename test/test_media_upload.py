@@ -153,7 +153,11 @@ class MediaResolveTests(unittest.TestCase):
             {"type": "image_url", "image_url": {"url": "media://x.png"}},
             {"type": "input_audio", "input_audio": {"data": "media://y.wav"}},
         ]
-        self.assertEqual(fm.content_part_to_text(parts), "第一行\n[图片]\n[音频]")
+        # 媒体部件占位带 media:// 引用：模型可用 read_media 回读历史图片
+        self.assertEqual(
+            fm.content_part_to_text(parts),
+            "第一行\n[图片 media://x.png]\n[音频 media://y.wav]",
+        )
 
 
 class MediaEstimatorTests(unittest.TestCase):
@@ -259,8 +263,11 @@ class MultimodalHistoryReplayTests(unittest.TestCase):
         messages = round_entry_to_context_messages(round_entry, 0)
         self.assertEqual(messages[0]["role"], "user")
         # 历史轮次用户消息为纯文本口径：媒体部件（media:// 引用）替换为
-        # [图片] 占位引用，不回传图片数据；仅当前轮消息保留多部件并解析
-        self.assertEqual(messages[0]["content"], "这是什么图\n[图片]")
+        # 带引用的占位标注，不回传图片数据；仅当前轮消息保留多部件并解析
+        self.assertEqual(
+            messages[0]["content"],
+            "这是什么图\n[图片 media://abc_def123456.png]",
+        )
         self.assertEqual(messages[1]["role"], "assistant")
 
     def test_message_model_accepts_multimodal_content(self):

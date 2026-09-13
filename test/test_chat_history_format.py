@@ -105,8 +105,12 @@ class ChatHistoryFormatTests(unittest.TestCase):
         messages = round_entry_to_context_messages(round_entry, max_tool_result_length=-1)
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["role"], "user")
-        # 中断轮次的用户消息为纯文本口径：媒体部件替换为 [图片] 占位引用
-        self.assertEqual(messages[0]["content"], "描述这个图片\n[图片]")
+        # 中断轮次的用户消息为纯文本口径：媒体部件替换为带 media:// 引用的
+        # 占位标注（模型可据此用 read_media 回读）
+        self.assertEqual(
+            messages[0]["content"],
+            "描述这个图片\n[图片 media://a.png]",
+        )
 
     def test_stop_task_only_round_still_dropped(self):
         """仅剩"停止任务"的轮次没有可回传内容，不应产生消息。"""

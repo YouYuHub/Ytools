@@ -177,6 +177,7 @@ def build_sys_prompt(include_media_prompt: bool = True) -> str:
     notes = [
         "工具由用户选择提供，你只能使用最近一次 user 角色给你的（如果用户提供了）；之前用过的工具不一定能使用。",
         "任务过程中，你的思考过程只保留最近一次，过程中的重要发现需要实时告诉用户，这也是为了后续任务的连贯性。",
+        "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等形式出现在上下文里（media:// 为会话媒体库的稳定引用）；需要重新查看历史图片/音频时，用 read_media 传入对应 media:// 引用即可。",
         timeout_note,
     ]
     if tool_result_limit > 0:
