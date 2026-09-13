@@ -223,6 +223,7 @@
         res.data && res.data.role_info && res.data.role_info.is_overridden
       );
     });
+    App.refreshChatModelLabel();
     return results.some(function (res) { return res.error; });
   }
 
@@ -359,6 +360,7 @@
       enhancePanel.classList.add("hidden");
       const data = await API.getModels(state.activeModelRole, state.sessionId || undefined);
       if (data) state.modelConfigs[state.activeModelRole] = data;
+      App.refreshChatModelLabel();
       // 仅模型更换才影响 token 估算口径（窗口取自模型定义，参数不影响）：
       // 切换聊天模型后立即刷新统计标签；压缩/标题模型不影响统计，无需刷新
       if (modelChanged && state.activeModelRole === "chat_model") {
@@ -382,6 +384,7 @@
       const data = await API.getModels(state.activeModelRole, state.sessionId);
       if (data) state.modelConfigs[state.activeModelRole] = data;
       state.modelLoadFailed = false;
+      App.refreshChatModelLabel();
       initModelPanel();
       if (state.activeModelRole === "chat_model") {
         App.refreshContextTokenStats(state.sessionId);

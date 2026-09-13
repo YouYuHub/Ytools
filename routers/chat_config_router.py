@@ -595,9 +595,10 @@ def _tool_concurrency_config_payload() -> dict:
             "sub_agent_max_concurrent": "同一父轮并发子智能体数量上限；超出的子任务排队执行",
         },
         "env_names": dict(_TOOL_CONCURRENCY_ENV_NAMES),
+        # 与其他配置端点一致：memory_state 以 .env 变量名为键
         "memory_state": {
-            name: env_manager.env_vars.get(env_name)
-            for name, env_name in _TOOL_CONCURRENCY_ENV_NAMES.items()
+            env_name: env_manager.env_vars.get(env_name)
+            for env_name in _TOOL_CONCURRENCY_ENV_NAMES.values()
         },
     }
 

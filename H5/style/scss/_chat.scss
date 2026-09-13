@@ -63,6 +63,7 @@
     color: var(--text-tertiary);
     font-size: 13px;
     padding: 4px 0;
+    min-width: 0;
 
     &:hover {
       color: var(--text-secondary);
@@ -73,6 +74,25 @@
       height: 14px;
       transition: transform 0.15s ease;
     }
+
+    // 流式期间头部右侧的实时预览行：单行、溢出省略、新行替换旧行；
+    // 仅 is-streaming 态显示（历史回放/已结束的思考不显示），done() 清空内容
+    .think-preview {
+      display: none;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      color: var(--text-secondary);
+      opacity: 0.75;
+      pointer-events: none;
+    }
+  }
+
+  &.is-streaming .think-toggle .think-preview {
+    display: block;
   }
 
   // 展开后箭头转向
@@ -234,6 +254,9 @@
 // 父智能体派发的子任务独立块：标题条（#序号·任务摘要·状态徽标）+
 // 可折叠区（任务/计划/思考/正文/工具轨迹/最终回复）。左侧缩进边框
 // 视觉上区分父子层级。
+
+// 思考复用主区 think-block（默认折叠）；正文区始终显示（空时隐藏标题）；
+// 工具调用复用主区 tool-block（默认折叠）
 .agent-block {
   // 左缩进 18px：宽度同步减去该缩进，避免 100% + 18px 溢出消息区右缘
   width: calc(100% - 18px);

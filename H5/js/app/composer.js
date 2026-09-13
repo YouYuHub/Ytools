@@ -136,25 +136,45 @@
       renderPendingOutbox();
       return;
     }
-    // 消息引导：附件需要先上传才能注入，纯文本直接注入；带附件时回退暂存
+    // 消息引导：纯文本走后端注入接口（下一轮检查点立即生效）；
+    // 多次引导按「空行分隔」合并为同一条用户消息，消费后只发送一次；
+    // 带附件或注入不可用时回退本地暂存（流结束后作为一条消息派发）
+    let injected = false;
     if (!mediaSnapshot.length && state.sessionId) {
+      // 已有同会话待注入消息：把新输入拼接进去，消费时作为一条完整消息注入
+      const pending = state.injectedPending;
+      const hasPending = Boolean(pending && pending.sessionId === state.sessionId && pending.text);
+      const mergedText = hasPending ? pending.text + "\n\n" + text : text;
       try {
-        const res = await API.injectMessage(state.sessionId, text);
+        const res = await API.injectMessage(state.sessionId, mergedText);
         if (res && res.ok) {
-          // 先在消息框上方挂"待注入"提示；气泡等后端 SSE message_injected
-          // 事件（检查点消费）再插入——那一刻节点末尾恰好在当前轮工具结果
-          // 之后，位置与后端 messages 顺序一致
-          state.injectedPending = { sessionId: state.sessionId, text: text };
+          if (hasPending) {
+            // 后端队列里的旧消息已被合并版取代：撤回旧的避免同内容重复注入
+            try { await API.cancelInjectMessage(state.sessionId, pending.text); } catch (_) { /* 撤回失败仅可能瞬时双条，下次检查点逐条消费不丢失 */ }
+          }
+          // 气泡等后端 SSE message_injected 事件（检查点消费）再插入
+          state.injectedPending = { sessionId: state.sessionId, text: mergedText };
           renderPendingOutbox();
-          toast("已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
-          return;
+          toast(hasPending
+            ? "引导内容已合并（空行分隔），消费时作为一条用户消息注入"
+            : "已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
+          injected = true;
         }
         // 任务未运行/注入失败：回退本地暂存（流结束后派发）
       } catch (_) { /* 网络异常同样回退暂存 */ }
     }
-    const replaced = Boolean(state.steerMessage);
-    state.steerMessage = message;
-    toast(replaced ? "已替换消息引导内容，回复结束后发送" : "已设为消息引导，当前回复结束后立即发送");
+    if (injected) return;
+    // 本地暂存合并：同会话已有引导未派发时，新输入以空行拼进同一条、附件并入
+    const prevSteer = (state.steerMessage && state.steerMessage.sessionId === state.sessionId)
+      ? state.steerMessage : null;
+    state.steerMessage = {
+      text: prevSteer && prevSteer.text ? prevSteer.text + "\n\n" + text : text,
+      media: (prevSteer && prevSteer.media ? prevSteer.media : []).concat(mediaSnapshot),
+      sessionId: state.sessionId,
+    };
+    toast(prevSteer
+      ? "引导内容已合并（空行分隔），当前回复结束后一起发送"
+      : "已设为消息引导，当前回复结束后立即发送");
     renderPendingOutbox();
   }
 
@@ -178,7 +198,8 @@
     rows.forEach(function (row) {
       const item = el("div", "pending-outbox-item");
       item.appendChild(el("span", "pending-outbox-badge", row.label));
-      item.appendChild(el("span", "pending-outbox-text", row.message.text || "[图片/附件]"));
+      // 收尾空白会进入省略号前的可见文本（看起来内容很长），显示前裁掉
+      item.appendChild(el("span", "pending-outbox-text", (row.message.text || "").trim() || "[图片/附件]"));
       // 立即发送：当前会话流式中则打断该轮（后端收尾 + 本地中止），以本条消息
       // 立即开启新一轮；无进行中的流时直接派发（与自动 flush 同链路）
       const sendNow = el("button", "pending-outbox-send", "发送");
@@ -239,7 +260,7 @@
       const item = el("div", "pending-outbox-item injected");
       item.title = "已提交后端，将在本轮工具结果处理后注入上下文";
       item.appendChild(el("span", "pending-outbox-badge", "引导"));
-      item.appendChild(el("span", "pending-outbox-text", state.injectedPending.text || ""));
+      item.appendChild(el("span", "pending-outbox-text", (state.injectedPending.text || "").trim() || "[图片/附件]"));
       const remove = el("button", "pending-outbox-remove", "×");
       remove.type = "button";
       remove.title = "撤回并放回输入框修改";

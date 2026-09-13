@@ -691,6 +691,7 @@ html[data-theme=dark] .panel .session-list .session-item.active {
   color: var(--text-tertiary);
   font-size: 13px;
   padding: 4px 0;
+  min-width: 0;
 }
 .think-block .think-toggle:hover {
   color: var(--text-secondary);
@@ -699,6 +700,21 @@ html[data-theme=dark] .panel .session-list .session-item.active {
   width: 14px;
   height: 14px;
   transition: transform 0.15s ease;
+}
+.think-block .think-toggle .think-preview {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  pointer-events: none;
+}
+.think-block.is-streaming .think-toggle .think-preview {
+  display: block;
 }
 .think-block.open .think-toggle .icon {
   transform: rotate(90deg);
@@ -2247,7 +2263,7 @@ html[data-theme=dark] .codeblock code.language-c, html[data-theme=dark] .token.l
   display: none;
 }
 .context-token-status .context-token-todo-slot {
-  flex: 1 1 0;
+  flex: 0 1 auto;
   min-width: 0;
   text-align: left;
 }
@@ -2278,6 +2294,23 @@ html[data-theme=dark] .codeblock code.language-c, html[data-theme=dark] .token.l
 @media (max-width: 420px) {
   .context-token-status .context-token-workdir {
     flex-basis: 42%;
+  }
+}
+.context-token-status .context-token-model {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+.context-token-status .context-token-model:hover {
+  color: var(--text-secondary);
+}
+@media (max-width: 768px) {
+  .context-token-status .context-token-model {
+    display: none;
   }
 }
 .context-token-status .context-token-workdir-editor {
@@ -2608,6 +2641,18 @@ html:not([data-theme=dark]) #voiceBtn {
   flex-direction: column;
   gap: 6px;
   margin-bottom: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.pending-outbox::-webkit-scrollbar {
+  width: 8px;
+}
+.pending-outbox::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+.pending-outbox::-webkit-scrollbar-track {
+  background: transparent;
 }
 .pending-outbox .pending-outbox-item {
   display: flex;
@@ -4475,6 +4520,42 @@ html:not([data-theme=dark]) #voiceBtn {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.skills-modal .skills-toolbar .skills-rename-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-input, var(--bg-elevated));
+  border: 1px solid #0b84d8;
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+.skills-modal .skills-toolbar .skills-rename-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.skills-modal .skills-toolbar .skills-rename-btn .icon {
+  width: 14px;
+  height: 14px;
+}
+.skills-modal .skills-toolbar .skills-rename-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.skills-modal .skills-toolbar .skills-rename-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .skills-modal .skills-tabs {
   display: flex;

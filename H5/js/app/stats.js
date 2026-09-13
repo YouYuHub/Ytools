@@ -7,8 +7,36 @@
 (function (App) {
   "use strict";
   const {
-    state, tokenTotal, contextTokenStatus, contextTokenSummary
+    state, tokenTotal, contextTokenStatus, contextTokenSummary,
+    contextTokenModel
   } = App;
+
+  // ---------- 当前会话聊天模型名（状态条中部占位） ----------
+  // 反映服务端生效的聊天模型选择：会话切换/新建会话/模型面板加载保存后调用。
+  // 无缓存或显式传入会话（切换会话）时拉取一次 /chat_config/models?role=chat_model，
+  // 之后复用缓存；会话独立选择与全局默认已由后端合并进 role_info.selection。
+  async function refreshChatModelLabel(sessionId) {
+    if (!contextTokenModel) return;
+    const target = sessionId ? SessionUtils.sanitizeSessionId(sessionId) : state.sessionId;
+    // 无缓存 / 显式切换会话 / 新建会话（target 为空=取全局默认）时强制拉取，
+    // 避免沿用上一会话的独立选择缓存
+    if (!state.modelConfigs || !state.modelConfigs.chat_model || sessionId || !target) {
+      try {
+        const data = await API.getModels("chat_model", target || undefined);
+        if (data) {
+          state.modelConfigs = state.modelConfigs || {};
+          state.modelConfigs.chat_model = data;
+        }
+      } catch (_) { /* 拉取失败保留现有显示 */ }
+    }
+    const cfg = state.modelConfigs && state.modelConfigs.chat_model;
+    const sel = cfg && cfg.role_info && cfg.role_info.selection;
+    const name = sel ? (sel.model || sel.model_name || "") : "";
+    contextTokenModel.textContent = name;
+    contextTokenModel.title = name ? "当前聊天模型：" + name : "";
+    contextTokenModel.classList.toggle("hidden", !name);
+  }
+  App.refreshChatModelLabel = refreshChatModelLabel;
 
   // ---------- token 统计 ----------
   // 用量归一化 / 文案见 FormatUtils（js/format_utils.js）

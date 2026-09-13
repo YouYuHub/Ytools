@@ -507,6 +507,10 @@
     const wrap = el("div", "think-block");
     const toggle = el("button", "think-toggle");
     toggle.innerHTML = '<span class="think-dots"><i></i><i></i><i></i></span><svg class="icon" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg><span>思考过程</span>';
+    // 实时预览行：流式期间在「思考过程」右侧显示最新一行思考（0.2s 节流，
+    // 新行替换旧行）；思考结束/权威回放时清除，收尾保持折叠头原样
+    const preview = el("span", "think-preview");
+    toggle.appendChild(preview);
     const content = el("div", "think-content");
     toggle.addEventListener("click", function () { wrap.classList.toggle("open"); });
     // 展开态下双击显示区域即可折叠（展开仍走头部按钮）
@@ -514,12 +518,71 @@
     content.addEventListener("dblclick", function () { wrap.classList.remove("open"); });
     wrap.appendChild(toggle);
     wrap.appendChild(content);
+
+    let lastPreview = "";
+    let lastPreviewAt = 0;
+    let previewTimer = null;
+    const PREVIEW_THROTTLE_MS = 200;
+
+    // 取累积文本的最后一个非空行作为预览（新行替代旧行）；全部空白则清空
+    function latestLine() {
+      const text = content.textContent;
+      let tail = "";
+      for (let i = text.length - 1; i >= 0; i--) {
+        const ch = text[i];
+        if (ch === "\n" || ch === "\r") {
+          if (tail) break;
+          continue;
+        }
+        tail = ch + tail;
+      }
+      return tail.trim();
+    }
+
+    function renderPreview() {
+      const line = latestLine();
+      if (!line) {
+        preview.textContent = "";
+        preview.title = "";
+        return;
+      }
+      preview.textContent = line;
+      preview.title = line;
+      lastPreview = line;
+      lastPreviewAt = Date.now();
+    }
+
+    function schedulePreview() {
+      const elapsed = Date.now() - lastPreviewAt;
+      if (elapsed >= PREVIEW_THROTTLE_MS) {
+        renderPreview();
+        return;
+      }
+      if (previewTimer) return;
+      previewTimer = setTimeout(function () {
+        previewTimer = null;
+        renderPreview();
+      }, PREVIEW_THROTTLE_MS - elapsed);
+    }
+
+    function clearPreview() {
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+      }
+      preview.textContent = "";
+      preview.title = "";
+      lastPreview = "";
+      lastPreviewAt = 0;
+    }
+
     return {
       wrap: wrap,
-      setText: function (t) { content.textContent = t; },
-      add: function (delta) { content.textContent += delta; },
+      setText: function (t) { content.textContent = t; schedulePreview(); },
+      add: function (delta) { content.textContent += delta; schedulePreview(); },
+      textContent: function () { return content.textContent; },
       streaming: function () { wrap.classList.add("is-streaming"); },
-      done: function () { wrap.classList.remove("is-streaming"); },
+      done: function () { clearPreview(); wrap.classList.remove("is-streaming"); },
     };
   }
 
@@ -701,7 +764,7 @@
 
     let taskSummary = "";
     let todoItems = null;
-    let rounds = [];          // [{seq, el, reasoningPre, contentEl, toolEntries: Map}]
+    let rounds = [];          // [{seq, el, thinkBlock, contentLabel, contentEl, toolEntries: Map}]
     let status = "running";
     let finalReplyText = "";
     let usageTotal = null;
@@ -754,68 +817,93 @@
       return null;
     }
 
-    /** model_call：新开一轮分区（思考弱化区 + 正文区 + 工具轨迹容器）。 */
-    function beginRound(evt) {
+    /** model_call：新开一轮分区。思考复用主区 think-block（默认折叠+流式
+     * 三点动画），正文区始终显示（空时隐藏标题），工具行复用
+     * 主区 tool-block（默认折叠）。authoritative=true 表示来自 model_call
+     * 权威整轮数据（或历史回放）：思考/正文按整轮数据替换（delta 流式期间
+     * 已实时显示同内容），避免重复叠加。 */
+    function beginRound(evt, authoritative) {
       let round = findRound(evt.seq);
+      if (!round && evt.seq != null && rounds.length) {
+        const last = rounds[rounds.length - 1];
+        // 兼容旧流：无 seq 的 delta 先建隐式轮，后续 model_call 认领归位
+        if (last.seq == null && !last.hydrated) {
+          last.seq = evt.seq;
+          const labelEl = last.el.querySelector(".agent-round-label");
+          if (labelEl) labelEl.textContent = "第 " + evt.seq + " 轮";
+          round = last;
+        }
+      }
       if (!round) {
         const section = el("div", "agent-round");
         if (rounds.length) section.appendChild(el("div", "agent-round-divider"));
         section.appendChild(el("div", "agent-round-label", "第 " + (evt.seq != null ? evt.seq : rounds.length + 1) + " 轮"));
-        const reasoningLabel = el("div", "agent-label agent-label-think", "思考");
-        const reasoningPre = el("pre", "agent-pre agent-think");
-        const contentLabel = el("div", "agent-label", "正文");
+        const thinkBlock = buildThinkBlock();          // 思考：默认折叠 + 流式三点
+        const contentLabel = el("div", "agent-label is-empty", "正文"); // 正文始终显示，无内容隐藏标题
         const contentEl = el("div", "agent-content");
         const toolsWrap = el("div", "agent-tools");
-        section.appendChild(reasoningLabel);
-        section.appendChild(reasoningPre);
+        section.appendChild(thinkBlock.wrap);
         section.appendChild(contentLabel);
         section.appendChild(contentEl);
         section.appendChild(toolsWrap);
-        round = { seq: evt.seq, el: section, reasoningPre: reasoningPre, contentEl: contentEl, toolsWrap: toolsWrap, toolEntries: new Map() };
+        round = {
+          seq: evt.seq,
+          el: section,
+          thinkBlock: thinkBlock,
+          contentLabel: contentLabel,
+          contentEl: contentEl,
+          contentText: "",
+          toolsWrap: toolsWrap,
+          toolEntries: new Map(),
+          hydrated: false,
+        };
         rounds.push(round);
         body.appendChild(section);
       }
       if (typeof evt.reasoning_content === "string" && evt.reasoning_content) {
-        round.reasoningPre.textContent += evt.reasoning_content;
-        round.reasoningLabel = round.el.querySelector(".agent-label-think");
-      } else {
-        // 无思考内容：隐藏思考占位，避免空标题
-        const thinkLabel = round.el.querySelector(".agent-label-think");
-        if (thinkLabel && !round.reasoningPre.textContent) thinkLabel.classList.add("is-empty");
+        // 替换式写入：与 delta 流式期间累积的内容一致，防止重复叠加
+        round.thinkBlock.setText(evt.reasoning_content);
+        round.thinkBlock.wrap.classList.remove("is-empty");
+      } else if (authoritative && !round.thinkBlock.textContent()) {
+        round.thinkBlock.wrap.classList.add("is-empty");
       }
       if (typeof evt.content === "string" && evt.content) {
+        round.contentText = evt.content;
         round.contentEl.innerHTML = Markdown.render(evt.content);
+        round.contentLabel.classList.remove("is-empty");
         App.highlightCodeBlocks(round.contentEl);
         App.updateCodeblockCopyButtons();
-      } else if (!round.contentEl.textContent && !(evt.content == null)) {
-        round.contentEl.classList.add("is-empty");
+      } else if (authoritative && !round.contentText) {
+        round.contentLabel.classList.add("is-empty");
       }
       (evt.tool_calls || []).forEach(function (call) {
         const fn = call.function || {};
-        addToolLine(round, fn.name || call.name || "tool", fn.arguments || "", null, null);
+        const entry = addToolLine(round, fn.name || call.name || "tool", fn.arguments || "", null);
+        // tool_calls 声明行登记：tool_start/tool_result 按 id 回填，避免重复建行
+        if (call.id && !round.toolEntries.has(call.id)) round.toolEntries.set(call.id, entry);
       });
+      if (authoritative) {
+        round.hydrated = true;
+        round.thinkBlock.done(); // 权威数据到达：清除流式三点指示
+      }
       return round;
     }
 
-    /** 轮内工具轨迹行（tool_calls 声明 / tool_start / tool_result 共用）。 */
-    function addToolLine(round, name, argsText, resultText, opts) {
-      const line = el("div", "agent-tool-line");
-      const nameEl = el("span", "agent-tool-name", name);
-      const argsPre = el("pre", "agent-pre agent-tool-args");
-      argsPre.textContent = argsText || "";
-      line.appendChild(nameEl);
-      line.appendChild(argsPre);
-      let resultPre = null;
-      if (resultText != null) {
-        resultPre = el("pre", "agent-pre agent-tool-result");
-        resultPre.textContent = resultText;
-        line.appendChild(resultPre);
-      }
-      if (opts && opts.pending) {
-        line.classList.add("is-pending");
-      }
-      round.toolsWrap.appendChild(line);
-      return { line: line, resultPre: resultPre };
+    /** 参数文本统一序列化：tool_start.arguments / model_call tool_calls 可能是对象。 */
+    function normalizeArgsText(argsText) {
+      if (argsText == null) return "";
+      if (typeof argsText === "string") return argsText;
+      try { return JSON.stringify(argsText, null, 2); } catch (e) { return String(argsText); }
+    }
+
+    /** 轮内工具行：复用主区 tool-block（头部折叠，主体=输入/输出），返回
+     * 与主区一致的 ui 控制器（tool_start 标执行中 / tool_result 填结果）。 */
+    function addToolLine(round, name, argsText, resultText) {
+      const block = buildToolBlock(name);
+      if (argsText != null && argsText !== "") block.setInput(normalizeArgsText(argsText));
+      if (resultText != null) block.setOutput(resultText);
+      round.toolsWrap.appendChild(block.wrap);
+      return block;
     }
 
     function findToolEntry(round, toolCallId) {
@@ -827,37 +915,61 @@
       return rounds.length ? rounds[rounds.length - 1] : null;
     }
 
-    /** SSE phase=delta：实时追加到最新轮（无轮则建隐式轮）。 */
+    /** 流式期间正文 md 节流重渲染：与主消息区一致用 Markdown.render 全量重建，
+     * 但按帧直接渲染会高频重排（每块含代码高亮/复制按钮重建），40ms 合并一次。 */
+    function scheduleContentRender(round) {
+      if (round.contentRenderTimer) return;
+      round.contentRenderTimer = setTimeout(function () {
+        round.contentRenderTimer = null;
+        if (round.contentText) {
+          round.contentEl.innerHTML = Markdown.render(round.contentText);
+          App.highlightCodeBlocks(round.contentEl);
+          App.updateCodeblockCopyButtons();
+        }
+      }, 40);
+    }
+
+    /** SSE phase=delta：实时追加到所属轮；seq 已知但轮未建时先建隐式轮占位
+     * （新一轮 delta 先于 model_call 到达，不能落进上一轮）。 */
     function appendLiveDelta(evt) {
-      let round = currentRoundBySeq(evt);
-      if (!round) {
-        round = beginRound({ seq: null });
-      }
+      const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq != null ? evt.seq : null });
       const rc = typeof evt.reasoning_delta === "string" ? evt.reasoning_delta : "";
       const ct = typeof evt.content_delta === "string" ? evt.content_delta : "";
       if (rc) {
-        round.reasoningPre.textContent += rc;
-        scrollToPreBottom(round.reasoningPre);
+        round.thinkBlock.wrap.classList.remove("is-empty");
+        round.thinkBlock.add(rc);
+        round.thinkBlock.streaming();
       }
       if (ct) {
-        round.contentEl.textContent += ct;
-        round.contentEl.scrollTop = round.contentEl.scrollHeight;
+        round.contentText = (round.contentText || "") + ct;
+        round.contentLabel.classList.remove("is-empty");
+        round.contentEl.classList.remove("is-empty");
+        scheduleContentRender(round);
       }
+      autoOpen();
     }
 
     function currentRoundBySeq(evt) {
-      if (evt.seq != null) {
-        const match = findRound(evt.seq);
-        if (match) return match;
-      }
+      // seq 已知：严格匹配所属轮（找不到交给调用方建隐式轮），避免串轮
+      if (evt.seq != null) return findRound(evt.seq);
+      // 旧流兼容：无 seq 的 delta 落到最新轮（无轮由调用方建隐式轮）
       return rounds.length ? rounds[rounds.length - 1] : null;
     }
 
-    /** tool_start：执行中占位行（tool_result 到达时回填）。 */
+    /** tool_start：执行中占位行（tool_result 到达时回填）。
+     * 后端字段为 function_name（旧数据兼容 tool_name）；若 model_call 已按
+     * tool_calls 预建声明行，则复用该块并标执行中，避免重复。 */
     function addToolEntry(evt) {
       const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq });
-      const entry = addToolLine(round, evt.tool_name || "tool", evt.arguments || "", null, { pending: true });
-      if (evt.tool_call_id) round.toolEntries.set(evt.tool_call_id, entry);
+      const toolCallId = evt.tool_call_id || "";
+      let entry = findToolEntry(round, toolCallId);
+      if (entry) {
+        entry.executing();
+        return;
+      }
+      entry = addToolLine(round, evt.function_name || evt.tool_name || "tool", evt.arguments, null);
+      entry.executing();
+      if (toolCallId) round.toolEntries.set(toolCallId, entry);
     }
 
     /** tool_result：按 tool_call_id 回填结果（缺 start 时补建整行）。 */
@@ -865,18 +977,12 @@
       const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq });
       let entry = findToolEntry(round, evt.tool_call_id);
       if (!entry) {
-        entry = addToolLine(round, evt.tool_name || "tool", evt.arguments || "", null, {});
+        entry = addToolLine(round, evt.tool_name || "tool", evt.arguments, null);
         if (evt.tool_call_id) round.toolEntries.set(evt.tool_call_id, entry);
       }
-      entry.line.classList.remove("is-pending");
+      entry.finish();
       const resultText = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2);
-      if (entry.resultPre) {
-        entry.resultPre.textContent = resultText;
-      } else {
-        entry.resultPre = el("pre", "agent-pre agent-tool-result");
-        entry.resultPre.textContent = resultText;
-        entry.line.appendChild(entry.resultPre);
-      }
+      entry.setOutput(resultText);
     }
 
     function renderTodo(items) {
@@ -916,9 +1022,26 @@
       finalReplyText = evt && typeof evt.final_reply === "string" ? evt.final_reply : finalReplyText;
       usageTotal = evt && evt.usage_total && typeof evt.usage_total === "object" ? evt.usage_total : usageTotal;
       errorText = evt && typeof evt.error === "string" ? evt.error : errorText;
-      // 收尾区：最终回复（受众是父智能体，按纯文本展示）
+      // 收尾清理：未到达 model_call 的轮次清掉思考流式三点；
+      // 待渲染的正文 md 定时器立即刷出（避免 done 先于 40ms 节流到达丢字）
+      rounds.forEach(function (r) {
+        r.thinkBlock.done();
+        if (r.contentRenderTimer) {
+          clearTimeout(r.contentRenderTimer);
+          r.contentRenderTimer = null;
+          if (r.contentText) {
+            r.contentEl.innerHTML = Markdown.render(r.contentText);
+            App.highlightCodeBlocks(r.contentEl);
+            App.updateCodeblockCopyButtons();
+          }
+        }
+      });
+      // 收尾区：最终回复（按 md 渲染；模型产出多为结构化文本，可读性更好）
       if (finalReplyText) {
-        appendLabeledPre("最终回复 → 父智能体", "agent-final-reply").textContent = finalReplyText;
+        const finalPre = appendLabeledPre("最终回复 → 父智能体", "agent-final-reply");
+        finalPre.innerHTML = Markdown.render(finalReplyText);
+        App.highlightCodeBlocks(finalPre);
+        App.updateCodeblockCopyButtons();
       }
       if (usageTotal && Number(usageTotal.total_tokens) > 0) {
         body.appendChild(el("div", "agent-usage", FormatUtils.usageText(usageTotal)));
@@ -960,7 +1083,7 @@
           return;
         }
         if (phase === "delta") { appendLiveDelta(evt); return; }
-        if (phase === "model_call") { beginRound(evt); return; }
+        if (phase === "model_call") { beginRound(evt, true); return; }
         if (phase === "tool_start") { addToolEntry(evt); return; }
         if (phase === "tool_result") { fillToolEntry(evt); return; }
         if (phase === "todo") {
@@ -976,7 +1099,7 @@
         (record.entries || []).forEach(function (entry) {
           const evt = Object.assign({}, entry, { phase: entry.phase });
           if (entry.phase === "model_call") {
-            beginRound(evt);
+            beginRound(evt, true);
           } else if (entry.phase === "tool_start") {
             addToolEntry(evt);
           } else if (entry.phase === "tool_result") {

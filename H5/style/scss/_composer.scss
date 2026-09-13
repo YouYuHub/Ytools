@@ -41,9 +41,10 @@
     }
   }
 
-  // 左侧占位：预留给 todo 按钮，同时把摘要推向居中
+  // 左侧占位：预留给 todo 按钮（收缩自适应，不吃自由空间，
+  // 让模型名的盒子从 todo 控件右缘一直延伸到 token 摘要，实现真正居中）
   .context-token-todo-slot {
-    flex: 1 1 0;
+    flex: 0 1 auto;
     min-width: 0;
     text-align: left;
   }
@@ -79,6 +80,26 @@
 
     @media (max-width: 420px) {
       flex-basis: 42%;
+    }
+  }
+
+  // 当前会话聊天模型名：与 todo 槽对半共享中部空隙并居中显示，
+  // 长名溢出省略（title 看全名）；小屏收起，避免挤压 token 摘要与路径
+  .context-token-model {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+    color: var(--text-tertiary);
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+
+    @media (max-width: 768px) {
+      display: none;
     }
   }
 
@@ -519,7 +540,8 @@ html:not([data-theme="dark"]) #voiceBtn {
 
 // ---------- 引导 / 队列消息暂存指示器 ----------
 // 显示在输入框上方（flex-wrap 换行占满一整行，不挤入输入行）：
-// 引导条目 + 队列条目，可立即发送或移除放回输入框修改
+// 引导条目 + 队列条目，可立即发送或移除放回输入框修改；
+// 多条多行时整体限高滚动，避免把 composer 撑得过高遮住消息区
 .pending-outbox {
   order: 0;
   flex-basis: 100%;
@@ -527,6 +549,22 @@ html:not([data-theme="dark"]) #voiceBtn {
   flex-direction: column;
   gap: 6px;
   margin-bottom: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+
+  // 自定义细滚动条（panel-scrollbar mixin 定义在 components，此处不可引用）
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 4px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
 
   .pending-outbox-item {
     display: flex;

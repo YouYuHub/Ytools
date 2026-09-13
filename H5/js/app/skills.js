@@ -25,6 +25,8 @@
   const newOkBtn = $("#skillsNewOk");
   const newCancelBtn = $("#skillsNewCancel");
   const fileNameLabel = $("#skillsFileName");
+  const renameBtn = $("#skillsRenameBtn");
+  const renameInput = $("#skillsRenameInput");
   const tabPreview = $("#skillsTabPreview");
   const tabEdit = $("#skillsTabEdit");
   const deleteBtn = $("#skillsDeleteBtn");
@@ -133,6 +135,7 @@
     saveBtn.disabled = none;
     loadBtn.disabled = none;
     deleteBtn.disabled = none;
+    renameBtn.disabled = none;
   }
 
   // ---------- 数据动作 ----------
@@ -159,6 +162,8 @@
   }
 
   async function selectFile(name) {
+    resetDeleteArm(); // 切换文件必须撤掉上一个文件的删除确认态（防误删新选中文件）
+    resetRenameEdit();
     stashDraft(); // 保存当前文件的未保存修改（无修改时是 no-op）
     try {
       let content;
@@ -432,6 +437,64 @@
     }
   }
 
+  // ---------- 重命名（笔图标 → 内联输入框；Enter 确认 / Esc 取消） ----------
+  let renaming = false;
+
+  // 退出重命名态恢复原 UI（未开始时是 no-op）
+  function resetRenameEdit() {
+    if (!renaming) return;
+    renaming = false;
+    renameInput.classList.add("hidden");
+    renameInput.value = "";
+    renameBtn.classList.remove("hidden");
+    fileNameLabel.classList.remove("hidden");
+  }
+
+  function startRename() {
+    if (currentName == null || renaming) return;
+    resetDeleteArm(); // 重命名期间取消删除确认态，避免误触
+    renaming = true;
+    fileNameLabel.classList.add("hidden");
+    renameBtn.classList.add("hidden");
+    renameInput.value = stemOf(currentName);
+    renameInput.classList.remove("hidden");
+    renameInput.focus();
+    renameInput.select();
+  }
+
+  async function confirmRename() {
+    if (!renaming) return; // blur 与 Enter 双触发只执行一次
+    const oldName = currentName;
+    const raw = renameInput.value.trim();
+    if (!oldName || !raw || stemOf(oldName) === raw) {
+      // 名称没变或为空：视为取消
+      resetRenameEdit();
+      return;
+    }
+    renaming = false;
+    renameInput.classList.add("hidden");
+    try {
+      const data = await API.renamePrompt(oldName, raw);
+      const newName = (data && data.name) || (raw + ".md");
+      // 未保存草稿跟随迁移；编辑器内容不变（基线仍是同一份文件内容）
+      if (drafts.has(oldName)) {
+        drafts.set(newName, drafts.get(oldName));
+        drafts.delete(oldName);
+      }
+      currentName = newName;
+      fileNameLabel.textContent = newName;
+      toast("已重命名为 " + newName);
+      await refreshList(true); // 重建列表缓存（旧名条目已不存在）
+      refreshDirtyUi();
+    } catch (err) {
+      toast("重命名失败：" + err.message);
+    } finally {
+      renameBtn.classList.remove("hidden");
+      fileNameLabel.classList.remove("hidden");
+      renameInput.value = "";
+    }
+  }
+
   async function createNew() {
     const raw = newNameInput.value.trim();
     if (!raw) { toast("请先输入提示词名称"); newNameInput.focus(); return; }
@@ -571,6 +634,18 @@
   saveBtn.addEventListener("click", saveCurrent);
   deleteBtn.addEventListener("click", deleteCurrent);
   loadBtn.addEventListener("click", loadToComposer);
+
+  // 重命名：笔图标进入编辑；Enter/失焦确认，Esc 取消
+  renameBtn.addEventListener("click", startRename);
+  renameInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      confirmRename();
+    } else if (e.key === "Escape") {
+      resetRenameEdit();
+    }
+  });
+  renameInput.addEventListener("blur", confirmRename);
 
   // ---------- 上传本地文件为提示词 ----------
   // 选择后读取文本内容，以「同名 + .md」新建提示词；成功后立即选中该文件

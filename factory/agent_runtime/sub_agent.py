@@ -412,10 +412,12 @@ class SubAgentRunner:
                 function_call_delta = event.get("function_call")
                 if content:
                     full_response += content
-                    await self._emit("delta", content_delta=content)
+                    # seq 与本轮 model_call/tool_* 对齐：前端按 seq 归位轮次，
+                    # 避免 delta 先于 model_call 到达时轮次错位/重复分区
+                    await self._emit("delta", content_delta=content, seq=self._seq)
                 if reasoning_content:
                     full_reasoning += reasoning_content
-                    await self._emit("delta", reasoning_delta=reasoning_content)
+                    await self._emit("delta", reasoning_delta=reasoning_content, seq=self._seq)
                 if tool_calls_delta:
                     merge_tool_call_delta(tool_calls, tool_calls_delta)
                     if tool_call_stream_timeout > 0:
@@ -454,9 +456,7 @@ class SubAgentRunner:
         plan = prepare_tool_execution(normalized, known_tool_names)
         parsed_tools = [item for item in plan.parsed_tools if item[2] in ctx.tool_servers]
         blocked_tools = [item for item in plan.parsed_tools if item[2] not in ctx.tool_servers]
-
         results: list[dict[str, Any]] = []
-
         # 未授权工具：立即拒绝（不推送 tool_start）
         for idx, tc, tn, ta in blocked_tools:
             results.append({
@@ -467,7 +467,6 @@ class SubAgentRunner:
                 "result": f"工具 {tn} 未在子任务工具列表中，禁止调用（子智能体不支持再派发子任务）",
                 "error": None,
             })
-
         builtin_results: list[tuple[int, dict, str, dict, Any]] = []
         external_tools: list[tuple[int, dict, str, dict]] = []
         for idx, tc, tn, ta in parsed_tools:
@@ -510,7 +509,6 @@ class SubAgentRunner:
                 builtin_results.append((idx, tc, tn, ta, file_tool_result))
                 continue
             external_tools.append((idx, tc, tn, ta))
-
         # tool_start 事件（内置 + 外部统一推送；被拦截的不推送）
         for idx, tc, tn, ta in parsed_tools:
             await self._emit(
@@ -520,13 +518,11 @@ class SubAgentRunner:
                 arguments=ta,
                 seq=self._seq,
             )
-
         for idx, tc, tn, ta, result in builtin_results:
             results.append({
                 "index": idx, "tool_call": tc, "tool_name": tn,
                 "tool_args": ta, "result": result, "error": None,
             })
-
         if external_tools:
             max_workers = max(1, min(3, len(external_tools)))
             mcp_results = await asyncio.to_thread(
@@ -536,12 +532,10 @@ class SubAgentRunner:
                 max_workers=max_workers,
             )
             results.extend(mcp_results)
-
         results.sort(key=lambda item: item["index"])
         return results
 
     # ----------------------------- 主循环 -----------------------------
-
     async def run(self) -> SubAgentResult:
         try:
             return await self._run_inner()
@@ -593,12 +587,10 @@ class SubAgentRunner:
             await self._emit_start()
             await self._emit_done("error", detail, detail)
             return self._make_result()
-
         await self._emit_start()
         compaction_settings = load_context_compaction_settings()
         oversized_threshold = resolve_oversized_result_token_threshold(compaction_settings)
         max_oversized_rejections = compaction_settings.max_oversized_rejections
-
         while True:
             # ---- 停止条件检查（每轮顶部）----
             if ctx.cancel_token.is_set():
@@ -622,11 +614,9 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("max_rounds")
                 await self._emit_done("max_rounds", self._final_reply, None)
                 return self._make_result()
-
             self.rounds += 1
             self._seq += 1
             call = await self._model_call()
-
             if call["stream_error"] is not None:
                 detail = f"子任务模型流式响应出错：{call['stream_error']}"
                 self._status = "error"
@@ -634,11 +624,9 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("error", error=detail)
                 await self._emit_done("error", self._final_reply, detail)
                 return self._make_result()
-
             tool_calls = call["tool_calls"]
             full_response = call["full_response"]
             full_reasoning = call["full_reasoning"]
-
             # 工具调用流式阶段超时且无可用调用：以内部消息反馈子模型重试
             if call["tool_phase_timeout_hit"] and not tool_calls:
                 self.messages.append({
@@ -650,7 +638,6 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 continue
-
             # 构建带 tool_calls 的 assistant 消息（只保留已知工具）
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if full_response:
@@ -673,7 +660,6 @@ class SubAgentRunner:
                         "arguments": function_info.get("arguments", "{}"),
                     },
                 })
-
             # 无工具调用：任务收尾
             if not formatted_tool_calls:
                 if call["finish_reason"] == "length":
@@ -708,7 +694,6 @@ class SubAgentRunner:
                 self._final_reply = final_reply
                 await self._emit_done("done", final_reply, None)
                 return self._make_result()
-
             assistant_message["tool_calls"] = formatted_tool_calls
             self.messages.append(assistant_message)
             # 落盘本轮模型调用（思考/正文/工具调用轨迹，docs §7.1 model_call）
@@ -719,7 +704,6 @@ class SubAgentRunner:
                 content=assistant_message.get("content"),
                 tool_calls=formatted_tool_calls,
             )
-
             # 工具执行
             tool_results = await self._execute_tool_round(tool_calls)
             if not tool_results:
@@ -729,7 +713,6 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 continue
-
             for tool_result in tool_results:
                 tool_call = tool_result["tool_call"]
                 tool_call_id = tool_call.get("id", "")
@@ -797,7 +780,6 @@ class SubAgentRunner:
             # 循环继续：下一轮模型调用（顶部已检查停止条件）
 
     # ----------------------------- 收尾辅助 -----------------------------
-
     def _build_progress_reply(self, status: str, error: str | None = None) -> str:
         """非正常收尾时返回给父级的"进展 + 未完成原因"说明。"""
         last_text = ""
@@ -847,7 +829,6 @@ class SubAgentRunner:
 # ---------------------------------------------------------------------------
 # 并发编排（父循环入口）
 # ---------------------------------------------------------------------------
-
 async def run_sub_agent_batch(
     contexts: list[SubAgentContext],
 ) -> list[dict[str, Any]]:

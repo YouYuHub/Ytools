@@ -312,6 +312,7 @@
     // 恢复"新对话"的草稿（通常为空；未发送就切走的内容不会丢）
     App.restoreSessionDraft(null);
     App.resetContextTokenStats();
+    App.refreshChatModelLabel(); // 新对话回到全局默认（服务端返回全局选择）
     state.hasConversation = false;
     state.importedHistoryText = null;
     enhancePanel.classList.add("hidden");
@@ -410,6 +411,7 @@
     }
     setEmpty(false);
     App.rebuildQnav();
+    App.refreshChatModelLabel(id); // 会话模型选择可能与会话绑定，打开时同步状态条
     return true;
   }
 

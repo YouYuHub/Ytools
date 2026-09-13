@@ -66,7 +66,8 @@ window.App = window.App || {};
     // 手动压缩的中止控制器：终止按钮点击时 abort 断开压缩 SSE 连接
     manualCompactAbort: null,
     // 流式期间的消息暂存：
-    // steerMessage = 消息引导（当前 SSE 流结束后立即作为新一轮发送，单条后设覆盖前设）
+    // steerMessage = 消息引导（当前 SSE 流结束后立即作为新一轮发送；
+    //   同会话多次引导会以空行分隔合并为同一条消息，附件也并入该条）
     // pendingQueue = 队列消息（当前任务完成后 FIFO 逐条自动发送，可累积多条）
     // 均为 { text, media } 结构；media 为待上传附件快照，空数组表示纯文本
     steerMessage: null,
@@ -137,6 +138,7 @@ window.App = window.App || {};
   const composerAttachments = $("#composerAttachments");
   const pendingOutbox = $("#pendingOutbox");
   const contextTokenTodoSlot = $("#contextTokenTodoSlot");
+  const contextTokenModel = $("#contextTokenModel");
   const todoPanelHost = $("#todoPanel");
   const askModal = $("#askModal");
   const askQuestions = $("#askQuestions");
@@ -330,7 +332,13 @@ window.App = window.App || {};
     app.classList.toggle("empty", Boolean(empty));
     sessionActionsBtn.title = empty ? "加载" : "分享 / 加载 / 压缩对话";
     App.refreshComposerButtons();
-    qnav.classList.add("hidden");
+    // 问题导航只在真正清空会话时隐藏；转为非空态时按当前消息数重建显隐，
+    // 否则手动压缩等仅调用 setEmpty(false) 的流程会把导航藏掉且无人恢复
+    if (empty || typeof App.rebuildQnav !== "function") {
+      qnav.classList.add("hidden");
+    } else {
+      App.rebuildQnav();
+    }
     requestAnimationFrame(updateScrollBottomOffset);
     if (!enhancePanel.classList.contains("hidden")) App.fitEnhancePanel();
   }
@@ -478,7 +486,7 @@ window.App = window.App || {};
   compactSessionItem, main, chatScroll,
   chatInner, input, composer,
   composerWrap, contextTokenStatus, contextTokenSummary,
-  contextTokenWorkdir, sendBtn, stopBtn,
+  contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn,
   voiceBtn, stopGroup, stopMenuBtn, queueMenu,
   composerAttachments, pendingOutbox, contextTokenTodoSlot,
   todoPanelHost, askModal, askQuestions,

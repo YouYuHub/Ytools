@@ -533,23 +533,20 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         before = await self.router.get_mcp_tool_config()
         before_body = json.loads(before.body.decode("utf-8"))
         self.assertEqual(before.status_code, 200)
+        # stream_timeout_seconds 已从前端配置移除（后端逻辑保留，仅接口字段删除）
+        self.assertNotIn("stream_timeout_seconds", json.dumps(before_body))
         self.assertEqual(before_body["call_timeout_seconds"], 300)
-        self.assertEqual(before_body["stream_timeout_seconds"], 300)
         self.assertEqual(before_body["env_names"]["call_timeout_seconds"], "MCP_TOOL_CALL_TIMEOUT_SECONDS")
-        self.assertEqual(before_body["env_names"]["stream_timeout_seconds"], "TOOL_CALL_STREAM_TIMEOUT_SECONDS")
 
         response = await self.router.update_mcp_tool_config(
-            self.router.McpToolConfig(call_timeout_seconds=12, stream_timeout_seconds=180)
+            self.router.McpToolConfig(call_timeout_seconds=12)
         )
         body = json.loads(response.body.decode("utf-8"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body["config"]["call_timeout_seconds"], 12)
-        self.assertEqual(body["config"]["stream_timeout_seconds"], 180)
         self.assertEqual(body["memory_state"]["MCP_TOOL_CALL_TIMEOUT_SECONDS"], "12.0")
-        self.assertEqual(body["memory_state"]["TOOL_CALL_STREAM_TIMEOUT_SECONDS"], "180.0")
         content = (self._temp_path / ".env").read_text(encoding="utf-8")
         self.assertIn("MCP_TOOL_CALL_TIMEOUT_SECONDS=12.0", content)
-        self.assertIn("TOOL_CALL_STREAM_TIMEOUT_SECONDS=180.0", content)
 
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as ctx:
@@ -557,11 +554,37 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
                 self.router.McpToolConfig(call_timeout_seconds=-1)
             )
         self.assertEqual(ctx.exception.status_code, 400)
-        with self.assertRaises(HTTPException) as ctx2:
-            await self.router.update_mcp_tool_config(
-                self.router.McpToolConfig(stream_timeout_seconds=-1)
-            )
-        self.assertEqual(ctx2.exception.status_code, 400)
+
+    async def test_tool_concurrency_config_get_and_post(self) -> None:
+        before = await self.router.get_tool_concurrency_config()
+        before_body = json.loads(before.body.decode("utf-8"))
+        self.assertEqual(before.status_code, 200)
+        self.assertEqual(before_body["mcp_tool_workers"], 3)
+        self.assertEqual(before_body["sub_agent_max_concurrent"], 3)
+        self.assertEqual(
+            before_body["env_names"],
+            {
+                "mcp_tool_workers": "ONE_TASK_MAX_WORKERS",
+                "sub_agent_max_concurrent": "SUB_AGENT_MAX_CONCURRENT",
+            },
+        )
+
+        response = await self.router.update_tool_concurrency_config(
+            self.router.ToolConcurrencyConfig(mcp_tool_workers=6, sub_agent_max_concurrent=7)
+        )
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["config"]["mcp_tool_workers"], 6)
+        self.assertEqual(body["config"]["sub_agent_max_concurrent"], 7)
+        self.assertEqual(body["memory_state"]["ONE_TASK_MAX_WORKERS"], "6")
+        self.assertEqual(body["memory_state"]["SUB_AGENT_MAX_CONCURRENT"], "7")
+        content = (self._temp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn("ONE_TASK_MAX_WORKERS=6", content)
+        self.assertIn("SUB_AGENT_MAX_CONCURRENT=7", content)
+
+        from env_manager import env_vars
+        self.assertEqual(env_vars.get("ONE_TASK_MAX_WORKERS"), "6")
+        self.assertEqual(env_vars.get("SUB_AGENT_MAX_CONCURRENT"), "7")
 
 
 if __name__ == "__main__":

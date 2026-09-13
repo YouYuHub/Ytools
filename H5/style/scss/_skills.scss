@@ -218,6 +218,48 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+
+    // 重命名内联输入框：占满文件名位置（编辑时标签与笔按钮隐藏）
+    .skills-rename-input {
+      flex: 1;
+      min-width: 0;
+      padding: 4px 8px;
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg-input, var(--bg-elevated));
+      border: 1px solid #0b84d8;
+      border-radius: var(--radius-sm);
+      outline: none;
+    }
+
+    .skills-rename-btn {
+      flex-shrink: 0;
+      width: 26px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text-tertiary);
+      cursor: pointer;
+
+      .icon {
+        width: 14px;
+        height: 14px;
+      }
+
+      &:hover:not(:disabled) {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+
+      &:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+    }
   }
 
   .skills-tabs {
