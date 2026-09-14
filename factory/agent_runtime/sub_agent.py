@@ -364,6 +364,9 @@ class SubAgentRunner:
         tool_call_stream_timeout = load_tool_call_stream_timeout()
         tool_phase_deadline: float | None = None
         tool_phase_timeout_hit = False
+        # 上游提前断开检测（EOF 未收到 finish_reason，ChatLLM 补发标记帧）：
+        # 截断续写重试——落盘部分内容 + 内部消息让子模型继续（与父循环同语义）
+        stream_truncated = False
         model_config, parameter = self._resolve_request_model_config()
         request = self._build_request(parameter)
         sse_iter = ChatLLM.chat_completions(
@@ -396,6 +399,11 @@ class SubAgentRunner:
                 event = parse_sse_event(sse_chunk)
                 if event is None:
                     continue
+                if event.get("stream_truncated"):
+                    # 上游提前断开（EOF 未收到 finish_reason）：置标记后跳出，
+                    # 走下方"截断续写重试"路径，不按正常收尾处理
+                    stream_truncated = True
+                    break
                 if event.get("done") or ctx.stop_requested():
                     break
                 if event.get("error") is not None:
@@ -443,6 +451,7 @@ class SubAgentRunner:
             "finish_reason": finish_reason,
             "stream_error": stream_error,
             "tool_phase_timeout_hit": tool_phase_timeout_hit,
+            "stream_truncated": stream_truncated,
         }
 
     # ----------------------------- 工具执行 -----------------------------
@@ -507,12 +516,6 @@ class SubAgentRunner:
                         )
                     todo_result = {
                         "message": sub_message,
-                        "current plan state": {
-                            "total": len(items),
-                            "done": done_count,
-                            "in_progress": in_progress_count,
-                            "pending": pending_count,
-                        },
                         "plan_complete": sub_plan_complete,
                         "todos": items,
                     }
@@ -693,6 +696,25 @@ class SubAgentRunner:
                 })
             # 无工具调用：任务收尾
             if not formatted_tool_calls:
+                # 上游提前断开（EOF 未收到 finish_reason）：与 token 截断同语义，
+                # 以内部消息让子模型继续（受 max_rounds 约束，不会无限重试）。
+                # 此前该场景与正常收尾不可区分——空正文被包装为"思考摘要"静默
+                # 结束（done），真实回答丢失
+                if call["stream_truncated"]:
+                    if full_response:
+                        self.messages.append({"role": "assistant", "content": full_response})
+                    elif full_reasoning:
+                        self.messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "上一次回复因连接中断被截断，你已输出的内容可能不完整。"
+                            "请从中断处继续完成回答（如结论已完整，请重述一次完整结论）。"
+                        ),
+                        "_internal": True,
+                    })
+                    stream_truncated = False
+                    continue
                 if call["finish_reason"] == "length":
                     # 截断续写：落盘已生成内容 + 内部"请继续"消息（同父循环语义）
                     if full_response:

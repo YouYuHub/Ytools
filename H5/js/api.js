@@ -183,15 +183,21 @@ const api_url = localStorage.getItem("ytools-api-base")
   /**
    * 保存工具选择
    * 不传 sessionId：写回全局默认 setting/mcp_servers.json 的 inputs 键（新建会话前的默认）
-   * 传 sessionId：写入该会话 _meta.tool_selection（空 inputs 表示清除覆盖恢复跟随全局）
+   * 传 sessionId：写入该会话 _meta.tool_selection 覆盖快照（空 inputs = 显式无工具模式，
+   * 不再回退全局默认）；clear=true 时忽略 inputs，清除会话覆盖恢复跟随全局
    * @param {Object<string, string[]>} inputs 服务名 -> 工具名数组；未提及的已配置服务保存为 []
    * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [clear] 仅会话级有效：清除该会话的工具选择覆盖，恢复跟随全局默认
    */
-  function updateToolSelection(inputs, sessionId) {
+  function updateToolSelection(inputs, sessionId, clear) {
+    const body = sessionId
+      ? { inputs: inputs || {}, session_id: sessionId }
+      : { inputs: inputs || {} };
+    if (sessionId && clear) body.clear = true;
     return request("/chat_config/tool_selection", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(sessionId ? { inputs: inputs || {}, session_id: sessionId } : { inputs: inputs || {} }),
+      body: JSON.stringify(body),
     });
   }
 

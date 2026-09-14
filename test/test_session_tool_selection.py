@@ -64,13 +64,18 @@ def test_update_normalizes_and_clears():
         }))
         assert meta["tool_selection"] == {"sysServer": ["create_file"]}
         assert read_session_meta_value(sid, "tool_selection") == {"sysServer": ["create_file"]}
-        # 空 dict / None → 清除覆盖
+        # 空 dict → 显式无工具模式（哨兵，不回退全局）；None → 清除覆盖
         meta = asyncio.run(manager.update_session_tool_selection({}))
+        assert meta["tool_selection"] == {"__empty__": []}, "空选择落盘为哨兵（显式无工具）"
+        assert read_session_meta_value(sid, "tool_selection") == {"__empty__": []}
+        effective, warning = resolve_session_tool_selection(sid)
+        assert effective == {} and warning is None, "哨兵=显式无工具，不回退全局默认"
+        meta = asyncio.run(manager.update_session_tool_selection(None))
         assert "tool_selection" not in meta
         assert read_session_meta_value(sid, "tool_selection") is None
     finally:
         _cleanup(sid)
-    print("PASS: 会话工具选择写入规整 + 空值清除覆盖")
+    print("PASS: 会话工具选择写入规整 + 三态语义（快照/哨兵/清除）")
 
 
 def test_resolve_uses_override_first():

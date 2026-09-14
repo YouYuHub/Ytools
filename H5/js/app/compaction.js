@@ -116,7 +116,10 @@
    */
   async function runManualCompactionStream() {
     if (state.manualCompactRunning) return;
+    const compactSessionId = state.sessionId;
     state.manualCompactRunning = true;
+    // 记录发起压缩的会话：终止按钮/发送守卫只作用于该会话，切到其他会话不受影响
+    state.manualCompactSession = compactSessionId;
     // 压缩期间隐藏发送按钮、终止按钮接管（点击可中止压缩），结束后恢复
     state.manualCompactAbort = new AbortController();
     App.refreshComposerButtons();
@@ -124,9 +127,11 @@
     let sawStart = false;
     scrollToBottom();
     try {
-      await API.compactContextStream(state.sessionId, function (evt) {
+      await API.compactContextStream(compactSessionId, function (evt) {
         if (!evt || evt.type === "done") return;
         const data = evt.data || {};
+        // 用户切走后的压缩事件不渲染进其他会话视图；切回后由 done/统计刷新呈现
+        const inCompactView = state.sessionId === compactSessionId;
         if (data.event === "compaction_manual_result") {
           const rounds = Number(data.compressed_rounds) || 0;
           if (data.error) {
@@ -136,13 +141,14 @@
           } else if (!sawStart) {
             toast("没有新的历史轮次需要压缩（当前已是摘要模式）");
           }
-          App.refreshSessionUsage(state.sessionId);
-          App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, state.sessionId);
+          App.refreshSessionUsage(compactSessionId);
+          App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, compactSessionId);
           return;
         }
         if (data.event !== "context_compaction") return;
         if (data.phase === "start") {
           sawStart = true;
+          if (!inCompactView) return;
           ui = App.buildCompactionBlock({
             scope: "session",
             phase: "start",
@@ -151,26 +157,30 @@
           chatInner.appendChild(ui.wrap);
           setEmpty(false);
         } else if (data.phase === "delta" && ui) {
-          ui.appendDelta(data);
+          // 用户切走又切回：运行块曾随视图清空失联，重新挂回后继续实时渲染
+          if (!ui.wrap.isConnected && inCompactView) chatInner.appendChild(ui.wrap);
+          if (ui.wrap.isConnected) ui.appendDelta(data);
         } else if (data.phase === "aborted") {
           // 压缩失败：块转为失败态（错误信息 + 已生成部分标注未生效），
           // 不再伪装成完成态
           if (ui) {
             ui.update({ phase: "aborted", error: data.error || "" });
             ui = null;
-          } else {
+          } else if (inCompactView) {
             const failed = App.buildCompactionBlock(Object.assign({ scope: "session" }, data));
             chatInner.appendChild(failed.wrap);
           }
         } else if (data.phase === "done") {
-          if (ui) ui.update(data);
-          else {
+          if (ui && ui.wrap.isConnected) {
+            ui.update(data);
+          } else if (inCompactView) {
+            // 切走期间视图被清空：运行块失联，重建完成态块保证切回可见
             ui = App.buildCompactionBlock(Object.assign({ scope: "session" }, data));
             chatInner.appendChild(ui.wrap);
             sawStart = true;
           }
         }
-        if (state.sessionId) stickToBottom();
+        if (inCompactView) stickToBottom();
       }, state.manualCompactAbort.signal);
     } catch (err) {
       const aborted = err.name === "AbortError";
@@ -189,12 +199,13 @@
       if (ui) ui.update({ phase: "aborted", error: aborted ? "用户手动终止" : (err.message || "连接中断") });
     } finally {
       state.manualCompactRunning = false;
+      state.manualCompactSession = null;
       state.manualCompactAbort = null;
       App.refreshComposerButtons();
-      App.refreshSessionUsage(state.sessionId);
-      App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, state.sessionId);
+      App.refreshSessionUsage(compactSessionId);
+      App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, compactSessionId);
       // 压缩结束后派发暂存的引导/队列消息（压缩期间发送被禁止，此处补发）
-      setTimeout(function () { App.flushPendingMessages(state.sessionId); }, 0);
+      setTimeout(function () { App.flushPendingMessages(compactSessionId); }, 0);
     }
   }
 

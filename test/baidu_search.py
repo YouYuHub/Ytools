@@ -1,9 +1,11 @@
+import os
 import requests
 # import json
 from datetime import datetime
 
-# 你的 API Key
-api_key = "bce-v3/ALTAK-EUDImdBe7lSXV0ueQU6ff/58a44e5ffb662ae4e14b4840be42603d1bcf6740"
+# 你的 API Key（脱敏：从环境变量 BAIDU_QIANFAN_API_KEY 读取；
+# 历史提交 8e6dffa 之前曾内置真实密钥，已占位化，建议到百度千帆控制台轮换）
+api_key = os.environ.get("BAIDU_QIANFAN_API_KEY", "your-baidu-api-key")
 
 # 搜索关键词
 query = "人工智能最新进展"

@@ -155,7 +155,17 @@ diff 视图渲染在输出区上方，输出区文本替换为「后端 message 
 
 结构：`.diff-view` → `.diff-bar`（「文件变更」标题 + `+N` 绿 / `-N` 红 徽标 + 截断/跳过提示）+ `.diff-code`（逐行 `.diff-line`，含 `.diff-no` 双行号列、`.diff-sign` 符号列、`.diff-text` 内容列）。
 
-### 4.4 挂点与状态机
+### 4.4 diff 行内语法高亮（V1.1 追加）
+
+`buildDiffView` 在解析之外按文件类型对 `.diff-text` 内容做 Prism 行内高亮：
+
+- **语言推断**：从 diff 头部 `--- a/路径` / `+++ b/路径` 取文件名后缀查 `DIFF_FILE_EXTS`（与 markdown.js 的 DIFF_EXTS 同口径：py/js/ts/cpp/java/cs/css/less/scss/html/go/rust/bash/json/yaml/ini/cmake/makefile/docker…），另有 Dockerfile/Makefile/CMakeLists/.env 特殊文件名判定；头两行均无命中（如纯文本/md 文件）则**整卡回退纯文本**；
+- **高亮链路**：逐行 `Prism.tokenize → Prism.util.encode → Prism.Token.stringify`（与官方 `highlight()` 同链路，输出已 HTML 转义，无 XSS）；`.diff-text` 先 textContent 原文、高亮成功才 `innerHTML` 替换，异常逐行回退纯文本不影响其他行；
+- **缓存**：推断结果按 `diffObj` 引用存 `WeakMap`（历史回放重复渲染同对象零成本）；
+- **配色继承**：`pre.diff-code` 带 `language-<lang>` 类，`_prism.scss` 的 `language-palette` mixin 同时挂 `.diff-code.language-x` 选择器，行内 token 无独立语言类、按容器继承变量（token CSS 分组已拆分 `.token.constant`/`.token.variable` 独立变量）；
+- markdown 代码栅栏 ```diff 的行内高亮走既有 diff-highlight 插件（`language-diff-<lang>`），与本节 diff 卡片是**两条独立链路**（插件要求行 token 包裹结构，diff 卡片自定义 DOM 不适用）。
+
+### 4.5 挂点与状态机
 
 | 挂点 | 位置 | 接入 |
 |---|---|---|
@@ -217,7 +227,9 @@ tool-block 状态机配套：
 | `factory/chat_factory.py` | `_format_tool_result` 剥离；主循环 JSONL 落盘 record.file_diff；SSE tool_return.file_diff |
 | `factory/agent_runtime/sub_agent.py` | `_format_result_text` 剥离；正常 tool_result 子事件带 file_diff |
 | `H5/js/history_parser.js` | toolResult 记录透传 `file_diff` |
-| `H5/js/app/messages.js` | `buildDiffView` / `applyToolResult` / buildToolBlock 的 setDiff/clearDiff/finish/beginStream/挂点 |
+| `H5/js/app/messages.js` | `buildDiffView`（含行内高亮）/ `applyToolResult` / buildToolBlock 的 setDiff/clearDiff/finish/beginStream/挂点 |
+| `H5/js/vendor/prism/prism-python-imports.js` | python 语法增强（内建类型/None/全大写常量/docstring/类名，VS Code 口径） |
+| `H5/style/scss/_prism.scss` | Prism 主题调色板（python=VS Code Light+/Dark Modern；constant/variable/docstring 独立变量；`.diff-code.language-x` 继承挂点） |
 | `H5/js/app/chat.js` | 两处 tool_return 挂点改走 applyToolResult |
 | `H5/style/scss/_chat.scss` | diff 视图样式（明/暗主题） |
 | `docs/api_docs.md` | 「文件变更 diff」一节（字段速查） |

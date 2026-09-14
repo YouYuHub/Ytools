@@ -466,6 +466,47 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
             {"__builtin__": ["todo_write"], "pipeIpcMcp": [], "sysServer": []},
         )
 
+    async def test_tool_selection_session_empty_snapshot_and_clear(self) -> None:
+        """会话级三态语义：空 inputs=显式无工具哨兵；clear=true=清除覆盖。"""
+        from memory.chat_memory import (
+            get_chat_memory_manager,
+            resolve_session_tool_selection,
+        )
+
+        session_id = "empty_sel_ut"
+        manager = await get_chat_memory_manager(session_id)
+        try:
+            # 空 inputs + session_id → 哨兵落盘（显式无工具，不回退全局）
+            response = await self.router.update_tool_selection(
+                self.router.McpToolSelection(inputs={}, session_id=session_id))
+            body = json.loads(response.body.decode("utf-8"))
+            self.assertEqual(body["state"], "succeed")
+            self.assertIn("显式无工具", body["message"])
+            self.assertTrue(body["is_overridden"])
+            self.assertEqual(body["session_selection"], {"__empty__": []})
+            self.assertEqual(body["effective_selection"], {})
+            effective, warning = resolve_session_tool_selection(session_id)
+            self.assertEqual(effective, {})
+            self.assertIsNone(warning)
+
+            # GET 回显覆盖态
+            response = await self.router.get_tool_selection(session_id=session_id)
+            body = json.loads(response.body.decode("utf-8"))
+            self.assertTrue(body["is_overridden"])
+            self.assertEqual(body["effective_selection"], {})
+
+            # clear=true → 清除覆盖恢复跟随全局（inputs 被忽略）
+            response = await self.router.update_tool_selection(
+                self.router.McpToolSelection(inputs={}, session_id=session_id, clear=True))
+            body = json.loads(response.body.decode("utf-8"))
+            self.assertIn("恢复跟随全局", body["message"])
+            self.assertFalse(body["is_overridden"])
+            self.assertIsNone(json.loads(
+                (await self.router.get_tool_selection(session_id=session_id)).body.decode("utf-8")
+            )["session_selection"])
+        finally:
+            manager._file_path.unlink(missing_ok=True)
+
     async def test_tool_selection_builtin_session_override(self) -> None:
         """会话级内置工具选择：写入 _meta.tool_selection 并被回退解析原样返回。"""
         from memory.chat_memory import (

@@ -208,8 +208,14 @@ class McpToolSelection(BaseModel):
     )
     session_id: Optional[str] = Field(
         None,
-        description="会话ID；携带时写入该会话的 _meta.tool_selection（会话级覆盖，"
-                    "空 inputs 表示清除覆盖恢复跟随全局），不携带时写入全局默认（mcp_servers.json 的 inputs 键）",
+        description="会话ID；携带时写入该会话的 _meta.tool_selection（会话级覆盖：非空快照按会话生效，"
+                    "空 inputs 为显式无工具模式；仅 clear=true 时清除覆盖恢复跟随全局），"
+                    "不携带时写入全局默认（mcp_servers.json 的 inputs 键）",
+    )
+    clear: bool = Field(
+        False,
+        description="仅会话级有效：清除该会话的工具选择覆盖，恢复跟随全局默认；"
+                    "此时 inputs 被忽略",
     )
 
 

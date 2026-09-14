@@ -13,8 +13,10 @@
   --prism-atrule: #cf222e;
   --prism-string: #0a3069;
   --prism-attr-value: #0a3069;
+  --prism-docstring: #0a3069;
   --prism-number: #0550ae;
   --prism-boolean: #0550ae;
+  --prism-constant: #0550ae;
   --prism-function: #8250df;
   --prism-macro: #8250df;
   --prism-class: #953800;
@@ -24,6 +26,7 @@
   --prism-attr-name: #116329;
   --prism-selector: #116329;
   --prism-builtin: #116329;
+  --prism-variable: #116329;
   --prism-operator: #cf222e;
   --prism-diff-add: #116329;
   --prism-diff-del: #cf222e;
@@ -40,8 +43,10 @@ html[data-theme="dark"] {
   --prism-atrule: #ff7b72;
   --prism-string: #a5d6ff;
   --prism-attr-value: #a5d6ff;
+  --prism-docstring: #a5d6ff;
   --prism-number: #79c0ff;
   --prism-boolean: #79c0ff;
+  --prism-constant: #79c0ff;
   --prism-function: #d2a8ff;
   --prism-macro: #d2a8ff;
   --prism-class: #ffa657;
@@ -51,6 +56,7 @@ html[data-theme="dark"] {
   --prism-attr-name: #7ee787;
   --prism-selector: #7ee787;
   --prism-builtin: #7ee787;
+  --prism-variable: #7ee787;
   --prism-operator: #ff7b72;
   --prism-diff-add: #56d364;
   --prism-diff-del: #ff7b72;
@@ -99,6 +105,11 @@ html[data-theme="dark"] {
   color: var(--prism-string);
 }
 
+// Python docstring（三引号字符串，由 prism-python-imports.js 命名为 py-docstring）
+.token.py-docstring {
+  color: var(--prism-docstring);
+}
+
 .token.number,
 .token.regex {
   color: var(--prism-number);
@@ -129,11 +140,20 @@ html[data-theme="dark"] {
 }
 
 .token.property,
-.token.variable,
-.token.constant,
 .token.symbol,
 .token.builtin-target {
   color: var(--prism-property);
+}
+
+// 变量/参数（独立变量，便于 Python/JS 等按语义高亮口径单独调）
+.token.variable {
+  color: var(--prism-variable);
+}
+
+// 常量（全大写等 readonly 值）
+.token.constant,
+.token.caps-constant {
+  color: var(--prism-constant);
 }
 
 .token.tag {
@@ -169,10 +189,14 @@ html[data-theme="dark"] {
 // 按编辑器生态配色：
 //   Web/配置文件 → VS Code（Light+ / Dark+）：js/ts/css/html/less/scss/sass/qml/qss/
 //     json/makefile/docker/yaml/ini(env)/gitignore(ignore)/cmake；qss 复用 css 语法
-//   Python / Java  → IntelliJ（Light / Darcula，PyCharm 同源）
-//   C / C++        → Visual Studio（Light / Dark）
-// 选择器同时覆盖普通代码块（code.language-x）与 diff 行内语法
-// （diff-highlight 插件会给行 token 追加 language-<内层> 类）。
+//   Python       → VS Code（Light+ / Dark Modern，与编辑器内 Python 视图一致）：
+//     keyword #0000ff/#d7ba7d、内建类型+None 青绿、全大写常量蓝、函数名默认前景、
+//     变量/参数浅蓝（深色）、docstring=注释色
+//   Java         → IntelliJ（Light / Darcula，PyCharm 同源）
+//   C / C++      → Visual Studio（Light / Dark）
+// 选择器同时覆盖普通代码块（code.language-x）、diff 行内语法
+// （diff-highlight 插件会给行 token 追加 language-<内层> 类）与工具结果
+// diff 卡片（pre.diff-code.language-<语言>，行内 token 无语言类、按容器继承变量）。
 // 未列出的语言（go/rust/bash）使用基线配色。
 
 @mixin language-palette($langs) {
@@ -180,6 +204,7 @@ html[data-theme="dark"] {
   @each $l in $langs {
     $sel: list.append($sel, string.unquote(".codeblock code.language-#{$l}"), comma);
     $sel: list.append($sel, string.unquote(".token.language-#{$l}"), comma);
+    $sel: list.append($sel, string.unquote(".diff-code.language-#{$l}"), comma);
   }
   #{$sel} {
     @content;
@@ -247,19 +272,21 @@ html[data-theme="dark"] {
   --prism-operator: #000000;
 }
 
-// --- Python（IntelliJ 基础上微调：字符串 VSCode 黄橙色、类型绿色） ---
+// --- Python（VS Code 口径：Light+ / Dark Modern，与编辑器内 Python 视图一致） ---
 @include language-palette("python") {
-  --prism-keyword: #0033b3;
+  --prism-keyword: #0000ff;
   --prism-string: #a31515;
   --prism-attr-value: #a31515;
-  --prism-number: #1750eb;
-  --prism-boolean: #0033b3;
-  --prism-function: #00627a;
-  --prism-class: #067d17;
-  --prism-decorator: #a50a5b;
-  --prism-property: #000000;
-  --prism-builtin: #0033b3;
-  --prism-comment: #8c8c8c;
+  --prism-number: #098658;
+  --prism-boolean: #0000ff;
+  --prism-constant: #0000ff;
+  --prism-docstring: #0000ff;
+  --prism-function: #795e26;
+  --prism-class: #267f99;
+  --prism-decorator: #795e26;
+  --prism-property: #098658;
+  --prism-builtin: #267f99;
+  --prism-comment: #008000;
   --prism-punctuation: #000000;
   --prism-operator: #000000;
 }
@@ -283,22 +310,25 @@ html[data-theme="dark"] {
   }
 }
 
-// --- Python Darcula 微调（字符串 VSCode 黄橙色、类型 VSCode 绿色） ---
+// --- Python Dark Modern（截图口径：关键字/None/常量蓝、内建类型青绿、
+//     docstring 绿、函数名与变量默认前景、decorator 黄） ---
 html[data-theme="dark"] {
   @include language-palette("python") {
-    --prism-keyword: #cc7832;
+    --prism-keyword: #569cd6;
     --prism-string: #ce9178;
     --prism-attr-value: #ce9178;
-    --prism-number: #6897bb;
-    --prism-boolean: #cc7832;
-    --prism-function: #ffc66d;
+    --prism-number: #b5cea8;
+    --prism-boolean: #569cd6;
+    --prism-constant: #569cd6;
+    --prism-docstring: #e9bd6f;
+    --prism-function: #d4d4d4;
     --prism-class: #4ec9b0;
-    --prism-decorator: #a8c023;
-    --prism-property: #a9b7c6;
-    --prism-builtin: #ffc66d;
-    --prism-comment: #808080;
-    --prism-punctuation: #a9b7c6;
-    --prism-operator: #a9b7c6;
+    --prism-decorator: #dcdcaa;
+    --prism-property: #b5cea8;
+    --prism-builtin: #4ec9b0;
+    --prism-comment: #6a9955;
+    --prism-punctuation: #d4d4d4;
+    --prism-operator: #d4d4d4;
   }
 }
 

@@ -172,7 +172,8 @@ def _default_meta(session_id: str) -> dict[str, Any]:
         # 惰性写入——只有用户显式设置过才落盘，新会话不预填
         "work_dir": None,
         # 会话独立工具选择：None 表示未覆盖，跟随全局默认（mcp_servers.json 的 inputs 键）。
-        # 结构与 inputs 一致：{服务名: [工具名]}；空选择视为未覆盖（清空即恢复跟随全局）
+        # 结构与 inputs 一致：{服务名: [工具名]}；全取消勾选后保存会写入「空选择哨兵」
+        # （EMPTY_TOOL_SELECTION_KEY），表示显式无工具模式而非未覆盖
         "tool_selection": None,
         # 会话独立模型选择：None 表示未覆盖，跟随全局默认（models.json 顶层 model_selection）。
         # 结构为 {角色: {ownership_name, model_name, parameter, api_type}}，仅存已覆盖的角色；
@@ -252,24 +253,39 @@ def resolve_session_work_dir(session_id: str) -> tuple[str | None, str | None]:
     return None, warning
 
 
+# 「空选择哨兵」：会话级工具选择全取消后保存的落盘形态。
+# normalize_tool_inputs 对空数组键原样保留（{"__empty__": []} 规整后不变），
+# 使空选择在 meta 重算/清空历史/配置快照等既有链路中不被当作「未覆盖」清除；
+# 解析时命中哨兵 → 会话显式无工具模式，不再回退全局默认。
+# 兼容：旧落盘无哨兵（未覆盖=None）语义不变；读到了手工构造的同形 dict 也按哨兵处理。
+EMPTY_TOOL_SELECTION_KEY = "__empty__"
+_EMPTY_TOOL_SELECTION = {EMPTY_TOOL_SELECTION_KEY: []}
+
+
 def resolve_session_tool_selection(
     session_id: str,
 ) -> tuple[dict[str, list[str]] | None, str | None]:
     """解析会话生效工具选择（惰性：只读，不落盘）。
 
     解析顺序（会话覆盖优先，全局默认兜底）：
-    1. `_meta.tool_selection` 为非空 {服务名: [工具名]} → 直接生效；
-       请求未携带 tool_names 时由生成流程用它作为本轮工具；
-    2. 未覆盖/空选择/非法 → 回退全局默认（mcp_servers.json 的 inputs 键）；
+    1. `_meta.tool_selection` 为覆盖快照时按快照生效：
+       - 非空 {服务名: [工具名]} → 直接生效；
+       - 空选择哨兵（EMPTY_TOOL_SELECTION_KEY）→ 会话显式无工具模式，返回 ({}，None)；
+         请求未携带 tool_names 时由生成流程按无工具处理，不再回退全局默认；
+    2. 未覆盖（None）/非法 → 回退全局默认（mcp_servers.json 的 inputs 键）；
     3. 全局配置读取失败 → 记录警告，返回 (None, 警告)，调用方按无默认工具处理。
 
     Returns:
-        (生效工具选择或 None, 警告消息或 None)
+        (生效工具选择或 None（None=无工具），警告消息或 None)
     """
     override = read_session_meta_value(session_id, "tool_selection")
-    normalized_override = normalize_tool_inputs(override) if override is not None else None
-    if normalized_override:
-        return normalized_override, None
+    if override is not None:
+        normalized_override = normalize_tool_inputs(override)
+        if normalized_override == _EMPTY_TOOL_SELECTION:
+            # 会话显式无工具：不回退全局默认（覆盖语义完整）
+            return {}, None
+        if normalized_override:
+            return normalized_override, None
     inputs, _servers, error = get_global_tool_inputs()
     if error:
         return None, f"全局默认工具配置读取失败（{error}），本轮按未配置默认工具处理"
@@ -1524,8 +1540,10 @@ class ChatMemoryManager:
         """写入/清除会话独立工具选择（_meta.tool_selection）。
 
         Args:
-            tool_selection: {服务名: [工具名]}；None/空 dict 表示清除覆盖，
-                恢复跟随全局默认（mcp_servers.json 的 inputs 键）。
+            tool_selection: {服务名: [工具名]} 覆盖快照；传**空 dict** 表示
+                「显式无工具模式」（落盘为 EMPTY_TOOL_SELECTION_KEY 哨兵，
+                后续不回退全局默认）；传 None 表示清除覆盖，恢复跟随
+                全局默认（mcp_servers.json 的 inputs 键）。
                 非法条目（非字符串/空串/重复工具名）由服务端规整时丢弃。
         Returns:
             更新后的元数据字典
@@ -1535,12 +1553,14 @@ class ChatMemoryManager:
         if tool_selection is not None and not isinstance(tool_selection, dict):
             raise ValueError("tool_selection 必须是 {服务名: [工具名]} 形式的字典")
         normalized = normalize_tool_inputs(tool_selection)
+        # 写入值三态：非空快照 / 空选择哨兵（显式无工具）/ 删除键（清除覆盖）
+        stored = normalized if normalized else _EMPTY_TOOL_SELECTION
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            if normalized:
-                meta["tool_selection"] = normalized
-            else:
+            if tool_selection is None:
                 meta.pop("tool_selection", None)
+            else:
+                meta["tool_selection"] = stored
             meta["updated_at"] = now_str()
             _write_meta_and_entries(self._file_path, meta, entries)
         return meta

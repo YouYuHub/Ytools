@@ -268,8 +268,19 @@ def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, 
             continue
         compacted.append(message)
     if todos:
+        done_count = sum(1 for item in todos if item.get("status") == "done")
+        plan_complete = done_count == len(todos)
         symbols = {"done": "✓", "in_progress": "→", "pending": "○"}
-        lines = ["当前任务："]
+        if plan_complete:
+            # 终态摘要：模型最后一次 todo 调用（全部 done）的"请汇总答复用户"
+            # 指令在下一轮会被本摘要替换——终态必须自带收官指令，否则后续
+            # 轮次只剩一列 ✓，模型无从判断计划已结束
+            lines = [
+                f"任务规划已全部完成（{done_count}/{len(todos)} 项）："
+                "请汇总执行结果直接答复用户；如无新的计划，无需再调用本工具。"
+            ]
+        else:
+            lines = [f"当前任务计划（已完成 {done_count}/{len(todos)} 项）："]
         lines.extend(f"{symbols.get(item.get('status'), '○')} {item.get('content', '')}" for item in todos)
         compacted.append({"role": "system", "content": "\n".join(lines), "_todo_summary": True})
     messages[:] = compacted
@@ -483,12 +494,6 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
         )
     result: dict[str, Any] = {
         "message": message,
-        "current plan state": {
-            "total": len(items),
-            "done": done_count,
-            "in_progress": in_progress_count,
-            "pending": pending_count,
-        },
         # 机器可读完成标记：模型无需解析 message 即可判断计划是否收官
         "plan_complete": plan_complete,
         # 回写规整后的完整列表：模型据此对齐自动分配/继承出的最终 id，
@@ -751,7 +756,7 @@ async def _run_chat_generation(
             warning_event = {
                 "warning": {
                     "code": "NO_TOOL_SELECTED",
-                    "message": "本轮未选择任何工具，已按无工具模式继续",
+                    "message": "本轮无工具模式：前端未选择任何工具（或会话显式无工具）",
                 }
             }
             await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
@@ -1210,6 +1215,9 @@ async def _run_chat_generation(
         # run_task = True
         # last_tool_ret = ""  # 上一次调用工具的返回值
         # while run_task:
+        # 上游提前断开（stream_truncated）的累计重试次数：任务级计数器，
+        # 跨模型轮次累计（单轮内多次重试同样计入），上限见 stream_truncated_retries
+        model_retries = 0
         while session_chat_memory.run_task:
             stream.set_round_start()
             # 每轮检查点：取出注入消息，本轮模型调用即可看到
@@ -1237,6 +1245,7 @@ async def _run_chat_generation(
             finish_reason = None  # 追踪模型完成原因：stop（正常完成）、length（token 截断）、tool_calls（工具调用）
             pending_finish_payload: dict[str, Any] | None = None  # 延后发送 finish_reason，先发 usage 尾帧
             stream_error = None  # 追踪上游流式错误（与用户手动停止区分，避免误记为"停止任务"）
+            stream_truncated = False  # 本轮流被上游提前关闭（EOF 未收到 finish_reason）
             tool_calls: List[dict] = []
             usage_accumulator = UsageAccumulator()
             # 将 messages 附加到 tool_request 中（请求侧副本占位化，
@@ -1251,6 +1260,18 @@ async def _run_chat_generation(
             tool_call_stream_timeout = _load_tool_call_stream_timeout()
             tool_phase_deadline: float | None = None
             tool_phase_timeout_hit = False
+            # 上游提前断开标记（EOF 且未收到 finish_reason，由 ChatLLM 补发标记帧）：
+            # 此前该场景与正常收尾走同一路径——空正文静默落盘并结束任务，思考
+            # 内容全部丢失；现改为截断续写重试：先落盘已生成的部分内容，再以
+            # 内部消息提示模型继续（同 finish_reason=length 语义）。零或负数
+            # =不限制（一直重试到 max_model_retries，兜底任务不中断）。
+            stream_truncated = False
+            try:
+                stream_truncated_retries = int(load_var("STREAM_TRUNCATION_MAX_RETRIES", 2))
+            except (TypeError, ValueError):
+                stream_truncated_retries = 2
+            if stream_truncated_retries <= 0:
+                stream_truncated_retries = None
             # 手动迭代 async generator（而非 async for）：需要对工具调用阶段
             # 施加"事件间隔"超时；超时/提前退出时显式 aclose 立即断开上游连接
             sse_iter = ChatLLM.chat_completions(
@@ -1289,6 +1310,12 @@ async def _run_chat_generation(
                     if event is None:
                         await _stream_emit(stream, sse_chunk)
                         continue
+                    if event.get("stream_truncated"):
+                        # 上游提前断开（EOF 未收到 finish_reason）：内容不完整。
+                        # 置标记后跳出，走下方"截断续写重试"路径（先落盘已生成的
+                        # 部分内容，再以内部消息提示模型继续），不按正常收尾处理
+                        stream_truncated = True
+                        break
                     if event.get("done") or not session_chat_memory.run_task:
                         if pending_finish_payload is not None:
                             await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
@@ -1446,6 +1473,49 @@ async def _run_chat_generation(
                 continue
             # 检查 tool_calls 是否为空
             if not tool_calls:
+                # 上游提前断开（EOF 且未收到 finish_reason）：与 token 截断同语义。
+                # 此前该场景与正常收尾不可区分——空正文静默落盘并结束任务，
+                # 思考内容看似保留实则回答丢失；现改为截断续写重试。
+                if stream_truncated:
+                    if stream_truncated_retries is not None and model_retries >= stream_truncated_retries:
+                        # 重试超限：落盘已生成的思考/正文 + 带重试统计的错误记录，
+                        # 结束任务（错误不静默，用户可看到失败原因并重发）
+                        print(f"[WARN] 上游连接提前断开，重试 {model_retries} 次仍截断，结束任务")
+                        if full_reasoning:
+                            await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
+                        if full_response:
+                            await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
+                        error_record: dict[str, Any] = {
+                            "role": "assistant",
+                            "error": (
+                                "上游连接在响应完成前断开（未收到 finish_reason），"
+                                f"自动重试 {model_retries} 次仍不完整；已生成的部分内容已保留"
+                            ),
+                            "step": "read_sse_stream",
+                            "retry": model_retries,
+                            "max_attempts": stream_truncated_retries,
+                        }
+                        await session_chat_memory.add_chat_history(error_record)
+                        session_chat_memory.run_task = False
+                        break
+                    model_retries += 1
+                    print(f"[WARN] 上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
+                    # 已生成的部分内容进入 messages（模型续写时可见上下文），
+                    # 不落盘——避免 JSONL 留下"腰斩的回答"，最终完整回答统一落盘
+                    if full_response:
+                        messages.append({"role": "assistant", "content": full_response})
+                    elif full_reasoning:
+                        messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "上一次回复因连接中断被截断，你已输出的内容可能不完整。"
+                            "请从中断处继续完成回答（如结论已完整，请重述一次完整结论）。"
+                        ),
+                        "_internal": True,
+                    })
+                    await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'STREAM_TRUNCATED_RETRY', 'message': f'上游连接中断，正在自动续写重试（第 {model_retries} 次）'}}, ensure_ascii=False)}\n\n")
+                    continue
                 # 如果 finish_reason 是 "length"，说明模型输出因 max_tokens 不足被截断
                 # 需要提示模型继续完成回答，而不是按"未调用工具"的逻辑处理
                 if finish_reason == "length":

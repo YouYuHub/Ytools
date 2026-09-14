@@ -22,6 +22,7 @@
       "read_file",
       "read_media",
       "search_files",
+      "sub_agent",
       "todo_write",
       "write_file"
     ],

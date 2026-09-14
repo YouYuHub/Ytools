@@ -743,27 +743,46 @@ async def update_tool_selection(payload: McpToolSelection):
       setting/mcp_servers.json 的 inputs 键，其余内容保持不变；键必须为
       `servers` 中已配置的服务名，未知服务报 400（伪服务 __builtin__ 除外，
       其下存放前端在内置工具分组勾选的 todo_write / ask_user 等）；
-    - 携带 session_id（会话内选择）：写入该会话 _meta.tool_selection，
-      不修改全局 inputs；空 inputs 表示清除会话覆盖、恢复跟随全局默认；
+    - 携带 session_id（会话内选择）：写入该会话 _meta.tool_selection 覆盖快照，
+      不修改全局 inputs；空 inputs = 会话显式无工具模式（落盘空选择哨兵，
+      不再回退全局默认）；仅 clear=true 表示清除会话覆盖、恢复跟随全局默认；
       规整后为空的非法条目会被丢弃。
     """
     global _MCP_TOOL_INPUTS_MEMORY
     from factory.agent_runtime.builtin_tools import BUILTIN_TOOL_SERVER_KEY
     incoming = _normalize_tool_inputs(payload.inputs)
     if payload.session_id and str(payload.session_id).strip():
-        from memory.chat_memory import get_chat_memory_manager, normalize_session_id
+        from memory.chat_memory import (
+            EMPTY_TOOL_SELECTION_KEY,
+            get_chat_memory_manager,
+            normalize_session_id,
+        )
         session_id = normalize_session_id(payload.session_id)
         manager = await get_chat_memory_manager(session_id)
-        meta = await manager.update_session_tool_selection(incoming or None)
-        session_selection = meta.get("tool_selection")
-        effective = _normalize_tool_inputs(session_selection) if session_selection else None
+        if payload.clear:
+            # 显式清除覆盖：恢复跟随全局默认（inputs 被忽略）
+            meta = await manager.update_session_tool_selection(None)
+            session_selection = None
+            effective = None
+            message = f"会话 [{session_id}] 已恢复跟随全局默认工具选择"
+        else:
+            # 覆盖快照语义：空 dict = 显式无工具（哨兵），非空 = 覆盖快照
+            meta = await manager.update_session_tool_selection(incoming)
+            session_selection = meta.get("tool_selection")
+            is_empty_sentinel = (
+                isinstance(session_selection, dict)
+                and set(session_selection) == {EMPTY_TOOL_SELECTION_KEY}
+            )
+            effective = {} if is_empty_sentinel else _normalize_tool_inputs(session_selection) if session_selection else None
+            if is_empty_sentinel:
+                message = f"会话 [{session_id}] 工具选择已保存（0 项，显式无工具模式，不跟随全局默认）"
+            elif session_selection:
+                message = f"会话 [{session_id}] 工具选择已保存（{sum(len(names) for names in effective.values())} 项）"
+            else:
+                message = f"会话 [{session_id}] 工具选择已保存（空）"
         return JSONResponse(content={
             "state": "succeed",
-            "message": (
-                f"会话 [{session_id}] 工具选择已保存（{sum(len(names) for names in effective.values()) if effective else 0} 项）"
-                if session_selection
-                else f"会话 [{session_id}] 已恢复跟随全局默认工具选择"
-            ),
+            "message": message,
             "session_id": session_id,
             "session_selection": session_selection,
             "effective_selection": effective or {},

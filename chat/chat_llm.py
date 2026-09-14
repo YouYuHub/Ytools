@@ -534,12 +534,15 @@ class ChatLLM:
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
+                    saw_finish_reason = False
+                    saw_done = False
                     for line in ChatLLM._iter_sse_body_lines(f, is_chunked):
                         line = line.strip()
                         if not line or not line.startswith(b"data: "):
                             continue
                         data_str = line[6:]
                         if data_str.strip() == b"[DONE]":
+                            saw_done = True
                             break
                         try:
                             chunk = json.loads(data_str)
@@ -578,12 +581,18 @@ class ChatLLM:
                         if sse_data:
                             yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
                         if finish_reason is not None:
+                            saw_finish_reason = True
                             finish_payload = {"finish_reason": finish_reason}
                             if chunk_id is not None:
                                 finish_payload["id"] = chunk_id
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if not saw_done and not saw_finish_reason:
+                        # 上游连接在流式响应完成前被关闭（EOF 且未收到
+                        # finish_reason）：内容不完整。补发标记帧告知调用方
+                        # （由调用方决定重试策略）；仍按惯例合成 [DONE] 收尾
+                        yield f"data: {json.dumps({'stream_truncated': True}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 finally:
@@ -734,12 +743,19 @@ class ChatLLM:
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
+                    # 上游提前断开检测：EOF 结束且未收到 finish_reason（也未收到
+                    # [DONE]）说明内容不完整。EOF 与"上游正常发 [DONE]"走同一收尾
+                    # 路径，此前调用方无从区分——在合成 [DONE] 前补 stream_truncated
+                    # 标记帧供调用方决定重试策略（标记帧无 choices，前端自动忽略）
+                    saw_finish_reason = False
+                    saw_done = False
                     async for line in ChatLLM._aiter_sse_body_lines(reader, is_chunked, timeout_read, stop_checker):
                         line = line.strip()
                         if not line or not line.startswith(b"data: "):
                             continue
                         data_str = line[6:]
                         if data_str.strip() == b"[DONE]":
+                            saw_done = True
                             break
                         try:
                             chunk = json.loads(data_str)
@@ -778,12 +794,18 @@ class ChatLLM:
                         if sse_data:
                             yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
                         if finish_reason is not None:
+                            saw_finish_reason = True
                             finish_payload = {"finish_reason": finish_reason}
                             if chunk_id is not None:
                                 finish_payload["id"] = chunk_id
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if not saw_done and not saw_finish_reason:
+                        # 上游连接在流式响应完成前被关闭（EOF 且未收到
+                        # finish_reason）：内容不完整。补发标记帧告知调用方
+                        # （由调用方决定重试策略）；仍按惯例合成 [DONE] 收尾
+                        yield f"data: {json.dumps({'stream_truncated': True}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 finally:

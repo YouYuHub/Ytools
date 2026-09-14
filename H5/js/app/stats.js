@@ -15,20 +15,26 @@
   // 反映服务端生效的聊天模型选择：会话切换/新建会话/模型面板加载保存后调用。
   // 无缓存或显式传入会话（切换会话）时拉取一次 /chat_config/models?role=chat_model，
   // 之后复用缓存；会话独立选择与全局默认已由后端合并进 role_info.selection。
+  // requestSeq 防竞态：快速连续切换会话时丢弃过期响应，避免旧会话的模型名
+  // 后到覆盖新会话的显示（与下方 context token 刷新的序号保护同一思路）。
+  let chatModelLabelRequestSeq = 0;
   async function refreshChatModelLabel(sessionId) {
     if (!contextTokenModel) return;
     const target = sessionId ? SessionUtils.sanitizeSessionId(sessionId) : state.sessionId;
+    const requestSeq = ++chatModelLabelRequestSeq;
     // 无缓存 / 显式切换会话 / 新建会话（target 为空=取全局默认）时强制拉取，
     // 避免沿用上一会话的独立选择缓存
     if (!state.modelConfigs || !state.modelConfigs.chat_model || sessionId || !target) {
       try {
         const data = await API.getModels("chat_model", target || undefined);
+        if (requestSeq !== chatModelLabelRequestSeq) return; // 过期响应：不写缓存不渲染
         if (data) {
           state.modelConfigs = state.modelConfigs || {};
           state.modelConfigs.chat_model = data;
         }
       } catch (_) { /* 拉取失败保留现有显示 */ }
     }
+    if (requestSeq !== chatModelLabelRequestSeq) return; // 渲染前再校验，只用最新一次调用的结果
     const cfg = state.modelConfigs && state.modelConfigs.chat_model;
     const sel = cfg && cfg.role_info && cfg.role_info.selection;
     const name = sel ? (sel.model || sel.model_name || "") : "";

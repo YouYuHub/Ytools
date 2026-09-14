@@ -344,12 +344,20 @@
 
 .diff-no {
   flex: 0 0 auto;
-  min-width: 56px;
+  display: flex;
+  gap: 6px;
   padding-right: 8px;
-  text-align: right;
   color: var(--text-tertiary);
   opacity: 0.75;
   user-select: none;
+}
+
+// 双行号子列：左=旧（删除/上下文）、右=新（新增/上下文），固定宽右对齐保证
+// 删除行旧行号在左列、新增行新行号在右列，不再挤到同一位置
+.diff-no-old,
+.diff-no-new {
+  min-width: 34px;
+  text-align: right;
 }
 
 .diff-sign {

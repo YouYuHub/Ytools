@@ -4,7 +4,7 @@
 - 硬性错误整体拒绝，并返回带条目序号的纠错原因；
 - id 缺失 → 继承上一版计划或本地自增分配；id 重复 → 重新分配；
 - 多个 in_progress → 仅保留首个，其余降级 pending；
-- 工具结果回写 current plan state / todos / warnings。
+- 工具结果回写 message（自带进度统计）/ todos / warnings。
 """
 import asyncio
 import json
@@ -146,8 +146,8 @@ class TodoApplyTests(unittest.TestCase):
             ]},
         ))
         self.assertIsNotNone(items)
-        self.assertEqual(result["current plan state"],
-                         {"total": 2, "done": 1, "in_progress": 1, "pending": 0})
+        # 返回已精简：message 自带进度统计（不再有独立的 current plan state 块）
+        self.assertNotIn("current plan state", result)
         self.assertEqual([i["id"] for i in result["todos"]], ["1", "2"])
         # 三态文案：首次创建走「已创建」，非完成态 plan_complete=False
         self.assertIn("任务计划已创建", result["message"])
@@ -196,6 +196,32 @@ class TodoApplyTests(unittest.TestCase):
         self.assertIn("汇总执行结果", result_all_done["message"])
         self.assertTrue(result_all_done["plan_complete"])
         self.assertEqual(items_all_done[1]["status"], "done")
+
+    def test_replace_todo_context_summary_terminal_state(self):
+        # 摘要终态回归：模型最后一次 todo 调用（全部 done）后，历史 todo
+        # 调用/结果被替换为摘要——终态摘要必须自带"全部完成+请汇总答复"
+        # 收官指令，否则下一轮摘要只剩一列 ✓，模型无从判断计划已结束
+        from factory import chat_factory
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "function": {"name": "todo_write", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "t1", "_tool_name": "todo_write", "content": "ok"},
+            {"role": "assistant", "content": "任务执行完毕"},
+        ]
+        chat_factory._replace_todo_context(messages, [
+            {"content": "准备测试", "status": "done"},
+            {"content": "汇总结果", "status": "done"},
+        ])
+        # todo 调用与结果被替换，摘要追加在消息末尾（末尾指令靠近最新上下文）
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[1]["content"], "任务执行完毕")
+        summary = messages[2]["content"]
+        self.assertIn("任务规划已全部完成（2/2 项）", summary)
+        self.assertIn("汇总执行结果直接答复用户", summary)
+        self.assertIn("✓ 汇总结果", summary)
 
     def test_apply_session_todo_missing_id_inherits_prev(self):
         from factory import chat_factory

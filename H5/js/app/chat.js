@@ -520,8 +520,8 @@
     if (!text && !pendingMedia.length) return;
     // 仅当“当前会话”正在流式时禁止发送；其他会话在后台流式不影响本会话发送
     if (state.streaming && state.streamingSession === state.sessionId) return;
-    // 手动压缩进行中：发送会打断压缩任务并交错写入会话历史
-    if (state.manualCompactRunning) {
+    // 手动压缩进行中：仅压缩会话禁止发送（发送会打断压缩任务并交错写入会话历史）
+    if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
       toast("正在压缩对话上下文，请稍后再发送");
       return;
     }
@@ -658,8 +658,9 @@
   sendBtn.addEventListener("click", function () { send(); });
 
   stopBtn.addEventListener("click", async function () {
-    // 手动压缩进行中：终止按钮中止压缩（断开 SSE 连接，后端检测到断开后自行收尾）
-    if (state.manualCompactRunning) {
+    // 手动压缩进行中：终止按钮中止压缩（断开 SSE 连接，后端检测到断开后自行收尾）；
+    // 终止作用于压缩会话本身，切到其他会话后此按钮属于该会话的流式任务
+    if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
       if (state.manualCompactAbort) state.manualCompactAbort.abort();
       return;
     }

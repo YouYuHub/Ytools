@@ -923,12 +923,18 @@ html[data-theme=dark] .panel .session-list .session-item.active {
 
 .diff-no {
   flex: 0 0 auto;
-  min-width: 56px;
+  display: flex;
+  gap: 6px;
   padding-right: 8px;
-  text-align: right;
   color: var(--text-tertiary);
   opacity: 0.75;
   user-select: none;
+}
+
+.diff-no-old,
+.diff-no-new {
+  min-width: 34px;
+  text-align: right;
 }
 
 .diff-sign {
@@ -2035,8 +2041,10 @@ html[data-theme=dark] .tool-block-diff.is-del {
   --prism-atrule: #cf222e;
   --prism-string: #0a3069;
   --prism-attr-value: #0a3069;
+  --prism-docstring: #0a3069;
   --prism-number: #0550ae;
   --prism-boolean: #0550ae;
+  --prism-constant: #0550ae;
   --prism-function: #8250df;
   --prism-macro: #8250df;
   --prism-class: #953800;
@@ -2046,6 +2054,7 @@ html[data-theme=dark] .tool-block-diff.is-del {
   --prism-attr-name: #116329;
   --prism-selector: #116329;
   --prism-builtin: #116329;
+  --prism-variable: #116329;
   --prism-operator: #cf222e;
   --prism-diff-add: #116329;
   --prism-diff-del: #cf222e;
@@ -2062,8 +2071,10 @@ html[data-theme=dark] {
   --prism-atrule: #ff7b72;
   --prism-string: #a5d6ff;
   --prism-attr-value: #a5d6ff;
+  --prism-docstring: #a5d6ff;
   --prism-number: #79c0ff;
   --prism-boolean: #79c0ff;
+  --prism-constant: #79c0ff;
   --prism-function: #d2a8ff;
   --prism-macro: #d2a8ff;
   --prism-class: #ffa657;
@@ -2073,6 +2084,7 @@ html[data-theme=dark] {
   --prism-attr-name: #7ee787;
   --prism-selector: #7ee787;
   --prism-builtin: #7ee787;
+  --prism-variable: #7ee787;
   --prism-operator: #ff7b72;
   --prism-diff-add: #56d364;
   --prism-diff-del: #ff7b72;
@@ -2120,6 +2132,10 @@ html[data-theme=dark] {
   color: var(--prism-string);
 }
 
+.token.py-docstring {
+  color: var(--prism-docstring);
+}
+
 .token.number,
 .token.regex {
   color: var(--prism-number);
@@ -2150,11 +2166,18 @@ html[data-theme=dark] {
 }
 
 .token.property,
-.token.variable,
-.token.constant,
 .token.symbol,
 .token.builtin-target {
   color: var(--prism-property);
+}
+
+.token.variable {
+  color: var(--prism-variable);
+}
+
+.token.constant,
+.token.caps-constant {
+  color: var(--prism-constant);
 }
 
 .token.tag {
@@ -2186,7 +2209,7 @@ html[data-theme=dark] {
   font-style: italic;
 }
 
-.codeblock code.language-javascript, .token.language-javascript, .codeblock code.language-typescript, .token.language-typescript, .codeblock code.language-css, .token.language-css, .codeblock code.language-markup, .token.language-markup, .codeblock code.language-less, .token.language-less, .codeblock code.language-scss, .token.language-scss, .codeblock code.language-sass, .token.language-sass, .codeblock code.language-qml, .token.language-qml, .codeblock code.language-json, .token.language-json, .codeblock code.language-cmake, .token.language-cmake, .codeblock code.language-makefile, .token.language-makefile, .codeblock code.language-docker, .token.language-docker, .codeblock code.language-yaml, .token.language-yaml, .codeblock code.language-ini, .token.language-ini, .codeblock code.language-ignore, .token.language-ignore {
+.codeblock code.language-javascript, .token.language-javascript, .diff-code.language-javascript, .codeblock code.language-typescript, .token.language-typescript, .diff-code.language-typescript, .codeblock code.language-css, .token.language-css, .diff-code.language-css, .codeblock code.language-markup, .token.language-markup, .diff-code.language-markup, .codeblock code.language-less, .token.language-less, .diff-code.language-less, .codeblock code.language-scss, .token.language-scss, .diff-code.language-scss, .codeblock code.language-sass, .token.language-sass, .diff-code.language-sass, .codeblock code.language-qml, .token.language-qml, .diff-code.language-qml, .codeblock code.language-json, .token.language-json, .diff-code.language-json, .codeblock code.language-cmake, .token.language-cmake, .diff-code.language-cmake, .codeblock code.language-makefile, .token.language-makefile, .diff-code.language-makefile, .codeblock code.language-docker, .token.language-docker, .diff-code.language-docker, .codeblock code.language-yaml, .token.language-yaml, .diff-code.language-yaml, .codeblock code.language-ini, .token.language-ini, .diff-code.language-ini, .codeblock code.language-ignore, .token.language-ignore, .diff-code.language-ignore {
   --prism-keyword: #0000ff;
   --prism-atrule: #af00db;
   --prism-directive: #af00db;
@@ -2206,7 +2229,7 @@ html[data-theme=dark] {
   --prism-operator: #000000;
 }
 
-html[data-theme=dark] .codeblock code.language-javascript, html[data-theme=dark] .token.language-javascript, html[data-theme=dark] .codeblock code.language-typescript, html[data-theme=dark] .token.language-typescript, html[data-theme=dark] .codeblock code.language-css, html[data-theme=dark] .token.language-css, html[data-theme=dark] .codeblock code.language-markup, html[data-theme=dark] .token.language-markup, html[data-theme=dark] .codeblock code.language-less, html[data-theme=dark] .token.language-less, html[data-theme=dark] .codeblock code.language-scss, html[data-theme=dark] .token.language-scss, html[data-theme=dark] .codeblock code.language-sass, html[data-theme=dark] .token.language-sass, html[data-theme=dark] .codeblock code.language-qml, html[data-theme=dark] .token.language-qml, html[data-theme=dark] .codeblock code.language-json, html[data-theme=dark] .token.language-json, html[data-theme=dark] .codeblock code.language-cmake, html[data-theme=dark] .token.language-cmake, html[data-theme=dark] .codeblock code.language-makefile, html[data-theme=dark] .token.language-makefile, html[data-theme=dark] .codeblock code.language-docker, html[data-theme=dark] .token.language-docker, html[data-theme=dark] .codeblock code.language-yaml, html[data-theme=dark] .token.language-yaml, html[data-theme=dark] .codeblock code.language-ini, html[data-theme=dark] .token.language-ini, html[data-theme=dark] .codeblock code.language-ignore, html[data-theme=dark] .token.language-ignore {
+html[data-theme=dark] .codeblock code.language-javascript, html[data-theme=dark] .token.language-javascript, html[data-theme=dark] .diff-code.language-javascript, html[data-theme=dark] .codeblock code.language-typescript, html[data-theme=dark] .token.language-typescript, html[data-theme=dark] .diff-code.language-typescript, html[data-theme=dark] .codeblock code.language-css, html[data-theme=dark] .token.language-css, html[data-theme=dark] .diff-code.language-css, html[data-theme=dark] .codeblock code.language-markup, html[data-theme=dark] .token.language-markup, html[data-theme=dark] .diff-code.language-markup, html[data-theme=dark] .codeblock code.language-less, html[data-theme=dark] .token.language-less, html[data-theme=dark] .diff-code.language-less, html[data-theme=dark] .codeblock code.language-scss, html[data-theme=dark] .token.language-scss, html[data-theme=dark] .diff-code.language-scss, html[data-theme=dark] .codeblock code.language-sass, html[data-theme=dark] .token.language-sass, html[data-theme=dark] .diff-code.language-sass, html[data-theme=dark] .codeblock code.language-qml, html[data-theme=dark] .token.language-qml, html[data-theme=dark] .diff-code.language-qml, html[data-theme=dark] .codeblock code.language-json, html[data-theme=dark] .token.language-json, html[data-theme=dark] .diff-code.language-json, html[data-theme=dark] .codeblock code.language-cmake, html[data-theme=dark] .token.language-cmake, html[data-theme=dark] .diff-code.language-cmake, html[data-theme=dark] .codeblock code.language-makefile, html[data-theme=dark] .token.language-makefile, html[data-theme=dark] .diff-code.language-makefile, html[data-theme=dark] .codeblock code.language-docker, html[data-theme=dark] .token.language-docker, html[data-theme=dark] .diff-code.language-docker, html[data-theme=dark] .codeblock code.language-yaml, html[data-theme=dark] .token.language-yaml, html[data-theme=dark] .diff-code.language-yaml, html[data-theme=dark] .codeblock code.language-ini, html[data-theme=dark] .token.language-ini, html[data-theme=dark] .diff-code.language-ini, html[data-theme=dark] .codeblock code.language-ignore, html[data-theme=dark] .token.language-ignore, html[data-theme=dark] .diff-code.language-ignore {
   --prism-keyword: #569cd6;
   --prism-atrule: #c586c0;
   --prism-directive: #c586c0;
@@ -2226,7 +2249,7 @@ html[data-theme=dark] .codeblock code.language-javascript, html[data-theme=dark]
   --prism-operator: #d4d4d4;
 }
 
-.codeblock code.language-java, .token.language-java {
+.codeblock code.language-java, .token.language-java, .diff-code.language-java {
   --prism-keyword: #0033b3;
   --prism-string: #067d17;
   --prism-attr-value: #067d17;
@@ -2242,23 +2265,25 @@ html[data-theme=dark] .codeblock code.language-javascript, html[data-theme=dark]
   --prism-operator: #000000;
 }
 
-.codeblock code.language-python, .token.language-python {
-  --prism-keyword: #0033b3;
+.codeblock code.language-python, .token.language-python, .diff-code.language-python {
+  --prism-keyword: #0000ff;
   --prism-string: #a31515;
   --prism-attr-value: #a31515;
-  --prism-number: #1750eb;
-  --prism-boolean: #0033b3;
-  --prism-function: #00627a;
-  --prism-class: #067d17;
-  --prism-decorator: #a50a5b;
-  --prism-property: #000000;
-  --prism-builtin: #0033b3;
-  --prism-comment: #8c8c8c;
+  --prism-number: #098658;
+  --prism-boolean: #0000ff;
+  --prism-constant: #0000ff;
+  --prism-docstring: #0000ff;
+  --prism-function: #795e26;
+  --prism-class: #267f99;
+  --prism-decorator: #795e26;
+  --prism-property: #098658;
+  --prism-builtin: #267f99;
+  --prism-comment: #008000;
   --prism-punctuation: #000000;
   --prism-operator: #000000;
 }
 
-html[data-theme=dark] .codeblock code.language-java, html[data-theme=dark] .token.language-java {
+html[data-theme=dark] .codeblock code.language-java, html[data-theme=dark] .token.language-java, html[data-theme=dark] .diff-code.language-java {
   --prism-keyword: #cc7832;
   --prism-string: #6a8759;
   --prism-attr-value: #6a8759;
@@ -2274,23 +2299,25 @@ html[data-theme=dark] .codeblock code.language-java, html[data-theme=dark] .toke
   --prism-operator: #a9b7c6;
 }
 
-html[data-theme=dark] .codeblock code.language-python, html[data-theme=dark] .token.language-python {
-  --prism-keyword: #cc7832;
+html[data-theme=dark] .codeblock code.language-python, html[data-theme=dark] .token.language-python, html[data-theme=dark] .diff-code.language-python {
+  --prism-keyword: #569cd6;
   --prism-string: #ce9178;
   --prism-attr-value: #ce9178;
-  --prism-number: #6897bb;
-  --prism-boolean: #cc7832;
-  --prism-function: #ffc66d;
+  --prism-number: #b5cea8;
+  --prism-boolean: #569cd6;
+  --prism-constant: #569cd6;
+  --prism-docstring: #e9bd6f;
+  --prism-function: #d4d4d4;
   --prism-class: #4ec9b0;
-  --prism-decorator: #a8c023;
-  --prism-property: #a9b7c6;
-  --prism-builtin: #ffc66d;
-  --prism-comment: #808080;
-  --prism-punctuation: #a9b7c6;
-  --prism-operator: #a9b7c6;
+  --prism-decorator: #dcdcaa;
+  --prism-property: #b5cea8;
+  --prism-builtin: #4ec9b0;
+  --prism-comment: #6a9955;
+  --prism-punctuation: #d4d4d4;
+  --prism-operator: #d4d4d4;
 }
 
-.codeblock code.language-c, .token.language-c, .codeblock code.language-cpp, .token.language-cpp, .codeblock code.language-csharp, .token.language-csharp {
+.codeblock code.language-c, .token.language-c, .diff-code.language-c, .codeblock code.language-cpp, .token.language-cpp, .diff-code.language-cpp, .codeblock code.language-csharp, .token.language-csharp, .diff-code.language-csharp {
   --prism-keyword: #0000ff;
   --prism-directive: #0000ff;
   --prism-string: #a31515;
@@ -2306,7 +2333,7 @@ html[data-theme=dark] .codeblock code.language-python, html[data-theme=dark] .to
   --prism-operator: #000000;
 }
 
-html[data-theme=dark] .codeblock code.language-c, html[data-theme=dark] .token.language-c, html[data-theme=dark] .codeblock code.language-cpp, html[data-theme=dark] .token.language-cpp, html[data-theme=dark] .codeblock code.language-csharp, html[data-theme=dark] .token.language-csharp {
+html[data-theme=dark] .codeblock code.language-c, html[data-theme=dark] .token.language-c, html[data-theme=dark] .diff-code.language-c, html[data-theme=dark] .codeblock code.language-cpp, html[data-theme=dark] .token.language-cpp, html[data-theme=dark] .diff-code.language-cpp, html[data-theme=dark] .codeblock code.language-csharp, html[data-theme=dark] .token.language-csharp, html[data-theme=dark] .diff-code.language-csharp {
   --prism-keyword: #569cd6;
   --prism-directive: #569cd6;
   --prism-string: #ce9178;
@@ -3296,6 +3323,21 @@ html:not([data-theme=dark]) #voiceBtn {
 .tool-modal .tool-modal-toolbar .tool-confirm:hover {
   background: #096fb7;
 }
+.tool-modal .tool-modal-toolbar .tool-follow-global {
+  flex-shrink: 0;
+  height: 38px;
+  padding: 0 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.tool-modal .tool-modal-toolbar .tool-follow-global:hover {
+  color: var(--text);
+  border-color: var(--text-tertiary);
+}
 .tool-modal .tool-modal-desc {
   padding: 8px 20px 12px;
   color: var(--text-secondary);
@@ -4046,9 +4088,12 @@ html:not([data-theme=dark]) #voiceBtn {
 .chat-settings-dialog .chat-setting-field input:focus {
   border-color: #0b84d8;
 }
+.chat-settings-dialog .chat-setting-field:has(+ .chat-settings-threshold-hint) {
+  padding-bottom: 2px;
+}
 .chat-settings-dialog .chat-settings-threshold-hint {
   margin: 0 0 6px;
-  padding: 5px 10px;
+  padding: 3px 10px;
   border-radius: var(--radius-sm);
   background: var(--bg-code);
   color: var(--text-tertiary);

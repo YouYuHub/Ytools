@@ -771,6 +771,63 @@
   // ---------- 展示用 diff 视图（write_file / edit_file 结果） ----------
   // 解析 unified diff 文本：@@ hunk 头（淡化分隔）、+ 添加（绿）、- 删除（红）、
   // 空格行上下文；首字符规则解析，与后端 difflib 输出格式强约定。
+  // 行内语法高亮：从 ---/+++ 头推断文件语言 → 行文本经 Prism 高亮后注入
+  // .diff-text（Prism 输出已 HTML 转义，textContent 先行、高亮成功才替换）；
+  // 无 Prism / 语言不支持 / 高亮异常自动回退纯文本。
+
+  // diff 文件名后缀 → Prism 语言名（与 markdown.js DIFF_EXTS 同口径；未收录返回空串）
+  const DIFF_FILE_EXTS = {
+    py: "python",
+    js: "javascript", mjs: "javascript", jsx: "javascript",
+    ts: "typescript", tsx: "typescript",
+    cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", h: "cpp", c: "cpp",
+    java: "java", cs: "csharp",
+    css: "css", less: "less", scss: "scss", sass: "sass", qss: "css",
+    qml: "qml", html: "markup", htm: "markup", xml: "markup", svg: "markup",
+    go: "go", rs: "rust",
+    sh: "bash", bash: "bash",
+    json: "json", jsonc: "json", jsonl: "json",
+    yaml: "yaml", yml: "yaml",
+    ini: "ini", env: "ini",
+    cmake: "cmake", makefile: "makefile", dockerfile: "docker",
+  };
+
+  // 从 diff 头部（--- a/xxx / +++ b/xxx）推断内层语言；缓存按 diffObj 引用
+  const diffLangCache = new WeakMap();
+  function inferDiffFileLang(diffObj, diffText) {
+    if (diffObj && diffLangCache.has(diffObj)) return diffLangCache.get(diffObj);
+    let lang = "";
+    const head = (diffText || "").split("\n", 4);
+    for (let i = 0; i < head.length && !lang; i++) {
+      // difflib 头：`--- a/相对路径` / `+++ b/相对路径`；兼容裸路径写法
+      const m = head[i].match(/^--- (?:a\/)?(\S+)|^\+\+\+ (?:b\/)?(\S+)/);
+      if (!m) continue;
+      const file = m[1] || m[2] || "";
+      const base = file.replace(/\\/g, "/").split("/").pop().toLowerCase();
+      const ext = base.indexOf(".") >= 0 ? base.split(".").pop() : "";
+      if (ext && DIFF_FILE_EXTS[ext]) lang = DIFF_FILE_EXTS[ext];
+      else if (base.startsWith("dockerfile")) lang = "docker";
+      else if (base.startsWith("makefile") || base.startsWith("gnumakefile")) lang = "makefile";
+      else if (base.startsWith("cmakelists")) lang = "cmake";
+      else if (base.startsWith(".env")) lang = "ini";
+    }
+    if (diffObj) diffLangCache.set(diffObj, lang);
+    return lang;
+  }
+
+  // 行文本 → Prism 高亮 HTML（未高亮时返回 null，调用方回退 textContent）。
+  // 与官方 highlight() 同链路：tokenize 后必须先 util.encode 转义再 stringify
+  //（Token.stringify 自身不转义字符串内容，漏 encode 会把 <script> 裸注入）。
+  function highlightDiffLine(text, lang) {
+    if (!window.Prism || !Prism.languages || !Prism.languages[lang]) return null;
+    try {
+      const encoded = Prism.util.encode(Prism.tokenize(text, Prism.languages[lang]));
+      return Prism.Token.stringify(encoded, lang);   // 输出已 HTML 转义
+    } catch (_) {
+      return null;
+    }
+  }
+
   function buildDiffView(diffObj) {
     const box = el("div", "diff-view");
     const statsBits = [];
@@ -801,7 +858,9 @@
 
     const text = String((diffObj && diffObj.diff) || "");
     if (text) {
-      const pre = el("pre", "diff-code");
+      // 语言推断一次并缓存（WeakMap 随 diffObj 生命周期，历史回放同样命中）
+      const lineLang = inferDiffFileLang(diffObj, text);
+      const pre = el("pre", "diff-code" + (lineLang ? " language-" + lineLang : ""));
       const lines = text.split("\n");
       let oldNo = 0;
       let newNo = 0;
@@ -823,13 +882,26 @@
         const kind = line.charAt(0);
         const cls = kind === "+" ? "is-add" : (kind === "-" ? "is-del" : "is-ctx");
         const row = el("div", "diff-line " + cls);
+        // 双行号列：左列=旧行号（+ 行留空）、右列=新行号（- 行留空），
+        // 两个固定宽度右对齐子列，删除/新增的号码不再挤在同一位置
         const gutter = el("span", "diff-no");
-        const oldText = kind === "+" ? "" : String(oldNo);
-        const newText = kind === "-" ? "" : String(newNo);
-        gutter.textContent = (oldText + " " + newText).trim();
+        gutter.appendChild(el("span", "diff-no-old", kind === "+" ? "" : String(oldNo)));
+        gutter.appendChild(el("span", "diff-no-new", kind === "-" ? "" : String(newNo)));
         row.appendChild(gutter);
         row.appendChild(el("span", "diff-sign", kind === " " ? "" : kind));
-        row.appendChild(el("span", "diff-text", line.slice(1)));
+        const cell = el("span", "diff-text");
+        const content = line.slice(1);
+        if (lineLang) {
+          const html = highlightDiffLine(content, lineLang);
+          if (html != null) {
+            cell.innerHTML = html;   // Prism Token.stringify 输出已转义，安全
+          } else {
+            cell.textContent = content;
+          }
+        } else {
+          cell.textContent = content;
+        }
+        row.appendChild(cell);
         if (kind === "+") {
           newNo += 1;
         } else if (kind === "-") {
@@ -2077,16 +2149,28 @@
     }
     qnav.classList.remove("hidden");
 
+    const total = qnavUsers.length;
+    // 指示条均匀采样：问题数超过上限时不再截断（此前超过 40 条的完全不显示），
+    // 而是把全部问题均匀映射到 QNAV_MAX_DASHES 条指示条上——
+    // 第 j 条负责问题段 [floor(j*n/D), floor((j+1)*n/D))，点击跳到段首问题；
+    // 问题数不超过上限时一一对应，行为与原先完全一致。面板列表仍列出全部问题。
+    const dashCount = Math.min(QNAV_MAX_DASHES, total);
+    for (let j = 0; j < dashCount; j++) {
+      const start = Math.floor(j * total / dashCount);
+      const end = Math.floor((j + 1) * total / dashCount);
+      const bubble = qnavUsers[start].querySelector(".msg-bubble");
+      let text = bubble ? bubble.textContent : "问题 " + (start + 1);
+      // 一条指示条对应多个问题时，标题标注问题序号区间
+      if (end - start > 1) text = (start + 1) + "-" + end + ". " + text;
+      const dash = el("button", "qnav-dash");
+      dash.title = text;
+      dash.addEventListener("click", function () { jumpToQuestion(start); });
+      qnavRail.appendChild(dash);
+    }
+
     qnavUsers.forEach(function (userEl, i) {
       const bubble = userEl.querySelector(".msg-bubble");
       const text = bubble ? bubble.textContent : "问题 " + (i + 1);
-
-      if (i < QNAV_MAX_DASHES) {
-        const dash = el("button", "qnav-dash");
-        dash.title = text;
-        dash.addEventListener("click", function () { jumpToQuestion(i); });
-        qnavRail.appendChild(dash);
-      }
       const item = el("button", "qnav-item", i + 1 + ". " + text);
       item.addEventListener("click", function () { jumpToQuestion(i); });
       qnavPanel.appendChild(item);
@@ -2114,8 +2198,22 @@
     qnavUsers.forEach(function (userEl, i) {
       if (userEl.getBoundingClientRect().top - scrollRect.top < 120) current = i;
     });
-    qnavRail.querySelectorAll(".qnav-dash").forEach(function (d, i) {
-      d.classList.toggle("active", i === current);
+    // 高亮当前问题所属的采样段：与 rebuildQnav 同口径计算每段起点，
+    // 找最大的 start_j ≤ current 即当前段；一一对应时直接用下标
+    const dashes = qnavRail.querySelectorAll(".qnav-dash");
+    let activeDash = -1;
+    if (dashes.length && dashes.length === qnavUsers.length) {
+      activeDash = current;
+    } else {
+      for (let j = dashes.length - 1; j >= 0; j--) {
+        if (Math.floor(j * qnavUsers.length / dashes.length) <= current) {
+          activeDash = j;
+          break;
+        }
+      }
+    }
+    dashes.forEach(function (d, i) {
+      d.classList.toggle("active", i === activeDash);
     });
     qnavPanel.querySelectorAll(".qnav-item").forEach(function (d, i) {
       d.classList.toggle("active", i === current);

@@ -63,6 +63,8 @@ window.App = window.App || {};
     pendingAskBlock: null,
     // 手动压缩进行中标记：compaction 模块置位，发送守卫与发送按钮据此拦截
     manualCompactRunning: false,
+    // 手动压缩所属会话：守卫/按钮只作用于该会话，其他会话不受影响
+    manualCompactSession: null,
     // 手动压缩的中止控制器：终止按钮点击时 abort 断开压缩 SSE 连接
     manualCompactAbort: null,
     // 流式期间的消息暂存：
@@ -176,6 +178,7 @@ window.App = window.App || {};
   const toolSelected = $("#toolSelected");
   const toolCollapseAll = $("#toolCollapseAll");
   const toolRefresh = $("#toolRefresh");
+  const toolFollowGlobal = $("#toolFollowGlobal");
   const fileInput = $("#fileInput");
   const historyFileInput = $("#historyFileInput");
   const fileChips = $("#fileChips");
@@ -501,7 +504,7 @@ window.App = window.App || {};
   enhanceClearOverride, enhanceHint, plusBtn,
   plusMenu, toolModal, toolGroups,
   toolSearchInput, toolSelected, toolCollapseAll,
-  toolRefresh, fileInput, historyFileInput,
+  toolRefresh, toolFollowGlobal, fileInput, historyFileInput,
   fileChips, toolChips, themeMenu,
   profileSub, scrollBottomBtn, qnav,
   qnavRail, qnavPanel, toastWrap,

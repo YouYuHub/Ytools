@@ -295,6 +295,24 @@
         background: #096fb7;
       }
     }
+
+    // 「跟随全局」按钮（会话覆盖态显示）：弱化视觉，与确定按钮并排
+    .tool-follow-global {
+      flex-shrink: 0;
+      height: 38px;
+      padding: 0 14px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 13px;
+      cursor: pointer;
+
+      &:hover {
+        color: var(--text);
+        border-color: var(--text-tertiary);
+      }
+    }
   }
 
   .tool-modal-desc {
@@ -1089,10 +1107,15 @@
   }
 
   // 有效压缩阈值提示行（触发比例字段下方，独占一行）：
-  // 对齐字段描述 small 的弱化视觉，避免浏览器默认 <p> 16px 大字
+  // 对齐字段描述 small 的弱化视觉，避免浏览器默认 <p> 16px 大字；
+  // 上方字段的底 padding 用 :has 邻接压缩，避免「描述小字 → 提示行」间距过大
+  .chat-setting-field:has(+ .chat-settings-threshold-hint) {
+    padding-bottom: 2px;
+  }
+
   .chat-settings-threshold-hint {
     margin: 0 0 6px;
-    padding: 5px 10px;
+    padding: 3px 10px;
     border-radius: var(--radius-sm);
     background: var(--bg-code);
     color: var(--text-tertiary);

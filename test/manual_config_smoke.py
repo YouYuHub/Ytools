@@ -110,11 +110,21 @@ def main() -> None:
         print("OK: GET(session_id) 返回会话覆盖/生效选择")
 
         resp = _request("POST", "/chat_config/tool_selection", {"inputs": {}, "session_id": sid})
+        # 三态语义：空 inputs = 显式无工具模式（哨兵，不回退全局）
+        assert resp["is_overridden"] is True and resp["session_selection"] == {"__empty__": []}, resp
+        resp = _request("GET", f"/chat_config/tool_selection?session_id={sid}")
+        assert resp["is_overridden"] is True
+        assert resp["session_selection"] == {"__empty__": []}, resp
+        assert resp["effective_selection"] == {}, "空哨兵 = 显式无工具，不回退全局默认"
+        print("OK: 空 inputs 保存为显式无工具哨兵（不回退全局）")
+
+        resp = _request("POST", "/chat_config/tool_selection",
+                        {"inputs": {}, "session_id": sid, "clear": True})
         assert resp["is_overridden"] is False and resp["session_selection"] is None, resp
         resp = _request("GET", f"/chat_config/tool_selection?session_id={sid}")
         assert resp["is_overridden"] is False
-        assert resp["effective_selection"] == resp["inputs"], "清除后生效选择应等于全局默认"
-        print("OK: 空 inputs 清除会话覆盖，恢复跟随全局")
+        assert resp["effective_selection"] == resp["inputs"], "clear 清除覆盖后生效选择应等于全局默认"
+        print("OK: clear=true 清除会话覆盖，恢复跟随全局")
 
         # ---- 3. 全局 tool_selection POST 仍写 mcp_servers.json ----
         global_inputs = {server: [] for server in servers_before}

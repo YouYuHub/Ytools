@@ -343,6 +343,9 @@
     // 恢复目标会话的输入草稿（文本+附件；无草稿则清空）
     App.restoreSessionDraft(id);
     App.resetContextTokenStats();
+    // 会话切换时同步状态条模型名：显式传 id 强制按目标会话拉取生效选择
+    //（会话独立选择 → 全局默认），避免沿用上一会话的模型缓存显示
+    App.refreshChatModelLabel(id);
     state.hasConversation = false;
     state.importedHistoryText = null;
     App.updateExportButton();
@@ -411,7 +414,7 @@
     }
     setEmpty(false);
     App.rebuildQnav();
-    App.refreshChatModelLabel(id); // 会话模型选择可能与会话绑定，打开时同步状态条
+    // 模型名刷新已提升到 openSession 主流程（此处不再调用，避免同一次打开重复请求）
     return true;
   }
 

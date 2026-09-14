@@ -26,8 +26,9 @@
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
     // 手动压缩进行中：发送会打断压缩任务并交错写入会话历史，隐藏发送入口
     // （键盘发送由 send() 内的同名守卫拦截）；终止按钮接管，点击可中止压缩。
-    // 压缩期间引导/队列也不可用：必须等压缩完成后才能发消息
-    const compacting = state.manualCompactRunning;
+    // 压缩期间引导/队列也不可用：必须等压缩完成后才能发消息。
+    // 仅压缩发起会话受影响：切到其他会话时按钮状态不受后台压缩影响
+    const compacting = state.manualCompactRunning && state.manualCompactSession === state.sessionId;
     // 运行中组合按钮：仅当前会话流式/压缩时显示；上拉钮只在流式（非压缩）时可用
     const showStopGroup = currentStreaming || compacting;
     composer.classList.toggle("has-text", hasText);
@@ -99,7 +100,9 @@
     e.preventDefault();
     // 流式进行中（当前会话、非压缩）：Enter=消息引导，Alt+Enter=加入队列
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
-    if (currentStreaming && !state.manualCompactRunning) {
+    const compactingHere = state.manualCompactRunning &&
+      state.manualCompactSession === state.sessionId;
+    if (currentStreaming && !compactingHere) {
       submitSteerOrQueue(e.altKey ? "queue" : "steer");
       return;
     }
@@ -116,7 +119,7 @@
   async function submitSteerOrQueue(mode) {
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
     if (!currentStreaming) return;
-    if (state.manualCompactRunning) {
+    if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
       toast("正在压缩对话上下文，请等待压缩完成后再发送");
       return;
     }
@@ -206,7 +209,7 @@
       sendNow.type = "button";
       sendNow.title = "立即发送该条消息（生成中则打断当前回复并以此消息重发）";
       sendNow.addEventListener("click", async function () {
-        if (state.manualCompactRunning) {
+        if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
           toast("正在压缩对话上下文，请稍后再发送");
           return;
         }
@@ -338,7 +341,8 @@
       state.suppressFlushOnce = false;
       return;
     }
-    if (state.manualCompactRunning) return;
+    // 压缩进行中仅拦截压缩会话的派发（其余会话不受影响）
+    if (state.manualCompactRunning && state.manualCompactSession === (finishedSessionId || state.sessionId)) return;
     if (state.pendingAskQuestions) return; // ask_user 等待用户回答，不抢占
     const target = finishedSessionId || state.sessionId;
     // 用户已切走：留在暂存区，重新打开该会话时再派发

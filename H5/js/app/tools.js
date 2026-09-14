@@ -9,7 +9,8 @@
   const {
     state, el, toast, $,
     toolModal, toolGroups, toolSearchInput, toolSelected,
-    toolCollapseAll, toolRefresh, toolTip, hideToolTip
+    toolCollapseAll, toolRefresh, toolTip, hideToolTip,
+    toolFollowGlobal
   } = App;
 
   // ---------- 工具选择 ----------
@@ -106,7 +107,9 @@
 
   async function saveToolSelection() {
     try {
-      // 会话内选择写入该会话（_meta.tool_selection，仅本会话生效）；
+      // 会话内选择写入该会话（_meta.tool_selection 覆盖快照，仅本会话生效）；
+      // 全取消勾选后保存 = 会话显式无工具模式（后端落空选择哨兵，不回退全局默认），
+      // 「恢复跟随全局默认」走下方独立的 toolFollowGlobal 按钮（clear 语义）；
       // 新对话（尚未产生 sessionId）的选择写入全局默认（mcp_servers.json 的 inputs 键），
       // 作为之后新建会话的默认工具——与工作路径"新会话前改默认"的语义一致
       if (state.sessionId) {
@@ -119,6 +122,21 @@
       updateToolSelectionHint();
     } catch (err) {
       toast("工具选择保存失败：" + err.message);
+    }
+  }
+
+  // 会话级「恢复跟随全局默认」：清除 _meta.tool_selection 覆盖（clear 语义），
+  // 之后该会话重新跟随 mcp_servers.json 的全局 inputs；新对话无覆盖，不显示按钮
+  async function followGlobalToolSelection() {
+    if (!state.sessionId) return;
+    try {
+      await API.updateToolSelection({}, state.sessionId, true);
+      state.toolSelectionOverridden = false;
+      await loadToolSelection();
+      App.refreshContextTokenStats(state.sessionId);
+      toast("本会话已恢复跟随全局默认工具选择");
+    } catch (err) {
+      toast("恢复跟随全局失败：" + err.message);
     }
   }
 
@@ -157,11 +175,15 @@
     }).catch(function () { /* 加载失败保持本地状态 */ });
   }
 
-  // 模态框"已选 N 项"上悬浮提示当前是会话独立选择还是全局默认
+  // 模态框"已选 N 项"上悬浮提示当前是会话独立选择还是全局默认；
+  // 「跟随全局」按钮仅在会话覆盖态显示（清除覆盖用，见 followGlobalToolSelection）
   function updateToolSelectionHint() {
+    if (toolFollowGlobal) {
+      toolFollowGlobal.hidden = !state.toolSelectionOverridden;
+    }
     if (!toolSelected) return;
     toolSelected.title = state.toolSelectionOverridden
-      ? "当前为该会话的独立工具选择（清除全部并保存可恢复跟随全局默认）"
+      ? "当前为该会话的独立工具选择（含显式无工具模式）；点「跟随全局」可恢复跟随默认"
       : "当前跟随全局默认工具选择；新对话中修改会更新全局默认";
   }
 
@@ -342,10 +364,18 @@
     App.closeToolModal();
     App.refreshContextTokenStats(state.sessionId);
     toast(savingForSession
-      ? "已保存本会话工具选择（" + state.selectedTools.size + " 项）"
+      ? (state.selectedTools.size
+        ? "已保存本会话工具选择（" + state.selectedTools.size + " 项）"
+        : "已保存：本会话显式无工具模式（不跟随全局默认）")
       : "已保存为新会话默认工具选择（" + state.selectedTools.size + " 项）");
     await saveToolSelection();
   });
+
+  // 「跟随全局」：仅会话覆盖态显示；清除本会话独立选择（含显式无工具模式），
+  // 恢复跟随 mcp_servers.json 的全局默认
+  if (toolFollowGlobal) {
+    toolFollowGlobal.addEventListener("click", followGlobalToolSelection);
+  }
 
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
