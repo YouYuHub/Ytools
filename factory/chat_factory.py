@@ -620,17 +620,26 @@ def _build_sub_agent_contexts(
     session_chat_memory,
     stream,
     stop_checker,
+    parent_vision_enabled: bool | None = None,
 ) -> list["SubAgentContext"]:
     """把父循环收集的 sub_agent 调用转成 SubAgentContext 列表（docs/sub_agent_v1.md §6.1）。
 
     工具快照在派发时刻固化：
     - 剔除 sub_agent（V1 禁止嵌套）与 check_tool_exists（子任务工具已知）；
     - ask_user 替换为占位定义（子任务无用户通道，占位执行返回明确错误）；
-    - read_media 若父级本轮未启用，子级同样不注入。
+    - read_media：父级本轮未启用，或模型不支持视觉（parent_vision_enabled
+      为 False）时一律不注入——schema 不进子任务请求，子模型就无从知道并
+      调用该工具（支持时正常注入，子任务执行链已接内置处理）。
     """
     limits = load_sub_agent_limits()
     used_agent_ids: set[str] = set()
     contexts: list["SubAgentContext"] = []
+    # 派发层 read_media 可见性按"实际执行子任务的模型"判定：
+    # sub_agent_model 独立子模型支持视觉 → 注入；父级/子模型不支持视觉 → 不注入
+    #（schema 不进子任务请求，子模型就无从知道并调用该工具）
+    from factory.agent_runtime.sub_agent import resolve_sub_agent_vision_enabled
+    sub_vision_enabled = resolve_sub_agent_vision_enabled(parent_vision_enabled)
+    read_media_blocked = not sub_vision_enabled
     for agent_index, (tool_index, tc, task_text, initial_todo) in enumerate(sub_agent_calls):
         tool_call_id = tc.get("id", "") if isinstance(tc, dict) else ""
         # 子工具白名单 = 父级本轮工具快照 − sub_agent − check_tool_exists；
@@ -641,6 +650,8 @@ def _build_sub_agent_contexts(
         for tool_def in round_tools:
             tool_name = _tool_name_from_definition(tool_def)
             if not tool_name or tool_name == SUB_AGENT_TOOL_NAME or tool_name == CHECK_TOOL_EXISTS_NAME:
+                continue
+            if tool_name == READ_MEDIA_NAME and read_media_blocked:
                 continue
             if tool_name == ASK_USER_TOOL_NAME:
                 child_tools.append(dict(ASK_USER_PLACEHOLDER_DEFINITION))
@@ -672,6 +683,7 @@ def _build_sub_agent_contexts(
             reply_max_chars=limits["reply_max_chars"],
             emit_event=lambda payload: _emit_sub_agent_event(session_chat_memory, stream, payload),
             stop_checker=stop_checker,
+            parent_vision_enabled=parent_vision_enabled,
         ))
         used_agent_ids.add(contexts[-1].agent_id)
     return contexts
@@ -711,6 +723,25 @@ async def _run_chat_generation(
     except ChatModelConfigurationError as exc:
         await _stream_emit(stream, _sse_error_payload(str(exc)))
         return
+    # 会话生效聊天模型的视觉能力（models.json 模型条目 vision 字段）：
+    # 决定当前轮图片/视频是否解析为 base64 发送、read_media 工具是否注入。
+    # 配置缺失（mock 场景/异常回退）时保守视为支持，行为与历史版本一致，
+    # 不发能力警告、不拦截工具。
+    chat_config_effective = require_default_chat_config()
+    if isinstance(chat_config_effective, dict):
+        vision_enabled = bool(chat_config_effective.get("vision", False))
+    else:
+        vision_enabled = True
+    if not vision_enabled:
+        vision_warning_event = {
+            "warning": {
+                "code": "VISION_DISABLED",
+                "message": "当前模型不支持视觉（vision=false），本次消息中的图片/视频仅存档不发送，read_media 工具不可用",
+            }
+        }
+        await _stream_emit(
+            stream, f"data: {json.dumps(vision_warning_event, ensure_ascii=False)}\n\n"
+        )
     await load_all_tools()
     # 计算本轮允许使用的工具：后端实时工具为唯一真相；前端仅允许传 tool_names
     configured_tools = list(tool_registry.ALL_TOOLS)
@@ -811,6 +842,9 @@ async def _run_chat_generation(
     read_file_requested = READ_FILE_NAME in (requested_names or [])
     search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
     read_media_requested = READ_MEDIA_NAME in (requested_names or [])
+    # 模型不支持视觉时 read_media 一律不注入（即使前端勾选/选择快照里带上）：
+    # 工具能力由后端会话生效模型决定，前端仅为展示口径
+    read_media_requested = read_media_requested and vision_enabled
     sub_agent_requested = (
         SUB_AGENT_TOOL_NAME in (requested_names or [])
         and load_var("SUB_AGENT_ENABLED", DEFAULT_SUB_AGENT_ENABLED)
@@ -986,8 +1020,12 @@ async def _run_chat_generation(
         # 等带引用的占位标注，见 chat_history_format/file_memory），不回传图片
         # 数据；已压缩轮次（摘要/问题索引）不携带媒体。用户消息此刻已按原始
         # 引用落盘，历史 JSONL 不会膨胀。
+        # 模型不支持视觉（vision=false）时媒体部件不解析 base64，就地替换为
+        # 带引用的文本占位（图片仅存档，不发图片数据）。
         try:
-            unresolved_media = resolve_message_media_refs(session_id, messages)
+            unresolved_media = resolve_message_media_refs(
+                session_id, messages, vision_enabled=vision_enabled
+            )
             if unresolved_media:
                 print(
                     f"[WARN] {len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
@@ -1845,6 +1883,7 @@ async def _run_chat_generation(
                         session_id,
                         current_task_media_references,
                         already_injected=read_media_injected_refs,
+                        vision_enabled=vision_enabled,
                     )
                     if read_media_result.get("ok"):
                         read_media_injected_refs.update(
@@ -1960,6 +1999,7 @@ async def _run_chat_generation(
                     session_chat_memory=session_chat_memory,
                     stream=stream,
                     stop_checker=stop_checker,
+                    parent_vision_enabled=vision_enabled,
                 )
                 tool_results.extend(await run_sub_agent_batch(sub_contexts))
             if builtin_results:

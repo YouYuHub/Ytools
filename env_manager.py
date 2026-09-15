@@ -156,6 +156,8 @@ def get_model_config(provider_name: str | None = None, model_name: str | None = 
         model_item.get("id") or model_item.get("name")
     )
     resolved_config["selected_model"] = dict(model_item)
+    # 视觉能力顶层字段（请求链路能力判断的读取口径）：models.json 缺省视为不支持
+    resolved_config["vision"] = bool(model_item.get("vision", False))
     resolved_config.setdefault("apiType", "chat-completions")
     return resolved_config
 
@@ -624,6 +626,8 @@ def select_chat_model(
         "model_id": chat_config.get("selected_model_id"),
         "parameter": selected["parameter"],
         "api_type": selected["api_type"],
+        # 模型能力回显：供前端在切换模型后立即感知视觉能力（read_media 可用性等）
+        "vision": bool(chat_config.get("vision", False)) if chat_config else False,
     }
 
 

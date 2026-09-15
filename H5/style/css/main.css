@@ -1925,6 +1925,9 @@ html[data-theme=dark] .tool-block-diff.is-del {
   padding: 4px;
   box-sizing: border-box;
 }
+.md-svg-block .md-svg-view[hidden] {
+  display: none;
+}
 .md-svg-block .md-svg-view svg {
   display: block;
   width: 100%;

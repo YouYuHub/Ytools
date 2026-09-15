@@ -856,6 +856,11 @@ def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
         "available_models": available,
         "available_count": len(available),
     }
+    if role == "chat_model":
+        # 会话生效聊天模型的视觉能力：前端据此控制 read_media 工具的可用性
+        #（vision=false 时该工具在工具选择弹窗置灰不可勾选）与上传提示
+        effective_config = env_manager.get_model_config(provider, model) if (provider and model) else None
+        payload["vision"] = bool(effective_config.get("vision", False)) if effective_config else False
     if role == "compaction_model":
         payload["compaction_status"] = get_context_compaction_model_status()
     return payload

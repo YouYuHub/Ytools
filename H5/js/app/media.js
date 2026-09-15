@@ -191,6 +191,11 @@
 
   async function addPendingMediaFiles(files) {
     const added = [];
+    // 模型不支持视觉（vision=false）时的能力提示：附件照常上传存档，
+    // 发送时后端只会给模型传文本占位（不发图片 base64），read_media 不可用
+    if (files && files.length && !App.getChatModelVision()) {
+      toast("当前模型不支持视觉：附件仅存档，模型看不到图片内容");
+    }
     for (const file of files || []) {
       if (!file) continue;
       if (state.pendingMedia.length >= MAX_PENDING_MEDIA) {

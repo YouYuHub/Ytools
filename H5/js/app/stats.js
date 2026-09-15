@@ -41,8 +41,19 @@
     contextTokenModel.textContent = name;
     contextTokenModel.title = name ? "当前聊天模型：" + name : "";
     contextTokenModel.classList.toggle("hidden", !name);
+    // 会话生效模型的视觉能力：read_media 工具可用性与附件发送提示的判定来源
+    //（后端 role_info.vision 为权威值；接口失败时保守置 true，不误伤可用功能）
+    state.chatModelVision = cfg && cfg.role_info
+      ? (cfg.role_info.vision !== false)
+      : true;
   }
   App.refreshChatModelLabel = refreshChatModelLabel;
+
+  // 当前会话生效聊天模型是否支持视觉（models.json vision 字段，后端合并会话
+  // 覆盖后的权威值）；数据未拉到时保守按支持处理，避免误禁功能
+  App.getChatModelVision = function () {
+    return state.chatModelVision !== false;
+  };
 
   // ---------- token 统计 ----------
   // 用量归一化 / 文案见 FormatUtils（js/format_utils.js）
@@ -197,7 +208,7 @@
       "请求上下文 " + FormatUtils.fmtNum(used) + " / " + FormatUtils.fmtNum(limit) +
       "（" + formatContextPercent(ratio) + "）",
       recentCount ? "最近 " + recentCount + " 轮合计 " + FormatUtils.fmtNum(recentTokens) + " tokens" : "暂无可展开轮次",
-      compressionCount ? "单轮压缩 " + FormatUtils.fmtNum(compressionCount) + " 次" : "未发生单轮压缩",
+      compressionCount ? "当前会话累计压缩 " + FormatUtils.fmtNum(compressionCount) + " 次" : "当前会话未发生压缩",
     ].join("\n");
     contextTokenStatus.setAttribute("aria-label",
       "请求上下文 " + formatContextPercent(ratio) +

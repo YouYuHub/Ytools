@@ -24,7 +24,7 @@ from config import DEFAULT_SERVICE_HOST, DEFAULT_SERVICE_PORT
 
 # 引入路由，需要在 init_path() 之后
 from routers.chat_router import api_chat_router
-from routers.chat_config_router import api_chat_config_router
+from routers.chat_config_router import api_chat_config_router, sync_tool_selection_memory
 from routers.tools_manage_router import api_tools_manage_router
 from routers.file_router import api_file_router
 from routers.prompt_router import api_prompt_router
@@ -96,8 +96,7 @@ def _start_config_hot_reload() -> None:
     def _reload_mcp_servers(data: dict, meta: dict) -> None:
         # inputs / servers 变化都同步工具选择内存快照（服务集合可能增删）
         try:
-            from routers import chat_config_router
-            chat_config_router.sync_tool_selection_memory(data)
+            sync_tool_selection_memory(data)
         except Exception as exc:
             print(f"[config-watch] 同步工具选择内存失败: {exc}")
 
@@ -140,11 +139,11 @@ _start_config_hot_reload()
 # ---------- 工具注册表预热：启动即后台探测一次，首个页面加载/首条消息直接命中缓存 ----------
 def _prewarm_tool_registry() -> None:
     from config import get_current_dir
-    from factory.agent_runtime import tool_registry
+    from factory.agent_runtime.tool_registry import refresh_tools_from_mcp
 
     def _prewarm() -> None:
         try:
-            asyncio.run(tool_registry.refresh_tools_from_mcp(get_current_dir()))
+            asyncio.run(refresh_tools_from_mcp(get_current_dir()))
         except Exception as exc:
             print(f"[prewarm] MCP 工具预热失败（首个请求会现场重探）: {exc}")
 

@@ -49,6 +49,25 @@ def _load_tool_call_timeout() -> float:
         return float(DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS)
 
 
+def _load_chat_vision_enabled() -> bool:
+    """当前生效聊天模型（ambient 会话覆盖 → 全局默认）是否支持视觉。
+
+    与真实生成请求同一读取口径：真实任务内 ambient 覆盖已由
+    set_ambient_model_selection 设置（工厂任务启动 / token 统计分支），
+    get_default_chat_config 即返回该会话生效模型配置；读取失败（未配置
+    模型、配置异常等）保守视为支持——不发误导性禁用提示，与工厂层
+    vision 判定的保守口径一致。
+    """
+    try:
+        from env_manager import get_default_chat_config
+        chat_config = get_default_chat_config()
+        if isinstance(chat_config, dict):
+            return bool(chat_config.get("vision", False))
+    except Exception:
+        pass
+    return True
+
+
 def build_media_tag_prompt() -> str:
     """媒体伪标签输出说明：前端会把 <image>/<audio>/<video>/<pdf> 渲染为可交互控件。
 
@@ -174,10 +193,27 @@ def build_sys_prompt(include_media_prompt: bool = True) -> str:
             "MCP 工具执行不限制超时：单次调用可能长时间阻塞，"
             "耗时不确定的操作请主动拆分并阶段性反馈进度。"
         )
+    # 媒体附件说明按当前生效模型的视觉能力分叉（vision 读取口径与真实
+    # 请求一致）：不支持视觉的模型绝不能看到 read_media 可用的指引——
+    # 否则会照着提示词模仿文本版工具调用（实证：无工具模式下输出
+    # <tool name="read_media"> 伪调用，参数名都是编的）
+    if _load_chat_vision_enabled():
+        media_note = (
+            "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等形式出现在上下文里"
+            "（media:// 为会话媒体库的稳定引用）；需要重新查看历史图片/音频时，"
+            "用 read_media（如果可用）传入对应 media:// 引用即可。"
+        )
+    else:
+        media_note = (
+            # "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等纯文本占位出现在上下文里："
+            "当前模型不支持视觉，图片/视频内容不会回传给你（仅存档）。"
+            # "read_media 工具不可用、不要尝试读取任何媒体引用；如需识别图片内容，"
+            # "请告知用户切换支持视觉的模型。音频不受影响，仍会以多模态部件回传。"
+        )
     notes = [
-        "工具由用户选择提供，你只能使用最近一次 user 角色给你的（如果用户提供了）；之前用过的工具不一定能使用。",
+        "工具由用户选择提供，你只能使用最近一次 user 角色给你的（如果用户提供了）；之前用过的工具不一定能使用。"
         "任务过程中，你的思考过程只保留最近一次，过程中的重要发现需要实时告诉用户，这也是为了后续任务的连贯性。",
-        "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等形式出现在上下文里（media:// 为会话媒体库的稳定引用）；需要重新查看历史图片/音频时，用 read_media 传入对应 media:// 引用即可。",
+        media_note,
         timeout_note,
     ]
     if tool_result_limit > 0:

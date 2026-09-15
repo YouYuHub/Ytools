@@ -1503,6 +1503,7 @@ def execute_read_media(
     available_references: list[str] | set[str] | tuple[str, ...] | None = None,
     already_injected: set[str] | None = None,
     load_media=None,
+    vision_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
 
@@ -1512,7 +1513,9 @@ def execute_read_media(
       时 media:// 引用仍按旧语义过滤，非 media:// 来源不受影响；
     - already_injected：本轮已注入过的引用（重复读取直接跳过）；
     - load_media：媒体加载函数（默认 load_any_media_model_part），便于测试
-      注入桩；签名 (session_id, reference, quality=…) → info|None。
+      注入桩；签名 (session_id, reference, quality=…) → info|None；
+    - vision_enabled=False：当前模型不支持视觉时直接拒绝执行（兜底拦截，
+      正常情况下工厂层在注入阶段已按 vision 过滤，不会把本工具给到模型）。
 
     返回结构：
     - ok 为 True 时 loaded/injected_references 为成功读取的媒体元信息；
@@ -1524,6 +1527,15 @@ def execute_read_media(
     references, quality, arg_error = normalize_read_media_args(tool_args)
     if arg_error:
         return {"ok": False, "error": arg_error, "loaded": [], "skipped": [], "injected_references": []}
+    # 模型不支持视觉：拒绝执行并说明原因（切回支持视觉的模型后可正常使用）
+    if vision_enabled is False:
+        return {
+            "ok": False,
+            "error": "当前模型不支持视觉（vision=false），read_media 工具不可用；请切换支持视觉的模型后重试",
+            "loaded": [],
+            "skipped": [],
+            "injected_references": [],
+        }
 
     available = {str(item) for item in (available_references or [])}
     injected = {str(item) for item in (already_injected or set())}

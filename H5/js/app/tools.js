@@ -198,6 +198,9 @@
   }
 
   function toggleDraftTool(name, checked) {
+    // 当前模型不支持视觉（vision=false）时 read_media 不可用：勾选守卫，
+    // 整组全选/单独勾选/行点击三条路径都经过这里统一拦截
+    if (checked && name === "read_media" && !App.getChatModelVision()) return;
     if (checked) state.draftTools.add(name);
     else state.draftTools.delete(name);
     updateToolSelected();
@@ -207,6 +210,13 @@
     toolGroups.innerHTML = "";
     const query = toolSearchInput.value.trim().toLowerCase();
     const groups = groupTools();
+    // 当前模型不支持视觉时 read_media 不可用：先从草稿勾选集剔除（渲染后
+    // 复选框置灰，保存后不会带上），后端请求侧同样兜底过滤
+    const visionBlocked = !App.getChatModelVision();
+    if (visionBlocked && state.draftTools.has("read_media")) {
+      state.draftTools.delete("read_media");
+      updateToolSelected();
+    }
     // 内置工具分组固定排首位，其后按 MCP 服务顺序
     const order = unique([App.BUILTIN_SERVER_KEY].concat(state.servers, Array.from(groups.keys())));
 
@@ -267,7 +277,17 @@
 
           row.innerHTML = '<svg class="icon tool-row-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/></svg><span class="tool-row-info"><span class="tool-row-name"></span><span class="tool-row-description"></span></span>';
           row.querySelector(".tool-row-name").textContent = tool.name;
-          row.querySelector(".tool-row-description").textContent = tool.description;
+          // read_media 在当前模型不支持视觉时置灰禁用（勾选路径已统一守卫）
+          const rowVisionBlocked = visionBlocked && tool.name === "read_media";
+          if (rowVisionBlocked) {
+            checkbox.disabled = true;
+            row.style.opacity = "0.55";
+            row.title = "当前模型不支持视觉（vision=false），read_media 不可用";
+            row.querySelector(".tool-row-description").textContent =
+              tool.description + "（当前模型不支持视觉，不可用）";
+          } else {
+            row.querySelector(".tool-row-description").textContent = tool.description;
+          }
           row.insertBefore(checkbox, row.firstChild);
           row.addEventListener("click", function () {
             checkbox.checked = !checkbox.checked;

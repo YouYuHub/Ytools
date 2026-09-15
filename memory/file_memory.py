@@ -579,13 +579,22 @@ def save_session_media_stream(session_id: str, filename: str, file_obj: Any) -> 
     }
 
 
-def resolve_media_content_parts(session_id: str, content: Any) -> tuple[Any, list[str]]:
+def resolve_media_content_parts(
+    session_id: str,
+    content: Any,
+    vision_enabled: bool | None = None,
+) -> tuple[Any, list[str]]:
     """把消息 content 列表里的 media:// 引用解析为上游 API 兼容格式。
 
     - ``image_url.url`` / ``video_url.url`` 等 URL 字段：解析为
       ``data:<mime>;base64,<b64>``（url 与 base64 双格式中的 base64 形态）；
     - ``input_audio.data``：解析为纯 base64（OpenAI 音频格式不要 data: 前缀）；
     - 其余部件（纯文本、http(s) URL、已内联 data:）原样保留。
+
+    vision_enabled=False（当前模型不支持视觉）时媒体部件不再解析为 base64，
+    就地替换为带引用的文本占位（「[图片 media://x.png]」等，与历史回放口径
+    一致）——图片仅存档（media:// 引用已随消息落盘），不发图片数据给不支持
+    视觉的模型；None 视为 True（保持向后兼容，默认按支持视觉解析）。
 
     返回 (解析后的 content, 未成功解析的引用列表)。content 为字符串时原样返回。
     """
@@ -597,6 +606,13 @@ def resolve_media_content_parts(session_id: str, content: Any) -> tuple[Any, lis
         if not isinstance(part, dict):
             resolved_parts.append(part)
             continue
+        # 视觉降级：模型不支持视觉时媒体部件转文本占位（audio 不受影响），
+        # 引用保留在占位文本中，模型可切支持视觉的模型后用 read_media 回读
+        if vision_enabled is False:
+            media_label = _media_reference_label(part)
+            if media_label is not None and str(part.get("type") or "") != "input_audio":
+                resolved_parts.append({"type": "text", "text": media_label})
+                continue
         new_part = dict(part)
         # URL 类部件：image_url / video_url 等以 _url 结尾的键
         for key, value in list(new_part.items()):
@@ -640,9 +656,15 @@ def resolve_media_content_parts(session_id: str, content: Any) -> tuple[Any, lis
     return resolved_parts, unresolved
 
 
-def resolve_message_media_refs(session_id: str, messages: list[Any]) -> list[str]:
+def resolve_message_media_refs(
+    session_id: str,
+    messages: list[Any],
+    vision_enabled: bool | None = None,
+) -> list[str]:
     """就地解析一组消息里的媒体引用（仅当前轮消息调用，历史轮次不解析）。
 
+    vision_enabled=False 时媒体部件不解析为 base64，替换为文本占位（见
+    resolve_media_content_parts）；vision_enabled=None 视为 True（兼容默认）。
     返回未成功解析的引用列表；单个解析异常不影响其余部件。
     """
     unresolved_all: list[str] = []
@@ -652,7 +674,9 @@ def resolve_message_media_refs(session_id: str, messages: list[Any]) -> list[str
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        resolved, unresolved = resolve_media_content_parts(session_id, content)
+        resolved, unresolved = resolve_media_content_parts(
+            session_id, content, vision_enabled=vision_enabled
+        )
         message["content"] = resolved
         unresolved_all.extend(unresolved)
     return unresolved_all

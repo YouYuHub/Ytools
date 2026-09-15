@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,11 +38,15 @@ from util.timestamp_utils import now_str
 from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
     CHECK_TOOL_EXISTS_NAME,
+    READ_MEDIA_NAME,
     SUB_AGENT_TOOL_NAME,
     TODO_TOOL_NAME,
     execute_ask_user_placeholder,
     execute_builtin_tool,
+    execute_read_media,
+    load_any_media_model_part,
     normalize_todo_items,
+    roll_recent_media_parts,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -100,6 +105,9 @@ class SubAgentContext:
     # 回调（父循环注入）
     emit_event: Callable[[dict[str, Any]], Awaitable[None]]  # JSONL 追加 + SSE 推送
     stop_checker: Callable[[], bool]                          # 父级停止信号查询
+    # 父级当轮聊天模型的视觉能力（派发时刻固化）：子任务 read_media 可用性
+    # 判定优先用父级传入值；sub_agent_model 独立子模型配置可在执行时再覆盖判定
+    parent_vision_enabled: bool | None = None
 
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
@@ -204,6 +212,74 @@ def _format_result_text(result: Any) -> str:
         return str(result)
 
 
+# 子任务任务文本中的 media:// 引用提取（子任务 read_media 安全边界数据源）：
+# 父模型派发任务时会把可回读的媒体引用写进 task 文本（如「读取 media://a.png」），
+# 子模型只允许读取这些引用（与父级"当前任务引用集"口径一致——子任务上下文中
+# 没有其他来源），非引用（本地路径/http 直链）不受此过滤限制
+_MEDIA_REFERENCE_IN_TEXT_RE = re.compile(r"media://[^\s<>()\"'`。，！？；、）】》]+")
+
+READ_MEDIA_REJECTION_MESSAGE = (
+    "当前子任务模型不支持视觉（vision=false），read_media 工具不可用、"
+    "不要再次调用；请在最终回复中说明无法查看媒体内容。"
+)
+
+
+def resolve_sub_agent_vision_enabled(parent_vision_enabled: bool | None) -> bool:
+    """解析子任务的视觉能力（实际执行子任务的模型为准）。
+
+    - sub_agent_model 已配置为独立模型且配置有效（存在、协议为
+      chat-completions，与 _resolve_request_model_config 回退链一致）
+      → 按该模型 vision 判定——子模型不支持视觉时，无论父级是否支持/
+        是否启用 read_media，子任务都不应看到该工具；
+    - 未配置/配置失效/协议不符 → 继承父级聊天模型口径（parent_vision_enabled；
+      未传 None 时保守视为支持）。
+
+    判定失败（异常/配置缺失）保守视为支持，避免误禁工具（与工厂层保守口径一致）。
+    """
+    try:
+        selection = get_role_selection("sub_agent_model") or {}
+        provider = selection.get("ownership_name")
+        model = selection.get("model_name")
+        if provider and model:
+            chat_config = get_model_config(str(provider), str(model))
+            if (
+                isinstance(chat_config, dict)
+                and str(chat_config.get("apiType") or "chat-completions").casefold()
+                == "chat-completions"
+            ):
+                return bool(chat_config.get("vision", False))
+    except Exception:
+        pass
+    return parent_vision_enabled if parent_vision_enabled is not None else True
+
+
+def _collect_task_media_references(task: str) -> list[str]:
+    """按出现顺序收集任务文本中的 media:// 引用（去重）。
+
+    子任务的安全边界数据源：子任务上下文完全独立（只有 task 一条 user 消息），
+    能看到的媒体引用只可能出现在任务文本里——父模型据此引用派发，子模型
+    读取该集合之外的 media:// 引用没有意义（也防止任务文本被注入引用做越权探测）。
+    """
+    if not isinstance(task, str):
+        return []
+    refs: list[str] = []
+    for match in _MEDIA_REFERENCE_IN_TEXT_RE.finditer(task):
+        ref = match.group(0).rstrip("。，！？;；,)")
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _tool_definition_name(tool_def: Any) -> str:
+    """从工具定义 dict 取函数名（畸形定义返回空串）。"""
+    if not isinstance(tool_def, dict):
+        return ""
+    function_info = tool_def.get("function")
+    if isinstance(function_info, dict):
+        return str(function_info.get("name") or "")
+    return str(tool_def.get("name") or "")
+
+
 class SubAgentRunner:
     """单个子任务的精简 Agent 循环（职责划分对齐 V2 的 AgentRunner 设计）。"""
 
@@ -226,6 +302,37 @@ class SubAgentRunner:
         self._error: str | None = None
         self._final_reply = ""
         self._consecutive_oversized = 0
+        # read_media 数据注入坐标（子任务版，与父循环同语义）：
+        # pending_parts 为 (reference, quality) 坐标，工具结果统一处理后
+        # 现场加载 base64 部件注入为 user 消息（仅内存，不落盘）；
+        # injected_refs 防重复读取；滚动窗口只保留最近 5 个
+        self.read_media_pending_parts: list[tuple[str, Any]] = []
+        self.read_media_injected_refs: set[str] = set()
+        # 任务文本中的 media:// 引用集合：子任务 read_media 的安全边界数据源
+        #（父模型派发任务时把可回读引用写进 task，子模型只能读这些）
+        self.task_media_references: set[str] = set(
+            _collect_task_media_references(context.task)
+        )
+        # 子任务模型的视觉能力（派发时由父级传入；None=派发方未判定，执行时兜底解析）
+        self._vision_enabled: bool | None = getattr(
+            context, "parent_vision_enabled", None
+        )
+
+    def _visible_tool_definitions(self) -> list[dict[str, Any]]:
+        """当前子任务可见的工具定义。
+
+        vision=false（子任务模型不支持视觉）时剔除 read_media 定义——
+        工具 schema 一旦出现在请求里，模型就会知道并可能调用；不看请求上下文
+        直接拒绝的方式在这里行不通（拒绝也是模型「知道」的一种）。与父级
+        「不支持视觉时不注入 read_media」同口径。
+        """
+        tools = list(self.context.tools)
+        if self._vision_enabled is False:
+            tools = [
+                tool_def for tool_def in tools
+                if _tool_definition_name(tool_def) != READ_MEDIA_NAME
+            ]
+        return tools
 
     # ----------------------------- 事件发射 -----------------------------
 
@@ -252,7 +359,11 @@ class SubAgentRunner:
             "start",
             task=self.context.task,
             todo=self.todo or None,
-            tools=[name for name in self.context.tool_servers if name != CHECK_TOOL_EXISTS_NAME],
+            tools=[
+                name for name in self.context.tool_servers
+                if name != CHECK_TOOL_EXISTS_NAME
+                and not (self._vision_enabled is False and name == READ_MEDIA_NAME)
+            ],
             rounds_limit=self.context.max_rounds,
             timeout_seconds=self.context.timeout_seconds,
         )
@@ -322,7 +433,9 @@ class SubAgentRunner:
         """
         request = ChatLLMRequest(
             messages=build_request_messages(copy_for_request(self.messages)),
-            tools=list(self.context.tools) or None,
+            # 按模型可见性过滤后的工具（vision=false 时不含 read_media，
+            # 请求里不出现该 schema，模型就无从知道并调用）
+            tools=self._visible_tool_definitions() or None,
             session_id=self.context.session_id,
         )
         if "temperature" in parameter:
@@ -531,6 +644,60 @@ class SubAgentRunner:
                     "error": "子智能体不支持再派发子任务（V1 禁止嵌套），请自行完成或分步执行",
                 }))
                 continue
+            if tn == READ_MEDIA_NAME:
+                # 读取媒体（子任务版，与父循环 execute_read_media 同接口）：
+                # 引用白名单 = 任务文本中的 media:// 引用（子任务上下文独立，
+                # 没有其他来源）；数据本体由 runner 在工具结果统一处理后注入
+                if not self._vision_enabled:
+                    read_media_result: dict[str, Any] = {
+                        "ok": False,
+                        "error": READ_MEDIA_REJECTION_MESSAGE,
+                        "loaded": [],
+                        "skipped": [],
+                        "injected_references": [],
+                    }
+                elif not self.task_media_references and any(
+                    isinstance(item, str) and item.strip().startswith("media://")
+                    for item in (ta.get("references") if isinstance(ta, dict) else None) or []
+                ):
+                    # 任务文本没有任何 media:// 引用：media:// 调用一律越界拒绝
+                    #（execute_read_media 对空边界集合不做过滤是父级口径，这里
+                    # 显式收紧，防越权读取会话其他媒体；本地/网络来源不受影响）
+                    read_media_result = {
+                        "ok": False,
+                        "error": (
+                            "任务文本中没有可读取的 media:// 引用"
+                            "（read_media 仅支持父级派发任务文本中出现的引用）"
+                        ),
+                        "loaded": [],
+                        "skipped": [],
+                        "injected_references": [],
+                    }
+                else:
+                    read_media_result = execute_read_media(
+                        ta,
+                        ctx.session_id,
+                        self.task_media_references,
+                        already_injected=self.read_media_injected_refs,
+                        vision_enabled=self._vision_enabled,
+                    )
+                if read_media_result.get("ok"):
+                    self.read_media_injected_refs.update(
+                        read_media_result.get("injected_references") or []
+                    )
+                    self.read_media_pending_parts.extend([
+                        (item["reference"], item.get("quality"))
+                        for item in (read_media_result.get("loaded") or [])
+                        if item.get("reference")
+                    ])
+                    evicted_refs: set[str] = set()
+                    self.read_media_pending_parts = roll_recent_media_parts(
+                        self.read_media_pending_parts,
+                        evicted=evicted_refs,
+                    )
+                    self.read_media_injected_refs.difference_update(evicted_refs)
+                builtin_results.append((idx, tc, tn, ta, read_media_result))
+                continue
             builtin_result = execute_builtin_tool(
                 tn, ta, ctx.configured_tool_names, ctx.configured_tool_servers,
                 enabled_tool_names=set(ctx.tool_servers),
@@ -602,14 +769,24 @@ class SubAgentRunner:
 
     async def _run_inner(self) -> SubAgentResult:
         ctx = self.context
+        # 子任务视觉能力：以实际执行子任务的模型为准无条件解析——
+        # sub_agent_model 独立子模型配置 > 父级口径（parent_vision_enabled）
+        # > 保守支持。父级传入值只作为独立子模型未配置时的兜底，不能覆盖
+        # 独立子模型的判定（否则会出现"父级支持但子模型不支持却看得到
+        # read_media"的漏洞）
+        self._vision_enabled = resolve_sub_agent_vision_enabled(
+            self._vision_enabled if isinstance(self._vision_enabled, bool) else None
+        )
+        visible_tools = self._visible_tool_definitions()
         # 预检查：task + 工具定义 vs 模型窗口（超窗 → error 收尾，不走父级降级链）
+        # 按"模型实际可见工具"估算（vision=false 时 read_media 已被剔除）
         model_config, _parameter = self._resolve_request_model_config()
         window = (
             resolve_config_max_input_tokens(model_config, default=8192)
             if model_config is not None
             else resolve_model_max_input_tokens(default=8192)
         )
-        estimated = estimate_request_context_tokens(self.messages, ctx.tools)
+        estimated = estimate_request_context_tokens(self.messages, visible_tools)
         if window > 0 and estimated > window:
             detail = (
                 f"子任务上下文预估 {estimated} tokens 超过模型窗口 {window}："
@@ -837,6 +1014,41 @@ class SubAgentRunner:
                     "content": ret,
                     "_tool_name": tool_name,
                 })
+            # read_media 数据注入（子任务版）：按坐标现场加载媒体 base64 部件，
+            # 作为 user 消息追加进 messages（仅内存，不落盘——任务文本里的
+            # media:// 引用即子任务媒体台账）。加载失败的坐标以占位文本告知
+            # 子模型，避免静默丢失
+            if self.read_media_pending_parts:
+                media_parts = []
+                for reference, quality in self.read_media_pending_parts:
+                    info = load_any_media_model_part(ctx.session_id, reference, quality=quality)
+                    if info is not None and info.get("part") is not None:
+                        media_parts.append(info["part"])
+                    elif isinstance(info, dict) and info.get("error"):
+                        media_parts.append({
+                            "type": "text",
+                            "text": f"[媒体 {reference} 读取失败：{info['error']}]",
+                        })
+                    else:
+                        media_parts.append({
+                            "type": "text",
+                            "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
+                        })
+                self.messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "以下是你刚才调用 read_media 读取的媒体内容"
+                                "（按引用顺序排列）："
+                            ),
+                        },
+                        *media_parts,
+                    ],
+                    "_internal": True,
+                })
+                self.read_media_pending_parts = []
             # 循环继续：下一轮模型调用（顶部已检查停止条件）
 
     # ----------------------------- 收尾辅助 -----------------------------

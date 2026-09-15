@@ -225,13 +225,71 @@ def _command_output_candidates() -> tuple:
 _child_env_cache = None
 
 
+# Windows 启动进程时动态合成的"内置"环境变量（注册表不落盘）：
+# SystemRoot/SystemDrive/ProgramFiles/ProgramData/PUBLIC/SESSIONNAME 等。
+# 注册表枚举永远拿不到它们，必须用系统 API（或常规默认值）求解，
+# 否则 %VAR% 引用（如 ComSpec=%SystemRoot%\system32\cmd.exe）无法展开。
+def _builtin_windows_env() -> dict:
+    """求解 Windows 内置环境变量（仅用于补全与展开引用，不覆盖真实值）。"""
+    home = Path(os.path.expanduser("~"))
+    builtin = {
+        "SystemRoot": r"C:\WINDOWS", "windir": r"C:\WINDOWS", "SystemDrive": "C:",
+        "ComSpec": r"C:\WINDOWS\system32\cmd.exe",
+        "ProgramFiles": r"C:\Program Files",
+        "ProgramFiles(x86)": r"C:\Program Files (x86)",
+        "ProgramW6432": r"C:\Program Files",
+        "CommonProgramFiles": r"C:\Program Files\Common Files",
+        "CommonProgramFiles(x86)": r"C:\Program Files (x86)\Common Files",
+        "CommonProgramW6432": r"C:\Program Files\Common Files",
+        "ProgramData": r"C:\ProgramData",
+        "ALLUSERSPROFILE": r"C:\ProgramData",
+        "PUBLIC": str(home.parent / "Public"),
+        "USERPROFILE": str(home),
+        "APPDATA": str(home / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(home / "AppData" / "Local"),
+        "TEMP": str(home / "AppData" / "Local" / "Temp"),
+        "TMP": str(home / "AppData" / "Local" / "Temp"),
+        # 本服务与命令子进程均在交互桌面会话内运行
+        "SESSIONNAME": "Console",
+    }
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        shell32 = ctypes.windll.shell32
+        buf = ctypes.create_unicode_buffer(260)
+        if kernel32.GetWindowsDirectoryW(buf, 260) > 0:
+            win_dir = buf.value.rstrip("\\")
+            builtin["SystemRoot"] = builtin["windir"] = win_dir
+            builtin["SystemDrive"] = os.path.splitdrive(win_dir)[0]
+            builtin["ComSpec"] = os.path.join(win_dir, "system32", "cmd.exe")
+        # SHGetFolderPathW 的 CSIDL 常量（实测返回值：Program Files /
+        # Program Files (x86) / Common Files / Common Files (x86) / ProgramData）
+        for csidl, name in (
+            (0x26, "ProgramFiles"), (0x2A, "ProgramFiles(x86)"),
+            (0x2B, "CommonProgramFiles"), (0x2C, "CommonProgramFiles(x86)"),
+            (0x23, "ProgramData"),
+        ):
+            if shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+                builtin[name] = buf.value
+    except Exception:
+        pass
+    # 64 位进程（本服务为 x64 Python）：W6432 系列不做重定向，取 64 位路径
+    builtin["ProgramW6432"] = builtin["ProgramFiles"]
+    builtin["CommonProgramW6432"] = builtin["CommonProgramFiles"]
+    builtin["ALLUSERSPROFILE"] = builtin["ProgramData"]
+    return builtin
+
+
 def _merged_child_env():
     """构建子进程环境变量（Windows 返回 dict，POSIX 返回 None 表示默认继承）。
 
-    MCP 宿主可能以裁剪过的环境块启动本服务（缺 COMPUTERNAME/USERNAME、PATH
-    不完整等），子进程随之继承残缺环境。这里从注册表补全系统级与用户级环境
-    变量后合并：进程内显式设置 > 用户级 > 系统级；PATH 三方拼接去重而非覆盖。
-    结果缓存，避免每次调用都读注册表。
+    MCP 宿主可能以裁剪过的环境块启动本服务（缺 COMPUTERNAME/USERNAME、
+    SystemRoot/ProgramFiles 等内置变量、PATH 不完整等），子进程随之继承
+    残缺环境。这里从注册表补全系统级与用户级环境变量后合并：进程内显式
+    设置 > 用户级 > 系统级；PATH 三方拼接去重而非覆盖。注册表不落盘的
+    内置变量（Windows 启动进程时动态合成）由 _builtin_windows_env 用系统
+    API 求解补全，保证 %VAR% 引用可展开。变量名保持注册表/进程内的原始
+    大小写（不做大写化）。结果缓存，避免每次调用都读注册表。
     """
     global _child_env_cache
     if os.name != "nt":
@@ -268,7 +326,7 @@ def _merged_child_env():
                             break
                         index += 1
                         if isinstance(name, str) and isinstance(value, str):
-                            bucket[name.upper()] = value
+                            bucket[name] = value  # 保持注册表原始大小写
             except OSError:
                 continue
     except ImportError:
@@ -297,33 +355,57 @@ def _merged_child_env():
                     except OSError:
                         break
                     index += 1
-                    if isinstance(name, str) and isinstance(value, str):
-                        raw_user.setdefault(name.upper(), value)
+                    if isinstance(name, str) and isinstance(value, str) \
+                            and not any(k.upper() == name.upper() for k in raw_user):
+                        raw_user[name] = value
         except OSError:
             pass
     except ImportError:
         pass
 
-    lookup = {**raw_system, **raw_user,
-              **{k.upper(): v for k, v in os.environ.items()}}
-    for bucket in (raw_system, raw_user):
-        for name in list(bucket):
-            bucket[name] = _expand(bucket[name], lookup)
+    builtin = _builtin_windows_env()
+    # 展开用查找表：系统 < 用户/易失 < 进程 < 内置（内置仅兜底，真实值优先）
+    lookup = {}
+    for source in (raw_system, raw_user, os.environ, builtin):
+        for name, value in source.items():
+            if isinstance(name, str) and isinstance(value, str):
+                lookup[name.upper()] = value
+    for source in (raw_system, raw_user):
+        for name in list(source):
+            source[name] = _expand(source[name], lookup)
 
-    merged = dict(raw_system)
-    sys_path = merged.pop("PATH", "")
-    user_path = raw_user.pop("PATH", "")
-    merged.update(raw_user)
-    proc_path = os.environ.get("PATH", "")
+    def _get_ci(d, wanted):
+        hit = next((k for k in d if k.upper() == wanted.upper()), None)
+        return d[hit] if hit is not None else ""
+
+    # 合并：键保持最高优先级来源的原始大小写（进程 > 用户 > 系统）
+    merged = {}
+    for source in (raw_system, raw_user, os.environ):
+        for name, value in source.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            if name.upper() == "PATH":
+                continue  # PATH 三方拼接，单独处理
+            hit = next((k for k in merged if k.upper() == name.upper()), None)
+            if hit is not None:
+                del merged[hit]
+            merged[name] = value
+    # 内置变量补全：系统/用户/进程均未提供时才写入（子进程缺它们会导致
+    # cmd 找不到 ProgramFiles、PSModulePath 残留 %ProgramFiles% 等问题）
+    for name, value in builtin.items():
+        if not any(k.upper() == name.upper() for k in merged):
+            merged[name] = value
+    # PATH 三方拼接去重（注册表 PATH 先展开，再拼进程 PATH）
     seen, deduped = set(), []
-    for part in ";".join(p for p in (sys_path, user_path, proc_path) if p).split(";"):
+    parts = [_expand(_get_ci(raw_system, "Path"), lookup),
+             _expand(_get_ci(raw_user, "Path"), lookup),
+             os.environ.get("PATH", "")]
+    for part in ";".join(p for p in parts if p).split(";"):
         key = part.rstrip("\\").lower()
         if part and key not in seen:
             seen.add(key)
             deduped.append(part)
     merged["PATH"] = ";".join(deduped)
-    # 进程内其余变量最优先（PATH 已在上面三方合并，此处跳过避免覆盖）
-    merged.update({k: v for k, v in os.environ.items() if k.upper() != "PATH"})
     _child_env_cache = merged
     return merged
 
@@ -973,7 +1055,8 @@ def _wmi_create_process(command_line: str) -> int:
     return int(text)
 
 
-def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, prefix):
+def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, prefix,
+                        split_streams=False):
     """生成"WMI → wscript → VBS(vbHide) → cmd"隐藏执行链的脚本文件并启动，返回信息字典。
 
     为什么经 VBS 中转（实测结论）：
@@ -995,6 +1078,8 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     seq = next(_BG_NAME_SEQ) % 10000
     base = f"{prefix}_{stamp}_{seq:04d}_{os.getpid()}"
     out_path = _BG_LOG_DIR / f"{base}.out.txt"
+    # split_streams（前台中转用）：stdout/stderr 分开落盘，便于对齐工具返回结构
+    err_path = _BG_LOG_DIR / f"{base}.err.txt" if split_streams else None
     done_path = _BG_LOG_DIR / f"{base}.done.txt"
     launcher_path = _BG_LOG_DIR / f"{base}.cmd"
     vbs_path = _BG_LOG_DIR / f"{base}.vbs"
@@ -1013,7 +1098,8 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         "@echo off\r\n"
         + "".join(line + "\r\n" for line in _batch_env_lines())
         + f'cd /d "{work_dir or os.getcwd()}"\r\n'
-        + f'{exec_line} < nul > "{out_path}" 2>&1\r\n'
+        + (f'{exec_line} < nul > "{out_path}" 2> "{err_path}"\r\n' if split_streams
+           else f'{exec_line} < nul > "{out_path}" 2>&1\r\n')
     )
     # VBS 包装器：0=vbHide 隐藏窗口；True=等待结束拿退出码；退出码写入 done 供轮询读取
     vbs_text = (
@@ -1038,7 +1124,7 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
     pid = _wmi_create_process(f'wscript.exe //nologo "{vbs_path}"')
     return {
-        "pid": pid, "out": out_path, "done": done_path,
+        "pid": pid, "out": out_path, "err": err_path, "done": done_path,
         "launcher": launcher_path, "runner": runner_path, "vbs": vbs_path,
     }
 
@@ -1073,12 +1159,16 @@ def _kill_process_tree(proc: subprocess.Popen, is_nt: bool) -> None:
             pass
 
 
-def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
-                            cwd, timeout, is_nt) -> tuple:
-    """前台执行命令，返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒)。"""
+def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
+                           cwd, timeout, is_nt) -> tuple:
+    """Popen 直接执行（Windows 中转链失败/超时的兜底；POSIX 常规路径）。
+
+    返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒)。
+    """
     if shell_kind == "cmd":
-        # cmd 用列表形式避免 shell=True 的二次解析歧义；/d 忽略 AutoRun、/s 规范引号处理
-        argv = [shell_exe, "/d", "/s", "/c", command]
+        # cmd 用 /c 接命令原文（字符串形式），规避列表形式把引号按 MSVCRT
+        # 规则序列化成 \" 而 cmd 不认 \" 导致的二次解析破坏
+        argv = [shell_exe, "/c", command]
     else:
         argv = [shell_exe, *shell_prefix, command]
     popen_kwargs = dict(
@@ -1110,6 +1200,67 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
     stdout_text = _decode_bytes(out_bytes or b"", candidates=candidates).replace("\r\n", "\n")
     stderr_text = _decode_bytes(err_bytes or b"", candidates=candidates).replace("\r\n", "\n")
     return proc.returncode, stdout_text, stderr_text, timed_out, elapsed
+
+
+def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
+                            cwd, timeout, is_nt) -> tuple:
+    """前台执行命令，返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒)。
+
+    Windows 上本服务进程被宿主放入受限 Job 对象（实测 LimitFlags 含
+    KILL_ON_JOB_CLOSE），部分原生程序（nvidia-smi 等）在该 Job 内初始化会
+    失败。与后台模式同思路，默认改走 "WMI → wscript → VBS(vbHide) → cmd"
+    隐藏中转链（脱离 Job 与进程树），stdout/stderr 分别落盘后读取；
+    中转链启动失败时回退 Popen 直接执行。POSIX 仍走 Popen 直接执行。
+    """
+    if not is_nt:
+        return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
+                                      cwd, timeout, is_nt)
+    started = time.monotonic()
+    try:
+        info = _write_relay_script(
+            command, cwd, shell_exe, shell_kind, shell_prefix, "fg",
+            split_streams=True)
+    except Exception:
+        return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
+                                      cwd, timeout, is_nt)
+    timed_out = False
+    deadline = started + timeout
+    done_path = Path(info["done"])
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            text = done_path.read_text(encoding="mbcs", errors="ignore").strip()
+            if text:
+                break  # 退出码已写入
+            time.sleep(0.02)  # done 已创建但退出码尚在写入
+        else:
+            time.sleep(0.05)
+    exit_code = None
+    if done_path.exists():
+        try:
+            exit_code = int(done_path.read_text(encoding="mbcs", errors="ignore").strip())
+        except (ValueError, OSError):
+            exit_code = None
+    if exit_code is None:
+        # 超时：终止执行侧进程树（runner 存在杀 runner，否则杀启动器 cmd）
+        timed_out = True
+        root_pid = info.get("runner") or info.get("cmd")
+        if root_pid:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(root_pid), "/T", "/F"],
+                    capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                pass
+        exit_code = -1
+    elapsed = time.monotonic() - started
+    candidates = _command_output_candidates()
+    out_path, err_path = Path(info["out"]), info.get("err")
+    out_bytes = out_path.read_bytes() if out_path.exists() else b""
+    err_bytes = err_path.read_bytes() if err_path and Path(err_path).exists() else b""
+    stdout_text = _decode_bytes(out_bytes, candidates=candidates).replace("\r\n", "\n")
+    stderr_text = _decode_bytes(err_bytes, candidates=candidates).replace("\r\n", "\n")
+    return exit_code, stdout_text, stderr_text, timed_out, elapsed
 
 
 def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt) -> str:

@@ -1550,11 +1550,18 @@ html[data-theme="dark"] {
   // 高度按 viewBox 比例联动（内联样式注入 aspect-ratio + 宽度钳制）。
   // 不能照搬代码/文本块的 70vh 块高上限：高度触顶后等比内容只能
   // 居中缩小，两侧会留出大片空白（"图片只占中间一部分宽度"）；
-  // 超长兜底在内联样式的宽度钳制里（填满宽度后高约 1.7 屏才收窄）
+  // 超长兜底在内联样式的宽度钳制里（填满宽度后高约 1.7 屏才收窄）。
+  // 注意：必须保留 [hidden] 的 display:none —— 该规则在前部被后面的
+  // display:block 覆盖后，"代码" tab 激活时图片视图（含渲染失败态）
+  // 不会隐藏，两个视图会叠加显示。
   .md-svg-view {
     display: block;
     padding: 4px;
     box-sizing: border-box;
+
+    &[hidden] {
+      display: none;
+    }
 
     svg {
       display: block;

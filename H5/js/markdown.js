@@ -293,6 +293,11 @@
     startOnLoad: false,
     securityLevel: "strict",
     theme: "default",
+    // v12 默认 false：语法错误时 mermaid 会把「bomb + Syntax error in text」
+    // 错误 SVG 渲染进它挂在 document.body 的临时容器（#d{id}），异常路径下
+    // 残留节点把页面底部撑出一大块错误图；true 时失败直接抛异常（临时元素
+    // 由库内 T() 清理），错误说明走我们自己的 holder 文本展示。
+    suppressErrorRendering: true,
   };
   let mermaidLoadPromise = null;
   let mermaidInitPromise = null;
@@ -381,6 +386,21 @@
     }
   }
 
+  // mermaid.render 的临时容器 id 规则（v12 源码）：无容器参数调用时在
+  // document.body 上创建 #d{id}（部分路径为 #i{id}）；正常完成时库内
+  // removeTempElements 会移除，异常路径可能残留（曾表现为页面底部被
+  // bomb 错误图撑高）。suppressErrorRendering 已让失败不再画错误图，
+  // 这里再兜底清掉可能残留的临时节点。
+  function removeMermaidTempNodes(renderId) {
+    if (typeof document === "undefined" || !document.body) return;
+    ["d" + renderId, "i" + renderId].forEach(function (tid) {
+      const node = document.getElementById(tid);
+      if (node && node.parentNode === document.body) {
+        node.parentNode.removeChild(node);
+      }
+    });
+  }
+
   // mermaid.render 包装：结果 SVG 写入 holder 并做自适应宽度处理；
   // 渲染失败时 holder 显示错误说明并继续抛出（调用方可做状态标记）。
   // opts.renderId：换用其它 DOM id 调 mermaid.render（流式重建后同一图已换
@@ -407,6 +427,8 @@
         return true;
       });
     }).catch(function (err) {
+      // 失败兜底：清理可能残留在 body 上的渲染临时容器，再落错误态文案
+      removeMermaidTempNodes(renderId);
       holder.classList.add("md-mermaid-error");
       holder.textContent = "Mermaid 渲染失败：" + ((err && err.message) || "语法错误");
       throw err;

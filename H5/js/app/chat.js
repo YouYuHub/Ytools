@@ -606,7 +606,13 @@
     // 内置工具（todo_write/ask_user）并入 selectedTools，与 MCP 工具一起随 tool_names 上送，
     // 后端按名称识别注入；未选择任何工具时不携带该字段，由后端回退会话/全局默认选择
     if (state.selectedTools.size > 0) {
-      payload.tool_names = Array.from(state.selectedTools);
+      // 模型不支持视觉时 read_media 不上送（工具弹窗已禁选，此处为兜底过滤；
+      // 后端请求侧还有一层拦截，前端/后端双保险）
+      let toolNames = Array.from(state.selectedTools);
+      if (!App.getChatModelVision()) {
+        toolNames = toolNames.filter(function (name) { return name !== "read_media"; });
+      }
+      if (toolNames.length > 0) payload.tool_names = toolNames;
     }
     // 生成参数（temperature/top_p/presence_penalty/reasoning_effort/extra_body 等）
     // 不显式传递，由服务端按 model_selection.chat_model.parameter 填充（面板“参数”设置）
