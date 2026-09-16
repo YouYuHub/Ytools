@@ -37,6 +37,7 @@ from memory.file_memory import (
     resolve_message_media_refs,
 )
 from memory.chat_history_format import content_part_to_text
+from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
@@ -160,15 +161,49 @@ def _copy_for_request(messages: List[dict]) -> List[dict]:
 
 
 def _format_tool_result(result: Any) -> str:
-    if isinstance(result, dict) and "_file_diff" in result:
-        # 内置文件工具的展示用 diff：只推送前端与落盘，不进入模型上下文
-        result = {k: v for k, v in result.items() if k != "_file_diff"}
+    if isinstance(result, dict):
+        # 内置文件工具的展示用 diff 与版本链入链数据：只推送前端与落盘，不进入模型上下文
+        result = {
+            k: v for k, v in result.items()
+            if k not in ("_file_diff", "_file_history")
+        }
     if isinstance(result, str):
         return result
     try:
         return json.dumps(result, ensure_ascii=False)
     except Exception:
         return str(result)
+
+
+async def _record_file_history(
+    session_id: str,
+    tool_name: str,
+    raw_result: Any,
+    round_number: int,
+) -> None:
+    """V2 文件历史版本链消费点：摘取 _file_history 入链数据并落链。
+
+    非文件工具 / 数据缺失 / 入链失败一律静默跳过（版本链失败不影响对话主流程，
+    前端仍有 V1 的 file_diff 展示兜底）。
+    """
+    payload = None
+    if isinstance(raw_result, dict):
+        payload = raw_result.get("_file_history")
+    if not isinstance(payload, dict) or not payload.get("path"):
+        return
+    try:
+        _file_history.record_change(
+            session_id,
+            path=str(payload["path"]),
+            display_path=str(payload.get("display_path") or payload["path"]),
+            old_text=payload.get("old_text"),
+            new_text=payload.get("new_text"),
+            tool=tool_name,
+            round_number=int(round_number or 0),
+            encoding=str(payload.get("encoding") or "utf-8"),
+        )
+    except Exception as record_error:
+        print(f"[WARN] 文件版本链记录失败（不影响对话）: {record_error}")
 
 
 def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
@@ -621,6 +656,7 @@ def _build_sub_agent_contexts(
     stream,
     stop_checker,
     parent_vision_enabled: bool | None = None,
+    parent_round_number: int = 0,
 ) -> list["SubAgentContext"]:
     """把父循环收集的 sub_agent 调用转成 SubAgentContext 列表（docs/sub_agent_v1.md §6.1）。
 
@@ -684,6 +720,7 @@ def _build_sub_agent_contexts(
             emit_event=lambda payload: _emit_sub_agent_event(session_chat_memory, stream, payload),
             stop_checker=stop_checker,
             parent_vision_enabled=parent_vision_enabled,
+            parent_round_number=parent_round_number,
         ))
         used_agent_ids.add(contexts[-1].agent_id)
     return contexts
@@ -875,6 +912,13 @@ async def _run_chat_generation(
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
     session_file_memory = await get_file_memory_manager(session_id)
+    # V2 文件版本链：本任务所属轮次号（任务开始时取一次；工具入链时统一标注）。
+    # 此刻新轮尚未落盘，"已收尾轮次数 + 1" 正好是本轮序号。
+    try:
+        current_round_number = await session_chat_memory.get_current_round_number()
+    except Exception as round_error:
+        print(f"[WARN] 获取轮次号失败（版本链按 round=0 记录）: {round_error}")
+        current_round_number = 0
     # 新生成任务必须显式置回运行态：上一个被中断的任务可能在 finally 里置 False，
     # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
     session_chat_memory.run_task = True
@@ -2000,6 +2044,7 @@ async def _run_chat_generation(
                     stream=stream,
                     stop_checker=stop_checker,
                     parent_vision_enabled=vision_enabled,
+                    parent_round_number=current_round_number,
                 )
                 tool_results.extend(await run_sub_agent_batch(sub_contexts))
             if builtin_results:
@@ -2030,6 +2075,12 @@ async def _run_chat_generation(
                     raw_result = tool_result['result']
                     ret = _format_tool_result(raw_result)
                     file_diff = raw_result.get("_file_diff") if isinstance(raw_result, dict) else None
+                    # V2 版本链：摘取 _file_history 入链数据（写前/写后全文）落链，
+                    # 失败静默（前端展示仍有 file_diff 兜底）；round 号为当前进行中的轮次号
+                    if isinstance(raw_result, dict) and "_file_history" in raw_result:
+                        await _record_file_history(
+                            session_id, tool_name, raw_result, current_round_number
+                        )
                     # 超大结果拒绝：超过阈值时结果不进入模型上下文，
                     # 改为写入"输出过长"反馈让模型重新考虑工具使用；
                     # 原始结果只保留截断预览到 JSONL，连续超长达到上限后终止任务

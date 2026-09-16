@@ -131,6 +131,26 @@
                 </button>
                 <div class="topbar-spacer"></div>
                 <span class="token-total hidden" id="tokenTotal" title="本会话累计 token 消耗"></span>
+                <button class="icon-btn hidden" id="fileChangesBtn" title="文件变更">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z" />
+                        <path d="M14 3v5h5" />
+                        <path d="M9 13h6M9 17h4" />
+                    </svg>
+                    <span class="fh-badge hidden"></span>
+                </button>
+                <div class="menu topbar-menu fh-panel hidden" id="fileChangesPanel">
+                    <div class="fh-panel-head">
+                        <strong>文件变更</strong>
+                        <span class="fh-panel-stats" id="fileChangesStats">加载中...</span>
+                    </div>
+                    <div class="fh-file-list" id="fileChangesList"></div>
+                    <div class="fh-panel-foot hidden" id="fileChangesFoot">
+                        <span>点击文件在新窗口打开编辑器（全文可编辑 / 撤回差异块 / 回退 / 保留）</span>
+                        <button type="button" class="fh-cleanup-btn" id="fileChangesCleanup"
+                            title="删除所有已全部保留/撤回文件的版本链留档（不可恢复）">清理留档</button>
+                    </div>
+                </div>
                 <div class="top-actions">
                     <button class="icon-btn" id="sessionActionsBtn" title="加载">
                         <svg class="icon icon-dots" viewBox="0 0 24 24">
@@ -652,6 +672,20 @@
         </section>
     </div>
 
+    <!-- V2.3 文件 diff 编辑器已迁移至独立页 editor.html（面板点击新窗口打开）；
+         此处仅保留「清理留档」等面板级操作的二次确认框 -->
+    <div class="confirm-modal hidden" id="fhConfirmModal" aria-hidden="true">
+        <div class="confirm-modal-backdrop" id="fhConfirmBackdrop"></div>
+        <section class="confirm-modal-dialog" role="dialog" aria-modal="true">
+            <h2>确认操作</h2>
+            <p id="fhConfirmMessage"></p>
+            <div class="confirm-modal-actions">
+                <button class="confirm-cancel" id="fhConfirmCancel">取消</button>
+                <button class="confirm-danger" id="fhConfirmOk">确认执行</button>
+            </div>
+        </section>
+    </div>
+
     <div class="toast-wrap" id="toastWrap"></div>
 
     <script src="js/api.js"></script>
@@ -709,6 +743,7 @@
     <script src="js/app/model_panel.js"></script>
     <script src="js/app/tools.js"></script>
     <script src="js/app/chat.js"></script>
+    <script src="js/app/filehistory.js"></script>
     <script src="js/app.js"></script>
 </body>
 

@@ -35,7 +35,7 @@ from factory.agent_runtime.sub_agent import (
 from memory import file_memory as fm
 
 _TEST_SESSION = "sub_read_media_test"
-_TEST_MEDIA_DIR = Path("history_files") / "upload" / _TEST_SESSION
+_TEST_MEDIA_DIR = fm.HISTORY_ROOT / _TEST_SESSION
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 

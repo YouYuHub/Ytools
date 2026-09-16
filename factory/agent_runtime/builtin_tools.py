@@ -642,6 +642,12 @@ _FILE_DIFF_MAX_TEXT_CHARS = 256 * 1024   # 新旧文本超过该大小时跳过�
 _FILE_DIFF_MAX_DIFF_CHARS = 20000        # diff 文本上限，超限截断
 _FILE_DIFF_CONTEXT_LINES = 2             # hunk 上下文行数
 
+# ------------------- V2 文件历史版本链（record_change 入链数据） -------------------
+# 工具层只负责携带"写前/写后全文"，由 chat_factory / sub_agent 消费点调用
+# memory.file_history.record_change 落版本链（docs/file_diff.md §9）；本模块
+# 保持纯函数语义，不感知 session_id 与版本链存储。
+_FILE_HISTORY_PAYLOAD_KEY = "_file_history"   # {path, display_path, old_text, new_text}
+
 
 def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
     """生成 unified diff 与行数统计（前端展示用）。
@@ -697,6 +703,8 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
             "lines_removed": 0,
             "diff_truncated": False,
             "diff_skipped": "unchanged",
+            "path": str(path),
+            "display_path": display,
         }
     return {
         "diff": "\n".join(parts),
@@ -704,6 +712,8 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
         "lines_removed": removed,
         "diff_truncated": truncated,
         "diff_skipped": "",
+        "path": str(path),
+        "display_path": display,
     }
 
 
@@ -760,6 +770,18 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "encoding": encoding,
         "content_hash": _content_hash(content),
         "_file_diff": file_diff,
+        # V2 版本链入链数据：{path, display_path, old_text, new_text}
+        # （消费点 chat_factory / sub_agent 摘取后调 record_change，再统一剥离）
+        _FILE_HISTORY_PAYLOAD_KEY: {
+            "path": str(path.resolve()),
+            "display_path": _display_path(path.resolve()),
+            "encoding": encoding,
+            "old_text": old_text if file_diff.get("diff_skipped") != "file_too_large" else None,
+            # 追加模式的最终全文 = 旧内容 + 新写入内容
+            "new_text": (
+                (old_text + content) if append else content
+            ) if len(old_text + content) <= _FILE_DIFF_MAX_TEXT_CHARS else None,
+        },
     }
 
 
@@ -838,6 +860,14 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "matched_lines": matched_lines,
         "content_hash": _content_hash(updated),
         "_file_diff": file_diff,
+        # V2 版本链入链数据（text/updated 均为换行归一化后的全文）
+        _FILE_HISTORY_PAYLOAD_KEY: {
+            "path": str(path.resolve()),
+            "display_path": _display_path(path.resolve()),
+            "encoding": used_encoding,
+            "old_text": text if file_diff.get("diff_skipped") != "file_too_large" else None,
+            "new_text": updated if len(updated) <= _FILE_DIFF_MAX_TEXT_CHARS else None,
+        },
     }
 
 

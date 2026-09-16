@@ -190,6 +190,13 @@
       width: 15px;
       height: 15px;
     }
+
+    // 收缩只允许发生在文件路径上：图标/"调用工具"/工具名等刚性占位。
+    // 否则 flex 默认按 各项基准宽度×收缩系数 分摊压缩量——路径基准极大，
+    // 分摊后其余项仍会被压扁（"调用工具"竖排、工具名截成"ed..."）
+    > * {
+      flex-shrink: 0;
+    }
   }
 
   .tool-block-name {
@@ -228,24 +235,52 @@
     margin: 6px 0 4px;
   }
 
-  // 标题栏文件变更徽标（setDiff 挂载）：块折叠时也能看到「+N -M」
+  // 标题栏文件变更徽标（setDiff 挂载）：块折叠时也能看到「+N -M」，
+  // +N 恒绿、-M 恒红（两个独立 span，不再按 add/del-only 整体变色）
   .tool-block-diff {
     display: inline-flex;
+    gap: 6px;
     margin-left: 8px;
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--text-tertiary);
+    flex-shrink: 0;
 
     &[hidden] {
       display: none;
     }
 
-    &.is-add {
+    .diff-num.is-add {
       color: #1a7f37;
     }
 
-    &.is-del {
+    .diff-num.is-del {
       color: #cf222e;
+    }
+  }
+
+  // 标题栏完整文件路径（setDiff 挂载）：单行省略号溢出隐藏，
+  // flex: 1 1 auto + min-width:0 —— 弹性占据剩余空间并随父容器等比收缩
+  // （窗口再窄也不会顶着固定最小宽度挤占"调用工具/工具名/徽标"）；
+  // hover title 显示完整路径，点击复制
+  .tool-block-file {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin-left: 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+
+    &[hidden] {
+      display: none;
+    }
+
+    &:hover {
+      color: var(--text-secondary);
     }
   }
 
@@ -373,12 +408,12 @@
 
 html[data-theme="dark"] {
   .diff-num.is-add,
-  .tool-block-diff.is-add {
+  .tool-block-diff .diff-num.is-add {
     color: #7ee787;
   }
 
   .diff-num.is-del,
-  .tool-block-diff.is-del {
+  .tool-block-diff .diff-num.is-del {
     color: #ff9492;
   }
 }

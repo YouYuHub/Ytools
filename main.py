@@ -29,6 +29,7 @@ from routers.tools_manage_router import api_tools_manage_router
 from routers.file_router import api_file_router
 from routers.prompt_router import api_prompt_router
 from routers.export_router import api_export_router
+from routers.file_history_router import api_file_history_router
 
 
 # FastAPI 实例化
@@ -88,6 +89,7 @@ app.include_router(api_tools_manage_router, tags=["ToolsManage"])
 app.include_router(api_file_router, tags=["FileUpload"])
 app.include_router(api_prompt_router, tags=["Skills"])
 app.include_router(api_export_router, tags=["Export"])
+app.include_router(api_file_history_router, tags=["FileDiffHistory"])
 
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------

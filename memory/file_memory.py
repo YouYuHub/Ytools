@@ -15,13 +15,15 @@ from PIL import Image
 # 自定义模块
 from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str as _timestamp_now
 
-HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files" / "upload"
+# 会话上传数据的存储根目录（由 history_files/upload/ 改名而来，
+# 目录名保留 session 语义；_meta.upload_id 字段名沿用不变）
+HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files" / "session_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 # ---------- 多媒体附件（图片/音频/视频） ----------
 # 聊天多模态消息的二进制文件存储：原始字节保存在
-# history_files/upload/<session>/media/ 下，聊天消息 content 列表里用
+# history_files/session_files/<session>/media/ 下，聊天消息 content 列表里用
 # "media://<stored_name>" 引用，发送上游前由 resolve_media_content_parts
 # 解析为 OpenAI 兼容格式（image_url.url = data URL；input_audio.data = base64）。
 
@@ -66,7 +68,7 @@ MEDIA_PART_LABELS = {
 
 # ---------- 可解析文档的原始字节（用于点击预览/下载） ----------
 # 上传解析流程历来只保存解析后的文本 JSON；原始文件（如 PDF）字节另存一份在
-# history_files/upload/<session>/files/ 下，前端消息/附件区的文档可点击预览。
+# history_files/session_files/<session>/files/ 下，前端消息/附件区的文档可点击预览。
 
 DOC_DIRECTORY_NAME = "files"
 
@@ -86,11 +88,12 @@ def _get_session_dir(session_id: str) -> Path:
 
 
 def get_upload_dir_name(session_id: str) -> str:
-    """返回该会话上传文件所在目录名（history_files/upload/ 下的文件夹名）。
+    """返回该会话上传文件所在目录名（history_files/session_files/ 下的文件夹名）。
 
     上传目录按上传时前端传入的 session_id 命名（`_safe_session_id` 后的结果），
     可能与聊天会话文件名不一致，因此调用方会把它记录到会话 _meta.upload_id，
-    供删除会话时连带清理上传目录。
+    供删除会话时连带清理上传目录。字段名沿用 upload_id 不变（仅指目录名，
+    与物理路径无关）。
     """
     return _safe_session_id(session_id)
 

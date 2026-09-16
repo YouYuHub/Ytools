@@ -161,7 +161,7 @@ async def upload_files(
                         "content": parse_result["text_content"],  # 只保存文本内容
                         "size": parse_result["size"]
                     }
-                    # 同时保存原始字节（history_files/upload/<session>/files/），
+                    # 同时保存原始字节（history_files/session_files/<session>/files/），
                     # 供前端点击预览 PDF/文本/下载原文件；保存失败只告警不影响解析结果
                     stored_name = None
                     try:
@@ -216,7 +216,7 @@ async def upload_session_media(
 ):
     """
     上传多媒体附件（图片/音频/视频），原始字节保存到
-    history_files/upload/<session>/media/，供聊天多模态消息以
+    history_files/session_files/<session>/media/，供聊天多模态消息以
     media://<stored_name> 引用（发送上游前由后端解析为 data URL / base64）。
     参数:
         files: 媒体文件列表，最多 10 个；单文件上限按类别：图片/音频 20MB、视频 500MB

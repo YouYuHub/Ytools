@@ -92,7 +92,8 @@ agent_tool_sse/
 │   ├── chat_momory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
 │   └── compact.md               # 压缩逻辑说明文档
 │
-├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ upload/<session>/（上传文件解析结果）
+├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
+│                                 #   上传记录目录 history_files/session_files/<session>/（upload 改名而来）：文件解析 JSON + media/ + files/ + file_diffs/
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
                                  #   test_context_compaction / test_chat_router / test_sub_agent 等）
@@ -160,7 +161,7 @@ agent_tool_sse/
 读取：/file/get_session_media、/file/get_session_document 均支持 HTTP Range（206），
   音频/视频进度条即时拖动跳转；/file/get_session_document 供 PDF/文本预览与下载
 ```
-解析后的文本在下一轮聊天时注入系统提示词供模型使用；媒体以 `media://` 引用保存在历史中（JSONL 不膨胀）。上传目录名（按前端传入的 session_id 命名，可能与会话文件名不一致）会记录到会话 `_meta.upload_id`，删除会话时可连带清理。
+解析后的文本在下一轮聊天时注入系统提示词供模型使用；媒体以 `media://` 引用保存在历史中（JSONL 不膨胀）。上传目录名（按前端传入的 session_id 命名，可能与会话文件名不一致）会记录到会话 `_meta.upload_id`，删除会话时可连带清理。上传数据目录为 `history_files/session_files/`（由 `upload` 目录改名而来，字段名 upload_id 沿用不变）。
 
 ### 3. 模型/配置动态切换
 - **切换模型**：`POST /chat_config/models/select`（body: `provider/model/role/parameter`）→ 校验 models.json 存在该组合 → 写入 models.json 顶层 `model_selection.<role>`（四角色：chat/compaction/title/sub_agent）并同步内存，实时生效；不再写 .env。**会话级覆盖**：携带 `session_id` 时写入该会话 `_meta.model_selection.<role>`（仅覆盖该角色，`clear=true` 清除恢复跟随全局），生成/压缩/参数默认值填充按「会话覆盖 → 全局默认」逐角色解析——ambient 任务级上下文（ContextVar）实现，`create_task` 上下文隔离保证多会话互不影响；覆盖模型失效时发 `MODEL_SELECTION_FALLBACK` warning 并回退全局。`sub_agent_model` 未配置时子智能体继承聊天模型
@@ -214,7 +215,7 @@ agent_tool_sse/
   - 压缩 usage 分桶累计：单轮 `compress_usage`、跨轮 `_history_compress_usage`；压缩过程事件（start/done）以 `event="context_compaction"` 独立行落盘，与 SSE 推送同结构
   - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；`run_task` 属性按会话控制对话启停
   - 支持按行删除/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
-- **FileMemoryManager**（`history_files/upload/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理
+- **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）
   - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）
 
 ### 6. 配置模型（`config.py`）

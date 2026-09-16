@@ -1,0 +1,460 @@
+// ============================================================
+// V2 文件历史版本链：顶栏统计面板 + diff 编辑器（docs/file_diff.md §9）
+// - 面板挂在顶栏 fileChangesBtn 下（复用 topbar-menu 定位）
+// - 编辑器为全屏 modal：行级 Total Diff 视图
+//   绿行 = 新增/修改（textarea 可编辑）；红块 = 被删除的旧内容（无行号只读）
+// - 明暗主题沿用 variables 变量；add/del 色值与 _chat.scss 的 .diff-view 同口径
+// ============================================================
+
+$fh-add-bg: rgba(46, 160, 67, 0.16);
+$fh-del-bg: rgba(248, 81, 73, 0.16);
+$fh-add-text: #1a7f37;
+$fh-del-text: #cf222e;
+
+// ---------- 顶栏按钮徽标 ----------
+.fh-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  font-weight: 600;
+}
+
+#fileChangesBtn {
+  position: relative;
+}
+
+// ---------- 统计面板 ----------
+.fh-panel {
+  top: 44px;
+  left: auto;
+  right: 12px;
+  width: 420px;
+  max-width: calc(100vw - 24px);
+  padding: 0;
+  z-index: 60;
+}
+
+.fh-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+
+  strong {
+    font-size: 13px;
+  }
+}
+
+.fh-panel-stats {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fh-file-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 4px 6px;
+}
+
+.fh-empty {
+  padding: 18px 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.fh-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
+.fh-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fh-file-meta {
+  display: inline-flex;
+  gap: 6px;
+  flex: none;
+  font-size: 11px;
+}
+
+.fh-add {
+  color: $fh-add-text;
+  font-weight: 600;
+}
+
+.fh-del {
+  color: $fh-del-text;
+  font-weight: 600;
+}
+
+.fh-kept {
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+}
+
+.fh-arrow {
+  flex: none;
+  color: var(--text-tertiary);
+}
+
+.fh-panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-tertiary);
+
+  &[hidden] {
+    display: none;
+  }
+}
+
+.fh-cleanup-btn {
+  flex: none;
+  padding: 3px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--danger, #cf222e);
+  font-size: 11px;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(248, 81, 73, 0.1);
+  }
+}
+
+// ---------- diff 编辑器（全屏 modal） ----------
+.fh-editor-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+}
+
+.fh-editor-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.fh-editor {
+  position: absolute;
+  inset: 3vh 4vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-menu);
+  overflow: hidden;
+}
+
+.fh-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+
+.fh-editor-title-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  strong {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.45;
+    word-break: break-all;
+    white-space: normal; // 完整文件路径过长时换行展示（不再截断）
+    cursor: pointer;
+  }
+}
+
+.fh-editor-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fh-editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.fh-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+.fh-btn-primary {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+
+  &:hover:not(:disabled) {
+    opacity: 0.88;
+    background: var(--accent);
+  }
+}
+
+.fh-btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+
+  &:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+}
+
+.fh-round-select {
+  max-width: 180px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.fh-editor-body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 0 14px;
+}
+
+.fh-skip {
+  margin: 40px auto;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.fh-table {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-width: max-content;
+}
+
+.fh-line {
+  display: flex;
+  align-items: flex-start;
+  min-height: 21px;
+  padding: 0 10px 0 0;
+}
+
+.fh-no {
+  flex: none;
+  width: 96px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  user-select: none;
+}
+
+.fh-text,
+.fh-textarea {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.fh-text {
+  color: var(--text);
+}
+
+// 上下文行：不可编辑（保持定位稳定）
+.fh-ctx {
+  background: transparent;
+}
+
+// 新增行（绿色底）：textarea 可编辑
+.fh-add {
+  background: $fh-add-bg;
+
+  .fh-textarea {
+    background: transparent;
+    border: 0;
+    outline: none;
+    resize: none;
+    color: $fh-add-text;
+    font: inherit;
+    padding: 0;
+    overflow: hidden;
+  }
+}
+
+// 删除行（红色块，无行号、不可编辑）：模拟 VS Code 删除行内联展示
+.fh-del {
+  background: $fh-del-bg;
+
+  .fh-text {
+    color: $fh-del-text;
+    text-decoration: line-through;
+    text-decoration-color: rgba($fh-del-text, 0.5);
+  }
+
+  .fh-no {
+    visibility: hidden; // 无行号
+  }
+}
+
+// hunk 头：差异块标题 + 单块/区间保留/撤回按钮（4 按钮，允许换行）
+.fh-hunk-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 10px 4px 0;
+  margin-top: 6px;
+  background: var(--bg-code);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.fh-hunk-label-wrap {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.fh-hunk-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  letter-spacing: 1px;
+  user-select: none;
+}
+
+.fh-hunk-keep,
+.fh-hunk-undo {
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.fh-hunk-keep {
+  border: 1px solid $fh-add-text;
+  color: $fh-add-text;
+  opacity: 0.85;
+
+  &:hover {
+    background: $fh-add-bg;
+    opacity: 1;
+  }
+}
+
+.fh-hunk-undo {
+  border: 1px solid $fh-del-text;
+  color: $fh-del-text;
+  opacity: 0.85;
+
+  &:hover {
+    background: $fh-del-bg;
+    opacity: 1;
+  }
+}
+
+// ---------- 暗色主题 ----------
+html[data-theme="dark"] {
+  .fh-add { color: #7ee787; }
+  .fh-del { color: #ff9492; }
+  .fh-add .fh-textarea { color: #7ee787; }
+  .fh-del .fh-text { color: #ff9492; text-decoration-color: rgba(255, 148, 146, 0.5); }
+  .fh-btn { background: var(--bg-elevated); }
+  .fh-btn-primary { background: var(--accent); color: var(--accent-contrast); }
+}
+
+// ---------- 移动端 ----------
+@media (max-width: 768px) {
+  .fh-editor {
+    inset: 0;
+    border-radius: 0;
+  }
+
+  .fh-editor-head {
+    flex-wrap: wrap;
+  }
+
+  .fh-panel {
+    right: 8px;
+  }
+}

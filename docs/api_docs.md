@@ -105,11 +105,11 @@
 | /chat_history/file | GET | session_id | 下载会话 JSONL 文件（首行 `_meta` 元数据） |
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
-| /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/upload/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
+| /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
 | /chat_history/delete_lines | DELETE | startline(必填,≥1), endline(必填,≥1,包含), session_id | `{state, describe, meta_after, usage_after}`；行号**不含** `_meta` 首行；startline>endline 报 400 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
 
-> **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/upload/<upload_id>/`）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。
+> **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/session_files/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。目录原名 `history_files/upload/`（upload 改名为 session_files）。
 
 ### POST /chat_history/upload_chat_file
 接收前端上传的 jsonl 聊天历史文件，按现有格式过滤后保存到 `history_files` 目录。
@@ -309,6 +309,38 @@ SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（�
 
 MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结果，不带 `file_diff`，前端自动回退普通文本渲染，无需处理。
 
+### 文件历史版本链（V2，`/file_diff/*`）
+
+内置文件工具每次成功写入后，除 V1 的 `file_diff` 外还会把「写前/写后全文」经 `chat_factory` / `sub_agent` 消费点（`_file_history` 顶级键，同样不进模型上下文）写入版本链：
+`history_files/session_files/<session>/file_diffs/<key8>/meta.json + g<gen>/v*.txt`（全文快照链，key = sha1(绝对路径 normcase) 前 8 位；磁盘为唯一真源，会话重开仍可回放/回退）。
+设计详见 `docs/file_diff.md` §9。核心语义：
+
+- **Total Diff** = diff(当前代基线, 当前内容)：多次修改合并展示单文件总变更；
+- **Change Diff** = diff(同代上一版本, 本版本)：单次修改；
+- **round** = 用户会话轮次号：「回退到第 N 轮发起时」= 链上 round < N 的最新快照写回磁盘；
+- **keep**：保留封版（历史代锁定不可撤回），以当前内容开新代基线；
+- **hide_clean**：`/list` 默认隐藏已保留/已全部撤回（Total 无行数变化）的文件；留档清理用 DELETE /delete。
+
+| 方法 | 路径 | 参数 / body | 返回 | 错误 |
+|---|---|---|---|---|
+| GET | `/file_diff/list` | session_id | `{files:[{key,path,display_path,kept,versions,added,removed,updated_at,last_role}], stats:{total,added,removed}}` | — |
+| GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed}]}` | 404 |
+| GET | `/file_diff/content` | session_id, key, v?(缺省最新) | `{...,v,gen,hash,role,tool,round,at,encoding,eol,kept,content}` | 404 |
+| GET | `/file_diff/total_diff` | session_id, key | `{key,display_path,baseline_v,current_v,kept,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` | 404 |
+| GET | `/file_diff/change_diff` | session_id, key, v | `{...,v,prev_v,gen,role,tool,round,at,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` | 404 |
+| POST | `/file_diff/hunk_undo` | `{session_id,key,hunk_index,until_hunk?}` | `{ok,hunk:{old_start,old_count,new_start,new_count},undone_count,version,total}`（撤回差异块并写回磁盘，不可恢复；until_hunk=true 撤回此处及之后） | 400/404 |
+| POST | `/file_diff/hunk_keep` | `{session_id,key,hunk_index,until_hunk?}` | `{ok,version,new_gen,kept_hunk,kept_count,total}`（保留该块、其余还原为基线，固化为新代基线并写回磁盘；until_hunk=true 保留此处及之后） | 400/404 |
+| POST | `/file_diff/sync` | `{session_id,key}` | `{synced,version?,total?,message?}`（从磁盘刷新：外部修改并入版本链并重算 diff） | 400/404 |
+| GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h}],hunks:[{index,old_start,...}],truncated,max_rows,diff,...}`（V2.2 全文视图：ctx/del/add 行序列 + hunk 坐标，超限截断前端回退紧凑模式） | 404 |
+| POST | `/file_diff/rollback` | `{session_id,key, to_version?/to_round?, target:"baseline"}` | `{ok,version,restored_to:{v,hash},total}`（写回磁盘并追加 rollback 版本） | 400/404/409 |
+| POST | `/file_diff/save` | `{session_id,key,content,expected_hash}` | `{ok,version,total}`（编辑器保存，乐观锁；写回磁盘 + 追加 user_edit 版本） | 400/404/**409**(hash 冲突) |
+| POST | `/file_diff/keep` | `{session_id,key}` | `{ok,kept:true,new_gen,baseline_v,total}`（保留封版：历史代拒绝再撤回） | 400/404 |
+| DELETE | `/file_diff/delete` | session_id, key | `{deleted,key}`（删除该文件版本链目录） | 400 |
+| POST | `/file_diff/cleanup` | `{session_id,clean_only?=true}` | `{removed_count,removed:[{key,path}]}`（批量清理留档：只清已全部保留/撤回的文件链） | — |
+
+409 的两种来源：目标版本所在代已 `locked`（keep 后）；`save` 的 expected_hash 与链上最新版本不符（文件读后被外部修改）。
+前端：顶栏「文件变更」按钮（徽标=文件数）→ 统计面板（footer 带清理留档入口）→ 点击文件**新窗口打开独立编辑器页 `H5/editor.html?session_id&key`**（V2.3：全文视图 ctx/add 行可编辑 overlay + Prism 行内高亮，del 红块只读；每 hunk 保留/撤回 +「此处及之后」区间操作；保存 Ctrl+S / 回退基线或任意轮次 / 保留 / 从磁盘刷新；超 2 万行回退紧凑 diff 模式）。
+
 ### 模型选择（三种模型 + 参数）
 
 模型选择存于 `setting/models.json` 顶层 `model_selection` 键（与 provider 目录同文件，读写即时生效，不再依赖 `.env` 的 `CHAT_OWNERSHIP_NANE/CHAT_MODEL_NAME`，仅作未配置时的回退）：
@@ -431,8 +463,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 上传文件并解析文本（≤10 个，单个 ≤10MB），结果写入文件记忆。
 - Form: `files`(必填, 多文件)；Query: `session_id`
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status(success/failed), message?, type?, content_length?}`
-- 上传文件保存为 `history_files/upload/<session_id>/<文件名>.json`（目录按前端传入的 `session_id` 命名，仅存解析出的文本内容）；
-  同时把**原始文件字节**另存到 `history_files/upload/<session_id>/files/<名>_<随机>.<ext>`（供 `GET /file/get_session_document` 点击预览/下载），
+- 上传文件保存为 `history_files/session_files/<session_id>/<文件名>.json`（目录按前端传入的 `session_id` 命名，仅存解析出的文本内容）；
+  同时把**原始文件字节**另存到 `history_files/session_files/<session_id>/files/<名>_<随机>.<ext>`（供 `GET /file/get_session_document` 点击预览/下载），
   `results[]` 与 file_memory 记录均携带 `stored_name`（保存失败时为 null，不影响解析结果）；
   上传成功后会把该目录名写入对应聊天会话 jsonl 的 `_meta.upload_id`（会话文件不存在时自动创建），
   供 `/chat_history/delete_file` 连带清理；`upload_id` 为实际记录的目录名（记录失败时为 null，不影响上传结果）。
@@ -445,7 +477,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 | /file/clear_session_file_memorys | DELETE | session_id | `{message}` |
 
 ### POST /file/upload_session_media
-上传聊天多媒体附件（图片/音频/视频），**原始字节**保存到 `history_files/upload/<session>/media/`。
+上传聊天多媒体附件（图片/音频/视频），**原始字节**保存到 `history_files/session_files/<session>/media/`。
 - Form: `files`(必填, 多文件)；Query: `session_id`
 - 限制：≤10 个/次；单文件上限按类别——图片/音频 20MB、**视频 500MB（流式落盘，不整体读入内存）**；扩展名白名单——图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff（ico/tif/tiff 视觉模型不原生接受，上传时由 Pillow 自动转为 PNG 再落盘，需安装 pillow）、音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status, stored_name, media_ref, kind(image/audio/video), mime, size}`
@@ -462,7 +494,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 ### GET /file/get_session_document
 读取会话内已上传文档的**原始文件字节**（前端点击预览 PDF/文本/下载原文件）。
-原始字节在上传解析时另存于 `history_files/upload/<session>/files/`（`upload_session_files` 返回的 `stored_name`，并写入 file_memory 记录）；旧版本上传的文档无原始字节，无法预览。
+原始字节在上传解析时另存于 `history_files/session_files/<session>/files/`（`upload_session_files` 返回的 `stored_name`，并写入 file_memory 记录）；旧版本上传的文档无原始字节，无法预览。
 - Query: `name`(必填, 即 stored_name，禁止路径分隔符), `session_id`
 - 支持 HTTP Range 请求（206），大 PDF 按需加载
 - 返回: 文件字节流（Content-Type 按扩展名推断）；不存在 404

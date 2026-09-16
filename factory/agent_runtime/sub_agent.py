@@ -34,6 +34,7 @@ from env_manager import (
     load_var,
 )
 from util.timestamp_utils import now_str
+from memory import file_history as _file_history
 
 from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
@@ -108,6 +109,8 @@ class SubAgentContext:
     # 父级当轮聊天模型的视觉能力（派发时刻固化）：子任务 read_media 可用性
     # 判定优先用父级传入值；sub_agent_model 独立子模型配置可在执行时再覆盖判定
     parent_vision_enabled: bool | None = None
+    # V2 文件版本链：父级会话轮次号（子任务内文件工具入链标注 round 用）
+    parent_round_number: int = 0
 
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
@@ -201,9 +204,12 @@ def _collect_usage(accumulator: UsageAccumulator) -> dict[str, Any]:
 
 
 def _format_result_text(result: Any) -> str:
-    if isinstance(result, dict) and "_file_diff" in result:
-        # 内置文件工具的展示用 diff：只推送前端与落盘，不进入子模型上下文
-        result = {k: v for k, v in result.items() if k != "_file_diff"}
+    if isinstance(result, dict):
+        # 内置文件工具的展示用 diff 与版本链入链数据：只推送前端与落盘，不进入子模型上下文
+        result = {
+            k: v for k, v in result.items()
+            if k not in ("_file_diff", "_file_history")
+        }
     if isinstance(result, str):
         return result
     try:
@@ -353,6 +359,25 @@ class SubAgentRunner:
                 f"[WARN] sub_agent 事件发射失败"
                 f"（agent_id={self.context.agent_id}, phase={phase}）: {exc}"
             )
+
+    def _record_file_history(self, raw_result: dict[str, Any]) -> None:
+        """V2 版本链：子任务内文件工具变更入链（同父级消费点语义，失败静默）。"""
+        payload = raw_result.get("_file_history")
+        if not isinstance(payload, dict) or not payload.get("path"):
+            return
+        try:
+            _file_history.record_change(
+                self.context.session_id,
+                path=str(payload["path"]),
+                display_path=str(payload.get("display_path") or payload["path"]),
+                old_text=payload.get("old_text"),
+                new_text=payload.get("new_text"),
+                tool="sub_agent." + (payload.get("tool") or "file_tool"),
+                round_number=int(self.context.parent_round_number or 0),
+                encoding=str(payload.get("encoding") or "utf-8"),
+            )
+        except Exception as record_error:
+            print(f"[WARN] 子任务文件版本链记录失败（不影响子任务）: {record_error}")
 
     async def _emit_start(self) -> None:
         await self._emit(
@@ -998,6 +1023,9 @@ class SubAgentRunner:
                 sub_file_diff = (
                     sub_raw_result.get("_file_diff") if isinstance(sub_raw_result, dict) else None
                 )
+                # V2 版本链：子任务内的文件工具变更同样入链（标注父轮次号）
+                if isinstance(sub_raw_result, dict) and "_file_history" in sub_raw_result:
+                    self._record_file_history(sub_raw_result)
                 await self._emit(
                     "tool_result",
                     tool_call_id=tool_call_id,

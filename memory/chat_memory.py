@@ -39,8 +39,9 @@ from config import (
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 
-# 会话上传文件的根目录（与 memory.file_memory.HISTORY_ROOT 保持一致）
-UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "upload"
+# 会话上传文件的根目录（与 memory.file_memory.HISTORY_ROOT 保持一致：
+# history_files/session_files/，由 upload 目录改名而来）
+UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "session_files"
 
 # 跨进程写锁文件的统一存放目录：避免 *.lock 散落在历史文件根目录
 # （与 <session>_chat.jsonl、<session>_chat.jsonl.pending 混在一起）
@@ -907,6 +908,25 @@ class ChatMemoryManager:
         with self._lock:
             return self._round_store.current_tool_result_count()
 
+    async def get_current_round_number(self) -> int:
+        """当前进行中的轮次号（已完成 chat_round 条目数 + 1），从 1 开始。
+
+        供 file_history 版本链标注 round 使用：同轮内的多次编辑 round 相同，
+        「回退到第 N 轮发起时」= 链上 round < N 的最新快照。跨进程读文件
+        （worker 进程同样以此口径计算），仅数条目、不重算 meta，成本一次
+        全量读取；工具循环开始处调用一次即可。
+        """
+        with self._lock:
+            _, entries = _load_meta_and_entries(self._file_path, self.session_id)
+        return (
+            sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("event") == "chat_round"
+            )
+            + 1
+        )
+
     async def update_current_round_compaction(
         self,
         compress_content: str,
@@ -1139,11 +1159,11 @@ class ChatMemoryManager:
         """
         把本会话上传文件所在目录名写入首行 _meta 的 upload_id 字段。
 
-        上传目录按上传时前端传入的 session_id 命名（history_files/upload/
+        上传目录按上传时前端传入的 session_id 命名（history_files/session_files/
         下的文件夹名），可能与会话文件名不一致；记录后可保证删除会话时
         能连带清理上传目录（见 delete_chat_session_file）。
         Args:
-            upload_id: 上传目录名（history_files/upload/ 下的文件夹名）
+            upload_id: 上传目录名（history_files/session_files/ 下的文件夹名）
         Returns:
             更新后的元数据字典
         """
@@ -1752,7 +1772,7 @@ class ChatMemoryManager:
             upload_dir = UPLOAD_HISTORY_ROOT / upload_dir_name
             if upload_dir.exists():
                 _delete_path_with_retry(upload_dir, recursive=True)
-                deleted_parts.append(f"上传目录 upload/{upload_dir_name}")
+                deleted_parts.append(f"上传目录 history_files/session_files/{upload_dir_name}")
         if not deleted_parts:
             return {
                 "state": "succeed",

@@ -37,7 +37,7 @@
   }
 
   /**
-   * 上传媒体附件到 history_files/upload/<session>/media/，换回 media:// 引用；
+   * 上传媒体附件到 history_files/session_files/<session>/media/，换回 media:// 引用；
    * 后端发送上游前会把引用解析为 data URL / base64（兼容 Chat Completions 格式）
    */
   async function uploadMediaFiles(streamSessionId, files) {
@@ -51,6 +51,19 @@
       else toast("附件上传失败：" + result.filename + "：" + (result.message || "未知原因"));
     });
     return uploadedMedia;
+  }
+
+  // V2 文件版本链徽标刷新（防抖）：文件工具结果到达后延迟拉一次统计
+  let fileChangesTimer = null;
+  function scheduleFileChangesBadgeRefresh(sessionId) {
+    if (state.sessionId !== sessionId) return;
+    if (fileChangesTimer) clearTimeout(fileChangesTimer);
+    fileChangesTimer = setTimeout(function () {
+      fileChangesTimer = null;
+      if (App.fileHistory && typeof App.fileHistory.refreshBadge === "function") {
+        App.fileHistory.refreshBadge();
+      }
+    }, 400);
   }
 
   /**
@@ -469,6 +482,8 @@
         // （防抖合并，流式期间多次结果只产生一次请求）
         if (state.sessionId === sessionId) {
           App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
+          // V2 文件版本链：文件工具结果到达后刷新顶栏"文件变更"徽标（防抖）
+          scheduleFileChangesBadgeRefresh(sessionId);
         }
       }
       // token 用量：每次 LLM 调用一份独立统计，按 completion id 去重后累加为本轮累计

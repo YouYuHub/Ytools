@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>文件 diff 编辑器 · Ytools</title>
+  <!-- 主题初始化（读 localStorage ytools-theme，避免闪白） -->
+  <script src="js/theme.js"></script>
+  <link rel="stylesheet" href="style/css/main.css" />
+</head>
+<body class="eh-page">
+  <header class="eh-head">
+    <div class="eh-title-wrap" id="ehTitleWrap"></div>
+    <div class="eh-bar">
+      <button type="button" class="fh-btn fh-btn-primary" id="ehSave">保存</button>
+      <button type="button" class="fh-btn" id="ehRevert" title="回退到本轮任务首次修改前的状态">回退到基线</button>
+      <select class="fh-round-select" id="ehRoundSelect" hidden></select>
+      <button type="button" class="fh-btn" id="ehSync"
+        title="文件在外部（如 VS Code）被修改过后，点此把最新磁盘内容并入版本链并重算 diff">从磁盘刷新</button>
+      <button type="button" class="fh-btn" id="ehKeep" title="保留当前文件并锁定历史（历史版本不可再撤回）">保留</button>
+      <button type="button" class="fh-btn" id="ehClose" title="关闭本窗口（Esc）">关闭</button>
+    </div>
+  </header>
+
+  <main class="eh-body" id="ehBody">
+    <div class="eh-loading" id="ehLoading">加载中...</div>
+  </main>
+
+  <!-- 危险操作二次确认 -->
+  <div class="confirm-modal hidden" id="ehConfirm" aria-hidden="true">
+    <div class="confirm-modal-backdrop" id="ehConfirmBackdrop"></div>
+    <section class="confirm-modal-dialog" role="dialog" aria-modal="true">
+      <h2>确认操作</h2>
+      <p id="ehConfirmMessage"></p>
+      <div class="confirm-modal-actions">
+        <button type="button" class="confirm-cancel" id="ehConfirmCancel">取消</button>
+        <button type="button" class="confirm-primary" id="ehConfirmOk">确定</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="js/api.js"></script>
+  <!-- Prism 语法高亮（与主应用同一套语言包） -->
+  <script src="js/vendor/prism/prism-core.min.js"></script>
+  <script src="js/vendor/prism/prism-clike.min.js"></script>
+  <script src="js/vendor/prism/prism-c.min.js"></script>
+  <script src="js/vendor/prism/prism-csharp.min.js"></script>
+  <script src="js/vendor/prism/prism-javascript.min.js"></script>
+  <script src="js/vendor/prism/prism-qml.min.js"></script>
+  <script src="js/vendor/prism/prism-typescript.min.js"></script>
+  <script src="js/vendor/prism/prism-css.min.js"></script>
+  <script src="js/vendor/prism/prism-less.min.js"></script>
+  <script src="js/vendor/prism/prism-scss.min.js"></script>
+  <script src="js/vendor/prism/prism-sass.min.js"></script>
+  <script src="js/vendor/prism/prism-markup.min.js"></script>
+  <script src="js/vendor/prism/prism-markup-embed.js"></script>
+  <script src="js/vendor/prism/prism-python.min.js"></script>
+  <script src="js/vendor/prism/prism-python-imports.js"></script>
+  <script src="js/vendor/prism/prism-java.min.js"></script>
+  <script src="js/vendor/prism/prism-cpp.min.js"></script>
+  <script src="js/vendor/prism/prism-go.min.js"></script>
+  <script src="js/vendor/prism/prism-rust.min.js"></script>
+  <script src="js/vendor/prism/prism-bash.min.js"></script>
+  <script src="js/vendor/prism/prism-json.min.js"></script>
+  <script src="js/vendor/prism/prism-cmake.min.js"></script>
+  <script src="js/vendor/prism/prism-makefile.min.js"></script>
+  <script src="js/vendor/prism/prism-docker.min.js"></script>
+  <script src="js/vendor/prism/prism-yaml.min.js"></script>
+  <script src="js/vendor/prism/prism-ini.min.js"></script>
+  <script src="js/vendor/prism/prism-ignore.min.js"></script>
+  <script src="js/vendor/prism/prism-diff.min.js"></script>
+  <script src="js/app/editor.js"></script>
+</body>
+</html>

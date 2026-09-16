@@ -202,12 +202,14 @@ class NoToolNamesRegressionTests(unittest.TestCase):
 
 
 def _cleanup():
-    root = Path(__file__).resolve().parents[1] / "history_files"
+    repo_root = Path(__file__).resolve().parents[1]
+    root = repo_root / "history_files"
     for suffix in ("", ".pending"):
         target = root / f"{TEST_SESSION}_chat.jsonl{suffix}"
         if target.exists():
             target.unlink()
-    upload_dir = root / TEST_SESSION
+    # 上传记录目录（upload 已改名为 history_files/session_files/）
+    upload_dir = root / "session_files" / TEST_SESSION 
     if upload_dir.exists():
         shutil.rmtree(upload_dir, ignore_errors=True)
     try:

@@ -406,7 +406,7 @@ const api_url = localStorage.getItem("ytools-api-base")
 
   /**
    * 上传多媒体附件（图片/音频/视频）：POST /file/upload_session_media
-   * 原始字节保存到 history_files/upload/<session>/media/，返回 media:// 引用
+   * 原始字节保存到 history_files/session_files/<session>/media/，返回 media:// 引用
    * @param {string} sessionId 会话 ID
    * @param {File[]} files 媒体文件列表
    * @returns {Promise<{total:number, success:number, failed:number,
@@ -560,6 +560,121 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
+  // ---------- V2 文件历史版本链（docs/file_diff.md §9） ----------
+  function listFileChanges(sessionId) {
+    return request("/file_diff/list?session_id=" + encodeURIComponent(sessionId || "default"));
+  }
+
+  function fileVersions(sessionId, key) {
+    return request("/file_diff/versions?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileContent(sessionId, key, v) {
+    let path = "/file_diff/content?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key);
+    if (v != null) path += "&v=" + encodeURIComponent(v);
+    return request(path);
+  }
+
+  function fileTotalDiff(sessionId, key) {
+    return request("/file_diff/total_diff?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileChangeDiff(sessionId, key, v) {
+    return request("/file_diff/change_diff?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key) + "&v=" + encodeURIComponent(v));
+  }
+
+  function fileFullView(sessionId, key) {
+    return request("/file_diff/full_view?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileHunkUndo(sessionId, key, hunkIndex, untilHunk) {
+    return request("/file_diff/hunk_undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        hunk_index: hunkIndex,
+        until_hunk: !!untilHunk,
+      }),
+    });
+  }
+
+  function fileRollback(sessionId, key, options) {
+    const opts = options || {};
+    return request("/file_diff/rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        to_version: opts.to_version != null ? opts.to_version : null,
+        to_round: opts.to_round != null ? opts.to_round : null,
+        target: opts.target || "baseline",
+      }),
+    });
+  }
+
+  function fileSave(sessionId, key, content, expectedHash) {
+    return request("/file_diff/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        content: content,
+        expected_hash: expectedHash,
+      }),
+    });
+  }
+
+  function fileKeep(sessionId, key) {
+    return request("/file_diff/keep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", key: key }),
+    });
+  }
+
+  function fileHistoryDelete(sessionId, key) {
+    return request("/file_diff/delete?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key), { method: "DELETE" });
+  }
+
+  function fileHunkKeep(sessionId, key, hunkIndex, untilHunk) {
+    return request("/file_diff/hunk_keep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        hunk_index: hunkIndex,
+        until_hunk: !!untilHunk,
+      }),
+    });
+  }
+
+  function fileSyncFromDisk(sessionId, key) {
+    return request("/file_diff/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", key: key }),
+    });
+  }
+
+  function fileCleanup(sessionId, cleanOnly) {
+    return request("/file_diff/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", clean_only: !!cleanOnly }),
+    });
+  }
+
   global.API = {
     BASE,
     listSessions,
@@ -607,5 +722,21 @@ const api_url = localStorage.getItem("ytools-api-base")
     savePrompt,
     renamePrompt,
     deletePrompt,
+    listFileChanges,
+    fileVersions,
+    fileContent,
+    fileTotalDiff,
+    fileFullView,
+    fileChangeDiff,
+    fileHunkUndo,
+    fileHunkKeep,
+    fileSyncFromDisk,
+    fileRollback,
+    fileSave,
+    fileKeep,
+    fileHistoryDelete,
+    fileCleanup,
   };
 })(window);
+
+

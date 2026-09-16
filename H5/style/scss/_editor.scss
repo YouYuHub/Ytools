@@ -1,0 +1,307 @@
+// ============================================================
+// V2.3 独立文件 diff 编辑器页（editor.html / js/app/editor.js）
+// - 与主应用同源样式变量（main.css :root），明暗主题跟随 localStorage
+// - 全文视图行序列：ctx 行也可编辑（V2.3：除红块 del 外全部可编辑），
+//   编辑全文行不改变 diff 语义，仅随保存整体入链
+// - 行内语法高亮：Prism 高亮层（pre.eh-hl）+ 透明文字 textarea 叠加（overlay）
+// - 复用 _filehistory.scss 的全局类：fh-btn / fh-hunk-head / fh-skip 等
+// ============================================================
+
+$eh-add-bg: rgba(46, 160, 67, 0.16);
+$eh-del-bg: rgba(248, 81, 73, 0.16);
+$eh-add-text: #1a7f37;
+$eh-del-text: #cf222e;
+
+// ---------- 页面骨架 ----------
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body.eh-page {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.eh-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;         // 标题过长时操作栏换到第二行
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+
+.eh-title-wrap {
+  flex: 1 1 100%;          // 完整文件路径独占顶行，过长自动换行
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  strong {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.45;
+    word-break: break-all;
+    white-space: normal;   // 完整路径过长自动换行
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.eh-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.eh-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+// 编辑器页按钮整体调矮（fh-btn 沿用主应用全局样式，此处按需收紧）
+body.eh-page .fh-btn {
+  padding: 3px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+body.eh-page .fh-round-select {
+  padding: 3px 8px;
+  font-size: 12px;
+  max-width: 200px;
+}
+
+.eh-body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 0 40vh;   // 底部留白便于编辑最后一行
+
+  // 垂直滚动条调宽（默认约 8px 太窄，编辑区内容长时不便定位拖拽）
+  &::-webkit-scrollbar {
+    width: 14px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    min-height: 48px;
+    border-radius: 7px;
+    background: var(--border-strong, rgba(128, 128, 128, 0.45));
+
+    &:hover {
+      background: var(--text-tertiary, rgba(128, 128, 128, 0.7));
+    }
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  scrollbar-width: auto;
+  scrollbar-color: var(--border-strong, rgba(128, 128, 128, 0.45)) transparent;
+}
+
+.eh-loading {
+  margin: 60px auto;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+// ---------- 行渲染 ----------
+.eh-table {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-width: max-content;
+}
+
+.eh-line {
+  display: flex;
+  align-items: flex-start;
+  min-height: 21px;
+  padding: 0 10px 0 0;
+}
+
+.eh-no {
+  flex: none;
+  width: 96px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  user-select: none;
+  line-height: 1.55;
+}
+
+// 可编辑单元格：高亮层 + 透明输入层叠加（overlay editing）
+.eh-edit {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 21px;
+
+  pre.eh-hl,
+  .eh-input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font: inherit;
+    line-height: inherit;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  pre.eh-hl {
+    pointer-events: none;   // 事件全部交给上层 textarea
+    z-index: 0;
+  }
+
+  .eh-input {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    color: transparent;          // 文字由下层高亮层渲染
+    caret-color: var(--text);    // 光标可见
+    outline: none;
+    resize: none;
+    overflow: hidden;
+  }
+}
+
+.eh-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+}
+
+// ctx 行：中性背景、正常文字色、可编辑（V2.3：全文皆可编辑，红块除外）
+.eh-ctx {
+  .eh-hl {
+    color: var(--text);
+  }
+}
+
+// add 行：绿底，编辑中文字保持绿色系
+.eh-add {
+  background: $eh-add-bg;
+
+  .eh-hl {
+    color: $eh-add-text;
+  }
+}
+
+// del 行：红底只读（无行号、删除线）
+.eh-del {
+  background: $eh-del-bg;
+
+  .eh-text {
+    color: $eh-del-text;
+    text-decoration: line-through;
+    text-decoration-color: rgba($eh-del-text, 0.5);
+  }
+
+  .eh-no {
+    visibility: hidden;
+  }
+}
+
+// 原生选区配色：与多行整行高亮同一深蓝（替代默认蓝反白，明暗主题统一）。
+// 多行选区经逐行 setSelectionRange 程序化铺开，同样由 ::selection 渲染——
+// 首尾行精确到鼠标扫过的字符区间，中间行整行。
+.eh-input::selection {
+  background: rgba(49, 93, 140, 0.92);
+  color: #fff;
+}
+
+.eh-input::-moz-selection {
+  background: rgba(49, 93, 140, 0.92);
+  color: #fff;
+}
+
+// 红块行无输入框，无法参与原生选区：跨行选到 del 行时整行类高亮兜底
+.eh-line.is-selected {
+  background: rgba(49, 93, 140, 0.92);
+}
+
+// 多行选区的非聚焦行：Chrome 不渲染非聚焦输入框的 ::selection，
+// 在高亮层用 .eh-sel span 精确包裹选中片段（颜色与原生选区完全一致）
+.eh-hl .eh-sel {
+  background: rgba(49, 93, 140, 0.92);
+  color: #fff;
+  border-radius: 1px;
+}
+
+// ---------- 提示 toast ----------
+.eh-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-menu);
+  padding: 8px 16px;
+  font-size: 12.5px;
+  z-index: 200;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+
+  &.is-show {
+    opacity: 1;
+  }
+}
+
+// 二次确认主按钮（confirm-danger 是主应用的红色删除样式，编辑器页用中性主色）
+#ehConfirm {
+  .confirm-primary {
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--accent-contrast, #fff);
+
+    &:hover {
+      opacity: 0.88;
+    }
+  }
+}
+
+// ---------- 暗色主题 ----------
+html[data-theme="dark"] {
+  body.eh-page {
+    background: var(--bg);
+  }
+
+  .eh-add .eh-hl {
+    color: #7ee787;
+  }
+
+  .eh-del .eh-text {
+    color: #ff9492;
+    text-decoration-color: rgba(255, 148, 146, 0.5);
+  }
+}

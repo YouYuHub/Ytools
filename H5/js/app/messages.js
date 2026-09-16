@@ -600,6 +600,7 @@
       statusIcon +
       "<span>调用工具</span>" +
       '<span class="tool-block-name"></span>' +
+      '<span class="tool-block-file" hidden></span>' +
       '<span class="tool-block-diff" hidden></span>' +
       '<svg class="icon tool-block-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
     head.querySelector(".tool-block-name").textContent = name || "tool";
@@ -680,7 +681,7 @@
       },
       setOutput: function (t) { outPre.textContent = t || "(无输出)"; },
       // 附带展示用 diff 视图（write_file/edit_file 结果）：渲染在输出区上方，
-      // 并在块标题栏挂 +N/-M 徽标（块默认折叠时也能一眼看到文件变更）
+      // 头部显示完整文件路径（可换行、垂直居中）+ "+N绿 / -M红" 双徽标
       setDiff: function (diff) {
         clearDiff();
         if (!diff) return;
@@ -688,16 +689,34 @@
         body.insertBefore(diffView, outLabel);
         const badge = head.querySelector(".tool-block-diff");
         if (badge) {
+          badge.innerHTML = "";
           const added = Number(diff.lines_added) || 0;
           const removed = Number(diff.lines_removed) || 0;
           const skipped = diff.diff_skipped || "";
-          badge.textContent = skipped === "unchanged" ? "无变化"
-            : skipped === "file_too_large" ? "文件过大"
-            : "+" + added + " -" + removed;
-          badge.classList.toggle("is-add", added > 0 && removed === 0);
-          badge.classList.toggle("is-del", removed > 0 && added === 0);
+          if (skipped === "unchanged") {
+            badge.appendChild(el("span", "diff-num is-add", "无变化"));
+          } else if (skipped === "file_too_large") {
+            badge.appendChild(el("span", "diff-num is-del", "文件过大"));
+          } else {
+            // +N 恒绿、-M 恒红（不再按 add-only/del-only 整体变色）
+            badge.appendChild(el("span", "diff-num is-add", "+" + added));
+            badge.appendChild(el("span", "diff-num is-del", "-" + removed));
+          }
           badge.hidden = false;
           wrap.classList.add("has-diff");
+        }
+        // 头部文件名：完整路径，一行放不下自动换行（1/2 行均垂直居中），
+        // hover title 显示完整路径，点击复制
+        const fileTag = head.querySelector(".tool-block-file");
+        if (fileTag && diff.path) {
+          fileTag.textContent = diff.path;
+          fileTag.title = diff.path + "（点击复制）";
+          fileTag.onclick = function () {
+            try {
+              navigator.clipboard.writeText(diff.path).then(function () {}, function () {});
+            } catch (_) { /* 忽略 */ }
+          };
+          fileTag.hidden = false;
         }
       },
       clearDiff: function () {
@@ -707,9 +726,13 @@
         diffView = null;
         const badge = head.querySelector(".tool-block-diff");
         if (badge) {
-          badge.textContent = "";
-          badge.classList.remove("is-add", "is-del");
+          badge.innerHTML = "";
           badge.hidden = true;
+        }
+        const fileTag = head.querySelector(".tool-block-file");
+        if (fileTag) {
+          fileTag.textContent = "";
+          fileTag.hidden = true;
         }
         wrap.classList.remove("has-diff");
       },
@@ -917,15 +940,45 @@
     return box;
   }
 
+  // 从工具参数 JSON 文本中提取文件路径（write_file/edit_file 的 full_file_name，
+  // 兜底 _file_diff 无 path 字段的旧数据）
+  function extractPathFromArgs(argsText) {
+    if (!argsText || typeof argsText !== "string") return "";
+    try {
+      const args = JSON.parse(argsText);
+      const raw = args.full_file_name || args.path || "";
+      return String(raw).trim();
+    } catch (_) {
+      // 参数可能是流式未闭合 JSON：宽松匹配 "full_file_name":"..."
+      const m = /"full_file_name"\s*:\s*"([^"]+)"/.exec(argsText)
+        || /"path"\s*:\s*"([^"]+)"/.exec(argsText);
+      return m ? m[1].replace(/\\\\/g, "\\").replace(/\//g, "\\") : "";
+    }
+  }
+
+  // 从 unified diff 文件头（--- a/xxx / +++ b/xxx）提取展示路径
+  function extractPathFromDiffText(diffText) {
+    if (!diffText) return "";
+    const m = /^--- (?:a\/)?(.+)$/m.exec(diffText);
+    return m ? m[1].trim() : "";
+  }
+
   /** 工具输出统一入口：带 file_diff 的结构化结果渲染 diff 视图 + 统计摘要文本，
-   * 其余一律按原文纯文本输出（MCP 版同名工具 / 旧历史无 diff 自动回退）。 */
-  function applyToolResult(block, name, resultText, fileDiff) {
+   * 其余一律按原文纯文本输出（MCP 版同名工具 / 旧历史无 diff 自动回退）。
+   * argsText（可选）：工具原始参数 JSON 文本，用于在 _file_diff 无 path 字段的
+   * 旧数据里兜底提取完整文件路径（full_file_name）。 */
+  function applyToolResult(block, name, resultText, fileDiff, argsText) {
     let parsed = null;
     if (fileDiff && typeof fileDiff === "object") {
       try {
         const obj = JSON.parse(resultText);
         if (obj && typeof obj === "object" && obj.path != null) parsed = obj;
       } catch (_) { /* 回退纯文本 */ }
+      // 旧数据 _file_diff 无 path 字段：从参数或 diff 文件头兜底提取
+      if (parsed && !fileDiff.path) {
+        fileDiff.path = extractPathFromArgs(argsText)
+          || extractPathFromDiffText(fileDiff.diff) || "";
+      }
     }
     if (parsed) {
       const statsBits = [];
