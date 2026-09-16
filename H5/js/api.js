@@ -108,6 +108,94 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
+  // ---------- 会话分享 / 多会话导入（zip / jsonl 两阶段） ----------
+  /**
+   * 把一个或多个会话打包为 zip 下载。
+   * 响应为二进制 zip；以 <a download> 方式触发浏览器下载。
+   * @param {string[]} sessionIds 会话 ID 列表（单会话即 zip 分享）
+   * @returns {Promise<{skipped:string[], name:string}>} skipped 为不存在的会话
+   */
+  async function exportSessionsZip(sessionIds) {
+    // 逗号分隔单值传参：后端 session_ids 是标量 str（重复键会被丢弃只留最后一个）
+    const params = new URLSearchParams();
+    params.set("session_ids", (sessionIds || []).join(","));
+    const res = await fetch(BASE + "/chat_history/export_zip?" + params.toString());
+    if (!res.ok) {
+      let detail = "导出失败 " + res.status;
+      try {
+        const body = await res.json();
+        if (body.detail) detail = body.detail;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const skipped = [];
+    try {
+      (res.headers.get("X-Skipped-Sessions") || "")
+        .split(",").forEach(function (s) { if (s) skipped.push(decodeURIComponent(s)); });
+    } catch (_) { /* 头缺失忽略 */ }
+    // 从 Content-Disposition 提取 UTF-8 文件名（单会话 <id>_chat.zip / 多会话带时间戳）
+    const dispo = res.headers.get("Content-Disposition") || "";
+    const m = dispo.match(/filename\*=UTF-8''([^;]+)/i);
+    const name = m ? decodeURIComponent(m[1]) : "ytools_sessions.zip";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    return { skipped: skipped, name: name };
+  }
+
+  /**
+   * 导入预检（不落盘）：上传 zip/jsonl，返回会话清单与本地冲突列表
+   * @param {File} file zip 或 jsonl 文件
+   * @returns {Promise<{type, filename, total, sessions:Array, conflicts:string[]}>}
+   */
+  function previewImport(file) {
+    const fd = new FormData();
+    fd.append("file", file);
+    return fetch(BASE + "/chat_history/import_preview", { method: "POST", body: fd })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.json().then(function (body) {
+            throw new Error(body.detail || ("预检失败 " + res.status));
+          });
+        }
+        return res.json();
+      });
+  }
+
+  /**
+   * 导入提交（第二阶段）：按逐会话冲突决策写入
+   * @param {File} file 同预检的文件（后端无状态，需重传）
+   * @param {string} [conflictStrategy="ask"] 全局策略 ask/overwrite/rename/skip
+   * @param {Object<string,string>} [decisions] {session_id: overwrite|rename|skip}
+   * @returns {Promise<{state, imported:Array, skipped:Array, failed:Array}>}
+   */
+  function submitImport(file, conflictStrategy, decisions) {
+    const fd = new FormData();
+    fd.append("file", file);
+    const params = new URLSearchParams();
+    params.set("conflict_strategy", conflictStrategy || "ask");
+    if (decisions && Object.keys(decisions).length) {
+      params.set("decisions", JSON.stringify(decisions));
+    }
+    return fetch(BASE + "/chat_history/import_package?" + params.toString(), {
+      method: "POST",
+      body: fd,
+    }).then(function (res) {
+      if (!res.ok) {
+        return res.json().then(function (body) {
+          throw new Error(body.detail || ("导入失败 " + res.status));
+        });
+      }
+      return res.json();
+    });
+  }
+
   // ---------- 工具 ----------
   /**
    * 列出工具；后端默认复用 TTL 内的探测缓存（首屏毫秒级返回），
@@ -685,6 +773,9 @@ const api_url = localStorage.getItem("ytools-api-base")
     fetchSessionFile,
     deleteSession,
     uploadChatHistory,
+    exportSessionsZip,
+    previewImport,
+    submitImport,
     listTools,
     getModels,
     selectModel,
@@ -738,5 +829,4 @@ const api_url = localStorage.getItem("ytools-api-base")
     fileCleanup,
   };
 })(window);
-
 

@@ -215,6 +215,7 @@ agent_tool_sse/
   - 压缩 usage 分桶累计：单轮 `compress_usage`、跨轮 `_history_compress_usage`；压缩过程事件（start/done）以 `event="context_compaction"` 独立行落盘，与 SSE 推送同结构
   - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；`run_task` 属性按会话控制对话启停
   - 支持按行删除/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
+  - **多会话分享/导入**：`export_sessions_to_zip` 打包（各会话 jsonl + `session_files/<upload_id>/` 数据 + manifest.json）；`list_zip_sessions` 预检（不落盘，返回会话清单与本地冲突标记）；`import_sessions_from_zip` 两阶段提交（冲突策略 ask/overwrite/rename/skip，逐会话决策，另存时上传目录归属随新会话 ID 改名并回写 `_meta.upload_id`），路由见 `/chat_history/export_zip|import_preview|import_package`
 - **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）
   - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）
 

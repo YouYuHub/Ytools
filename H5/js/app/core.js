@@ -194,6 +194,14 @@ window.App = window.App || {};
   const deleteModalBackdrop = $("#deleteModalBackdrop");
   const deleteCancel = $("#deleteCancel");
   const deleteConfirm = $("#deleteConfirm");
+  // 导入冲突决策弹窗（zip/jsonl 两阶段导入）
+  const importConflictModal = $("#importConflictModal");
+  const importConflictBackdrop = $("#importConflictBackdrop");
+  const importConflictList = $("#importConflictList");
+  const importConflictHint = $("#importConflictHint");
+  const importConflictSummary = $("#importConflictSummary");
+  const importConflictCancel = $("#importConflictCancel");
+  const importConflictSubmit = $("#importConflictSubmit");
   const chatSettingsModal = $("#chatSettingsModal");
   const chatSettingsBackdrop = $("#chatSettingsBackdrop");
   const chatSettingsClose = $("#chatSettingsClose");
@@ -413,6 +421,7 @@ window.App = window.App || {};
       closeMenus();
       if (!toolModal.classList.contains("hidden")) closeToolModal();
       if (!deleteModal.classList.contains("hidden")) App.closeDeleteModal();
+      if (!importConflictModal.classList.contains("hidden")) App.closeImportConflict();
       if (!chatSettingsModal.classList.contains("hidden")) App.closeChatSettings();
       if (!askModal.classList.contains("hidden")) App.closeAskModal();
     }
@@ -428,6 +437,9 @@ window.App = window.App || {};
   deleteModalBackdrop.addEventListener("click", function () { App.closeDeleteModal(); });
   deleteCancel.addEventListener("click", function () { App.closeDeleteModal(); });
   deleteConfirm.addEventListener("click", function () { App.confirmDeleteSession(); });
+  // 导入冲突弹窗：关闭逻辑由 history.js 模块注册（App.closeImportConflict）
+  importConflictBackdrop.addEventListener("click", function () { App.closeImportConflict(); });
+  importConflictCancel.addEventListener("click", function () { App.closeImportConflict(); });
 
   // ---------- 侧边栏 ----------
   function setSidebarCollapsed(collapsed) {
@@ -509,7 +521,10 @@ window.App = window.App || {};
   profileSub, scrollBottomBtn, qnav,
   qnavRail, qnavPanel, toastWrap,
   deleteModal, deleteModalBackdrop, deleteCancel,
-  deleteConfirm, chatSettingsModal, chatSettingsBackdrop,
+  deleteConfirm, importConflictModal, importConflictBackdrop,
+  importConflictList, importConflictHint, importConflictSummary,
+  importConflictCancel, importConflictSubmit,
+  chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
   toolCallTimeoutSeconds, networkRetryMaxAttempts, mcpToolWorkers,

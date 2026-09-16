@@ -54,22 +54,56 @@
                     </button>
                 </div>
 
-                <button class="side-row" id="newChatBtn">
-                    <svg class="icon" viewBox="0 0 24 24">
-                        <path
-                            d="M13.5 3.5H8a4.5 4.5 0 0 0-4.5 4.5v8a4.5 4.5 0 0 0 4.5 4.5h8a4.5 4.5 0 0 0 4.5-4.5V10" />
-                        <path d="m12.1 11.9 8-8a1.56 1.56 0 0 1 2.2-2.2L14.3 9.7l-1.3 1.2L12 12Z" />
-                    </svg>
-                    <span>新对话</span>
-                </button>
+                <!-- 新对话行：左「新对话」+ 右「多选」（多选点击后本按钮变为“取消多选”并展开下方操作条） -->
+                <div class="side-actions">
+                    <button class="side-row" id="newChatBtn">
+                        <svg class="icon" viewBox="0 0 24 24">
+                            <path
+                                d="M13.5 3.5H8a4.5 4.5 0 0 0-4.5 4.5v8a4.5 4.5 0 0 0 4.5 4.5h8a4.5 4.5 0 0 0 4.5-4.5V10" />
+                            <path d="m12.1 11.9 8-8a1.56 1.56 0 0 1 2.2-2.2L14.3 9.7l-1.3 1.2L12 12Z" />
+                        </svg>
+                        <span>新对话</span>
+                    </button>
+                    <button type="button" class="bulk-mode-toggle" id="bulkModeBtn"
+                        title="多选会话，批量分享/删除；再次点击退出多选">
+                        <svg class="icon" viewBox="0 0 24 24">
+                            <path d="M9 11l3 3 8-8" />
+                            <path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" />
+                        </svg>
+                        <span>多选</span>
+                    </button>
+                </div>
+
+                <!-- 多选操作条：进入多选后在本行下方展开（分享所选 / 删除所选 / 已选计数） -->
+                <div class="session-bulk-bar hidden" id="sessionBulkBar">
+                    <button type="button" class="bulk-btn" id="bulkShareBtn" title="把所选会话打包为 zip 下载">
+                        <svg class="icon" viewBox="0 0 24 24">
+                            <circle cx="18" cy="5" r="3" />
+                            <circle cx="6" cy="12" r="3" />
+                            <circle cx="18" cy="19" r="3" />
+                            <path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4" />
+                        </svg>
+                        <span>分享</span>
+                    </button>
+                    <button type="button" class="bulk-btn danger" id="bulkDeleteBtn" title="删除所选会话">
+                        <svg class="icon" viewBox="0 0 24 24">
+                            <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6" />
+                        </svg>
+                        <span>删除</span>
+                    </button>
+                    <span class="bulk-count" id="bulkCount"></span>
+                </div>
 
                 <div class="search-box" id="searchBox">
                     <input class="search-input" id="searchInput" type="text" placeholder="搜索会话...">
                 </div>
 
-                <div class="session-list" id="sessionList">
-                    <div class="session-label">最近</div>
+                <!-- 「最近」标题行（预留后续分组扩展） -->
+                <div class="session-head" id="sessionHead">
+                    <span class="session-label">最近</span>
                 </div>
+
+                <div class="session-list" id="sessionList"></div>
 
                 <div class="panel-foot">
                     <div class="menu theme-menu hidden" id="themeMenu">
@@ -179,7 +213,7 @@
                                 <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
                                 <path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" />
                             </svg>
-                            <span class="menu-item-label">加载 JSONL</span>
+                            <span class="menu-item-label">加载会话（JSONL / 分享包）</span>
                         </button>
                         <button class="menu-item hidden" id="compactSessionItem">
                             <svg class="icon" viewBox="0 0 24 24">
@@ -414,7 +448,7 @@
                     <div class="file-chips hidden" id="fileChips"></div>
                     <div class="tool-chips hidden" id="toolChips"></div>
                     <input type="file" id="fileInput" multiple hidden>
-                    <input type="file" id="historyFileInput" accept=".jsonl,.json,application/json" hidden>
+                    <input type="file" id="historyFileInput" accept=".jsonl,.zip,application/json,application/zip" multiple hidden>
                     <div class="suggest-row" id="suggestRow">
                         <button class="suggest-chip" data-prompt="解释一下什么是 SSE 流式响应，它和普通接口有什么区别？">什么是 SSE 流式响应</button>
                         <button class="suggest-chip" data-prompt="帮我用 Python 写一个带注释的快速排序">写一段快速排序</button>
@@ -580,6 +614,24 @@
             <div class="confirm-modal-actions">
                 <button class="confirm-cancel" id="deleteCancel">取消</button>
                 <button class="confirm-danger" id="deleteConfirm">确认删除</button>
+            </div>
+        </section>
+    </div>
+
+    <!-- 导入冲突决策弹窗：同名会话选择「覆盖」或「重命名另存」（逐会话列表） -->
+    <div class="confirm-modal hidden" id="importConflictModal" aria-hidden="true">
+        <div class="confirm-modal-backdrop" id="importConflictBackdrop"></div>
+        <section class="confirm-modal-dialog import-conflict-dialog" role="dialog" aria-modal="true"
+            aria-labelledby="importConflictTitle">
+            <h2 id="importConflictTitle">导入会话冲突</h2>
+            <p id="importConflictHint">以下会话与本地已有会话同名，请选择处理方式：</p>
+            <div class="import-conflict-list" id="importConflictList"></div>
+            <div class="import-conflict-foot">
+                <span class="import-conflict-hint" id="importConflictSummary"></span>
+                <div class="confirm-modal-actions">
+                    <button class="confirm-cancel" id="importConflictCancel">取消导入</button>
+                    <button class="confirm-primary" id="importConflictSubmit">确认导入</button>
+                </div>
             </div>
         </section>
     </div>

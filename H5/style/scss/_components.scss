@@ -1285,6 +1285,94 @@
   }
 }
 
+// ---------- 导入冲突决策弹窗（zip / jsonl 两阶段导入） ----------
+.confirm-modal-dialog.import-conflict-dialog {
+  width: min(520px, 100%);
+  max-height: min(72vh, 560px);
+  display: flex;
+  flex-direction: column;
+
+  .import-conflict-list {
+    margin-top: 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .import-conflict-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 14px;
+
+    .import-conflict-hint {
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+
+    .confirm-modal-actions {
+      margin-top: 0;
+    }
+  }
+}
+
+.import-conflict-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+
+  &.conflict {
+    border-color: rgba(232, 117, 165, 0.55);
+    background: rgba(232, 117, 165, 0.06);
+  }
+
+  .ic-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .ic-title {
+    font-size: 14px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ic-info {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  .ic-new-tag {
+    font-size: 12px;
+    color: #0b84d8;
+    flex-shrink: 0;
+  }
+
+  .ic-choice {
+    flex-shrink: 0;
+    font: inherit;
+    font-size: 13px;
+    padding: 5px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    outline: none;
+    cursor: pointer;
+  }
+}
+
 // ---------- 媒体/文档预览模态框 ----------
 .media-preview-modal {
   position: fixed;

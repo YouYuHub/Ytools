@@ -83,10 +83,23 @@
   function buildSessionItem(id, title) {
     const item = el("div", "session-item" + (id === state.sessionId ? " active" : ""));
     item.dataset.session = id;
+    // 多选模式的选中气泡：bulk-mode 下显示，点击切换选中（自身是死区元素，必须绑事件）
+    const check = el("span", "session-check");
+    check.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+    check.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (bulkMode) toggleBulkSelect(id, item);
+    });
+    item.appendChild(check);
+    if (bulkMode && bulkSelected.has(id)) item.classList.add("bulk-selected");
     const select = el("button", "session-select");
     select.type = "button";
     select.appendChild(el("span", "session-name", title));
     select.addEventListener("click", function () {
+      if (bulkMode) {
+        toggleBulkSelect(id, item);
+        return;
+      }
       closeSessionMenus();
       openSession(id);
     });
@@ -98,10 +111,173 @@
     actions.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>';
     actions.addEventListener("click", function (event) {
       event.stopPropagation();
+      if (bulkMode) {
+        toggleBulkSelect(id, item);
+        return;
+      }
       toggleSessionMenu(id, item, actions);
     });
     item.appendChild(actions);
     return item;
+  }
+
+  // ---------- 会话多选（批量分享 / 批量删除） ----------
+  let bulkMode = false;
+  const bulkSelected = new Set();
+
+  function selectedVisibleIds() {
+    // 只统计当前可见（未被搜索过滤；filterSessions 用 style.display 隐藏）的选中项
+    return Array.from(sessionList.querySelectorAll(".session-item"))
+      .filter(function (node) { return node.style.display !== "none"; })
+      .map(function (node) { return node.dataset.session; })
+      .filter(function (id) { return bulkSelected.has(id); });
+  }
+
+  function toggleBulkSelect(id, item) {
+    if (bulkSelected.has(id)) {
+      bulkSelected.delete(id);
+      item.classList.remove("bulk-selected");
+    } else {
+      bulkSelected.add(id);
+      item.classList.add("bulk-selected");
+    }
+    updateBulkBarState();
+  }
+
+  function updateBulkBarState() {
+    const count = bulkSelected.size;
+    const shareBtn = $("#bulkShareBtn");
+    const delBtn = $("#bulkDeleteBtn");
+    if (shareBtn) shareBtn.disabled = count === 0;
+    if (delBtn) delBtn.disabled = count === 0;
+    const label = $("#bulkCount");
+    if (label) label.textContent = count ? "已选 " + count : "";
+  }
+
+  /** 多选模式切换按钮：进入后自身变为「取消多选」，并展开下方分享/删除操作条。 */
+  function setBulkToggle(active) {
+    const btn = $("#bulkModeBtn");
+    if (!btn) return;
+    const label = btn.querySelector("span");
+    if (active) {
+      btn.classList.add("bulk-mode-active");
+      if (label) label.textContent = "取消多选";
+      btn.title = "退出多选";
+    } else {
+      btn.classList.remove("bulk-mode-active");
+      if (label) label.textContent = "多选";
+      btn.title = "多选会话，批量分享/删除；再次点击退出多选";
+    }
+  }
+
+  function enterBulkMode() {
+    bulkMode = true;
+    bulkSelected.clear();
+    document.body.classList.add("bulk-mode");
+    // 多选按钮变为「取消多选」，并展开操作条（分享/删除/已选计数）
+    setBulkToggle(true);
+    $("#sessionBulkBar").classList.remove("hidden");
+    sessionList.querySelectorAll(".session-item").forEach(function (item) {
+      item.classList.remove("bulk-selected");
+    });
+    updateBulkBarState();
+  }
+
+  function exitBulkMode() {
+    bulkMode = false;
+    bulkSelected.clear();
+    document.body.classList.remove("bulk-mode");
+    setBulkToggle(false);
+    $("#sessionBulkBar").classList.add("hidden");
+    sessionList.querySelectorAll(".session-item").forEach(function (item) {
+      item.classList.remove("bulk-selected");
+    });
+    updateBulkBarState();
+  }
+
+  /** 批量分享：所选会话打包 zip 下载（复用后端 export_zip 接口）。 */
+  async function bulkShareSessions() {
+    const ids = selectedVisibleIds();
+    if (!ids.length) {
+      toast("请先选择要分享的会话");
+      return;
+    }
+    toast("正在打包 " + ids.length + " 个会话…");
+    try {
+      const result = await API.exportSessionsZip(ids);
+      const skippedNote = result.skipped && result.skipped.length
+        ? "，" + result.skipped.length + " 个不存在已跳过"
+        : "";
+      toast("已下载 " + result.name + skippedNote);
+    } catch (err) {
+      toast("分享失败：" + err.message);
+    } finally {
+      // 分享动作结束（成功/失败一致）后自动退出多选，回到普通浏览状态
+      exitBulkMode();
+    }
+  }
+
+  /** 批量删除：复用删除确认弹窗（标题动态显示数量）。 */
+  function openBulkDeleteModal() {
+    const ids = selectedVisibleIds();
+    if (!ids.length) {
+      toast("请先选择要删除的会话");
+      return;
+    }
+    const streaming = ids.filter(function (id) {
+      return state.activeStream && state.activeStream.sessionId === id;
+    });
+    if (streaming.length === ids.length) {
+      toast("生成中的会话请先停止后再删除");
+      return;
+    }
+    state.pendingBulkDelete = ids.filter(function (id) {
+      return !state.activeStream || state.activeStream.sessionId !== id;
+    });
+    if (!state.pendingBulkDelete.length) return;
+    if (streaming.length) toast("生成中的会话已跳过");
+    $("#deleteModalTitle").textContent = "删除 " + state.pendingBulkDelete.length + " 个会话？";
+    deleteModal.querySelector("p").textContent =
+      "删除后将无法恢复这些会话及其历史记录（含上传数据目录），确定继续吗？";
+    deleteModal.classList.remove("hidden");
+    deleteModal.setAttribute("aria-hidden", "false");
+  }
+
+  async function confirmBulkDelete() {
+    const ids = state.pendingBulkDelete;
+    deleteConfirm.disabled = true;
+    try {
+      const errors = [];
+      let removed = 0;
+      for (const id of ids) {
+        try {
+          await API.deleteSession(id);
+          delete state.sessionRecency[id];
+          const overrides = readTitleOverrides();
+          delete overrides[id];
+          localStorage.setItem(SESSION_TITLE_KEY, JSON.stringify(overrides));
+          const node = sessionList.querySelector('[data-session="' + CSS.escape(id) + '"]');
+          if (node) node.remove();
+          removed++;
+        } catch (err) {
+          errors.push(id + "：" + err.message);
+        }
+      }
+      // 恢复删除弹窗的默认文案（单会话删除共用该弹窗）
+      $("#deleteModalTitle").textContent = "删除会话？";
+      deleteModal.querySelector("p").textContent =
+        "删除后将无法恢复该会话及其历史记录，确定继续吗？";
+      state.pendingBulkDelete = null;
+      closeDeleteModal();
+      if (removed) toast("已删除 " + removed + " 个会话");
+      if (errors.length) toast(errors.length + " 个删除失败：" + errors[0]);
+      if (ids.includes(state.sessionId)) startNewChat();
+      await loadSessions();
+    } finally {
+      // 无论删除完成还是中途异常，都退出多选并恢复确认按钮
+      exitBulkMode();
+      deleteConfirm.disabled = false;
+    }
   }
 
   function closeSessionMenus() {
@@ -213,12 +389,23 @@
   }
 
   function closeDeleteModal() {
+    // 恢复弹窗默认文案（批量删除共用弹窗后，取消/确认都要还原标题与说明）
+    const titleNode = $("#deleteModalTitle");
+    if (titleNode) titleNode.textContent = "删除会话？";
+    const descNode = deleteModal.querySelector("p");
+    if (descNode) descNode.textContent = "删除后将无法恢复该会话及其历史记录，确定继续吗？";
+    state.pendingBulkDelete = null;
     state.pendingDelete = null;
     deleteModal.classList.add("hidden");
     deleteModal.setAttribute("aria-hidden", "true");
   }
 
   async function confirmDeleteSession() {
+    // 批量删除：pendingBulkDelete 非空时走批量流程（与单会话共用同一弹窗）
+    if (state.pendingBulkDelete) {
+      await confirmBulkDelete();
+      return;
+    }
     if (!state.pendingDelete) return;
     const pending = state.pendingDelete;
     deleteConfirm.disabled = true;
@@ -330,6 +517,20 @@
   $("#newChatBtn").addEventListener("click", startNewChat);
   $("#railNewChat").addEventListener("click", startNewChat);
 
+  // ---------- 多选工具条事件 ----------
+  const bulkModeBtn = $("#bulkModeBtn");
+  const bulkShareBtn = $("#bulkShareBtn");
+  const bulkDeleteBtn = $("#bulkDeleteBtn");
+  if (bulkModeBtn) {
+    // 同一按钮：未进入时→进入多选；进入后按钮文案为「取消多选」→退出
+    bulkModeBtn.addEventListener("click", function () {
+      if (bulkMode) exitBulkMode();
+      else enterBulkMode();
+    });
+  }
+  if (bulkShareBtn) bulkShareBtn.addEventListener("click", bulkShareSessions);
+  if (bulkDeleteBtn) bulkDeleteBtn.addEventListener("click", openBulkDeleteModal);
+
   async function openSession(id) {
     const seq = ++sessionOpenSeq;
     // 保存当前会话的输入草稿（文本+附件），再切换到目标会话
@@ -435,4 +636,9 @@
   App.startNewChat = startNewChat;
   App.openSession = openSession;
   App.restoreActiveStream = restoreActiveStream;
+  // 多选批量操作（分享 zip / 删除）
+  App.enterBulkMode = enterBulkMode;
+  App.exitBulkMode = exitBulkMode;
+  App.bulkShareSessions = bulkShareSessions;
+  App.openBulkDeleteModal = openBulkDeleteModal;
 })(window.App);

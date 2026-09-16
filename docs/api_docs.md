@@ -108,6 +108,9 @@
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
 | /chat_history/delete_lines | DELETE | startline(必填,≥1), endline(必填,≥1,包含), session_id | `{state, describe, meta_after, usage_after}`；行号**不含** `_meta` 首行；startline>endline 报 400 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
+| /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；详见下方「会话分享 / 导入」 |
+| /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
+| /chat_history/import_package | POST | 见下方说明 | 见下方说明 |
 
 > **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/session_files/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。目录原名 `history_files/upload/`（upload 改名为 session_files）。
 
@@ -121,6 +124,33 @@
   - 写入后重新计算 `user_questions` / `usage` / `record_count` / `completion_count`。
 - **同名冲突**：目标文件 `<session_id>_chat.jsonl` 已存在且 `overwrite=false`（默认）时，自动追加时间戳另存为 `<session_id>_<YYYYMMDD_HHMMSS>_chat.jsonl`，避免覆盖旧会话；`overwrite=true` 时强制覆盖。
 - **返回**: `{state, session_id(实际写入), filename(实际保存文件名), total_lines, imported_rounds, skipped_lines, record_count, completion_count, title, overwrite, collision(bool, 是否同名另存), meta}`
+
+### 会话分享 / 多会话导入（zip + jsonl，两阶段冲突确认）
+
+**分享打包 `GET /chat_history/export_zip?session_ids=a,b,c`**
+
+把一个或多个会话打包为 zip 下载，zip 内布局：
+
+```
+<session>_chat.jsonl              # 会话历史（与 history_files 根一致）
+session_files/<upload_id>/...     # 该会话在 session_files/ 下的全部上传数据（解析记录/media/files/file_diffs）
+manifest.json                     # {version, exported_at, sessions: [{session_id, filename, title, upload_id}]}
+```
+
+- 单会话下载名 `<session_id>_chat.zip`，多会话 `ytools_sessions_<时间戳>.zip`；
+- 不存在的会话列入响应头 `X-Skipped-Sessions`（URL 编码逗号分隔），全部不存在时报 400。
+
+**导入两阶段**（前端弹窗逐会话选择「覆盖 / 重命名另存 / 跳过」）：
+
+1. `POST /chat_history/import_preview`（Form: `file`，支持 .zip / .jsonl）——**预检不落盘**：
+   - 返回 `{type(zip|jsonl), filename, total, sessions[], conflicts[]}`；
+   - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count}`；`exists=true` 表示本地已有同名会话（即冲突，列入 `conflicts`）；
+   - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析（含路径穿越防护）。
+2. `POST /chat_history/import_package?conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（Form: `file`）——**提交导入**：
+   - 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`（ask 且无逐项决策时该会话跳过，绝不静默改名/覆盖）；
+   - 无冲突会话直接导入；zip 包同时落盘各会话的 `session_files/<upload_id>/` 数据；
+   - 冲突「重命名」：会话 ID 追加时间戳另存，上传数据目录归属同步改名为新会话 ID，并回写首行 `_meta.upload_id`；「覆盖」：清空旧 jsonl 与旧上传目录后写入；
+   - 返回 `{state, imported[], skipped[], failed[]}`，单会话失败不阻断其他会话。
 
 ## 3. 上下文 Context
 

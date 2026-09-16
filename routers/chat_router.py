@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 from typing import Any, Optional, List
+import urllib.parse
 # fastapi 库导入
 from fastapi import APIRouter, Query, HTTPException, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -45,6 +47,10 @@ from memory.chat_memory import (
     chat_memory_file_exists,
     resolve_session_work_dir,
     resolve_session_model_selection,
+    export_sessions_to_zip,
+    list_zip_sessions,
+    import_sessions_from_zip,
+    IMPORT_PACKAGE_MAX_BYTES,
 )
 from memory.file_memory import cleanup_file_memory_manager
 from routers.chat_config_router import get_chat_work_dir_config
@@ -395,6 +401,205 @@ async def upload_chat_history_file(
         "collision": import_result.get("collision", False),
         "meta": import_result.get("meta"),
     })
+
+
+# ---------- 会话分享 / 多会话导入（zip / jsonl，两阶段冲突确认） ----------
+# 导入文件大小上限：zip 包含媒体原字节，放宽到 512MB；单 jsonl 沿用 20MB
+def _import_file_size_limit(filename: str) -> int:
+    return IMPORT_PACKAGE_MAX_BYTES if filename.lower().endswith(".zip") else _UPLOAD_CHAT_FILE_MAX_BYTES
+
+
+def _read_upload_bytes(file: UploadFile, max_bytes: int, label: str) -> bytes:
+    """读取上传文件字节流并校验非空/大小上限。"""
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail=f"请提供有效的{label}")
+    try:
+        raw_bytes = file.file.read() if getattr(file, "file", None) is not None else asyncio.get_event_loop().run_until_complete(file.read())
+    except Exception as read_error:
+        raise HTTPException(status_code=400, detail=f"读取上传文件失败: {read_error}")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail=f"上传的{label}为空")
+    if len(raw_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件大小超过限制（最大 {max_bytes // (1024 * 1024)}MB）",
+        )
+    return raw_bytes
+
+
+@api_chat_router.get('/chat_history/export_zip')
+async def export_chat_sessions_zip(
+    session_ids: str = Query(
+        ...,
+        description="要分享的会话 ID 列表，逗号分隔（单会话即为 zip 分享；至少 1 个，最多 100 个）",
+    ),
+):
+    """
+    把一个或多个会话打包为 zip 下载：每个会话一个 `<session>_chat.jsonl` +
+    该会话在 session_files/ 下的全部上传数据 + manifest.json 清单。
+
+    单会话下载名为 `<session_id>_chat.zip`，多会话为 `ytools_sessions_<时间戳>.zip`。
+    """
+    ids = [sid.strip() for sid in (session_ids or "").split(",") if sid.strip()]
+    try:
+        zip_bytes, download_name, skipped = export_sessions_to_zip(ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"打包会话失败: {exc}")
+    quoted = urllib.parse.quote(download_name)
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "X-Skipped-Sessions": urllib.parse.quote(",".join(skipped)),
+    }
+    return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+
+class ImportPreviewResponse(BaseModel):
+    type: str  # zip / jsonl
+    sessions: List[dict[str, Any]]
+    conflicts: List[str]  # 与本地已有会话同名的 session_id 列表
+
+
+@api_chat_router.post('/chat_history/import_preview')
+async def preview_chat_import(
+    file: UploadFile = File(..., description="要导入的分享包（zip 或 jsonl）"),
+):
+    """
+    导入预检（不落盘）：解析 zip/jsonl 并返回会话清单与本地冲突信息。
+
+    - zip：逐会话返回 {session_id, title, imported_rounds, exists, media_count}；
+    - jsonl：按单会话解析（与 upload_chat_file 同一解析器），exists 标记本地同名会话。
+    前端据 conflicts 弹出「覆盖 / 重命名」决策弹窗后调用 import_package 提交。
+    """
+    filename = (file.filename or "").strip()
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        raw_bytes = _read_upload_bytes(file, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
+        try:
+            preview = list_zip_sessions(raw_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        sessions = preview.get("sessions") or []
+    elif lower.endswith(".jsonl"):
+        raw_bytes = _read_upload_bytes(file, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
+        from memory.chat_memory import _parse_jsonl_payload, _get_chat_history_file, _safe_session_id
+
+        try:
+            base_meta, round_entries, total_lines, skipped_lines = _parse_jsonl_payload(raw_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        base_id = normalize_session_id(filename)
+        exists = _get_chat_history_file(base_id).exists()
+        upload_dir_name = ""
+        if isinstance(base_meta, dict) and isinstance(base_meta.get("upload_id"), str):
+            upload_dir_name = _safe_session_id(base_meta["upload_id"])
+        sessions = [{
+            "session_id": base_id,
+            "filename": f"{base_id}_chat.jsonl",
+            "title": (base_meta or {}).get("title") or base_id,
+            "imported_rounds": len(round_entries),
+            "skipped_lines": skipped_lines,
+            "total_lines": total_lines,
+            "exists": exists,
+            "upload_dir_name": upload_dir_name,
+            "media_count": 0,
+        }]
+    else:
+        raise HTTPException(status_code=400, detail="仅支持 .zip 分享包或 .jsonl 历史文件")
+    conflicts = [s["session_id"] for s in sessions if s.get("exists")]
+    return JSONResponse(content={
+        "type": "zip" if lower.endswith(".zip") else "jsonl",
+        "filename": filename,
+        "total": len(sessions),
+        "sessions": sessions,
+        "conflicts": conflicts,
+    })
+
+
+class ImportSubmitRequest(BaseModel):
+    """导入提交：随包附带的逐会话冲突决策。"""
+    conflict_strategy: str = "ask"
+    decisions: dict[str, str] = {}
+
+
+@api_chat_router.post('/chat_history/import_package')
+async def import_chat_package(
+    file: UploadFile = File(..., description="要导入的分享包（zip 或 jsonl）"),
+    conflict_strategy: str = Query(
+        "ask",
+        description="全局冲突策略：ask（默认，按 decisions 逐会话决策）/ overwrite / rename / skip",
+    ),
+    decisions: str = Query(
+        "",
+        description='逐会话决策 JSON：{"<session_id>": "overwrite|rename|skip"}',
+    ),
+):
+    """
+    提交导入（第二阶段）：按预检时用户选择的冲突策略写入会话。
+
+    - zip 包：逐会话导入 jsonl + session_files 数据目录（冲突另存时同步改名
+      上传目录归属并回写 _meta.upload_id）；
+    - jsonl：单会话导入，冲突策略与 zip 相同（overwrite 覆盖 / rename 另存）。
+    返回 {state, imported, skipped, failed} 汇总。
+    """
+    filename = (file.filename or "").strip()
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        raw_bytes = _read_upload_bytes(file, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
+        try:
+            decisions_map = json.loads(decisions) if (decisions or "").strip() else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"decisions 参数不是合法 JSON: {exc}")
+        if not isinstance(decisions_map, dict):
+            raise HTTPException(status_code=400, detail="decisions 参数必须是对象")
+        try:
+            result = await import_sessions_from_zip(
+                raw_bytes,
+                conflict_strategy=conflict_strategy,
+                decisions=decisions_map,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(content=result)
+    if lower.endswith(".jsonl"):
+        raw_bytes = _read_upload_bytes(file, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
+        base_id = normalize_session_id(filename)
+        strategy = (conflict_strategy or "ask").strip().lower()
+        decision_map: dict[str, str] = {}
+        try:
+            parsed_decisions = json.loads(decisions) if (decisions or "").strip() else {}
+            if isinstance(parsed_decisions, dict):
+                decision_map = {str(k): str(v).strip().lower() for k, v in parsed_decisions.items()}
+        except json.JSONDecodeError:
+            decision_map = {}
+        decision = decision_map.get(base_id) or (strategy if strategy != "ask" else "rename")
+        # jsonl 单会话导入：复用管理器导入逻辑（与 upload_chat_file 相同，但由决策驱动）
+        from memory.chat_memory import _import_jsonl_payload
+
+        if decision == "skip":
+            return JSONResponse(content={
+                "state": "succeed",
+                "imported": [],
+                "skipped": [{"session_id": base_id, "reason": "conflict_skip"}],
+                "failed": [],
+            })
+        if decision not in {"overwrite", "rename"}:
+            raise HTTPException(status_code=400, detail=f"未知的冲突决策: {decision}")
+        try:
+            import_result = _import_jsonl_payload(base_id, raw_bytes, overwrite=(decision == "overwrite"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"解析 jsonl 失败: {exc}")
+        await cleanup_chat_memory_manager(str(import_result.get("session_id") or base_id))
+        return JSONResponse(content={
+            "state": "succeed",
+            "imported": [import_result],
+            "skipped": [],
+            "failed": [],
+        })
+    raise HTTPException(status_code=400, detail="仅支持 .zip 分享包或 .jsonl 历史文件")
 
 
 @api_chat_router.get('/chat_context/token_stats')

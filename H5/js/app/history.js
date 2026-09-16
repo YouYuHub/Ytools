@@ -7,10 +7,12 @@
 (function (App) {
   "use strict";
   const {
-    state, toast, $, setEmpty,
+    state, toast, $, el, setEmpty,
     scrollToBottom, closeMenus, docKindOf, MAX_DOC_FILE_SIZE,
     historyFileInput, fileInput, sessionActionsBtn, sessionActionsMenu,
-    shareSessionItem, compactSessionItem, chatInner
+    shareSessionItem, compactSessionItem, chatInner,
+    importConflictModal, importConflictList, importConflictHint,
+    importConflictSummary, importConflictSubmit
   } = App;
 
   // ---------- 分享 / 加载 / 压缩会话 ----------
@@ -89,6 +91,171 @@
     App.startManualCompaction();
   });
 
+  // ---------- 导入（zip / jsonl 两阶段：预检 → 冲突决策 → 提交） ----------
+  // 待导入上下文：预检结果缓存（提交时按需重传文件）
+  let pendingImport = null;
+
+  /**
+   * 入口分流：.jsonl 走单会话两阶段导入；.zip 走多会话两阶段导入。
+   * 本地解析兜底（后端不可用/无记录）保持原有 previewLocalHistory 行为。
+   */
+  async function handleHistoryFile(file) {
+    const name = (file.name || "").toLowerCase();
+    if (name.endsWith(".zip")) {
+      await importPackageFlow(file);
+      return;
+    }
+    try {
+      const text = await file.text();
+      const parsed = HistoryParser.parseHistory(text);
+      if (!parsed.records.length) {
+        toast("未找到可显示的会话记录");
+        return;
+      }
+      // 会话标识以文件名为准：先本地校验内容，再走两阶段导入持久化
+      const baseId = SessionUtils.sanitizeSessionId(file.name);
+      const localId = baseId !== "default" ? baseId : ("imported-" + Date.now().toString(36));
+      let preview;
+      try {
+        preview = await API.previewImport(file);
+      } catch (previewErr) {
+        // 后端不可用时退回本地预览
+        previewLocalHistory(text, parsed, localId, "后端不可用，已本地预览：" + previewErr.message);
+        return;
+      }
+      if (!preview.sessions.length || preview.sessions[0].imported_rounds === 0) {
+        previewLocalHistory(text, parsed, localId, "文件中没有可导入的会话记录，已本地预览");
+        return;
+      }
+      openImportConflict(preview, file);
+    } catch (err) {
+      toast("加载失败：" + err.message);
+    }
+  }
+
+  /**
+   * 打开冲突决策弹窗（无冲突的会话默认「导入」，冲突的默认「重命名」）。
+   * 用户逐项选择后确认提交（import_package 第二阶段）。
+   */
+  function openImportConflict(preview, file) {
+    const conflicts = preview.conflicts || [];
+    pendingImport = { preview: preview, file: file };
+    importConflictList.innerHTML = "";
+    if (preview.type === "jsonl") {
+      importConflictHint.textContent = "该会话与本地已有会话同名，请选择处理方式：";
+    } else {
+      importConflictHint.textContent = "包内 " + preview.total + " 个会话"
+        + (conflicts.length ? "，其中 " + conflicts.length + " 个与本地同名：" : "，均可直接导入：");
+    }
+    preview.sessions.forEach(function (s) {
+      const isConflict = s.exists;
+      const row = document.createElement("div");
+      row.className = "import-conflict-item" + (isConflict ? " conflict" : "");
+      row.dataset.sessionId = s.session_id;
+      const main = document.createElement("div");
+      main.className = "ic-main";
+      const title = document.createElement("span");
+      title.className = "ic-title";
+      title.textContent = s.title || s.session_id;
+      title.title = s.session_id;
+      const info = document.createElement("span");
+      info.className = "ic-info";
+      const bits = [];
+      if (s.imported_rounds != null) bits.push(s.imported_rounds + " 轮");
+      if (s.media_count) bits.push(s.media_count + " 个媒体文件");
+      if (isConflict) bits.push("本地已存在同名会话");
+      info.textContent = bits.join(" · ") || (isConflict ? "本地已存在同名会话" : "新会话");
+      main.appendChild(title);
+      main.appendChild(info);
+      row.appendChild(main);
+      if (isConflict) {
+        const choice = document.createElement("select");
+        choice.className = "ic-choice";
+        choice.dataset.sessionId = s.session_id;
+        [
+          ["rename", "重命名另存"],
+          ["overwrite", "覆盖本地会话"],
+          ["skip", "跳过该会话"],
+        ].forEach(function (pair) {
+          const opt = document.createElement("option");
+          opt.value = pair[0];
+          opt.textContent = pair[1];
+          choice.appendChild(opt);
+        });
+        row.appendChild(choice);
+      } else {
+        row.appendChild(el("span", "ic-new-tag", "新会话"));
+      }
+      importConflictList.appendChild(row);
+    });
+    importConflictSummary.textContent = conflicts.length
+      ? "冲突 " + conflicts.length + " 个"
+      : "共 " + preview.total + " 个会话";
+    importConflictModal.classList.remove("hidden");
+    importConflictModal.setAttribute("aria-hidden", "false");
+  }
+
+  /** 收集弹窗中的逐会话决策并提交导入。 */
+  async function confirmImport() {
+    if (!pendingImport) return;
+    const ctx = pendingImport;
+    importConflictSubmit.disabled = true;
+    const decisions = {};
+    importConflictList.querySelectorAll("select.ic-choice").forEach(function (sel) {
+      decisions[sel.dataset.sessionId] = sel.value;
+    });
+    try {
+      const result = await API.submitImport(ctx.file, "ask", decisions);
+      closeImportConflictFn();
+      const importedList = result.imported || [];
+      const skippedList = result.skipped || [];
+      const failedList = result.failed || [];
+      const failedMsg = failedList.length
+        ? "，失败 " + failedList.length + " 个（" + (failedList[0].session_id || "") + "…）"
+        : "";
+      if (!importedList.length) {
+        toast("没有导入任何会话（冲突已跳过" + failedMsg + "）");
+        return;
+      }
+      await App.loadSessions();
+      // 打开最后一个导入成功的会话（多选导入时通常就是最新项）
+      const last = importedList[importedList.length - 1];
+      await App.openSession(SessionUtils.sanitizeSessionId(last.session_id));
+      const collisionCount = importedList.filter(function (r) { return r.collision; }).length;
+      let msg = "已导入 " + importedList.length + " 个会话";
+      if (collisionCount) msg += "（" + collisionCount + " 个重名已另存）";
+      if (skippedList.length) msg += "，跳过 " + skippedList.length + " 个";
+      toast(msg + failedMsg);
+    } catch (err) {
+      toast("导入失败：" + err.message);
+    } finally {
+      importConflictSubmit.disabled = false;
+    }
+  }
+
+  /** zip 分享包导入流程：预检 → （有冲突时）决策弹窗 → 提交。 */
+  async function importPackageFlow(file) {
+    let preview;
+    try {
+      preview = await API.previewImport(file);
+    } catch (err) {
+      toast("读取分享包失败：" + err.message);
+      return;
+    }
+    if (!preview.total) {
+      toast("分享包中没有可导入的会话");
+      return;
+    }
+    openImportConflict(preview, file);
+  }
+
+  function closeImportConflictFn() {
+    importConflictModal.classList.add("hidden");
+    importConflictModal.setAttribute("aria-hidden", "true");
+    importConflictList.innerHTML = "";
+    pendingImport = null;
+  }
+
   // 本地预览 jsonl（后端不可用 / 无合法轮次时兜底）
   function previewLocalHistory(text, parsed, sessionId, toastMsg) {
     App.resetContextTokenStats();
@@ -106,37 +273,29 @@
   }
 
   historyFileInput.addEventListener("change", async function () {
-    const file = historyFileInput.files && historyFileInput.files[0];
+    // 支持一次选择多个文件（批量 zip 分享包 / 多个 jsonl），逐个走导入流程
+    const files = Array.from(historyFileInput.files || []);
     historyFileInput.value = "";
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const parsed = HistoryParser.parseHistory(text);
-      if (!parsed.records.length) {
-        toast("未找到可显示的会话记录");
-        return;
-      }
-      // 会话标识以文件名为准：先本地校验内容，再上传到后端持久化
-      const baseId = SessionUtils.sanitizeSessionId(file.name);
-      const localId = baseId !== "default" ? baseId : ("imported-" + Date.now().toString(36));
-      try {
-        const res = await API.uploadChatHistory(baseId, file, false);
-        if (!res || res.imported_rounds === 0) {
-          previewLocalHistory(text, parsed, localId, "文件中没有可导入的会话记录，已本地预览");
-          return;
-        }
-        const actualId = SessionUtils.sanitizeSessionId(res.session_id || baseId);
-        await App.loadSessions();
-        await App.openSession(actualId);
-        toast(res.collision ? "会话已导入（与已有会话重名，已另存新文件）" : "会话已导入");
-      } catch (uploadErr) {
-        // 后端不可用时退回本地预览
-        previewLocalHistory(text, parsed, localId, "上传失败，已本地预览：" + uploadErr.message);
-      }
-    } catch (err) {
-      toast("加载失败：" + err.message);
+    if (!files.length) return;
+    if (files.length === 1) {
+      await handleHistoryFile(files[0]);
+      return;
     }
+    toast("正在导入 " + files.length + " 个文件…");
+    let okCount = 0;
+    let failCount = 0;
+    for (const f of files) {
+      try {
+        await handleHistoryFile(f);
+        okCount++;
+      } catch (_) {
+        failCount++;
+      }
+    }
+    if (failCount) toast("批量导入完成：成功 " + okCount + " 个，失败 " + failCount + " 个");
   });
+
+  importConflictSubmit.addEventListener("click", function () { confirmImport(); });
 
   fileInput.addEventListener("change", async function () {
     let files = Array.from(fileInput.files || []);
@@ -202,4 +361,6 @@
   App.updateExportButton = updateExportButton;
   App.downloadSession = downloadSession;
   App.loadSessionFiles = loadSessionFiles;
+  // 导入冲突弹窗的关闭入口（core.js 的 Esc / 背景点击经此调用）
+  App.closeImportConflict = closeImportConflictFn;
 })(window.App);
