@@ -555,11 +555,17 @@
     setEmpty(false);
     App.refreshComposerButtons();
 
-    // 上传媒体附件（输入框路径用 state.pendingMedia 的 file；flush 路径同构）
+    // 上传媒体附件（输入框路径用 state.pendingMedia 的 file；flush 路径同构；
+    // 编辑重发路径的元素已带 media_ref/stored_name 无 file —— 直接复用原引用，不重新上传）
     const uploadedMedia = [];
-    if (pendingMedia.length) {
+    const needUploadMedia = [];
+    pendingMedia.forEach(function (m) {
+      if (m && m.file) needUploadMedia.push(m);
+      else if (m && m.media_ref) uploadedMedia.push(m);
+    });
+    if (needUploadMedia.length) {
       try {
-        const files = pendingMedia.map(function (m) { return m.file; });
+        const files = needUploadMedia.map(function (m) { return m.file; });
         const results = await uploadMediaFiles(streamSessionId, files);
         results.forEach(function (result) { uploadedMedia.push(result); });
       } catch (err) {
@@ -587,7 +593,9 @@
 
     const userNode = App.appendUserMessage(userContent, null, streamSessionId, state.sessionDocs);
     App.upsertLocalSession(streamSessionId, { userText: text || (uploadedMedia.length ? "[图片/附件]" : text) });
-    App.rebuildQnav();
+    // 问题导航重建已移到下方 DOM 手术（原地重发删旧轮+原位插入）之后：
+    // 若在手术前重建，旧第 N 轮节点仍在（旧文本占第 N 位），新气泡又临时
+    // 挂在末尾（新文本占第 total+1 位），导航面板会出现新旧两条重复条目
     if (fromInput) {
       App.clearPendingMedia();
       input.value = "";
@@ -600,9 +608,104 @@
 
     // 本轮回复容器：思考/回答/工具按到达顺序分块
     const msg = el("div", "msg");
-    chatInner.appendChild(msg);
-    scrollToBottom();
-    const activeStream = {
+    // insertedMidway：原地重发/插入重答把新节点放在会话中部（非末尾追加）时为真，
+    // 用于滚动分叉（停在发起位置而非贴底）；
+    // liveRound：本轮在历史中的最终轮次号（重发=第 N 轮，插入=第 N+1 轮），
+    // 流式节点补打 data-round 用；普通发送为 null（收尾重载后随历史回放打标）
+    let insertedMidway = false;
+    const liveRound = direct && direct.targetRound != null ? direct.targetRound
+      : direct && direct.insertAfterRound != null ? direct.insertAfterRound + 1
+      : null;
+    // 编辑重发（重新生成该轮）：屏幕锚点插入——删除旧第 N 轮的屏幕节点，
+    // 新回复插入其原位（第 N+1 轮首节点之前），保持与历史结构一致；
+    // ask_user 卡片再答（insertAfterRound）：新回复插入第 N+1 轮首节点之前
+    // （即原第 N 轮之后），后续轮次节点整体后推——与后端插入收尾一一对应；
+    // 普通发送直接追加末尾
+    if (direct && direct.targetRound) {
+      const oldRound = String(direct.targetRound);
+      const firstNext = chatInner.querySelector('[data-round="' + (direct.targetRound + 1) + '"]');
+      let removed = false;
+      let sweepDone = false;
+      // 旧轮节点可能被中间压缩等无 data-round 的节点分隔，统一遍历删除；
+      // 命中下一轮已标记节点即停止——旧轮区间之后的无标记节点（后续轮次的
+      // 时间分隔条等）不属于旧轮，不能清
+      Array.from(chatInner.childNodes).forEach(function (node) {
+        if (node.nodeType !== 1) return;
+        if (node.getAttribute("data-round") === oldRound) {
+          node.remove();
+          removed = true;
+          return;
+        }
+        if (!removed || sweepDone) return;
+        if (node.getAttribute("data-round")) {
+          sweepDone = true;
+          return;
+        }
+        // 旧轮区间内的时间戳等无标记节点一并清掉（停止于旧轮边界）
+        if (node.classList && (node.classList.contains("msg-time") || node.classList.contains("round-usage"))) {
+          node.remove();
+        }
+      });
+      if (firstNext && firstNext.parentNode === chatInner) {
+        chatInner.insertBefore(userNode, firstNext);
+        chatInner.insertBefore(msg, firstNext);
+        insertedMidway = true;
+      } else {
+        // 找不到下一轮锚点（编辑的是最后一轮）：直接追加
+        chatInner.appendChild(userNode);
+        chatInner.appendChild(msg);
+      }
+    } else if (direct && direct.insertAfterRound) {
+      // 回答轮插入：锚点为旧编号第 N+1 轮首节点（其后所有轮次在屏幕上自然后推）。
+      // 先取锚点引用再重编号：后端插入语义会把后续轮次编号整体 +1，屏幕节点
+      // data-round 同步重编，否则新节点补打 data-round=N+1 后与旧编号碰撞
+      // （编辑/删除按编号定位会错轮）
+      const firstNext = chatInner.querySelector('[data-round="' + (direct.insertAfterRound + 1) + '"]');
+      Array.from(chatInner.querySelectorAll("[data-round]")).forEach(function (node) {
+        const r = parseInt(node.getAttribute("data-round"), 10);
+        if (r >= direct.insertAfterRound + 1) {
+          node.setAttribute("data-round", String(r + 1));
+          if (node._editData) node._editData.round = r + 1;
+        }
+      });
+      if (firstNext && firstNext.parentNode === chatInner) {
+        chatInner.insertBefore(userNode, firstNext);
+        chatInner.insertBefore(msg, firstNext);
+        insertedMidway = true;
+      } else {
+        chatInner.appendChild(userNode);
+        chatInner.appendChild(msg);
+      }
+    } else {
+      chatInner.appendChild(userNode);
+      chatInner.appendChild(msg);
+    }
+    // 原地重发/插入重答：新节点已在会话中部就位，补上历史节点才有的
+    // data-round 标记与编辑数据——否则本轮没有编辑/复制入口，且后续再次
+    // 编辑本轮时删除循环匹配不到旧回复节点。必须在手术完成后打标：
+    // 新 userNode 若先带上 data-round=N，会被上面的删除循环误删
+    if (liveRound != null) {
+      userNode.dataset.round = String(liveRound);
+      userNode._editData = { content: userContent, round: liveRound };
+      App.attachUserEditAction(userNode);
+      msg.dataset.round = String(liveRound);
+    }
+    // 原地重发/插入重答时视口停留在发起位置：对齐新提问气泡到视口顶部
+    // （瞬跳，覆盖 smooth 滚动动画），不滚到底部——底部往往是更靠后的
+    // 旧轮次；末尾追加语义（普通发送/编辑最后一轮）保持贴底跟随生成
+    if (insertedMidway) {
+      const prevBehavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      const delta = userNode.getBoundingClientRect().top - chatScroll.getBoundingClientRect().top;
+      chatScroll.scrollTop += delta;
+      chatScroll.style.scrollBehavior = prevBehavior;
+      // 向下跳转不触发用户上滚暂停机制，显式暂停自动贴底：
+      // 流式期间视口不被 delta 高频贴底拉回，用户滚回底部可自动恢复跟随
+      App.pauseAutoScroll();
+    } else {
+      scrollToBottom();
+    }
+    App.rebuildQnav();    const activeStream = {
       sessionId: streamSessionId,
       userText: text,
       userNode: userNode,
@@ -618,6 +721,15 @@
       messages: [{ role: "user", content: userContent }],
       session_id: streamSessionId,
     };
+    // 编辑重发「重新生成该轮」：携带 target_round，后端把本轮回复原地替换
+    // 历史第 N 轮（上下文截到第 N-1 轮）；ask_user 卡片再答携带 insert_round，
+    // 后端把回答轮插入历史第 N 轮之后（上下文截到第 N 轮）；普通发送不带
+    // 该字段走追加语义
+    if (direct && direct.targetRound) {
+      payload.target_round = direct.targetRound;
+    } else if (direct && direct.insertAfterRound) {
+      payload.insert_round = direct.insertAfterRound;
+    }
     // 内置工具（todo_write/ask_user）并入 selectedTools，与 MCP 工具一起随 tool_names 上送，
     // 后端按名称识别注入；未选择任何工具时不携带该字段，由后端回退会话/全局默认选择
     if (state.selectedTools.size > 0) {
@@ -632,9 +744,14 @@
     // 生成参数（temperature/top_p/presence_penalty/reasoning_effort/extra_body 等）
     // 不显式传递，由服务端按 model_selection.chat_model.parameter 填充（面板“参数”设置）
 
+    // 原地重发/插入重答的屏幕状态（删旧轮/重编号/打标）发生在发送瞬间，
+    // 而后端替换/插入收尾发生在流结束——失败/中止/空回复时屏幕与落盘可能失配，
+    // 收尾后强制重载会话恢复真实状态；成功路径不重载，保持视口停在发起位置
+    let streamFailed = false;
     try {
       await API.chatStream(payload, pipe.handle, state.abort.signal);
     } catch (err) {
+      streamFailed = true;
       if (err.name !== "AbortError") {
         msg.appendChild(el("div", "notice-bar", "请求失败：" + err.message));
       }
@@ -661,6 +778,11 @@
       App.refreshComposerButtons();
       refreshSessionTitle(streamSessionId);
       if (shouldReloadVisibleSession) {
+        setTimeout(function () { App.openSession(streamSessionId); }, 0);
+      } else if (liveRound != null && (streamFailed || fin.empty)) {
+        // 原地重发/插入重答失败（网络中断/停止/空回复等）：屏幕手术已做过但
+        // 后端可能未收尾提交，重载会话与 JSONL 对齐；流式期间禁止编辑的
+        // 守卫在重载后自然解除
         setTimeout(function () { App.openSession(streamSessionId); }, 0);
       }
       // 流结束（含 [DONE]/出错/停止）：后端已收尾当前轮，刷新一次统计。
@@ -845,7 +967,124 @@
   }
 
 
+  // ---------- 用户消息编辑重发编排（编辑 UI 在 messages.js） ----------
+  /**
+   * 编辑重发总编排：按模式执行删除/预演确认 → 重载会话 → 发送。
+   * @param {{msg: HTMLElement, round: number, text: string, media: Array, mode: string}} plan
+   *   mode: "regen"=重新生成该轮（原地替换，保留后续轮次）；
+   *         "truncate"=删除该轮及之后（GPT 语义）
+   */
+  async function confirmEditResend(plan) {
+    const sessionId = state.sessionId;
+    if (!sessionId || !plan || !plan.round) return;
+    // 复用附件：编辑重发不重新上传，删除清理时后端按 keep_media_refs 排除
+    const keptRefs = (plan.media || [])
+      .map(function (m) { return m.stored_name || ""; })
+      .filter(Boolean);
+
+    const doSend = function (targetRound) {
+      App.exitUserMessageEdit(plan.msg);
+      App.send({
+        text: plan.text,
+        media: plan.media,
+        targetRound: targetRound,
+      });
+    };
+
+    const reloadAndSend = async function (mode, targetRound, keepRefs) {
+      try {
+        await API.deleteRounds(sessionId, plan.round, {
+          mode: mode,
+          deleteFiles: true,
+          keepMediaRefs: keepRefs,
+        });
+      } catch (err) {
+        App.toast("删除轮次失败：" + err.message);
+        return;
+      }
+      // 删除成功：强制整段重放（data-round 随新解析自动刷新），然后发送。
+      // 删除接口要求会话非运行中；仅复位本会话的本地流式态（不影响其他会话后台流监听）
+      if (state.streamingSession === sessionId) {
+        state.streaming = false;
+        state.streamingSession = null;
+      }
+      await App.openSession(sessionId);
+      doSend(targetRound);
+    };
+
+    if (plan.mode === "regen") {
+      // 重新生成该轮：不预删！直接带 target_round 发送，后端轮次收尾时把
+      // 新回复整轮替换到历史第 N 轮位置（替换即删旧插新）。
+      // 若先删后发，后续轮次会前移导致 target_round 与删后编号错位，
+      // 新回复会错误替换到原第 N+1 轮的位置。
+      // 旧轮的孤儿附件留在盘上（无引用、占位极小），可经消息媒体删除功能清理。
+      doSend(plan.round);
+      return;
+    }
+    // 删除该轮及之后：破坏面较大（含后续轮次与其附件），先预演展示明细
+    let planned;
+    try {
+      planned = await API.deleteRounds(sessionId, plan.round, {
+        mode: "truncate",
+        deleteFiles: true,
+        dryRun: true,
+      });
+    } catch (err) {
+      App.toast("删除预演失败：" + err.message);
+      return;
+    }
+    // ask_user 卡片再答等无编辑面板的调用方（plan.msg 为 null）：降级用
+    // 原生 confirm 展示预演明细（ dry_run 已执行，确认后直接发送）
+    const plansArea = plan.msg ? plan.msg.querySelector(".msg-edit-plans") : null;
+    if (!plansArea) {
+      const summary = planned.planned_rounds || [];
+      const mediaFiles = (planned.planned_files && planned.planned_files.media_files) || [];
+      const docFiles = (planned.planned_files && planned.planned_files.doc_files) || [];
+      const lines = ["将删除 " + summary.length + " 个轮次"];
+      if (summary.length && summary[0].round) lines.push("（第 " + summary[0].round + " 轮起）");
+      if (mediaFiles.length) lines.push("、" + mediaFiles.length + " 个附件文件");
+      if (docFiles.length) lines.push("、" + docFiles.length + " 个上传文档");
+      if (window.confirm(lines.join("") + "。确认删除并发送？")) {
+        doSend(null);
+      }
+      return;
+    }
+    plansArea.innerHTML = "";
+    const box = el("div", "msg-edit-confirm");
+    const summary = planned.planned_rounds || [];
+    const mediaFiles = (planned.planned_files && planned.planned_files.media_files) || [];
+    const docFiles = (planned.planned_files && planned.planned_files.doc_files) || [];
+    const lines = [];
+    lines.push("将删除 " + summary.length + " 个轮次"
+      + (summary.length && summary[0].round ? "（第 " + summary[0].round + " 轮起）" : "")
+      + "。");
+    if (mediaFiles.length) lines.push("将删除 " + mediaFiles.length + " 个附件文件。");
+    if (docFiles.length) lines.push("将删除 " + docFiles.length + " 个上传文档。");
+    const desc = el("div", "msg-edit-confirm-desc", lines.join(" "));
+    box.appendChild(desc);
+    const actions = el("div", "msg-edit-confirm-actions");
+    const cancelBtn = el("button", "msg-edit-cancel", "取消");
+    const confirmBtn = el("button", "msg-edit-send", "确认删除并发送");
+    cancelBtn.type = "button";
+    confirmBtn.type = "button";
+    cancelBtn.addEventListener("click", function () {
+      // 复位面板确认条状态（showPlanConfirm 与预演条共用 plans 区域）
+      const panel = plan.msg.querySelector(".msg-edit-panel");
+      if (panel) panel._confirmShown = false;
+      plansArea.innerHTML = "";
+    });
+    confirmBtn.addEventListener("click", async function () {
+      confirmBtn.disabled = true;
+      await reloadAndSend("truncate", null, keptRefs);
+    });
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    box.appendChild(actions);
+    plansArea.appendChild(box);
+  }
+
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.send = send;
+  App.confirmEditResend = confirmEditResend;
   App.maybeAttachRunningStream = maybeAttachRunningStream;
 })(window.App);

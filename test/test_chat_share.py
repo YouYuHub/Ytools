@@ -91,11 +91,16 @@ class SessionShareTests(unittest.TestCase):
                 except OSError:
                     pass
             pending = chat_file.with_name(chat_file.name + ".pending")
-            if pending.exists():
-                try:
-                    pending.unlink()
-                except OSError:
-                    pass
+            # 侧车统一在 sidecars/ 子目录（旧版同目录位置也清理，防历史残留）
+            for pending in (
+                chat_file.with_name(chat_file.name + ".pending"),
+                chat_file.parent / "sidecars" / (chat_file.name + ".pending"),
+            ):
+                if pending.exists():
+                    try:
+                        pending.unlink()
+                    except OSError:
+                        pass
             for base in (fm.HISTORY_ROOT,):
                 data_dir = base / cm._safe_session_id(sid)
                 if data_dir.is_dir():

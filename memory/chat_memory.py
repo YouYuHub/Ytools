@@ -30,7 +30,7 @@ from memory.chat_round_store import (
     parse_round_entry,
 )
 from util.file_lock import cross_process_lock
-from util.timestamp_utils import now_str
+from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str
 from config import (
     DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
@@ -48,8 +48,39 @@ HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "session_files"
 
 # 跨进程写锁文件的统一存放目录：避免 *.lock 散落在历史文件根目录
-# （与 <session>_chat.jsonl、<session>_chat.jsonl.pending 混在一起）
+# （会话附属侧车 .todo/.pending/.bak/.tmp 同样集中在 sidecars/ 子目录）
 LOCK_ROOT = HISTORY_ROOT / "lock"
+
+# 会话附属侧车文件（进行中轮次检查点 .pending、任务计划 .todo、写前备份
+# .bak、原子写临时文件 .tmp）的统一存放目录：历史根目录只保留 *.jsonl
+# 正文件。惰性求值（每次实时读 HISTORY_ROOT）：测试会把 HISTORY_ROOT
+# 指向临时目录，模块级常量快照会绕过该替换
+def _sidecar_dir() -> Path:
+    root = HISTORY_ROOT / "sidecars"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _migrate_legacy_sidecar_files() -> None:
+    """把旧版散落在 history_files 根目录的会话侧车文件迁移到 sidecars/ 子目录。
+
+    覆盖 <session>_chat.jsonl.todo / .pending / .bak / .tmp（与 lock/ 迁移
+    同款策略）。个别文件正被其他进程持有时 Windows 会拒绝移动，静默跳过
+    留待下次启动再迁；迁移后旧路径不再被读取（重启部署后所有进程统一新路径）。
+    """
+    try:
+        for legacy in HISTORY_ROOT.glob("*_chat.jsonl.*"):
+            if not legacy.is_file():
+                continue
+            try:
+                legacy.replace(_sidecar_dir() / legacy.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+_migrate_legacy_sidecar_files()
 
 
 def _migrate_legacy_lock_files() -> None:
@@ -531,8 +562,10 @@ def _read_meta_first_line(file_path: Path) -> dict[str, Any] | None:
 
 # 原子写重试退避序列（秒）：Windows 上刚写入的文件可能被搜索索引、杀软或
 # 其他进程短暂占用（open / os.replace 偶发 WinError 5），指数退避把重试窗口
-# 拉长到约 2.6s 基本覆盖占用时长；仍失败由调用方决定中止还是降级。
-_ATOMIC_WRITE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+# 拉长到约 9s——大上下文会话的 JSONL 可达数十 MB，杀软/索引器扫描耗时会随
+# 体积增长（实测大文件场景 2.6s 窗口偶发不够用，压缩写盘失败导致任务终止）；
+# 仍失败由调用方决定中止还是降级。
+_ATOMIC_WRITE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0, 3.0)
 
 
 def _write_meta_and_entries(file_path: Path, meta: dict[str, Any], entries: list[dict[str, Any]]) -> None:
@@ -540,7 +573,7 @@ def _write_meta_and_entries(file_path: Path, meta: dict[str, Any], entries: list
     # 不会读到写了一半的文件，避免并发竞态导致记录丢失。
     # Windows 上临时文件与目标文件都可能被搜索索引/杀软短暂占用，临时文件
     # 的 open 与 os.replace 偶发 WinError 5，指数退避重试规避；全部失败则抛出。
-    tmp_path = file_path.with_name(file_path.name + ".tmp")
+    tmp_path = _sidecar_dir() / (file_path.name + ".tmp")
     last_error: OSError | None = None
     for delay in _ATOMIC_WRITE_RETRY_DELAYS:
         try:
@@ -587,6 +620,17 @@ class ChatMemoryManager:
         self._lock = threading.Lock()
         self._file_path = _get_chat_history_file(session_id)
         self._round_store = ChatRoundStore(session_id)
+        # 编辑重发（target_round）的轮内状态：仅设置方（生成任务）所在进程内生效，
+        # 任务结束或轮次收尾后自动复位；None 表示正常追加语义。
+        self._target_round_number: int | None = None
+        # 回答插入模式（ask_user 卡片再答专用）：收尾轮次插入历史第 N 轮之后
+        # （后续轮次整体后推），上下文截到第 N 轮为止。与 target_round 互斥
+        self._insert_round_number: int | None = None
+        # 回答插入模式（ask_user 卡片再答专用）：收尾轮次插入历史第 N 轮之后
+        # （后续轮次整体后推），上下文截到第 N 轮为止。与 target_round 互斥
+        self._insert_round_number: int | None = None
+        # 历史构建截断点（原地重跑时上下文只取第 N-1 轮及以前）
+        self._history_cutoff_rounds: int | None = None
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         # 仅在文件缺失时 touch：touch 对已存在的文件也会刷新 mtime，
         # 服务重启后逐会话实例化会平白搅动所有历史文件的修改时间；
@@ -604,6 +648,15 @@ class ChatMemoryManager:
             if stored_meta != meta:
                 _write_meta_and_entries(self._file_path, meta, entries)
         self._recover_pending_round_checkpoint()
+
+    def _sidecar_path(self, suffix: str) -> Path:
+        """会话附属侧车文件路径：统一放 history_files/sidecars/ 子目录。
+
+        suffix 形如 ".pending" / ".todo" / ".bak"。旧版同目录侧车文件在
+        服务启动时由 _migrate_legacy_sidecar_files 一次性搬迁；文件仍被
+        占用等迁移失败场景下旧位置可能仍有残留，读取类路径做旧位置回退。
+        """
+        return _sidecar_dir() / (self._file_path.name + suffix)
 
     @property
     def _meta_lock_path(self) -> Path:
@@ -714,6 +767,67 @@ class ChatMemoryManager:
         """
         self._run_task = value
 
+    def set_target_round(self, target_round: int | None) -> None:
+        """设置原地重跑目标轮次号（编辑重发：本轮回复替换历史第 N 轮）。
+
+        仅影响设置之后本进程内的轮次收尾与历史构建；轮次收尾（替换写入）
+        完成后自动复位为 None。设置无效值（非正整数）按 None 处理。
+        与回答插入模式（set_insert_round）互斥：设置一方会清掉另一方。
+        """
+        try:
+            normalized = int(target_round) if target_round is not None else None
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is not None and normalized < 1:
+            normalized = None
+        self._target_round_number = normalized
+        self._history_cutoff_rounds = normalized
+        if normalized is not None:
+            self._insert_round_number = None
+
+    def set_insert_round(self, insert_round: int | None) -> None:
+        """设置回答插入轮次号（ask_user 卡片再答：回答轮插入历史第 N 轮之后）。
+
+        收尾时新轮插入第 N 轮之后、后续轮次整体后推；上下文历史截到第 N 轮
+        为止（第 N 轮的提问与模型已发生的行为保留，被回答驱动继续）。
+        轮次收尾（插入写入）完成后自动复位为 None；与 target_round 互斥。
+        """
+        try:
+            normalized = int(insert_round) if insert_round is not None else None
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is not None and normalized < 1:
+            normalized = None
+        self._insert_round_number = normalized
+        self._history_cutoff_rounds = normalized
+        if normalized is not None:
+            self._target_round_number = None
+
+    async def get_insert_round(self) -> int | None:
+        """当前回答插入轮次号（任务内调用方读取用）。"""
+        with self._lock:
+            return self._insert_round_number
+
+    async def get_target_round(self) -> int | None:
+        """当前原地重跑目标轮次号（任务内调用方读取用）。"""
+        with self._lock:
+            return self._target_round_number
+
+    def invalidate_context_summary(self) -> None:
+        """使跨轮压缩累计摘要失效（下次聊天前从剩余原始轮次重建）。
+
+        原地重跑（编辑重发）开始时调用：被编辑轮次的旧内容仍在 JSONL，
+        若带着旧摘要生成，旧回复会经摘要重新进入上下文，违背「截到第 N-1 轮」
+        语义；失效后本次任务按原始轮次+截断窗口构建历史。
+        """
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if meta.get("context_summary") is None:
+                return
+            meta["context_summary"] = None
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            _write_meta_and_entries(self._file_path, meta, entries)
+
     async def get_file_text(self) -> str | None:
         """锁内读取完整 jsonl 文本（文件不存在返回 None），
         避免与并发写入交替读写读到不完整内容。"""
@@ -721,6 +835,26 @@ class ChatMemoryManager:
             if not self._file_path.exists():
                 return None
             return self._file_path.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _user_event_signature(event: dict[str, Any]) -> Any:
+        """用户事件的身份签名（忽略 timestamp）：原地重跑时判断「同一用户消息」用。"""
+        comparable = {k: v for k, v in event.items() if k != "timestamp"}
+        return json.dumps(comparable, ensure_ascii=False, sort_keys=True)
+
+    def _user_messages_equal(self, old_events: list[Any], new_events: list[Any]) -> bool:
+        """比较新旧轮次的用户消息是否相同（忽略 timestamp 与事件顺序外的噪声）。"""
+        old_users = [
+            self._user_event_signature(event)
+            for event in old_events
+            if isinstance(event, dict) and event.get("role") == "user"
+        ]
+        new_users = [
+            self._user_event_signature(event)
+            for event in new_events
+            if isinstance(event, dict) and event.get("role") == "user"
+        ]
+        return old_users == new_users
 
     async def add_chat_history(self, input_text: Any) -> str:
         """
@@ -757,7 +891,69 @@ class ChatMemoryManager:
                 meta.pop("_active_round_compaction", None)
                 # 轮次已收尾：检查点完成使命，连同最终事件一起落盘
                 self._clear_pending_checkpoint()
-                entries.append(completed_round)
+                target_round = self._target_round_number
+                insert_round = self._insert_round_number
+                replace_index = None
+                if target_round is not None:
+                    # 原地重跑（编辑重发）：新回复替换历史第 N 轮条目而非追加。
+                    # 目标轮次越界（历史已被并发删除等）时降级为追加，避免丢数据。
+                    round_positions = [
+                        index for index, entry in enumerate(entries)
+                        if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                    ]
+                    if target_round <= len(round_positions):
+                        replace_index = round_positions[target_round - 1]
+                    else:
+                        print(
+                            f"[WARN] target_round={target_round} 超出当前轮次数 "
+                            f"{len(round_positions)}，降级为追加写入"
+                        )
+                if replace_index is not None:
+                    old_round = entries[replace_index]
+                    if self._user_messages_equal(
+                        old_round.get("events") or [], completed_round.get("events") or []
+                    ):
+                        # 同一用户消息的重新生成：保留原轮次开始时间（轮次身份不变）
+                        completed_round["started_at"] = (
+                            old_round.get("started_at") or completed_round.get("started_at")
+                        )
+                    # 用户消息已编辑或原样重跑：一律整轮替换原条目（新轮插回原位置）。
+                    # 累计摘要保留：替换不改变轮次总数与编号，摘要游标继续有效；
+                    # 摘要对被编辑轮次的旧描述按现状保留不失效重压（大会话下
+                    # 整段重建摘要成本极高，见 get_context_messages 的钳制说明）
+                    entries[replace_index] = completed_round
+                    self._target_round_number = None
+                    self._history_cutoff_rounds = None
+                    self._backup_history_file()
+                elif insert_round is not None:
+                    # 回答插入（ask_user 卡片再答）：回答轮插入历史第 N 轮之后，
+                    # 第 N+1 轮及之后整体后推（原 N+1 轮变为 N+2…）。插入点越界
+                    # （历史被并发删除）时降级为追加。插入完成后旧轮次的编号
+                    # 全部变化，累计摘要游标随之失效重建
+                    round_positions = [
+                        index for index, entry in enumerate(entries)
+                        if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                    ]
+                    if insert_round <= len(round_positions):
+                        after_index = round_positions[insert_round - 1] + 1
+                        entries.insert(after_index, completed_round)
+                        self._insert_round_number = None
+                        self._history_cutoff_rounds = None
+                        meta["context_summary"] = None
+                        self._backup_history_file()
+                    else:
+                        print(
+                            f"[WARN] insert_round={insert_round} 超出当前轮次数 "
+                            f"{len(round_positions)}，降级为追加写入"
+                        )
+                        entries.append(completed_round)
+                        self._insert_round_number = None
+                        self._history_cutoff_rounds = None
+                        meta["context_summary"] = None
+                        self._backup_history_file()
+                else:
+                    # 正常追加语义：新收尾轮次挂到末尾
+                    entries.append(completed_round)
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
             else:
@@ -775,7 +971,8 @@ class ChatMemoryManager:
 
     @property
     def _pending_checkpoint_path(self) -> Path:
-        return self._file_path.with_name(self._file_path.name + ".pending")
+        # 进行中轮次检查点（.pending）：统一放 sidecars/ 子目录
+        return self._sidecar_path(".pending")
 
     def _read_pending_round_snapshot(self) -> dict[str, Any] | None:
         """读取侧车检查点中的进行中轮次快照（只读，供主进程 token 统计兜底）。
@@ -847,7 +1044,48 @@ class ChatMemoryManager:
             if completed_round is not None:
                 meta.pop("_active_round_compaction", None)
                 self._clear_pending_checkpoint()
-                entries.append(completed_round)
+                # 原地重跑（target_round）：停止收尾同样替换目标轮次——
+                # 编辑后旧回复已失效，中断的新回复占据其历史位置
+                target_round = self._target_round_number
+                insert_round = self._insert_round_number
+                replace_index = None
+                if target_round is not None:
+                    round_positions = [
+                        index for index, entry in enumerate(entries)
+                        if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                    ]
+                    if target_round <= len(round_positions):
+                        replace_index = round_positions[target_round - 1]
+                if replace_index is not None:
+                    old_round = entries[replace_index]
+                    if self._user_messages_equal(
+                        old_round.get("events") or [], completed_round.get("events") or []
+                    ):
+                        completed_round["started_at"] = (
+                            old_round.get("started_at") or completed_round.get("started_at")
+                        )
+                    entries[replace_index] = completed_round
+                    self._target_round_number = None
+                    self._history_cutoff_rounds = None
+                    # 中断收尾替换同样保留累计摘要（替换不减轮次，游标仍有效；
+                    # 与 add_chat_history 替换分支同口径）
+                    self._backup_history_file()
+                elif insert_round is not None:
+                    # 回答插入（ask_user 卡片再答）：中断收尾同样插入第 N 轮之后
+                    round_positions = [
+                        index for index, entry in enumerate(entries)
+                        if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                    ]
+                    if insert_round <= len(round_positions):
+                        entries.insert(round_positions[insert_round - 1] + 1, completed_round)
+                    else:
+                        entries.append(completed_round)
+                    self._insert_round_number = None
+                    self._history_cutoff_rounds = None
+                    meta["context_summary"] = None
+                    self._backup_history_file()
+                else:
+                    entries.append(completed_round)
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
@@ -898,6 +1136,285 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
             return len(removed)
 
+    # 消息内容中 media:// 引用的提取正则：stored_name 由 _safe_filename 生成，
+    # 字符集限定 [A-Za-z0-9_.-]，不含路径分隔符与空格，正则可安全截取
+    _MEDIA_REF_PATTERN = re.compile(r"media://([A-Za-z0-9_.\-]+)")
+
+    @classmethod
+    def _collect_media_refs(cls, payload: Any) -> set[str]:
+        """递归收集任意 JSON 结构中出现的 media://stored_name 引用集合。
+
+        覆盖轮次 events 里所有可能的引用位置：用户消息 content 部件、
+        助手输出的媒体伪标签、sub_agent 任务的 task 文本等（整体序列化后
+        统一扫描，避免遗漏未知嵌套结构）。
+        """
+        try:
+            text = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return set()
+        return set(cls._MEDIA_REF_PATTERN.findall(text))
+
+    @staticmethod
+    def _parse_timestamp_value(value: Any) -> datetime | None:
+        """把轮次/记录里的时间字符串解析为 datetime；失败返回 None。"""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return datetime.strptime(value.strip(), DEFAULT_TIMESTAMP_FORMAT)
+        except ValueError:
+            return None
+
+    def _plan_deleted_files(
+        self,
+        session_id: str,
+        removed_entries: list[dict[str, Any]],
+        remaining_entries: list[dict[str, Any]],
+        doc_window_start: datetime | None,
+        doc_window_inclusive: bool = True,
+    ) -> dict[str, Any]:
+        """预演将被清理的用户上传附件（媒体引用差集 + 文档时间窗）。
+
+        媒体：被删轮次集合的全部 media:// 引用 − 保留轮次的引用 = 可删除
+        文件（stored_name 全局唯一，天然覆盖「之后上传/生成」的文件）。
+        文档：files/ 目录没有逐轮绑定，按上传时间戳落在删除窗内的记录近似；
+        truncate 模式窗起点为被删首轮 started_at（含该时刻之后全部，>=），
+        single 模式窗起点为前一轮 ended_at（严格大于，秒级同刻不删——
+        边界归属不明的文件保守保留，宁漏删不误删）。
+        """
+        removed_refs = set()
+        for entry in removed_entries:
+            removed_refs |= self._collect_media_refs(entry)
+        kept_refs = set()
+        for entry in remaining_entries:
+            kept_refs |= self._collect_media_refs(entry)
+        planned_media = sorted(removed_refs - kept_refs)
+
+        planned_docs: list[dict[str, Any]] = []
+        if doc_window_start is not None:
+            for record_path in file_memory._list_session_files(session_id):
+                record = file_memory._read_json_file(record_path)
+                if not isinstance(record, dict):
+                    continue
+                uploaded_at = self._parse_timestamp_value(record.get("timestamp"))
+                if uploaded_at is None:
+                    continue
+                if doc_window_inclusive:
+                    if uploaded_at < doc_window_start:
+                        continue
+                else:
+                    if uploaded_at <= doc_window_start:
+                        continue
+                planned_docs.append({
+                    "record": record_path.name,
+                    "filename": str(record.get("filename") or ""),
+                    "stored_name": str(record.get("stored_name") or ""),
+                })
+        return {"media_files": planned_media, "doc_files": planned_docs}
+
+    def _execute_deleted_files_cleanup(
+        self,
+        session_id: str,
+        planned: dict[str, Any],
+    ) -> dict[str, Any]:
+        """执行附件清理：删除 media 原图（连同缩略图）、files/ 原始字节与记录 JSON。
+
+        单个文件删除失败不中断整体，失败的文件列入 returned failed 列表。
+        """
+        failed: list[str] = []
+        removed: list[str] = []
+        for stored_name in planned.get("media_files", []):
+            safe_name = file_memory._safe_filename(stored_name)
+            media_path = file_memory._media_dir(session_id) / safe_name
+            try:
+                file_memory._delete_media_file_with_retry(media_path)
+            except OSError as err:
+                failed.append(f"media/{safe_name}: {err}")
+                continue
+            removed.append(f"media/{safe_name}")
+            # 同名缩略图缓存一并清理（失败忽略，孤儿缩略图无功能影响）
+            try:
+                for thumb in file_memory._thumb_dir(session_id).glob(f"{safe_name}.thumb.*"):
+                    thumb.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for doc in planned.get("doc_files", []):
+            stored_name = doc.get("stored_name") or ""
+            try:
+                if stored_name:
+                    file_memory._delete_doc_file_with_retry(session_id, stored_name)
+            except OSError as err:
+                failed.append(f"files/{stored_name}: {err}")
+            record_name = doc.get("record") or ""
+            if record_name:
+                record_path = file_memory._get_session_dir(session_id) / record_name
+                try:
+                    record_path.unlink(missing_ok=True)
+                except OSError as err:
+                    failed.append(f"records/{record_name}: {err}")
+            removed.append(f"doc:{doc.get('filename') or record_name}")
+        return {"removed": removed, "failed": failed}
+
+    async def delete_rounds(
+        self,
+        start_round: int,
+        mode: str = "truncate",
+        delete_files: bool = False,
+        dry_run: bool = False,
+        keep_media_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """按轮次号删除历史轮次（编辑重发 / 整轮删除的持久层入口）。
+
+        Args:
+            start_round: 1-based 轮次号（第 N 个 chat_round 条目，与前端
+                data-round 同口径；游离压缩事件行不占轮次号）。
+            mode: "truncate" 删除该轮及其后所有轮次；"single" 仅删除该轮整轮
+                （该轮的用户消息与回复一并删除，后续轮次保留）。
+            delete_files: 是否连带清理该删除范围内引用、且保留内容不再引用的
+                用户上传附件（media/ 图片视频音频 + files/ 文档）。
+            dry_run: 预演模式——只返回将删除的轮次与文件明细，不写盘不删文件。
+            keep_media_refs: 清理时排除的媒体 stored_name 列表（编辑重发时
+                编辑态保留的附件仍要复用，不能删）。
+
+        Returns:
+            {state, removed_rounds, planned_rounds, planned_files, files_cleanup,
+             meta_after, usage_after}；dry_run 时 state="planned"。
+        """
+        if mode not in ("truncate", "single"):
+            raise ValueError(f"mode 必须是 truncate 或 single，收到: {mode}")
+        try:
+            start_round = int(start_round)
+        except (TypeError, ValueError):
+            raise ValueError("start_round 必须是整数")
+        if start_round < 1:
+            raise ValueError("start_round 必须从 1 开始")
+
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            round_positions = [
+                index for index, entry in enumerate(entries)
+                if isinstance(entry, dict) and entry.get("event") == "chat_round"
+            ]
+            total_rounds = len(round_positions)
+            if start_round > total_rounds:
+                raise ValueError(
+                    f"轮次号 {start_round} 超出范围，当前共 {total_rounds} 轮"
+                )
+            if total_rounds == 0:
+                raise ValueError("当前会话没有可删除的轮次")
+
+            idx_start = round_positions[start_round - 1]
+            if mode == "truncate":
+                idx_end = len(entries) - 1
+            else:
+                # 单轮删除：到下一个 chat_round 之前（游离压缩行随删除轮一并丢弃）
+                idx_end = (
+                    round_positions[start_round] - 1
+                    if start_round < total_rounds
+                    else len(entries) - 1
+                )
+            removed_entries = entries[idx_start: idx_end + 1]
+            remaining_entries = entries[:idx_start] + entries[idx_end + 1:]
+
+            # 文档时间窗下界：truncate 用被删首轮 started_at（该轮随消息发送上传，
+            # 同一时刻或之后上传的文档归属本次删除）；single 用前一轮 ended_at
+            doc_window_start = None
+            first_removed = next(
+                (entry for entry in removed_entries if isinstance(entry, dict) and entry.get("event") == "chat_round"),
+                None,
+            )
+            if first_removed is not None:
+                if mode == "truncate":
+                    doc_window_start = self._parse_timestamp_value(first_removed.get("started_at"))
+                else:
+                    prev_round = next(
+                        (
+                            entry for entry in reversed(remaining_entries[: idx_start])
+                            if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                        ),
+                        None,
+                    )
+                    doc_window_start = self._parse_timestamp_value(
+                        (prev_round or {}).get("ended_at")
+                    )
+
+            planned_files = self._plan_deleted_files(
+                self.session_id, removed_entries, remaining_entries, doc_window_start,
+                doc_window_inclusive=(mode == "truncate"),
+            )
+            # 编辑重发复用的附件：从清理清单排除（预演与执行同一口径）
+            keep_refs = {
+                file_memory._safe_filename(str(ref)) for ref in (keep_media_refs or [])
+                if str(ref or "").strip()
+            }
+            if keep_refs:
+                planned_files["media_files"] = [
+                    name for name in planned_files["media_files"] if name not in keep_refs
+                ]
+            planned_rounds = []
+            round_counter = 0
+            for entry in entries:
+                if not (isinstance(entry, dict) and entry.get("event") == "chat_round"):
+                    continue
+                round_counter += 1
+                in_removed_range = (
+                    round_counter >= start_round if mode == "truncate"
+                    else round_counter == start_round
+                )
+                if in_removed_range:
+                    planned_rounds.append({
+                        "round": round_counter,
+                        "question": str((entry or {}).get("question") or "")[:120],
+                        "status": str((entry or {}).get("status") or ""),
+                    })
+
+            if dry_run:
+                return {
+                    "state": "planned",
+                    "mode": mode,
+                    "start_round": start_round,
+                    "total_rounds": total_rounds,
+                    "planned_rounds": planned_rounds,
+                    "planned_files": planned_files,
+                    "removed_rounds": 0,
+                    "files_cleanup": {"removed": [], "failed": []},
+                }
+
+            files_cleanup = {"removed": [], "failed": []}
+            if delete_files:
+                files_cleanup = self._execute_deleted_files_cleanup(self.session_id, planned_files)
+
+            # 破坏性写盘前留 .bak 侧车备份（sidecars/ 子目录，与 .tmp 原子写同目录），误删可手动恢复
+            self._backup_history_file()
+            meta["context_summary"] = None
+            meta = _recompute_meta_from_entries(self.session_id, meta, remaining_entries)
+            _write_meta_and_entries(self._file_path, meta, remaining_entries)
+            return {
+                "state": "succeed",
+                "mode": mode,
+                "start_round": start_round,
+                "total_rounds_before": total_rounds,
+                "planned_rounds": planned_rounds,
+                "planned_files": planned_files,
+                "removed_rounds": len(planned_rounds),
+                "files_cleanup": files_cleanup,
+                "meta_after": meta,
+                "usage_after": meta.get("usage", {}),
+            }
+
+    def _backup_history_file(self) -> None:
+        """写盘前把当前历史文件复制为 <名字>.bak（sidecars/ 子目录覆盖式备份）。
+
+        只在破坏性改写前调用；复制失败不阻断主流程（删除操作仍继续，
+        备份属尽力而为的兜底，不因备份失败拒绝用户显式请求的删除）。
+        """
+        try:
+            if self._file_path.exists():
+                # .bak 备份同样放 sidecars/ 子目录（与 .tmp/.todo/.pending 同目录管理，
+                # 历史根目录只保留 *.jsonl 正文件）
+                shutil.copy2(self._file_path, self._sidecar_path(".bak"))
+        except OSError as backup_error:
+            print(f"[WARN] 历史文件备份失败（继续执行删除）: {backup_error}")
+
     async def update_current_round_usage(
         self,
         usage_total: dict[str, Any],
@@ -919,8 +1436,17 @@ class ChatMemoryManager:
         「回退到第 N 轮发起时」= 链上 round < N 的最新快照。跨进程读文件
         （worker 进程同样以此口径计算），仅数条目、不重算 meta，成本一次
         全量读取；工具循环开始处调用一次即可。
+
+        原地重跑（target_round）时返回目标轮次号：编辑重发属于历史第 N 轮
+        的重新生成，工具入链的版本链 round 必须仍标 N（而非 N+1），否则
+        「回退到第 N 轮发起时」的快照语义会被破坏。回答插入（insert_round）
+        同理返回 N+1：回答轮即将插入第 N 轮之后，成为新的第 N+1 轮。
         """
         with self._lock:
+            if self._target_round_number is not None:
+                return self._target_round_number
+            if self._insert_round_number is not None:
+                return self._insert_round_number + 1
             _, entries = _load_meta_and_entries(self._file_path, self.session_id)
         return (
             sum(
@@ -1094,7 +1620,13 @@ class ChatMemoryManager:
             if not merge_compression_usage(history_usage, usage):
                 return "忽略空压缩 usage"
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
-            _write_meta_and_entries(self._file_path, meta, entries)
+            try:
+                _write_meta_and_entries(self._file_path, meta, entries)
+            except OSError as write_error:
+                # 压缩 usage 统计写盘被文件占用时降级：只影响统计数字完整性，
+                # 不影响摘要内容与任务运行（见 update_context_summary 同源注释）
+                print(f"[WARN] 历史压缩 usage 写盘失败（文件被占用，本次跳过）: {write_error}")
+                return "usage 写盘繁忙，已跳过"
         return "记录成功"
 
     async def get_meta(self) -> dict[str, Any]:
@@ -1119,27 +1651,75 @@ class ChatMemoryManager:
                 or not meta.get("user_questions")
             ):
                 meta, _entries = _load_meta_and_entries(self._file_path, self.session_id)
+        # todo 真源在侧车文件（见 get_session_todo）：_meta 首行的 todo 可能是
+        # 被其他写路径旧快照覆盖的陈旧值，这里以侧车为准合并返回，前端
+        # （会话切换时恢复计划面板）无需感知存储位置变化
+        sidecar_todo = self._read_todo_sidecar()
+        if sidecar_todo is not None or isinstance(meta.get("todo"), list):
+            meta["todo"] = sidecar_todo if sidecar_todo is not None else meta.get("todo")
         return meta
 
     async def get_session_metadata(self) -> dict[str, Any]:
         return await self.get_session_meta()
 
     async def get_session_todo(self) -> list[dict[str, Any]]:
-        """读取当前任务计划（_meta.todo）；无记录返回空列表。"""
+        """读取当前任务计划；无记录返回空列表。
+
+        真源是独立侧车文件（<session>_chat.jsonl.todo）：_meta 由多条写路径
+        全量重写（轮次收尾/压缩/标题等，分布在主进程与 worker 多个进程），
+        任何一路用旧快照回写都会覆盖掉并发更新的 todo——实测出现过工具结果
+        已回 plan_complete、下一轮 _meta.todo 却退回中间态，模型因此在系统
+        提示里看不到终态而重复调用 todo_write。侧车只有一个写方，无该竞态。
+        """
         with self._lock:
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-        todo = meta.get("todo")
+            data = self._read_todo_sidecar()
+        if data is not None:
+            return data
+        # 兼容迁移：侧车不存在（旧会话首次读取）时回退 _meta.todo，不回写——
+        # 首次 update 后侧车即成为唯一真源
+        with self._lock:
+            meta, _entries = _load_meta_and_entries(self._file_path, self.session_id)
+            todo = meta.get("todo")
         return todo if isinstance(todo, list) else []
 
     async def update_session_todo(self, todos: list[dict[str, Any]]) -> str:
-        """写入当前任务计划（_meta.todo），供前端展示与跨轮系统提示注入。"""
+        """写入当前任务计划（侧车文件，跨进程锁串行原子替换）。"""
         if not isinstance(todos, list):
             raise ValueError("todos 必须是列表")
         with self._write_guard():
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            meta["todo"] = todos
-            _write_meta_and_entries(self._file_path, meta, entries)
+            self._write_todo_sidecar(todos)
         return "记录成功"
+
+    @property
+    def _todo_sidecar_path(self) -> Path:
+        """任务计划侧车文件：<session>_chat.jsonl.todo（小 JSON 数组，sidecars/ 子目录）。"""
+        return self._sidecar_path(".todo")
+
+    def _read_todo_sidecar(self) -> list[dict[str, Any]] | None:
+        """读侧车 todo；文件不存在/损坏返回 None（调用方回退 _meta.todo）。"""
+        try:
+            if self._todo_sidecar_path.exists():
+                raw = json.loads(self._todo_sidecar_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    return [item for item in raw if isinstance(item, dict)]
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+
+    def _write_todo_sidecar(self, todos: list[dict[str, Any]]) -> None:
+        """侧车原子写（tmp + os.replace + 占用重试，与 meta 写同口径）。"""
+        tmp_path = self._todo_sidecar_path.with_name(self._todo_sidecar_path.name + ".tmp")
+        payload = json.dumps(todos, ensure_ascii=False)
+        last_error: OSError | None = None
+        for delay in _ATOMIC_WRITE_RETRY_DELAYS:
+            try:
+                tmp_path.write_text(payload, encoding="utf-8")
+                os.replace(tmp_path, self._todo_sidecar_path)
+                return
+            except OSError as err:
+                last_error = err
+                time.sleep(delay)
+        raise last_error
 
     async def update_session_title(self, title: str) -> dict[str, Any]:
         """
@@ -1207,7 +1787,15 @@ class ChatMemoryManager:
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["context_summary"] = _normalize_context_summary(summary)
-            _write_meta_and_entries(self._file_path, meta, entries)
+            try:
+                _write_meta_and_entries(self._file_path, meta, entries)
+            except OSError as write_error:
+                # 摘要写盘被 Windows 文件占用（杀软/索引器扫描大 JSONL，WinError 5）
+                # 时降级不抛错：摘要正文此时已由压缩模型成功生成，为写 meta 失败
+                # 终止整个生成任务得不偿失——本轮摘要暂不生效（模型上下文按原始
+                # 轮次回传，可能略大），下一次压缩流程会基于原始历史重新压缩。
+                print(f"[WARN] 累计摘要写盘失败（文件被占用，本次暂不生效，下轮重新压缩）: {write_error}")
+                return "摘要写盘繁忙，已跳过（下轮重新压缩）"
         return "记录成功"
 
     def _load_for_read(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1272,6 +1860,15 @@ class ChatMemoryManager:
             row for row in entries
             if isinstance(row, dict) and row.get("event") == "chat_round"
         ]
+        full_round_count = len(round_entries)
+        # 原地重跑（target_round）：上下文历史截到第 N-1 轮为止——被编辑轮次
+        # 的旧回复不再进入原始对话段（屏幕上第 N 轮之后的历史轮次仍保留，
+        # 但其生成依据不含旧第 N 轮）。累计摘要保留：见下方游标钳制说明
+        cutoff = self._history_cutoff_rounds
+        sliced_by_cutoff = False
+        if cutoff is not None and cutoff >= 1:
+            round_entries = round_entries[: cutoff - 1]
+            sliced_by_cutoff = True
         summarized_count = 0
         if context_summary is not None:
             try:
@@ -1279,10 +1876,21 @@ class ChatMemoryManager:
             except (TypeError, ValueError):
                 summarized_count = 0
             if summarized_count > len(round_entries):
-                # 游标失效（历史被删等）：视为无摘要，下次压缩前从原始轮次重建
-                context_summary = None
-                summary_message = None
-                summarized_count = 0
+                if sliced_by_cutoff and summarized_count <= full_round_count:
+                    # 原地重跑（target_round）的截断把游标推过了截断边界：
+                    # 摘要锚定在真实历史（替换不减轮次总数，游标仍有效），
+                    # 只是覆盖范围越过第 N-1 轮。保留摘要并把有效游标钳到
+                    # 截断边界——摘要替换截断点之前的全部上下文，原始对话
+                    # 从截断点起拼装。被编辑轮次的旧描述留在摘要里且不加任
+                    # 何提示：用户显式编辑本身即最新意图（与删除轮次不同，
+                    # 后者编号整体变化必须重建摘要）；模型执行中也会以工具
+                    # 实测校验。大会话下避免超窗与整段重压缩的 token 开销
+                    summarized_count = len(round_entries)
+                else:
+                    # 游标失效（历史被删等）：视为无摘要，下次压缩前从原始轮次重建
+                    context_summary = None
+                    summary_message = None
+                    summarized_count = 0
         if recent_questions_token_budget is None:
             question_budget = RECENT_QUESTIONS_TOKEN_BUDGET
         else:
@@ -1757,14 +2365,20 @@ class ChatMemoryManager:
             except OSError:
                 recorded_upload_id = None
         deleted_parts: list[str] = []
-        # 1) 删除 jsonl 历史文件与其 pending 检查点侧车
+        # 1) 删除 jsonl 历史文件与其 pending 检查点/todo 计划/.bak 备份侧车
+        #    （侧车统一在 sidecars/ 子目录，旧版残留同目录文件也一并清理）
         if chat_history_file.exists():
             _delete_path_with_retry(chat_history_file)
             deleted_parts.append(f"会话文件 {chat_history_file.name}")
-        pending_sidecar = chat_history_file.with_name(chat_history_file.name + ".pending")
-        if pending_sidecar.exists():
-            _delete_path_with_retry(pending_sidecar)
-            deleted_parts.append(f"检查点 {pending_sidecar.name}")
+        for suffix, label in ((".pending", "检查点"), (".todo", "任务计划"), (".bak", "备份")):
+            sidecar = _sidecar_dir() / (chat_history_file.name + suffix)
+            if sidecar.exists():
+                _delete_path_with_retry(sidecar)
+                deleted_parts.append(f"侧车 {sidecar.name}")
+            legacy = chat_history_file.with_name(chat_history_file.name + suffix)
+            if legacy.exists():
+                _delete_path_with_retry(legacy)
+                deleted_parts.append(f"旧版侧车 {legacy.name}")
         # 2) 删除上传目录：优先用记录的 upload_id（需重新清洗，避免畸形值逃逸），
         #    否则回退为按 session_id 推导的目录名
         upload_dir_name = ""

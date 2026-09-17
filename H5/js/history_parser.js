@@ -141,10 +141,13 @@
   }
 
   // 解析 jsonl：首行 _meta，其余为 chat_round 记录或跨轮压缩事件
+  // 每条渲染 record 附带 round（1-based 轮次号，与后端 delete_rounds 的
+  // start_round 同口径）：供用户消息编辑/删除定位 JSONL 轮次
   function parseHistory(text) {
     const records = [];
     let metaUsageTotal = 0;
     let metaUsage = {};
+    let roundCounter = 0;
 
     text.split("\n").forEach(function (line, idx) {
       const trimmed = line.trim();
@@ -166,6 +169,9 @@
       }
       if (obj.event !== "chat_round" || !Array.isArray(obj.events)) return;
 
+      roundCounter += 1;
+      const roundNo = roundCounter;
+      const roundStart = records.length; // 本行产生的 records 起点（子块统一补轮次号用）
       const openBlocks = {}; // agent_id -> agentBlock record（轮内聚合）
       obj.events.forEach(function (evt) {
         if (!evt || typeof evt !== "object") return;
@@ -184,7 +190,7 @@
         }
 
         if (evt.role === "user" && evt.content && evt.content !== "停止任务") {
-          records.push({ kind: "user", content: evt.content, ts: ts });
+          records.push({ kind: "user", content: evt.content, ts: ts, round: roundNo });
           return;
         }
         // 父级 sub_agent 工具结果：轨迹已在 agentBlock 中，跳过普通渲染
@@ -198,6 +204,7 @@
             args: evt.arguments || "",
             result: typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2),
             ts: ts,
+            round: roundNo,
           };
           // 内置文件工具的展示用 diff（write_file/edit_file）：透传给渲染层
           if (evt.file_diff) toolRec.file_diff = evt.file_diff;
@@ -213,31 +220,36 @@
             kind: "notice",
             content: "网络请求失败（第 " + retryNo + (maxNo ? "/" + maxNo : "") + " 次重试前）：" + evt.error,
             ts: ts,
+            round: roundNo,
           });
           return;
         }
         if (evt.error) {
-          records.push({ kind: "notice", content: "出错：" + evt.error, ts: ts });
+          records.push({ kind: "notice", content: "出错：" + evt.error, ts: ts, round: roundNo });
           return;
         }
         if (typeof evt.reasoning_content === "string" && evt.reasoning_content.trim()) {
-          records.push({ kind: "think", content: evt.reasoning_content, ts: ts });
+          records.push({ kind: "think", content: evt.reasoning_content, ts: ts, round: roundNo });
         }
         if (typeof evt.content === "string" && evt.content.trim() && !evt.done) {
-          records.push({ kind: "assistant", content: evt.content, ts: ts });
+          records.push({ kind: "assistant", content: evt.content, ts: ts, round: roundNo });
         }
         if (Array.isArray(evt.tool_calls)) {
           evt.tool_calls.forEach(function (call) {
             const fn = call.function || {};
             // 父级 sub_agent 派发调用：块内已显示完整任务与轨迹，跳过普通工具块
             if ((fn.name || call.name) === "sub_agent") return;
-            records.push({ kind: "tool", name: fn.name || call.name || "tool", args: fn.arguments || "", ts: ts });
+            records.push({ kind: "tool", name: fn.name || call.name || "tool", args: fn.arguments || "", ts: ts, round: roundNo });
           });
         }
       });
 
       if (obj.usage_total && obj.usage_total.total_tokens) {
-        records.push({ kind: "usage", usage: obj.usage_total });
+        records.push({ kind: "usage", usage: obj.usage_total, round: roundNo });
+      }
+      // 轮内子块（sub_agent 聚合块等由辅助函数 push 的记录）统一补轮次号
+      for (let r = roundStart; r < records.length; r += 1) {
+        if (records[r].round == null) records[r].round = roundNo;
       }
     });
 

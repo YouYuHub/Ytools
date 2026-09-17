@@ -180,9 +180,15 @@
                     </div>
                     <div class="fh-file-list" id="fileChangesList"></div>
                     <div class="fh-panel-foot hidden" id="fileChangesFoot">
-                        <span>点击文件在新窗口打开编辑器（全文可编辑 / 撤回差异块 / 回退 / 保留）</span>
-                        <button type="button" class="fh-cleanup-btn" id="fileChangesCleanup"
-                            title="删除所有已全部保留/撤回文件的版本链留档（不可恢复）">清理留档</button>
+                        <span class="fh-foot-hint">点击文件在新窗口打开编辑器（全文可编辑 / 撤回差异块 / 回退 / 保留）</span>
+                        <span class="fh-foot-actions">
+                            <button type="button" class="fh-act-btn fh-keep-all" id="fileChangesKeepAll"
+                                title="接受全部文件的未决变更并封版为基线（之后不可再撤回）">全部保留</button>
+                            <button type="button" class="fh-act-btn fh-revert-all" id="fileChangesRevertAll"
+                                title="全部文件的未决变更回退到本轮基线（历史版本仍可在编辑器找回）">全部撤回</button>
+                            <button type="button" class="fh-act-btn fh-cleanup-btn" id="fileChangesCleanup"
+                                title="删除所有已全部保留/撤回文件的版本链留档（不可恢复）">清理留档</button>
+                        </span>
                     </div>
                 </div>
                 <div class="top-actions">
@@ -257,81 +263,6 @@
                     <!-- 任务计划面板：垂直布局占位（不遮挡输入框），位于状态栏与输入框之间 -->
                     <div class="todo-panel hidden" id="todoPanel"></div>
                     <div class="composer">
-                        <div class="enhance-panel hidden" id="enhancePanel">
-                            <div class="enhance-head">
-                                <strong>模型与参数设置</strong>
-                                <button class="icon-btn" id="enhanceClose" title="关闭">
-                                    <svg class="icon" viewBox="0 0 24 24">
-                                        <path d="M6 6l12 12M18 6 6 18" />
-                                    </svg>
-                                </button>
-                            </div>
-                            <div class="model-tabs" id="modelTabs">
-                                <button class="model-tab active" type="button" data-role="chat_model">聊天模型</button>
-                                <button class="model-tab" type="button" data-role="compaction_model">压缩模型</button>
-                                <button class="model-tab" type="button" data-role="title_model">标题模型</button>
-                                <button class="model-tab" type="button" data-role="sub_agent_model">子智能体</button>
-                            </div>
-                            <div class="enhance-body">
-                                <label class="enhance-field">
-                                    <span>选择模型</span>
-                                    <button class="model-picker" id="modelPicker" type="button">
-                                        <span class="model-picker-label placeholder" id="modelPickerLabel">请选择模型</span>
-                                        <svg class="icon model-picker-arrow" viewBox="0 0 24 24">
-                                            <path d="m6 9 6 6 6-6" />
-                                        </svg>
-                                    </button>
-                                </label>
-                                <div class="model-list hidden" id="modelList"></div>
-                                <label class="enhance-range">
-                                    <span><b>Temperature</b><output id="temperatureValue">0.7</output></span>
-                                    <input id="temperature" type="range" min="0" max="2" step="0.1" value="0.7">
-                                </label>
-                                <label class="enhance-range">
-                                    <span><b>最大输出 token</b><output id="maxTokensValue">8192</output></span>
-                                    <input id="maxTokens" type="range" min="256" max="131072" step="256">
-                                </label>
-                                <label class="enhance-range">
-                                    <span><b>Top P</b><output id="topPValue">1</output></span>
-                                    <input id="topP" type="range" min="0" max="1" step="0.05" value="1">
-                                </label>
-                                <label class="enhance-range">
-                                    <span><b>Presence penalty</b><output id="presencePenaltyValue">2</output></span>
-                                    <input id="presencePenalty" type="range" min="-2" max="2" step="0.1" value="2">
-                                </label>
-                                <div class="enhance-row">
-                                    <label class="enhance-field">
-                                        <span>思考深度</span>
-                                        <select id="reasoningEffort">
-                                            <option value="none">none</option>
-                                            <option value="minimal">minimal</option>
-                                            <option value="low">low</option>
-                                            <option value="medium">medium</option>
-                                            <option value="high">high</option>
-                                            <option value="xhigh">xhigh</option>
-                                            <option value="max">max</option>
-                                        </select>
-                                    </label>
-                                    <label class="enhance-check enhance-check-inline"
-                                        title="通过 extra_body.enable_thinking 传递">
-                                        <input type="checkbox" id="enableThinking">
-                                        <span>启用 thinking</span>
-                                    </label>
-                                </div>
-                            </div>
-                            <div class="enhance-foot">
-                                <div class="enhance-foot-left">
-                                    <button id="enhanceReset" type="button">恢复默认</button>
-                                    <button id="enhanceClearOverride" type="button" class="hidden"
-                                        title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
-                                    <span id="enhanceHint">参数未修改时仅切换模型、保留原参数</span>
-                                </div>
-                                <div class="enhance-actions">
-                                    <button id="enhanceCancel" type="button">取消</button>
-                                    <button id="enhanceConfirm" type="button">确定</button>
-                                </div>
-                            </div>
-                        </div>
                         <div class="menu plus-menu hidden" id="plusMenu">
                             <button class="menu-item" id="uploadItem">
                                 <svg class="icon" viewBox="0 0 24 24">
@@ -722,6 +653,86 @@
                 </main>
             </div>
         </section>
+    </div>
+
+    <!-- 模型与参数设置面板：body 级浮层（fixed 定位由 JS 锚定"参数"按钮）。
+         不放在 .bottom 内是因为顶栏 .topbar（z:26）与底部 .bottom（z:25）是两个
+         平级堆叠上下文，面板 z-index 再高也压不过顶栏文字（累计 token 描述遮挡问题）；
+         提升 body 级后 z-index 与全屏模态框在同一坐标系参与比较 -->
+    <div class="enhance-panel body-flyout hidden" id="enhancePanel">
+        <div class="enhance-head">
+            <strong>模型与参数设置</strong>
+            <button class="icon-btn" id="enhanceClose" title="关闭">
+                <svg class="icon" viewBox="0 0 24 24">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                </svg>
+            </button>
+        </div>
+        <div class="model-tabs" id="modelTabs">
+            <button class="model-tab active" type="button" data-role="chat_model">聊天模型</button>
+            <button class="model-tab" type="button" data-role="compaction_model">压缩模型</button>
+            <button class="model-tab" type="button" data-role="title_model">标题模型</button>
+            <button class="model-tab" type="button" data-role="sub_agent_model">子智能体</button>
+        </div>
+        <div class="enhance-body">
+            <label class="enhance-field">
+                <span>选择模型</span>
+                <button class="model-picker" id="modelPicker" type="button">
+                    <span class="model-picker-label placeholder" id="modelPickerLabel">请选择模型</span>
+                    <svg class="icon model-picker-arrow" viewBox="0 0 24 24">
+                        <path d="m6 9 6 6 6-6" />
+                    </svg>
+                </button>
+            </label>
+            <div class="model-list hidden" id="modelList"></div>
+            <label class="enhance-range">
+                <span><b>Temperature</b><output id="temperatureValue">0.7</output></span>
+                <input id="temperature" type="range" min="0" max="2" step="0.1" value="0.7">
+            </label>
+            <label class="enhance-range">
+                <span><b>最大输出 token</b><output id="maxTokensValue">8192</output></span>
+                <input id="maxTokens" type="range" min="256" max="131072" step="256">
+            </label>
+            <label class="enhance-range">
+                <span><b>Top P</b><output id="topPValue">1</output></span>
+                <input id="topP" type="range" min="0" max="1" step="0.05" value="1">
+            </label>
+            <label class="enhance-range">
+                <span><b>Presence penalty</b><output id="presencePenaltyValue">2</output></span>
+                <input id="presencePenalty" type="range" min="-2" max="2" step="0.1" value="2">
+            </label>
+            <div class="enhance-row">
+                <label class="enhance-field">
+                    <span>思考深度</span>
+                    <select id="reasoningEffort">
+                        <option value="none">none</option>
+                        <option value="minimal">minimal</option>
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                        <option value="xhigh">xhigh</option>
+                        <option value="max">max</option>
+                    </select>
+                </label>
+                <label class="enhance-check enhance-check-inline"
+                    title="通过 extra_body.enable_thinking 传递">
+                    <input type="checkbox" id="enableThinking">
+                    <span>启用 thinking</span>
+                </label>
+            </div>
+        </div>
+        <div class="enhance-foot">
+            <div class="enhance-foot-left">
+                <button id="enhanceReset" type="button">恢复默认</button>
+                <button id="enhanceClearOverride" type="button" class="hidden"
+                    title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
+                <span id="enhanceHint">参数未修改时仅切换模型、保留原参数</span>
+            </div>
+            <div class="enhance-actions">
+                <button id="enhanceCancel" type="button">取消</button>
+                <button id="enhanceConfirm" type="button">确定</button>
+            </div>
+        </div>
     </div>
 
     <!-- V2.3 文件 diff 编辑器已迁移至独立页 editor.html（面板点击新窗口打开）；

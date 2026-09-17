@@ -462,3 +462,134 @@ def test_hunk_index_consistent_with_full_view(workdir):
     assert result2["ok"] is True
     content2 = store.read_content(SESSION, key)["content"]
     assert "line 6 CHANGED" in content2 and "line 2 CHANGED" not in content2
+
+
+def test_keep_all_batches(workdir, tmp_path):
+    """批量保留：多文件未决变更一次性封版——Total Diff 归零、当前代锁定。"""
+    target = workdir["target"]
+    target2 = tmp_path / "proj" / "util.py"
+    target2.write_text("x = 1\n", encoding="utf-8", newline="")
+    _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
+    _record(target2, "x = 1\n", "x = 2\ny = 3\n")
+    # record 只入链不落盘：模拟真实流程中工具已把新内容写到磁盘
+    target.write_text("a = 10\nb = 2\nc = 3\n", encoding="utf-8", newline="")
+    target2.write_text("x = 2\ny = 3\n", encoding="utf-8", newline="")
+    result = store.keep_all(SESSION)
+    assert result["kept_count"] == 2 and len(result["skipped"]) == 0
+    for item in result["kept"]:
+        total = store.total_diff(SESSION, item["key"])
+        assert total["lines_added"] == 0 and total["lines_removed"] == 0
+    # 磁盘内容保持不变（保留 = 接受当前内容，不改文件）
+    assert target.read_text(encoding="utf-8") == "a = 10\nb = 2\nc = 3\n"
+    assert target2.read_text(encoding="utf-8") == "x = 2\ny = 3\n"
+    # 已无未决变更 → hide_clean 列表为空；重复批量保留返回空
+    assert store.list_files(SESSION, hide_clean=True) == []
+    assert store.keep_all(SESSION)["kept_count"] == 0
+    # 锁定语义与单文件 keep 一致：已封版旧代的版本拒绝作为回退目标
+    key = store.file_key(str(target))
+    with pytest.raises(PermissionError):
+        store.rollback(SESSION, key, to_version=1)
+
+
+def test_revert_all_batches(workdir, tmp_path):
+    """批量撤回：多文件未决变更一次性回退到各自本轮基线（磁盘同步写回）。"""
+    target = workdir["target"]
+    target2 = tmp_path / "proj" / "util.py"
+    target2.write_text("x = 1\n", encoding="utf-8", newline="")
+    _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
+    _record(target2, "x = 1\n", "x = 2\ny = 3\n")
+    # record 只入链不落盘：模拟真实流程中磁盘已是新内容
+    target.write_text("a = 10\nb = 2\nc = 3\n", encoding="utf-8", newline="")
+    target2.write_text("x = 2\ny = 3\n", encoding="utf-8", newline="")
+    result = store.revert_all(SESSION)
+    assert result["reverted_count"] == 2 and len(result["skipped"]) == 0
+    for item in result["reverted"]:
+        assert item["restored_to"]["hash"]
+        assert item["disk_removed"] is False  # 基线非空 = 已存在文件的回退
+    # 磁盘内容恢复为基线
+    assert target.read_text(encoding="utf-8") == "a = 1\nb = 2\nc = 3\n"
+    assert target2.read_text(encoding="utf-8") == "x = 1\n"
+    # Total Diff 归零 + hide_clean 列表为空 + 重复撤回为 no-op
+    assert store.list_files(SESSION, hide_clean=True) == []
+    assert store.revert_all(SESSION)["reverted_count"] == 0
+
+
+def test_rollback_empty_baseline_removes_file(workdir):
+    """新建文件回退到基线（空文本）：磁盘文件应被删除而非留 0 字节空文件。"""
+    target = workdir["target"]
+    new_path = target.parent / "brand_new.py"
+    new_path.write_text("created = True\n", encoding="utf-8", newline="")
+    store.record_change(
+        SESSION, path=str(new_path), display_path=str(new_path),
+        old_text="", new_text="created = True\n",
+        tool="write_file", round_number=1,
+    )
+    key = store.file_key(str(new_path))
+    result = store.rollback(SESSION, key, target="baseline")
+    assert result["ok"] is True
+    assert result["disk_removed"] is True
+    assert not new_path.exists()  # 空文件不留磁盘
+    # 版本链留档还在（编辑器仍可回看/找回内容）
+    assert (workdir["root"] / SESSION / "file_diffs" / key / "meta.json").exists()
+
+
+def test_revert_all_removes_new_files_and_keeps_modified(workdir, tmp_path):
+    """revert_all 混合场景：新建文件删除磁盘文件，已有文件恢复基线内容。"""
+    target = workdir["target"]
+    new_file = tmp_path / "proj" / "created_by_tool.py"
+    new_file.write_text("flag = 1\n", encoding="utf-8", newline="")
+    _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
+    store.record_change(
+        SESSION, path=str(new_file), display_path=str(new_file),
+        old_text="", new_text="flag = 1\n",
+        tool="write_file", round_number=1,
+    )
+    target.write_text("a = 10\nb = 2\nc = 3\n", encoding="utf-8", newline="")
+    result = store.revert_all(SESSION)
+    by_path = {item["path"]: item for item in result["reverted"]}
+    assert result["reverted_count"] == 2
+    assert by_path[str(new_file)]["disk_removed"] is True
+    assert by_path[str(target)]["disk_removed"] is False
+    assert not new_file.exists()
+    assert target.read_text(encoding="utf-8") == "a = 1\nb = 2\nc = 3\n"
+
+
+def test_keep_all_with_cleanup_removes_histories(workdir):
+    """keep_all(cleanup=True)：封版后版本链留档一并清理（默认行为）。"""
+    target = workdir["target"]
+    _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
+    key = store.file_key(str(target))
+    key_dir = workdir["root"] / SESSION / "file_diffs" / key
+    assert key_dir.exists()
+    result = store.keep_all(SESSION, cleanup=True)
+    assert result["kept_count"] == 1
+    assert result["cleaned_count"] == 1
+    assert not key_dir.exists()  # 封版后代已锁定，留档随之清理
+    # cleanup=False 时不清理（供"想保留回看能力"的调用方使用）
+    _record(target, "a = 10\nb = 2\nc = 3\n", "a = 11\n", rnd=2)
+    result2 = store.keep_all(SESSION, cleanup=False)
+    assert result2["kept_count"] == 1
+    assert "cleaned_count" not in result2
+    key_dir2 = workdir["root"] / SESSION / "file_diffs" / key
+    assert key_dir2.exists()
+
+
+def test_keep_all_skips_broken_entry_isolates_errors(workdir, tmp_path):
+    """错误隔离：单个文件操作失败（孤儿条目）不影响其余文件（逐条记入 skipped）。"""
+    target = workdir["target"]
+    target2 = tmp_path / "proj" / "util.py"
+    target2.write_text("x = 1\n", encoding="utf-8", newline="")
+    _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
+    _record(target2, "x = 1\n", "x = 2\ny = 3\n")
+    key2 = store.file_key(str(target2))
+    # 模拟索引孤儿：删掉 target2 的版本链目录但 index.json 残留（磁盘异常场景）
+    import shutil as _shutil
+    _shutil.rmtree(workdir["root"] / SESSION / "file_diffs" / key2, ignore_errors=True)
+    result = store.keep_all(SESSION)
+    assert result["kept_count"] == 1
+    assert len(result["skipped"]) == 1
+    skipped = result["skipped"][0]
+    assert skipped["key"] == key2
+    assert skipped.get("reason")  # 带原因说明
+    # 正常的 target 仍被批量保留成功
+    assert store.total_diff(SESSION, store.file_key(str(target)))["lines_added"] == 0

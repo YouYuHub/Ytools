@@ -23,9 +23,15 @@ TEST_SESSION = "todo_ut_session"
 
 def _cleanup():
     root = Path(__file__).resolve().parents[1] / "history_files"
-    chat = root / f"{TEST_SESSION}_chat.jsonl"
-    if chat.exists():
-        chat.unlink()
+    for suffix in ("", ".pending", ".todo"):
+        # 侧车统一在 sidecars/ 子目录（与旧版同目录位置都清，防历史残留）
+        for base in (root, root / "sidecars"):
+            chat = base / f"{TEST_SESSION}_chat.jsonl{suffix}"
+            if chat.exists():
+                try:
+                    chat.unlink()
+                except OSError:
+                    pass
 
 
 class TodoToolDefinitionTests(unittest.TestCase):
@@ -156,11 +162,12 @@ class TodoApplyTests(unittest.TestCase):
         todo = asyncio.run(self.manager.get_session_todo())
         self.assertEqual([item["content"] for item in todo], ["读取配置", "执行分析"])
         self.assertEqual([item["id"] for item in todo], ["1", "2"])
-        # 落盘到 _meta.todo
+        # 落盘到侧车文件（todo 真源：<session>_chat.jsonl.todo）
         import memory.chat_memory as cm
         with self.manager._lock:
-            meta, _ = cm._load_meta_and_entries(self.manager._file_path, TEST_SESSION)
-        self.assertEqual(meta["todo"][0]["status"], "done")
+            sidecar = self.manager._read_todo_sidecar()
+        self.assertEqual(sidecar[0]["status"], "done")
+        self.assertTrue(self.manager._todo_sidecar_path.exists())
 
     def test_apply_session_todo_update_and_complete_states(self):
         from factory import chat_factory
@@ -254,6 +261,48 @@ class TodoApplyTests(unittest.TestCase):
             self.manager, {"todos": "bad"}))
         self.assertIsNone(items)
         self.assertIn("todos 需要是对象数组", result["error"])
+
+    def test_todo_sidecar_survives_meta_rewrites(self):
+        """竞态回归：轮次收尾/压缩全量重写 _meta 后，todo 不得退回旧快照。
+
+        背景：todo 曾存于 _meta，而 _meta 由轮次收尾/压缩/标题等多条写路径
+        全量重写（主进程与 worker 多进程并发），后写者用旧快照覆盖导致模型
+        已收到 plan_complete、下一轮系统提示却仍是中间态 → 重复调用 todo_write。
+        侧车化后只有 update_session_todo 一个写方，免疫此类覆盖。
+        """
+        import memory.chat_memory as cm
+
+        v_done = [{"id": "1", "content": "步骤一", "status": "done"},
+                  {"id": "2", "content": "步骤二", "status": "done"}]
+        asyncio.run(self.manager.update_session_todo(v_done))
+        # 模拟其他写路径的全量重写（读到的 base_meta 无 todo 字段）
+        with self.manager._write_guard():
+            meta, entries = cm._load_meta_and_entries(self.manager._file_path, TEST_SESSION)
+            meta.pop("todo", None)
+            cm._write_meta_and_entries(self.manager._file_path, meta, entries)
+        todo = asyncio.run(self.manager.get_session_todo())
+        self.assertEqual([t["status"] for t in todo], ["done", "done"])
+        # 前端数据源（meta 合并）同样拿到侧车新值
+        merged = asyncio.run(self.manager.get_session_meta())
+        self.assertEqual([t["status"] for t in merged["todo"]], ["done", "done"])
+
+    def test_todo_sidecar_fallback_to_meta_for_legacy_sessions(self):
+        """兼容迁移：旧会话只有 _meta.todo（无侧车）时读取回退且不报错。"""
+        import memory.chat_memory as cm
+
+        legacy = [{"id": "1", "content": "旧计划", "status": "done"}]
+        with self.manager._write_guard():
+            meta, entries = cm._load_meta_and_entries(self.manager._file_path, TEST_SESSION)
+            meta["todo"] = legacy
+            cm._write_meta_and_entries(self.manager._file_path, meta, entries)
+        self.assertFalse(self.manager._todo_sidecar_path.exists())
+        todo = asyncio.run(self.manager.get_session_todo())
+        self.assertEqual(todo, legacy)  # 回退读到旧值，侧车仍未创建
+        # 首次 update 后侧车成为唯一真源
+        asyncio.run(self.manager.update_session_todo(
+            [{"id": "1", "content": "新计划", "status": "in_progress"}]))
+        todo2 = asyncio.run(self.manager.get_session_todo())
+        self.assertEqual(todo2[0]["content"], "新计划")
 
 
 if __name__ == "__main__":

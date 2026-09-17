@@ -681,12 +681,11 @@
 }
 
 // ---------- 增强参数面板 ----------
+// body 级浮层（index.html 中挂在 .bottom 之外）：position fixed 由
+// .body-flyout 提供，JS 打开时按"参数"按钮视口坐标内联 top/bottom/left
+// （composer.js placeEnhancePanel）。脱离 .bottom 堆叠上下文后 z-index
+// 才能压过顶栏 .topbar（26）——否则累计 token 描述会盖住面板（同坐标系：110 > 26）。
 .enhance-panel {
-  position: absolute;
-  // 与 composer 框同宽（composer 在 wrap 内 margin 0 8px，这里内缩 8px 对齐）
-  left: 0;
-  right: 0;
-  bottom: calc(100% + 8px);
   z-index: 110;
   max-height: calc(100vh - 96px);
   overflow-y: auto;
@@ -1034,11 +1033,8 @@
   }
 }
 
-// 空态（输入条居中时）：面板向下弹出，避免超出可视区（跨容器状态，保持扁平前缀）
-.app.empty .enhance-panel {
-  top: calc(100% + 8px);
-  bottom: auto;
-}
+// 空态向下弹出改由 JS 在 placeEnhancePanel 内计算（原 CSS 方案
+// .app.empty .enhance-panel { top:... } 已随面板提升 body 级失效删除）
 
 // ---------- 聊天设置模态框（元素同时带 .tool-modal-dialog 基础样式） ----------
 .chat-settings-dialog {
@@ -1661,7 +1657,90 @@
 
 // 弹层锚定触发按钮时的固定定位覆盖：由 JS 在打开时计算视口坐标并内联
 // top/bottom/left（见 composer.js placeAbove / placeEnhancePanel）。
-// 必须放在 .menu / .enhance-panel（position:absolute）之后才能赢得级联。
+// 必须放在 .menu（position:absolute）之后才能赢得级联。
 .fixed-flyout {
   position: fixed;
+}
+
+// body 级浮层基础定位（.bottom 内下拉改挂 body 时复用，如 enhance-panel）：
+// 脱离局部堆叠上下文，让面板自身 z-index 直接与顶栏/全屏模态框同坐标系比较；
+// 最终坐标仍由 JS 内联 top/bottom/left 控制，这里只提供 fixed + auto 内边距复位
+.body-flyout {
+  position: fixed;
+  inset: auto;
+}
+
+// ---------- ask_user 卡片再答：三选确认弹层（更新该轮 / 删除之后所有 / 取消） ----------
+.ask-answer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 220;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.ask-answer-confirm {
+  max-width: 430px;
+  padding: 18px 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  // 项目变量表无 --bg-primary（弹层背景若用无效变量会透明，与页面内容
+  // 穿透重叠）；统一用工具模态框同款 --bg-elevated
+  background: var(--bg-elevated);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.ask-answer-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.ask-answer-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-tertiary);
+  margin-bottom: 14px;
+}
+
+.ask-answer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ask-answer-cancel,
+.ask-answer-update,
+.ask-answer-truncate {
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-secondary);
+
+  &:hover { color: var(--text); }
+}
+
+// 更新该轮：accent 底（与编辑重发「发送」同款语义——原位重跑）
+.ask-answer-update {
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+
+  &:hover { opacity: 0.9; }
+}
+
+// 删除之后所有：danger 底（破坏性操作醒目区分）
+.ask-answer-truncate {
+  border: none;
+  background: var(--danger);
+  color: var(--accent-contrast);
+
+  &:hover { opacity: 0.9; }
 }

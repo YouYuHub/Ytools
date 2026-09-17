@@ -690,6 +690,17 @@
     );
   }
 
+  // 表格起始谓词：lines[idx] 含竖线且下一行是分隔行（|---|---| 或 ---|---）。
+  // 主循环与段落吞行共用同一判断——表格紧贴上一段落（模型偶发不输出空行）时，
+  // 段落吞行若不识别表格起始会把表头/分隔行/数据行全吞成一个 <p>（表现为
+  // 表格整段变成文本，小概率复现的"表格没有转化"即此因）
+  function isTableStart(lines, idx) {
+    if (idx + 1 >= lines.length) return false;
+    if (!lines[idx].includes("|")) return false;
+    const next = lines[idx + 1];
+    return /^\|?[\s:|-]+\|?$/.test(next) && next.includes("-");
+  }
+
   function renderTable(lines) {
     const rows = lines.map(splitTableRow);
     const isDivider = rows.length > 1 && rows[1].every(function (c) { return /^:?-{2,}:?$/.test(c); });
@@ -910,7 +921,7 @@
       }
 
       // 表格
-      if (line.includes("|") && i + 1 < lines.length && /^\|?[\s:|-]+\|?$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+      if (isTableStart(lines, i)) {
         const buf = [];
         while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
           buf.push(lines[i]);
@@ -953,13 +964,16 @@
         continue;
       }
 
-      // 普通段落（合并连续行；整行媒体占位各自独立成段，便于两列并排）
+      // 普通段落（合并连续行；整行媒体占位各自独立成段，便于两列并排）。
+      // 吞行时若下一行开启一个表格（表头+分隔行紧贴无空行），立即停手把
+      // 表格留给主循环的表格分支，避免整张表被吸进 <p> 变成纯文本
       const buf = [line];
       i++;
       while (
         i < lines.length &&
         lines[i].trim() !== "" &&
-        !/^(#{1,4}\s|```|&gt;|\s*[-*+]\s|\s*\d+\.\s)/.test(lines[i])
+        !/^(#{1,4}\s|```|&gt;|\s*[-*+]\s|\s*\d+\.\s)/.test(lines[i]) &&
+        !isTableStart(lines, i)
       ) {
         buf.push(lines[i]);
         i++;

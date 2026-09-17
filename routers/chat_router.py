@@ -22,6 +22,7 @@ from factory.chat_factory import (
     stop_chat_task,
     is_chat_stream_running,
 )
+from factory.session_worker import peek_worker_proxy
 from factory.agent_runtime.context_compaction import (
     compact_session_history_if_needed,
     load_context_compaction_settings,
@@ -334,6 +335,74 @@ async def remove_media_tag_from_history(payload: MediaTagRemoveRequest):
     return JSONResponse(content=result)
 
 
+class DeleteRoundsRequest(BaseModel):
+    """按轮次号删除历史轮次的请求体（用户消息编辑重发 / 整轮删除）。"""
+    session_id: str = "default"
+    start_round: int
+    mode: str = "truncate"        # truncate=该轮及之后全删；single=仅删该轮整轮
+    delete_files: bool = True     # 是否连带清理该范围内不再被引用的用户上传附件
+    dry_run: bool = False         # 预演：只返回明细不写盘
+    keep_media_refs: list[str] = []  # 清理时排除的媒体 stored_name（编辑重发复用的附件）
+
+
+def _session_generation_busy(session_id: str) -> bool:
+    """判断会话生成任务是否正在运行（编辑删除属破坏性操作，运行中必须拒绝）。
+
+    双路径判断：worker 模式查进程代理的生成态；inline 模式查会话流任务；
+    ChatMemoryManager.run_task 作为兜底（inline 任务收尾时置 False）。
+    """
+    proxy = peek_worker_proxy(session_id)
+    if proxy is not None and proxy.is_generation_running():
+        return True
+    if is_chat_stream_running(session_id):
+        return True
+    try:
+        manager = get_chat_memory_manager(session_id)
+    except Exception:
+        return False
+    # run_task 在任务开始时置 True；主进程缓存实例的兜底判断
+    return bool(getattr(manager, "run_task", False))
+
+
+@api_chat_router.post("/chat_history/delete_rounds")
+async def delete_chat_history_rounds(payload: DeleteRoundsRequest):
+    """
+    按轮次号删除会话历史轮次，支持两种模式：
+
+    - truncate：删除该轮及其后所有轮次（编辑消息重发的 GPT 同款语义）；
+    - single：仅删除该轮整轮（用户消息与回复一并删除，后续轮次保留，
+      轮次号自动前移）。
+
+    可选清理用户上传附件：媒体（media/ 图片/视频/音频）按引用计数差集
+    精确判定（被删轮次引用 − 保留轮次引用），文档（files/）按上传时间窗
+    近似判定；两者都只在「保留内容不再引用」时删除。
+
+    dry_run=True 时只返回将删除的轮次与文件明细（state="planned"），
+    前端展示确认弹窗后以 dry_run=False 正式执行；正式执行前会先写
+    <历史文件>.bak 侧车备份。
+    """
+    session_id = normalize_session_id(payload.session_id)
+    # 生成任务运行中拒绝删除：pending 轮次在 worker 内存里，此刻截断会
+    # 交错写入（删除后任务收尾 append 会把已删轮次之后的轮次又接回来）
+    if _session_generation_busy(session_id):
+        raise HTTPException(
+            status_code=409,
+            detail="该会话正在生成回复，请等待完成或停止后再编辑/删除轮次",
+        )
+    try:
+        manager = await get_chat_memory_manager(session_id)
+        result = await manager.delete_rounds(
+            start_round=payload.start_round,
+            mode=payload.mode,
+            delete_files=payload.delete_files,
+            dry_run=payload.dry_run,
+            keep_media_refs=payload.keep_media_refs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content=result)
+
+
 # 上传 jsonl 历史文件的最大尺寸（20MB，与单文件上传保持同一量级）
 _UPLOAD_CHAT_FILE_MAX_BYTES = 20 * 1024 * 1024
 
@@ -436,11 +505,34 @@ async def export_chat_sessions_zip(
 ):
     """
     把一个或多个会话打包为 zip 下载：每个会话一个 `<session>_chat.jsonl` +
-    该会话在 session_files/ 下的全部上传数据 + manifest.json 清单。
+    该会话在 session_files/ 下的全部上传数据（media/ 图片视频音频、files/ 文档、
+    thumbs/ 缩略图、diffs/ 文件版本链）+ manifest.json 清单。
 
-    单会话下载名为 `<session_id>_chat.zip`，多会话为 `ytools_sessions_<时间戳>.zip`。
+    单会话且该会话在 session_files/ 下没有任何附件数据时，直接返回 jsonl
+    明文（media_type: application/x-ndjson，Content-Disposition 为
+    `<session_id>_chat.jsonl`）——前端按 Content-Type 区分落地方式；
+    有附件（目录非空）时打 zip（单会话 `<session_id>_chat.zip`）。
+    多会话始终打 zip（`ytools_sessions_<时间戳>.zip`）。
     """
     ids = [sid.strip() for sid in (session_ids or "").split(",") if sid.strip()]
+    try:
+        # 单会话快捷路径：session_files 下无任何附件数据 → 只分享 jsonl 明文
+        if len(ids) == 1:
+            sid = normalize_session_id(ids[0])
+            payload = _export_single_session_payload_for_share(sid)
+            if payload is not None:
+                quoted = urllib.parse.quote(payload["filename"])
+                return Response(
+                    content=payload["text"].encode("utf-8"),
+                    media_type="application/x-ndjson",
+                    headers={
+                        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+                    },
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # 快捷路径失败回退 zip 打包流程
     try:
         zip_bytes, download_name, skipped = export_sessions_to_zip(ids)
     except ValueError as exc:
@@ -453,6 +545,29 @@ async def export_chat_sessions_zip(
         "X-Skipped-Sessions": urllib.parse.quote(",".join(skipped)),
     }
     return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+
+def _export_single_session_payload_for_share(session_id: str) -> dict[str, Any] | None:
+    """单会话分享判定：会话文件存在且 session_files 附件目录为空时返回 jsonl 明文数据。
+
+    附件目录判定与 _export_session_payload 同口径（目录名优先 _meta.upload_id）；
+    目录不存在或递归枚举无文件（media/files/thumbs/diffs 均为空）→ 仅 jsonl。
+    """
+    from memory.chat_memory import _export_session_payload, HISTORY_ROOT, _safe_session_id
+
+    payload = _export_session_payload(session_id)
+    if payload is None:
+        return None
+    upload_dir_name = (
+        _safe_session_id(payload["session_id"])
+        if not payload.get("upload_dir_name")
+        else payload["upload_dir_name"]
+    )
+    session_data_root = HISTORY_ROOT / "session_files" / upload_dir_name
+    has_files = session_data_root.is_dir() and any(session_data_root.rglob("*"))
+    if has_files:
+        return None
+    return {"filename": payload["filename"], "text": payload["text"]}
 
 
 class ImportPreviewResponse(BaseModel):

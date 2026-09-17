@@ -198,13 +198,14 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | 导出/加载（app/history.js） | 顶栏为图标按钮：空态点击直接进入"加载 JSONL"文件选择；有会话内容时点击展开三选项菜单——**分享对话**（下载 `<id>_chat.jsonl`）、**加载 JSONL**（校验后上传导入，重名自动另存，导入失败本地预览兜底）、**压缩对话**（见下） |
 | 手动压缩（app/compaction.js） | 点击"压缩对话"后：① 并行读取 token_stats 与历史压缩配置，仅用于确认弹窗展示当前上下文和摘要预算；② 二次确认（仅防误点击）；③ 确认后 POST `compact_manual?stream=true` 的 SSE 流，事件结构与自动压缩一致（start/delta/done + summary_text），复用 `buildCompactionBlock` 实时渲染压缩模型思考与累计摘要正文，结尾 result 帧提示纳入累计摘要的轮数并刷新用量/上下文统计。后端手动压缩与自动压缩共用多轮流程，覆盖全部已完成轮次，原始历史只存储不回传；模型上下文为累计摘要 + 全历史最近 10k tokens 用户问题 + 当前任务 |
 | 输入区（app/composer.js） | textarea 自增高；Enter 发送 / Shift 换行（排除中文输入法组合态）；发送/语音/停止三态按钮只反映当前会话状态；建议 chip 点击即发送 |
-| 模型参数面板 enhancePanel（app/model_panel.js / composer.js） | boost 按钮开关；面板以 fixed 定位垂直锚定参数按钮（空态向下展开到视口底、聊天态向上展开到视口顶），水平与输入框同宽对齐，高度不随输入框行数漂移；三角色选项卡（聊天模型/压缩模型/标题模型）；自绘模型 picker 按 provider 分组，附能力标签（视觉/工具）与 api_type/url；选新模型未手调过 max tokens 时随其 max_output_tokens 重设范围；任一参数改动置 dirty，「恢复默认」按 api_type 协议预设 + 角色默认；确定时仅 dirty 才组装 parameter 提交 `selectModel`（responses 协议字段为 max_output_tokens） |
+| 模型参数面板 enhancePanel（app/model_panel.js / composer.js） | boost 按钮开关；body 级浮层（打开时临时重挂 document.body，关闭挂回 .composer 原位）——脱离底部输入区堆叠上下文后 z-index(110) 才能压过顶栏(26)，避免顶栏累计 token 描述盖住面板；fixed 定位垂直锚定参数按钮（空态向下展开到视口底、聊天态向上展开到视口顶），水平与输入框同宽对齐，高度不随输入框行数漂移；三角色选项卡（聊天模型/压缩模型/标题模型）；自绘模型 picker 按 provider 分组，附能力标签（视觉/工具）与 api_type/url；选新模型未手调过 max tokens 时随其 max_output_tokens 重设范围；任一参数改动置 dirty，「恢复默认」按 api_type 协议预设 + 角色默认；确定时仅 dirty 才组装 parameter 提交 `selectModel`（responses 协议字段为 max_output_tokens） |
 | “+”功能菜单（app/composer.js） | 上传文件 / 选择工具 / 聊天设置 / Skills 提示词四个入口，分发至 history/tools/composer/skills 各自的处理逻辑；菜单以 fixed 定位锚定「+」按钮上方（打开时按按钮视口坐标计算，多行输入撑高输入框也不会漂移） |
 | 聊天设置弹窗（app/composer.js） | 并行读写三组配置：回传长度（思考过程/工具结果，0=不回传、负数=全部回传、正数=N 字符）、工具超时（MCP 单次执行超时 / 工具调用流式阶段无响应超时，正数为秒数、0=不限制；后者超时不终止任务，按工具调用失败反馈模型继续）与历史压缩策略（历史轮数/统一触发比例、累计摘要预算比例、超大拒绝系数等）；逐项数值校验，全成功才关闭 |
 | Skills 提示词库（app/skills.js） | “+”菜单打开可拖拽对话框（标题栏按住拖动、位置会话内记忆、Esc/背景/×关闭）；左侧文件列表（新建行内输入、名称自动补 .md）+ 右侧「预览 / 编辑」单栏切换（Typora 风格合并视图）：预览为博客式 Markdown 渲染（多级标题/表格/```lang 代码块高亮/引用，不支持图片），编辑为「格式工具栏 + 编辑器」单栏——选中文字即可加粗/斜体/行内代码、设 H1-H3、切换有序/无序列表与引用（再点取消），一键插入表格/代码块/分割线/链接（URL 占位自动选中），表格弹出 6×8 网格划选行列（含表头行，实时显示「N 行 × M 列」），支持 Ctrl+B/I，替换走 execCommand 保留原生 Ctrl+Z 撤销；保存（Ctrl+S）写回 `prompt/md_files/`；删除为两段式确认（3 秒内再点一次）；未保存修改暂存内存草稿，切文件/关弹窗不丢（列表与标题栏显示 ● 未保存）；「加载到输入框」把当前内容填进消息框并聚焦，直接发送 |
 | 文件 chips（app/history.js） | 上传限制 ≤10 个、单个 ≤10MB（超出 toast 截断/跳过）；chip 可单独删除；解析文本下一轮注入系统提示词 |
 | 发送与停止（app/chat.js） | 见下节 SSE 管线；停止 = 先调后端 `/stop_chat` 再本地 abort |
 | 工具选择弹窗（app/tools.js） | 打开时快照草稿集合；按 MCP server 分组三态全选 checkbox、折叠、搜索（名称+描述）、悬浮描述 tooltip；「刷新」走 `listTools(true)` 即 `GET /tools/list?refresh=1` 强制后端重探（页面初始化与普通加载读取后端探测缓存，毫秒级返回，见 api_docs.md"工具列表缓存与预热"）；确定才把草稿落为生效集合并刷新上下文统计 |
+| 独立 diff 编辑器页（editor.html / app/editor.js） | 面板点击文件新窗口打开；全文视图 ctx/add 行可编辑（Prism 高亮层 + 透明 textarea 叠加）、del 红块只读；顶栏固定「↑上一块 / ↓下一块」差异块跳转（jumpHunk：按滚动位置锚定——容器顶 32px 锚定带内命中的块头为当前块，跳相邻块并滚到容器顶下 8px，is-flash 短促高亮；纵向只调 scrollTop 不动横向位置）；顶栏主题下拉（跟随系统/浅色/深色）与主应用共用 ThemeManager 偏好；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留 |
 
 ### 3. SSE 事件处理管线
 

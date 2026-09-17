@@ -1,9 +1,11 @@
 // ============================================================
 // V2.3 独立文件 diff 编辑器页（editor.html / js/app/editor.js）
-// - 与主应用同源样式变量（main.css :root），明暗主题跟随 localStorage
+// - 与主应用同源样式变量（main.css :root），明暗主题跟随 localStorage，
+//   顶栏下拉可切换跟随系统/浅色/深色（ThemeManager 共用偏好）
 // - 全文视图行序列：ctx 行也可编辑（V2.3：除红块 del 外全部可编辑），
 //   编辑全文行不改变 diff 语义，仅随保存整体入链
 // - 行内语法高亮：Prism 高亮层（pre.eh-hl）+ 透明文字 textarea 叠加（overlay）
+// - 差异块导航：顶栏固定 ↑上一块/↓下一块 按钮（滚动位置锚定相邻块头跳转）
 // - 复用 _filehistory.scss 的全局类：fh-btn / fh-hunk-head / fh-skip 等
 // ============================================================
 
@@ -90,6 +92,29 @@ body.eh-page .fh-round-select {
   padding: 3px 8px;
   font-size: 12px;
   max-width: 200px;
+}
+
+// 顶栏主题下拉（跟随系统/浅色/深色）：与回退轮次下拉同一外观规格
+body.eh-page .eh-theme-select {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+// 顶栏差异块导航按钮（↑上一块 / ↓下一块）：fh-btn 按钮体收紧为窄条
+body.eh-page .eh-hunk-nav {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+// 跳转后目标 hunk 头短促高亮（scrollToHunkHead 加 is-flash，900ms 后移除）：
+// 动画从选中态淡回常态背景，帮助视线在长文件中定位落点
+.fh-hunk-head.is-flash {
+  animation: fh-hunk-flash 0.9s ease;
+}
+
+@keyframes fh-hunk-flash {
+  0% { background: var(--bg-active); }
+  100% { background: var(--bg-code); }
 }
 
 .eh-body {

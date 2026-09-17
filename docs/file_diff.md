@@ -314,6 +314,8 @@ graph TD
 | POST | `/file_diff/keep` | body {session_id,key} | `{ok,kept,new_gen,baseline_v,total}` |
 | DELETE | `/file_diff/delete` | session_id, key | `{deleted,key}` |
 | POST | `/file_diff/cleanup` | body {session_id,clean_only?=true} | `{removed_count,removed:[{key,path}]}`（V2.2 批量清理留档：clean_only=True 只清无行数变化文件链） |
+| POST | `/file_diff/keep_all` | body {session_id} | `{kept_count,kept:[{key,path,display_path,new_gen}],skipped:[{key,path,display_path,reason}]}`（V2.4 批量保留封版：逐文件以当前内容开新代基线；单文件失败记入 skipped 不影响其余） |
+| POST | `/file_diff/revert_all` | body {session_id} | `{reverted_count,reverted:[{key,path,display_path,restored_to}],skipped:[...]}`（V2.4 批量撤回：逐文件回退到各自当前代基线并写回磁盘；错误隔离同上） |
 
 错误映射：KeyError→404、PermissionError→409（含"已保留封版"）、ValueError→400。
 hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上下文下相邻变更可能合并为一个 hunk。
@@ -329,9 +331,9 @@ hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上�
 
 | 文件 | 内容 |
 |---|---|
-| `js/api.js` | listFileChanges / fileVersions / fileContent / fileTotalDiff / fileFullView / fileChangeDiff / fileHunkUndo / fileHunkKeep / fileSyncFromDisk / fileRollback / fileSave / fileKeep / fileHistoryDelete / fileCleanup |
-| `js/app/filehistory.js` | 顶栏徽标（文件数，2s 轮询 sessionId 变化 + 400ms 防抖刷新）+ 统计面板（清理留档按钮）；点击文件新窗口打开 `editor.html` |
-| `editor.html` + `js/app/editor.js` | **V2.3 独立 diff 编辑器页**：URL 参数 `?session_id&key`；全文视图 ctx/add 行均可编辑（overlay：Prism 高亮层 + 透明 textarea）；del 红块只读；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留；主题跟随主应用（ytools-theme-preference），API 指向同源 localStorage `ytools-api-base` |
+| `js/api.js` | listFileChanges / fileVersions / fileContent / fileTotalDiff / fileFullView / fileChangeDiff / fileHunkUndo / fileHunkKeep / fileSyncFromDisk / fileRollback / fileSave / fileKeep / fileHistoryDelete / fileCleanup / fileKeepAll / fileRevertAll |
+| `js/app/filehistory.js` | 顶栏徽标（文件数，2s 轮询 sessionId 变化 + 400ms 防抖刷新）+ 统计面板（全部保留 / 全部撤回 / 清理留档按钮，均二次确认）；点击文件新窗口打开 `editor.html` |
+| `editor.html` + `js/app/editor.js` | **V2.3 独立 diff 编辑器页**：URL 参数 `?session_id&key`；全文视图 ctx/add 行均可编辑（overlay：Prism 高亮层 + 透明 textarea）；del 红块只读；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留；顶栏固定「↑上一块 / ↓下一块」差异块跳转（V2.5，滚动位置锚定）；顶栏主题下拉（跟随系统/浅色/深色，与主应用共用 ThemeManager / ytools-theme-preference），API 指向同源 localStorage `ytools-api-base` |
 | `js/app/chat.js` | tool_return 处挂 `scheduleFileChangesBadgeRefresh` |
 | `style/scss/_filehistory.scss` | 面板/编辑器样式（add/del 色值与 V1 diff-view 同口径；dark 主题变量） |
 
@@ -345,9 +347,9 @@ hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上�
 
 ### 9.7 测试与验证
 
-`test/test_file_history.py`（V2.2：25 用例）：record 入链结构（baseline+tool 全文落盘）/ Total Diff=基线→当前（GPT 建议核心场景）/ 单次 diff / 幂等 unchanged / external 探测 / rollback to_round 与 baseline（磁盘写回验证）/ hunk undo 单块还原（含磁盘写回）/ until_hunk 区间撤/留 / 越界与空变更报错 / user_save 乐观锁冲突与成功 / keep 锁定+新代 / 超大文件不入链 / file_key 大小写稳定 / hunk 头解析 / full_view rows+hunks+截断 / cleanup 批量清理 / full_view.hunks 与接口坐标一致。
+`test/test_file_history.py`（V2.4：29 用例）：record 入链结构（baseline+tool 全文落盘）/ Total Diff=基线→当前（GPT 建议核心场景）/ 单次 diff / 幂等 unchanged / external 探测 / rollback to_round 与 baseline（磁盘写回验证）/ hunk undo 单块还原（含磁盘写回）/ until_hunk 区间撤/留 / 越界与空变更报错 / user_save 乐观锁冲突与成功 / keep 锁定+新代 / 超大文件不入链 / file_key 大小写稳定 / hunk 头解析 / full_view rows+hunks+截断 / cleanup 批量清理 / full_view.hunks 与接口坐标一致 / keep_all·revert_all 批量封版与批量回退（含错误隔离）。
 
-验证命令：`python -m pytest test/test_file_history.py -q --no-header`；全量（当前 525 passed，其中含 V1 的 13 用例）。
+验证命令：`python -m pytest test/test_file_history.py -q --no-header`；全量（当前 539 passed，其中含 V1 的 13 用例）。
 
 ### 9.8 V2.0 收敛范围与阶段 3 预留
 
@@ -383,4 +385,21 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **选区安全策略**：普通点击任何位置（其他行 / 行号列 / 红块行 / 空白处）都会**立即取消旧的多行选区**（mousedown 即清空，防止"选区残留误按退格删整段"）；进入多行选区时统一收起各行的浏览器原生反白，选区高亮观感一致；
 - full 视图保存算法为**按行序拼接所有 ctx/add 行当前值**（结构编辑后保存天然正确）；compact 回退模式仍按"替换 add 行"算法。
 
-阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 任务级整体回滚（会话全部文件一次性 Revert）/ 版本链原子写入（tmp+os.replace）/ 删除文件（delete_file）入链 / 编辑器行内 Prism 语法高亮 / external 快照自动探测（当前为手动"从磁盘刷新"）。
+**V2.4 追加（2026-09，按用户实测反馈；阶段 3「任务级整体回滚」落地）**：
+- **面板批量操作**：新增 `POST /file_diff/keep_all`（全部保留：会话内全部未决变更一次性封版，逐文件复用单文件 keep——锁当前代、以当前内容开新代基线、Total Diff 归零）与 `POST /file_diff/revert_all`（全部撤回：逐文件回退到各自当前代基线并写回磁盘，追加 rollback 版本，历史仍可在编辑器找回）；二者只处理仍有行数变化的文件（hide_clean 快照），单文件失败记入 `skipped` 不影响其余（错误隔离，会话锁 RLock 可重入外层持锁）；面板 footer 二者均带二次确认（防误触）；
+- **面板文件名单行化**：列表改用 `baseNameOf()` 只显示文件名末段（完整路径 hover title 可见，点击编辑器头部仍显完整路径），长路径不再截断行宽；
+- **顶栏层级修复**：`.topbar` z-index 25→26（原与输入区 `.bottom` 同为 25 且 DOM 靠前，输入框多行时文件变更面板被输入区遮挡）；
+- 面板 footer 改两行布局：提示语一行、三个操作按钮（全部保留绿 / 全部撤回橙 / 清理留档红）右对齐一行；
+- **修复 422**：批量接口请求模型改用独立的 `SessionOnlyRequest`（仅 session_id，初版误复用含必填 `key` 的 KeepRequest 导致 422）；`api.js` 的 `request()` 对 FastAPI 422 数组型 detail 逐条转可读文本（原直接塞对象显示 `[object Object]`）；新增路由级回归 `test/test_file_history_router.py`（TestClient 锁定只发 `{session_id}` 必须 200，3 用例）；
+- **徽标实时同步**：面板数据刷新（refreshPanelData）与顶栏徽标统一走 `refreshBadge(prefetched?)`（复用同一次 /list 响应免二次请求）；编辑器窗口（独立页）内操作后回到主页：window focus / visibilitychange 时同步；keep_all（含 cleanup）/ revert_all 完成回调也即时刷新——红点数字不再滞后；
+- **回退空基线删除磁盘文件**：`rollback` 与 `hunk_undo` 写回内容为空文本（= 新建文件的"从未创建"基线）时 `unlink` 删除磁盘文件（返回新增 `disk_removed` 标记），不再留 0 字节空文件；revert_all 结果逐条带 `disk_removed`，前端 toast 提示"含 N 个新建文件已删除"；
+- **keep_all 自动清理留档**：封版后历史代已锁定（回退被 409 拒绝），版本链仅剩"编辑器回看"价值——`POST /file_diff/keep_all` 请求模型改为 `KeepAllRequest{session_id, cleanup?=true}`，默认封版完成后顺带 `cleanup_file_histories(clean_only=True)` 清理留档目录（响应新增 `cleaned_count`），历史不再自动累积占磁盘；
+- 测试：`test_file_history.py` 新增 keep_all 批量封版 / revert_all 批量回退 / 错误隔离 / 空基线删文件 / 混合场景 / cleanup 留档 6 用例（33 个）；路由套件 5 用例（49 个含 V1 file_diff）。
+
+**V2.5 追加（2026-09，按用户实测反馈）**：
+- **差异块导航**：顶栏操作栏新增固定「↑ 上一块 / ↓ 下一块」按钮（`eh-hunk-nav`，关闭按钮左侧）——初版把按钮放进 hunk 头并给块头加 sticky 钉顶，实测同一滚动容器内多个 sticky 块头互相叠压显示错乱、钉住态 rect 不反映真实文档位置导致跳转只挪一行；V2.5 重构为固定顶栏 + `jumpHunk(dir)` **滚动位置锚定**：以滚动容器顶 32px 锚定带内命中的块头为"当前块"（带内没有取容器上方最近块头，上方没有返回 -1 落到头/尾块），跳到相邻块头并把其滚到容器顶下 8px（正好落回锚定带，可连续点击逐块推进）；纵向只调 `scrollTop` 不经 `scrollIntoView`（避免横向滚动位置被拉回最左）；跳转后目标块头 `is-flash` 900ms 高亮辅助定位，到达头/尾时 toast 提示。紧凑视图（truncated）同样适用，无差异块时 toast「没有可跳转的差异块」；
+- **hunk 头恢复普通文档流**：撤销 sticky 钉顶（多块叠压问题根源），块头上的保留/撤回按钮维持原有对应位置不变；
+- **面板避让问题导航条**：顶栏展开面板 `right: 12px → 40px`——右侧问题导航条 qnav（`right:14px`、轨道虚线最宽 20px，最左缘约距右 38px）z-index 30 高于顶栏 26，空间重叠时导航条会画在面板上；面板右缘外移至距主区右缘约 56px、与轨道留 ~18px 间隙（移动端 qnav 隐藏，媒体查询内 `right:8px` 覆盖不变）；
+- **编辑器页主题切换**：顶栏新增下拉（跟随系统/浅色/深色），复用 `js/theme.js` ThemeManager（同一 `ytools-theme-preference` 偏好、`themechange` 事件、system 跟随 prefers-color-scheme）；页面 `<html data-theme="light">` 初值由 theme.js 首绘前按偏好覆盖，消除"编辑器页只有深色"的不可切换问题。
+
+阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 版本链原子写入（tmp+os.replace）/ 删除文件（delete_file）入链 / 编辑器行内 Prism 语法高亮 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地。

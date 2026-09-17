@@ -54,6 +54,19 @@ class KeepRequest(BaseModel):
     key: str
 
 
+class SessionOnlyRequest(BaseModel):
+    """面板级批量撤回请求：仅需会话 ID（revert_all）。"""
+
+    session_id: str = "default"
+
+
+class KeepAllRequest(BaseModel):
+    """面板级批量保留请求：cleanup=True 时封版后顺带清理留档目录。"""
+
+    session_id: str = "default"
+    cleanup: bool = True
+
+
 class CleanupRequest(BaseModel):
     session_id: str = "default"
     clean_only: bool = True
@@ -219,4 +232,18 @@ async def delete_tracked_file(session_id: str = "default", key: str = ""):
 async def cleanup_histories(request: CleanupRequest):
     """批量清理留档：clean_only=True 只清已全部保留/撤回（无行数变化）的文件链。"""
     data = _store_call(store.cleanup_file_histories, request.session_id, clean_only=request.clean_only)
+    return JSONResponse(content=data)
+
+
+@api_file_history_router.post("/keep_all")
+async def keep_all_files(request: KeepAllRequest):
+    """批量保留：会话内全部未决变更一次性封版（cleanup=True 顺带清理留档目录）。"""
+    data = _store_call(store.keep_all, request.session_id, cleanup=request.cleanup)
+    return JSONResponse(content=data)
+
+
+@api_file_history_router.post("/revert_all")
+async def revert_all_files(request: SessionOnlyRequest):
+    """批量撤回：会话内全部未决变更一次性回退到各自当前代基线（磁盘同步写回）。"""
+    data = _store_call(store.revert_all, request.session_id)
     return JSONResponse(content=data)

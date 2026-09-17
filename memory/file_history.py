@@ -801,13 +801,20 @@ def hunk_undo(
             extra={"undone_hunks": undo_hunks},
         )
         _recompute_total(meta)
-        # 磁盘写回：撤回后的内容同步落盘（EOL 按当前版本风格）
+        # 磁盘写回：撤回后的内容同步落盘（EOL 按当前版本风格）；
+        # 还原结果为空文本 = 新建文件回退到从未创建 → 删除磁盘空文件
         latest = versions[-1]
         target_path = Path(meta["path"])
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        write_eol = "\r\n" if latest.get("eol") == "CRLF" else "\n"
-        with target_path.open("w", encoding=latest.get("encoding", "utf-8"), newline="") as fp:
-            fp.write(restored_text.replace("\n", write_eol))
+        if restored_text == "":
+            try:
+                target_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            write_eol = "\r\n" if latest.get("eol") == "CRLF" else "\n"
+            with target_path.open("w", encoding=latest.get("encoding", "utf-8"), newline="") as fp:
+                fp.write(restored_text.replace("\n", write_eol))
         result = {
             "ok": bool(version),
             "hunk": hunks[hunk_index],
@@ -1020,15 +1027,26 @@ def rollback(
         _recompute_total(meta)
         # 磁盘写回：恢复真实文件（目录可能已被外部删除，先建目录）
         target_path = Path(meta["path"])
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        write_text = content.replace("\n", "\r\n") if target_version.get("eol") == "CRLF" else content
-        with target_path.open("w", encoding=target_version.get("encoding", "utf-8"), newline="") as fp:
-            fp.write(write_text)
+        disk_removed = False
+        if content == "":
+            # 目标基线为空文本 = 跟踪起点文件不存在（新建文件）：回退即"恢复到
+            # 从未创建"，此时删除磁盘文件而非留一个 0 字节空文件
+            try:
+                target_path.unlink()
+                disk_removed = True
+            except FileNotFoundError:
+                pass
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text = content.replace("\n", "\r\n") if target_version.get("eol") == "CRLF" else content
+            with target_path.open("w", encoding=target_version.get("encoding", "utf-8"), newline="") as fp:
+                fp.write(write_text)
         result = {
             "ok": True,
             "version": version,
             "restored_to": {"v": target_version["v"], "hash": target_version["hash"]},
             "total": meta.get("total"),
+            "disk_removed": disk_removed,
         }
         _save_meta(meta)
         return result
@@ -1117,6 +1135,77 @@ def keep(session_id: str, key: str) -> dict[str, Any]:
         }
         _save_meta(meta)
         return result
+
+
+def keep_all(session_id: str, cleanup: bool = False) -> dict[str, Any]:
+    """批量保留：会话内全部未决变更一次性封版（逐文件以当前内容开新代基线）。
+
+    与编辑器「保留封版」同语义：各文件 Total Diff 归零、当前代锁定，此后这些
+    变更不可再撤回；只处理仍有行数变化的文件（已保留/已撤回的文件自动跳过）。
+    单文件失败不影响其余文件（错误隔离，逐条返回 skipped 原因）。
+
+    cleanup=True 时保留完成后顺带清理留档目录——封版后历史代已锁定（回退被
+    409 拒绝），版本链仅剩"在编辑器里回看"的价值，默认随批量保留一并清掉。
+    """
+    with _session_lock(session_id):
+        files = list_files(session_id, hide_clean=True)
+        kept: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in files:
+            key = item.get("key") or ""
+            entry = {
+                "key": key,
+                "path": item.get("path", ""),
+                "display_path": item.get("display_path", ""),
+            }
+            try:
+                result = keep(session_id, key)  # 会话锁 RLock 可重入
+                entry["new_gen"] = result.get("new_gen")
+                kept.append(entry)
+            except KeyError as exc:
+                entry["reason"] = str(exc.args[0]) if exc.args else "文件历史不存在"
+                skipped.append(entry)
+            except (PermissionError, ValueError) as exc:
+                entry["reason"] = str(exc)
+                skipped.append(entry)
+        result: dict[str, Any] = {
+            "kept_count": len(kept), "kept": kept, "skipped": skipped,
+        }
+        if cleanup and kept:
+            cleaned = cleanup_file_histories(session_id, clean_only=True)  # 锁可重入
+            result["cleaned_count"] = cleaned["removed_count"]
+        return result
+
+
+def revert_all(session_id: str) -> dict[str, Any]:
+    """批量撤回：会话内全部未决变更一次性回退到各自当前代基线。
+
+    与编辑器「回退基线」同语义：磁盘同步写回并追加 role=rollback 版本（可在
+    编辑器历史中找回）；只处理仍有行数变化的文件，单文件失败不影响其余。
+    """
+    with _session_lock(session_id):
+        files = list_files(session_id, hide_clean=True)
+        reverted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in files:
+            key = item.get("key") or ""
+            entry = {
+                "key": key,
+                "path": item.get("path", ""),
+                "display_path": item.get("display_path", ""),
+            }
+            try:
+                result = rollback(session_id, key, target="baseline")
+                entry["restored_to"] = result.get("restored_to")
+                entry["disk_removed"] = bool(result.get("disk_removed"))
+                reverted.append(entry)
+            except KeyError as exc:
+                entry["reason"] = str(exc.args[0]) if exc.args else "文件历史不存在"
+                skipped.append(entry)
+            except (PermissionError, ValueError) as exc:
+                entry["reason"] = str(exc)
+                skipped.append(entry)
+        return {"reverted_count": len(reverted), "reverted": reverted, "skipped": skipped}
 
 
 def delete_file_history(session_id: str, key: str) -> bool:

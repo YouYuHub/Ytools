@@ -36,7 +36,11 @@ $fh-del-text: #cf222e;
 .fh-panel {
   top: 44px;
   left: auto;
-  right: 12px;
+  // 右缘避让右侧问题导航条 qnav（right:14px + 轨道 4px 内距 + 虚线最宽 20px，
+  // 最左缘约距右 38px）：面板挂在 .top-actions（距右 16px），right:40px 使
+  // 面板右缘距主区右缘约 56px，与 qnav 轨道留 ~18px 间隙，不再重叠遮挡
+  // （qnav z-index 30 高于顶栏 26，空间上不重叠才是正解）
+  right: 40px;
   width: 420px;
   max-width: calc(100vw - 24px);
   padding: 0;
@@ -137,8 +141,7 @@ $fh-del-text: #cf222e;
 
 .fh-panel-foot {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 8px;
   padding: 8px 14px;
   border-top: 1px solid var(--border);
@@ -148,17 +151,56 @@ $fh-del-text: #cf222e;
   &[hidden] {
     display: none;
   }
+
+  .fh-foot-hint {
+    display: block;
+  }
+
+  .fh-foot-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
 }
 
-.fh-cleanup-btn {
+// ---------- 面板批量操作按钮（全部保留 / 全部撤回 / 清理留档） ----------
+.fh-act-btn {
   flex: none;
-  padding: 3px 10px;
+  padding: 4px 12px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--danger, #cf222e);
   font-size: 11px;
+  line-height: 16px;
   cursor: pointer;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
+.fh-keep-all {
+  color: $fh-add-text;
+  border-color: rgba(46, 160, 67, 0.55);
+
+  &:hover {
+    background: $fh-add-bg;
+  }
+}
+
+.fh-revert-all {
+  color: #9a6700;
+  border-color: rgba(154, 103, 0, 0.5);
+
+  &:hover {
+    background: rgba(154, 103, 0, 0.12);
+  }
+}
+
+.fh-cleanup-btn {
+  color: var(--danger, #cf222e);
 
   &:hover {
     background: rgba(248, 81, 73, 0.1);

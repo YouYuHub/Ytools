@@ -1,7 +1,7 @@
 /**
  * V2 文件历史版本链前端（docs/file_diff.md §9）：
  * - 主页面文件变更统计面板：会话内被改文件列表（只显示文件名 / hover 见完整路径 /
- *   已保留或已全部撤回的文件自动隐藏 / 清理留档入口）
+ *   已保留或已全部撤回的文件自动隐藏 / 全部保留 · 全部撤回 · 清理留档入口）
  * - diff 编辑器已迁移至独立页 editor.html（js/app/editor.js）：
  *   面板点击文件 → 新窗口打开 editor.html?session_id=...&key=...
  * 依赖：API（js/api.js）、App 核心（core.js）；须在 chat.js 之后加载。
@@ -73,7 +73,17 @@ window.App = window.App || {};
   }
 
   // ---------- 主页面统计面板 ----------
-  function refreshBadge() {
+  /** 路径 → 文件名（末段）：面板列表只展示文件名，完整路径进 hover title。 */
+  function baseNameOf(displayPath) {
+    const parts = String(displayPath || "").split(/[\\/]/);
+    return parts[parts.length - 1] || String(displayPath || "");
+  }
+
+  /**
+   * 刷新顶栏「文件变更」徽标（红点数字）。
+   * @param {object} [prefetched] 可选：刚拉取过的 /file_diff/list 数据，直接复用免二次请求
+   */
+  function refreshBadge(prefetched) {
     const btn = document.getElementById("fileChangesBtn");
     if (!btn) return;
     const badge = btn.querySelector(".fh-badge");
@@ -81,7 +91,7 @@ window.App = window.App || {};
       btn.classList.add("hidden");
       return;
     }
-    API.listFileChanges(state.sessionId).then(function (data) {
+    const apply = function (data) {
       panelFiles = data.files || [];
       const stats = data.stats || { total: 0, added: 0, removed: 0 };
       btn.classList.remove("hidden");
@@ -93,7 +103,12 @@ window.App = window.App || {};
         badge.classList.add("hidden");
         btn.title = "文件变更";
       }
-    }).catch(function () {
+    };
+    if (prefetched && prefetched.stats) {
+      apply(prefetched);
+      return;
+    }
+    API.listFileChanges(state.sessionId).then(apply).catch(function () {
       btn.classList.add("hidden");
     });
   }
@@ -112,8 +127,8 @@ window.App = window.App || {};
     for (const file of panelFiles) {
       const row = el("button", "fh-file-row");
       row.type = "button";
-      row.title = file.path;
-      const name = el("span", "fh-file-name", file.display_path);
+      row.title = file.path;  // hover 可见完整路径
+      const name = el("span", "fh-file-name", baseNameOf(file.display_path || file.path));
       const meta = el("span", "fh-file-meta");
       if (file.added) meta.appendChild(el("span", "fh-add", "+" + file.added));
       if (file.removed) meta.appendChild(el("span", "fh-del", "-" + file.removed));
@@ -143,17 +158,7 @@ window.App = window.App || {};
       panel.classList.remove("hidden");
       const stats = document.getElementById("fileChangesStats");
       stats.textContent = "加载中...";
-      API.listFileChanges(state.sessionId).then(function (data) {
-        panelFiles = data.files || [];
-        const s = data.stats || {};
-        stats.textContent = panelFiles.length
-          ? `${s.total} 个未决文件 · +${s.added} -${s.removed} 行`
-          : "暂无未决变更";
-        renderPanel();
-      }).catch(function (err) {
-        stats.textContent = "加载失败：" + err.message;
-        renderPanel();
-      });
+      refreshPanelData();
     } else {
       panel.classList.add("hidden");
     }
@@ -191,7 +196,53 @@ window.App = window.App || {};
           : "暂无未决变更";
       }
       renderPanel();
+      // 面板数据与顶栏徽标同步刷新（保留/撤回/清档后红点数字立即反映）
+      refreshBadge(data);
+    }).catch(function (err) {
+      const stats = document.getElementById("fileChangesStats");
+      if (stats) stats.textContent = "加载失败：" + err.message;
+      renderPanel();
     });
+  }
+
+  /** 全部保留：所有未决变更封版为新代基线（防误触二次确认）。 */
+  function keepAll() {
+    if (!state.sessionId) return;
+    askConfirm(
+      "全部保留：接受当前会话所有文件的未决变更，并封版为新基线（之后不可再撤回）；封版后的版本链留档将一并清理。确认继续？",
+      function () {
+        API.fileKeepAll(state.sessionId).then(function (result) {
+          const n = result.kept_count || 0;
+          const cleaned = result.cleaned_count || 0;
+          const skip = (result.skipped || []).length;
+          toast(n ? `已保留 ${n} 个文件` + (cleaned ? `，清理 ${cleaned} 个留档` : "")
+            + (skip ? `（跳过 ${skip} 个）` : "") : "没有可保留的变更");
+          refreshPanelData();
+        }).catch(function (err) {
+          toast("全部保留失败：" + err.message);
+        });
+      }
+    );
+  }
+
+  /** 全部撤回：所有未决变更回退到本轮基线（历史版本可在编辑器找回）。 */
+  function revertAll() {
+    if (!state.sessionId) return;
+    askConfirm(
+      "全部撤回：当前会话所有文件的未决变更将回退到本轮基线；新建文件将恢复为\"未创建\"状态（磁盘空文件会被删除），历史版本仍可在编辑器找回。确认继续？",
+      function () {
+        API.fileRevertAll(state.sessionId).then(function (result) {
+          const n = result.reverted_count || 0;
+          const removed = (result.reverted || []).filter(function (item) { return item.disk_removed; }).length;
+          const skip = (result.skipped || []).length;
+          toast(n ? `已撤回 ${n} 个文件` + (removed ? `（含 ${removed} 个新建文件已删除）` : "")
+            + (skip ? `（跳过 ${skip} 个）` : "") : "没有可撤回的变更");
+          refreshPanelData();
+        }).catch(function (err) {
+          toast("全部撤回失败：" + err.message);
+        });
+      }
+    );
   }
 
   // ---------- 二次确认 ----------
@@ -240,6 +291,8 @@ window.App = window.App || {};
     closePanel: closePanel,
     openEditor: openEditor,
     cleanupHistories: cleanupHistories,
+    keepAll: keepAll,
+    revertAll: revertAll,
   };
 
   document.addEventListener("DOMContentLoaded", function () {
@@ -258,12 +311,26 @@ window.App = window.App || {};
         closePanel();
       }
     });
-    // 清理留档入口
+    // 清理留档 / 全部保留 / 全部撤回 入口
     const cleanupBtn = document.getElementById("fileChangesCleanup");
     if (cleanupBtn) {
       cleanupBtn.addEventListener("click", function (e) {
         e.stopPropagation();
         cleanupHistories();
+      });
+    }
+    const keepAllBtn = document.getElementById("fileChangesKeepAll");
+    if (keepAllBtn) {
+      keepAllBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        keepAll();
+      });
+    }
+    const revertAllBtn = document.getElementById("fileChangesRevertAll");
+    if (revertAllBtn) {
+      revertAllBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        revertAll();
       });
     }
     // 二次确认框
@@ -284,6 +351,13 @@ window.App = window.App || {};
         const confirmModal = document.getElementById("fhConfirmModal");
         if (confirmModal && !confirmModal.classList.contains("hidden")) closeConfirm();
       }
+    });
+    // 编辑器页（独立窗口）内保留/撤回后回到主页面：focus / 可见性恢复时同步徽标
+    window.addEventListener("focus", function () {
+      refreshBadge();
+    });
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) refreshBadge();
     });
     // 会话切换 / 刷新后同步一次徽标（轻量轮询检测 sessionId 变化）
     let lastBadgedSession = null;

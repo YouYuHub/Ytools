@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -325,6 +326,40 @@ def resolve_media_path(session_id: str, reference: str) -> Path | None:
     if not path.is_file():
         return None
     return path
+
+
+def _delete_media_file_with_retry(path: Path, attempts: int = 6) -> None:
+    """删除媒体文件，带短重试（Windows 上刚写入的文件可能被索引/杀软短暂占用）。
+
+    文件不存在视为已删除直接返回；仍失败抛出 OSError 交由上层记录。
+    """
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
+def _delete_doc_file_with_retry(session_id: str, stored_name: str, attempts: int = 6) -> None:
+    """按 stored_name 删除 files/ 目录下的原始字节文件；不存在视为已删除。"""
+    path = resolve_document_path(session_id, stored_name)
+    if path is None:
+        return
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def save_session_media(session_id: str, filename: str, data: bytes) -> dict[str, Any]:

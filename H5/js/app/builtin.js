@@ -9,7 +9,8 @@
   const {
     state, el, toast, $,
     input, askModal, askQuestions, askSubmit,
-    contextTokenTodoSlot, todoPanelHost
+    contextTokenTodoSlot, todoPanelHost,
+    chatInner
   } = App;
 
   // ---------- 内置工具（服务端本地执行：todo_write / ask_user / sub_agent 等） ----------
@@ -110,45 +111,20 @@
 
   // ---------- 模型提问交互（ask_user：问题卡片 + 回答作为下一条消息） ----------
 
-  // 判断提问卡片是否仍可回答：其后只能出现“针对提问的回答”（前缀匹配）与模型回复，
-  // 一旦出现普通用户消息（开启新任务）或更新的提问卡片，即视为过期不可再答
-  function isAskBlockAnswerable(block) {
-    const chat = block.closest("#chatInner");
-    if (!chat) return true;
-    // 卡片可能位于 .msg 内（实时流）或直接挂在 #chatInner 下（历史回放）：
-    // 统一向上找到 #chatInner 的直接子节点作为定位锚点
-    let anchor = block;
-    while (anchor.parentElement && anchor.parentElement !== chat) {
-      anchor = anchor.parentElement;
-    }
-    const msgs = Array.from(chat.children);
-    const idx = msgs.indexOf(anchor);
-    if (idx < 0) return true;
-    for (let i = idx + 1; i < msgs.length; i++) {
-      const node = msgs[i];
-      if (node.querySelector(".ask-block")) return false;
-      const bubble = node.querySelector(".msg-user .msg-bubble");
-      if (bubble && bubble.textContent.indexOf("【回答模型提问】") !== 0) return false;
-    }
-    return true;
-  }
-
-  // 按最新对话状态刷新所有提问卡片：过期卡片保留展示但不可再答
+  // 提问卡片一律可点击回答：即使提问之后已有回答轮次甚至后续普通对话，
+  // 也可以重新回答——提交时按卡片所处位置弹出处理方式确认（更新该回答轮 /
+  // 插入回答 / 删除之后所有 / 取消），由用户决定如何安置新回答
   function refreshAskBlockStates() {
     document.querySelectorAll("#chatInner .ask-block").forEach(function (block) {
-      const answerable = isAskBlockAnswerable(block);
-      block.classList.toggle("ask-block-stale", !answerable);
       const hint = block.querySelector(".ask-block-hint");
       if (hint) {
-        hint.textContent = answerable
-          ? "点击本卡片可重新打开回答窗口"
-          : "已有后续对话，该提问不可再次回答";
+        hint.textContent = "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式";
       }
     });
   }
 
   // 聊天流内静态卡片：仅展示问题与选项，交互在弹窗中完成；
-  // 点击卡片可重新打开回答窗口（仅最新提问可答，过期卡片点击给出提示）
+  // 点击卡片可重新打开回答窗口（流式进行中在提交时拦截）
   function buildAskBlock(questions) {
     const wrap = el("div", "ask-block ask-block-clickable");
     wrap.appendChild(el("div", "ask-block-title", "🙋 模型向你提问（回答后任务继续）"));
@@ -159,13 +135,9 @@
       }
       wrap.appendChild(el("div", "ask-block-question", text));
     });
-    wrap.appendChild(el("div", "ask-block-hint", "点击本卡片可重新打开回答窗口"));
+    wrap.appendChild(el("div", "ask-block-hint", "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式"));
     if (Array.isArray(questions) && questions.length) {
       wrap.addEventListener("click", function () {
-        if (!isAskBlockAnswerable(wrap)) {
-          toast("该提问已有后续对话，不能再次回答");
-          return;
-        }
         openAskModal(questions, wrap);
       });
     }
@@ -322,14 +294,126 @@
     const text = lines.join("\n");
     const sourceBlock = state.pendingAskBlock;
     closeAskModal();
-    // 先清除提问卡片之后的旧回答轮（覆盖而非追加），再发送新回答
-    clearNodesAfterAskBlock(sourceBlock);
-    input.value = text;
-    App.send();
+    submitAskAnswer(text, sourceBlock);
   }
   askSubmit.addEventListener("click", handleAskSubmit);
   $("#askModalClose").addEventListener("click", closeAskModal);
   $("#askModalBackdrop").addEventListener("click", closeAskModal);
+
+  // 回答提交编排（ask_user 卡片）：按提问卡片所处对话位置自动分流——
+  // - 提问是最新轮次（其后无任何轮次）：回答直接作为新轮追加/插入提问轮之后
+  //   （insert_round 语义在末尾等价于追加，无需确认）；
+  // - 提问之后已有回答轮：三选确认——「更新该回答轮」（替换旧回答轮，即
+  //   编辑重发 regen 语义）/「删除提问之后所有」/「取消（不发起任务）」；
+  // - 提问之后只有普通对话轮（用户曾跳过该提问开启新任务）：三选确认——
+  //   「插入回答（后续轮次整体后推）」/「删除提问之后所有」/「取消」。
+  //   模式信息从卡片所在轮次的 data-round 推导（历史/实时流均有标注）；
+  // 找不到轮号（旧数据/异常结构）降级为普通发送
+  function submitAskAnswer(text, sourceBlock) {
+    // 定位提问卡片所在轮次号：卡片 → 所在轮次 DOM 锚点 → data-round
+    function findAskRound() {
+      if (!sourceBlock || !sourceBlock.isConnected) return null;
+      let node = sourceBlock;
+      while (node && node !== chatInner) {
+        if (node.getAttribute && node.getAttribute("data-round")) {
+          return parseInt(node.getAttribute("data-round"), 10) || null;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    }
+    const askRound = findAskRound();
+    if (!askRound) {
+      // 降级：拿不到轮号走旧行为（覆盖式清理 + 普通发送）
+      clearNodesAfterAskBlock(sourceBlock);
+      input.value = text;
+      App.send();
+      return;
+    }
+    // 提问轮之后是否已有回答轮 / 是否存在任何后续轮次
+    let hasExistingAnswer = false;
+    let hasLaterRounds = false;
+    for (const node of chatInner.children) {
+      const r = node.getAttribute ? parseInt(node.getAttribute("data-round"), 10) : NaN;
+      if (Number.isFinite(r) && r > askRound) {
+        hasLaterRounds = true;
+        const bubble = node.querySelector(".msg-user .msg-bubble");
+        if (bubble && bubble.textContent.indexOf("【回答模型提问】") === 0) {
+          hasExistingAnswer = true;
+        }
+        break;
+      }
+    }
+    if (!hasLaterRounds) {
+      // 提问是最新轮次：回答直接发送（插入点在末尾，等价追加，无需确认）
+      App.send({ text: text, insertAfterRound: askRound });
+      return;
+    }
+    // 后面已有对话（回答轮或普通对话）：三选确认后再发送
+    showAskAnswerConfirm(text, askRound, hasExistingAnswer);
+  }
+
+  // 三选确认弹层（独立轻量模态，复用 tool-modal 遮罩风格）
+  function showAskAnswerConfirm(text, askRound, hasExistingAnswer) {
+    const backdrop = el("div", "tool-modal-backdrop ask-answer-backdrop");
+    const dialog = el("div", "ask-answer-confirm");
+    // hasExistingAnswer=true → 主操作「更新该回答轮」（regen 替换旧回答轮）；
+    // false（提问后只有普通对话）→ 主操作「插入回答」（insert_round，后续轮次后推）
+    dialog.appendChild(el("div", "ask-answer-title",
+      hasExistingAnswer ? "该提问已有一个回答，请选择处理方式" : "该提问之后已有其他对话，请选择回答方式"));
+    const desc = el("div", "ask-answer-desc",
+      hasExistingAnswer
+        ? "「更新该回答轮」会重新生成该轮回答（后续对话保留，编号顺延）；" +
+          "「删除提问之后所有」会移除该回答及之后的所有轮次（含上传附件，不可恢复）；" +
+          "「取消」放弃本次回答，不发起任务。"
+        : "「插入回答」会把回答作为新轮插到该提问之后（后续对话整体后推，保留）；" +
+          "「删除提问之后所有」会移除该提问之后的所有轮次（含上传附件，不可恢复）；" +
+          "「取消」放弃本次回答，不发起任务。");
+    dialog.appendChild(desc);
+    const actions = el("div", "ask-answer-actions");
+    const cancelBtn = el("button", "ask-answer-cancel", "取消");
+    const updateBtn = el("button", "ask-answer-update", hasExistingAnswer ? "更新该回答轮" : "插入回答");
+    const truncateBtn = el("button", "ask-answer-truncate", "删除之后所有");
+    cancelBtn.type = "button";
+    updateBtn.type = "button";
+    truncateBtn.type = "button";
+    cancelBtn.addEventListener("click", function () {
+      backdrop.remove();
+    });
+    updateBtn.addEventListener("click", function () {
+      backdrop.remove();
+      if (hasExistingAnswer) {
+        // 更新该回答轮 = 编辑重发语义：替换旧回答轮（原位重跑）
+        App.confirmEditResend({
+          msg: null,
+          round: askRound + 1,
+          text: text,
+          media: [],
+          mode: "regen",
+        });
+      } else {
+        // 插入回答 = 插入语义：新回答轮插入提问轮之后，后续轮次整体后推
+        App.send({ text: text, insertAfterRound: askRound });
+      }
+    });
+    truncateBtn.addEventListener("click", function () {
+      backdrop.remove();
+      // 删除之后所有 = truncate 预演确认后发送（破坏面大，走既有 dry_run 明细）
+      App.confirmEditResend({
+        msg: null,
+        round: askRound + 1,
+        text: text,
+        media: [],
+        mode: "truncate",
+      });
+    });
+    actions.appendChild(cancelBtn);
+    actions.appendChild(updateBtn);
+    actions.appendChild(truncateBtn);
+    dialog.appendChild(actions);
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+  }
 
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------

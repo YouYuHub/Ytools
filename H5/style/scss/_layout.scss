@@ -10,7 +10,8 @@
   overflow: hidden;
 
   // ---------- 空态：输入条垂直居中（ChatGPT 首页形态） ----------
-  // （.app.empty .suggest-row 在 _composer、.app.empty .enhance-panel 在 _components）
+  // （.app.empty .suggest-row 在 _composer；enhance-panel 已提升 body 级，
+  //   空态向下弹出坐标由 composer.js placeEnhancePanel 计算）
   &.empty {
     .chat-scroll {
       display: none;
@@ -80,7 +81,8 @@
   top: 0;
   right: 0;
   left: 0;
-  z-index: 25;
+  // 高于底部输入区 .bottom（25）：顶栏下拉面板（文件变更统计等）不被输入区遮挡
+  z-index: 26;
   display: flex;
   align-items: center;
   gap: 8px;

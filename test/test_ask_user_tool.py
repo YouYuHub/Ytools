@@ -15,11 +15,14 @@ TEST_SESSION = "ask_ut_session"
 def _cleanup():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "history_files"
-    chat = root / f"{TEST_SESSION}_chat.jsonl"
     for suffix in ("", ".pending"):
-        target = root / f"{TEST_SESSION}_chat.jsonl{suffix}"
         try:
-            target.unlink()
+            (root / f"{TEST_SESSION}_chat.jsonl{suffix}").unlink()
+        except OSError:
+            pass
+        # 侧车统一在 sidecars/ 子目录（与旧版同目录位置都清，防历史残留）
+        try:
+            (root / "sidecars" / f"{TEST_SESSION}_chat.jsonl{suffix}").unlink()
         except OSError:
             pass
 

@@ -503,6 +503,7 @@
     state.hasConversation = false;
     state.importedHistoryText = null;
     enhancePanel.classList.add("hidden");
+    if (App.dockEnhancePanel) App.dockEnhancePanel(); // body 级浮层挂回 .composer 原位
     chatInner.innerHTML = "";
     setEmpty(true);
     App.setSessionTotalTokens(0);
@@ -584,6 +585,8 @@
       } else {
         setEmpty(false);
         chatInner.innerHTML = "";
+        // 不传 replayState：初始打开走分段渲染（末尾 240 条先行，向上滚动
+        // 加载更早），flushRenderedTail 内部负责贴底
         App.renderRecords(visibleRecords);
         restoreActiveStream(id);
         App.rebuildQnav();

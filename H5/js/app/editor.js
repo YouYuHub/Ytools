@@ -5,7 +5,9 @@
  *   （编辑非差异行不改变 diff 语义，保存整体入链 user_edit 版本）；
  *   del 行红块只读无行号
  * - 行内语法高亮：Prism 高亮层（pre.eh-hl）+ 透明 textarea 叠加（overlay）
- * - 操作：保存（乐观锁）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版
+ * - 差异块导航：顶栏固定「↑上一块 / ↓下一块」（jumpHunk 按滚动位置锚定相邻块头）
+ * - 操作：保存（乐观锁）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版；
+ *   主题下拉与主应用共用 ThemeManager 偏好（跟随系统/浅色/深色）
  * 依赖：api.js / theme.js / Prism；由 filehistory.js 面板点击新窗口打开。
  */
 (function (global) {
@@ -40,6 +42,9 @@
     roundSelect: document.getElementById("ehRoundSelect"),
     sync: document.getElementById("ehSync"),
     keep: document.getElementById("ehKeep"),
+    themeSelect: document.getElementById("ehThemeSelect"),
+    prevHunk: document.getElementById("ehPrevHunk"),
+    nextHunk: document.getElementById("ehNextHunk"),
     close: document.getElementById("ehClose"),
     confirm: document.getElementById("ehConfirm"),
     confirmMessage: document.getElementById("ehConfirmMessage"),
@@ -357,6 +362,64 @@
       }));
     node.appendChild(labelWrap);
     return node;
+  }
+
+  /**
+   * 顶栏「上一块/下一块」：按当前滚动位置（视口顶部 24px 锚定带内命中的
+   * 块头为"当前块"，未命中取视口上方最近块头）确定基准，再滚到相邻块。
+   * 不以块头元素为锚——sticky 钉住的块头 rect 不反映真实文档位置，
+   * 也不能用 scrollIntoView（会把横向滚动拉回最左破坏长行阅读位置）。
+   * @param {-1|1} dir -1 上一块 / 1 下一块
+   */
+  function jumpHunk(dir) {
+    const heads = hunkHeads();
+    if (!heads.length) { toast("没有可跳转的差异块"); return; }
+    const anchor = currentHunkIndex(heads);
+    let target;
+    if (dir < 0) {
+      target = anchor < 0 ? heads[heads.length - 1]   // 未命中：直接跳最前一块
+        : heads[Math.max(0, anchor - 1)];
+    } else {
+      target = anchor < 0 ? heads[0]                  // 未命中：直接跳最后一块
+        : heads[Math.min(heads.length - 1, anchor + 1)];
+    }
+    if (target === heads[anchor]) { toast(anchor === 0 ? "已经是第一个差异块" : "已经是最后一个差异块"); }
+    scrollToHunkHead(target);
+  }
+
+  /** 按渲染顺序收集所有差异块头（含每次重渲染后的新节点） */
+  function hunkHeads() {
+    return Array.prototype.slice.call(dom.body.querySelectorAll(".fh-hunk-head"));
+  }
+
+  /**
+   * 当前块索引：以滚动容器顶为基准的 32px 锚定带内命中的块头即"当前块"
+   * （scrollToHunkHead 定位到 +8px，正好落带内，连续点击可逐块推进）；
+   * 带内没有（页顶/页中空档）取容器上方最近块头，上方没有（还没滚到
+   * 第一块）返回 -1（由调用方按方向决定落到头/尾块）。
+   */
+  function currentHunkIndex(heads) {
+    const bodyTop = dom.body.getBoundingClientRect().top;
+    const band = 32;
+    let lastAbove = -1;
+    for (let i = 0; i < heads.length; i++) {
+      const top = heads[i].getBoundingClientRect().top - bodyTop;
+      if (top >= 0 && top <= band) return i;
+      if (top < 0) lastAbove = i;
+    }
+    return lastAbove;
+  }
+
+  /**
+   * 纵向滚动到目标块头（容器顶下 8px），短促高亮辅助视线定位。
+   * 只调 scrollTop，不碰 scrollLeft（横向阅读位置保持不变）。
+   */
+  function scrollToHunkHead(head) {
+    const headRect = head.getBoundingClientRect();
+    const bodyRect = dom.body.getBoundingClientRect();
+    dom.body.scrollTop += headRect.top - bodyRect.top - 8;
+    head.classList.add("is-flash");
+    setTimeout(function () { head.classList.remove("is-flash"); }, 900);
   }
 
   function renderRow(row) {
@@ -1154,6 +1217,17 @@
       );
     });
     dom.close.addEventListener("click", function () { global.close(); });
+    // 差异块导航：顶栏固定按钮，按当前滚动位置锚定相邻块头跳转
+    dom.prevHunk.addEventListener("click", function () { if (st) jumpHunk(-1); });
+    dom.nextHunk.addEventListener("click", function () { if (st) jumpHunk(1); });
+    // 主题切换：与主应用共用同一份偏好（ThemeManager / ytools-theme-preference），
+    // system 选项由 ThemeManager 按 prefers-color-scheme 解析并在系统切换时跟随
+    if (dom.themeSelect) {
+      dom.themeSelect.value = window.ThemeManager.getPreference();
+      dom.themeSelect.addEventListener("change", function () {
+        window.ThemeManager.setPreference(dom.themeSelect.value);
+      });
+    }
     dom.confirmOk.addEventListener("click", function () {
       const action = confirmAction;
       closeConfirm();

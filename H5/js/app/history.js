@@ -39,20 +39,53 @@
     setTimeout(function () { URL.revokeObjectURL(url); }, 0);
   }
 
+  /**
+   * 分享当前会话：统一走 /chat_history/export_zip——
+   * 后端在「单会话且 session_files 下无附件数据」时直接回 jsonl 明文，
+   * 有附件（media/图片视频音频、files/文档、diffs/版本链等）时打 zip。
+   * 按 Content-Type 分流落地：zip → blob 下载；jsonl → 文本下载。
+   */
   async function downloadSession(sessionId) {
     sessionId = SessionUtils.sanitizeSessionId(sessionId);
     if (!sessionId || !state.hasConversation) {
       toast("当前没有可分享的对话内容");
       return;
     }
+    // 本地导入尚未落盘的预览内容：仍下载内存里的 jsonl 文本
     if (sessionId === state.sessionId && state.importedHistoryText) {
       downloadText(sessionId + "_chat.jsonl", state.importedHistoryText);
       return;
     }
     try {
-      const response = await fetch(API.BASE + "/chat_history/file?session_id=" + encodeURIComponent(sessionId));
-      if (!response.ok) throw new Error("导出失败");
-      downloadText(sessionId + "_chat.jsonl", await response.text());
+      const res = await fetch(API.BASE + "/chat_history/export_zip?session_ids=" + encodeURIComponent(sessionId));
+      if (!res.ok) {
+        let detail = "导出失败 " + res.status;
+        try { detail = (await res.json()).detail || detail; } catch (_) { /* ignore */ }
+        throw new Error(detail);
+      }
+      const contentType = res.headers.get("Content-Type") || "";
+      const dispo = res.headers.get("Content-Disposition") || "";
+      const m = dispo.match(/filename\*=UTF-8''([^;]+)/i);
+      // 文件名 fallback 按内容类型推导：zip 分支不再退成 .jsonl 名。
+      // 背景：Content-Disposition 不是 CORS 安全白名单头，file:// 等跨源
+      // 场景读不到它（需后端 Access-Control-Expose-Headers 配合），此时
+      // 按 Content-Type（CORS 白名单头，始终可读）推导正确的下载名
+      const isZip = contentType.indexOf("zip") >= 0;
+      const name = m ? decodeURIComponent(m[1]) : sessionId + (isZip ? "_chat.zip" : "_chat.jsonl");
+      if (isZip) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+        toast("已打包分享（含附件数据）：" + name);
+      } else {
+        downloadText(name, await res.text());
+      }
     } catch (err) {
       toast(err.message);
     }

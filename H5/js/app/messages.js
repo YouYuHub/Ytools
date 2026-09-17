@@ -13,149 +13,398 @@
     scrollBottomBtn
   } = App;
 
-  // 渲染历史记录（工具调用与结果按名称顺序配对）
-  function renderRecords(records) {
-    const pendingTools = {}; // name -> [tool ui]
-    const pendingCompactions = {}; // scope -> [尚未完成的压缩 ui]
+  // ---------- 分段渲染 ----------
+  // 初始渲染只画末尾 RENDER_TAIL_RECORDS 条记录（最近对话），顶部留一张
+  // 「加载更早消息」细条，向上滚动到底自动追加更早的分段——长会话打开时
+  // 只构建可视尾部，主线程阻塞时长与记录总数解耦。分段边界不允许落在
+  // 「欠账记录」上（见 isDependentRecord），保证工具调用与结果、压缩
+  // start/done 的配对不被切开；record.round 非空时新节点统一打 data-round。
+  const RENDER_TAIL_RECORDS = 240;
+  const RENDER_OLDER_BATCH = 160;
+  // 后台渐进回填的批间空闲间隔（ms）：批间让出主线程，浏览器的输入响应、
+  // 流式渲染、动画不受影响；期间用户上滚也不会看到空白（等 800ms 就有）
+  const BACKFILL_IDLE_DELAY = 120;
+  // loadOlder: { records, start, loading, timer } —— 待分段渲染的完整记录
+  // 表/下一个待渲染下标/批量渲染并发锁/后台回填调度句柄（细条由
+  // flushRenderedTail 创建插入；初始显示末尾后由后台渐进补全剩余记录）
+  const loadOlderState = { records: null, start: 0, loading: false, timer: null, button: null };
 
-    records.forEach(function (rec) {
-      if (rec.kind === "user") {
-        appendUserMessage(rec.content, rec.ts);
-        return;
-      }
-      if (rec.kind === "think") {
-        appendTime(rec.ts);
-        const think = buildThinkBlock();
-        think.setText(rec.content);
-        chatInner.appendChild(think.wrap);
-        return;
-      }
-      if (rec.kind === "assistant") {
-        appendTime(rec.ts);
-        appendStaticAssistant(rec.content);
-        return;
-      }
-      if (rec.kind === "tool") {
-        appendTime(rec.ts);
-        const ui = buildToolBlock(rec.name);
-        ui.setInput(FormatUtils.prettyJson(rec.args));
-        chatInner.appendChild(ui.wrap);
-        // ask_user 历史记录附一张可点击的提问卡片：刷新后仍能重新打开回答窗口
-        if (rec.name === App.ASK_USER_TOOL_NAME) {
-          const askQuestions = App.parseAskQuestionsFromArgs(rec.args);
-          if (askQuestions) chatInner.appendChild(App.buildAskBlock(askQuestions));
-        }
-        (pendingTools[rec.name] = pendingTools[rec.name] || []).push(ui);
-        return;
-      }
-      if (rec.kind === "toolResult") {
-        const queue = pendingTools[rec.name];
-        let ui = queue && queue.shift();
-        if (!ui) {
-          appendTime(rec.ts);
-          ui = buildToolBlock(rec.name);
-          ui.setInput(FormatUtils.prettyJson(rec.args));
-          chatInner.appendChild(ui.wrap);
-        }
-        applyToolResult(ui, rec.name, rec.result, rec.file_diff);
-        ui.finish();
-        return;
-      }
-      if (rec.kind === "usage") {
-        chatInner.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage)));
-        return;
-      }
-      if (rec.kind === "agentBlock") {
-        // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
-        appendTime(rec.started_at);
-        const agentUi = buildSubAgentBlock();
-        agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit });
-        agentUi.hydrate(rec);
-        agentUi.markReturned(rec);
-        chatInner.appendChild(agentUi.wrap);
-        return;
-      }
-      if (rec.kind === "notice") {
-        chatInner.appendChild(el("div", "notice-bar", rec.content));
-        return;
-      }
-      if (rec.kind === "compaction") {
-        // 任务中断遗留的未完成压缩（有 start、无 done）：置为中断态展示，
-        // 未覆盖的轮次由后端在下次请求按需重新压缩
-        if (rec.interrupted) {
-          appendTime(rec.ts);
-          const interruptedBar = el("div", "compaction-bar compaction-interrupted is-open");
-          const head = el("div", "compaction-head");
-          head.appendChild(el("span", "compaction-status-icon", "!"));
-          head.appendChild(el("span", "compaction-title",
-            (rec.scope === "session" ? "跨轮历史" : "本轮工具轨迹") + "压缩已中断，将在下次请求重新执行"));
-          interruptedBar.appendChild(head);
-          if (rec.content) {
-            const body = el("div", "compaction-body");
-            const pre = el("pre", "compaction-preview", rec.content);
-            body.appendChild(pre);
-            interruptedBar.appendChild(body);
-          }
-          chatInner.appendChild(interruptedBar);
-          return;
-        }
-        const compactionPayload = {
-          scope: rec.scope,
-          phase: rec.phase,
-          compress_context: rec.phase === "start" ? rec.content : "",
-          context_summary: rec.phase === "start" ? rec.content : "",
-          // done 记录携带最终摘要全文，刷新后仍可在压缩块中回放
-          summary_text: rec.phase === "done" ? (rec.summary_text || "") : "",
-          compress_usage: rec.scope === "round" ? rec.usage : null,
-          summary_usage: rec.scope === "session" ? rec.usage : null,
-          before_tokens: rec.before_tokens,
-          after_tokens: rec.after_tokens,
-          compress_index: rec.compress_index,
-          block_count: rec.block_count,
-          error: rec.error || "",
-        };
-        const scope = compactionPayload.scope === "session" ? "session" : "round";
-        const pendingQueue = pendingCompactions[scope];
-        const compactionUsage = compactionPayload.compress_usage || compactionPayload.summary_usage;
-        const isMergeEvent = compactionUsage && Number(compactionUsage.merge_block_count) > 0;
-        if (compactionPayload.phase === "aborted") {
-          // 失败记录：把此前未闭合的运行块转为失败态（无则直接新建失败块）
-          appendTime(rec.ts);
-          if (pendingQueue && pendingQueue.length) {
-            pendingQueue.shift().update({ phase: "aborted", error: compactionPayload.error });
-            pendingCompactions[scope] = [];
-          } else {
-            const failedUi = buildCompactionBlock(compactionPayload);
-            chatInner.appendChild(failedUi.wrap);
-          }
-          return;
-        }
-        if (compactionPayload.phase === "done" && !isMergeEvent && pendingQueue && pendingQueue.length) {
-          pendingQueue.shift().update(compactionPayload);
-          if (!pendingQueue.length) delete pendingCompactions[scope];
-          return;
-        }
-        appendTime(rec.ts);
-        const compactionUi = buildCompactionBlock(compactionPayload);
-        chatInner.appendChild(compactionUi.wrap);
-        if (compactionPayload.phase === "start") {
-          (pendingCompactions[scope] = pendingCompactions[scope] || []).push(compactionUi);
-        }
-        return;
-      }
-    });
+  // 欠账记录：渲染它需要其配对记录位于同段更早位置——toolResult 依赖同名
+  // tool 调用；压缩 done/aborted 依赖 start（interrupted 中断态独立展示，
+  // 不进配对）。段边界切开它们会产生「有结果无调用」的孤儿块
+  function isDependentRecord(rec) {
+    if (!rec) return false;
+    if (rec.kind === "toolResult") return true;
+    return rec.kind === "compaction" && !rec.interrupted && rec.phase !== "start";
+  }
 
-    // 没有等到结果的工具（历史中断）也标记结束
+  // 段尾安全消费数量：从 start 起最多 budget 条，段尾若恰好压在欠账记录上
+  // 则后移（把欠账记录连着前面的配对拉进本段）。返回本段消费的记录数
+  // （注意：此前版本把绝对下标当数量返回，初始切割 start 被算成 0，
+  // 表现为打开长会话只显示开头一段、后续内容无加载路径——已修复）
+  function pendingQueueSafeEnd(records, start, budget) {
+    let end = Math.min(records.length, start + budget);
+    while (end < records.length && isDependentRecord(records[end])) end += 1;
+    return end - start;
+  }
+
+  // 段头安全下标：段头若落在欠账记录上则前移（把欠账记录及其配对调用
+  // 拉进本段）。跨段边界的尾部安全由已渲染段的头边界规则保证
+  function pendingQueueSafeStart(records, start) {
+    while (start > 0 && isDependentRecord(records[start])) start -= 1;
+    return start;
+  }
+
+  // 本段渲染后通用收尾：未被结果配对的工具块（分段尾部/历史中断遗留）统一
+  // finish 置为完成态；初始渲染把末尾分段固定在屏幕底部（flushRenderedTail
+  // 内部处理），并对分段尾与新段头部共同组成的边界闭环 finish
+  function finishUnmatchedTools(pendingTools) {
     Object.keys(pendingTools).forEach(function (name) {
       pendingTools[name].forEach(function (ui) { ui.finish(); });
     });
+  }
+
+  // 渲染历史记录（工具调用与结果按名称顺序配对）
+  // 每条 record 渲染产生的新节点统一打 data-round（1-based 轮次号，
+  // 与后端 delete_rounds 的 start_round 同口径），供用户消息编辑/删除定位
+
+  // 单条记录渲染（容器参数化，主渲染与「加载更早消息」分段共用同一实现，
+  // 避免双份渲染逻辑漂移）。container 为 chatInner 时行为与历史版本一致；
+  // 配对队列 pendingTools/pendingCompactions 由调用方提供（主渲染与分段
+  // 回灌各自持有一套，互不串扰）
+  function renderOneRecordInto(container, rec, pendingTools, pendingCompactions) {
+    if (rec.kind === "user") {
+      appendUserMessage(rec.content, rec.ts, null, null, container, rec.round);
+      return;
+    }
+    if (rec.kind === "think") {
+      appendTimeInto(container, rec.ts);
+      const think = buildThinkBlock();
+      think.setText(rec.content);
+      container.appendChild(think.wrap);
+      return;
+    }
+    if (rec.kind === "assistant") {
+      appendTimeInto(container, rec.ts);
+      const body = el("div", "msg-assistant-body");
+      body.innerHTML = Markdown.render(rec.content);
+      highlightCodeBlocks(body);
+      container.appendChild(body);
+      return;
+    }
+    if (rec.kind === "tool") {
+      appendTimeInto(container, rec.ts);
+      const ui = buildToolBlock(rec.name);
+      ui.setInput(FormatUtils.prettyJson(rec.args));
+      container.appendChild(ui.wrap);
+      // ask_user 历史记录附一张可点击的提问卡片：刷新后仍能重新打开回答窗口
+      if (rec.name === App.ASK_USER_TOOL_NAME) {
+        const askQuestions = App.parseAskQuestionsFromArgs(rec.args);
+        if (askQuestions) container.appendChild(App.buildAskBlock(askQuestions));
+      }
+      (pendingTools[rec.name] = pendingTools[rec.name] || []).push(ui);
+      return;
+    }
+    if (rec.kind === "toolResult") {
+      const queue = pendingTools[rec.name];
+      let ui = queue && queue.shift();
+      if (!ui) {
+        appendTimeInto(container, rec.ts);
+        ui = buildToolBlock(rec.name);
+        ui.setInput(FormatUtils.prettyJson(rec.args));
+        container.appendChild(ui.wrap);
+      }
+      applyToolResult(ui, rec.name, rec.result, rec.file_diff);
+      ui.finish();
+      return;
+    }
+    if (rec.kind === "usage") {
+      container.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage)));
+      return;
+    }
+    if (rec.kind === "agentBlock") {
+      // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
+      appendTimeInto(container, rec.started_at);
+      const agentUi = buildSubAgentBlock();
+      agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit });
+      agentUi.hydrate(rec);
+      agentUi.markReturned(rec);
+      container.appendChild(agentUi.wrap);
+      return;
+    }
+    if (rec.kind === "notice") {
+      container.appendChild(el("div", "notice-bar", rec.content));
+      return;
+    }
+    if (rec.kind === "compaction") {
+      // 任务中断遗留的未完成压缩（有 start、无 done）：置为中断态展示，
+      // 未覆盖的轮次由后端在下次请求按需重新压缩
+      if (rec.interrupted) {
+        appendTimeInto(container, rec.ts);
+        const interruptedBar = el("div", "compaction-bar compaction-interrupted is-open");
+        const head = el("div", "compaction-head");
+        head.appendChild(el("span", "compaction-status-icon", "!"));
+        head.appendChild(el("span", "compaction-title",
+          (rec.scope === "session" ? "跨轮历史" : "本轮工具轨迹") + "压缩已中断，将在下次请求重新执行"));
+        interruptedBar.appendChild(head);
+        if (rec.content) {
+          const body = el("div", "compaction-body");
+          const pre = el("pre", "compaction-preview", rec.content);
+          body.appendChild(pre);
+          interruptedBar.appendChild(body);
+        }
+        container.appendChild(interruptedBar);
+        return;
+      }
+      const compactionPayload = {
+        scope: rec.scope,
+        phase: rec.phase,
+        compress_context: rec.phase === "start" ? rec.content : "",
+        context_summary: rec.phase === "start" ? rec.content : "",
+        // done 记录携带最终摘要全文，刷新后仍可在压缩块中回放
+        summary_text: rec.phase === "done" ? (rec.summary_text || "") : "",
+        compress_usage: rec.scope === "round" ? rec.usage : null,
+        summary_usage: rec.scope === "session" ? rec.usage : null,
+        before_tokens: rec.before_tokens,
+        after_tokens: rec.after_tokens,
+        compress_index: rec.compress_index,
+        block_count: rec.block_count,
+        error: rec.error || "",
+      };
+      const scope = compactionPayload.scope === "session" ? "session" : "round";
+      const pendingQueue = pendingCompactions[scope];
+      const compactionUsage = compactionPayload.compress_usage || compactionPayload.summary_usage;
+      const isMergeEvent = compactionUsage && Number(compactionUsage.merge_block_count) > 0;
+      if (compactionPayload.phase === "aborted") {
+        // 失败记录：把此前未闭合的运行块转为失败态（无则直接新建失败块）
+        appendTimeInto(container, rec.ts);
+        if (pendingQueue && pendingQueue.length) {
+          pendingQueue.shift().update({ phase: "aborted", error: compactionPayload.error });
+          pendingCompactions[scope] = [];
+        } else {
+          const failedUi = buildCompactionBlock(compactionPayload);
+          container.appendChild(failedUi.wrap);
+        }
+        return;
+      }
+      if (compactionPayload.phase === "done" && !isMergeEvent && pendingQueue && pendingQueue.length) {
+        pendingQueue.shift().update(compactionPayload);
+        if (!pendingQueue.length) delete pendingCompactions[scope];
+        return;
+      }
+      appendTimeInto(container, rec.ts);
+      const compactionUi = buildCompactionBlock(compactionPayload);
+      container.appendChild(compactionUi.wrap);
+      if (compactionPayload.phase === "start") {
+        (pendingCompactions[scope] = pendingCompactions[scope] || []).push(compactionUi);
+      }
+      return;
+    }
+  }
+
+  function renderRecords(records, replayState) {
+    // 渲染上下文（分段渲染状态）：replayState 为 null/缺省表示流式收尾、
+    // 编辑重发等对已打开会话的增量回放（记录数少、直接全量渲染，不贴底）；
+    // 初始全量渲染走分段并承担贴底/加载更早消息职责
+    const ctx = replayState === null ? { initial: false } : { initial: true };
+    if (replayState) Object.assign(ctx, replayState);
+    const pendingTools = {}; // name -> [tool ui]
+    const pendingCompactions = {}; // scope -> [尚未完成的压缩 ui]
+    function renderOneRecord(rec) {
+      renderOneRecordInto(chatInner, rec, pendingTools, pendingCompactions);
+    }
+
+    // 初始全量渲染走分段：只画末尾一段，之前的记录留给「加载更早消息」；
+    // 增量渲染（replayState === null）记录数一般很小，直接全量且不贴底。
+    const isInitialRender = ctx.initial;
+    let slice = records;
+    if (isInitialRender && records.length > RENDER_TAIL_RECORDS) {
+      const tailCount = pendingQueueSafeEnd(records, records.length - RENDER_TAIL_RECORDS, RENDER_TAIL_RECORDS);
+      const start = pendingQueueSafeStart(records, records.length - tailCount);
+      ctx.loadOlder = {
+        records: records,
+        start: start,
+      };
+      slice = records.slice(start);
+      loadOlderState.records = records;
+      loadOlderState.start = start;
+    } else {
+      // 增量回放 / 记录数少的初始渲染：清掉上一会话的分段状态（进行中的
+      // 后台回填循环据此在下一次调度校验时发现 records 已更换并停止）
+      loadOlderState.records = null;
+      loadOlderState.start = 0;
+    }
+
+    let rendered = 0;
+    const doRenderBatch = function (batchSize) {
+      const count = rendered >= slice.length ? 0 : pendingQueueSafeEnd(slice, rendered, batchSize);
+      for (let i = 0; i < count; i += 1) {
+        const rec = slice[rendered + i];
+        const before = chatInner.childNodes.length;
+        renderOneRecord(rec);
+        if (rec.round == null) continue;
+        for (let k = before; k < chatInner.childNodes.length; k += 1) {
+          const node = chatInner.childNodes[k];
+          if (node.nodeType === 1) node.setAttribute("data-round", String(rec.round));
+        }
+      }
+      rendered += count;
+      return count;
+    };
+
+    doRenderBatch(RENDER_TAIL_RECORDS);
+
+    // 没有等到结果的工具（历史中断）也标记结束
+    finishUnmatchedTools(pendingTools);
     // 历史渲染完成后刷新提问卡片可答性（带后续对话的旧提问不可再答）
     App.refreshAskBlockStates();
+    if (isInitialRender) {
+      flushRenderedTail(ctx);
+    }
+  }
+
+  // 「加载更早消息」细条（renderRecords 分段时插在聊天流顶部，styles 见
+  // _chat.scss .qnav-load-older）：初始显示末尾对话后，**后台渐进回填**会
+  // 自动把更早记录全部补齐（批间让出主线程保持流畅）；点击/向上滚动触及
+  // 细条可立即优先触发下一批，无需等待后台节奏
+  function createLoadOlderButton() {
+    const button = el("button", "qnav-load-older");
+    button.type = "button";
+    button.title = "加载更早的消息";
+    button.setAttribute("aria-label", "加载更早的消息");
+    button.addEventListener("click", function () {
+      scheduleBackfill(0);
+    });
+    if (typeof IntersectionObserver !== "undefined") {
+      const observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) scheduleBackfill(0);
+        });
+      }, { root: chatScroll, rootMargin: "120px 0px 0px 0px" });
+      observer.observe(button);
+    }
+    return button;
+  }
+
+  // 触发一次更早分段的渲染（共享并发锁；细条 loading 态在这里统一管理）。
+  // 全部补齐后细条隐藏
+  async function runOlderBatch() {
+    const button = loadOlderState.button;
+    if (loadOlderState.loading || !loadOlderState.records) return;
+    if (loadOlderState.start <= 0) {
+      if (button) button.classList.add("is-hidden");
+      return;
+    }
+    loadOlderState.loading = true;
+    if (button) button.classList.add("is-loading");
+    try {
+      await renderOlderBatch();
+    } finally {
+      loadOlderState.loading = false;
+      if (button) button.classList.remove("is-loading");
+      if (loadOlderState.start <= 0 && button) button.classList.add("is-hidden");
+    }
+  }
+
+  // 后台渐进回填调度：批次间隔 idle 延时（批间让出主线程），链式直到全部
+  // 记录渲染完——用户无需反复上滚，最终整段历史全部可见。会话切换的判定：
+  // 调度闭包持有发起时的 records 引用，renderRecords 换会话会整体替换该
+  // 引用，二者不同即说明已切走，立即停止（新会话自会启动自己的回填）
+  function scheduleBackfill(delay) {
+    if (loadOlderState.timer != null) return;
+    if (!loadOlderState.records || loadOlderState.start <= 0) {
+      const button = loadOlderState.button;
+      if (button && loadOlderState.start <= 0) button.classList.add("is-hidden");
+      return;
+    }
+    const myRecords = loadOlderState.records;
+    loadOlderState.timer = window.setTimeout(async function () {
+      loadOlderState.timer = null;
+      if (loadOlderState.records !== myRecords) return; // 已切走
+      const remainBefore = loadOlderState.start;
+      await runOlderBatch();
+      if (loadOlderState.records !== myRecords) return;
+      if (loadOlderState.start < remainBefore && loadOlderState.start > 0) {
+        scheduleBackfill(BACKFILL_IDLE_DELAY);
+      }
+    }, delay || BACKFILL_IDLE_DELAY);
+  }
+
+  // 追加更早的一段记录：插到当前聊天流最前面（保持时间顺序），以原首条
+  // 消息为锚回拨视口保持阅读位置不跳变；分段边界按 pendingQueueSafeEnd
+  // 前置回灌，保证调用/结果配对不被切开
+  async function renderOlderBatch() {
+    if (!loadOlderState.records) return;
+    // 段头回退：落点若是欠账记录（toolResult/压缩 done），连同其配对调用
+    // 一起拉进本段（只向更早方向回退，不会越过已渲染区间，无重复渲染）
+    const targetStart = pendingQueueSafeStart(
+      loadOlderState.records,
+      Math.max(0, loadOlderState.start - RENDER_OLDER_BATCH)
+    );
+    if (targetStart >= loadOlderState.start) return;
+    const count = pendingQueueSafeEnd(loadOlderState.records, targetStart, loadOlderState.start - targetStart);
+    // 锚点：当前聊天流首条真实消息（跳过顶部的「加载更早消息」细条）
+    let anchorNode = chatInner.firstElementChild;
+    while (anchorNode && anchorNode.classList.contains("qnav-load-older")) {
+      anchorNode = anchorNode.nextElementSibling;
+    }
+    const pendingTools = {}; // 本段内部配对用（与主渲染队列隔离）
+    const pendingCompactions = {};
+    const segment = loadOlderState.records.slice(targetStart, targetStart + count);
+    const frag = document.createDocumentFragment();
+    segment.forEach(function (rec) {
+      const before = frag.childNodes.length;
+      renderOneRecordInto(frag, rec, pendingTools, pendingCompactions);
+      if (rec.round == null) return;
+      for (let k = before; k < frag.childNodes.length; k += 1) {
+        const node = frag.childNodes[k];
+        if (node.nodeType === 1) node.setAttribute("data-round", String(rec.round));
+      }
+    });
+    // 分段尾部未配对的工具块置完成态
+    finishUnmatchedTools(pendingTools);
+    chatInner.insertBefore(frag, anchorNode || chatInner.firstChild);
+    loadOlderState.start = targetStart;
+    // 插入把锚点（及其下方内容）下推：按锚点位移回拨 scrollTop，视口内
+    // 阅读位置保持不变；content-visibility 下新内容进入视口附近即真实渲染
+    if (anchorNode && anchorNode.parentNode === chatInner) {
+      const delta = anchorNode.getBoundingClientRect().top - chatScroll.getBoundingClientRect().top;
+      if (delta > 0) {
+        const prev = chatScroll.style.scrollBehavior;
+        chatScroll.style.scrollBehavior = "auto";
+        chatScroll.scrollTop += delta;
+        chatScroll.style.scrollBehavior = prev;
+      }
+    }
+    App.rebuildQnav();
+    App.updateCodeblockCopyButtons();
+    // 回灌段可能包含 ask_user 卡片：与主渲染收尾同口径刷新可答性
+    App.refreshAskBlockStates();
+  }
+
+  // 初始渲染收尾：有分段时先在聊天流顶部插入「加载更早消息」细条，再瞬跳
+  // 到底——并启动后台渐进回填（无需滚动/点击，剩余记录自动分批补全直到
+  // 整段历史全部显示；scrollToBottom(true) 内部已临时覆盖 scroll-behavior，
+  // content-visibility 懒高度回填由其内部下一帧复位兜底）
+  function flushRenderedTail(ctx) {
+    if (ctx.loadOlder) {
+      const button = createLoadOlderButton();
+      loadOlderState.button = button;
+      chatInner.insertBefore(button, chatInner.firstChild);
+      scheduleBackfill(BACKFILL_IDLE_DELAY);
+    }
+    scrollToBottom(true);
   }
 
   function appendTime(ts) {
     if (!ts) return;
     chatInner.appendChild(el("div", "msg-time stage-time", FormatUtils.fmtTime(ts)));
+  }
+
+  // 时间行（容器参数化版本，renderOneRecordInto 配套）
+  function appendTimeInto(container, ts) {
+    if (!ts) return;
+    container.appendChild(el("div", "msg-time stage-time", FormatUtils.fmtTime(ts)));
   }
 
   // 压缩进度块：与思考/工具块保持一致。开始态可展开查看待压缩内容预览，
@@ -391,9 +640,7 @@
   // 首帧（浏览器原生 <video>，#t=0.1 确保首帧绘制）；input_audio 渲染固定
   // 格式音频徽标；docs 为发送时随消息的会话文档快照（file_memory，仅前端
   // 展示，不进入消息内容部件）
-  function appendUserMessage(content, ts, sessionId, docs, container) {
-    const msg = el("div", "msg msg-user");
-    if (ts) msg.appendChild(el("div", "msg-time", FormatUtils.fmtTime(ts)));
+  function buildUserBubble(content, sessionId, docs) {
     const bubble = el("div", "msg-bubble");
     const parts = Array.isArray(content) ? content : null;
     let text = String(content == null ? "" : content);
@@ -475,7 +722,20 @@
       if (mediaRow.childNodes.length) bubble.appendChild(mediaRow);
     }
     if (text) bubble.appendChild(el("div", "msg-user-text", text));
-    msg.appendChild(bubble);
+    return bubble;
+  }
+
+  function appendUserMessage(content, ts, sessionId, docs, container, round) {
+    const msg = el("div", "msg msg-user");
+    if (ts) msg.appendChild(el("div", "msg-time", FormatUtils.fmtTime(ts)));
+    msg.appendChild(buildUserBubble(content, sessionId, docs));
+    // 历史轮次的用户消息：记录原始内容供编辑态回填，并挂 hover「编辑」入口。
+    // round 为 null（实时发送）时编辑入口在收尾重载后随历史回放出现
+    if (round != null) {
+      msg.dataset.round = String(round);
+      msg._editData = { content: content, round: round };
+      attachUserEditAction(msg);
+    }
     // container 缺省追加到会话流末尾；传入正在流式的助手消息节点时，
     // 气泡嵌入其当前内容之后（工具结果位置），保持注入消息的时间顺序
     (container || chatInner).appendChild(msg);
@@ -483,6 +743,331 @@
     // 时不被拉回；整段历史回放后由 history.js 的 scrollToBottom 置底复位
     stickToBottom();
     return msg;
+  }
+
+  // ---------- 用户消息编辑（GPT 网页同款：hover 编辑 → textarea 重发） ----------
+  // 与 GPT 的差异：重发时提供两种删除范围——「重新生成该轮」（原地替换该轮，
+  // 之后的轮次保留）与「删除该轮及之后」（GPT 语义，后续轮次一并删除）。
+  // 后端按 data-round 精确删除 JSONL 轮次并清理不再引用的用户上传附件。
+
+  // ---------- 用户消息操作行（独立一行，SVG 图标按钮）：复制 / 编辑 ----------
+  // 复制：把该消息原始文本回填到剪贴板；编辑：进入编辑态。
+  // 与 GPT 网页的差异：重发时提供两种删除范围（重新生成该轮 / 删除该轮及之后）。
+
+  const EDIT_COPY_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const EDIT_PENCIL_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
+  const EDIT_CHECK_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M20 6 9 17l-5-5"/></svg>';
+
+  function attachUserEditAction(msg) {
+    const actions = el("div", "msg-user-actions");
+
+    const copyBtn = el("button", "msg-user-action-btn msg-user-copy-btn");
+    copyBtn.type = "button";
+    copyBtn.title = "复制";
+    copyBtn.innerHTML = EDIT_COPY_ICON + '<span class="msg-user-action-label">复制</span>';
+    copyBtn.addEventListener("click", function () {
+      const data = msg._editData || {};
+      // content 可能是字符串（纯文本消息）或多部件列表（多模态消息）
+      const text = contentToPlainText(data.content);
+      if (!text) { App.toast("该消息没有可复制的文本"); return; }
+      const done = function () {
+        copyBtn.classList.add("copied");
+        const label = copyBtn.querySelector(".msg-user-action-label");
+        if (label) label.textContent = "已复制";
+        setTimeout(function () {
+          copyBtn.classList.remove("copied");
+          if (label) label.textContent = "复制";
+        }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {
+          App.toast("复制失败（浏览器未授权剪贴板）");
+        });
+      } else {
+        // 兼容降级：临时 textarea + execCommand
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); done(); } catch (_) { App.toast("复制失败"); }
+        ta.remove();
+      }
+    });
+
+    const editBtn = el("button", "msg-user-action-btn msg-user-edit-btn");
+    editBtn.type = "button";
+    editBtn.title = "编辑这条消息并重发";
+    editBtn.innerHTML = EDIT_PENCIL_ICON + '<span class="msg-user-action-label">编辑</span>';
+    editBtn.addEventListener("click", function () { beginUserMessageEdit(msg); });
+
+    actions.appendChild(copyBtn);
+    actions.appendChild(editBtn);
+    msg.appendChild(actions);
+  }
+
+  // 从历史 content 部件提取附件项（media:// 引用，直接复用无需重新上传）
+  function extractUserMediaItems(content) {
+    const items = [];
+    (Array.isArray(content) ? content : []).forEach(function (part) {
+      if (!part || typeof part !== "object") return;
+      const type = part.type || "";
+      let ref = "";
+      if (type === "image_url" && part.image_url) ref = part.image_url.url || "";
+      else if (type === "video_url" && part.video_url) ref = part.video_url.url || "";
+      else if (type === "input_audio" && part.input_audio) ref = part.input_audio.data || "";
+      if (typeof ref !== "string" || ref.indexOf("media://") !== 0) return;
+      const stored = ref.slice("media://".length);
+      const dot = stored.lastIndexOf(".");
+      items.push({
+        kind: type === "image_url" ? "image" : type === "video_url" ? "video" : "audio",
+        media_ref: ref,
+        stored_name: stored,
+        format: dot > 0 ? stored.slice(dot + 1).toLowerCase() : "",
+      });
+    });
+    return items;
+  }
+
+  // content 正文提取（单一入口）：字符串原样返回；多部件列表取 text 部件
+  // 拼接。编辑回填、复制按钮共用——纯文本消息 content 是字符串而非数组，
+  // 此前两处分别各自实现导致字符串分支漏掉（编辑框不回填/复制按钮失效）
+  function contentToPlainText(content) {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return content == null ? "" : String(content);
+    return content
+      .map(function (part) {
+        return part && part.type === "text" && typeof part.text === "string" ? part.text : "";
+      })
+      .join("\n");
+  }
+
+  function beginUserMessageEdit(msg) {
+    if (!msg || !msg._editData || msg.classList.contains("is-editing")) return;
+    // 编辑只对静态历史有意义：本会话正在流式时禁止（轮次收尾前删除会被拒绝）
+    if (App.state.streaming && App.state.streamingSession === App.state.sessionId) {
+      App.toast("会话正在生成回复，请等待完成或停止后再编辑");
+      return;
+    }
+    const data = msg._editData;
+    const originalText = contentToPlainText(data.content);
+    const mediaItems = extractUserMediaItems(data.content);
+
+    msg.classList.add("is-editing");
+    msg._editRestore = msg.querySelector(".msg-bubble");
+    if (msg._editRestore) msg._editRestore.style.display = "none";
+
+    const panel = el("div", "msg-bubble msg-edit-bubble");
+    const textarea = el("textarea", "msg-edit-textarea");
+    textarea.value = originalText;
+    textarea.rows = Math.min(10, Math.max(2, originalText.split("\n").length));
+    textarea.placeholder = "编辑消息内容…";
+
+    // 附件芯片（在输入框上方，GPT 编辑态同款）：可移除，原样复用 media:// 引用
+    // 不重新上传；图片/视频显示缩略图，音频显示徽标
+    const keptMedia = mediaItems.slice();
+    const mediaRow = el("div", "msg-edit-media-row");
+    function renderMediaRow() {
+      mediaRow.innerHTML = "";
+      keptMedia.forEach(function (item, index) {
+        const chip = el("span", "msg-edit-chip");
+        const remove = el("button", "msg-edit-chip-remove", "×");
+        remove.type = "button";
+        remove.title = "移除该附件";
+        remove.addEventListener("click", function () {
+          keptMedia.splice(index, 1);
+          renderMediaRow();
+        });
+        const src = App.resolveMediaSrc(item.media_ref, App.state.sessionId);
+        if (item.kind === "image" && src) {
+          const thumb = el("img", "msg-edit-chip-thumb");
+          thumb.src = src;
+          thumb.alt = "附件图片";
+          chip.appendChild(thumb);
+          chip.appendChild(el("span", "msg-edit-chip-name", chipShortName(item.stored_name)));
+          // 点击预览（编辑态同样支持，与消息气泡缩略图一致）
+          chip.classList.add("clickable");
+          chip.title = "点击预览";
+          chip.addEventListener("click", function () {
+            App.openMediaPreview({ type: "image", src: src, title: "图片" });
+          });
+        } else if (item.kind === "video" && src) {
+          const thumb = el("video", "msg-edit-chip-thumb");
+          thumb.src = src + "#t=0.1";
+          thumb.muted = true;
+          thumb.preload = "metadata";
+          thumb.playsInline = true;
+          chip.appendChild(thumb);
+          chip.appendChild(el("span", "msg-edit-chip-name", "🎬 " + chipShortName(item.stored_name)));
+          chip.classList.add("clickable");
+          chip.title = "点击播放";
+          chip.addEventListener("click", function () {
+            App.openMediaPreview({ type: "video", src: src, title: "视频" });
+          });
+        } else if (item.kind === "audio" && src) {
+          chip.appendChild(el("span", "msg-edit-chip-name", mediaChipLabel(item.media_ref, "🎵")));
+          chip.classList.add("clickable");
+          chip.title = "点击收听";
+          chip.addEventListener("click", function () {
+            App.openMediaPreview({ type: "audio", src: src, title: "音频" });
+          });
+        } else {
+          chip.appendChild(el("span", "msg-edit-chip-name", mediaChipLabel(item.media_ref, "🎵")));
+        }
+        chip.appendChild(remove);
+        mediaRow.appendChild(chip);
+      });
+      mediaRow.style.display = keptMedia.length ? "" : "none";
+    }
+    renderMediaRow();
+    panel.appendChild(mediaRow);
+    panel.appendChild(textarea);
+
+    const foot = el("div", "msg-edit-foot");
+    const modes = el("div", "msg-edit-modes");
+    let mode = "regen";
+    const regenBtn = el("button", "msg-edit-mode selected", "重新生成该轮");
+    const truncateBtn = el("button", "msg-edit-mode", "删除该轮及之后");
+    regenBtn.type = "button";
+    truncateBtn.type = "button";
+    regenBtn.title = "删除该轮回复后原位重新生成，之后的轮次保留（其上下文不含旧回复）";
+    truncateBtn.title = "删除该轮及其后所有轮次（新回复追加在末尾，GPT 同款语义）";
+    regenBtn.addEventListener("click", function () {
+      mode = "regen";
+      regenBtn.classList.add("selected");
+      truncateBtn.classList.remove("selected");
+    });
+    truncateBtn.addEventListener("click", function () {
+      mode = "truncate";
+      truncateBtn.classList.add("selected");
+      regenBtn.classList.remove("selected");
+    });
+    modes.appendChild(regenBtn);
+    modes.appendChild(truncateBtn);
+    foot.appendChild(modes);
+
+    const buttons = el("div", "msg-edit-buttons");
+    const cancelBtn = el("button", "msg-edit-cancel", "取消");
+    const sendBtn = el("button", "msg-edit-send", "发送");
+    cancelBtn.type = "button";
+    sendBtn.type = "button";
+
+    // 面板内确认条（复用 plans 区域）：发送/取消防误触的统一入口
+    function showPlanConfirm(message, confirmLabel, onConfirm) {
+      const area = panel._planArea;
+      if (!area) { onConfirm(); return; }
+      panel._confirmShown = true;
+      area.innerHTML = "";
+      const box = el("div", "msg-edit-confirm");
+      box.appendChild(el("div", "msg-edit-confirm-desc", message));
+      const actions = el("div", "msg-edit-confirm-actions");
+      const cancel = el("button", "msg-edit-cancel", "取消");
+      const ok = el("button", "msg-edit-send", confirmLabel);
+      cancel.type = "button";
+      ok.type = "button";
+      cancel.addEventListener("click", function () {
+        panel._confirmShown = false;
+        area.innerHTML = "";
+      });
+      ok.addEventListener("click", function () {
+        ok.disabled = true;
+        onConfirm();
+      });
+      actions.appendChild(cancel);
+      actions.appendChild(ok);
+      box.appendChild(actions);
+      area.appendChild(box);
+    }
+
+    // 编辑是否产生过改动（文本或附件集合任一变化即视为已编辑）
+    function isEdited() {
+      if (textarea.value !== originalText) return true;
+      if (keptMedia.length !== mediaItems.length) return true;
+      return keptMedia.some(function (item, index) {
+        return !mediaItems[index] || mediaItems[index].stored_name !== item.stored_name;
+      });
+    }
+
+    cancelBtn.addEventListener("click", function () {
+      if (!isEdited()) {
+        // 内容未变：直接退出，不打扰
+        exitUserMessageEdit(msg);
+        return;
+      }
+      // 内容已改：防误触确认（放弃将丢失本次编辑）
+      showPlanConfirm("修改尚未发送，确认放弃本次修改？", "放弃修改", function () {
+        exitUserMessageEdit(msg);
+      });
+    });
+    // Esc 等全局取消入口共用同一防误触规则（未改直接退出，改了先确认）；
+    // 确认条已弹出时再按 Esc 视为「确认放弃」直接退出，避免二次弹窗死循环
+    panel._requestCancel = function () {
+      if (panel._confirmShown) { exitUserMessageEdit(msg); return; }
+      if (!isEdited()) { exitUserMessageEdit(msg); return; }
+      showPlanConfirm("修改尚未发送，确认放弃本次修改？", "放弃修改", function () {
+        exitUserMessageEdit(msg);
+      });
+    };
+    sendBtn.addEventListener("click", function () {
+      const text = textarea.value.trim();
+      if (!text && !keptMedia.length) {
+        App.toast("消息内容不能为空");
+        return;
+      }
+      if (mode === "truncate") {
+        // 删除该轮及之后：confirmEditResend 内部先 dry_run 展示明细再确认
+        App.confirmEditResend({
+          msg: msg,
+          round: data.round,
+          text: text,
+          media: keptMedia,
+          mode: mode,
+        });
+        return;
+      }
+      // 重新生成该轮：发送前轻量确认（旧回复将被替换，防手抖误触）
+      showPlanConfirm("将以当前内容重新生成该轮，旧回复将被替换。", "确认发送", function () {
+        App.confirmEditResend({
+          msg: msg,
+          round: data.round,
+          text: text,
+          media: keptMedia,
+          mode: mode,
+        });
+      });
+    });
+    buttons.appendChild(cancelBtn);
+    buttons.appendChild(sendBtn);
+    foot.appendChild(buttons);
+    panel.appendChild(foot);
+
+    const planArea = el("div", "msg-edit-plans");
+    panel.appendChild(planArea);
+    // 预演结果展示区（confirmEditResend 填充）：确认后执行真实删除
+    panel._planArea = planArea;
+    panel._getText = function () { return textarea.value.trim(); };
+    panel._getMedia = function () { return keptMedia.slice(); };
+
+    msg.appendChild(panel);
+    textarea.focus();
+    textarea.selectionStart = textarea.value.length;
+    App.autosize && App.autosize();
+  }
+
+  function exitUserMessageEdit(msg) {
+    if (!msg || !msg.classList.contains("is-editing")) return;
+    const panel = msg.querySelector(".msg-edit-bubble");
+    if (panel) panel.remove();
+    if (msg._editRestore) msg._editRestore.style.display = "";
+    msg._editRestore = null;
+    msg.classList.remove("is-editing");
   }
 
   // 媒体徽标文案：固定格式（图标+类型+名称），名称取 media:// 引用的存储文件名
@@ -493,6 +1078,14 @@
       return icon + " · " + (dot > 0 ? stored.slice(0, dot) : stored);
     }
     return icon;
+  }
+
+  // 附件芯片短名：stored_name 去扩展名，超长截断（缩略图芯片用）
+  function chipShortName(stored) {
+    if (!stored) return "附件";
+    const dot = stored.lastIndexOf(".");
+    const base = dot > 0 ? stored.slice(0, dot) : stored;
+    return base.length > 24 ? base.slice(0, 24) + "…" : base;
   }
 
   function appendStaticAssistant(content) {
@@ -2296,15 +2889,23 @@
   function updateCodeblockCopyButtons() {
     const scrollRect = chatScroll.getBoundingClientRect();
     const pinY = scrollRect.top + COPY_PIN_OFFSET;
-    chatInner.querySelectorAll(".codeblock .copy-btn").forEach(function (btn) {
-      const block = btn.closest(".codeblock");
-      const blockRect = block.getBoundingClientRect();
+    const buttons = chatInner.querySelectorAll(".codeblock .copy-btn");
+    // 读写分离：先对全部按钮一口气收集 rect（阶段一，纯读不触发写回布局），
+    // 再统一计算并写 class/样式（阶段二，纯写）。避免此前「逐个 rect 读 →
+    // 写 class → 下一个再读」交替造成的强制同步布局抖动（长会话滚动卡顿主因）
+    const rects = new Array(buttons.length);
+    for (let i = 0; i < buttons.length; i++) {
+      rects[i] = buttons[i].closest(".codeblock").getBoundingClientRect();
+    }
+    for (let i = 0; i < buttons.length; i++) {
+      const btn = buttons[i];
+      const blockRect = rects[i];
       const btnH = btn.offsetHeight || 28;
       // 代码块在视口内的可见高度（含下边框可见部分）
       const visible = Math.min(blockRect.bottom, scrollRect.bottom) - Math.max(blockRect.top, scrollRect.top);
       if (visible < btnH) {
         btn.classList.add("is-hidden");
-        return;
+        continue;
       }
       btn.classList.remove("is-hidden");
 
@@ -2325,7 +2926,7 @@
         btn.classList.remove("is-pinned");
         btn.style.removeProperty("--pin-shift");
       }
-    });
+    }
   }
 
   scrollBottomBtn.addEventListener("click", scrollToBottom);
@@ -2338,6 +2939,24 @@
   App.buildCompactionBlock = buildCompactionBlock;
   App.highlightCodeBlocks = highlightCodeBlocks;
   App.appendUserMessage = appendUserMessage;
+  App.attachUserEditAction = attachUserEditAction;
+  App.exitUserMessageEdit = exitUserMessageEdit;
+  // confirmEditResend 定义在 chat.js（发送编排）并由其导出，此处不重复赋值：
+  // 若引用本模块不存在的函数名会在加载期抛 ReferenceError 中断整个 IIFE，
+  // 导致后续所有 App.* 导出丢失（历史加载报 xxx is not a function）
+  App.cancelAnyUserEdit = function () {
+    // Esc 等全局入口：取消当前会话所有处于编辑态的用户消息。
+    // 有未发送修改时走面板内确认（panel._requestCancel，与取消按钮同规则），
+    // 无修改直接退出不打扰
+    document.querySelectorAll(".msg.msg-user.is-editing").forEach(function (msg) {
+      const panel = msg.querySelector(".msg-edit-panel");
+      if (panel && typeof panel._requestCancel === "function") {
+        panel._requestCancel();
+        return;
+      }
+      exitUserMessageEdit(msg);
+    });
+  };
   App.buildThinkBlock = buildThinkBlock;
   App.buildToolBlock = buildToolBlock;
   App.applyToolResult = applyToolResult;

@@ -33,7 +33,7 @@
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
-- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `_meta.todo` 同结构数据）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘 `_meta.todo`，当前计划同时注入系统提示词供模型跨轮感知）
+- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
 - `context_compaction`：单轮工具轨迹被压缩后的状态，含 `{scope:"round", before_tokens, after_tokens, fallback, compress_index, block_count, usage}`；`usage` 为压缩模型调用返回的 token 统计（部分服务端不返回时为 null）；新模式 `block_count` 通常为 1 个累计摘要块；工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
 - `context_compaction`（**实时压缩事件**，开始/完成两个阶段，见下方"压缩事件格式"）：单轮与跨轮压缩均实时推送，**同一份 payload 同时落盘 JSONL 独立事件行**（`event="context_compaction"`），保证前端"加载历史"与"实时显示"字段完全一致
@@ -107,12 +107,35 @@
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
 | /chat_history/delete_lines | DELETE | startline(必填,≥1), endline(必填,≥1,包含), session_id | `{state, describe, meta_after, usage_after}`；行号**不含** `_meta` 首行；startline>endline 报 400 |
+| /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs}` | 见下方「按轮次号删除（用户消息编辑重发）」；生成任务运行中报 409 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
 | /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；详见下方「会话分享 / 导入」 |
 | /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
 | /chat_history/import_package | POST | 见下方说明 | 见下方说明 |
 
 > **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/session_files/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。目录原名 `history_files/upload/`（upload 改名为 session_files）。
+
+### POST /chat_history/delete_rounds（按轮次号删除，用户消息编辑重发）
+
+**轮次号口径**：1-based 的第 N 个 `chat_round` 条目（与前端历史渲染 `data-round` 同口径）；游离压缩事件行不占轮次号。生成任务运行中拒绝（409）——pending 轮次在 worker 内存，此刻截断会交错写入。
+
+- **请求体**：
+  - `start_round`(必填)：从第 N 轮开始删；
+  - `mode`：`truncate`=删除该轮及其后所有轮次（编辑重发 GPT 语义）｜`single`=仅删除该轮整轮（用户消息与回复一并删除，后续轮次保留并前移）；
+  - `delete_files`(默认 true)：连带清理该删除范围内引用、且保留内容不再引用的**用户上传附件**（媒体按引用差集精确判定；文档按上传时间窗近似判定）。**不动模型文件版本链与 diff**；
+  - `dry_run`(默认 false)：预演——只返回明细不写盘不删文件；
+  - `keep_media_refs`：清理时排除的媒体 stored_name（编辑重发时被编辑消息的复用附件）。
+- **返回**：dry_run 时 `{state: "planned", planned_rounds: [{round, question, status}], planned_files: {media_files, doc_files}}`；正式执行 `{state: "succeed", removed_rounds, planned_*, files_cleanup: {removed, failed}, meta_after, usage_after}`。
+- **一致性保障**：写盘前生成 `<历史文件>.bak` 侧车备份（覆盖式）；`context_summary` 失效（下次聊天前从剩余原始轮次重建）；meta（usage/user_questions/标题）按剩余条目重算。
+
+**编辑重发两种模式的前端语义**：
+
+| 模式 | 删除范围 | 重发方式 | 上下文语义 |
+|---|---|---|---|
+| `single` + `target_round=N` | 删第 N 轮整轮 | `/chat_with_tool` 带 `target_round: N` 原地重跑 | 上下文截到第 N-1 轮；新回复替换历史第 N 轮位置；后续轮次保留但其历史依据不含旧第 N 轮 |
+| `truncate` + 普通发送 | 删第 N 轮及之后 | 普通发送（追加） | GPT 同款：后续轮次一并删除，新回复追加末尾 |
+
+**`target_round` 原地重跑（ChatLLMRequest 新字段）**：轮次收尾替换历史第 N 轮条目而非追加（用户消息相同则保留原 `started_at`，不同则视为已编辑同样整轮替换）；`get_current_round_number` 覆盖为 N（file_history 版本链 round 标注仍为 N）；`get_context_messages` 截到第 N-1 轮；越界（历史被并发删除）自动降级为追加；任务异常中断时同样按替换式收尾（stopped/interrupted 占据原轮次位置）。旧累计摘要失效后本次任务按原始轮次+截断窗口构建，且任务内**跳过前置压缩**（防旧第 N 轮内容被压进摘要重新进入上下文）。
 
 ### POST /chat_history/upload_chat_file
 接收前端上传的 jsonl 聊天历史文件，按现有格式过滤后保存到 `history_files` 目录。
@@ -349,6 +372,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **Change Diff** = diff(同代上一版本, 本版本)：单次修改；
 - **round** = 用户会话轮次号：「回退到第 N 轮发起时」= 链上 round < N 的最新快照写回磁盘；
 - **keep**：保留封版（历史代锁定不可撤回），以当前内容开新代基线；
+- **keep_all / revert_all**：面板级批量操作——全部保留=逐文件封版（Total 归零、当前代锁定），全部撤回=逐文件回退到各自当前代基线并写回磁盘（历史可在编辑器找回）；单文件失败隔离记入 skipped；
 - **hide_clean**：`/list` 默认隐藏已保留/已全部撤回（Total 无行数变化）的文件；留档清理用 DELETE /delete。
 
 | 方法 | 路径 | 参数 / body | 返回 | 错误 |
@@ -367,9 +391,11 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 | POST | `/file_diff/keep` | `{session_id,key}` | `{ok,kept:true,new_gen,baseline_v,total}`（保留封版：历史代拒绝再撤回） | 400/404 |
 | DELETE | `/file_diff/delete` | session_id, key | `{deleted,key}`（删除该文件版本链目录） | 400 |
 | POST | `/file_diff/cleanup` | `{session_id,clean_only?=true}` | `{removed_count,removed:[{key,path}]}`（批量清理留档：只清已全部保留/撤回的文件链） | — |
+| POST | `/file_diff/keep_all` | `{session_id, cleanup?=true}` | `{kept_count,kept:[{key,path,display_path,new_gen}],skipped:[{...,reason}],cleaned_count?}`（V2.4 全部保留封版：逐文件以当前内容开新代基线；默认顺带清理留档目录；单文件失败记入 skipped 不影响其余） | — |
+| POST | `/file_diff/revert_all` | `{session_id}` | `{reverted_count,reverted:[{...,restored_to,disk_removed}],skipped:[...]}`（V2.4 全部撤回：逐文件回退到各自当前代基线并写回磁盘；新建文件回退到空基线时删除磁盘文件并标记 disk_removed=true） | — |
 
 409 的两种来源：目标版本所在代已 `locked`（keep 后）；`save` 的 expected_hash 与链上最新版本不符（文件读后被外部修改）。
-前端：顶栏「文件变更」按钮（徽标=文件数）→ 统计面板（footer 带清理留档入口）→ 点击文件**新窗口打开独立编辑器页 `H5/editor.html?session_id&key`**（V2.3：全文视图 ctx/add 行可编辑 overlay + Prism 行内高亮，del 红块只读；每 hunk 保留/撤回 +「此处及之后」区间操作；保存 Ctrl+S / 回退基线或任意轮次 / 保留 / 从磁盘刷新；超 2 万行回退紧凑 diff 模式）。
+前端：顶栏「文件变更」按钮（徽标=文件数）→ 统计面板（只显示文件名，hover 见完整路径；footer 带「全部保留 / 全部撤回 / 清理留档」入口，前两者二次确认防误触）→ 点击文件**新窗口打开独立编辑器页 `H5/editor.html?session_id&key`**（V2.3：全文视图 ctx/add 行可编辑 overlay + Prism 行内高亮，del 红块只读；每 hunk 保留/撤回 +「此处及之后」区间操作；保存 Ctrl+S / 回退基线或任意轮次 / 保留 / 从磁盘刷新；超 2 万行回退紧凑 diff 模式）。
 
 ### 模型选择（三种模型 + 参数）
 

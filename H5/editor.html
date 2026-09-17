@@ -18,6 +18,17 @@
       <button type="button" class="fh-btn" id="ehSync"
         title="文件在外部（如 VS Code）被修改过后，点此把最新磁盘内容并入版本链并重算 diff">从磁盘刷新</button>
       <button type="button" class="fh-btn" id="ehKeep" title="保留当前文件并锁定历史（历史版本不可再撤回）">保留</button>
+      <!-- 主题切换：跟随系统 / 浅色 / 深色（与主应用共用同一 localStorage 偏好） -->
+      <select class="fh-round-select eh-theme-select" id="ehThemeSelect" title="界面主题">
+        <option value="system">主题：跟随系统</option>
+        <option value="light">主题：浅色</option>
+        <option value="dark">主题：深色</option>
+      </select>
+      <!-- 差异块导航：按当前滚动位置锚定相邻块头跳转（jumpHunk） -->
+      <button type="button" class="fh-btn eh-hunk-nav" id="ehPrevHunk"
+        title="跳转到上一个差异块">↑ 上一块</button>
+      <button type="button" class="fh-btn eh-hunk-nav" id="ehNextHunk"
+        title="跳转到下一个差异块">↓ 下一块</button>
       <button type="button" class="fh-btn" id="ehClose" title="关闭本窗口（Esc）">关闭</button>
     </div>
   </header>

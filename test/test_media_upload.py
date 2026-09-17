@@ -45,9 +45,13 @@ def _cleanup_test_session():
     chat_file = Path(__file__).resolve().parents[1] / "history_files" / f"{TEST_SESSION}_chat.jsonl"
     if chat_file.exists():
         chat_file.unlink()
-    pending_file = chat_file.with_name(chat_file.name + ".pending")
-    if pending_file.exists():
-        pending_file.unlink()
+    # 检查点侧车在 sidecars/ 子目录（旧版同目录位置也清理，防历史残留）
+    for pending_file in (
+        chat_file.with_name(chat_file.name + ".pending"),
+        chat_file.parent / "sidecars" / (chat_file.name + ".pending"),
+    ):
+        if pending_file.exists():
+            pending_file.unlink()
     try:
         from memory.chat_memory import cleanup_chat_memory_manager
         asyncio.run(cleanup_chat_memory_manager(TEST_SESSION))

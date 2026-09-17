@@ -309,7 +309,10 @@
   reasoningEffort.addEventListener("change", markParamDirty);
   enableThinking.addEventListener("change", markParamDirty);
 
-  enhanceCancel.addEventListener("click", function () { enhancePanel.classList.add("hidden"); });
+  enhanceCancel.addEventListener("click", function () {
+    enhancePanel.classList.add("hidden");
+    if (App.dockEnhancePanel) App.dockEnhancePanel();
+  });
 
   // 恢复默认：按选中模型的 api_type 取预设默认参数（角色默认覆盖协议默认），
   // 后端暂未按 api_type 细分适配，预设先占位，后续随协议设计调整
@@ -347,6 +350,7 @@
     const paramsChanged = state.modelParamDirty;
     if (!modelChanged && !paramsChanged) {
       enhancePanel.classList.add("hidden");
+      if (App.dockEnhancePanel) App.dockEnhancePanel();
       toast("模型与参数均未变化");
       return;
     }
@@ -358,6 +362,7 @@
       // 模型未更换（仅保存参数）时不用后端的"已切换"文案，避免误导
       toast(modelChanged ? (res.message || "已保存") : "模型未更换，参数已保存");
       enhancePanel.classList.add("hidden");
+      if (App.dockEnhancePanel) App.dockEnhancePanel();
       const data = await API.getModels(state.activeModelRole, state.sessionId || undefined);
       if (data) state.modelConfigs[state.activeModelRole] = data;
       App.refreshChatModelLabel();

@@ -369,10 +369,10 @@
     });
   });
 
-  // ---------- 参数面板 ----------
-  // 弹层锚定触发按钮而非输入框容器：多行输入时 composer 变高，CSS 的
-  // bottom: calc(100%+8px) 会把弹层推到容器另一端甚至推出视口；
-  // 打开时按按钮的视口坐标 fixed 定位，与容器高度彻底解耦。
+  // ---------- 弹层锚定工具（"+"功能菜单等仍留在 .composer 内的下拉复用） ----------
+  // 锚定触发按钮而非容器：多行输入时 composer 变高，CSS 的 bottom: calc(100%+8px)
+  // 会把弹层推到容器另一端甚至推出视口；打开时按按钮的视口坐标 fixed 定位，
+  // 与容器高度彻底解耦（enhance-panel 浮层已提升 body 级，见下方 placeEnhancePanel）。
   function placeAbove(el, anchor) {
     const r = anchor.getBoundingClientRect();
     el.classList.add("fixed-flyout");
@@ -382,12 +382,28 @@
     el.style.right = "auto";
   }
 
+  // 参数面板已提升 body 级浮层（见 index.html / _components.scss）：打开时临时
+  // 重挂到 document.body，脱离 .bottom（25）的堆叠上下文后，面板 z-index(110)
+  // 才能压过顶栏 .topbar（26）——否则顶栏累计 token 描述文字会盖住面板。
+  // 关闭时挂回 .composer 原位（首个子节点），保持 DOM 结构与开发调试直观。
+  const enhanceDock = enhancePanel.parentNode || document.body;
+
+  function floatEnhancePanel() {
+    if (enhancePanel.parentNode === document.body) return;
+    document.body.appendChild(enhancePanel);
+  }
+
+  function dockEnhancePanel() {
+    if (enhancePanel.parentNode === enhanceDock) return;
+    enhanceDock.insertBefore(enhancePanel, enhanceDock.firstChild);
+  }
+
   // 参数面板垂直锚定参数按钮（空态向下展开/聊天态向上展开），水平保持与 composer 同宽对齐
   function placeEnhancePanel() {
     const empty = app.classList.contains("empty");
     const btnRect = boostBtn.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
-    enhancePanel.classList.add("fixed-flyout");
+    floatEnhancePanel();
     enhancePanel.style.left = Math.max(8, composerRect.left) + "px";
     enhancePanel.style.width = composerRect.width + "px";
     enhancePanel.style.right = "auto";
@@ -417,10 +433,15 @@
   function toggleEnhancePanel() {
     const opening = enhancePanel.classList.contains("hidden");
     plusMenu.classList.add("hidden");
-    enhancePanel.classList.toggle("hidden");
     if (opening) {
+      // 先显示再 fit（fit 量取面板矩形，隐藏态 rect 为 0）；两者同任务同步执行，
+      // 浏览器在任务结束后才绘制，不存在"先在默认位置闪一帧"的问题
+      enhancePanel.classList.remove("hidden");
       fitEnhancePanel();
       App.openModelPanel();
+    } else {
+      enhancePanel.classList.add("hidden");
+      dockEnhancePanel();
     }
   }
 
@@ -703,6 +724,7 @@
   App.refreshComposerButtons = refreshComposerButtons;
   App.autosize = autosize;
   App.fitEnhancePanel = fitEnhancePanel;
+  App.dockEnhancePanel = dockEnhancePanel;
   App.closeChatSettings = closeChatSettings;
   App.submitSteerOrQueue = submitSteerOrQueue;
   App.renderPendingOutbox = renderPendingOutbox;

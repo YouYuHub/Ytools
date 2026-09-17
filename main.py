@@ -73,6 +73,11 @@ app.add_middleware(
     allow_credentials=True, # 允许携带 cookie
     allow_methods=["*"], # 允许所有方法
     allow_headers=["*"], # 允许所有头部
+    # 暴露非 CORS 安全白名单的响应头：下载接口把文件名放在
+    # Content-Disposition（Content-Type 之外的头默认对 JS 不可见），
+    # file:// 等跨源前端读不到它会把 zip 包错名存成 .jsonl；
+    # X-Skipped-Sessions（批量分享跳过的会话列表）同理需要显式暴露
+    expose_headers=["Content-Disposition", "X-Skipped-Sessions"],
 )
 
 

@@ -26,7 +26,15 @@ const api_url = localStorage.getItem("ytools-api-base")
       let detail = res.status + " " + res.statusText;
       try {
         const body = await res.json();
-        detail = body.detail || body.message || JSON.stringify(body);
+        if (Array.isArray(body.detail)) {
+          // FastAPI 422 校验错误：detail 是数组，逐条转成可读文本
+          detail = body.detail.map(function (item) {
+            const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
+            return (loc ? loc + ": " : "") + (item.msg || JSON.stringify(item));
+          }).join("; ");
+        } else {
+          detail = body.detail || body.message || JSON.stringify(body);
+        }
       } catch (_) { /* 忽略非 JSON 响应 */ }
       throw new Error(detail);
     }
@@ -559,6 +567,31 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
+   * 按轮次号删除历史轮次：POST /chat_history/delete_rounds
+   * @param {string} sessionId 会话 ID
+   * @param {number} startRound 1-based 轮次号（第 N 个 chat_round）
+   * @param {{mode?:string, deleteFiles?:boolean, dryRun?:boolean}} [opts]
+   *   mode: "truncate"=该轮及之后全删（GPT 编辑语义）；"single"=仅删该轮整轮
+   *   dryRun: true 时只返回将删除的轮次与文件明细（state="planned"），不写盘
+   * @returns {Promise<object>} 后端结果（planned 明细 / succeed+meta_after）
+   */
+  async function deleteRounds(sessionId, startRound, opts) {
+    opts = opts || {};
+    return request("/chat_history/delete_rounds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        start_round: startRound,
+        mode: opts.mode || "truncate",
+        delete_files: opts.deleteFiles !== false,
+        dry_run: !!opts.dryRun,
+        keep_media_refs: opts.keepMediaRefs || [],
+      }),
+    });
+  }
+
+  /**
    * SSE 聊天：POST /chat_with_tool
    * @param {object} payload 请求体（messages/session_id/tool_names...）
    * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
@@ -763,6 +796,22 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
+  function fileKeepAll(sessionId, cleanup) {
+    return request("/file_diff/keep_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", cleanup: cleanup !== false }),
+    });
+  }
+
+  function fileRevertAll(sessionId) {
+    return request("/file_diff/revert_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default" }),
+    });
+  }
+
   global.API = {
     BASE,
     listSessions,
@@ -803,6 +852,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     sessionDocumentUrl,
     localFileUrl,
     removeMediaTag,
+    deleteRounds,
     getSessionFiles,
     deleteSessionFile,
     chatStream,
@@ -827,6 +877,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     fileKeep,
     fileHistoryDelete,
     fileCleanup,
+    fileKeepAll,
+    fileRevertAll,
   };
 })(window);
 

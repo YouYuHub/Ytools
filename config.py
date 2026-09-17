@@ -87,6 +87,8 @@ class ChatLLMRequest(BaseModel):
     session_id: str = "default"                 # 会话ID，用于隔离不同会话的记忆（工具和文件历史）
     use_backend_history: Optional[bool] = None   # 是否启用后端会话历史拼接（None 表示走服务端默认）
     backend_history_rounds: Optional[int] = None # 兼容参数；摘要-only 模式不限制已完成历史回传
+    target_round: Optional[int] = None          # 编辑重发的目标轮次号（1-based）：本轮回复原地替换历史第 N 轮，None 表示正常追加新轮
+    insert_round: Optional[int] = None          # 回答插入轮次号（1-based）：收尾轮次插入历史第 N 轮之后、后续轮次整体后推，上下文截到第 N 轮为止（ask_user 卡片再答专用）
 
 
 class ChatModelSelection(BaseModel):

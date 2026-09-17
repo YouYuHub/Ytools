@@ -303,6 +303,12 @@ window.App = window.App || {};
     updateScrollBottomOffset();
     chatScroll.scrollTop = chatScroll.scrollHeight;
     if (instant) chatScroll.style.scrollBehavior = prev;
+    // content-visibility 懒渲染修正：屏幕外消息以估算占位参与 scrollHeight，
+    // 真实高度回填（视口附近内容完成渲染）后底部会再伸长一截，下一帧复位一次
+    // 保证真正贴底；已在底部时 scrollTop 不变，重复调用无副作用
+    requestAnimationFrame(function () {
+      chatScroll.scrollTop = chatScroll.scrollHeight;
+    });
   }
 
   function nearBottom() {
@@ -337,6 +343,13 @@ window.App = window.App || {};
       return;
     }
     scrollToBottom();
+  }
+
+  // 程序化跳转后显式暂停自动贴底（原地重发把视口对齐到发起位置等场景）：
+  // 用户上滚暂停机制只认滚动事件方向（scrollTop 变小），向下跳转触发不了，
+  // 需要调用方显式声明；用户滚回底部 24px 内或点“回到底部”自动恢复
+  function pauseAutoScroll() {
+    autoScrollPaused = true;
   }
 
   function setEmpty(empty) {
@@ -389,6 +402,9 @@ window.App = window.App || {};
     themeMenu.classList.add("hidden");
     plusMenu.classList.add("hidden");
     enhancePanel.classList.add("hidden");
+    // 面板是 body 级浮层（打开时重挂到 body），关闭时挂回 .composer 原位；
+    // 经 App.* 运行期解引用（composer.js 后于本文件加载才定义该方法）
+    if (App.dockEnhancePanel) App.dockEnhancePanel();
     sessionActionsMenu.classList.add("hidden");
     queueMenu.classList.add("hidden");
     state.composerSendMode = "";
@@ -418,6 +434,11 @@ window.App = window.App || {};
   });
   document.addEventListener("keydown", function (e) {
     if (e.key === "Escape") {
+      // 编辑中的用户消息优先消费 Esc（编辑/确认弹窗与模态框可并存）
+      if (document.querySelector(".msg.msg-user.is-editing")) {
+        App.cancelAnyUserEdit();
+        return;
+      }
       closeMenus();
       if (!toolModal.classList.contains("hidden")) closeToolModal();
       if (!deleteModal.classList.contains("hidden")) App.closeDeleteModal();
@@ -429,7 +450,10 @@ window.App = window.App || {};
 
   $("#toolModalClose").addEventListener("click", closeToolModal);
   $("#toolModalBackdrop").addEventListener("click", closeToolModal);
-  enhanceClose.addEventListener("click", function () { enhancePanel.classList.add("hidden"); });
+  enhanceClose.addEventListener("click", function () {
+    enhancePanel.classList.add("hidden");
+    if (App.dockEnhancePanel) App.dockEnhancePanel();
+  });
   // 跨模块的 App.* 方法必须经包装函数在点击时再解引用：core.js 先于行为
   // 模块（sessions.js 等）加载，此刻 App.closeDeleteModal 还是 undefined，
   // 直接注册 addEventListener(type, undefined) 会被静默忽略（拆分单文件
@@ -532,7 +556,7 @@ window.App = window.App || {};
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
-  scrollToBottom, nearBottom, stickToBottom, setEmpty,
+  scrollToBottom, nearBottom, stickToBottom, pauseAutoScroll, setEmpty,
   updateScrollBottomOffset, refreshThemeUI, closeMenus,
   closeToolModal, setSidebarCollapsed, filterSessions,
   readTitleOverrides, docKindOf, hideToolTip,

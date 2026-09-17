@@ -912,6 +912,44 @@ async def _run_chat_generation(
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
     session_file_memory = await get_file_memory_manager(session_id)
+    # 编辑重发（target_round）：设置原地重跑目标轮次号。此后：
+    # - 轮次收尾替换历史第 N 轮条目而非追加（add_chat_history / stop_current_round）；
+    # - 上下文历史截到第 N-1 轮，旧累计摘要保留并用游标钳制参与拼装
+    #   （get_context_messages）；
+    # - 版本链 round 标注仍为 N（get_current_round_number 覆盖）。
+    request_target_round = getattr(tool_request, "target_round", None)
+    if request_target_round is not None:
+        session_chat_memory.set_target_round(request_target_round)
+        # 保留既有累计摘要：摘要游标锚定在真实历史上（替换不减少轮次总数，
+        # 游标仍有效），上下文由「摘要 + 截到第 N-1 轮的原始对话」拼装——
+        # 大会话编辑重发不会因摘要失效而超窗或整段重压缩。摘要对被编辑
+        # 轮次的旧描述按现状保留（用户显式编辑即最新意图，模型执行中亦会
+        # 以工具实测校验），不给模型加任何失真提示，详见
+        # get_context_messages 的游标钳制说明
+        try:
+            await _stream_emit(
+                stream,
+                f"data: {json.dumps({'target_round': int(request_target_round)}, ensure_ascii=False)}\n\n",
+            )
+        except Exception:
+            pass
+    # 回答插入（insert_round，ask_user 卡片再答）：收尾轮次插入历史第 N 轮
+    # 之后、后续轮次整体后推；上下文截到第 N 轮为止（提问轮行为保留，回答
+    # 驱动其继续）。摘要同样失效：插入后轮次编号整体变化，旧游标不再成立
+    request_insert_round = getattr(tool_request, "insert_round", None)
+    if request_insert_round is not None:
+        session_chat_memory.set_insert_round(request_insert_round)
+        try:
+            session_chat_memory.invalidate_context_summary()
+        except Exception as summary_error:
+            print(f"[WARN] insert_round 摘要失效失败（不影响本轮）: {summary_error}")
+        try:
+            await _stream_emit(
+                stream,
+                f"data: {json.dumps({'insert_round': int(request_insert_round)}, ensure_ascii=False)}\n\n",
+            )
+        except Exception:
+            pass
     # V2 文件版本链：本任务所属轮次号（任务开始时取一次；工具入链时统一标注）。
     # 此刻新轮尚未落盘，"已收尾轮次数 + 1" 正好是本轮序号。
     try:
@@ -1006,12 +1044,17 @@ async def _run_chat_generation(
             except Exception as exc:
                 print(f"[WARN] 压缩中断状态检查失败：{exc}")
             try:
-                await compact_session_history_if_needed(
-                    session_chat_memory,
-                    tool_request,
-                    settings=history_compaction_settings,
-                    event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
-                )
+                # 原地重跑（target_round）/回答插入（insert_round）跳过前置
+                # 压缩：压缩会以当前盘上历史（旧版第 N 轮仍在）为源更新摘要
+                # 游标，违背截断语义；本轮上下文已由保留摘要+截断拼装覆盖，
+                # 收尾替换/插入后下次普通发送再基于新状态重建
+                if request_target_round is None and request_insert_round is None:
+                    await compact_session_history_if_needed(
+                        session_chat_memory,
+                        tool_request,
+                        settings=history_compaction_settings,
+                        event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                    )
             except ContextCompactionError as exc:
                 # 压缩模型与聊天模型均失败：终止任务，不回退到原始历史。
                 detail = f"上下文压缩失败，任务已终止：{exc}"
@@ -1089,20 +1132,35 @@ async def _run_chat_generation(
             )
             active_file_block = file_memory_suffix
             messages[0]["content"] += file_memory_suffix
-        # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）
+        # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
+        # 终态（全部 done）必须给收官指令：若仍写"可调用 todo_write 全量更新"，
+        # 模型会把它当继续施工的邀请，重复调用工具把整列已完成的步骤再提交一遍
         try:
             session_todo = await session_chat_memory.get_session_todo()
         except Exception:
             session_todo = []
         if session_todo:
+            todo_done_count = sum(
+                1 for item in session_todo if item.get("status") == "done"
+            )
+            todo_complete = todo_done_count == len(session_todo)
             todo_lines = []
             for item in session_todo:
                 mark = {"done": "[x]", "in_progress": "[>]"}.get(item.get("status"), "[ ]")
                 todo_lines.append(f"{mark} {item.get('content', '')}")
-            todo_suffix = (
-                "\n当前任务计划（可调用 todo_write 全量更新，保持与最新进展同步）：\n"
-                + "\n".join(todo_lines)
-            )
+            if todo_complete:
+                todo_suffix = (
+                    "\n当前任务规划已全部完成（"
+                    + f"{todo_done_count}/{len(session_todo)} 项，全部 [x]）：\n"
+                    + "\n".join(todo_lines)
+                    + "\n这是收官提醒：请直接汇总执行结果答复用户，"
+                    "如无新的计划，无需再调用 todo_write 工具。"
+                )
+            else:
+                todo_suffix = (
+                    "\n当前任务计划（可调用 todo_write 全量更新，保持与最新进展同步）：\n"
+                    + "\n".join(todo_lines)
+                )
             messages[0]["content"] += todo_suffix
         # P1：首次模型调用前的上下文预算检查。
         # 组装完系统提示/文件内容后，预估整个请求上下文（消息+工具定义）；
@@ -2348,6 +2406,14 @@ async def _run_chat_generation(
         # 清理工具管理内存（使用 session_id 隔离）
         try:
             session_chat_memory.run_task = False
+        except Exception:
+            pass
+        # target_round / insert_round 兜底复位：正常路径由收尾替换/插入逻辑
+        # 复位，异常路径下管理器缓存随 cleanup 销毁自然复位；这里显式兜底防
+        # cleanup 失败残留到下一轮
+        try:
+            session_chat_memory.set_target_round(None)
+            session_chat_memory.set_insert_round(None)
         except Exception:
             pass
         await cleanup_chat_memory_manager(session_id)
