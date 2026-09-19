@@ -264,6 +264,7 @@
       '<div class="md-svg-actions">' +
       '<button type="button" class="md-svg-btn md-canvas-run" data-canvas-action="run">▶ 运行</button>' +
       '<button type="button" class="md-svg-btn" data-canvas-action="shot" title="导出当前画布为 PNG">截图</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="full" title="全屏显示画布（Esc 退出）">⛶ 全屏</button>' +
       '<button type="button" class="md-svg-btn" data-canvas-action="reset" title="清空画布回到未运行状态">↺ 重置</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       "</div>" +
@@ -612,6 +613,11 @@
     });
     out = out
       .replace(/\\\|/g, "|")
+      // 还原转义形态的 <br>：模型常在表格单元格内用 <br> 换行，md 源经
+      // escapeHtml 后已变成 &lt;br&gt; 字面文本。仅还原无属性的换行标签
+      // （安全标签，无法注入），其余 HTML 保持转义；行内代码已先行占位，
+      // 代码内容中的 &lt;br&gt; 不受影响、保持字面显示
+      .replace(/&lt;br\s*\/?&gt;/gi, "<br>")
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/__([^_]+)__/g, "<strong>$1</strong>")
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")

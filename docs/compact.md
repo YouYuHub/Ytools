@@ -233,7 +233,9 @@
 4. **写状态**：解析分段标题生成单块累计摘要状态（`blocks[0]` 带 `round_start=1, round_end=新游标`），连同 `source_round_count` 游标、按新游标重算的保真问题索引一起原子写入 `_meta.context_summary`；压缩 usage 累计入 `compress_usage` / `_history_compress_usage`；
 5. 循环直到未压缩轮次满足窗口/预算条件。
 
-**游标自愈**：`source_round_count` 大于现存轮次数（历史被删/导入不匹配）时，旧摘要整体作废并从原始轮次重建；手动删除历史行同样会重置 `context_summary`。
+**游标自愈**：`source_round_count` 大于现存轮次数（导入不匹配等异常漂移）时，旧摘要整体作废并从原始轮次重建。
+
+**删除轮次不停摘要**：`delete_rounds`（truncate/single）删除轮次只改变后续轮次编号，不改变摘要正文承载的历史事实，因此摘要不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置同步平移三处编号锚点：`source_round_count` 游标（减去被删的已压缩轮次数）、`blocks[].round_start/round_end`（覆盖轮次全部被删的块丢弃）、`recent_question_numbers + recent_questions`（被删轮次的问题移除、其后编号前移）。丢弃摘要会让下轮上下文退化为原始轮次全量回传，大会话直接超出模型窗口。例外：按行删除（旧行号接口）仍会重置 `context_summary`。
 
 ---
 

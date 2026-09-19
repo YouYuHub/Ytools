@@ -25,8 +25,10 @@ from config import (
 from env_manager import (
     ChatModelConfigurationError,
     get_model_config,
+    get_role_headers,
     get_role_parameter,
     get_role_selection,
+    inject_custom_headers_into_config,
     load_var,
     require_default_chat_config,
 )
@@ -314,12 +316,14 @@ def resolve_context_compaction_model_config(
     if provider:
         candidate = get_model_config(provider, model)
         if candidate is not None and str(candidate.get("apiType") or "chat-completions").strip().casefold() == "chat-completions":
-            config = candidate
+            # 压缩角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
+            config = inject_custom_headers_into_config(candidate, get_role_headers("compaction_model"))
         else:
             print(
                 f"[WARN] 压缩模型不可用（{provider} / {model}），回退为当前聊天模型执行压缩"
             )
     if config is None:
+        # 回退聊天模型：require_default_chat_config 已注入聊天角色头
         config = require_default_chat_config()
     return config
 

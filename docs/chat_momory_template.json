@@ -44,6 +44,7 @@
     "compress_usage": "全部压缩模型调用的 usage 累计（含 compression_count 与 last 两个字段）",
     "_history_compress_usage": "跨轮历史压缩单独的 usage 累计（已并入 compress_usage，用于区分统计口径）",
     "_active_round_compaction": "临时字段：任务进行中单轮压缩的检查点 {question, events, started_at}，轮次收尾/新轮次开始时清除",
+    "_title_state": "会话标题生成状态标记：{source: 'title_model', model: 生成模型名, applied_at: 写入时间, title_generated: true}。由标题模型在首个提问任务收尾后写入（见 factory/agent_runtime/title_generator.py）；已标记后不再重复生成，用户手动重命名（PUT /chat_history/title）同样受此保护。未配置标题模型/生成失败时无此字段，标题保持旧机制（首个用户问题前 40 字兜底）",
     "_pending_round_checkpoint": "旧版检查点字段（已迁移到 .pending 侧车文件），加载时兼容清理"
   },
   "context_summary模板": {

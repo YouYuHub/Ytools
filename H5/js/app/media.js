@@ -211,7 +211,10 @@
       if (kind === "image") {
         finalFile = await compressImageFile(file);
       }
-      const sizeLimit = MEDIA_SIZE_LIMITS[kind] || MEDIA_SIZE_LIMITS.image;
+      // 动图 gif 按视频档（600MB）预检：发送/读取侧同样归视频档（转码前先缩放）
+      const extLower = ((file.name || "").split(".").pop() || "").toLowerCase();
+      const limitKind = extLower === "gif" ? "video" : kind;
+      const sizeLimit = MEDIA_SIZE_LIMITS[limitKind] || MEDIA_SIZE_LIMITS.image;
       if (finalFile.size > sizeLimit) {
         toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
         continue;

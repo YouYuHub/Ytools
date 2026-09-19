@@ -15,8 +15,9 @@
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
-    networkRetryMaxAttempts, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
-    oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint
+    networkRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
+    oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint,
+    settingsRetitleRow, settingsRetitleToggle, settingsRetitleStatus
   } = App;
 
   // ---------- 输入区 ----------
@@ -31,9 +32,11 @@
     const compacting = state.manualCompactRunning && state.manualCompactSession === state.sessionId;
     // 运行中组合按钮：仅当前会话流式/压缩时显示；上拉钮只在流式（非压缩）时可用
     const showStopGroup = currentStreaming || compacting;
+    // 语音录音中：识别文本实时写入输入框（hasText 为真），麦克风按钮保持显示
+    // 并进入录音态（再点停止），发送按钮隐藏避免边录边发
     composer.classList.toggle("has-text", hasText);
-    sendBtn.classList.toggle("hidden", !hasText || currentStreaming || compacting);
-    voiceBtn.classList.toggle("hidden", hasText || currentStreaming || compacting);
+    sendBtn.classList.toggle("hidden", !hasText || speechActive || currentStreaming || compacting);
+    voiceBtn.classList.toggle("hidden", (hasText && !speechActive) || currentStreaming || compacting);
     stopGroup.classList.toggle("hidden", !showStopGroup);
     stopGroup.classList.toggle("compact-only", compacting);
     stopMenuBtn.classList.toggle("hidden", !currentStreaming || compacting);
@@ -98,6 +101,9 @@
   input.addEventListener("keydown", function (e) {
     if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
     e.preventDefault();
+    // 回车发送前先结束录音（录音中写入的文本随消息发出，避免发送后
+    // 识别结果继续写回已清空的输入框）
+    if (typeof stopSpeechInput === "function" && speechActive) stopSpeechInput();
     // 流式进行中（当前会话、非压缩）：Enter=消息引导，Alt+Enter=加入队列
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
     const compactingHere = state.manualCompactRunning &&
@@ -361,14 +367,6 @@
     await App.send(next);
   }
 
-  document.querySelectorAll(".suggest-chip").forEach(function (chip) {
-    chip.addEventListener("click", function () {
-      input.value = chip.dataset.prompt || chip.textContent.trim();
-      autosize();
-      App.send();
-    });
-  });
-
   // ---------- 弹层锚定工具（"+"功能菜单等仍留在 .composer 内的下拉复用） ----------
   // 锚定触发按钮而非容器：多行输入时 composer 变高，CSS 的 bottom: calc(100%+8px)
   // 会把弹层推到容器另一端甚至推出视口；打开时按按钮的视口坐标 fixed 定位，
@@ -454,8 +452,136 @@
     if (!plusMenu.classList.contains("hidden")) placeAbove(plusMenu, plusBtn);
   });
 
-  // 语音类按钮：占位
-  voiceBtn.addEventListener("click", function () { toast("语音输入暂未开放"); });
+  // ---------- 语音输入（Web Speech API，Chrome / Edge） ----------
+  // 点麦克风开始识别，识别文本实时写入输入框：以点击时的光标为插入点，
+  // 确认结果累积拼接、中间结果实时替换预览；再点麦克风（或切会话）停止。
+  // Chrome 的连续模式在长静默后会自动断开，未手动停止且无致命错误时自动
+  // 重启识别会话，保持"一次点击连续听写"的体验。
+  let speechRec = null;        // 当前 SpeechRecognition 实例
+  let speechActive = false;    // 用户意图上的"录音中"（含自动重启间隙）
+  let speechFatal = false;     // 不可恢复错误（权限/网络），不再自动重启
+  let speechBase = "";         // 插入点之前的原文
+  let speechTail = "";         // 插入点之后的原文
+  let speechSep = "";          // 原文与识别文本之间的衔接空格
+  let speechFinal = "";        // 已确认（final）识别文本累计
+  let speechLastWritten = null; // 上次写入后的输入框全文（外部修改检测）
+
+  function applySpeechText(interim) {
+    // 外部修改检测（发送清空/程序填充/草稿恢复）：以当前输入框重新锚定插入点
+    if (speechLastWritten !== null && input.value !== speechLastWritten) {
+      speechBase = input.value;
+      speechTail = "";
+      speechSep = speechBase && !/\s$/.test(speechBase) ? " " : "";
+      speechFinal = "";
+    }
+    const before = speechBase + speechSep + speechFinal + interim;
+    input.value = before + speechTail;
+    speechLastWritten = input.value;
+    // 光标跟随识别文本末尾（继续打字/发送位置与听写一致）
+    input.setSelectionRange(before.length, before.length);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function stopSpeechInput() {
+    speechActive = false;
+    speechLastWritten = null;
+    if (speechRec) {
+      const rec = speechRec;
+      speechRec = null;
+      // stop() 会把缓冲中的最后一段识别完再结束（abort 会直接丢弃）
+      try { rec.stop(); } catch (_) { /* 已停止 */ }
+    }
+    voiceBtn.classList.remove("is-recording");
+    voiceBtn.title = "语音输入";
+    refreshComposerButtons();
+  }
+
+  function startSpeechInput() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      toast("当前浏览器不支持语音识别，请使用 Edge 或 Chrome");
+      return;
+    }
+    const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
+    const end = input.selectionEnd == null ? pos : input.selectionEnd;
+    speechBase = input.value.slice(0, pos);
+    speechTail = input.value.slice(end);
+    speechSep = speechBase && !/\s$/.test(speechBase) ? " " : "";
+    speechFinal = "";
+    speechFatal = false;
+    speechLastWritten = null;
+    let rec;
+    try {
+      rec = new SR();
+    } catch (err) {
+      toast("语音识别启动失败：" + (err && err.message || err));
+      return;
+    }
+    speechRec = rec;
+    speechActive = true;
+    rec.lang = "zh-CN";
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = function (event) {
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) speechFinal += result[0].transcript;
+        else interim += result[0].transcript;
+      }
+      applySpeechText(interim);
+    };
+    rec.onerror = function (event) {
+      const err = (event && event.error) || "";
+      if (err === "not-allowed" || err === "service-not-allowed") {
+        speechFatal = true;
+        toast("麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问");
+      } else if (err === "network") {
+        speechFatal = true;
+        toast("语音识别服务不可用（浏览器在线语音服务网络异常）");
+      } else if (err !== "no-speech" && err !== "aborted") {
+        speechFatal = true;
+        toast("语音识别出错：" + err);
+      }
+    };
+    rec.onend = function () {
+      if (!speechActive || speechRec !== rec) return;
+      if (speechFatal) {
+        stopSpeechInput();
+        return;
+      }
+      // 长静默自动断开：稍候重启识别会话（留出缓冲避免错误状态下高频重启），
+      // 直到用户再次点击麦克风
+      setTimeout(function () {
+        if (!speechActive || speechRec !== rec) return;
+        try {
+          rec.start();
+        } catch (_) {
+          stopSpeechInput();
+        }
+      }, 150);
+    };
+    try {
+      rec.start();
+    } catch (err) {
+      speechActive = false;
+      speechRec = null;
+      toast("语音识别启动失败：" + (err && err.message || err));
+      return;
+    }
+    voiceBtn.classList.add("is-recording");
+    voiceBtn.title = "停止语音输入";
+    refreshComposerButtons();
+  }
+
+  voiceBtn.addEventListener("click", function () {
+    // 以"识别会话存在"为停止判据（speechActive 在自动重启间隙也为真，
+    // 但间隙内 speechActive 可能刚被致命错误复位——按 speechRec 判定
+    // 保证第二次点击一定停止，不会误启动新会话）
+    if (speechRec || speechActive) stopSpeechInput();
+    else startSpeechInput();
+  });
+  App.stopVoiceInput = stopSpeechInput;
 
   // ---------- 运行中发送选项（上拉菜单） ----------
   // 上拉钮点击弹出菜单；菜单项整体可点击，直接执行对应动作
@@ -510,16 +636,70 @@
   }
 
   // 两个接口同属“聊天设置”，共用一组确定/取消：打开时并行加载，确定时并行提交
+  // ---------- 「每条消息重新标题」开关（会话独立配置，切换即保存） ----------
+  // 与弹窗内三组数值配置的"确定才保存"语义分离，避免误改；打开弹窗时拉取回填
+  async function loadSettingsRetitle() {
+    if (!settingsRetitleRow || !settingsRetitleToggle) return;
+    const sid = state.sessionId || "";
+    if (!sid) {
+      settingsRetitleRow.hidden = true; // 新对话（无会话文件）不显示该开关
+      return;
+    }
+    settingsRetitleRow.hidden = false;
+    settingsRetitleToggle.disabled = true;
+    settingsRetitleToggle.checked = false;
+    if (settingsRetitleStatus) settingsRetitleStatus.textContent = "读取中…";
+    try {
+      const data = await API.getRetitleSetting(sid);
+      if (state.sessionId !== sid) return; // 等待期间已切换会话
+      settingsRetitleToggle.checked = Boolean(data.enabled);
+      if (settingsRetitleStatus) {
+        const st = data.title_state || {};
+        settingsRetitleStatus.textContent =
+          "标题状态：" + (st.title_generated ? "已生成" : st.attempted ? "已尝试（失败不再自动重试）" : "未生成");
+      }
+    } catch (_) {
+      if (settingsRetitleStatus) settingsRetitleStatus.textContent = "读取失败";
+    } finally {
+      settingsRetitleToggle.disabled = false;
+    }
+  }
+
+  async function onSettingsRetitleChange() {
+    const sid = state.sessionId || "";
+    if (!sid) return;
+    const enabled = settingsRetitleToggle.checked;
+    settingsRetitleToggle.disabled = true;
+    try {
+      const res = await API.updateRetitleSetting(sid, enabled);
+      toast(res.message || (enabled ? "已开启每条消息重新标题" : "已关闭每条消息重新标题"));
+      if (settingsRetitleStatus) settingsRetitleStatus.textContent = "";
+      await loadSettingsRetitle();
+    } catch (err) {
+      toast("保存失败：" + err.message);
+      settingsRetitleToggle.checked = !enabled; // 保存失败回滚 UI
+      await loadSettingsRetitle();
+    } finally {
+      settingsRetitleToggle.disabled = false;
+    }
+  }
+
+  if (settingsRetitleToggle) {
+    settingsRetitleToggle.addEventListener("change", onSettingsRetitleChange);
+  }
+
   async function openChatSettings() {
     chatSettingsModal.classList.remove("hidden");
     chatSettingsModal.setAttribute("aria-hidden", "false");
     chatSettingsConfirm.disabled = true;
+    loadSettingsRetitle();
     const results = await Promise.all([
       API.getContextReturnConfig().catch(function () { return null; }),
       // 传 session_id：模型窗口按会话生效模型口径计算，与顶部 token 统计一致
       API.getHistoryCompactionConfig(state.sessionId).catch(function () { return null; }),
       API.getMcpToolConfig().catch(function () { return null; }),
       API.getNetworkRetryConfig().catch(function () { return null; }),
+      API.getVideoReadLimitConfig().catch(function () { return null; }),
       API.getToolConcurrencyConfig().catch(function () { return null; }),
     ]);
     chatSettingsConfirm.disabled = false;
@@ -527,9 +707,11 @@
     const comp = results[1];
     const mcp = results[2];
     const retry = results[3];
-    const conc = results[4];
+    const videoLimit = results[4];
+    const conc = results[5];
     const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, comp && comp.defaults || {},
-      mcp && mcp.defaults || {}, retry && retry.defaults || {}, conc && conc.defaults || {});
+      mcp && mcp.defaults || {}, retry && retry.defaults || {},
+      videoLimit && videoLimit.defaults || {}, conc && conc.defaults || {});
     if (ctx && ctx.defaults) {
       Object.assign(defaults, ctx.defaults);
     }
@@ -541,6 +723,8 @@
       ? mcp.call_timeout_seconds : defaults.call_timeout_seconds;
     networkRetryMaxAttempts.value = retry && retry.max_attempts != null
       ? retry.max_attempts : defaults.network_retry_max_attempts;
+    videoReadMaxSeconds.value = videoLimit && videoLimit.max_seconds != null
+      ? videoLimit.max_seconds : defaults.video_read_max_seconds;
     mcpToolWorkers.value = conc && conc.mcp_tool_workers != null
       ? conc.mcp_tool_workers : defaults.mcp_tool_workers;
     subAgentMaxConcurrent.value = conc && conc.sub_agent_max_concurrent != null
@@ -551,11 +735,12 @@
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
     renderEffectiveThresholdHint(comp);
-    if (!ctx || !comp || !mcp || !retry || !conc) {
+    if (!ctx || !comp || !mcp || !retry || !videoLimit || !conc) {
       toast((ctx ? "" : "回传长度配置加载失败；") +
         (comp ? "" : "压缩策略配置加载失败；") +
         (mcp ? "" : "MCP 工具超时配置加载失败；") +
         (retry ? "" : "网络重试配置加载失败；") +
+        (videoLimit ? "" : "视频读取上限配置加载失败；") +
         (conc ? "" : "工具并发配置加载失败"));
     }
   }
@@ -595,6 +780,7 @@
     toolResultMaxLength.value = defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = defaults.call_timeout_seconds;
     networkRetryMaxAttempts.value = defaults.network_retry_max_attempts;
+    videoReadMaxSeconds.value = defaults.video_read_max_seconds;
     mcpToolWorkers.value = defaults.mcp_tool_workers;
     subAgentMaxConcurrent.value = defaults.sub_agent_max_concurrent;
     keepRounds.value = defaults.keep_rounds;
@@ -612,15 +798,17 @@
   // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
   // - 工具执行超时/网络重试次数：>=0（0=不限制）
+  // - 视频最大读取秒数：5–3600（越界/非法值读取端自动钳制，此处前置校验）
   // - 工具并发执行两项：>=1
   // - 触发比例/摘要预算比例/连续拒绝上限：>0
-  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, concConfig) {
+  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, videoLimitConfig, concConfig) {
     const isNum = function (v) { return v != null && Number.isFinite(v); };
     const rows = [
       ["思考过程回传长度", ctxConfig.reasoning_max_length, function (v) { return isNum(v); }],
       ["工具结果回传长度", ctxConfig.tool_result_max_length, function (v) { return isNum(v); }],
       ["工具执行超时", mcpConfig.call_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
       ["网络失败重试次数", retryConfig.max_attempts, function (v) { return isNum(v) && v >= 0; }],
+      ["视频最大读取秒数", videoLimitConfig.max_seconds, function (v) { return isNum(v) && v >= 5 && v <= 3600; }],
       ["MCP 工具并发线程数", concConfig.mcp_tool_workers, function (v) { return isNum(v) && v >= 1; }],
       ["子智能体并发上限", concConfig.sub_agent_max_concurrent, function (v) { return isNum(v) && v >= 1; }],
       ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
@@ -650,11 +838,14 @@
     const retryConfig = {
       max_attempts: readSettingNumber(networkRetryMaxAttempts),
     };
+    const videoLimitConfig = {
+      max_seconds: readSettingNumber(videoReadMaxSeconds),
+    };
     const concConfig = {
       mcp_tool_workers: readSettingNumber(mcpToolWorkers),
       sub_agent_max_concurrent: readSettingNumber(subAgentMaxConcurrent),
     };
-    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, concConfig);
+    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, videoLimitConfig, concConfig);
     if (invalid.length) {
       toast("请填写有效数值：" + invalid.join("、"));
       return;
@@ -665,6 +856,7 @@
       API.updateHistoryCompactionConfig(compConfig, state.sessionId),
       API.updateMcpToolConfig(mcpConfig),
       API.updateNetworkRetryConfig(retryConfig),
+      API.updateVideoReadLimitConfig(videoLimitConfig),
       API.updateToolConcurrencyConfig(concConfig),
     ]);
     chatSettingsConfirm.disabled = false;

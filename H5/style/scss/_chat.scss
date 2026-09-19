@@ -274,6 +274,8 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     cursor: pointer;
+    // 单行显示：内容为完整路径（相对路径已按会话工作目录解析），
+    // 超宽省略号收尾，完整路径 hover 可见、点击复制
 
     &[hidden] {
       display: none;
@@ -1278,6 +1280,12 @@ html[data-theme="dark"] {
     }
 
     &.copied { color: var(--accent); }
+
+    // 删除按钮：hover 红色警示（危险操作色彩区分，与确认框主按钮同色）
+    &.msg-user-delete-btn:hover {
+      color: var(--danger);
+      background: color-mix(in srgb, var(--danger) 10%, transparent);
+    }
   }
 
   &:hover .msg-user-actions {
@@ -1289,6 +1297,12 @@ html[data-theme="dark"] {
   &:has(.msg-user-action-btn.copied) .msg-user-actions {
     opacity: 1;
     pointer-events: auto;
+  }
+
+  // 编辑态隐藏操作行（删除/复制/编辑）：面板内已有取消/发送入口，
+  // 操作行继续浮现只会干扰编辑（display:none 连 hover 一起屏蔽）
+  &.is-editing .msg-user-actions {
+    display: none;
   }
 
   // 编辑面板：附件行在输入框上方（GPT 编辑态同款），面板本身无边框
@@ -1988,6 +2002,41 @@ html[data-theme="dark"] {
     white-space: pre-wrap;
     word-break: break-word;
     color: var(--text-secondary);
+  }
+
+  // 全屏模式（Fullscreen API 作用于整个 .md-canvas-block，操作按钮保留在
+  // 全屏内可用）：深色背景，画布视图撑满剩余空间（沙箱内 #stage 以
+  // object-fit:contain 等比缩放，不随容器比例变形），日志区压到底部
+  .md-canvas-block:fullscreen {
+    display: flex;
+    flex-direction: column;
+    background: #111318;
+    padding: 10px;
+    overflow: hidden;
+
+    .md-svg-head {
+      flex: none;
+    }
+
+    .md-canvas-view {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+
+      .md-canvas-frame {
+        flex: 1;
+        height: auto;
+        min-height: 0;
+      }
+
+      .md-canvas-log {
+        flex: none;
+        max-height: 140px;
+        margin-top: 8px;
+      }
+    }
   }
 }
 

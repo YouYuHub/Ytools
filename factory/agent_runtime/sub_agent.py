@@ -29,8 +29,10 @@ from chat.chat_llm import ChatLLM
 from config import ChatLLMRequest
 from env_manager import (
     get_model_config,
+    get_role_headers,
     get_role_parameter,
     get_role_selection,
+    inject_custom_headers_into_config,
     load_var,
 )
 from util.timestamp_utils import now_str
@@ -48,6 +50,8 @@ from factory.agent_runtime.builtin_tools import (
     load_any_media_model_part,
     normalize_todo_items,
     roll_recent_media_parts,
+    retire_prior_video_parts,
+    cap_video_parts_in_batch,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -309,9 +313,10 @@ class SubAgentRunner:
         self._final_reply = ""
         self._consecutive_oversized = 0
         # read_media 数据注入坐标（子任务版，与父循环同语义）：
-        # pending_parts 为 (reference, quality) 坐标，工具结果统一处理后
-        # 现场加载 base64 部件注入为 user 消息（仅内存，不落盘）；
-        # injected_refs 防重复读取；滚动窗口只保留最近 5 个
+        # pending_parts 为 (reference, quality, start_time, end_time) 坐标，
+        # 工具结果统一处理后现场加载 base64 部件注入为 user 消息（仅内存，
+        # 不落盘）；视频区间读取的坐标含区间；injected_refs 防重复读取
+        # （键带区间：同视频不同区间是新的读取）；滚动窗口只保留最近 5 个
         self.read_media_pending_parts: list[tuple[str, Any]] = []
         self.read_media_injected_refs: set[str] = set()
         # 任务文本中的 media:// 引用集合：子任务 read_media 的安全边界数据源
@@ -436,7 +441,10 @@ class SubAgentRunner:
                     parameter = get_role_parameter("sub_agent_model") or {}
                 except Exception:
                     parameter = {}
-                return chat_config, parameter
+                # 子智能体角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
+                return inject_custom_headers_into_config(
+                    chat_config, get_role_headers("sub_agent_model")
+                ), parameter
             print(
                 f"[WARN] 子智能体模型配置无效或协议不支持"
                 f"（{provider} / {model}），子任务回退父级聊天模型"
@@ -711,7 +719,12 @@ class SubAgentRunner:
                         read_media_result.get("injected_references") or []
                     )
                     self.read_media_pending_parts.extend([
-                        (item["reference"], item.get("quality"))
+                        (
+                            item["reference"],
+                            item.get("quality"),
+                            item.get("start_time"),
+                            item.get("end_time"),
+                        )
                         for item in (read_media_result.get("loaded") or [])
                         if item.get("reference")
                     ])
@@ -1047,9 +1060,15 @@ class SubAgentRunner:
             # media:// 引用即子任务媒体台账）。加载失败的坐标以占位文本告知
             # 子模型，避免静默丢失
             if self.read_media_pending_parts:
+                # 视频一次性消费：与父级注入同口径——先回收旧 video 部件，
+                # 同批多视频仅第一个带画面数据（供应商单请求仅 1 个视频）
+                retire_prior_video_parts(self.messages)
                 media_parts = []
-                for reference, quality in self.read_media_pending_parts:
-                    info = load_any_media_model_part(ctx.session_id, reference, quality=quality)
+                for reference, quality, start_time, end_time in self.read_media_pending_parts:
+                    info = load_any_media_model_part(
+                        ctx.session_id, reference, quality=quality,
+                        start_time=start_time, end_time=end_time,
+                    )
                     if info is not None and info.get("part") is not None:
                         media_parts.append(info["part"])
                     elif isinstance(info, dict) and info.get("error"):
@@ -1062,6 +1081,7 @@ class SubAgentRunner:
                             "type": "text",
                             "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
                         })
+                media_parts = cap_video_parts_in_batch(media_parts)
                 self.messages.append({
                     "role": "user",
                     "content": [

@@ -55,6 +55,20 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
+   * 前端触发的会话标题生成（SSE 流内采集到预览后调用一次，非轮询）。
+   * 后端调标题模型生成、写盘并同步返回标题（已生成过/失败/未配置时
+   * 返回 skipped + 当前盘上标题）；前端收到即替换侧栏标题。
+   * @param {{session_id, question_text?, model_preview?, question_parts?}} body
+   */
+  function generateSessionTitle(body) {
+    return request("/chat_config/generate_title", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  /**
    * 获取当前会话的模型上下文 token 统计。
    * @param {string} sessionId 会话 ID
   * @param {number} [maxRounds] 参与统计的最近轮数；<=0 表示全部；省略时由服务端跟随聊天设置
@@ -242,11 +256,13 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @param {object|null} [parameter] 生成参数（按 api_type 分桶）；null 表示仅切换模型、保留原参数桶
    * @param {string} [sessionId] 会话 ID
    * @param {boolean} [clear] 仅会话级有效：清除该会话当前角色的独立模型选择，恢复跟随全局默认
+   * @param {Array|null} [headers] 该角色自定义请求头 [{name, value}]；null 保持现有配置，[] 清空
    */
-  function selectModel(provider, model, role, parameter, sessionId, clear) {
+  function selectModel(provider, model, role, parameter, sessionId, clear, headers) {
     const body = { provider: provider, model: model };
     if (role) body.role = role;
     if (parameter !== undefined) body.parameter = parameter;
+    if (headers !== undefined) body.headers = headers;
     if (sessionId) {
       body.session_id = sessionId;
       if (clear) body.clear = true;
@@ -294,6 +310,28 @@ const api_url = localStorage.getItem("ytools-api-base")
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * 读取会话「每条消息重新标题」开关（会话独立配置）
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{state, enabled, exists, title_state: {title_generated, attempted}}>}
+   */
+  function getRetitleSetting(sessionId) {
+    return request("/chat_config/retitle_setting?session_id=" + encodeURIComponent(sessionId));
+  }
+
+  /**
+   * 写入会话「每条消息重新标题」开关（会话独立配置，仅对本会话生效）
+   * @param {string} sessionId 会话 ID
+   * @param {boolean} enabled true=每轮收尾都重新生成标题；false=仅首轮生成一次
+   */
+  function updateRetitleSetting(sessionId, enabled) {
+    return request("/chat_config/retitle_setting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, enabled: Boolean(enabled) }),
     });
   }
 
@@ -405,6 +443,25 @@ const api_url = localStorage.getItem("ytools-api-base")
    */
   function updateNetworkRetryConfig(config) {
     return request("/chat_config/network_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取视频区间读取最大秒数配置（read_media 工具）
+   */
+  function getVideoReadLimitConfig() {
+    return request("/chat_config/video_read_limit");
+  }
+
+  /**
+   * 更新视频区间读取最大秒数（read_media 工具）
+   * @param {{max_seconds: number}} config 5–3600，越界/非法值由读取端自动钳制
+   */
+  function updateVideoReadLimitConfig(config) {
+    return request("/chat_config/video_read_limit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(config),
@@ -817,6 +874,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     listSessions,
     streamStatus,
     getSessionMeta,
+    generateSessionTitle,
     getContextTokenStats,
     updateSessionTitle,
     fetchSessionFile,
@@ -832,6 +890,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateHistoryCompactionConfig,
     getToolSelection,
     updateToolSelection,
+    getRetitleSetting,
+    updateRetitleSetting,
     getContextReturnConfig,
     updateContextReturnConfig,
     getMcpToolConfig,
@@ -840,6 +900,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateToolConcurrencyConfig,
     getNetworkRetryConfig,
     updateNetworkRetryConfig,
+    getVideoReadLimitConfig,
+    updateVideoReadLimitConfig,
     getWorkDirConfig,
     changeChatDir,
     setSessionWorkDir,

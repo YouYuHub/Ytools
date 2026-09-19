@@ -1,8 +1,4 @@
 {
-  "Ollama": {
-    "vendor": "ollama",
-    "url": "http://localhost:11434"
-  },
   "Wsl Completions": {
     "vendor": "wsl",
     "apiKey": "not-needed",
@@ -64,21 +60,6 @@
       }
     }
   },
-  "ApiYi Claude": {
-    "vendor": "custom_endpoint",
-    "apiKey": "sk-apiYi-api-key",
-    "apiType": "messages",
-    "models": {
-      "Claude Opus 4.8": {
-        "id": "claude-opus-4-8",
-        "url": "https://api.apiyi.com/v1",
-        "toolCalling": true,
-        "vision": true,
-        "maxInputTokens": 928000,
-        "maxOutputTokens": 24000
-      }
-    }
-  },
   "Qwen Completions": {
     "vendor": "custom_endpoint",
     "apiKey": "sk-ws-qwen-api-key",
@@ -126,37 +107,6 @@
       }
     }
   },
-  "OpenCode Message": {
-    "vendor": "custom_endpoint",
-    "apiKey": "sk-opencode-api-key",
-    "apiType": "messages",
-    "models": {
-      "Qwen3.7 Max": {
-        "id": "qwen3.7-max",
-        "url": "https://opencode.ai/zen/go/v1",
-        "toolCalling": true,
-        "vision": true,
-        "maxInputTokens": 888888,
-        "maxOutputTokens": 16000
-      },
-      "Minimax M3": {
-        "id": "minimax-m3",
-        "url": "https://opencode.ai/zen/go/v1",
-        "toolCalling": true,
-        "vision": true,
-        "maxInputTokens": 428000,
-        "maxOutputTokens": 65536
-      },
-      "Qwen3.7 Plus": {
-        "id": "qwen3.7-plus",
-        "url": "https://opencode.ai/zen/go/v1",
-        "toolCalling": true,
-        "vision": true,
-        "maxInputTokens": 888888,
-        "maxOutputTokens": 65536
-      }
-    }
-  },
   "OpenCode Completions": {
     "vendor": "custom_endpoint",
     "apiKey": "sk-opencode-api-key",
@@ -194,8 +144,8 @@
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
       },
-      "GLM 5.2": {
-        "id": "glm-5.2",
+      "GLM 5.3 Flash": {
+        "id": "glm-5.3-flash",
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,

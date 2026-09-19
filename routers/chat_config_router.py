@@ -8,6 +8,7 @@ from dataclasses import replace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 from config import (
     DEFAULT_HISTORY_TRIGGER_RATIO,
@@ -31,6 +32,7 @@ from config import (
     McpToolConfig,
     McpToolSelection,
     NetworkRetryConfig,
+    RetitleSettingPayload,
     SessionWorkDirConfig,
     ToolConcurrencyConfig,
 )
@@ -61,9 +63,11 @@ from factory.agent_runtime.context_compaction import (
     resolve_summary_total_budget,
 )
 from memory.chat_memory import (
+    chat_memory_file_exists,
     normalize_session_id,
     resolve_session_model_selection,
 )
+from factory.agent_runtime.title_generator import generate_title_for_frontend
 
 # 创建 API 路由器实例
 api_chat_config_router = APIRouter()
@@ -632,6 +636,89 @@ async def update_tool_concurrency_config(payload: ToolConcurrencyConfig):
     })
 
 
+# ---------- 视频区间读取最大秒数配置（read_media 工具） ----------
+
+from memory.file_memory import (  # noqa: E402
+    DEFAULT_VIDEO_MAX_READ_SECONDS,
+    VIDEO_MAX_READ_SECONDS_ENV,
+    video_max_read_seconds,
+)
+
+
+class VideoReadLimitConfig(BaseModel):
+    """read_media 工具视频区间读取最大秒数配置。"""
+
+    max_seconds: int = Field(
+        DEFAULT_VIDEO_MAX_READ_SECONDS,
+        description=(
+            "read_media 单次视频区间读取的最大秒数；越界/非法值在读取端"
+            "自动钳制到 5–3600（非法回退默认 60），此处允许任意整数便于表达原始配置"
+        ),
+    )
+
+
+def _parse_video_read_limit(value: Any, default: int) -> int:
+    """解析视频最大读取秒数配置；非整数回退默认值（钳制在读取端统一做）。"""
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed
+
+
+def _video_read_limit_config_payload() -> dict:
+    effective = video_max_read_seconds()
+    return {
+        "max_seconds": _parse_video_read_limit(
+            load_var(VIDEO_MAX_READ_SECONDS_ENV, DEFAULT_VIDEO_MAX_READ_SECONDS),
+            DEFAULT_VIDEO_MAX_READ_SECONDS,
+        ),
+        # 读取端钳制后的实际生效值（每次现读，随 .env 热重载同步）
+        "effective_seconds": effective,
+        "limits": {"min": 5, "max": 3600},
+        "defaults": {"max_seconds": DEFAULT_VIDEO_MAX_READ_SECONDS},
+        "semantics": {
+            "clamp": "越界/非法值在读取端自动钳制到 5–3600（非法回退默认 60）",
+            "scope": (
+                "read_media 工具单次视频区间读取的最大秒数；"
+                "探测元数据（start_time == end_time）不受影响"
+            ),
+        },
+        "env_names": {"max_seconds": VIDEO_MAX_READ_SECONDS_ENV},
+        "memory_state": env_manager.env_vars.get(VIDEO_MAX_READ_SECONDS_ENV),
+    }
+
+
+@api_chat_config_router.get("/chat_config/video_read_limit")
+async def get_video_read_limit_config():
+    """获取视频区间读取最大秒数配置（read_media 工具）。"""
+    return JSONResponse(content=_video_read_limit_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/video_read_limit")
+async def update_video_read_limit_config(payload: VideoReadLimitConfig):
+    """实时更新视频区间读取最大秒数并持久化。
+
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次 read_media
+      工具调用即按新值读取（video_max_read_seconds 现读 + 工具描述动态构建）
+    - 读取端统一钳制 5–3600（越界值保存原样、生效值钳制，响应回显 effective_seconds）
+    """
+    parsed = _parse_video_read_limit(
+        payload.max_seconds, DEFAULT_VIDEO_MAX_READ_SECONDS
+    )
+    try:
+        updated = set_env_vars({
+            VIDEO_MAX_READ_SECONDS_ENV: parsed,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content={
+        "state": "succeed",
+        "updated": updated,
+        "config": _video_read_limit_config_payload(),
+    })
+
+
 _MODEL_ROLES = ("chat_model", "compaction_model", "title_model", "sub_agent_model")
 
 
@@ -851,8 +938,12 @@ def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
             "model": model,
             "api_type": api_type,
             "parameter": selection.get("parameter") or {},
+            "headers": selection.get("headers") or [],
         },
         "effective_parameter": env_manager.get_role_parameter(role),
+        # 该角色模型选择的自定义请求头（会话覆盖 → 全局默认已由 selection 合并），
+        # 前端编辑器按此回填键值行
+        "effective_headers": env_manager.get_role_headers(role),
         "available_models": available,
         "available_count": len(available),
     }
@@ -961,12 +1052,19 @@ async def select_active_chat_model(payload: ChatModelSelection):
                 inherit = (existing.get(payload.role) or {}).get("parameter")
                 if inherit is None:
                     inherit = (env_manager.get_global_model_selection().get(payload.role) or {}).get("parameter")
+                # headers 沿用与 parameter 同一套继承语义：未传时沿用现有
+                # （会话级优先，否则全局该角色的），提供时全量替换（[] 清空）
+                inherit_headers = (existing.get(payload.role) or {}).get("headers")
+                if inherit_headers is None:
+                    inherit_headers = (env_manager.get_global_model_selection().get(payload.role) or {}).get("headers")
                 entry = build_model_selection_entry(
                     payload.provider,
                     payload.model,
                     payload.role,
                     parameter=payload.parameter,
                     inherit_parameter=inherit,
+                    headers=payload.headers,
+                    inherit_headers=inherit_headers,
                 )
                 meta = await manager.update_session_model_selection(payload.role, entry)
                 message = f"会话 [{session_id}] {payload.role} 已切换为 {entry['ownership_name']} / {entry['model_name']}"
@@ -996,6 +1094,7 @@ async def select_active_chat_model(payload: ChatModelSelection):
             payload.model,
             role=payload.role,
             parameter=payload.parameter,
+            headers=payload.headers,
         )
     except ChatModelConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1005,4 +1104,115 @@ async def select_active_chat_model(payload: ChatModelSelection):
         "current": selection,
         "effective_parameter": env_manager.get_role_parameter(selection["role"]),
         "selection": env_manager.get_global_model_selection(),
+    })
+
+
+class FrontendTitleRequest(BaseModel):
+    """前端触发的标题生成请求体（SSE 流内采集到预览后发起一次）。"""
+    session_id: str = Field(..., description="会话 ID")
+    question_text: str = Field("", description="用户问题文本（截断在前端）")
+    model_preview: str = Field("", description="模型输出预览（思考/正文累计前100字符）")
+    question_parts: Optional[list[dict[str, Any]]] = Field(
+        None,
+        description="首问原始 content 部件列表（多模态标题用；纯文本轮可不传）",
+    )
+
+
+@api_chat_config_router.post("/chat_config/generate_title")
+async def generate_session_title_frontend(payload: FrontendTitleRequest):
+    """前端触发的会话标题生成（解耦聊天主链路）。
+
+    前端在 SSE 流内收集模型输出（思考/正文 delta），累计达 100 字符（或
+    [DONE] 时不足 100 取全文）后调用本接口**一次**：后端调标题模型生成、
+    写盘并把标题同步返回——前端收到即替换侧栏标题，不再轮询 meta。
+    已生成过/失败标记/未配置标题模型时跳过生成并回显当前标题（零成本）；
+    「每条消息重新标题」开启时每轮都会生成。
+
+    会话级标题模型覆盖：请求处理内临时设置 ambient（照抄 role_info 展示
+    的既有模式），生成函数内部 get_role_selection 即该会话生效结果。
+    """
+    session_id = normalize_session_id(payload.session_id)
+    if not chat_memory_file_exists(session_id):
+        raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
+    from memory.chat_memory import resolve_session_model_selection
+    from env_manager import reset_ambient_model_selection, set_ambient_model_selection
+
+    effective_selection, _warnings = resolve_session_model_selection(session_id)
+    ambient_token = set_ambient_model_selection(effective_selection)
+    try:
+        result = await generate_title_for_frontend(
+            session_id,
+            str(payload.question_text or ""),
+            str(payload.model_preview or ""),
+            question_parts=payload.question_parts,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"标题生成失败：{exc}")
+    finally:
+        reset_ambient_model_selection(ambient_token)
+    return JSONResponse(content=result)
+
+
+@api_chat_config_router.get("/chat_config/retitle_setting")
+async def get_retitle_setting(session_id: str = Query(..., description="会话 ID")):
+    """读取会话「每条消息重新标题」开关（_meta.retitle_each_message）。
+
+    会话独立配置（无全局默认）：未设置时视为关闭（仅首轮生成一次标题）。
+    附带 _title_state 概览（是否已生成/已尝试），供前端开关旁展示状态。
+    """
+    from memory.chat_memory import (
+        chat_memory_file_exists,
+        normalize_session_id,
+        read_session_meta_value,
+    )
+    normalized = normalize_session_id(session_id)
+    exists = chat_memory_file_exists(normalized)
+    enabled = bool(read_session_meta_value(normalized, "retitle_each_message"))
+    state = read_session_meta_value(normalized, "_title_state")
+    state = state if isinstance(state, dict) else {}
+    return JSONResponse(content={
+        "state": "succeed",
+        "session_id": normalized,
+        "enabled": enabled,
+        "exists": exists,
+        "title_state": {
+            "title_generated": bool(state.get("title_generated")),
+            "attempted": bool(state.get("attempted")),
+        },
+    })
+
+
+@api_chat_config_router.post("/chat_config/retitle_setting")
+async def update_retitle_setting(payload: RetitleSettingPayload):
+    """写入会话「每条消息重新标题」开关（会话独立配置，不影响全局）。
+
+    - enabled=true：每轮任务收尾都由标题模型重新生成标题（覆盖式，
+      手动重命名后的标题也会被覆盖——属该开关的显式语义）；
+    - enabled=false：仅会话首个任务收尾尝试一次（默认）。
+    """
+    from memory.chat_memory import (
+        chat_memory_file_exists,
+        get_chat_memory_manager,
+        normalize_session_id,
+    )
+    if not payload.session_id or not str(payload.session_id).strip():
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    session_id = normalize_session_id(payload.session_id)
+    if not chat_memory_file_exists(session_id):
+        raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
+    try:
+        manager = await get_chat_memory_manager(session_id)
+        meta = await manager.update_session_retitle_setting(bool(payload.enabled))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存失败：{exc}")
+    return JSONResponse(content={
+        "state": "succeed",
+        "session_id": session_id,
+        "enabled": bool(meta.get("retitle_each_message")),
+        "message": (
+            f"会话 [{session_id}] 已开启每条消息重新标题" if payload.enabled
+            else f"会话 [{session_id}] 已关闭每条消息重新标题（仅首轮生成）"
+        ),
     })

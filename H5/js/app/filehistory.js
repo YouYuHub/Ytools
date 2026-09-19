@@ -83,7 +83,14 @@ window.App = window.App || {};
    * 刷新顶栏「文件变更」徽标（红点数字）。
    * @param {object} [prefetched] 可选：刚拉取过的 /file_diff/list 数据，直接复用免二次请求
    */
-  function refreshBadge(prefetched) {
+  let badgeInflight = false; // 在途去重：同会话统计请求进行中不重复发起
+  // 节流兜底：非强制路径（focus/visibilitychange/外部调用）同会话短窗口内
+  // 只发一次。focus 事件可能被输入法/浏览器扩展/系统通知等触发成风暴，
+  // 每次直调都会变成对 /file_diff/list 的轮询——统一节流兜底。数据变更
+  // 源（会话切换 noteSessionChanged、文件工具结果防抖刷新）带 force 不受限。
+  const BADGE_REFRESH_MIN_INTERVAL_MS = 1500;
+  let lastBadgeRequestedAt = 0;
+  function refreshBadge(prefetched, force) {
     const btn = document.getElementById("fileChangesBtn");
     if (!btn) return;
     const badge = btn.querySelector(".fh-badge");
@@ -108,9 +115,31 @@ window.App = window.App || {};
       apply(prefetched);
       return;
     }
-    API.listFileChanges(state.sessionId).then(apply).catch(function () {
-      btn.classList.add("hidden");
+    // 静默守卫三重：在途去重 + 同会话节流窗口 + 响应归属校验——杜绝任何
+    // 路径（含未知调用方/焦点风暴）把徽标刷新变成轮询源
+    const requestedSession = state.sessionId;
+    if (badgeInflight) return;
+    const now = Date.now();
+    if (!force && now - lastBadgeRequestedAt < BADGE_REFRESH_MIN_INTERVAL_MS) return;
+    badgeInflight = true;
+    lastBadgeRequestedAt = now;
+    API.listFileChanges(requestedSession).then(function (data) {
+      badgeInflight = false;
+      if (state.sessionId === requestedSession) apply(data);
+    }).catch(function () {
+      badgeInflight = false;
+      if (state.sessionId === requestedSession) btn.classList.add("hidden");
     });
+  }
+
+  // 会话变化通知（事件驱动，替代旧 2s 轮询看门狗）：sessionId 与上次已同步
+  // 值不同才刷新一次；相同则零请求。由 openSession/startNewChat/
+  // ensureSessionId/本地导入预览四个赋值点显式调用
+  let lastNotedSession;
+  function noteSessionChanged() {
+    if (state.sessionId === lastNotedSession) return;
+    lastNotedSession = state.sessionId;
+    refreshBadge(undefined, true); // 会话切换是数据变更源：强制刷新不受节流限制
   }
 
   function renderPanel() {
@@ -287,6 +316,7 @@ window.App = window.App || {};
   // ---------- 导出与初始化 ----------
   App.fileHistory = {
     refreshBadge: refreshBadge,
+    noteSessionChanged: noteSessionChanged,
     togglePanel: togglePanel,
     closePanel: closePanel,
     openEditor: openEditor,
@@ -352,20 +382,18 @@ window.App = window.App || {};
         if (confirmModal && !confirmModal.classList.contains("hidden")) closeConfirm();
       }
     });
-    // 编辑器页（独立窗口）内保留/撤回后回到主页面：focus / 可见性恢复时同步徽标
+    // 编辑器页（独立窗口）内保留/撤回后回到主页面：focus / 可见性恢复时同步徽标。
+    // 不带 force——受同会话节流窗口约束：焦点事件可能被输入法/扩展/系统通知
+    // 打成风暴，节流后同一风暴窗口内最多 1 次 /file_diff/list（静默期零请求）
     window.addEventListener("focus", function () {
       refreshBadge();
     });
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) refreshBadge();
     });
-    // 会话切换 / 刷新后同步一次徽标（轻量轮询检测 sessionId 变化）
-    let lastBadgedSession = null;
-    setInterval(function () {
-      if (state.sessionId !== lastBadgedSession) {
-        lastBadgedSession = state.sessionId;
-        refreshBadge();
-      }
-    }, 2000);
+    // 初始同步一次（此后全部事件驱动：openSession / startNewChat /
+    // ensureSessionId / 历史导入钩子调用 noteSessionChanged；
+    // 不再保留任何定时轮询——静默期对 /file_diff/list 零请求）
+    noteSessionChanged();
   });
 })(window.App);

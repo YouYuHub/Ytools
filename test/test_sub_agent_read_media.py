@@ -191,7 +191,7 @@ class SubAgentReadMediaVisionFalseTests(unittest.TestCase):
 
     def _runner_with_read_media(self, vision_value):
         from factory.agent_runtime.sub_agent import _tool_definition_name
-        read_media_def = json.loads(json.dumps(bt.READ_MEDIA_TOOL_DEFINITION))
+        read_media_def = json.loads(json.dumps(bt.build_read_media_tool_definition()))
         ctx, emitted = _make_context(
             task="看看 media://a.png",
             tools=[read_media_def],
@@ -256,7 +256,7 @@ class SubAgentReadMediaVisionTrueTests(unittest.TestCase):
     def test_success_returns_meta_and_pends_injection(self):
         ref = self.saved["media_ref"]
         task = f"读取 {ref} 并描述内容"
-        read_media_def = json.loads(json.dumps(bt.READ_MEDIA_TOOL_DEFINITION))
+        read_media_def = json.loads(json.dumps(bt.build_read_media_tool_definition()))
         ctx, emitted = _make_context(
             task=task,
             tools=[read_media_def],
@@ -278,10 +278,10 @@ class SubAgentReadMediaVisionTrueTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["injected_references"], [ref])
         # 坐标已进入待注入队列
-        self.assertEqual(runner.read_media_pending_parts, [(ref, None)])
+        self.assertEqual(runner.read_media_pending_parts, [(ref, None, None, None)])
 
     def test_reference_outside_task_rejected(self):
-        read_media_def = json.loads(json.dumps(bt.READ_MEDIA_TOOL_DEFINITION))
+        read_media_def = json.loads(json.dumps(bt.build_read_media_tool_definition()))
         ctx, _ = _make_context(
             task="没有引用的任务",
             tools=[read_media_def],

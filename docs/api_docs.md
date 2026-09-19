@@ -32,6 +32,8 @@
 - `tool_calls`：工具调用增量（按 index 合并）
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
+- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）
+- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行——上一轮正常完成后**无需重载会话**即可继续编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口）。覆盖式回答截断可能使轮次偏移，事件在截断后统一推送；失败路径不推送（前端走失败重载兜底）；仅实时推送不落盘
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
@@ -117,7 +119,7 @@
 
 ### POST /chat_history/delete_rounds（按轮次号删除，用户消息编辑重发）
 
-**轮次号口径**：1-based 的第 N 个 `chat_round` 条目（与前端历史渲染 `data-round` 同口径）；游离压缩事件行不占轮次号。生成任务运行中拒绝（409）——pending 轮次在 worker 内存，此刻截断会交错写入。
+**轮次号口径**：1-based 的第 N 个 `chat_round` 条目（与前端历史渲染 `data-round` 同口径）；游离压缩事件行不占轮次号。生成任务运行中拒绝（409）——pending 轮次在 worker 内存，此刻截断会交错写入。**前端编排**：任务运行中允许进入编辑态（仅提示"确认发送后会先停止生成再重发"）；用户确认后前端先调 `POST /stop_chat` 停止生成（任务按"手动停止"收尾落盘，停止接口同步等待任务完全退出），随后删除接口不再遇到 409。前端另有「删除该轮」hover 入口走 `single` 模式（确认框 → 删除 → 重载会话，运行中直接提示暂不删除）。
 
 - **请求体**：
   - `start_round`(必填)：从第 N 轮开始删；
@@ -233,8 +235,12 @@ manifest.json                     # {version, exported_at, sessions: [{session_i
 | /chat_config/mcp_tools | POST | Body `{call_timeout_seconds}`（非负数，0 表示不限制） | `{state, updated, config}`；写回 .env 并同步内存，下一次工具调用立即生效 |
 | /chat_config/tool_concurrency | GET | - | `{mcp_tool_workers, sub_agent_max_concurrent, defaults, semantics, env_names, memory_state}`；MCP 工具并发线程数与子智能体并发上限 |
 | /chat_config/tool_concurrency | POST | Body `{mcp_tool_workers, sub_agent_max_concurrent}`（均 ≥1，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次工具执行立即生效 |
+| /chat_config/video_read_limit | GET | - | `{max_seconds, effective_seconds, limits{min,max}, defaults, semantics, env_names, memory_state}`；read_media 工具视频区间读取最大秒数（.env `VIDEO_MAX_READ_SECONDS`），`effective_seconds` 为读取端钳制后的现读生效值（5–3600，非法回退 60），随 .env 热重载同步 |
+| /chat_config/video_read_limit | POST | Body `{max_seconds}`（整数，缺省用默认 60） | `{state, updated, config}`；写回 .env 并同步内存，下一次 read_media 调用即按新值读取（工具描述动态构建现读）；越界值保存原样、生效值钳制 5–3600 |
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
-| /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；空 `inputs` 清除会话覆盖恢复跟随全局默认；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
+| /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.j |
+| /chat_config/retitle_setting | GET | `session_id`（必填） | `{state, session_id, enabled, exists, title_state: {title_generated, attempted}}`；读取会话「每条消息重新标题」开关（`_meta.retitle_each_message`，会话独立配置，未设置视为关闭）与标题生成状态概览 |
+| /chat_config/retitle_setting | POST | Body `{session_id, enabled}` | `{state, session_id, enabled, message}`；写入会话「每条消息重新标题」开关：开启时每轮任务收尾都重新生成标题（开启瞬间清除 `_title_state.attempted`），关闭时仅首轮生成一次；会话不存在返回 404 |son（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；空 `inputs` 清除会话覆盖恢复跟随全局默认；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 
 ### 工作目录与会话独立 worker 进程
 
@@ -424,7 +430,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）/ `sub_agent_model`（子智能体）。`compaction_model` / `sub_agent_model` 必须为 `chat-completions` 协议。
 - `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议专属 `thinking`（messages）、`max_output_tokens / instructions`（responses）。
 - `api_type`（只读回显，前端不传）：后端根据 models.json 中该模型的 `apiType` 自动确定，可选值 `chat_completions` / `messages` / `responses`（连字符归一为下划线、小写；`apiType` 缺失时默认 `chat_completions`）。
-- 向后兼容：只传 `{provider, model}` 等价于 `role=chat_model` 且参数不变。
+- `headers`（可选）：该角色的**自定义请求头**，`[{"name": "x-foo", "value": "bar"}]` 列表形态（后端也接受 `{"x-foo": "bar"}` 键值字典的手工编辑形态）。持久化位置与 parameter 一致——全局默认存 models.json 顶层 `model_selection.<role>.headers`，会话级存 `_meta.model_selection.<role>.headers`（新会话首次任务开始时随 model_selection 整体快照一次）。继承语义与 parameter 相同：`null` 保持现有（"仅切换模型、自定义头不变"），提供时全量替换，`[]` 清空。**注入链**：请求上游时 ChatLLM 从模型配置的 `_custom_headers` 读取并拼入原始 HTTP 头（放在 Authorization 之后、Content-Length 之前；非法条目——空名/含冒号或空白/含 CRLF——在规范化阶段丢弃，防头部注入）；同名键后者覆盖前者。四个角色各自独立（聊天/压缩/标题/子智能体），聊天角色随 `require_default_chat_config` 注入，其余角色随各自模型解析处注入；原先硬编码的 `x-opencode-session` 已删除，opencode 等供应商需要的会话头改由该配置提供。
+- 向后兼容：只传 `{provider, model}` 等价于 `role=chat_model` 且参数与自定义头均不变。
 
 **参数取用回退链**：当前 `api_type` 的桶 > `chat_completions` 桶 > 任意第一个非空桶 > 空（内置默认）。旧版扁平 `parameter`（键为字段名）加载时自动迁移为 `chat_completions` 桶。
 
@@ -436,7 +443,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 **压缩模型优先级**：`model_selection.compaction_model`（未配置时跟随当前聊天模型）。压缩模型完全由 models.json 的 `model_selection` 管理，**不再从 `.env` 读取或写入**（`HISTORY_COMPACT_MODEL_PROVIDER/NAME` 已移除）。
 
-`title_model` 当前仅保存配置（标题生成暂未启用），参数与 `api_type` 一并持久化，供后续消费。
+**标题模型**：`model_selection.title_model`（会话覆盖 → 全局默认，仅 chat-completions 协议）消费于**会话标题自动生成（前端驱动，与聊天主链路解耦）**：前端在 SSE 流内收集模型输出（思考/正文 delta），累计达 100 字符（思考/正文取较长者）即调 `POST /chat_config/generate_title`**一次**（流结束不足 100 字符时以已有全文触发）；请求携带【用户问题】（截 300 字）+【输出预览】+ 首问原始 content 部件（多模态）。后端调标题模型生成 ≤30 字标题、写回会话首行 `_meta.title` 与 `_title_state` 标记（source/model/applied_at）并把标题**同步返回**——前端收到即替换侧栏标题，**零轮询**（不再轮询 `/chat_history/meta`）。**生成时机（会话独立配置 `retitle_each_message`，前端聊天设置弹窗开关）**：关闭（默认）时仅首个任务尝试一次；开启时每轮都重新生成（覆盖式，手动重命名后的标题也会被覆盖，属该开关显式语义）。**跳过条件**：已有 `title_generated`（首轮已生成/手动重命名过）或 `attempted`（失败标记）时接口直接回显当前标题、不调标题模型。**失败防重试**：一次调用失败（上游 4xx/5xx、空输出等）后写 `_title_state.attempted` 标记（含 `title_attempted_at`），之后轮次不再自动重试；需要重试时开启「每条消息重新标题」（开启瞬间清除 attempted）或手动重命名会话。接口内同会话 2s 防抖窗口防重复请求。未配置标题模型或调用失败时**保持旧机制标题**（首个用户问题前 40 字兜底），零行为变化。**多模态标题**：首问含图片/视频/音频时，标题模型支持视觉（该模型 vision=true）则媒体解析为 base64 一并送入（大图自动降采样，与聊天主链路同口径）；不支持视觉时媒体部件按 vision=false 同口径转为「[图片 media://x.png]」文本占位（不发 base64）。请求参数：标题模型 `parameter`（按 api_type 取桶）> 内置默认（temperature 0.3 / top_p 1.0 / presence_penalty 0.0 / max_tokens 64 / reasoning_effort low，无工具、非流式、不拼后端历史）。注意：所选标题模型需在其网关侧实际可用——部分网关按角色/工作区对模型做区域门控（如同 provider 下聊天模型可用而标题角色调用返回 403 RegionError），失败会打印可行动的 WARN 并保持旧机制标题，更换标题模型即可。**自定义请求头**：标题角色的 `headers` 配置（模型面板标题模型 tab）随配置注入上游请求（opencode 等需会话头的供应商在此配置）。
 
 ### 工具选择持久化（mcp_servers.json inputs + 会话 _meta.tool_selection）
 
@@ -535,11 +542,12 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 ### POST /file/upload_session_media
 上传聊天多媒体附件（图片/音频/视频），**原始字节**保存到 `history_files/session_files/<session>/media/`。
 - Form: `files`(必填, 多文件)；Query: `session_id`
-- 限制：≤10 个/次；单文件上限按类别——图片/音频 20MB、**视频 500MB（流式落盘，不整体读入内存）**；扩展名白名单——图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff（ico/tif/tiff 视觉模型不原生接受，上传时由 Pillow 自动转为 PNG 再落盘，需安装 pillow）、音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv
+- 限制：≤10 个/次；单文件上限按类别——图片/音频 20MB、**视频 600MB（流式落盘，不整体读入内存）**；扩展名白名单——图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff（ico/tif/tiff 视觉模型不原生接受，上传时由 Pillow 自动转为 PNG 再落盘，需安装 pillow）、音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status, stored_name, media_ref, kind(image/audio/video), mime, size}`
 - 聊天消息引用方式：`content` 部件列表中 `{"type":"image_url","image_url":{"url":"media://<stored_name>"}}`（音频为 `{"type":"input_audio","input_audio":{"data":"media://<stored_name>","format":"wav"}}`，视频 `video_url`）。
   后端发送上游前把 `media://` 引用解析为 OpenAI 兼容格式：URL 类部件 → `data:<mime>;base64,<b64>`，`input_audio.data` → 纯 base64；`https://` 与已内联 `data:`/base64 原样透传（url 与 base64 双格式兼容）。
-  **大图自动降采样**：超过 2MB 的图片（GIF 动图除外）在解析时改发 JPEG 缩略图——长边 ≤1568px、质量 85，缓存到 `<session>/thumbs/<原名>.thumb.jpg`（按原文件 mtime+size 指纹失效重建）；生成失败回退原图。原图仍完整落盘，预览/下载不受影响。前端在**发送前**也做同等压缩（canvas 重采样，压缩无收益保留原文件），双保险进一步降低上传体积与视觉 token 计费。
+  **大图自动降采样**：超过 2MB 的图片（GIF 除外，无论动静）在解析时改发 JPEG 缩略图——长边 ≤1568px、质量 85，缓存到 `<session>/thumbs/<原名>.thumb.jpg`（按原文件 mtime+size 指纹失效重建）；生成失败回退原图。原图仍完整落盘，预览/下载不受影响。前端在**发送前**也做同等压缩（canvas 重采样，压缩无收益保留原文件），双保险进一步降低上传体积与视觉 token 计费。
+  **视觉 API 拒绝格式的自动转换（发送上游前，不动落盘原图）**：静图 gif 与 bmp/ico/tif/tiff 统一转 PNG；**动图 gif 转 H.264 MP4**（Pillow `is_animated/n_frames` 判动静动，动图经 ffmpeg fps=10 + minterpolate 补帧 30fps + libx264 编码为 mp4，部件类型随之变为 `video_url`；ffmpeg 定位三级回退：系统 PATH → `imageio-ffmpeg` 包内置静态二进制 → 均缺失时按静图回退链路兜底）；转换缓存到 `<session>/media_transcode/<原名>.conv.<png|mp4>`（同款 mtime+size 指纹失效）。原生格式（png/jpg/jpeg/webp）不变。
 - 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位。
 
 ### GET /file/get_session_media
@@ -567,15 +575,44 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   与用户上传同规则：类型校验、大小上限、ICO/TIFF 自动转 PNG），重复读取走
   会话链路（无需重复下载/读盘）；重复读取自动去重；
 - `quality`：可选，50-100（默认 85）——仅对超过 2MB 的大图降采样生效
-  （长边 1568、JPEG 质量按该参数；小图/GIF 动图按原样回传）；
-- 规模边界沿用媒体上传规则（图片/音频 20MB、视频 500MB）；
+  （长边 1568、JPEG 质量按该参数；小图/GIF 按转换后口径回传）；
+- `start_time` / `end_time`：可选，视频与动图 gif 的**区间读取**秒数
+  （精确到帧，毫秒精度；内部按源帧率吸附到帧边界）。语义约定：
+  - **未指定区间**的视频/动图默认读 `[0, min(时长, 60s)]`（单次注入上限
+    `VIDEO_MAX_READ_SECONDS = 60`），返回 `video` 元信息块含实际读取区间，
+    `truncated=true` 表示还有剩余内容，模型可按 `[上一段 end, end+60]` 续读；
+  - **显式区间**（仅 `start_time` 或两者）：单次超过 60 秒自动截断为
+    `[start, start+60]` 并标记 `truncated`；
+  - **元数据探测约定**：`start_time == end_time`（如 `0`/`0`）只返回元数据
+    文本（时长/帧率/分辨率/大小，不回传视频数据）；`end_time < start_time`
+    参数错误；`start_time` 超出视频时长参数错误；
+  - 返回值 `loaded[]` 每项携带 `video` 块 `{duration, fps, width, height,
+    read:{start,end,seconds,truncated}}`（探测约定时为 `probe:true` 且无
+    `read`）；`duration` 不可得时按帧计数估算（`estimated_duration:true`）；
+  - 动图 gif 先转码 mp4 再按区间切片（同一转码缓存复用）；切片缓存
+    `<原名>.clip_<start>_<end>.mp4` 按源文件指纹失效；**网络直链视频不支持
+    区间读取**（URL 直传由供应商拉取）；同引用不同区间视为新的读取
+    （去重键 `reference#start-end`），相同区间重复读取仍去重；
+- **格式自动转换**（与聊天附件注入同口径）：视觉 API 拒绝的图片格式在
+  构建部件前自动转换——静图 gif 与 bmp/ico/tif/tiff → PNG（Pillow）、
+  **动图 gif → H.264 MP4**（流式字节扫描判动静动 + ffmpeg 转码「先缩放后
+  插值」，部件类型变为 `video_url`；转码失败回退首帧 PNG/JPEG 缩略图）；
+  `loaded[]` 每项额外携带 `converted` 元信息（`{original_format,
+  converted_format, animated, converted_kind}`，未转换为 null）；网络直链
+  遇到被拒格式时临时下载（上限按内容判定：gif 600MB / 其他 30MB）走同一
+  转换内核，转换失败回退 URL 直传原行为；
+- **ffmpeg 定位三级回退**：系统 PATH → `imageio-ffmpeg` 包内置的静态
+  二进制（requirements.txt 已含，`pip install imageio-ffmpeg` 即得，无需
+  系统级安装/管理员权限，自带 libx264 与 minterpolate）→ 转换不可用
+  （静图 gif 回退首帧 PNG）；fresh 环境装完 requirements 即完整可用；
+- 规模边界沿用媒体上传规则（图片/音频 20MB、视频 600MB）；读取侧按内容判定：静图类 30MB、动图 gif 与视频 600MB、音频 20MB，超限直接拒绝（错误占位注明原因，绝不注入原始大文件）；
 - **无内容安全边界**（当前策略：工具由用户提供；本地/网络来源不做白名单
   拦截，本地路径相对会话工作目录解析）；用户授权确认逻辑后续接入：
   来源审计字段（`source_type` = session/network/local、`source` = 原始引用）
   已在加载链路沿途携带，届时在 `register_media_source` 入口挂确认钩子；
 - 返回为纯文本元信息（读取了哪些、来源类型、实际生效 quality、是否降采样/
   跳过原因）；**数据本体（base64）不进入工具结果文本**——工具结果按原样落盘
-  JSONL，媒体数据由后端按 loaded 项的 `reference+quality` 坐标经
+  JSONL，媒体数据由后端按 loaded 项的 `reference+quality+区间` 坐标经
   `load_any_media_model_part` 现场加载为 user 消息多模态部件
   （`image_url`/`video_url`/`input_audio`），在工具结果处理完成后追加进
   后续模型请求上下文（仅内存、不落盘历史），token 统计按多模态部件固定

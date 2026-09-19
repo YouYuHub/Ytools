@@ -80,10 +80,225 @@
     });
   }
 
+  // ---------- 溢出标题 hover 跑马灯 ----------
+  // 溢出标题 hover 250ms 后开始滚动：在裁剪窗口内让内层文本整体左移（尾部
+  // 文字从右缘滚入），终点为"末尾文字 + 右边距"对齐，留出边距避免尾字贴边
+  // 被右缘渐隐/操作按钮压住。
+  // 动画载体为 transform: translateX（合成层属性，每帧只走 GPU 合成、不触
+  // 发整行 reflow），配合 ease-out 缓动（先快后慢）——旧实现逐帧写
+  // text-indent（布局属性）每帧 reflow，掉帧/重渲染时表现为跳变不平滑。
+  // 移出后 80ms 才复位（防抖），期间回到同一标题则继续滚动（保留已滚动位
+  // 移），吸收真实鼠标在行内掠动产生的边界事件抖动；复位也走 rAF 动画回滑，
+  // 不再瞬间归零。
+  // .is-marquee 类负责移除右缘渐隐遮罩 + will-change 提升合成层。
+  let marqueeTimer = null;       // 启动延迟 timer
+  let marqueeResetTimer = null;  // 移出复位防抖 timer
+  let marqueeName = null;        // 当前滚动的标题元素
+  let marqueeSession = null;     // 当前滚动的会话 id（行被重渲染替换后凭此接管新元素）
+  let marqueeRaf = 0;            // rAF 句柄（滚动/复位共用）
+  let marqueeShift = 0;          // 本次滚动的总位移（溢出 + 右边距）
+  let marqueeMoved = 0;          // 已滚动位移（px）
+  let marqueeLast = 0;           // 上一帧时间戳
+  let marqueeAnimatingReset = false; // 复位动画进行中标记
+
+  const MARQUEE_DELAY = 250;         // hover 触发延迟（ms），快速划过不触发
+  const MARQUEE_SPEED_MAX = 160;     // 起步最高速度（px/s）
+  const MARQUEE_SPEED_MIN = 36;      // 收尾最低速度（px/s），避免无限逼近终点
+  const MARQUEE_DECEL = 1.6;         // 减速系数：speed = MIN + 剩余距离×该值
+  const MARQUEE_RIGHT_INSET = 10;    // 终点时末尾文字与右缘的间距（px）
+  const MARQUEE_RESET_DEBOUNCE = 80; // 移出复位防抖（ms）
+  const MARQUEE_MAX_DT = 64;         // 单帧最大时间步长（ms），防切页回来跳变
+  const MARQUEE_RESET_SPEED = 320;   // 复位回滚速度（px/s），快速但可见
+
+  function clearMarqueeRaf() {
+    if (marqueeRaf) {
+      cancelAnimationFrame(marqueeRaf);
+      marqueeRaf = 0;
+    }
+  }
+
+  function marqueeSessionId(name) {
+    const item = name.closest(".session-item");
+    return item ? item.dataset.session || "" : "";
+  }
+
+  // 统一的标题文本写入点：兼容双层结构（内层 .session-name-text 承载文本，
+  // 跑马灯 transform 作用在内层；外层 .session-name 保持裁剪窗口），旧
+  // node.textContent = title 会把内层结构连根替换导致 transform 失效——
+  // 所有运行期改标题的路径都必须走本函数。返回是否发生了变更（false=同值）
+  function setSessionNameText(nameNode, title) {
+    if (!nameNode) return false;
+    const inner = nameNode.querySelector(".session-name-text");
+    const target = inner || nameNode; // 兜底：旧结构（无双层）直接写
+    if (target.textContent === title) return false;
+    target.textContent = title;
+    return true;
+  }
+
+  // 行被列表重渲染替换后，凭会话 id 找到接任的同名标题元素
+  function marqueeSuccessor() {
+    if (!marqueeSession) return null;
+    const item = sessionList.querySelector(
+      '.session-item[data-session="' + (window.CSS && CSS.escape ? CSS.escape(marqueeSession) : marqueeSession) + '"]');
+    return item ? item.querySelector(".session-name") : null;
+  }
+
+  // 把元素摆到"已滚动 moved px"的位置（transform 载体：合成层属性，
+  // 每帧只走 GPU 合成，不再触发整行 reflow——跳变感的旧根因）
+  function applyMarqueeTransform(node, moved) {
+    node.style.transform = "translateX(" + (-moved) + "px)";
+  }
+
+  // transform 动画载体解析：双层结构时取内层 .session-name-text（外层
+  // .session-name 是 overflow:hidden 的裁剪窗口，整体平移会把窗口移出可视
+  // 区；平移内层文本 = 旧 text-indent 语义的合成层等价实现），旧单层结构
+  // 直接用外层自身兜底
+  function marqueeAnimTarget(nameNode) {
+    return nameNode.querySelector(".session-name-text") || nameNode;
+  }
+
+  function resetMarqueeDom() {
+    if (marqueeName) {
+      marqueeName.classList.remove("is-marquee");
+      applyMarqueeTransform(marqueeAnimTarget(marqueeName), 0);
+      marqueeAnimTarget(marqueeName).style.removeProperty("transform");
+    }
+    marqueeName = null;
+    marqueeSession = null;
+    marqueeMoved = 0;
+    marqueeAnimatingReset = false;
+  }
+
+  function stopTitleMarquee() {
+    if (marqueeTimer) {
+      clearTimeout(marqueeTimer);
+      marqueeTimer = null;
+    }
+    if (marqueeResetTimer) {
+      clearTimeout(marqueeResetTimer);
+      marqueeResetTimer = null;
+    }
+    clearMarqueeRaf();
+    resetMarqueeDom();
+  }
+
+  // 复位回滚动画：从当前位移平滑归零（移出 hover 时不再瞬间跳回句首）
+  function runMarqueeReset() {
+    marqueeAnimatingReset = true;
+    clearMarqueeRaf();
+    marqueeLast = 0;
+    const step = function (now) {
+      if (!marqueeName || !marqueeName.isConnected || !marqueeAnimatingReset) {
+        clearMarqueeRaf();
+        return;
+      }
+      const dt = Math.min(now - (marqueeLast || now), MARQUEE_MAX_DT);
+      marqueeLast = now;
+      const next = marqueeMoved - (dt / 1000) * MARQUEE_RESET_SPEED;
+      if (next <= 0) {
+        resetMarqueeDom();
+        marqueeRaf = 0;
+        return;
+      }
+      marqueeMoved = next;
+      applyMarqueeTransform(marqueeAnimTarget(marqueeName), marqueeMoved);
+      marqueeRaf = requestAnimationFrame(step);
+    };
+    marqueeRaf = requestAnimationFrame(step);
+  }
+
+  function runMarqueeFrame() {
+    clearMarqueeRaf();
+    const step = function (now) {
+      // 行被列表重渲染替换（元素脱离文档）：接管同会话的新元素，滚动无缝继续
+      if (!marqueeName || !marqueeName.isConnected) {
+        const next = marqueeSuccessor();
+        if (!next) {
+          clearMarqueeRaf();
+          return;
+        }
+        if (next !== marqueeName) {
+          next.classList.add("is-marquee");
+          applyMarqueeTransform(marqueeAnimTarget(next), marqueeMoved);
+          marqueeName = next;
+        }
+      }
+      const name = marqueeName;
+      const dt = Math.min(now - (marqueeLast || now), MARQUEE_MAX_DT);
+      marqueeLast = now;
+      const remaining = marqueeShift - marqueeMoved;
+      // 按剩余距离减速：起步顶速快速滚入，接近终点线性减速到收尾速度
+      // （速度连续，无突兀停止；中断续滚天然兼容——每帧按当前状态重算）
+      const speed = Math.min(
+        MARQUEE_SPEED_MAX,
+        MARQUEE_SPEED_MIN + remaining * MARQUEE_DECEL
+      );
+      marqueeMoved = Math.min(marqueeShift, marqueeMoved + (dt / 1000) * speed);
+      applyMarqueeTransform(marqueeAnimTarget(name), marqueeMoved);
+      if (marqueeMoved >= marqueeShift) {
+        marqueeRaf = 0;   // 到头：hover 期间保持终点（类在，遮罩仍移除）
+        return;
+      }
+      marqueeRaf = requestAnimationFrame(step);
+    };
+    marqueeRaf = requestAnimationFrame(step);
+  }
+
+  sessionList.addEventListener("mouseover", function (e) {
+    const name = e.target.closest(".session-name");
+    if (!name) return;
+    // 防抖窗口内回到同一标题，或复位回滚动画进行中重新进入：
+    // 停止回滚、继续正向滚动（保留已滚动位移，不从头重放）
+    if ((marqueeResetTimer || marqueeAnimatingReset) && name === marqueeName) {
+      clearTimeout(marqueeResetTimer);
+      marqueeResetTimer = null;
+      marqueeAnimatingReset = false;
+      marqueeLast = 0;
+      runMarqueeFrame();
+      return;
+    }
+    if (name === marqueeName) return;
+    stopTitleMarquee();
+    marqueeTimer = setTimeout(function () {
+      marqueeTimer = null;
+      if (!name.isConnected || marqueeName) return;
+      const overflow = name.scrollWidth - name.clientWidth;
+      if (overflow <= 2) return;
+      marqueeName = name;
+      marqueeSession = marqueeSessionId(name);
+      marqueeShift = overflow + MARQUEE_RIGHT_INSET;
+      marqueeMoved = 0;
+      marqueeLast = 0;
+      name.classList.add("is-marquee");
+      runMarqueeFrame();
+    }, MARQUEE_DELAY);
+  });
+
+  sessionList.addEventListener("mouseout", function (e) {
+    const name = e.target.closest(".session-name");
+    if (!name) return;
+    // 启动延迟期内移出：直接取消
+    if (marqueeTimer) {
+      clearTimeout(marqueeTimer);
+      marqueeTimer = null;
+      return;
+    }
+    if (name !== marqueeName) return;
+    // 复位回滚已在进行：无需再防抖，等它自然归零
+    if (marqueeAnimatingReset) return;
+    // 滚动中移出：防抖后平滑回滚；80ms 内回到同一标题则继续正向滚动
+    if (marqueeResetTimer) clearTimeout(marqueeResetTimer);
+    clearMarqueeRaf();
+    marqueeResetTimer = setTimeout(function () {
+      marqueeResetTimer = null;
+      if (name !== marqueeName || marqueeAnimatingReset) return;
+      runMarqueeReset();
+    }, MARQUEE_RESET_DEBOUNCE);
+  });
+
   function buildSessionItem(id, title) {
     const item = el("div", "session-item" + (id === state.sessionId ? " active" : ""));
-    item.dataset.session = id;
-    // 多选模式的选中气泡：bulk-mode 下显示，点击切换选中（自身是死区元素，必须绑事件）
+    item.dataset.session = id;    // 多选模式的选中气泡：bulk-mode 下显示，点击切换选中（自身是死区元素，必须绑事件）
     const check = el("span", "session-check");
     check.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
     check.addEventListener("click", function (event) {
@@ -94,7 +309,13 @@
     if (bulkMode && bulkSelected.has(id)) item.classList.add("bulk-selected");
     const select = el("button", "session-select");
     select.type = "button";
-    select.appendChild(el("span", "session-name", title));
+    // 标题双层结构：外层 .session-name 固定裁剪窗口（overflow:hidden），
+    // 内层 .session-name-text 承载文本并作为跑马灯 transform 载体——
+    // transform 平移的是内层文本，外层窗口不动（旧 text-indent 语义的
+    // transform 等价实现）；写文本统一走 setSessionNameText 保结构
+    const nameNode = el("span", "session-name");
+    nameNode.appendChild(el("span", "session-name-text", title));
+    select.appendChild(nameNode);
     select.addEventListener("click", function () {
       if (bulkMode) {
         toggleBulkSelect(id, item);
@@ -325,6 +546,7 @@
   }
 
   function renameSession(id, item) {
+    stopTitleMarquee(); // 进入编辑态会替换 .session-select：先停掉该行跑马灯，避免回滚状态残留
     const current = item.querySelector(".session-name").textContent;
     const select = item.querySelector(".session-select");
     const wrapper = el("div", "session-edit");
@@ -455,7 +677,7 @@
       sessionList.insertBefore(item, label ? label.nextSibling : sessionList.firstChild);
     } else if (opts.title) {
       const name = item.querySelector(".session-name");
-      if (name) name.textContent = title;
+      setSessionNameText(name, title);
     }
     // 置顶（本会话刚发生交互，应排在列表最前）
     const label = sessionList.querySelector(".session-label");
@@ -478,6 +700,8 @@
   function ensureSessionId() {
     if (!state.sessionId) {
       state.sessionId = SessionUtils.sanitizeSessionId(SessionUtils.generateSessionId());
+      // 文件变更徽标事件驱动同步（替代旧 2s 轮询看门狗；未变化时零请求）
+      if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     }
     return state.sessionId;
   }
@@ -500,6 +724,7 @@
     App.restoreSessionDraft(null);
     App.resetContextTokenStats();
     App.refreshChatModelLabel(); // 新对话回到全局默认（服务端返回全局选择）
+    if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     state.hasConversation = false;
     state.importedHistoryText = null;
     enhancePanel.classList.add("hidden");
@@ -536,8 +761,12 @@
     const seq = ++sessionOpenSeq;
     // 保存当前会话的输入草稿（文本+附件），再切换到目标会话
     App.saveSessionDraft();
+    // 切换会话时结束进行中的语音输入（识别文本不能串写到另一个会话的输入框）
+    if (App.stopVoiceInput) App.stopVoiceInput();
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
+    // 文件变更徽标事件驱动同步（会话切换即刷新一次；未变化时零请求）
+    if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     App.loadWorkDir();
     App.loadToolSelection(); // 按会话加载独立工具选择（未覆盖则应用全局默认）
     // 模型面板打开中时按新会话的生效选择刷新
@@ -635,6 +864,7 @@
   App.markActiveSession = markActiveSession;
   App.refreshSessionFades = refreshSessionFades;
   App.upsertLocalSession = upsertLocalSession;
+  App.setSessionNameText = setSessionNameText;
   App.ensureSessionId = ensureSessionId;
   App.startNewChat = startNewChat;
   App.openSession = openSession;

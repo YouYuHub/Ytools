@@ -765,6 +765,99 @@ def normalize_context_summary(summary: Any) -> dict[str, Any] | None:
     return normalized
 
 
+def adjust_context_summary_for_deleted_rounds(
+    summary: Any,
+    deleted_round_numbers: Any,
+) -> Any:
+    """删除轮次后同步调整累计摘要的游标与编号，让摘要继续可用。
+
+    删除会使后续轮次编号整体前移（与前端 data-round 同口径的 1-based
+    编号），若直接丢弃摘要，下轮上下文会退化为原始轮次全量回传而超窗。
+    这里按删除位置平移摘要中的三处编号锚点，返回调整后的摘要：
+
+    - source_round_count：减去被删的已压缩轮次数（游标内轮次被删后，
+      剩余覆盖轮次数即新游标）；
+    - blocks[].round_start/round_end：删除位之前的整体前移、区间内被删
+      的收缩端点，覆盖轮次全部被删的块整体丢弃；
+    - recent_question_numbers + recent_questions：被删轮次的问题移除，
+      其后编号前移；编号缺失或与问题列表不等长（无法对齐）时保持原样。
+
+    摘要为 None / 非法结构时原样返回；纯文本摘要（游标恒为 0、无编号
+    锚点）不受删除影响，也原样返回。
+    """
+    if not isinstance(summary, dict):
+        return summary
+    if not isinstance(deleted_round_numbers, (list, tuple, set)):
+        return summary
+    deleted: set[int] = set()
+    for number in deleted_round_numbers:
+        try:
+            parsed = int(number)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 1:
+            deleted.add(parsed)
+    if not deleted:
+        return summary
+
+    def _deleted_before(number: int) -> int:
+        return sum(1 for item in deleted if item < number)
+
+    def _deleted_upto(number: int) -> int:
+        return sum(1 for item in deleted if item <= number)
+
+    adjusted = dict(summary)
+    try:
+        old_count = int(adjusted.get("source_round_count") or 0)
+    except (TypeError, ValueError):
+        old_count = 0
+    adjusted["source_round_count"] = max(0, old_count - _deleted_upto(old_count))
+
+    raw_blocks = adjusted.get("blocks")
+    if isinstance(raw_blocks, list) and raw_blocks:
+        kept_blocks: list[Any] = []
+        for block in raw_blocks:
+            if not isinstance(block, dict):
+                kept_blocks.append(block)
+                continue
+            try:
+                round_start = int(block.get("round_start") or 0)
+                round_end = int(block.get("round_end") or 0)
+            except (TypeError, ValueError):
+                round_start = round_end = 0
+            if round_start > 0 and round_end >= round_start:
+                new_start = round_start - _deleted_before(round_start)
+                new_end = round_end - _deleted_upto(round_end)
+                if new_start > new_end:
+                    continue  # 覆盖轮次全部被删，块内容不再锚定任何现存轮次
+                block = dict(block)
+                block["round_start"] = new_start
+                block["round_end"] = new_end
+            kept_blocks.append(block)
+        adjusted["blocks"] = kept_blocks
+
+    questions = adjusted.get("recent_questions")
+    numbers = adjusted.get("recent_question_numbers")
+    if (
+        isinstance(questions, list)
+        and isinstance(numbers, list)
+        and len(questions) == len(numbers)
+    ):
+        kept_questions: list[Any] = []
+        kept_numbers: list[Any] = []
+        for number, question in zip(numbers, questions):
+            if isinstance(number, int) and number in deleted:
+                continue
+            if isinstance(number, int) and number >= 1:
+                kept_numbers.append(number - _deleted_before(number))
+            else:
+                kept_numbers.append(number)
+            kept_questions.append(question)
+        adjusted["recent_questions"] = kept_questions
+        adjusted["recent_question_numbers"] = kept_numbers
+    return adjusted
+
+
 def render_recent_questions_message(summary: Any) -> dict[str, Any] | None:
     """把问题列表或 `context_summary.recent_questions` 渲染为独立 system 消息。
 

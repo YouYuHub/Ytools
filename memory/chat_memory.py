@@ -261,6 +261,35 @@ def read_session_meta_value(session_id: str, key: str) -> Any:
     return None
 
 
+def mark_title_attempted(session_id: str) -> dict[str, Any] | None:
+    """在 _title_state 上标记"已尝试生成标题"（title_attempted_at + attempted）。
+
+    标题模型调用失败后调用：防止上游持续不可用时每个新任务都白发一次
+    标题请求。会话不存在/无 _meta/写盘失败一律静默返回 None（标题任务
+    本身已失败，此标记尽力而为）。开启「每条消息重新标题」开关时该
+    标记会被清除并在每轮重新生成时不再写入。
+    """
+    try:
+        file_path = _get_chat_history_file(normalize_session_id(session_id))
+        if not file_path.exists():
+            return None
+        meta, entries = _load_meta_and_entries(file_path, normalize_session_id(session_id))
+        if not isinstance(meta, dict) or not meta:
+            return None
+        title_state = dict(meta.get("_title_state")) if isinstance(meta.get("_title_state"), dict) else {}
+        if title_state.get("title_generated"):
+            return None
+        title_state["attempted"] = True
+        title_state["title_attempted_at"] = now_str()
+        meta["_title_state"] = title_state
+        meta["updated_at"] = now_str()
+        _write_meta_and_entries(file_path, meta, entries)
+        return meta
+    except Exception as exc:
+        print(f"[WARN] 标题尝试标记写入失败（不影响聊天任务）: {exc}")
+        return None
+
+
 def resolve_session_work_dir(session_id: str) -> tuple[str | None, str | None]:
     """解析会话生效工作目录（惰性：不落盘、不 chdir）。
 
@@ -363,6 +392,7 @@ def resolve_session_model_selection(
 # 摘要/历史格式化已迁移到 memory.chat_history_format，本文件仅保留调用入口
 from memory.chat_history_format import (
     normalize_context_summary as _normalize_context_summary,
+    adjust_context_summary_for_deleted_rounds as _adjust_summary_for_deleted_rounds,
     render_context_summary as _render_context_summary,
     render_recent_questions_message as _render_recent_questions_message,
     extract_recent_questions as _extract_recent_questions,
@@ -1275,6 +1305,12 @@ class ChatMemoryManager:
             keep_media_refs: 清理时排除的媒体 stored_name 列表（编辑重发时
                 编辑态保留的附件仍要复用，不能删）。
 
+        Notes:
+            跨轮累计摘要（context_summary）不随删除丢弃：游标 source_round_count、
+            摘要块覆盖轮次与保真问题索引按删除位置平移后继续生效——删除只改变
+            轮次编号，不改变摘要正文承载的历史事实；丢弃摘要会让下轮上下文
+            退化为原始轮次全量回传，大会话直接超出模型窗口。
+
         Returns:
             {state, removed_rounds, planned_rounds, planned_files, files_cleanup,
              meta_after, usage_after}；dry_run 时 state="planned"。
@@ -1385,7 +1421,18 @@ class ChatMemoryManager:
 
             # 破坏性写盘前留 .bak 侧车备份（sidecars/ 子目录，与 .tmp 原子写同目录），误删可手动恢复
             self._backup_history_file()
-            meta["context_summary"] = None
+            # 累计摘要不整体作废：按删除位置平移游标（source_round_count）、
+            # 摘要块覆盖范围与保真问题索引的轮次编号，摘要继续生效。
+            # 丢弃摘要会让下轮上下文退化为原始轮次回传，大会话直接超窗
+            # （删除只影响编号锚点，不影响摘要正文承载的历史事实）
+            deleted_round_numbers = (
+                list(range(start_round, total_rounds + 1))
+                if mode == "truncate"
+                else [start_round]
+            )
+            meta["context_summary"] = _adjust_summary_for_deleted_rounds(
+                meta.get("context_summary"), deleted_round_numbers
+            )
             meta = _recompute_meta_from_entries(self.session_id, meta, remaining_entries)
             _write_meta_and_entries(self._file_path, meta, remaining_entries)
             return {
@@ -1735,6 +1782,55 @@ class ChatMemoryManager:
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["title"] = new_title
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def apply_generated_title(
+        self,
+        title: str,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        写入标题模型生成的会话标题与生成标记（_title_state）。
+
+        与 update_session_title 同一写盘路径（_write_guard 互斥）；用户
+        后续手动重命名走 update_session_title 时覆盖 title 本身，而
+        _title_state.title_generated 标记让标题任务不再重复覆盖手动标题
+        （recompute 的首问 40 字兜底也因 title != default_title 不触发）。
+        Args:
+            title: 标题模型生成的标题
+            state: 附带生成信息（source/model/applied_at），缺省仅写标记
+        Returns:
+            更新后的元数据字典
+        """
+        new_title = (title or "").strip()
+        if not new_title:
+            raise ValueError("title 不能为空")
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["title"] = new_title
+            title_state = dict(state) if isinstance(state, dict) else {}
+            title_state.setdefault("source", "title_model")
+            title_state["title_generated"] = True
+            meta["_title_state"] = title_state
+            meta["updated_at"] = now_str()
+            _write_meta_and_entries(self._file_path, meta, entries)
+        return meta
+
+    async def update_session_retitle_setting(self, enabled: bool) -> dict[str, Any]:
+        """写入会话「每条消息重新标题」开关（_meta.retitle_each_message）。
+
+        会话独立配置：开启时每轮任务收尾都重新生成标题；关闭（默认）时
+        仅首个任务收尾尝试一次。开启瞬间同时清掉 _title_state.attempted
+        标记（历史失败已无意义，开启后每轮都会重新生成）。
+        """
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            meta["retitle_each_message"] = bool(enabled)
+            title_state = meta.get("_title_state")
+            if isinstance(title_state, dict) and title_state.pop("attempted", None) is not None:
+                meta["_title_state"] = title_state
             meta["updated_at"] = now_str()
             _write_meta_and_entries(self._file_path, meta, entries)
         return meta

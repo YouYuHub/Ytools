@@ -38,9 +38,12 @@
     wrap.appendChild(dialog);
     document.body.appendChild(wrap);
 
-    function close() { wrap.remove(); }
-    cancelBtn.addEventListener("click", close);
-    backdrop.addEventListener("click", close);
+    function close(cancelled) {
+      wrap.remove();
+      if (cancelled && typeof opts.onCancel === "function") opts.onCancel();
+    }
+    cancelBtn.addEventListener("click", function () { close(true); });
+    backdrop.addEventListener("click", function () { close(true); });
     okBtn.addEventListener("click", function () {
       close();
       if (typeof opts.onConfirm === "function") opts.onConfirm();
@@ -212,4 +215,5 @@
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.startManualCompaction = startManualCompaction;
+  App.openConfirmDialog = openConfirmDialog;
 })(window.App);

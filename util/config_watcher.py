@@ -11,6 +11,10 @@ setting/mcp_servers.json 与 setting/models.json，先比对文件内容 hash
   （不动 .env）。模型配置本身是"先构建后整体替换"的原子赋值，请求协程
   读到的要么是旧配置要么是新配置。
 
+**.env 变更：重载 env_vars 内存字典（reload_env_vars）——所有 load_var 配置
+  （如 VIDEO_MAX_READ_SECONDS、HISTORY_COMPACT_* 等）随即热生效，无需重启；
+  set_env_vars 写接口本身已同步内存，热重载服务的是「外部直接编辑 .env」。**
+
 worker 子进程不需要该线程：每个生成任务开始时 worker 会自行 init_path()
 刷新 .env/models.json，并按磁盘上的 mcp_servers.json 重新发现工具。
 
@@ -45,12 +49,13 @@ DEFAULT_WATCH_INTERVAL_SECONDS = 5.0
 
 
 def default_watch_targets() -> dict[str, Path]:
-    """默认监视目标：项目 setting 目录下的两个配置文件。"""
+    """默认监视目标：项目 setting 目录的两个配置文件 + 项目 .env。"""
     from config import PROJECT_ROOT
     setting_dir = Path(PROJECT_ROOT) / "setting"
     return {
         "mcp_servers": setting_dir / "mcp_servers.json",
         "models": setting_dir / "models.json",
+        "env": Path(PROJECT_ROOT) / ".env",
     }
 
 
@@ -137,9 +142,14 @@ def _check_target(target: str, path: Path) -> str:
             state["mtime_ns"] = stat.st_mtime_ns
             return "unchanged"
     try:
-        data = json.loads(payload.decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("顶层结构必须是 JSON 对象")
+        if target == "env":
+            # .env 是宽松 KV 文本（非 JSON）：合法性与重载都交给 env_manager，
+            # 任何文本变化都会触发一次重载回调（内部失败时保留内存现状）
+            data: dict[str, Any] = {"_raw_bytes": len(payload)}
+        else:
+            data = json.loads(payload.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("顶层结构必须是 JSON 对象")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         # 解析失败：不更新 hash（下一轮文件修好后自动重试），内存配置保持现状
         print(f"[config-watch] {path} 解析失败，保留内存配置: {exc}")

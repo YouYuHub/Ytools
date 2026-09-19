@@ -108,6 +108,12 @@ class ChatModelSelection(BaseModel):
         None,
         description="该模型的默认生成参数（如 temperature/max_tokens/top_p 等），全量替换语义；不传表示保持现有配置",
     )
+    headers: Optional[list[dict[str, Any]]] = Field(
+        None,
+        description="该角色的自定义请求头列表 [{name, value}]；None 表示保持现有配置，"
+                    "[] 表示清空。随模型选择持久化（全局 models.json / 会话 _meta），"
+                    "请求上游时由 ChatLLM 注入原始 HTTP 头",
+    )
     session_id: Optional[str] = Field(
         None,
         description="会话ID；携带时写入该会话的 _meta.model_selection（会话级覆盖，仅覆盖该角色），"
@@ -165,6 +171,17 @@ class ContextReturnConfig(BaseModel):
         DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
         description="历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符",
     )
+
+
+class RetitleSettingPayload(BaseModel):
+    """「每条消息重新标题」开关配置载荷。
+
+    enabled=true 时该会话每轮任务收尾都由标题模型重新生成标题；
+    false（默认）时仅首个任务收尾尝试一次。
+    session_id 缺省视为当前未创建会话（返回 400）。
+    """
+    enabled: bool = Field(False, description="是否开启每条消息重新标题（会话独立配置）")
+    session_id: Optional[str] = Field(None, description="目标会话 ID")
 
 
 class McpToolConfig(BaseModel):

@@ -450,7 +450,7 @@
       const html = highlight(input.value, st.lang);
       if (html != null) hl.innerHTML = html;
       else hl.textContent = input.value;
-      syncHeight(input, hl);
+      syncHeight(input, hl, cell);
     };
     input.addEventListener("input", function () {
       paint();
@@ -486,16 +486,56 @@
     cell.appendChild(hl);
     cell.appendChild(input);
     line.appendChild(cell);
+    // 此刻行尚未插入文档（脱离布局），首测行高不可信——入队待插入后复测
+    queueHeightSync(row);
     return line;
   }
 
-  /** 让高亮层跟随输入行数撑高（textarea 自动行高）。 */
-  function syncHeight(input, hl) {
+    /** 让高亮层跟随输入行数撑高（textarea 自动行高）。 */
+  function syncHeight(input, hl, cell) {
     input.style.height = "auto";
     const h = Math.max(input.scrollHeight, 21);
     input.style.height = h + "px";
     hl.style.minHeight = h + "px";
+    // 高亮层与输入层都是 absolute（inset:0），不参与行布局：
+    // 行高必须显式写到 .eh-edit 单元格，换行成多行的行才能把整行撑高，
+    // 否则内容溢出行盒盖住下一行（行号与下一行正文重叠）
+    if (cell) cell.style.height = h + "px";
   }
+
+  // 首次渲染（renderRow）发生在行节点插入 DOM 之前，textarea.scrollHeight
+  // 无布局可用（恒 0），行高全部塌成 21px——长行换行后溢出与下一行重叠。
+  // 把这类"脱离文档的测量"收集起来，等插入后再批量复测一次行高。
+  const pendingHeightRows = [];
+  let heightSyncScheduled = false;
+
+  function queueHeightSync(row) {
+    if (pendingHeightRows.indexOf(row) === -1) pendingHeightRows.push(row);
+    if (heightSyncScheduled) return;
+    heightSyncScheduled = true;
+    requestAnimationFrame(function () {
+      heightSyncScheduled = false;
+      const rows = pendingHeightRows.splice(0);
+      for (const pending of rows) {
+        if (pending.lineEl && pending.lineEl.isConnected && pending.paint) {
+          pending.paint();
+        }
+      }
+    });
+  }
+
+  // 视口宽度变化会改变每行的换行位置（已量好的行高全部失真），
+  // 防抖后对全部可编辑行整表复测
+  let resizeTimer = null;
+  window.addEventListener("resize", function () {
+    if (!st || !st.rows) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      for (const row of st.rows) {
+        if (row.paint) queueHeightSync(row);
+      }
+    }, 150);
+  });
 
   // ---------- 结构化行编辑（full 视图） ----------
   // 每行是独立 textarea，行与行之间的"换行"不是任何 textarea 内的字符，

@@ -87,9 +87,9 @@ window.App = window.App || {};
     sessionDrafts: {},
   };
 
-  // 待发送附件上限：数量与单文件大小按类别区分（与后端 MEDIA_SIZE_LIMITS 一致：视频 500MB）
+  // 待发送附件上限：数量与单文件大小按类别区分（与后端 MEDIA_SIZE_LIMITS 一致：视频 600MB）
   const MAX_PENDING_MEDIA = 6;
-  const MEDIA_SIZE_LIMITS = { image: 20 * 1024 * 1024, audio: 20 * 1024 * 1024, video: 500 * 1024 * 1024 };
+  const MEDIA_SIZE_LIMITS = { image: 20 * 1024 * 1024, audio: 20 * 1024 * 1024, video: 600 * 1024 * 1024 };
   // 与后端 memory.file_memory 的媒体扩展名白名单保持一致
   // （ico/tif/tiff 上传后由后端自动转为 png，模型始终收到原生支持的格式）
   const MEDIA_EXTENSIONS = {
@@ -170,6 +170,12 @@ window.App = window.App || {};
   const enhanceReset = $("#enhanceReset");
   const enhanceClearOverride = $("#enhanceClearOverride");
   const enhanceHint = $("#enhanceHint");
+  const customHeadersBox = $("#customHeadersBox");
+  const customHeadersRows = $("#customHeadersRows");
+  const addHeaderRow = $("#addHeaderRow");
+  const settingsRetitleRow = $("#settingsRetitleRow");
+  const settingsRetitleToggle = $("#settingsRetitleToggle");
+  const settingsRetitleStatus = $("#settingsRetitleStatus");
   const plusBtn = $("#plusBtn");
   const plusMenu = $("#plusMenu");
   const toolModal = $("#toolModal");
@@ -212,6 +218,7 @@ window.App = window.App || {};
   const toolResultMaxLength = $("#toolResultMaxLength");
   const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
   const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
+  const videoReadMaxSeconds = $("#videoReadMaxSeconds");
   const mcpToolWorkers = $("#mcpToolWorkers");
   const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
   const keepRounds = $("#keepRounds");
@@ -254,6 +261,7 @@ window.App = window.App || {};
     tool_result_max_length: -1,
     call_timeout_seconds: 300,
     network_retry_max_attempts: 3,
+    video_read_max_seconds: 60,
     mcp_tool_workers: 3,
     sub_agent_max_concurrent: 3,
     keep_rounds: 20,
@@ -422,7 +430,12 @@ window.App = window.App || {};
     themeMenu.classList.toggle("hidden");
   });
   document.addEventListener("click", function (e) {
-    if (!themeMenu.contains(e.target) && !plusMenu.contains(e.target) && !enhancePanel.contains(e.target) &&
+    // composedPath 在事件派发时定格：面板内点击即使处理过程中 DOM 被增删
+    // （如删除自定义请求头行后按钮脱离文档），仍判定为面板内点击，
+    // 不会误触发"点击面板外部"的收起逻辑
+    const clickPath = typeof e.composedPath === "function" ? e.composedPath() : null;
+    const inEnhancePanel = clickPath ? clickPath.includes(enhancePanel) : enhancePanel.contains(e.target);
+    if (!themeMenu.contains(e.target) && !plusMenu.contains(e.target) && !inEnhancePanel &&
       !sessionActionsMenu.contains(e.target) && !queueMenu.contains(e.target) &&
       e.target !== plusBtn && e.target !== boostBtn &&
       !sessionActionsBtn.contains(e.target)) {
@@ -537,8 +550,10 @@ window.App = window.App || {};
   maxTokens, maxTokensValue, topP,
   topPValue, presencePenalty, presencePenaltyValue,
   enhanceCancel, enhanceConfirm, enhanceReset,
-  enhanceClearOverride, enhanceHint, plusBtn,
-  plusMenu, toolModal, toolGroups,
+  enhanceClearOverride, enhanceHint,
+  customHeadersBox, customHeadersRows, addHeaderRow,
+  settingsRetitleRow, settingsRetitleToggle, settingsRetitleStatus,
+  plusBtn, plusMenu, toolModal, toolGroups,
   toolSearchInput, toolSelected, toolCollapseAll,
   toolRefresh, toolFollowGlobal, fileInput, historyFileInput,
   fileChips, toolChips, themeMenu,
@@ -551,7 +566,7 @@ window.App = window.App || {};
   chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
-  toolCallTimeoutSeconds, networkRetryMaxAttempts, mcpToolWorkers,
+  toolCallTimeoutSeconds, networkRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
   subAgentMaxConcurrent, keepRounds,
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,

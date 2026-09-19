@@ -10,8 +10,8 @@
   overflow: hidden;
 
   // ---------- 空态：输入条垂直居中（ChatGPT 首页形态） ----------
-  // （.app.empty .suggest-row 在 _composer；enhance-panel 已提升 body 级，
-  //   空态向下弹出坐标由 composer.js placeEnhancePanel 计算）
+  // （enhance-panel 已提升 body 级，空态向下弹出坐标由 composer.js
+  //   placeEnhancePanel 计算）
   &.empty {
     .chat-scroll {
       display: none;

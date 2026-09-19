@@ -79,13 +79,23 @@ class SubAgentTruncatingLLM:
         yield "data: [DONE]\n\n"
 
 
-class StreamTruncationRecoveryTests(unittest.IsolatedAsyncioTestCase):
+class TruncationTestBase(unittest.IsolatedAsyncioTestCase):
+    """公共基座：只放环境搭建与消费工具，不定义测试方法（避免被子类重复继承）。"""
+
     def setUp(self):
         cf._CHAT_WORKER_MODE = "inline"
         self._orig_chat = cf.ChatLLM.chat_completions
         self._orig_load_var = cf.load_var
         cf.ChatLLM.chat_completions = TruncatingLLM.chat_completions
-        cf.load_var = self._orig_load_var  # 保持真实配置（截断重试默认 2 次）
+
+        def _patched_load_var(key, default=None):
+            # 截断重试次数与 .env 解耦（真实环境可能调成 3/5）：
+            # 本测试固定 2 次验证"默认上限"语义，其余配置走真实读取
+            if key == "STREAM_TRUNCATION_MAX_RETRIES":
+                return 2
+            return self._orig_load_var(key, default)
+
+        cf.load_var = _patched_load_var
         cf._SSE_HEARTBEAT_SECONDS = 0.05
         cf.load_all_tools = lambda: asyncio.sleep(0)
         cf.tool_registry.ALL_TOOLS = []
@@ -114,6 +124,9 @@ class StreamTruncationRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def _history_path(self, sid):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, "history_files", f"{sid}_chat.jsonl")
+
+
+class StreamTruncationRecoveryTests(TruncationTestBase):
 
     async def test_truncated_stream_retries_and_completes(self):
         # 第一次调用被截断 → 自动重试 → 第二次正常回答收尾，任务不假结束
@@ -233,6 +246,93 @@ class SubAgentTruncationRecoveryTests(unittest.TestCase):
             self.assertGreaterEqual(len(internal), 1)
         finally:
             ChatLLM.chat_completions = original
+
+
+class IntermittentLLM:
+    """模拟"长任务中多次间歇中断但从未连续达上限"的场景。
+
+    调用序列（上限 2）：1 截断 → 2 正常工具调用轮(todo_write) → 3 截断 →
+    4 截断 → 5 正常回答。
+    旧的任务级累计计数：call 1 计 1、call 3 计 2、call 4 达上限 2 → 第 4 次
+    调用后直接终止任务（共 4 次调用，无最终回答）。
+    连续中断计数语义（修复后）：call 2 正常完成把计数清零，call 3、4 重新
+    从 1 开始累计，第 5 次调用仍可正常完成任务。
+    """
+
+    calls = 0
+    last_messages = None
+
+    @staticmethod
+    async def chat_completions(request=None, stream=False, stop_checker=None, **kw):
+        IntermittentLLM.calls += 1
+        n = IntermittentLLM.calls
+        if IntermittentLLM.last_messages is None:
+            IntermittentLLM.last_messages = {}
+        IntermittentLLM.last_messages[n] = (
+            list(request.messages) if request is not None and request.messages else []
+        )
+        if n in (1, 3, 4):
+            # 模拟上游 EOF + stream_truncated 标记帧（部分思考增量）
+            yield f"data: {json.dumps({'reasoning_content': f'间歇中断片段{n}'})}\n\n"
+            yield f"data: {json.dumps({'stream_truncated': True})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if n == 2:
+            # 正常完成的工具调用轮：finish_reason=tool_calls（触发计数复位）
+            yield f"data: {json.dumps({'content': '工具轮前的说明'})}\n\n"
+            yield f"data: {json.dumps({'tool_calls': [{
+                'index': 0,
+                'id': 'call_reset_1',
+                'type': 'function',
+                'function': {
+                    'name': 'todo_write',
+                    'arguments': json.dumps(
+                        {'todos': [{'id': 't1', 'content': '验证连续中断计数复位', 'status': 'pending'}]},
+                        ensure_ascii=False,
+                    ),
+                },
+            }]})}\n\n"
+            yield f"data: {json.dumps({'finish_reason': 'tool_calls'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        # n == 5：恢复后的正常收尾
+        yield f"data: {json.dumps({'content': '恢复后的完整回答'})}\n\n"
+        yield f"data: {json.dumps({'finish_reason': 'stop'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+class ModelRetriesConsecutiveResetTests(TruncationTestBase):
+    """连续中断计数复位回归：正常完成的轮次清零计数，任务不被历史累计误杀。"""
+
+    def setUp(self):
+        super().setUp()
+        cf.ChatLLM.chat_completions = IntermittentLLM.chat_completions
+        IntermittentLLM.calls = 0
+        IntermittentLLM.last_messages = {}
+
+    async def test_consecutive_counter_resets_after_normal_round(self):
+        # 中断(1) → 正常工具轮(2) → 中断(3) → 中断(4) → 正常收尾(5)：
+        # 上限 2 是"单次请求内连续中断"——call 2 正常完成后计数清零，
+        # call 3/4 各自重新累计（第 1 次、第 2 次），call 5 正常完成任务。
+        # 旧的任务级累计计数会在 call 4 就终止任务（仅 4 次调用 + 错误记录）
+        sid = f"mock_trunc_reset_{uuid.uuid4().hex}"
+        try:
+            text = await self._consume(sid)
+            self.assertIn("恢复后的完整回答", text)
+            self.assertIn("[DONE]", text)
+            self.assertEqual(IntermittentLLM.calls, 5)
+            # 连续计数语义：每次中断都从"第 1 次"重新计数
+            self.assertEqual(text.count("（第 1 次）"), 2)  # 调用 1、3（各为新一轮的连续第 1 次）
+            self.assertIn("（第 2 次）", text)              # 调用 4（同一请求周期内连续第 2 次）
+            self.assertNotIn("（第 3 次）", text)           # 未发生连续 3 次中断
+            # 落盘不应有"连续重试超限"的错误记录，最终回答完整保留
+            with open(self._history_path(sid), "r", encoding="utf-8") as f:
+                raw = f.read()
+            self.assertNotIn("单次请求内连续自动重试", raw)
+            self.assertIn("恢复后的完整回答", raw)
+        finally:
+            await cleanup_chat_memory_manager(sid)
+            ChatMemoryManager.delete_chat_session_file(sid)
 
 
 if __name__ == "__main__":

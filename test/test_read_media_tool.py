@@ -50,7 +50,7 @@ def _make_png_bytes(width: int, height: int) -> bytes:
     return out.getvalue()
 
 
-def _fake_loader(session_id, reference, quality=None):
+def _fake_loader(session_id, reference, quality=None, start_time=None, end_time=None):
     """给 execute_read_media 的加载桩：返回可注入部件形态（含实际生效质量）。"""
     if reference == "media://fail.png":
         return None
@@ -108,7 +108,7 @@ class NormalizeArgsTests(unittest.TestCase):
     """normalize_read_media_args 参数规整。"""
 
     def test_strips_media_scheme_and_dedupes(self):
-        references, quality, error = bt.normalize_read_media_args({
+        references, quality, error, _s, _e = bt.normalize_read_media_args({
             "references": ["media://a.png", " media://a.png ", "media://b.jpg", ""],
         })
         self.assertEqual(references, ["media://a.png", "media://b.jpg"])
@@ -116,28 +116,58 @@ class NormalizeArgsTests(unittest.TestCase):
         self.assertIsNone(error)
 
     def test_single_string_wrapped(self):
-        references, _q, error = bt.normalize_read_media_args({"references": "media://a.png"})
+        references, _q, error, _s, _e = bt.normalize_read_media_args({"references": "media://a.png"})
         self.assertEqual(references, ["media://a.png"])
         self.assertIsNone(error)
 
     def test_quality_bounds(self):
-        _, quality, error = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 50})
+        _, quality, error, _s, _e = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 50})
         self.assertEqual(quality, 50)
         self.assertIsNone(error)
-        _, _, error = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 49})
+        _, _, error, _, _ = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 49})
         self.assertIn("超出范围", error)
-        _, _, error = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 101})
+        _, _, error, _, _ = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": 101})
         self.assertIn("超出范围", error)
-        _, _, error = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": "abc"})
+        _, _, error, _, _ = bt.normalize_read_media_args({"references": ["media://a.png"], "quality": "abc"})
         self.assertIn("无效", error)
 
+    def test_time_range_validation(self):
+        # 合法区间：透传
+        _r, _q, error, start, end = bt.normalize_read_media_args({
+            "references": ["media://v.mp4"], "start_time": 1.5, "end_time": 30.25,
+        })
+        self.assertIsNone(error)
+        self.assertEqual(start, 1.5)
+        self.assertEqual(end, 30.25)
+        # 仅 start：end 缺省由加载内核按上限截断
+        _r, _q, error, start, end = bt.normalize_read_media_args({
+            "references": ["media://v.mp4"], "start_time": 10,
+        })
+        self.assertIsNone(error)
+        self.assertEqual(start, 10.0)
+        self.assertIsNone(end)
+        # end < start：参数错误
+        _r, _q, error, _, _ = bt.normalize_read_media_args({
+            "references": ["media://v.mp4"], "start_time": 5, "end_time": 2,
+        })
+        self.assertIn("小于", error)
+        # 非数字/负数：参数错误
+        _r, _q, error, _, _ = bt.normalize_read_media_args({
+            "references": ["media://v.mp4"], "start_time": "abc",
+        })
+        self.assertIn("无效", error)
+        _r, _q, error, _, _ = bt.normalize_read_media_args({
+            "references": ["media://v.mp4"], "end_time": -1,
+        })
+        self.assertIn("不能为负", error)
+
     def test_empty_references_rejected(self):
-        _, _, error = bt.normalize_read_media_args({"references": []})
+        _, _, error, _, _ = bt.normalize_read_media_args({"references": []})
         self.assertIn("不能为空", error)
-        _, _, error = bt.normalize_read_media_args({"references": 123})
+        _, _, error, _, _ = bt.normalize_read_media_args({"references": 123})
         self.assertIn("无效", error)
         # 单个字符串自动包列表（宽容处理，不算错误）
-        references, _, error = bt.normalize_read_media_args({"references": "not-a-list"})
+        references, _, error, _, _ = bt.normalize_read_media_args({"references": "not-a-list"})
         self.assertEqual(references, ["not-a-list"])
         self.assertIsNone(error)
 
@@ -296,16 +326,19 @@ class LoadMediaModelPartTests(unittest.TestCase):
             self.assertEqual(max(img.size), fm.MODEL_MEDIA_MAX_EDGE)
 
     def test_gif_skips_downsample(self):
+        # 静态 GIF（单帧）：视觉 API 拒绝 gif → 统一转 PNG 发送（跳过降采样）
         import io as _io
         from PIL import Image as _Image
         out = _io.BytesIO()
         _Image.new("P", (64, 48), color=3).save(out, format="GIF")
         gif_bytes = out.getvalue()
-        saved = fm.save_session_media(TEST_SESSION, "动图.gif", gif_bytes)
+        saved = fm.save_session_media(TEST_SESSION, "静图.gif", gif_bytes)
         info = fm.load_session_media_model_part(TEST_SESSION, saved["media_ref"], quality=50)
         self.assertFalse(info["downsampled"])
+        self.assertIsNotNone(info.get("converted"))
+        self.assertEqual(info["converted"]["converted_format"], "png")
         url = info["part"]["image_url"]["url"]
-        self.assertTrue(url.startswith("data:image/gif;base64,"))
+        self.assertTrue(url.startswith("data:image/png;base64,"))
 
     def test_invalid_reference_returns_none(self):
         self.assertIsNone(fm.load_session_media_model_part(TEST_SESSION, "media://ghost.png"))

@@ -463,6 +463,30 @@ html:not([data-theme="dark"]) #voiceBtn {
   color: #757575;
 }
 
+// 语音录音中：红色按钮 + 呼吸光圈（识别文本实时写入输入框，再点停止）
+.round-btn.is-recording {
+  background: var(--danger, #dc2626);
+  color: #fff;
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+
+// 浅色主题下 #voiceBtn 的灰色弱化是 ID 选择器，需带 .is-recording 提权才能覆盖
+html:not([data-theme="dark"]) #voiceBtn.is-recording {
+  background: var(--danger, #dc2626);
+  color: #fff;
+}
+
+@keyframes voice-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.35);
+  }
+
+  50% {
+    box-shadow: 0 0 0 7px rgba(220, 38, 38, 0);
+  }
+}
+
 // ---------- 运行中组合按钮：停止 + 发送选项上拉 ----------
 // 方形停止钮与窄上拉钮拼合为一组（VS Code 风格），仅当前会话运行中显示；
 // 上拉钮弹出菜单（消息引导/加入队列），菜单项整体可点击直接执行
@@ -642,34 +666,6 @@ html:not([data-theme="dark"]) #voiceBtn {
 .plus-menu {
   bottom: calc(100% + 8px);
   left: 8px;
-}
-
-// 建议胶囊（空态时显示在输入条下方）
-.suggest-row {
-  display: none;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
-  margin-top: 14px;
-
-  .suggest-chip {
-    padding: 8px 16px;
-    border: 1px solid var(--border-strong);
-    border-radius: 999px;
-    font-size: 13px;
-    color: var(--text-secondary);
-    transition: background-color 0.15s ease, color 0.15s ease;
-
-    &:hover {
-      background: var(--bg-hover);
-      color: var(--text);
-    }
-  }
-}
-
-// 空态由根节点 .app.empty 控制（跨容器状态，保持扁平前缀）
-.app.empty .suggest-row {
-  display: flex;
 }
 
 // 工具选择 / 已上传文件 标签行

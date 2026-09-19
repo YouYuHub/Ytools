@@ -293,6 +293,7 @@
   function previewLocalHistory(text, parsed, sessionId, toastMsg) {
     App.resetContextTokenStats();
     state.sessionId = sessionId;
+    if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     state.importedHistoryText = text;
     state.hasConversation = true;
     chatInner.innerHTML = "";

@@ -321,6 +321,38 @@
     font-size: 14px;
   }
 
+  // 「每条消息重新标题」开关行（工具配置弹窗内，会话独立配置）
+  .tool-retitle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 20px 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-code);
+
+    .tool-retitle-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .tool-retitle-status {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      color: var(--text-tertiary);
+    }
+  }
+
   .tool-groups {
     flex: 1;
     min-height: 0;
@@ -797,6 +829,89 @@
     cursor: pointer;
   }
 
+  // 自定义请求头编辑器（键值两列，可逐行增减；随角色模型选择持久化）
+  .enhance-headers {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 2px;
+
+    .enhance-headers-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+
+      button {
+        padding: 2px 8px;
+        font-size: 11px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-sm);
+        background: var(--bg-code);
+        color: var(--text-secondary);
+        cursor: pointer;
+
+        &:hover {
+          background: var(--bg-hover);
+          color: var(--text);
+        }
+      }
+    }
+
+    .enhance-headers-rows {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .enhance-header-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 20px;
+      gap: 6px;
+      align-items: center;
+
+      input {
+        min-width: 0;
+        padding: 4px 6px;
+        font-size: 12px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-sm);
+        background: var(--bg-code);
+        color: var(--text);
+
+        &:focus {
+          outline: none;
+          border-color: var(--accent, var(--border-strong));
+        }
+      }
+
+      .enhance-header-remove {
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        line-height: 1;
+        font-size: 13px;
+        border: none;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-tertiary);
+        cursor: pointer;
+
+        &:hover {
+          background: var(--bg-hover);
+          color: var(--text);
+        }
+      }
+    }
+
+    .enhance-headers-tip {
+      font-size: 11px;
+      color: var(--text-tertiary);
+    }
+  }
+
   // 模型选择按钮：面板内展开列表（替代原生 select 弹出层，窄屏可完整显示/滚动）
   .model-picker {
     display: flex;
@@ -1054,6 +1169,11 @@
 
     & + .chat-settings-section {
       margin-top: 10px;
+    }
+
+    // 「每条消息重新标题」开关行（自 toolModal 迁入；去掉工具弹窗的贴边距）
+    .tool-retitle-row {
+      margin: 2px 0 10px;
     }
 
     h3 {

@@ -235,6 +235,74 @@ class DeleteRoundsTests(unittest.TestCase):
         self.assertTrue(doc_path.exists(), "窗口外上传的文档不应误删")
 
 
+class DeleteRoundsSummaryTests(unittest.TestCase):
+    """删除轮次后跨轮累计摘要不丢弃：游标/块范围/问题编号同步平移并继续生效。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_chat_root = chat_memory.HISTORY_ROOT
+        self._orig_file_root = file_memory.HISTORY_ROOT
+        chat_memory.HISTORY_ROOT = Path(self._tmp)
+        file_memory.HISTORY_ROOT = Path(self._tmp)
+        self.session_id = "sess_delete_summary"
+        self.manager = chat_memory.ChatMemoryManager(self.session_id)
+        for question, answer in [
+            ("问题一", "回答一"),
+            ("问题二", "回答二"),
+            ("问题三", "回答三"),
+            ("问题四", "回答四"),
+            ("问题五", "回答五"),
+        ]:
+            asyncio.run(self.manager.add_chat_history({"role": "user", "content": question}))
+            asyncio.run(self.manager.add_chat_history({"role": "assistant", "content": answer}))
+            asyncio.run(self.manager.add_chat_history({"role": "assistant", "done": "[DONE]"}))
+        asyncio.run(self.manager.update_context_summary({
+            "source_round_count": 3,
+            "blocks": [{"summary": "已压缩的历史事实", "round_start": 1, "round_end": 3}],
+            "recent_questions": ["问题二", "问题三"],
+            "recent_question_numbers": [2, 3],
+        }))
+
+    def tearDown(self):
+        chat_memory.HISTORY_ROOT = self._orig_chat_root
+        file_memory.HISTORY_ROOT = self._orig_file_root
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _meta_summary(self):
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        return meta.get("context_summary")
+
+    def test_single_delete_shifts_summary_cursor(self):
+        asyncio.run(self.manager.delete_rounds(2, mode="single"))
+        summary = self._meta_summary()
+        self.assertIsNotNone(summary, "删除轮次不应丢弃累计摘要")
+        self.assertEqual(summary["source_round_count"], 2)
+        self.assertEqual(summary["blocks"][0]["round_start"], 1)
+        self.assertEqual(summary["blocks"][0]["round_end"], 2)
+        self.assertEqual(summary["recent_question_numbers"], [2])
+        self.assertEqual(summary["recent_questions"], ["问题三"])
+
+    def test_truncate_inside_summary_shrinks_cursor(self):
+        asyncio.run(self.manager.delete_rounds(2, mode="truncate"))
+        summary = self._meta_summary()
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["source_round_count"], 1)
+        self.assertEqual(summary["blocks"][0]["round_end"], 1)
+        self.assertEqual(summary["recent_questions"], [])
+
+    def test_context_messages_use_summary_after_delete(self):
+        asyncio.run(self.manager.delete_rounds(2, mode="single"))
+        messages = asyncio.run(self.manager.get_context_messages(max_rounds=0))
+        rendered = json.dumps(messages, ensure_ascii=False)
+        self.assertIn("【历史压缩摘要】", rendered)
+        # 已压缩轮次的原始对话不再回传（含被删轮次自身）
+        self.assertNotIn("回答一", rendered)
+        self.assertNotIn("回答二", rendered)
+        # 游标之后的轮次仍以完整对话回传
+        self.assertIn("回答四", rendered)
+        self.assertIn("回答五", rendered)
+
+
 class TargetRoundTests(unittest.TestCase):
     """target_round 原地重跑：替换式收尾、版本链轮次覆盖、历史截断。"""
 

@@ -5,6 +5,7 @@
 import json
 # import urllib.request
 # import urllib.error
+import re
 import urllib.parse
 import socket
 import ssl
@@ -49,6 +50,28 @@ def _resolve_network_retry_max_attempts() -> int:
         return int(raw)
     except (TypeError, ValueError):
         return DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
+
+
+def _build_custom_header_lines(chat_config: dict[str, Any]) -> str:
+    """把模型配置中的自定义请求头（`_custom_headers`）拼为原始 HTTP 头行。
+
+    配置来源（随模型配置注入）：会话/全局 model_selection.<role>.headers，
+    由 env_manager.inject_custom_headers_into_config 写入配置副本。非法条目
+    （空名/含冒号或空白）在规范化阶段已丢弃，此处仅作防御性过滤。
+    """
+    raw = (chat_config or {}).get("_custom_headers")
+    if not isinstance(raw, list):
+        return ""
+    lines = ""
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = "" if item.get("value") is None else str(item.get("value"))
+        if not name or re.search(r"[\r\n]", name + value):
+            continue
+        lines += f"{name}: {value}\r\n"
+    return lines
 
 
 @dataclass
@@ -484,6 +507,8 @@ class ChatLLM:
                         f"Host: {host}\r\n"
                         f"Content-Type: application/json\r\n"
                         f"Authorization: Bearer {api_key}\r\n"
+                        # 模型配置的自定义请求头（model_selection.<role>.headers）
+                        f"{_build_custom_header_lines(chat_config)}"
                         f"Content-Length: {len(body_bytes)}\r\n"
                         f"Connection: close\r\n"
                         f"\r\n"
@@ -688,9 +713,11 @@ class ChatLLM:
                     header_lines = (
                         f"Host: {host}\r\n"
                         f"Content-Type: application/json\r\n"
-                        # opencode 需要携带 x-opencode-session 头部，值为 session id
-                        f"x-opencode-session: lolicon1314\r\n"
                         f"Authorization: Bearer {api_key}\r\n"
+                        # 模型配置的自定义请求头（model_selection.<role>.headers，
+                        # 取代原先硬编码的 x-opencode-session   ——   opencode 等供应商
+                        # 需要的会话头在参数面板按角色自行配置）
+                        f"{_build_custom_header_lines(chat_config)}"
                         f"Content-Length: {len(body_bytes)}\r\n"
                         f"Connection: close\r\n"
                         f"\r\n"
@@ -907,6 +934,8 @@ class ChatLLM:
                 f"Host: {host}\r\n"
                 f"Content-Type: application/json\r\n"
                 f"Authorization: Bearer {api_key}\r\n"
+                # 模型配置的自定义请求头（model_selection.<role>.headers）
+                f"{_build_custom_header_lines(chat_config)}"
                 f"Content-Length: {len(body_bytes)}\r\n"
                 f"Connection: close\r\n"
                 f"\r\n"

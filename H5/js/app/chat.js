@@ -53,15 +53,20 @@
     return uploadedMedia;
   }
 
-  // V2 文件版本链徽标刷新（防抖）：文件工具结果到达后延迟拉一次统计
+  // V2 文件版本链徽标刷新（防抖）：文件工具结果到达后延迟拉一次统计。
+  // 仅文件写型工具才可能产生版本链变更（版本链 tool 角色=write_file/edit_file/
+  // sub_agent.*）——搜索/命令/问答等工具结果不再触发 /file_diff/list 请求，
+  // 避免多工具任务期间每个工具结果一次接口调用的风暴
   let fileChangesTimer = null;
+  const FILE_BADGE_TOOLS = ["write_file", "edit_file", "sub_agent"];
   function scheduleFileChangesBadgeRefresh(sessionId) {
     if (state.sessionId !== sessionId) return;
     if (fileChangesTimer) clearTimeout(fileChangesTimer);
     fileChangesTimer = setTimeout(function () {
       fileChangesTimer = null;
       if (App.fileHistory && typeof App.fileHistory.refreshBadge === "function") {
-        App.fileHistory.refreshBadge();
+        // 工具结果是数据变更源：force 不受 refreshBadge 的节流窗口限制
+        App.fileHistory.refreshBadge(undefined, true);
       }
     }, 400);
   }
@@ -90,6 +95,11 @@
     const usageByCompletion = new Map();
     const usageWithoutId = new Map();
     let roundUsageAcc = null;
+    // 标题生成（前端驱动）：流内累计思考/正文 delta，达 TITLE_PREVIEW_CHARS
+    // 时由 maybeTriggerTitle 发起一次标题请求（聊天主链路不再感知标题任务）
+    let titleReasoning = "";
+    let titleContent = "";
+    let titleTriggered = false;
 
     function sealTextBlocks() {
       if (curThink) curThink.done();
@@ -183,6 +193,12 @@
     function handle(evt) {
       if (evt.type === "done") return;
       const data = evt.data || {};
+
+      // 轮次开始：后端任务启动后推送本轮最终轮次号（普通发送），前端就地
+      // 补挂本轮提问气泡的编辑/复制/删除入口（此前收尾不重载就没有入口）
+      if (data.round_started && typeof data.round_started.round === "number") {
+        App.attachLiveRoundEntry(activeStream, data.round_started.round);
+      }
 
       // 事件不含 reasoning_content 字段 = 当前思考阶段已结束
       const hasReasoning = typeof data.reasoning_content === "string" && data.reasoning_content;
@@ -347,6 +363,7 @@
           appendStage(curThink.wrap);
         }
         curThink.add(data.reasoning_content);
+        titleReasoning += data.reasoning_content;
       }
       // 回答：每段独立一个块
       if (typeof data.content === "string" && data.content) {
@@ -366,6 +383,7 @@
         App.highlightCodeBlocks(curAnswer);
         // 流式整块重建后立即同步设置钉住态，避免 MutationObserver 延迟到下一帧造成左右闪切
         App.updateCodeblockCopyButtons();
+        titleContent += data.content;
       }
       // 工具调用增量：按 index 合并，参数 JSON 逐帧流式展示。
       // 模型生成 arguments（命令文本/文件内容等）的每个增量帧都会实时
@@ -445,7 +463,8 @@
             App.applyToolResult(
               tb.ui, tr.function_name,
               typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2),
-              tr.file_diff
+              tr.file_diff,
+              tr.arguments
             );
             tb.ui.finish();
             tb.done = true;
@@ -471,7 +490,8 @@
         App.applyToolResult(
           tb.ui, tr.function_name,
           typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2),
-          tr.file_diff
+          tr.file_diff,
+          tr.arguments
         );
         tb.ui.finish();
         tb.done = true;
@@ -482,8 +502,11 @@
         // （防抖合并，流式期间多次结果只产生一次请求）
         if (state.sessionId === sessionId) {
           App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
-          // V2 文件版本链：文件工具结果到达后刷新顶栏"文件变更"徽标（防抖）
-          scheduleFileChangesBadgeRefresh(sessionId);
+          // V2 文件版本链：仅文件写型工具结果触发徽标刷新（防抖）；
+          // 其它工具（搜索/命令/ask_user/todo 等）不产生版本链变更，不请求
+          if (FILE_BADGE_TOOLS.indexOf(tr.function_name) >= 0) {
+            scheduleFileChangesBadgeRefresh(sessionId);
+          }
         }
       }
       // token 用量：每次 LLM 调用一份独立统计，按 completion id 去重后累加为本轮累计
@@ -494,13 +517,28 @@
         }
       }
       if (state.sessionId === sessionId) stickToBottom();
+      // 标题生成（前端驱动）：流内累计达 100 字符即发起一次标题请求（一次）
+      maybeTriggerTitle(sessionId, false);
+    }
+
+    // 标题触发判定（管线内：访问采集变量）：未触发且有预览时发起一次请求；
+    // force=true（流结束兜底）不足 100 字符也以已有全文触发
+    function maybeTriggerTitle(sessionId, force) {
+      if (titleTriggered) return;
+      const preview = pickTitlePreview(titleReasoning, titleContent);
+      if (!preview) return;
+      if (!force && preview.length < TITLE_PREVIEW_CHARS) return;
+      titleTriggered = true;
+      requestSessionTitle(sessionId, activeStream.userText, activeStream.questionParts, preview);
     }
 
     return {
       handle: handle,
       finish: function () {
-        // 流结束仍未收到消费信号：清除待注入提示（避免停止/异常时残留）
+        // 流结束时仍未收到消费信号：清除待注入提示（避免停止/异常时残留）
         App.clearInjectedPending(sessionId);
+        // 流结束仍未触发标题：不足 100 字符以已有全文触发一次（有输出才触发）
+        maybeTriggerTitle(sessionId, true);
         if (curAnswer) curAnswer.classList.remove("msg-cursor");
         msg.querySelectorAll(".think-block.is-streaming").forEach(function (think) {
           think.classList.remove("is-streaming");
@@ -708,6 +746,11 @@
     App.rebuildQnav();    const activeStream = {
       sessionId: streamSessionId,
       userText: text,
+      // 首问原始 content（字符串或部件列表）：round_started 到达时给本轮
+      // 提问气泡补挂编辑/删除入口用（编辑回填与媒体芯片解析的数据源）
+      userContent: userContent,
+      // 多模态时含 media:// 引用，标题请求透传给后端解析
+      questionParts: Array.isArray(userContent) ? userContent : null,
       userNode: userNode,
       messageNode: msg,
       completed: false,
@@ -758,7 +801,13 @@
     } finally {
       const fin = pipe.finish();
       if (typeof App.finalizeMermaidBlocks === "function") App.finalizeMermaidBlocks();
-      const shouldReloadVisibleSession = state.sessionId === streamSessionId && activeStream.messageNode.parentNode !== chatInner;
+      // 编辑重发"停止生成并重发"接管本流时会打 detached 标记：节点被新轮
+      // DOM 手术移除属预期行为，旧流收尾的重载兜底必须跳过，否则会把新
+      // 一轮流式渲染的节点整段重建掉
+      const wasDetached = activeStream.detached === true;
+      const shouldReloadVisibleSession = !wasDetached
+        && state.sessionId === streamSessionId
+        && activeStream.messageNode.parentNode !== chatInner;
       if (fin.empty && !msg.querySelector(".msg-user")) msg.remove();
       const usageReconciled = await App.refreshSessionUsage(streamSessionId);
       if (!usageReconciled && fin.roundUsage && fin.roundUsage.total_tokens) {
@@ -776,13 +825,11 @@
       }
       if (state.sessionId === streamSessionId) App.clearContextStatsTimer();
       App.refreshComposerButtons();
-      refreshSessionTitle(streamSessionId);
       if (shouldReloadVisibleSession) {
         setTimeout(function () { App.openSession(streamSessionId); }, 0);
-      } else if (liveRound != null && (streamFailed || fin.empty)) {
+      } else if (!wasDetached && liveRound != null && (streamFailed || fin.empty)) {
         // 原地重发/插入重答失败（网络中断/停止/空回复等）：屏幕手术已做过但
-        // 后端可能未收尾提交，重载会话与 JSONL 对齐；流式期间禁止编辑的
-        // 守卫在重载后自然解除
+        // 后端可能未收尾提交，重载会话与 JSONL 对齐
         setTimeout(function () { App.openSession(streamSessionId); }, 0);
       }
       // 流结束（含 [DONE]/出错/停止）：后端已收尾当前轮，刷新一次统计。
@@ -941,33 +988,113 @@
       .catch(function () { /* 状态查询失败则跳过续接与补发 */ });
   }
 
-  // 发送后刷新侧边栏标题（新会话首条消息会生成历史文件）
-  let titleTimer = null;
-  function refreshSessionTitle(sessionId) {
-    const targetSessionId = SessionUtils.sanitizeSessionId(sessionId || state.sessionId);
-    clearTimeout(titleTimer);
-    titleTimer = setTimeout(async function () {
-      const known = Array.from(sessionList.querySelectorAll(".session-item"))
-        .some(function (n) { return n.dataset.session === targetSessionId; });
-      if (!known) {
-        await App.loadSessions();
+  // ---------- 会话标题（前端驱动，零轮询） ----------
+  // 采集与触发：流式管线累计思考/正文 delta，任一达 TITLE_PREVIEW_CHARS 即
+  // POST /chat_config/generate_title **一次**；流结束时不足 100 字符以已有
+  // 全文触发。后端生成写盘并把标题同步返回（已生成过/失败标记/未配置时
+  // 返回 skipped + 当前盘上标题，同样一次往返）——前端收到即替换侧栏标题，
+  // 不再轮询 /chat_history/meta。标题生成与聊天主链路完全解耦。
+  const TITLE_PREVIEW_CHARS = 100;
+  let titleInflight = null; // 进行中的标题请求 {sessionId}（防并发重复）
+
+  function pickTitlePreview(reasoning, content) {
+    // 思考与正文取较长者（正文语义更相关），截到 100 字符
+    const source = content.length >= reasoning.length ? content : reasoning;
+    return source.slice(0, TITLE_PREVIEW_CHARS).trim();
+  }
+
+  async function requestSessionTitle(sessionId, questionText, questionParts, preview) {
+    const sid = SessionUtils.sanitizeSessionId(sessionId);
+    if (!sid || (titleInflight && titleInflight.sessionId === sid)) return;
+    titleInflight = { sessionId: sid };
+    try {
+      const res = await API.generateSessionTitle({
+        session_id: sid,
+        question_text: String(questionText || "").slice(0, 300),
+        model_preview: preview || "",
+        question_parts: Array.isArray(questionParts) && questionParts.length ? questionParts : undefined,
+      });
+      const title = res && res.title || "";
+      if (title) applySessionTitle(sid, title);
+    } catch (_) { /* 请求失败静默：标题保持现状 */ }
+    finally {
+      if (titleInflight && titleInflight.sessionId === sid) titleInflight = null;
+    }
+  }
+
+  function applySessionTitle(sessionId, title) {
+    const sid = SessionUtils.sanitizeSessionId(sessionId);
+    const node = sessionList.querySelector('[data-session="' + sid + '"] .session-name');
+    if (!node) {
+      // 侧栏还没有该会话条目（极端时序）：重载会话列表建立条目后再替换
+      App.loadSessions().then(function () {
         App.markActiveSession();
-      }
-      try {
-        const meta = await API.getSessionMeta(targetSessionId);
-        if (meta.title) {
-          const node = sessionList.querySelector('[data-session="' + targetSessionId + '"] .session-name');
-          if (node) {
-            node.textContent = SessionUtils.getSessionTitle(targetSessionId, meta.title);
-            App.refreshSessionFades();
-          }
+        const retry = sessionList.querySelector('[data-session="' + sid + '"] .session-name');
+        if (retry && App.setSessionNameText(retry, title)) {
+          App.refreshSessionFades();
         }
-      } catch (_) { /* 忽略 */ }
-    }, 1200);
+      }).catch(function () { /* ignore */ });
+      return;
+    }
+    if (App.setSessionNameText(node, title)) {
+      App.refreshSessionFades();
+    }
   }
 
 
   // ---------- 用户消息编辑重发编排（编辑 UI 在 messages.js） ----------
+
+  /**
+   * 编辑重发专用：会话正在生成时先弹确认框（再次提醒任务正在进行），
+   * 确认返回 true 并立即停止生成——与停止按钮同款链路（后端 stop_chat
+   * 会等待任务完全退出、按"手动停止"把已生成内容收尾落盘），同时复位
+   * 本地流式状态；取消返回 false（用户放弃本次编辑重发）。
+   * @returns {Promise<boolean>} true=已停止可继续删除/重发；false=用户取消
+   */
+  async function requestStopRunningGeneration(sessionId) {
+    const message = "当前会话正在生成回复。确认后将立刻停止本次生成" +
+      "（已生成内容按中断收尾落盘），并以编辑后的消息重新发起。";
+    const confirmed = await new Promise(function (resolve) {
+      if (typeof App.openConfirmDialog !== "function") {
+        resolve(window.confirm(message + "确认继续？"));
+        return;
+      }
+      let settled = false;
+      App.openConfirmDialog({
+        title: "任务正在进行中",
+        message: message,
+        confirmText: "停止生成并重发",
+        onConfirm: function () { settled = true; resolve(true); },
+        onCancel: function () { if (!settled) { settled = true; resolve(false); } },
+      });
+    });
+    if (!confirmed) return false;
+    // 用户主动停止：本轮结束后不自动派发引导/队列消息（消费一次后复位）
+    state.suppressFlushOnce = true;
+    try {
+      await API.stopChat(sessionId);
+    } catch (_) { /* 后端停止失败也继续本地清理（生成可能已自行结束） */ }
+    // 中止本地监听（后端任务已由 stopChat 收尾；abort 触发旧 send 的
+    // finally 兜底清理，节点已脱管不会误删新内容）
+    if (state.activeStream && state.activeStream.sessionId === sessionId) {
+      if (state.abort) state.abort.abort();
+      // detached 标记：旧流收尾的失败重载兜底跳过（本轮即将被删除/重发，
+      // 新一轮流式渲染已在路上，重载会把新节点整段重建掉）
+      state.activeStream.detached = true;
+      state.activeStream.completed = true;
+      state.activeStream = null;
+    }
+    if (state.streamingSession === sessionId) {
+      state.streaming = false;
+      state.streamingSession = null;
+      // 本地监听已中止：清掉所属控制器（旧 send 的 finally 因 wasAttached
+      // 已为 false 不会清理；下次 send 会重新创建）
+      state.abort = null;
+    }
+    App.refreshComposerButtons();
+    return true;
+  }
+
   /**
    * 编辑重发总编排：按模式执行删除/预演确认 → 重载会话 → 发送。
    * @param {{msg: HTMLElement, round: number, text: string, media: Array, mode: string}} plan
@@ -977,6 +1104,12 @@
   async function confirmEditResend(plan) {
     const sessionId = state.sessionId;
     if (!sessionId || !plan || !plan.round) return;
+    // 会话正在生成：先经用户二次确认停止任务（再次提醒"任务正在进行"），
+    // 停止收尾落盘后才允许删除轮次，随后按计划重发
+    if (state.streaming && state.streamingSession === sessionId) {
+      const proceed = await requestStopRunningGeneration(sessionId);
+      if (!proceed) return;
+    }
     // 复用附件：编辑重发不重新上传，删除清理时后端按 keep_media_refs 排除
     const keptRefs = (plan.media || [])
       .map(function (m) { return m.stored_name || ""; })

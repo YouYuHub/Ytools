@@ -29,7 +29,7 @@ def _cleanup_media_dir():
     shutil.rmtree(_TEST_MEDIA_DIR, ignore_errors=True)
 
 
-def _fake_loader(session_id, reference, quality=None):
+def _fake_loader(session_id, reference, quality=None, start_time=None, end_time=None):
     if reference == "media://fail.png":
         return None
     return {

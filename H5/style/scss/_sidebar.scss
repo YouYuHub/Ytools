@@ -334,12 +334,32 @@
       overflow: hidden;
       white-space: nowrap;
 
+      // 内层文本载体：跑马灯 transform 作用于它（外层是裁剪窗口不动）。
+      // inline-block 是必须的——普通 inline 元素不响应 transform
+      .session-name-text {
+        display: inline-block;
+        white-space: nowrap;
+        max-width: none;
+      }
+
       // ChatGPT 式溢出淡出：真被截断时由 JS（App.refreshSessionFades）加
       // .truncated，右缘 ~28px 渐隐遮挡文字（遮罩作用于文字本身，
       // 选中态/悬浮态背景上都成立），不再用「…」占位
       &.truncated {
         -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent 100%);
         mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent 100%);
+      }
+
+      // hover 跑马灯滚动中（sessions.js 以 rAF 逐帧对内层 .session-name-text
+      // 写 transform: translateX 并加本类）：移除渐隐遮罩让滚入的尾部文字
+      // 完整可见；will-change 提示合成层让逐帧 transform 不触发 reflow；
+      // 类移除即整体复位
+      &.is-marquee {
+        -webkit-mask-image: none;
+        mask-image: none;
+        .session-name-text {
+          will-change: transform;
+        }
       }
     }
 

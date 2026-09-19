@@ -17,6 +17,7 @@ import contextvars
 import ctypes
 import json
 import os
+import re
 import sys
 from typing import Any
 from pathlib import Path
@@ -192,7 +193,8 @@ def require_default_chat_config() -> dict[str, Any]:
         raise ChatModelConfigurationError(
             f"models.json 中找不到已选择的模型：{provider_name} / {model_name}"
         )
-    return chat_config
+    # 聊天角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
+    return inject_custom_headers_into_config(chat_config, get_role_headers("chat_model"))
 
 
 def list_available_models() -> list[dict[str, Any]]:
@@ -245,7 +247,7 @@ def _default_model_selection() -> dict[str, dict[str, Any]]:
       其他协议回退父级聊天模型并打印警告）。
     """
     return {
-        role: {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None}
+        role: {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None, "headers": []}
         for role in ("chat_model", "compaction_model", "title_model", "sub_agent_model")
     }
 
@@ -277,10 +279,39 @@ def _normalize_parameter_buckets(parameter: Any) -> dict[str, dict[str, Any]]:
     return buckets
 
 
+def _normalize_custom_headers(raw: Any) -> list[dict[str, str]]:
+    """把自定义请求头归一化为 [{"name": ..., "value": ...}] 列表。
+
+    - 接受 [{"name": "x-foo", "value": "bar"}]（前端编辑器形态）或
+      {"x-foo": "bar"}（手工编辑 models.json 的便捷形态）；
+    - name 非法（空/含冒号/含空白/为标准 HTTP 传输头）的条目丢弃；
+    - value 转 str（None 视为空串）；同名条目保留最后一次出现的值；
+    - 返回新列表，调用方修改不影响全局状态。
+    """
+    if not isinstance(raw, (list, dict)):
+        return []
+    pairs: list[tuple[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            pairs.append((name, item.get("value")))
+    else:
+        pairs = [(str(key), value) for key, value in raw.items()]
+    merged: dict[str, str] = {}
+    for name, value in pairs:
+        if not name or re.search(r"[\s:]", name):
+            continue
+        merged[name] = "" if value is None else str(value)
+    return [{"name": name, "value": value} for name, value in merged.items()]
+
+
 def _normalize_model_selection(raw: Any) -> dict[str, dict[str, Any]]:
-    """把 models.json 顶层的任意结构归一化为 {role: {ownership_name, model_name, parameter, api_type}}。
+    """把 models.json 顶层的任意结构归一化为 {role: {ownership_name, model_name, parameter, api_type, headers}}。
 
     parameter 为按 api_type 分桶结构；旧版扁平格式自动迁移为 chat_completions 桶。
+    headers 为自定义请求头列表（旧数据无该字段时自动补空列表）。
     """
     normalized = _default_model_selection()
     if not isinstance(raw, dict):
@@ -303,6 +334,7 @@ def _normalize_model_selection(raw: Any) -> dict[str, dict[str, Any]]:
             "model_name": model_name,
             "parameter": _normalize_parameter_buckets(parameter),
             "api_type": api_type,
+            "headers": _normalize_custom_headers(entry.get("headers")),
         }
     return normalized
 
@@ -380,7 +412,54 @@ def get_global_model_selection() -> dict[str, dict[str, Any]]:
 
 def get_role_selection(role: str) -> dict[str, Any]:
     """返回单个角色（chat_model/compaction_model/title_model）的选择。"""
-    return get_model_selection().get(role, {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None})
+    return get_model_selection().get(role, {
+        "ownership_name": None, "model_name": None, "parameter": {}, "api_type": None, "headers": [],
+    })
+
+
+def get_role_headers(role: str) -> list[dict[str, str]]:
+    """返回该角色模型选择的自定义请求头（归一化列表，副本）。
+
+    会话级 ambient 覆盖已由 get_model_selection 合并（会话覆盖 → 全局默认）；
+    未配置角色/未选择模型时返回空列表。
+    """
+    selection = get_role_selection(role)
+    headers = selection.get("headers")
+    if not isinstance(headers, list):
+        return []
+    return [
+        {"name": str(item.get("name") or ""), "value": str(item.get("value") or "")}
+        for item in headers
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+
+
+def inject_custom_headers_into_config(
+    chat_config: dict[str, Any] | None,
+    headers: Any = None,
+) -> dict[str, Any] | None:
+    """把自定义请求头注入模型配置副本（ChatLLM 请求时读取 `_custom_headers`）。
+
+    chat_config 为 None 或 headers 为空时原样返回（None 保持 None）；否则返回
+    浅拷贝副本（避免污染 models_config 内存态）。同名头后者覆盖前者，非法
+    条目已由 _normalize_custom_headers 丢弃。
+    """
+    if chat_config is None:
+        return None
+    normalized = _normalize_custom_headers(headers) if headers else []
+    if not normalized:
+        return dict(chat_config) if isinstance(chat_config, dict) else chat_config
+    merged = dict(chat_config) if isinstance(chat_config, dict) else {}
+    existing = merged.get("_custom_headers")
+    combined = _normalize_custom_headers(existing) + normalized
+    # 同名去重：保留后注入的（调用方值优先）
+    dedup: dict[str, str] = {}
+    for item in combined:
+        dedup[item["name"]] = item["value"]
+    merged["_custom_headers"] = [
+        {"name": name, "value": value} for name, value in dedup.items()
+    ]
+    return merged
 
 
 _CHAT_PARAMETER_FIELDS = (
@@ -557,12 +636,16 @@ def build_model_selection_entry(
     role: str,
     parameter: dict[str, Any] | None = None,
     inherit_parameter: Any = None,
+    headers: Any = None,
+    inherit_headers: Any = None,
 ) -> dict[str, Any]:
     """校验并构建单个角色的模型选择条目（全局 select 与会话级 select 共用）。
 
     - parameter 为 None 时沿用 inherit_parameter（调用方传入该角色现有参数桶，
       "仅切换模型、参数保持不变"语义）；
-    - parameter 提供时按该模型 api_type 分桶全量替换该桶，其余桶保留自 inherit。
+    - parameter 提供时按该模型 api_type 分桶全量替换该桶，其余桶保留自 inherit；
+    - headers 为 None 时沿用 inherit_headers（"仅切换模型、自定义头保持不变"）；
+      提供时全量替换（空列表视为清空）。
     Raises:
         ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
     """
@@ -571,11 +654,13 @@ def build_model_selection_entry(
     if parameter is not None:
         normalized_fields = {key: value for key, value in parameter.items() if key in _CHAT_PARAMETER_FIELDS}
         buckets[api_type] = normalized_fields
+    effective_headers = _normalize_custom_headers(headers) if headers is not None else _normalize_custom_headers(inherit_headers)
     return {
         "ownership_name": _normalize_config_name(provider_name),
         "model_name": _normalize_config_name(chat_config.get("selected_model_name") or model_name),
         "parameter": buckets,
         "api_type": api_type,
+        "headers": effective_headers,
     }
 
 
@@ -584,6 +669,7 @@ def select_chat_model(
     model_name: str,
     role: str = "chat_model",
     parameter: dict[str, Any] | None = None,
+    headers: Any = None,
 ) -> dict[str, Any]:
     """把模型选择写入 models.json 顶层 `model_selection` 键，并同步内存（实时生效）。
 
@@ -592,6 +678,8 @@ def select_chat_model(
     - parameter: 该模型的默认生成参数（如 temperature/max_tokens 等）。按 api_type 分桶存储：
       写入该模型 api_type 对应的桶（如 messages 模型写入 parameter["messages"]），其它桶保留。
       parameter 传 None 时仅切换模型、参数桶不变（同协议切换沿用参数）。
+    - headers: 该角色的自定义请求头（[{name, value}] 列表）；None 表示仅切换模型、
+      自定义头保持不变，[] 表示清空。随条目持久化到 models.json / 会话 _meta。
     - api_type: 只读回显字段，前端不传；由后端根据 models.json 中该模型的 apiType 自动确定
     - 不再写 .env 的 CHAT_OWNERSHIP_NANE / CHAT_MODEL_NAME
     """
@@ -605,6 +693,8 @@ def select_chat_model(
         )
     if parameter is not None and not isinstance(parameter, dict):
         raise ChatModelConfigurationError("parameter 必须是字典")
+    if headers is not None and not isinstance(headers, (list, dict)):
+        raise ChatModelConfigurationError("headers 必须是 [{name, value}] 列表或键值字典")
 
     chat_config, api_type = _resolve_selection_target(normalized_provider, normalized_model, role)
     # 写全局配置必须基于纯全局选择（不叠加任何会话级 ambient 覆盖）
@@ -616,6 +706,8 @@ def select_chat_model(
         role,
         parameter=parameter,
         inherit_parameter=existing.get("parameter"),
+        headers=headers,
+        inherit_headers=existing.get("headers"),
     )
     save_model_selection(current)
     selected = get_model_selection()[role]
@@ -626,6 +718,7 @@ def select_chat_model(
         "model_id": chat_config.get("selected_model_id"),
         "parameter": selected["parameter"],
         "api_type": selected["api_type"],
+        "headers": selected.get("headers") or [],
         # 模型能力回显：供前端在切换模型后立即感知视觉能力（read_media 可用性等）
         "vision": bool(chat_config.get("vision", False)) if chat_config else False,
     }
@@ -877,6 +970,41 @@ def reload_models_config() -> bool:
         print(f"[config-watch] models.json 重新加载失败，保留内存配置: {exc}")
         return False
     _apply_models_setting(new_models, new_selection, new_setting_vars)
+    return True
+
+
+def reload_env_vars(coding: str = "utf-8") -> bool:
+    """重新读取项目 .env 并同步内存 env_vars（供配置热重载线程调用）。
+
+    解析逻辑与 init_path 的 .env 阶段一致（变量引用展开）；解析失败（IO/编码
+    异常）时保留内存现状并返回 False。读方（load_var）要么看到旧字典要么看
+    到新字典，不读到中间态。set_env_vars 的写接口在写入的同时已直接更新内存，
+    本函数服务于「外部直接改 .env 文件」的场景。
+    """
+    global env_vars
+    if not env_file:
+        return False
+    env_path = Path(env_file)
+    if not env_path.exists():
+        env_vars = {}
+        return True
+    try:
+        raw_vars = {}
+        with open(env_file, "r", encoding=coding) as f:
+            for line in f:
+                if "=" in line:
+                    var_name, var_value = line.strip().split("=", 1)
+                    if not var_name.strip().startswith("#"):
+                        raw_vars[var_name.strip().strip("\"").strip("'").strip()] = (
+                            var_value.strip().strip("\"").strip("'").strip()
+                        )
+        resolved_env_vars = {}
+        for var_name, raw_value in raw_vars.items():
+            resolved_env_vars[var_name] = _resolve_variable_references(raw_value, raw_vars)
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"[config-watch] .env 重新加载失败，保留内存配置: {exc}")
+        return False
+    env_vars = resolved_env_vars
     return True
 
 

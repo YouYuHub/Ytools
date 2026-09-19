@@ -544,7 +544,7 @@ class StreamMediaTests(unittest.TestCase):
     def test_media_size_limit_by_kind(self):
         self.assertEqual(fm.media_size_limit("image"), 20 * 1024 * 1024)
         self.assertEqual(fm.media_size_limit("audio"), 20 * 1024 * 1024)
-        self.assertEqual(fm.media_size_limit("video"), 500 * 1024 * 1024)
+        self.assertEqual(fm.media_size_limit("video"), 600 * 1024 * 1024)
         self.assertEqual(fm.media_size_limit(None), 20 * 1024 * 1024)
 
     def test_save_session_media_stream_happy_path(self):
@@ -555,6 +555,40 @@ class StreamMediaTests(unittest.TestCase):
         self.assertTrue(saved["stored_name"].endswith(".mp4"))
         stored = fm.resolve_media_path(TEST_SESSION, saved["media_ref"])
         self.assertEqual(stored.read_bytes(), b"fake-video" * 10)
+
+    def test_save_session_media_stream_accepts_large_gif(self):
+        import io as _io
+
+        # 动图 gif 归视频档（600MB）：超过图片档 20MB 也应被接受
+        payload = b"GIF89a" + b"x" * (21 * 1024 * 1024)
+        saved = fm.save_session_media_stream(
+            TEST_SESSION, "big_anim.gif", _io.BytesIO(payload)
+        )
+        self.assertEqual(saved["kind"], "image")
+        self.assertGreater(saved["size"], 20 * 1024 * 1024)
+        try:
+            fm.resolve_media_path(TEST_SESSION, saved["media_ref"]).unlink()
+        except OSError:
+            pass
+
+    def test_save_session_media_stream_gif_over_600mb_rejected(self):
+        # 动图 gif 上限 600MB：超限流式拒绝（1MB 块逐块计数）
+        limit = fm.MEDIA_SEND_ANIMATED_OR_VIDEO_LIMIT_BYTES
+        blob = b"\x00" * (1024 * 1024)
+
+        class LimitedStream:
+            def __init__(self):
+                self.chunks = 0
+
+            def read(self, n):
+                if self.chunks * len(blob) >= limit + len(blob):
+                    return b""
+                self.chunks += 1
+                return blob
+
+        with self.assertRaises(ValueError) as ctx:
+            fm.save_session_media_stream(TEST_SESSION, "huge.gif", LimitedStream())
+        self.assertIn("600MB", str(ctx.exception))
 
     def test_save_session_media_stream_aborts_over_limit(self):
         import io as _io
@@ -666,20 +700,20 @@ class ImageThumbnailTests(unittest.TestCase):
             )
 
     def test_gif_skips_thumbnail(self):
-        # 小阈值下的小 GIF：动图跳过缩略图，保持原格式发送
+        # 静态 GIF（单帧）：视觉 API 会拒绝 gif，统一转 PNG 后发送（不再原样）
         from PIL import Image as _Image
 
         out = io.BytesIO()
         _Image.new("P", (64, 48), color=3).save(out, format="GIF")
         gif_bytes = out.getvalue()
         self.assertGreater(len(gif_bytes), 32)
-        saved = fm.save_session_media(TEST_SESSION, "动图.gif", gif_bytes)
+        saved = fm.save_session_media(TEST_SESSION, "静图.gif", gif_bytes)
         content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
         with patch.object(fm, "IMAGE_THUMBNAIL_THRESHOLD_BYTES", 16):
             resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
         self.assertEqual(unresolved, [])
         url = resolved[0]["image_url"]["url"]
-        self.assertTrue(url.startswith("data:image/gif;base64,"))
+        self.assertTrue(url.startswith("data:image/png;base64,"))
 
     def test_corrupt_large_image_falls_back_to_original(self):
         # 超过阈值但不是合法图片：缩略图失败应回退原样发送

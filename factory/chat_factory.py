@@ -62,6 +62,8 @@ from factory.agent_runtime.builtin_tools import (
     execute_read_media,
     load_any_media_model_part,
     roll_recent_media_parts,
+    retire_prior_video_parts,
+    cap_video_parts_in_batch,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -965,6 +967,14 @@ async def _run_chat_generation(
     # 语义与原先内联 lambda 完全一致。
     stop_checker = lambda: (not session_chat_memory.run_task)  # noqa: E731
     try:
+        # 轮次开始事件：告知前端本轮的最终轮次号（普通发送=已收尾轮次数+1；
+        # target_round/insert_round 已在上方单独推送，不再重复）。前端据此给
+        # 本轮提问气泡就地补挂编辑/删除入口，不再依赖收尾整段重载（否则最后
+        # 完成的一轮要切走再切回才有操作入口）。轮次可能因覆盖式回答截断而
+        # 偏移，事件统一推迟到截断后发送；失败路径不发送（前端走失败重载兜底）
+        emit_round_started = (
+            request_target_round is None and request_insert_round is None
+        )
         # 覆盖式重新回答：新消息是对最新 ask_user 提问的回答时，先截断该提问
         # 轮之后的旧回答轮，保证一个问题只有一个答案轮次。截断方法内置保护：
         # 提问轮之后若已开启普通新任务（非回答轮），则不动历史按追加处理。
@@ -982,6 +992,18 @@ async def _run_chat_generation(
                     print(f"[INFO] 覆盖式重新回答：已截断提问后的 {removed_rounds} 个旧轮次")
         except Exception as trunc_error:
             print(f"[WARN] 覆盖式回答截断失败（按追加处理）: {trunc_error}")
+        # 普通发送：覆盖式截断可能已改变轮次计数，此刻计算并推送
+        # round_started（本轮的最终轮次号），前端据此给本轮提问气泡
+        # 就地补挂编辑/删除入口
+        if emit_round_started:
+            try:
+                live_round_no = await session_chat_memory.get_current_round_number()
+                await _stream_emit(
+                    stream,
+                    f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n",
+                )
+            except Exception as round_emit_error:
+                print(f"[WARN] round_started 事件发送失败（前端走重载兜底）: {round_emit_error}")
         use_backend_history = parse_bool_like(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
@@ -1133,8 +1155,10 @@ async def _run_chat_generation(
             active_file_block = file_memory_suffix
             messages[0]["content"] += file_memory_suffix
         # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
-        # 终态（全部 done）必须给收官指令：若仍写"可调用 todo_write 全量更新"，
-        # 模型会把它当继续施工的邀请，重复调用工具把整列已完成的步骤再提交一遍
+        # 终态（全部 done）文案必须「新任务感知」：该后缀每轮新任务都会随系统
+        # 提示注入，写"请汇总执行结果/无需再调用"是收官时对上一轮说的话，
+        # 跨轮残留会让模型面对新任务仍去"汇总旧结果"、并压制为新任务建计划的
+        # 意图——改为说明"上一计划已收官，新任务可新建计划覆盖"。
         try:
             session_todo = await session_chat_memory.get_session_todo()
         except Exception:
@@ -1150,11 +1174,12 @@ async def _run_chat_generation(
                 todo_lines.append(f"{mark} {item.get('content', '')}")
             if todo_complete:
                 todo_suffix = (
-                    "\n当前任务规划已全部完成（"
+                    "\n上一任务规划已全部完成（"
                     + f"{todo_done_count}/{len(session_todo)} 项，全部 [x]）：\n"
                     + "\n".join(todo_lines)
-                    + "\n这是收官提醒：请直接汇总执行结果答复用户，"
-                    "如无新的计划，无需再调用 todo_write 工具。"
+                    + "\n该计划已收官，无需对它做任何更新；"
+                    "若当前新任务需要多步骤跟踪，可调用 todo_write 新建计划"
+                    "（全量覆盖旧列表），否则直接执行新任务即可。"
                 )
             else:
                 todo_suffix = (
@@ -1355,8 +1380,10 @@ async def _run_chat_generation(
         # run_task = True
         # last_tool_ret = ""  # 上一次调用工具的返回值
         # while run_task:
-        # 上游提前断开（stream_truncated）的累计重试次数：任务级计数器，
-        # 跨模型轮次累计（单轮内多次重试同样计入），上限见 stream_truncated_retries
+        # 上游提前断开（stream_truncated）的重试计数：单次请求内"连续"中断
+        # 才累计——每轮正常完成的 API 调用会把计数归零（见下方清零点），
+        # 重新发起请求（新轮次/续写重发）后重新计数；连续达到
+        # stream_truncated_retries 上限才终止任务（长任务不再被历史累计误杀）
         model_retries = 0
         while session_chat_memory.run_task:
             stream.set_round_start()
@@ -1407,7 +1434,7 @@ async def _run_chat_generation(
             # =不限制（一直重试到 max_model_retries，兜底任务不中断）。
             stream_truncated = False
             try:
-                stream_truncated_retries = int(load_var("STREAM_TRUNCATION_MAX_RETRIES", 2))
+                stream_truncated_retries = int(load_var("STREAM_TRUNCATION_MAX_RETRIES", 5))
             except (TypeError, ValueError):
                 stream_truncated_retries = 2
             if stream_truncated_retries <= 0:
@@ -1559,6 +1586,12 @@ async def _run_chat_generation(
             if pending_finish_payload is not None:
                 await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                 pending_finish_payload = None
+            # 连续中断计数复位点：本轮 API 调用正常完成（收到 finish_reason
+            # 或 done，未发生截断/错误）——计数归零。此后重新发起的请求
+            # （工具调用续轮、length 续写、截断续写）都从中断 0 次重新计数，
+            # 即"单次发起请求连续 N 次上游中断才终止任务"
+            if not stream_truncated:
+                model_retries = 0
             # 上游模型流出错（如连接被切断/重试达到上限）：记录真实错误原因，
             # 而不是伪装成"用户停止任务"。中间重试过程不落盘（仅前端提示），
             # 这里是唯一落盘点：附带完整重试统计，追溯信息不丢。
@@ -1617,10 +1650,10 @@ async def _run_chat_generation(
                 # 此前该场景与正常收尾不可区分——空正文静默落盘并结束任务，
                 # 思考内容看似保留实则回答丢失；现改为截断续写重试。
                 if stream_truncated:
-                    if stream_truncated_retries is not None and model_retries >= stream_truncated_retries:
+                    if stream_truncated_retries > 0 and stream_truncated_retries is not None and model_retries >= stream_truncated_retries:
                         # 重试超限：落盘已生成的思考/正文 + 带重试统计的错误记录，
                         # 结束任务（错误不静默，用户可看到失败原因并重发）
-                        print(f"[WARN] 上游连接提前断开，重试 {model_retries} 次仍截断，结束任务")
+                        print(f"[WARN] 上游连接提前断开，单次请求内连续重试 {model_retries} 次仍截断，结束任务")
                         if full_reasoning:
                             await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
                         if full_response:
@@ -1629,7 +1662,7 @@ async def _run_chat_generation(
                             "role": "assistant",
                             "error": (
                                 "上游连接在响应完成前断开（未收到 finish_reason），"
-                                f"自动重试 {model_retries} 次仍不完整；已生成的部分内容已保留"
+                                f"单次请求内连续自动重试 {model_retries} 次仍不完整；已生成的部分内容已保留"
                             ),
                             "step": "read_sse_stream",
                             "retry": model_retries,
@@ -1927,7 +1960,8 @@ async def _run_chat_generation(
             ask_user_pending = False
             ask_user_questions: list[dict[str, Any]] = []
             # read_media 已注入的引用与待注入坐标（本轮任务内累计，防止重复读取）；
-            # 坐标为 (reference, quality) 对，注入时现场加载 base64 部件
+            # 坐标为 (reference, quality, start_time, end_time) 四元组——视频区间
+            # 读取的坐标含区间，注入时现场按坐标加载 base64 部件
             read_media_injected_refs: set[str] = set()
             read_media_pending_parts: list[tuple[str, Any]] = []
             for idx, tc, tn, ta in parsed_tools:
@@ -1977,8 +2011,8 @@ async def _run_chat_generation(
                     continue
                 if tn == READ_MEDIA_NAME:
                     # 读取当前任务媒体：把 media:// 引用解析为媒体加载坐标
-                    #（reference+quality），数据本体（base64）不进入工具结果文本
-                    #（避免刷 JSONL / 超大结果截断），在下方统一处理时按坐标
+                    #（reference+quality+区间），数据本体（base64）不进入工具结果
+                    # 文本（避免刷 JSONL / 超大结果截断），在下方统一处理时按坐标
                     # 现场加载为 user 消息部件（仅内存）
                     read_media_result = execute_read_media(
                         ta,
@@ -1993,7 +2027,12 @@ async def _run_chat_generation(
                         )
                         loaded_meta = read_media_result.get("loaded") or []
                         read_media_pending_parts.extend([
-                            (item["reference"], item.get("quality"))
+                            (
+                                item["reference"],
+                                item.get("quality"),
+                                item.get("start_time"),
+                                item.get("end_time"),
+                            )
                             for item in loaded_meta
                             if item.get("reference")
                         ])
@@ -2262,9 +2301,16 @@ async def _run_chat_generation(
                 # 消息落盘，这里只为让模型看到数据）。占位计费口径已覆盖 user 多模
                 # 态部件。加载失败的坐标以占位文本告知模型，避免静默丢失。
                 if read_media_pending_parts and not oversized_abort:
+                    # 视频一次性消费：注入新片段前，先回收先前注入的 video
+                    # 部件（供应商单请求仅 1 个视频；多段切片滞留也会撑爆
+                    # token）——占位文本替代数据，工具结果文本不受影响
+                    retire_prior_video_parts(messages)
                     media_parts = []
-                    for reference, quality in read_media_pending_parts:
-                        info = load_any_media_model_part(session_id, reference, quality=quality)
+                    for reference, quality, start_time, end_time in read_media_pending_parts:
+                        info = load_any_media_model_part(
+                            session_id, reference, quality=quality,
+                            start_time=start_time, end_time=end_time,
+                        )
                         if info is not None and info.get("part") is not None:
                             media_parts.append(info["part"])
                         elif isinstance(info, dict) and info.get("error"):
@@ -2278,6 +2324,9 @@ async def _run_chat_generation(
                                 "type": "text",
                                 "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
                             })
+                    # 单请求视频配额≤1：同批并行读多个视频时仅第一个带画面
+                    # 数据，其余转为占位（工具结果已含各自读取元信息，可按序补读）
+                    media_parts = cap_video_parts_in_batch(media_parts)
                     media_message: dict[str, Any] = {
                         "role": "user",
                         "content": [

@@ -617,9 +617,15 @@ class SubAgentModelConfigTests(unittest.TestCase):
                 "factory.agent_runtime.sub_agent.get_role_parameter",
                 return_value={"temperature": 0.2, "enable_thinking": True},
             ) as param_mock,
+            # 隔离真实全局配置中可能存在的模型自定义头（inject 仍执行：空头返回浅拷贝）
+            mock.patch(
+                "factory.agent_runtime.sub_agent.get_role_headers",
+                return_value=[],
+            ),
         ):
             config, parameter = runner._resolve_request_model_config()
-            self.assertIs(config, model_cfg)
+            # 空 headers 时返回配置浅拷贝（防止污染内存态），等值即可
+            self.assertEqual(config, model_cfg)
             self.assertEqual(parameter.get("temperature"), 0.2)
             param_mock.assert_any_call("sub_agent_model")
 

@@ -13,7 +13,8 @@
     enableThinking, temperature, temperatureValue, maxTokens,
     maxTokensValue, topP, topPValue, presencePenalty,
     presencePenaltyValue, enhanceCancel, enhanceConfirm, enhanceReset,
-    enhanceClearOverride, enhanceHint
+    enhanceClearOverride, enhanceHint,
+    customHeadersRows, addHeaderRow
   } = App;
 
   // ---------- 模型与参数面板 ----------
@@ -183,12 +184,102 @@
     reasoningEffort.value = params.reasoning_effort || defaults.reasoning_effort;
     const extra = params.extra_body || {};
     enableThinking.checked = extra.enable_thinking != null ? Boolean(extra.enable_thinking) : defaults.enable_thinking;
+    // 自定义请求头按该角色生效值回填（会话覆盖 → 全局默认）
+    renderHeaderRows(info && info.effective_headers);
     syncRangeOutputs();
     state.modelParamDirty = false;
   }
 
   function markParamDirty() {
     state.modelParamDirty = true;
+  }
+
+  // ---------- 面板草稿（按角色保留未保存的编辑） ----------
+  // 切换角色页签时不再从服务端重新回填（那会清掉用户的未保存编辑）：
+  // 切走前把当前表单存入草稿，切回时恢复草稿。面板打开、保存成功、
+  // 清除覆盖时才以服务端当前配置重建基线；模型"选择"变更时的重新拉取
+  // 校准由 selectModelKey → refreshMaxTokensAfterSwitch 承担。
+  function drafts() {
+    if (!state.modelPanelDrafts) state.modelPanelDrafts = {};
+    return state.modelPanelDrafts;
+  }
+
+  // 把当前展示中的角色表单存入草稿（仅激活角色，切走前调用）
+  function saveRoleDraft(role) {
+    if (role !== state.activeModelRole) return;
+    drafts()[role] = {
+      selectedModelKey: state.selectedModelKey,
+      temperature: temperature.value,
+      maxTokens: maxTokens.value,
+      topP: topP.value,
+      presencePenalty: presencePenalty.value,
+      reasoningEffort: reasoningEffort.value,
+      enableThinking: enableThinking.checked,
+      headers: collectHeaderRows(),
+      dirty: state.modelParamDirty,
+    };
+  }
+
+  // 恢复角色草稿（含模型选择、参数、请求头与 dirty 标记）
+  function applyRoleDraft(draft) {
+    state.selectedModelKey = draft.selectedModelKey;
+    modelList.classList.add("hidden");
+    temperature.value = draft.temperature;
+    setupMaxTokensRange(draft.maxTokens);
+    topP.value = draft.topP;
+    presencePenalty.value = draft.presencePenalty;
+    reasoningEffort.value = draft.reasoningEffort;
+    enableThinking.checked = draft.enableThinking;
+    renderHeaderRows(draft.headers);
+    syncRangeOutputs();
+    updateModelPickerLabel();
+    state.modelParamDirty = draft.dirty;
+  }
+
+  // ---------- 自定义请求头编辑器（键值两列，可增减行） ----------
+  // 渲染 effective_headers 回填键值行；收集/删除行都会置 dirty，
+  // 确定时随 parameter 一并提交（headers 全量替换语义）
+  function renderHeaderRows(headers) {
+    customHeadersRows.innerHTML = "";
+    (Array.isArray(headers) ? headers : []).forEach(function (item) {
+      addHeaderRowInputs(item.name || "", item.value || "");
+    });
+  }
+
+  function addHeaderRowInputs(name, value) {
+    const row = el("div", "enhance-header-row");
+    const nameInput = el("input", "enhance-header-name");
+    nameInput.type = "text";
+    nameInput.placeholder = "头名称（如 x-opencode-session）";
+    nameInput.value = name || "";
+    const valueInput = el("input", "enhance-header-value");
+    valueInput.type = "text";
+    valueInput.placeholder = "值";
+    valueInput.value = value || "";
+    const removeBtn = el("button", "enhance-header-remove");
+    removeBtn.type = "button";
+    removeBtn.title = "删除该行";
+    removeBtn.textContent = "×";
+    removeBtn.addEventListener("click", function () {
+      row.remove();
+      markParamDirty();
+    });
+    nameInput.addEventListener("input", markParamDirty);
+    valueInput.addEventListener("input", markParamDirty);
+    row.appendChild(nameInput);
+    row.appendChild(valueInput);
+    row.appendChild(removeBtn);
+    customHeadersRows.appendChild(row);
+  }
+
+  function collectHeaderRows() {
+    const headers = [];
+    customHeadersRows.querySelectorAll(".enhance-header-row").forEach(function (row) {
+      const name = (row.querySelector(".enhance-header-name") || {}).value || "";
+      const value = (row.querySelector(".enhance-header-value") || {}).value || "";
+      if (name.trim()) headers.push({ name: name.trim(), value: value });
+    });
+    return headers;
   }
 
   // 按选中模型的 api_type 分桶组装 parameter（responses 协议用 max_output_tokens）
@@ -256,18 +347,27 @@
 
   function initModelPanel() {
     renderModelTabs();
-    renderModelPicker();
-    renderEnhanceFields();
+    const draft = drafts()[state.activeModelRole];
+    if (draft) {
+      applyRoleDraft(draft);   // 切回页签：恢复未保存的编辑，不重新拉取回填
+    } else {
+      renderModelPicker();
+      renderEnhanceFields();
+      saveRoleDraft(state.activeModelRole);  // 以服务端回填为初始草稿基线
+    }
     updateModelPanelHint();
     enhancePanel.scrollTop = 0;
   }
 
   function openModelPanel() {
+    state.modelPanelDrafts = {};   // 每次打开都以服务端当前配置为基线
     // 先用缓存渲染，再异步刷新服务端配置
     initModelPanel();
     loadModelConfigs().then(function (failed) {
       if (enhancePanel.classList.contains("hidden")) return;
       state.modelLoadFailed = failed;
+      // 服务端最新配置到达：清掉打开瞬间的缓存基线草稿，以最新数据重建
+      state.modelPanelDrafts = {};
       // initModelPanel 内会按加载结果刷新提示文案与"清除会话覆盖"按钮可见性
       initModelPanel();
     });
@@ -276,6 +376,7 @@
   modelTabs.addEventListener("click", function (e) {
     const tab = e.target.closest(".model-tab");
     if (!tab || tab.dataset.role === state.activeModelRole) return;
+    saveRoleDraft(state.activeModelRole);   // 切走前保留当前页签的未保存编辑
     state.activeModelRole = tab.dataset.role;
     renderModelTabs();
     initModelPanel();
@@ -308,6 +409,11 @@
   presencePenalty.addEventListener("input", function () { markParamDirty(); syncRangeOutputs(); });
   reasoningEffort.addEventListener("change", markParamDirty);
   enableThinking.addEventListener("change", markParamDirty);
+  // 自定义请求头：添加空行（输入/删除行时各自置 dirty）
+  addHeaderRow.addEventListener("click", function () {
+    addHeaderRowInputs("", "");
+    markParamDirty();
+  });
 
   enhanceCancel.addEventListener("click", function () {
     enhancePanel.classList.add("hidden");
@@ -315,7 +421,8 @@
   });
 
   // 恢复默认：按选中模型的 api_type 取预设默认参数（角色默认覆盖协议默认），
-  // 后端暂未按 api_type 细分适配，预设先占位，后续随协议设计调整
+  // 后端暂未按 api_type 细分适配，预设先占位，后续随协议设计调整。
+  // 自定义请求头不属于"参数默认"范畴，恢复默认不触碰
   function applyRoleDefaults() {
     const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
     const apiType = model && model.api_type
@@ -347,7 +454,13 @@
     // 不再调用切换接口，避免每次确定都弹"已切换"提示。
     // 快照缺失（配置加载失败）时按有变化处理，仍允许显式保存
     const modelChanged = key !== currentModelKey(state.activeModelRole);
-    const paramsChanged = state.modelParamDirty;
+    // 头部行与回填快照对比：有增删改才算改动（避免空编辑器误覆盖已有配置）
+    const headersNow = JSON.stringify(collectHeaderRows());
+    const headersBefore = JSON.stringify(
+      (roleConfig() && roleConfig().role_info && roleConfig().role_info.effective_headers) || []
+    );
+    const headersChanged = headersNow !== headersBefore;
+    const paramsChanged = state.modelParamDirty || headersChanged;
     if (!modelChanged && !paramsChanged) {
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
@@ -357,14 +470,17 @@
     enhanceConfirm.disabled = true;
     try {
       const parameter = paramsChanged ? buildParameterObject() : null;
+      // headers 仅在有改动时提交（None = 后端保持现有配置不变）
+      const headers = headersChanged ? collectHeaderRows() : null;
       // 会话内保存为该会话独立模型选择；新对话（无 sessionId）保存为全局默认
-      const res = await API.selectModel(provider, model, state.activeModelRole, parameter, state.sessionId || undefined);
+      const res = await API.selectModel(provider, model, state.activeModelRole, parameter, state.sessionId || undefined, false, headers);
       // 模型未更换（仅保存参数）时不用后端的"已切换"文案，避免误导
       toast(modelChanged ? (res.message || "已保存") : "模型未更换，参数已保存");
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
       const data = await API.getModels(state.activeModelRole, state.sessionId || undefined);
       if (data) state.modelConfigs[state.activeModelRole] = data;
+      state.modelPanelDrafts = {};   // 保存成功：服务端状态已变化，草稿基线作废
       App.refreshChatModelLabel();
       // 仅模型更换才影响 token 估算口径（窗口取自模型定义，参数不影响）：
       // 切换聊天模型后立即刷新统计标签；压缩/标题模型不影响统计，无需刷新
@@ -389,6 +505,7 @@
       const data = await API.getModels(state.activeModelRole, state.sessionId);
       if (data) state.modelConfigs[state.activeModelRole] = data;
       state.modelLoadFailed = false;
+      if (state.modelPanelDrafts) delete state.modelPanelDrafts[state.activeModelRole];
       App.refreshChatModelLabel();
       initModelPanel();
       if (state.activeModelRole === "chat_model") {

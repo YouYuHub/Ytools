@@ -135,8 +135,14 @@ def _start_config_hot_reload() -> None:
                 f"chat_model={selection.get('provider')}/{selection.get('model')}"
             )
 
+    def _reload_env(_data: dict, _meta: dict) -> None:
+        import env_manager as _env_manager
+        if _env_manager.reload_env_vars():
+            print("[config-watch] .env 内存已同步（load_var 类配置热生效，如 VIDEO_MAX_READ_SECONDS）")
+
     config_watcher.register_reload_callback("mcp_servers", "tool_selection_memory", _reload_mcp_servers)
     config_watcher.register_reload_callback("models", "models_config", _reload_models)
+    config_watcher.register_reload_callback("env", "env_vars", _reload_env)
     config_watcher.start_config_watcher()
 
 

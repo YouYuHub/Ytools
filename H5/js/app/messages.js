@@ -114,7 +114,7 @@
         ui.setInput(FormatUtils.prettyJson(rec.args));
         container.appendChild(ui.wrap);
       }
-      applyToolResult(ui, rec.name, rec.result, rec.file_diff);
+      applyToolResult(ui, rec.name, rec.result, rec.file_diff, rec.args);
       ui.finish();
       return;
     }
@@ -763,6 +763,9 @@
   const EDIT_CHECK_ICON =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
     '<path d="M20 6 9 17l-5-5"/></svg>';
+  const EDIT_TRASH_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-.9 14a2 2 0 0 1-2 1.9H7.9a2 2 0 0 1-2-1.9L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
 
   function attachUserEditAction(msg) {
     const actions = el("div", "msg-user-actions");
@@ -808,6 +811,17 @@
     editBtn.innerHTML = EDIT_PENCIL_ICON + '<span class="msg-user-action-label">编辑</span>';
     editBtn.addEventListener("click", function () { beginUserMessageEdit(msg); });
 
+    // 删除该轮（用户消息与回复一并删除，后续轮次保留、轮次号自动前移）：
+    // hover 显示，点击弹确认框，确认后走 single 删除并重载会话
+    const deleteBtn = el("button", "msg-user-action-btn msg-user-delete-btn");
+    deleteBtn.type = "button";
+    deleteBtn.title = "删除该轮对话（含该轮回复，后续轮次保留）";
+    deleteBtn.innerHTML = EDIT_TRASH_ICON + '<span class="msg-user-action-label">删除</span>';
+    deleteBtn.addEventListener("click", function () { requestDeleteRound(msg); });
+
+    // 显示顺序：删除在左（危险操作与内容区隔离），复制/编辑靠右——
+    // 常用的复制/编辑位于视觉末端，减少删除按钮的误触概率
+    actions.appendChild(deleteBtn);
     actions.appendChild(copyBtn);
     actions.appendChild(editBtn);
     msg.appendChild(actions);
@@ -849,12 +863,80 @@
       .join("\n");
   }
 
+  /**
+   * 单轮删除编排（hover 删除按钮入口）：确认框 → single 删除该轮整轮
+   * （用户消息与回复一并删除，后续轮次保留、轮次号自动前移）→ 重载会话。
+   * 运行中由后端 delete_rounds 拒绝（409），前端仅提示；此处不主动停止
+   * 生成——删除是破坏性操作且无"顺带重发"的诉求，等待完成或手动停止。
+   */
+  function requestDeleteRound(msg) {
+    if (!msg || !msg._editData || msg.classList.contains("is-editing")) return;
+    const data = msg._editData;
+    const round = Number(data.round);
+    if (!round || round < 1) return;
+    if (App.state.streaming && App.state.streamingSession === App.state.sessionId) {
+      App.toast("会话正在生成回复，请等待完成或停止后再删除");
+      return;
+    }
+    if (typeof App.openConfirmDialog !== "function") {
+      if (!window.confirm("确认删除第 " + round + " 轮对话？该轮回复将一并删除，后续轮次保留。")) return;
+      performDeleteRound(round);
+      return;
+    }
+    App.openConfirmDialog({
+      title: "删除该轮对话",
+      message: "将删除第 " + round + " 轮（该轮用户消息与回复一并删除，" +
+        "不再引用的附件会被清理），后续轮次保留且轮次号自动前移。确认删除？",
+      confirmText: "确认删除",
+      onConfirm: function () { performDeleteRound(round); },
+    });
+  }
+
+  async function performDeleteRound(round) {
+    const sessionId = App.state.sessionId;
+    if (!sessionId) return;
+    try {
+      await API.deleteRounds(sessionId, round, { mode: "single", deleteFiles: true });
+    } catch (err) {
+      App.toast("删除轮次失败：" + err.message);
+      return;
+    }
+    // 删除成功：整段重载会话（data-round 与编辑数据随新解析自动刷新）
+    await App.openSession(sessionId);
+    App.toast("已删除第 " + round + " 轮对话");
+  }
+
+  /**
+   * 在流生成的提问气泡上就地补挂轮次标记与操作入口（编辑/复制/删除）。
+   * round_started 事件到达时调用：普通发送的 userNode 此前 round=null 没有
+   * 挂入口（收尾不重载就永远没有），后端在任务启动后立即推送本轮最终
+   * 轮次号，前端补上 data-round/_editData/操作行；answer 节点同步打标。
+   * targetRound/insertRound 路径已在 send() 内打标，此函数幂等跳过。
+   * @param {object} activeStream 活动流对象（含 userNode/messageNode/userContent）
+   * @param {number} round 本轮最终轮次号（1-based）
+   */
+  function attachLiveRoundEntry(activeStream, round) {
+    if (!activeStream || typeof round !== "number" || round < 1) return;
+    const userNode = activeStream.userNode;
+    if (!userNode || userNode.dataset.round) return;
+    // 附接的后台流（刷新重连）拿不到首问完整 content（replay 只有纯文本），
+    // 挂入口会导致编辑重发丢失多模态附件——此时不打标，等收尾重载后随
+    // 历史回放自然挂上完整入口
+    if (activeStream.userContent == null) return;
+    userNode.dataset.round = String(round);
+    userNode._editData = { content: activeStream.userContent, round: round };
+    attachUserEditAction(userNode);
+    if (activeStream.messageNode) {
+      activeStream.messageNode.dataset.round = String(round);
+    }
+  }
+
   function beginUserMessageEdit(msg) {
     if (!msg || !msg._editData || msg.classList.contains("is-editing")) return;
-    // 编辑只对静态历史有意义：本会话正在流式时禁止（轮次收尾前删除会被拒绝）
+    // 运行中也允许编辑：发送编排（confirmEditResend）在用户二次确认后会
+    // 停止进行中的生成任务再删除/重发；此处仅提示用户存在未完成生成
     if (App.state.streaming && App.state.streamingSession === App.state.sessionId) {
-      App.toast("会话正在生成回复，请等待完成或停止后再编辑");
-      return;
+      App.toast("会话正在生成回复：确认发送后会先停止生成再重发");
     }
     const data = msg._editData;
     const originalText = contentToPlainText(data.content);
@@ -1263,8 +1345,27 @@
     wrap.appendChild(head);
     wrap.appendChild(body);
 
+    // 头部文件名：完整路径（相对路径按会话工作目录解析），一行放不下
+    // 自动换行（CSS 钳制最多两行，超出省略；完整路径始终在 hover title
+    // 与点击复制内容里）
+    function setFileTagValue(path) {
+      const fileTag = head.querySelector(".tool-block-file");
+      if (!fileTag) return;
+      const full = resolveToolPath(path);
+      if (!full) return;
+      fileTag.textContent = full;
+      fileTag.title = full + "（点击复制）";
+      fileTag.onclick = function () {
+        try {
+          navigator.clipboard.writeText(full).then(function () {}, function () {});
+        } catch (_) { /* 忽略 */ }
+      };
+      fileTag.hidden = false;
+    }
+
     return {
       wrap: wrap,
+      setFileTag: setFileTagValue,
       setName: function (n) { head.querySelector(".tool-block-name").textContent = n || "tool"; },
       setInput: function (t) {
         // 整体重设（结果返回/历史回放路径）：清空揭示队列直接显示最终文本
@@ -1298,19 +1399,8 @@
           badge.hidden = false;
           wrap.classList.add("has-diff");
         }
-        // 头部文件名：完整路径，一行放不下自动换行（1/2 行均垂直居中），
-        // hover title 显示完整路径，点击复制
-        const fileTag = head.querySelector(".tool-block-file");
-        if (fileTag && diff.path) {
-          fileTag.textContent = diff.path;
-          fileTag.title = diff.path + "（点击复制）";
-          fileTag.onclick = function () {
-            try {
-              navigator.clipboard.writeText(diff.path).then(function () {}, function () {});
-            } catch (_) { /* 忽略 */ }
-          };
-          fileTag.hidden = false;
-        }
+        // 头部文件名：完整路径（与参数提取路径共用同一渲染）
+        setFileTagValue(diff.path);
       },
       clearDiff: function () {
         if (diffView && diffView.parentNode) {
@@ -1533,20 +1623,45 @@
     return box;
   }
 
-  // 从工具参数 JSON 文本中提取文件路径（write_file/edit_file 的 full_file_name，
-  // 兜底 _file_diff 无 path 字段的旧数据）
-  function extractPathFromArgs(argsText) {
-    if (!argsText || typeof argsText !== "string") return "";
-    try {
-      const args = JSON.parse(argsText);
-      const raw = args.full_file_name || args.path || "";
-      return String(raw).trim();
-    } catch (_) {
-      // 参数可能是流式未闭合 JSON：宽松匹配 "full_file_name":"..."
-      const m = /"full_file_name"\s*:\s*"([^"]+)"/.exec(argsText)
-        || /"path"\s*:\s*"([^"]+)"/.exec(argsText);
-      return m ? m[1].replace(/\\\\/g, "\\").replace(/\//g, "\\") : "";
+  // 从工具参数（对象或 JSON 文本均可）提取标题栏路径信息：
+  // read_file/write_file/edit_file 用 full_file_name；search_files 用搜索目录 dir_path；
+  // 兜底 _file_diff 无 path 字段的旧数据。参数可能是流式未闭合 JSON，宽松正则兜底。
+  function extractPathFromArgsValue(args, name) {
+    let obj = args;
+    if (typeof args === "string") {
+      args = args.trim();
+      if (!args) return "";
+      try {
+        obj = JSON.parse(args);
+      } catch (_) {
+        const m = /"full_file_name"\s*:\s*"([^"]+)"/.exec(args)
+          || /"dir_path"\s*:\s*"([^"]+)"/.exec(args)
+          || /"path"\s*:\s*"([^"]+)"/.exec(args);
+        return m ? m[1].replace(/\\\\/g, "\\") : "";
+      }
     }
+    if (!obj || typeof obj !== "object") return "";
+    if (name === "search_files") {
+      // 目录 + 搜索模式组合展示；未指定目录时回退显示模式（保证有识别信息）
+      const dir = String(obj.dir_path || "").trim();
+      const pattern = String(obj.pattern || "").trim();
+      if (dir && pattern) return dir + "（" + pattern + "）";
+      return dir || pattern;
+    }
+    return String(obj.full_file_name || obj.path || "").trim();
+  }
+
+  // 相对路径按会话工作目录解析为完整路径（模型常传相对路径，标题栏展示
+  // 完整定位）；已是绝对路径（盘符/根/~）或无法得知工作目录时原样返回
+  function resolveToolPath(path) {
+    const raw = String(path || "").trim();
+    if (!raw) return "";
+    if (/^([A-Za-z]:[\\/]|[\\/]|~)/.test(raw)) return raw;
+    const workDir = String((App.state && App.state.workDir) || "").trim();
+    if (!workDir) return raw;
+    const rel = raw.replace(/^\.[\\/]/, "");
+    const sep = workDir.indexOf("\\") !== -1 ? "\\" : "/";
+    return workDir.replace(/[\\/]+$/, "") + sep + rel;
   }
 
   // 从 unified diff 文件头（--- a/xxx / +++ b/xxx）提取展示路径
@@ -1558,9 +1673,10 @@
 
   /** 工具输出统一入口：带 file_diff 的结构化结果渲染 diff 视图 + 统计摘要文本，
    * 其余一律按原文纯文本输出（MCP 版同名工具 / 旧历史无 diff 自动回退）。
-   * argsText（可选）：工具原始参数 JSON 文本，用于在 _file_diff 无 path 字段的
-   * 旧数据里兜底提取完整文件路径（full_file_name）。 */
-  function applyToolResult(block, name, resultText, fileDiff, argsText) {
+   * args（可选，对象或 JSON 文本）：工具原始参数——用于在 _file_diff 无 path
+   * 字段的旧数据里兜底提取完整文件路径（full_file_name），以及为 read_file /
+   * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
+  function applyToolResult(block, name, resultText, fileDiff, args) {
     let parsed = null;
     if (fileDiff && typeof fileDiff === "object") {
       try {
@@ -1569,7 +1685,7 @@
       } catch (_) { /* 回退纯文本 */ }
       // 旧数据 _file_diff 无 path 字段：从参数或 diff 文件头兜底提取
       if (parsed && !fileDiff.path) {
-        fileDiff.path = extractPathFromArgs(argsText)
+        fileDiff.path = extractPathFromArgsValue(args, name)
           || extractPathFromDiffText(fileDiff.diff) || "";
       }
     }
@@ -1588,6 +1704,11 @@
       block.setDiff(fileDiff);
     } else {
       block.setOutput(resultText);
+    }
+    // 标题栏路径：diff 未带路径（含无 diff 的 read_file / search_files /
+    // 旧数据 write_file）时从参数补齐；diff 已带路径时 setDiff 已设置
+    if (!fileDiff || !fileDiff.path) {
+      block.setFileTag(extractPathFromArgsValue(args, name));
     }
   }
 
@@ -1852,7 +1973,7 @@
       }
       entry.finish();
       const resultText = typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2);
-      applyToolResult(entry, evt.tool_name, resultText, evt.file_diff);
+      applyToolResult(entry, evt.tool_name, resultText, evt.file_diff, evt.arguments);
     }
 
     function renderTodo(items) {
@@ -2294,20 +2415,37 @@
   // DOM/cookie/存储/同源接口）。通信全走 postMessage：
   //   1) iframe BOOT 完成 → 回发 canvas-ready；
   //   2) 父页按 ev.source 匹配 frame，下发 canvas-run{id,code}；
-  //   3) iframe 内 new Function('stage','console',code) 执行，console 收集，
-  //      结束时 canvas-done/canvas-error{logs, shot} 一次性回传（shot 为
-  //      沙箱内 stage.toDataURL 的自报快照——跨源读不到画布像素，截图
-  //      必须由 iframe 自己导出）。
+  //   3) iframe 内 new Function('stage','console',code) 执行，console 逐行
+  //      实时回传（canvas-log{id,line}）；
+  //   4) 同步体结束后"结算探测"：包装 rAF/定时器统计待执行回调数——归零则
+  //      脚本是一次性绘制，回传 canvas-done{logs,shot}（shot 为沙箱内
+  //      stage.toDataURL 自报快照——跨源读不到画布像素）；仍有任务在跑
+  //      （动画/游戏循环）则回发 canvas-live，父页保持运行态：用户可与
+  //      画布交互（点击/键盘），父页可随时下发 canvas-shot 索要当前帧；
+  //      脚本自身收尾（live 归零）时自动补发 canvas-done 携带最终快照；
+  //      异步回调抛错经 __onasync 上报 canvas-error，父页复位状态。
   // 用户代码不经 srcdoc 注入，避免 HTML 解析转义风险；流式重建的旧
   // iframe 随节点一起被丢弃，无需显式回收。
 
   const CANVAS_RUNTIME_CSS =
-    "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" +
-    "#stage{display:block;width:100%;height:100%;}";
+    // height:100%：body 高度必须显式铺满 iframe，#stage 的百分比高度才有
+    // 确定的解析基准（否则随内容收缩，画布位图与点击坐标全部失真）
+    "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;}" +
+    // object-fit:contain：画布位图等比缩放居中，常规/全屏下都不拉伸变形
+    "#stage{display:block;width:100%;height:100%;object-fit:contain;}";
 
   // 沙箱内宿主脚本：监听父页指令，执行用户脚本并回传日志/异常/快照
   const CANVAS_BOOT_JS = [
     "var stage=document.getElementById('stage');",
+    // 保留原生定时器引用（包装前的），探测逻辑自身不走被包装的全局
+    "var __raf=window.requestAnimationFrame.bind(window),",
+    "  __craf=window.cancelAnimationFrame.bind(window),",
+    "  __st=window.setTimeout.bind(window),",
+    "  __si=window.setInterval.bind(window),",
+    "  __cst=window.clearTimeout.bind(window),",
+    "  __csi=window.clearInterval.bind(window);",
+    // 活跃度追踪：__live = 待执行的 rAF/timeout/interval 回调数
+    "var __live=0,__pend={r:{},t:{},i:{}},__sentLive=false,__runId=null,logs=[];",
     "function shot(){",
     "  try{return stage.toDataURL('image/png');}catch(e){",
     "    return 'ERR:'+String(e&&e.message||e);",
@@ -2317,22 +2455,129 @@
     "  try{return typeof v==='string'?v:JSON.stringify(v);}catch(_){return String(v);}",
     "}",
     "function join(args){return Array.prototype.map.call(args,fmt).join(' ');}",
+    "function push(line){",
+    "  logs.push(line);if(logs.length>400)logs.splice(0,logs.length-400);",
+    "  parent.postMessage({type:'canvas-log',id:__runId,line:line},'*');",
+    "}",
+    // 独活中 live 归零 → 脚本自然收尾：补发 done 与最终快照（宏任务里复查，
+    // 给 rAF 回调"先减计数再调度下一帧"的过程留出重新累加的机会）
+    "function __checkDone(){",
+    "  if(!__sentLive||__live>0)return;",
+    "  __sentLive=false;",
+    "  parent.postMessage({type:'canvas-done',id:__runId,logs:logs.slice(-200),shot:shot()},'*');",
+    "}",
+    "function __rel(kind,h){",
+    "  if(__pend[kind][h]){delete __pend[kind][h];__live--;}",
+    "  if(__sentLive)__st(__checkDone,0);",
+    "}",
+    // 异步回调抛错不静默：上报 canvas-error，父页复位状态（日志行由父页
+    // 在 canvas-error 分支统一追加，这里不再重复 push）
+    "function __onasync(e){",
+    "  parent.postMessage({type:'canvas-error',id:__runId,logs:logs.slice(-200),shot:shot(),error:String(e&&e.message||e)},'*');",
+    "}",
+    "window.requestAnimationFrame=function(cb){",
+    "  var h;h=__raf(function(t){__rel('r',h);try{cb(t);}catch(e){__onasync(e);}});",
+    "  __pend.r[h]=1;__live++;return h;",
+    "};",
+    "window.cancelAnimationFrame=function(h){__rel('r',h);return __craf(h);};",
+    "window.setTimeout=function(f,ms){",
+    "  var a=Array.prototype.slice.call(arguments,2),h;",
+    "  h=__st(function(){__rel('t',h);try{f.apply(null,a);}catch(e){__onasync(e);}},ms);",
+    "  __pend.t[h]=1;__live++;return h;",
+    "};",
+    "window.clearTimeout=function(h){__rel('t',h);return __cst(h);};",
+    "window.setInterval=function(f,ms){",
+    "  var a=Array.prototype.slice.call(arguments,2),h;",
+    "  h=__si(function(){try{f.apply(null,a);}catch(e){__onasync(e);}},ms);",
+    "  __pend.i[h]=1;__live++;return h;",
+    "};",
+    "window.clearInterval=function(h){__rel('i',h);return __csi(h);};",
     "window.addEventListener('message',function(ev){",
     "  var d=ev.data||{};",
+    "  if(d.type==='canvas-shot'){",
+    "    parent.postMessage({type:'canvas-shot-data',id:d.id,shot:shot()},'*');",
+    "    return;",
+    "  }",
     "  if(d.type!=='canvas-run')return;",
-    "  var logs=[];",
-    "  var sc={log:function(){logs.push(join(arguments));},",
-    "    info:function(){logs.push(join(arguments));},",
-    "    warn:function(){logs.push('[warn] '+join(arguments));},",
-    "    error:function(){logs.push('[error] '+join(arguments));}};",
+    "  __runId=d.id;",
+    "  var sc={log:function(){push(join(arguments));},",
+    "    info:function(){push(join(arguments));},",
+    "    warn:function(){push('[warn] '+join(arguments));},",
+    "    error:function(){push('[error] '+join(arguments));}};",
     "  try{",
     "    new Function('stage','console',d.code)(stage,sc);",
-    "    parent.postMessage({type:'canvas-done',id:d.id,logs:logs,shot:shot()},'*');",
     "  }catch(err){",
-    "    logs.push('[异常] '+String(err&&err.message||err));",
-    "    parent.postMessage({type:'canvas-error',id:d.id,logs:logs,shot:shot(),error:String(err&&err.message||err)},'*');",
+    "    push('[异常] '+String(err&&err.message||err));",
+    "    parent.postMessage({type:'canvas-error',id:d.id,logs:logs.slice(-200),shot:shot(),error:String(err&&err.message||err)},'*');",
+    "    return;",
     "  }",
+    // 结算探测：同步体结束后等一帧再判定（期间脚本已把自己的首轮 rAF/
+    // 定时任务挂上）；仍有任务 → 独活模式，父页保持运行态供交互
+    "  __st(function(){__raf(function(){",
+    "    if(__live>0){",
+    "      __sentLive=true;",
+    "      parent.postMessage({type:'canvas-live',id:d.id},'*');",
+    "    }else{",
+    "      parent.postMessage({type:'canvas-done',id:d.id,logs:logs.slice(-200),shot:shot()},'*');",
+    "    }",
+    "  });});",
     "});",
+    // 未捕获异常兜底（用户直接挂在 stage/window 上的监听器抛错不走包装）
+    "window.onerror=function(msg,src,line){",
+    "  __onasync(new Error(String(msg)+(line?('（第'+line+'行）'):'')));",
+    "  return true;",
+    "};",
+    // 事件监听支持：
+    // 1) stage 指针事件的 offsetX/offsetY 换算为画布位图坐标——沙箱画布
+    //    以 object-fit:contain 等比缩放居中，CSS 坐标 ≠ 位图坐标，不换算
+    //    会导致点击命中有系统性偏移；facade 继承原事件，preventDefault 等
+    //    方法显式转发；
+    // 2) 监听器计入活跃度：纯点击交互的小游戏没有帧循环，也要保持运行态；
+    //    removeEventListener 对应回落（按原监听器函数映射到包装函数）。
+    "var __liveListeners=new WeakMap();",
+    "function __wrapEvent(e){",
+    "  if(!e||typeof e.clientX!=='number')return e;",
+    "  try{",
+    "    var r=stage.getBoundingClientRect();",
+    "    var s=Math.min(r.width/stage.width,r.height/stage.height)||1;",
+    "    var ox=(r.width-stage.width*s)/2,oy=(r.height-stage.height*s)/2;",
+    // Proxy 而非 Object.create 继承：原生事件访问器（clientX/target 等）
+    // 依赖内部槽位，原型链继承后 this 指向 facade 会抛 Illegal invocation；
+    // Proxy 的 get 先拦截 offset 坐标，其余属性回退原事件（函数绑定 this）
+    "    return new Proxy(e,{",
+    "      get:function(t,p){",
+    "        if(p==='offsetX')return (t.clientX-r.left-ox)/s;",
+    "        if(p==='offsetY')return (t.clientY-r.top-oy)/s;",
+    "        var v=t[p];",
+    "        return typeof v==='function'?v.bind(t):v;",
+    "      }",
+    "    });",
+    "  }catch(_){return e;}",
+    "}",
+    "var __stageAen=stage.addEventListener.bind(stage),__stageRen=stage.removeEventListener.bind(stage);",
+    "stage.addEventListener=function(t,fn,opt){",
+    "  if(typeof fn!=='function')return __stageAen(t,fn,opt);",
+    "  __live++;",
+    "  var wrapped=function(e){return fn.call(this,__wrapEvent(e));};",
+    "  __liveListeners.set(fn,wrapped);",
+    "  return __stageAen(t,wrapped,opt);",
+    "};",
+    "stage.removeEventListener=function(t,fn,opt){",
+    "  var wrapped=__liveListeners.get(fn);",
+    "  if(wrapped){__liveListeners.delete(fn);__live--;return __stageRen(t,wrapped,opt);}",
+    "  return __stageRen(t,fn,opt);",
+    "};",
+    "var __winAen=window.addEventListener.bind(window),__winRen=window.removeEventListener.bind(window);",
+    "window.addEventListener=function(t,fn,opt){",
+    "  if(typeof fn!=='function')return __winAen(t,fn,opt);",
+    "  __live++;",
+    "  __liveListeners.set(fn,fn);",
+    "  return __winAen(t,fn,opt);",
+    "};",
+    "window.removeEventListener=function(t,fn,opt){",
+    "  if(__liveListeners.get(fn)===fn){__liveListeners.delete(fn);__live--;}",
+    "  return __winRen(t,fn,opt);",
+    "};",
     "parent.postMessage({type:'canvas-ready'},'*');",
   ].join("\n");
 
@@ -2350,10 +2595,19 @@
     return frame;
   }
 
-  // 画布快照缓存：canvasId -> {dataUrl, error}（canvas-done/error 时写入）
+  // 画布快照缓存：canvasId -> {dataUrl, error}（canvas-done/error 时写入，
+  // 独活模式下由 canvas-shot-data 实时更新）
   const canvasShots = new Map();
+  // 独活模式"截图"请求中标记：canvasId -> true（响应到达后触发导出）
+  const pendingCanvasExport = new Map();
 
-  // 沙箱消息总线：ready → 下发该块源码；done/error → 状态复位 + 日志渲染 + 快照缓存
+  function findCanvasBlock(canvasId) {
+    return chatInner.querySelector(
+      '.md-canvas-block[data-canvas-id="' + canvasId + '"]');
+  }
+
+  // 沙箱消息总线：ready → 下发该块源码；log → 日志实时追加；
+  // live → 保持运行态（画布可交互）；done/error → 状态复位 + 快照缓存
   function onCanvasMessage(ev) {
     const data = ev.data || {};
     if (data.type === "canvas-ready") {
@@ -2374,25 +2628,64 @@
       }
       return;
     }
+    if (data.type === "canvas-log") {
+      const block = findCanvasBlock(data.id || "");
+      if (block) appendCanvasLog(block, [String(data.line || "")]);
+      return;
+    }
+    if (data.type === "canvas-live") {
+      // 动画/游戏脚本仍在运行：保持运行态（■ 停止），画布可交互
+      const block = findCanvasBlock(data.id || "");
+      if (block) setCanvasState(block, "running");
+      return;
+    }
+    if (data.type === "canvas-shot-data") {
+      // 独活模式实时快照：缓存后若有挂起的导出请求则继续导出
+      // （导出的是缓存里的 dataUrl 字符串——此前误传 block DOM 元素，
+      // fetch("[object HTMLDivElement]") 直接 "Failed to fetch"）
+      const id = data.id || "";
+      storeCanvasShot(id, data.shot);
+      if (pendingCanvasExport.get(id)) {
+        pendingCanvasExport.delete(id);
+        const rec = canvasShots.get(id);
+        if (rec && rec.dataUrl) {
+          exportCanvasShot(rec.dataUrl);
+        } else if (rec && rec.error) {
+          App.toast(rec.error);
+        } else {
+          App.toast("快照未就绪，请重试截图");
+        }
+      }
+      return;
+    }
     if (data.type === "canvas-done" || data.type === "canvas-error") {
-      const block = chatInner.querySelector(
-        '.md-canvas-block[data-canvas-id="' + data.id + '"]');
+      const block = findCanvasBlock(data.id || "");
       if (!block) return;
-      const shotData = String(data.shot || "");
-      canvasShots.set(data.id || "", {
-        dataUrl: shotData.indexOf("data:image/png") === 0 ? shotData : "",
-        error: shotData.indexOf("data:image/png") === 0 ? "" :
-          (shotData ? shotData.replace(/^ERR:/, "画布被浏览器标记污染，无法导出：") : ""),
-      });
-      renderCanvasLog(block, data.logs || []);
-      // 同步脚本瞬间完成：状态复位，按钮回到「▶ 运行」（再点即重跑）
+      storeCanvasShot(data.id || "", data.shot);
+      // 日志已由 canvas-log 逐行实时到达（postMessage 同通道 FIFO 有序），
+      // done/error 不再重复追加
+      if (data.type === "canvas-error" && data.error) {
+        appendCanvasLog(block, ["[异常] " + String(data.error)]);
+      }
+      // 同步脚本瞬间完成（或独活脚本自然收尾）：状态复位，按钮回到「▶ 运行」
       setCanvasState(block, "idle");
     }
   }
   window.addEventListener("message", onCanvasMessage);
 
-  // 日志区：画布下方等宽文本框（textContent 注入，防日志内容注入 HTML）
-  function renderCanvasLog(block, logs) {
+  // 快照缓存写入：只接受 PNG dataURL；污染失败转为可读错误说明
+  function storeCanvasShot(id, shotData) {
+    const shot = String(shotData || "");
+    canvasShots.set(id || "", {
+      dataUrl: shot.indexOf("data:image/png") === 0 ? shot : "",
+      error: shot.indexOf("data:image/png") === 0 ? "" :
+        (shot ? shot.replace(/^ERR:/, "画布被浏览器标记污染，无法导出：") : ""),
+    });
+  }
+
+  // 日志区：画布下方等宽文本框（textContent 注入，防日志内容注入 HTML）。
+  // 行缓冲挂在块元素属性上（流式逐行追加，上限 300 行，超出丢最旧）
+  function appendCanvasLog(block, lines) {
     const view = block.querySelector(".md-canvas-view");
     if (!view) return;
     let logBox = view.querySelector(".md-canvas-log");
@@ -2401,8 +2694,18 @@
       logBox.className = "md-canvas-log";
       view.appendChild(logBox);
     }
-    logBox.textContent = logs.length ? logs.join("\n") : "(无输出)";
+    const buffer = block.__canvasLogLines || (block.__canvasLogLines = []);
+    for (let i = 0; i < lines.length; i++) buffer.push(lines[i]);
+    while (buffer.length > 300) buffer.shift();
+    logBox.textContent = buffer.length ? buffer.join("\n") : "(无输出)";
     logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function resetCanvasLog(block) {
+    block.__canvasLogLines = [];
+    const view = block.querySelector(".md-canvas-view");
+    const logBox = view && view.querySelector(".md-canvas-log");
+    if (logBox) logBox.remove();
   }
 
   // 运行状态辅助：更新 data-canvas-state 并同步「运行/停止」按钮文案
@@ -2447,6 +2750,7 @@
       }
       const view = block.querySelector(".md-canvas-view");
       if (!view) return;
+      resetCanvasLog(block);
       view.innerHTML = "";
       view.appendChild(buildCanvasFrame());
       setCanvasState(block, "running");
@@ -2459,6 +2763,7 @@
       const frame = block.querySelector(".md-canvas-frame");
       if (frame) frame.remove();
       canvasShots.delete(block.dataset.canvasId || "");
+      resetCanvasLog(block);
       setCanvasState(block, "idle");
       const view = block.querySelector(".md-canvas-view");
       if (view) {
@@ -2467,36 +2772,96 @@
       return;
     }
 
+    if (action === "full") {
+      // 全屏：作用于整个控件块（含操作按钮，全屏内仍可停止/截图/退出），
+      // 沙箱 iframe 随容器铺满，沙箱内 #stage 等比缩放。全屏的是父页元素
+      // 而非 iframe 自身，无需给沙箱加 allow-fullscreen
+      if (document.fullscreenElement === block) {
+        document.exitFullscreen();
+        return;
+      }
+      if (!document.fullscreenEnabled) {
+        App.toast("当前环境不支持全屏显示");
+        return;
+      }
+      block.requestFullscreen().catch(function (err) {
+        App.toast("进入全屏失败：" + (err && err.message || err));
+      });
+      return;
+    }
+
     if (action === "shot") {
-      // 截图导出：使用沙箱执行完成时自报的快照（canvasShots 缓存）——
-      // 沙箱是 opaque origin，父页读不到 iframe 内画布像素，截图只能由
-      // iframe 内 stage.toDataURL 自报；未运行/被污染时给出明确提示
+      // 截图导出：同步绘制用 done 时自报的快照（canvasShots 缓存）；
+      // 独活模式（动画/游戏）向沙箱实时索要当前帧（跨源读不到 iframe
+      // 像素，截图只能由沙箱内 stage.toDataURL 自报）
       const id = block.dataset.canvasId || "";
+      if (block.dataset.canvasState === "running") {
+        const frame = block.querySelector(".md-canvas-frame");
+        if (!frame || !frame.contentWindow) {
+          App.toast("沙箱未在运行，先点「▶ 运行」");
+          return;
+        }
+        pendingCanvasExport.set(id, true);
+        frame.contentWindow.postMessage({ type: "canvas-shot", id: id }, "*");
+        return;
+      }
       const rec = canvasShots.get(id);
       if (!rec || (!rec.dataUrl && !rec.error)) {
         App.toast("尚未运行，先点「▶ 运行」");
         return;
       }
       if (rec.error) { App.toast(rec.error); return; }
-      try {
-        const blob = await (await fetch(rec.dataUrl)).blob();
-        if (navigator.clipboard && window.ClipboardItem) {
-          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-          App.toast("已复制画布截图");
-        } else {
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = url;
-          link.download = "canvas-shot.png";
-          link.click();
-          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-          App.toast("已下载画布截图 PNG");
-        }
-      } catch (err) {
-        App.toast("截图失败：" + (err && err.message || err));
-      }
+      exportCanvasShot(rec.dataUrl);
       return;
     }
+  });
+
+  // data URL → Blob：不走 fetch（Chromium 对 URL 有 2MB 上限，大画布的
+  // PNG data URL 超限后 fetch 直接抛 "Failed to fetch"；file:// 源下同样
+  // 受限），用 atob 手动解码，无长度限制
+  function dataUrlToBlob(dataUrl) {
+    const comma = dataUrl.indexOf(",");
+    const mime = ((/^data:([^;,]*)/.exec(dataUrl.slice(0, comma)) || [])[1]) || "image/png";
+    const bin = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  // 快照导出：优先复制到剪贴板，剪贴板不可用/写入失败降级为下载 PNG
+  async function exportCanvasShot(dataUrl) {
+    let blob;
+    try {
+      blob = /^data:/i.test(dataUrl) ? dataUrlToBlob(dataUrl) : await (await fetch(dataUrl)).blob();
+    } catch (err) {
+      App.toast("截图失败：" + (err && err.message || err));
+      return;
+    }
+    if (navigator.clipboard && window.ClipboardItem) {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        App.toast("已复制画布截图");
+        return;
+      } catch (err) {
+        // 剪贴板被策略/权限拒绝：走下载兜底，不再直接报错
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "canvas-shot.png";
+    link.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    App.toast("已下载画布截图 PNG");
+  }
+
+  // 全屏状态同步按钮文案（Esc 退出 / 多块同时存在时统一刷新）
+  document.addEventListener("fullscreenchange", function () {
+    const fullscreen = Boolean(document.fullscreenElement);
+    chatInner.querySelectorAll('[data-canvas-action="full"]').forEach(function (btn) {
+      btn.textContent = fullscreen ? "⤡ 退出全屏" : "⛶ 全屏";
+      btn.title = fullscreen ? "退出全屏（Esc）" : "全屏显示画布（Esc 退出）";
+    });
   });
 
   // 媒体元素加载失败（404/路径失效等）：capture 捕获 media error 事件
@@ -2941,6 +3306,7 @@
   App.appendUserMessage = appendUserMessage;
   App.attachUserEditAction = attachUserEditAction;
   App.exitUserMessageEdit = exitUserMessageEdit;
+  App.attachLiveRoundEntry = attachLiveRoundEntry;
   // confirmEditResend 定义在 chat.js（发送编排）并由其导出，此处不重复赋值：
   // 若引用本模块不存在的函数名会在加载期抛 ReferenceError 中断整个 IIFE，
   // 导致后续所有 App.* 导出丢失（历史加载报 xxx is not a function）

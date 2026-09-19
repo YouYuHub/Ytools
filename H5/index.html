@@ -380,12 +380,6 @@
                     <div class="tool-chips hidden" id="toolChips"></div>
                     <input type="file" id="fileInput" multiple hidden>
                     <input type="file" id="historyFileInput" accept=".jsonl,.zip,application/json,application/zip" multiple hidden>
-                    <div class="suggest-row" id="suggestRow">
-                        <button class="suggest-chip" data-prompt="解释一下什么是 SSE 流式响应，它和普通接口有什么区别？">什么是 SSE 流式响应</button>
-                        <button class="suggest-chip" data-prompt="帮我用 Python 写一个带注释的快速排序">写一段快速排序</button>
-                        <button class="suggest-chip" data-prompt="你现在可以使用哪些工具？分别能做什么？">你能用哪些工具</button>
-                        <button class="suggest-chip" data-prompt="帮我制定一份为期一周的英语学习计划">制定英语学习计划</button>
-                    </div>
                 </div>
             </div>
         </main>
@@ -456,6 +450,13 @@
             <div class="chat-settings-body">
                 <section class="chat-settings-section">
                     <h3>模型与工具配置</h3>
+                    <div class="tool-retitle-row" id="settingsRetitleRow" hidden>
+                        <label class="tool-retitle-label" title="开启后本会话每条消息发送完成都会重新生成会话标题；关闭则仅首个任务尝试一次">
+                            <input type="checkbox" id="settingsRetitleToggle">
+                            <span>每条消息重新标题</span>
+                        </label>
+                        <span class="tool-retitle-status" id="settingsRetitleStatus"></span>
+                    </div>
                     <label class="chat-setting-field">
                         <span>思考过程回传长度<small>0=不回传 · 负数=全部 · 正数=保留末尾 N 字符</small></span>
                         <input id="reasoningMaxLength" type="number" step="1">
@@ -471,6 +472,10 @@
                     <label class="chat-setting-field">
                         <span>网络失败重试次数<small>模型请求连续失败达到该次数才终止任务；0=不限制（一直重试）</small></span>
                         <input id="networkRetryMaxAttempts" type="number" min="0" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>视频最大读取秒数<small>read_media 单次视频区间读取上限（5–3600）；下一段续读时按该上限截断</small></span>
+                        <input id="videoReadMaxSeconds" type="number" min="5" max="3600" step="1">
                     </label>
                     <label class="chat-setting-field">
                         <span>MCP 工具并发数<small>同一轮多个工具调用并发执行的线程数（实际并发不超过本轮工具数）</small></span>
@@ -719,6 +724,14 @@
                     <input type="checkbox" id="enableThinking">
                     <span>启用 thinking</span>
                 </label>
+            </div>
+            <div class="enhance-headers" id="customHeadersBox">
+                <div class="enhance-headers-head">
+                    <span>自定义请求头</span>
+                    <button id="addHeaderRow" type="button" title="添加一行请求头">+ 添加</button>
+                </div>
+                <div class="enhance-headers-rows" id="customHeadersRows"></div>
+                <div class="enhance-headers-tip">随该角色的模型选择保存；请求上游时随原始 HTTP 头注入（如供应商要求的会话/签名头）。同名键后者覆盖前者。</div>
             </div>
         </div>
         <div class="enhance-foot">

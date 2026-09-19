@@ -1,6 +1,7 @@
 import unittest
 
 from memory.chat_history_format import (
+    adjust_context_summary_for_deleted_rounds,
     format_tool_call_history_line,
     extract_recent_questions,
     normalize_context_summary,
@@ -413,6 +414,92 @@ class ChatHistoryFormatTests(unittest.TestCase):
         self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_0")
         self.assertEqual(messages[2]["tool_call_id"], "call_0")
         self.assertEqual(messages[2]["content"], "14:20")
+
+
+class AdjustSummaryForDeletedRoundsTests(unittest.TestCase):
+    """删除轮次后累计摘要游标/块范围/问题编号的同步调整。"""
+
+    def _summary(self) -> dict:
+        return {
+            "source_round_count": 5,
+            "blocks": [
+                {"summary": "早期摘要", "round_start": 1, "round_end": 3},
+                {"summary": "近期摘要", "round_start": 4, "round_end": 5},
+            ],
+            "recent_questions": ["问题二", "问题三", "问题四", "问题五"],
+            "recent_question_numbers": [2, 3, 4, 5],
+        }
+
+    def test_single_delete_inside_cursor_shifts_anchors(self):
+        adjusted = adjust_context_summary_for_deleted_rounds(self._summary(), [2])
+        self.assertEqual(adjusted["source_round_count"], 4)
+        self.assertEqual(
+            [(b["round_start"], b["round_end"]) for b in adjusted["blocks"]],
+            [(1, 2), (3, 4)],
+        )
+        # 问题二被删，问题三/四/五编号前移
+        self.assertEqual(adjusted["recent_question_numbers"], [2, 3, 4])
+        self.assertEqual(adjusted["recent_questions"], ["问题三", "问题四", "问题五"])
+
+    def test_truncate_inside_cursor_shrinks_cursor(self):
+        # 删除第 2 轮及之后（2-5），游标内只剩第 1 轮
+        adjusted = adjust_context_summary_for_deleted_rounds(self._summary(), [2, 3, 4, 5])
+        self.assertEqual(adjusted["source_round_count"], 1)
+        self.assertEqual(
+            [(b["round_start"], b["round_end"]) for b in adjusted["blocks"]],
+            [(1, 1)],
+        )
+        self.assertEqual(adjusted["recent_question_numbers"], [])
+        self.assertEqual(adjusted["recent_questions"], [])
+
+    def test_delete_after_cursor_keeps_cursor_and_shifts_numbers(self):
+        # 删除第 6 轮（游标外）：游标与块范围不动，仅问题编号 >=6 才受影响
+        adjusted = adjust_context_summary_for_deleted_rounds(self._summary(), [6])
+        self.assertEqual(adjusted["source_round_count"], 5)
+        self.assertEqual(
+            [(b["round_start"], b["round_end"]) for b in adjusted["blocks"]],
+            [(1, 3), (4, 5)],
+        )
+        self.assertEqual(adjusted["recent_question_numbers"], [2, 3, 4, 5])
+
+    def test_fully_deleted_block_is_dropped(self):
+        summary = self._summary()
+        summary["blocks"].append({"summary": "尾巴摘要", "round_start": 6, "round_end": 6})
+        adjusted = adjust_context_summary_for_deleted_rounds(summary, [6])
+        self.assertEqual(
+            [(b["round_start"], b["round_end"]) for b in adjusted["blocks"]],
+            [(1, 3), (4, 5)],
+        )
+
+    def test_non_dict_and_invalid_numbers_pass_through(self):
+        self.assertIsNone(adjust_context_summary_for_deleted_rounds(None, [2]))
+        text_summary = "纯文本摘要"
+        self.assertEqual(
+            adjust_context_summary_for_deleted_rounds(text_summary, [2]), text_summary
+        )
+        summary = self._summary()
+        self.assertEqual(
+            adjust_context_summary_for_deleted_rounds(summary, []), summary
+        )
+        self.assertEqual(
+            adjust_context_summary_for_deleted_rounds(summary, ["x", 0, -1]), summary
+        )
+
+    def test_unpaired_question_numbers_keep_questions(self):
+        summary = self._summary()
+        summary.pop("recent_question_numbers")
+        adjusted = adjust_context_summary_for_deleted_rounds(summary, [2])
+        # 无法对齐编号时保持问题列表原样（宁可冗余不可错位）
+        self.assertEqual(
+            adjusted["recent_questions"],
+            ["问题二", "问题三", "问题四", "问题五"],
+        )
+
+    def test_adjusted_summary_stays_renderable(self):
+        adjusted = adjust_context_summary_for_deleted_rounds(self._summary(), [2])
+        rendered = render_context_summary(adjusted)
+        self.assertIn("覆盖轮次 1-2", rendered)
+        self.assertIn("覆盖轮次 3-4", rendered)
 
 
 if __name__ == "__main__":

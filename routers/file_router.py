@@ -219,7 +219,7 @@ async def upload_session_media(
     history_files/session_files/<session>/media/，供聊天多模态消息以
     media://<stored_name> 引用（发送上游前由后端解析为 data URL / base64）。
     参数:
-        files: 媒体文件列表，最多 10 个；单文件上限按类别：图片/音频 20MB、视频 500MB
+        files: 媒体文件列表，最多 10 个；单文件上限按类别：图片/音频 20MB、视频 600MB
                （视频流式落盘，不整体读入内存）；扩展名白名单校验
         session_id: 会话ID，用于隔离不同会话的媒体目录
     返回:
@@ -248,8 +248,9 @@ async def upload_session_media(
                 })
                 continue
             size_limit = media_size_limit(kind)
-            if kind == "video":
-                # 大文件流式落盘：边拷贝边计数、超限即中止，不整体读入内存
+            if kind == "video" or (kind == "image" and filename.lower().endswith(".gif")):
+                # 大文件流式落盘：边拷贝边计数、超限即中止，不整体读入内存；
+                # 动图 gif 归视频档（600MB，发送/读取侧按内容判定同口径）
                 saved = save_session_media_stream(session_id, filename, file.file)
                 results.append({"status": "success", **saved})
                 success_count += 1

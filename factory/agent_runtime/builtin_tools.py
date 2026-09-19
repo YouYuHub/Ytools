@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 import difflib
 import fnmatch
 import hashlib
+import uuid
 # import io
 import json
 import os
@@ -95,7 +96,7 @@ def inject_builtin_tools(
         tools.append(SEARCH_FILES_TOOL_DEFINITION)
         servers[SEARCH_FILES_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_read_media and READ_MEDIA_NAME not in servers:
-        tools.append(READ_MEDIA_TOOL_DEFINITION)
+        tools.append(build_read_media_tool_definition())
         servers[READ_MEDIA_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_sub_agent and SUB_AGENT_TOOL_NAME not in servers:
         tools.append(SUB_AGENT_TOOL_DEFINITION)
@@ -1219,68 +1220,137 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
 # 已预留来源审计信息，届时在 load_any_media_model_part 入口挂确认钩子。
 # 规模规则沿用上传链路：单次最多 5 个；图片超过 2MB（或显式传 quality）
 # 自动降采样为 JPEG 缩略图（长边 1568，质量按 quality 参数，默认 85）；
-# GIF 动图跳过降采样；大小上限图片/音频 20MB、视频 500MB。
+# 视觉 API 拒绝的格式自动转换后再注入（静图 gif/bmp/ico/tif/tiff → PNG，
+# 动图 gif → H.264 MP4；ffmpeg 定位回退 imageio-ffmpeg 包内置二进制，
+# 均缺失时静图 gif 回退首帧 PNG）；大小上限按内容判定：
+# 静图类 30MB、动图 gif 与视频类 600MB、音频 20MB
+# （网络直链下载转换上限同口径：gif 600MB / 其他 30MB；超限直接拒绝）。
 
 READ_MEDIA_MAX_ITEMS = 5
 _READ_MEDIA_QUALITY_MIN = 50
 _READ_MEDIA_QUALITY_MAX = 100
 
-READ_MEDIA_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": READ_MEDIA_NAME,
-        "description": (
-            "读取媒体文件（本地/网络/用户上传统一入口），把数据回传给你（多模态部件）"
-            "以便观察内容，最多 5 个。\n"
-            "参数：\n"
-            "    references: 媒体来源列表，支持三类引用（可混用）：\n"
-            "                1) media:// 引用（用户消息附件中已展示的引用，如 "
-            "media://xxx_abc12345.png，不要臆造）；\n"
-            "                2) 本地文件路径（绝对路径如 C:/data/x.png，或相对当前"
-            "工作目录的路径；支持 png/jpg/gif/webp/bmp 等图片与常见音频视频格式）；\n"
-            "                3) http(s) 网络直链（公开可访问的图片/音频/视频文件）；\n"
-            "                单个字符串视为单个引用\n"
-            "    quality:    图片清晰度 50-100（越大越清晰/占用越大，默认 85）；"
-            "仅对超过 2MB 的大图生效（小图按原样回传）\n"
-            "返回：\n"
-            "    文本说明（读取了哪些媒体、来源类型、是否降采样/超限跳过）；"
-            "数据本身以 user 消息多模态部件注入后续请求，不在本文本内\n"
-            "注意：\n"
-            "    视频/音频仅回传元信息与部分模型的有限支持，读取结果以图片为主；\n"
-            "    已读取过的引用无需重复读取（同一轮上下文已注入）"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "references": {
-                    "type": "array",
-                    "description": (
-                        "媒体来源列表（最多 5 个）：media:// 引用 / 本地文件路径 / "
-                        "http(s) 网络直链，可混用"
-                    ),
-                    "items": {"type": "string"},
+
+def build_read_media_tool_definition() -> dict[str, Any]:
+    """动态构建 read_media 工具定义。
+
+    视频最大读取秒数（VIDEO_MAX_READ_SECONDS）每次现读：此前作为模块级
+    常量时 f-string 在 import 时求值一次，.env 热重载后工具描述里的数字
+    仍是启动时的旧值；改为函数后每轮工具注入时现场取值，与
+    video_max_read_seconds() 的延迟读取语义一致（配置热重载即生效）。
+    """
+    max_seconds = file_memory.video_max_read_seconds()
+    return {
+        "type": "function",
+        "function": {
+            "name": READ_MEDIA_NAME,
+            "description": (
+                "读取媒体文件（本地/网络/用户上传统一入口），把数据回传给你（多模态部件）"
+                "以便观察内容，最多 5 个。\n"
+                "参数：\n"
+                "    references: 媒体来源列表，支持三类引用（可混用）：\n"
+                "                1) media:// 引用（用户消息附件中已展示的引用，如 "
+                "media://xxx_abc12345.png，不要臆造）；\n"
+                "                2) 本地文件路径（绝对路径如 C:/data/x.png，或相对当前"
+                "工作目录的路径；支持 png/jpg/gif/webp/bmp 等图片与常见音频视频格式）；\n"
+                "                3) http(s) 网络直链（公开可访问的图片/音频/视频文件）；\n"
+                "                单个字符串视为单个引用\n"
+                "    quality:    图片清晰度 50-100（越大越清晰/占用越大，默认 85）；"
+                "仅对超过 2MB 的大图生效（小图按原样回传）\n"
+                "    start_time: 视频区间读取开始秒数（可选，精确到帧，毫秒精度）\n"
+                "    end_time:   视频区间读取结束秒数（可选，精确到帧；省略时读取 "
+                f"start_time 起 {max_seconds} 秒——该上限可"
+                "由项目 .env 的 VIDEO_MAX_READ_SECONDS 配置）\n"
+                "返回：\n"
+                "    文本说明（读取了哪些媒体、来源类型、是否转换/降采样/超限跳过）；"
+                "数据本身以 user 消息多模态部件注入后续请求，不在本文本内\n"
+                "注意：\n"
+                "    视频/动图 gif 走区间读取（不再全量注入）：单次最多 "
+                f"{max_seconds} 秒（.env 可配），"
+                "请求区间超上限自动截断为 [start, "
+                "start+上限] 并在返回中标记 truncated；先传 start_time == end_time "
+                "（如 0/0）可只探测元数据（时长/帧率/分辨率，不回传视频数据）；"
+                "返回元信息含视频时长/帧率/分辨率与实际读取区间，据此规划下一段 "
+                "[上一段 end, end+上限] 续读；\n"
+                "    视频数据一次性消费：供应商单请求仅接受 1 个视频——读取新片段"
+                "时此前已注入的视频数据会被回收（工具结果中的参数与读取状态文本"
+                "仍保留）；需要回看画面就对同一引用与相同区间重新调用本工具"
+                "（切片有缓存，成本很低）；一次调用读多个视频时只有第一个片段"
+                "带画面数据，其余按序补读；\n"
+                "    视觉 API 拒绝的图片格式会自动转换后再注入：静图 gif 与 "
+                "bmp/ico/tif/tiff 转 PNG、动图 gif 转 H.264 MP4（ffmpeg 定位"
+                "回退 imageio-ffmpeg 包内置二进制，均缺失时动图回退首帧 PNG）；"
+                "原生格式（png/jpg/jpeg/webp）直接按原样注入；\n"
+                "    大小上限按内容判定：静图类 30MB、动图 gif 与视频 600MB、"
+                "音频 20MB；超过上限的媒体直接拒绝（错误信息注明原因），"
+                "不会注入原始大文件；\n"
+                "    视频/音频仅回传元信息与部分模型的有限支持，读取结果以图片为主；\n"
+                "    已读取过的引用无需重复读取（同一轮上下文已注入）"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "references": {
+                        "type": "array",
+                        "description": (
+                            "媒体来源列表（最多 5 个）：media:// 引用 / 本地文件路径 / "
+                            "http(s) 网络直链，可混用"
+                        ),
+                        "items": {"type": "string"},
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": (
+                            "图片清晰度 50-100（默认 85；仅对超过 2MB 的大图降采样生效，"
+                            "小图/动图按原样回传）"
+                        ),
+                    },
+                    "start_time": {
+                        "type": "number",
+                        "description": (
+                            "视频区间读取开始秒数（可选，精确到帧）；仅对视频与动图 gif "
+                            "生效"
+                        ),
+                    },
+                    "end_time": {
+                        "type": "number",
+                        "description": (
+                            "视频区间读取结束秒数（可选，精确到帧）；省略时读取 "
+                            f"start_time 起 {max_seconds} 秒；"
+                            "start_time == end_time 表示仅探测元数据（不回传视频数据）"
+                        ),
+                    },
                 },
-                "quality": {
-                    "type": "integer",
-                    "description": (
-                        "图片清晰度 50-100（默认 85；仅对超过 2MB 的大图降采样生效，"
-                        "小图/动图按原样回传）"
-                    ),
-                },
+                "required": ["references"],
             },
-            "required": ["references"],
         },
-    },
-}
+    }
 
 
-def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int | None, str | None]:
-    """校验并规整 read_media 参数：references 列表与可选 quality。
+def _media_injected_key(reference: str, start_time: float | None, end_time: float | None) -> str:
+    """read_media 注入去重键：未指定区间=引用原文；指定区间=引用#start-end。
 
-    返回 (references, quality, error_reason)；参数非法时 references 为空列表。
+    视频分段续读语义的关键：同一视频引用不同区间是合法的新读取（不命中
+    already_injected），相同区间重复读取仍被去重；未指定区间时保持旧键
+    （引用原文），兼容图片/音频与既有行为。
+    """
+    if start_time is None and end_time is None:
+        return reference
+    s_text = "" if start_time is None else f"{start_time:.3f}"
+    e_text = "" if end_time is None else f"{end_time:.3f}"
+    return f"{reference}#{s_text}-{e_text}"
+
+
+def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int | None, str | None, float | None, float | None]:
+    """校验并规整 read_media 参数：references 列表与可选 quality / 区间。
+
+    返回 (references, quality, error_reason, start_time, end_time)；
+    参数非法时 references 为空列表。
     - references：字符串/单元素自动包列表；每项接受 media:// 引用、本地路径
       或 http(s) 直链（仅做前后空白清理与去重，按出现顺序保留）；
-    - quality：50-100 整数，非法时返回 error。
+    - quality：50-100 整数，非法时返回 error；
+    - start_time / end_time：可选秒数（毫秒精度，视频/动图区间读取），
+      非数字或负数返回 error；end < start 返回 error（相等=仅探测元数据）。
     """
     args = tool_args if isinstance(tool_args, dict) else {}
     raw_references = args.get("references")
@@ -1291,7 +1361,7 @@ def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int
     if not isinstance(raw_references, list):
         return [], None, (
             "references 参数无效：需要媒体来源的字符串数组（media:// 引用 / 本地路径 / http(s) 直链）"
-        )
+        ), None, None
     references: list[str] = []
     for item in raw_references:
         text = str(item or "").strip()
@@ -1304,17 +1374,120 @@ def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int
         try:
             quality = int(quality)
         except (TypeError, ValueError):
-            return [], None, f"quality 参数无效: {quality!r}（应为 50-100 的整数）"
+            return [], None, f"quality 参数无效: {quality!r}（应为 50-100 的整数）", None, None
         if quality < _READ_MEDIA_QUALITY_MIN or quality > _READ_MEDIA_QUALITY_MAX:
             return [], None, (
                 f"quality 参数超出范围: {quality}（允许 {_READ_MEDIA_QUALITY_MIN}-"
                 f"{_READ_MEDIA_QUALITY_MAX}）"
-            )
+            ), None, None
+    times: list[float | None] = []
+    for name in ("start_time", "end_time"):
+        raw = args.get(name)
+        if raw is None:
+            times.append(None)
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return [], None, f"{name} 参数无效: {raw!r}（应为秒数，支持毫秒精度）", None, None
+        if value < 0:
+            return [], None, f"{name} 不能为负数: {value}", None, None
+        times.append(value)
+    start_time, end_time = times
+    if start_time is not None and end_time is not None and end_time < start_time:
+        return [], None, (
+            f"end_time({end_time}) 小于 start_time({start_time})：请保证 "
+            f"start_time <= end_time（相等表示仅探测视频元数据）"
+        ), None, None
     if not references:
         return [], quality, (
             "references 不能为空：请传入媒体来源（media:// 引用 / 本地文件路径 / http(s) 直链）"
-        )
-    return references, quality, None
+        ), start_time, end_time
+    return references, quality, None, start_time, end_time
+
+
+def retire_prior_video_parts(messages: Any) -> int:
+    """回收 messages 中已注入的 _internal 媒体消息里的视频部件（就地占位替换）。
+
+    供应商普遍限制单请求视频数量（实测该限制为 1：第二个视频触发
+    "videos in request 2 > 1" 400 错误）。模型分段串读视频时，先前注入的
+    切片若继续滞留在上下文，第二次读取一注入就会崩溃；同时多段切片
+    base64 滞留也是输入 token 膨胀的主因。
+
+    视频部件一次性消费语义：本函数把所有 _internal 媒体消息中的
+    video_url 部件就地替换为文本占位（说明数据已回收 + 回看方式）——
+    工具结果文本（参数与成功说明）照常保留在历史里；模型需要回看时对
+    同一引用与相同区间重新调用 read_media（切片有磁盘缓存，成本极低）。
+
+    在注入新一批媒体部件**之前**调用：旧视频全部回收，随后追加的新
+    消息携带本次视频数据，任何请求中视频部件数恒 ≤1。
+    图片（image_url）与音频部件不受影响（供应商允许多图共存）。
+    返回回收的部件数。
+    """
+    retired = 0
+    if not isinstance(messages, list):
+        return 0
+    placeholder = (
+        "[此前注入的视频片段数据已回收（供应商限制单请求仅 1 个视频）；"
+        "工具结果文本中的参数与读取状态仍可参考，如需回看画面，"
+        "请用 read_media 对同一引用与相同区间重新读取]"
+    )
+    for message in messages:
+        if not isinstance(message, dict) or not message.get("_internal"):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for index, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "video_url":
+                content[index] = {"type": "text", "text": placeholder}
+                retired += 1
+    return retired
+
+
+def cap_video_parts_in_batch(
+    parts: list[dict[str, Any]],
+    reference_hint: str | None = None,
+    read_hint: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """单次注入的并行视频部件配额（最多 1 个）：超出的转为占位文本。
+
+    一次 read_media 调用同时读取多个视频区间时，全量注入会在**本次请求**
+    就触发供应商单请求视频上限——构建注入消息阶段即裁剪：仅保留第一个
+    video_url 部件，后续视频部件替换为带读取参数与回看说明的占位文本。
+    reference_hint / read_hint：占位文案携带的引用与实际读取区间提示
+    （来自对应 loaded 项，便于模型按序补读）。
+    """
+    capped: list[dict[str, Any]] = []
+    video_taken = False
+    for part in parts:
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "video_url"
+        ):
+            if video_taken:
+                range_text = ""
+                if isinstance(read_hint, dict) and read_hint.get("start") is not None:
+                    range_text = (
+                        f"（{read_hint.get('start')}-{read_hint.get('end')}s，"
+                        f"工具结果已含读取元信息）"
+                    )
+                capped.append({
+                    "type": "text",
+                    "text": (
+                        f"[视频片段{range_text}读取成功，但视频数据未随本请求发送"
+                        f"（单请求仅 1 个视频）：请先基于当前内容继续，"
+                        f"随后单独调用 read_media 读取该区间查看]"
+                    ),
+                })
+            else:
+                video_taken = True
+                capped.append(part)
+            continue
+        capped.append(part)
+    return capped
 
 
 def roll_recent_media_parts(
@@ -1421,10 +1594,47 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
     }
 
 
+def _fetch_url_media_bytes(
+    source: str,
+    max_bytes: int | None = None,
+) -> bytes:
+    """下载 http(s) 媒体字节（转换前的临时获取，不落盘入库）。
+
+    上限默认按文件名后缀分流（对齐发送/读取口径，gif 动图走视频档）：
+    - .gif：600MB（MEDIA_SEND_ANIMATED_OR_VIDEO_LIMIT_BYTES，转码前先缩放）；
+    - 其他：30MB（MEDIA_SEND_IMAGE_LIMIT_BYTES，静图本就走缩略图链路）；
+    显式传 max_bytes 时按传入值。超出即拒绝（ValueError），仅 http/https；
+    返回原始字节。失败抛出异常由调用方转为 skipped 说明。
+    """
+    import urllib.request
+
+    if max_bytes is None:
+        max_bytes = _network_media_fetch_limit_bytes(source)
+    req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"网络媒体超过下载上限（{max_bytes // (1024 * 1024)}MB）")
+    return data
+
+
+def _network_media_fetch_limit_bytes(source_or_name: str) -> int:
+    """网络直链转换下载上限：gif 动图按视频档 600MB，其余按静图档 30MB。
+
+    未知扩展名/无扩展名按静图档保守处理（魔数嗅探在后端落盘前仍会进行）。
+    """
+    name = Path(urlsplit(source_or_name).path).name if "://" in source_or_name else source_or_name
+    if Path(name).suffix.lower() == ".gif":
+        return file_memory.MEDIA_SEND_ANIMATED_OR_VIDEO_LIMIT_BYTES
+    return file_memory.MEDIA_SEND_IMAGE_LIMIT_BYTES
+
+
 def load_any_media_model_part(
     session_id: str,
     reference: str,
     quality: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> dict[str, Any] | None:
     """本地/网络/会话统一媒体加载入口（read_media 数据注入使用）。
 
@@ -1433,14 +1643,23 @@ def load_any_media_model_part(
     - 本地路径 → 直接按真实路径读取文件构建部件；文件不存在时返回
       {"error": "未找到，可能已删除", ...}（调用方转为模型可见提示）；
     - http(s) 直链 → 不再下载/入库，直接把 URL 作为多模态部件透传给
-      上游模型（由模型供应商自行拉取；拉取失败再考虑恢复下载链路）。
+      上游模型（由模型供应商自行拉取；拉取失败再考虑恢复下载链路）；
+      但视觉 API 通常拒绝的格式（gif/bmp/ico/tiff 等）供应商同样会拒绝，
+      此时临时下载字节走统一转换内核（静图→PNG / 动图→mp4）后再注入；
+      网络视频不支持区间读取（start_time/end_time 仅对 media:// 与本地
+      路径生效，透传给上游由供应商自行拉取）。
+    start_time / end_time：视频与动图 gif 的区间读取秒数（帧吸附、单次
+    上限 VIDEO_MAX_READ_SECONDS；start==end 仅探测元数据），透传给加载内核。
     成功返回值形态与 load_session_media_model_part 一致，并统一补充来源
     审计信息：source_type（"session" / "network" / "local"）与 source
-    （本次调用的原始 reference）。
+    （本次调用的原始 reference）；转换成功时附带 converted 元信息。
     """
     source = (reference or "").strip()
     if source.startswith(file_memory.MEDIA_URL_SCHEME):
-        info = file_memory.load_session_media_model_part(session_id, source, quality=quality)
+        info = file_memory.load_session_media_model_part(
+            session_id, source, quality=quality,
+            start_time=start_time, end_time=end_time,
+        )
         if info is None:
             return None
         return {**info, "source_type": "session", "source": source}
@@ -1459,6 +1678,50 @@ def load_any_media_model_part(
                 "type": "input_audio",
                 "input_audio": {"data": source, "format": Path(name).suffix.lower().lstrip(".")},
             }
+        # 视觉 API 拒绝的图片格式（gif/bmp/ico/tif/tiff）：URL 直传同样会被
+        # 供应商拒绝——临时下载字节走统一转换内核后按转换结果注入；
+        # 转换失败（下载失败/ffmpeg 缺失/损坏文件）回退 URL 直传原行为
+        suffix = Path(name).suffix.lower()
+        if kind == "image" and (
+            suffix == ".gif" or suffix in file_memory._VISION_UNSAFE_IMAGE_EXTENSIONS
+        ):
+            try:
+                data = _fetch_url_media_bytes(source, max_bytes=_network_media_fetch_limit_bytes(name))
+                sniffed = file_memory._sniff_media_filename(data)
+                probe_name = (sniffed or name) if (suffix == ".gif" or not sniffed) else name
+                tmp_path = file_memory._transcode_cache_dir("network_media") / f"dl_{uuid.uuid4().hex[:8]}_{Path(probe_name).name}"
+                tmp_path.write_bytes(data)
+                try:
+                    converted_result = file_memory._load_converted_media_base64(
+                        file_memory._transcode_cache_dir("network_media"), tmp_path
+                    )
+                finally:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                if converted_result is not None:
+                    conv_mime, conv_b64, conv_meta = converted_result
+                    part = (
+                        {"type": "video_url", "video_url": {"url": file_memory._media_data_url(conv_mime, conv_b64)}}
+                        if conv_meta["converted_kind"] == "video"
+                        else {"type": "image_url", "image_url": {"url": file_memory._media_data_url(conv_mime, conv_b64)}}
+                    )
+                    return {
+                        "part": part,
+                        "kind": conv_meta["converted_kind"],
+                        "mime": conv_mime,
+                        "size": None,
+                        "downsampled": False,
+                        "quality": None,
+                        "stored_name": None,
+                        "filename": name,
+                        "converted": conv_meta,
+                        "source_type": "network",
+                        "source": source,
+                    }
+            except Exception:
+                pass  # 转换链路任何失败都回退 URL 直传
         return {
             "part": part,
             "kind": kind,
@@ -1475,9 +1738,15 @@ def load_any_media_model_part(
     local_path = Path(source)
     if not local_path.is_file():
         return {"error": f"未找到，可能已删除: {source}", "source_type": "local", "source": source}
-    info = file_memory._media_model_part_from_path(local_path, quality)
+    info = file_memory._media_model_part_from_path(
+        local_path, quality, start_time=start_time, end_time=end_time
+    )
     if info is None:
         return {"error": f"读取失败: {source}", "source_type": "local", "source": source}
+    if isinstance(info, dict) and info.get("error"):
+        # 大小门控等加载内核给出的错误说明：补来源审计后透传（调用方转为
+        # 模型可见的拒绝占位，绝不回退注入原始大文件）
+        return {**info, "source_type": "local", "source": source}
     # 沿途保留来源审计信息（本地直读不落盘，加载内核不携带）
     info["source_type"] = "local"
     info["source"] = source
@@ -1538,23 +1807,27 @@ def execute_read_media(
     """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
 
     - references 支持 media:// 引用 / 本地路径 / http(s) 直链，可混用；
+    - start_time / end_time：可选区间读取秒数（视频/动图，帧吸附；
+      start==end 仅探测元数据）；不指定时视频默认读前 VIDEO_MAX_READ_SECONDS 秒；
     - available_references：兼容旧接线的会话引用白名单（传 None 或空集合
       即不做边界过滤——当前策略：工具由用户提供，无安全边界）；传入集合
       时 media:// 引用仍按旧语义过滤，非 media:// 来源不受影响；
     - already_injected：本轮已注入过的引用（重复读取直接跳过）；
     - load_media：媒体加载函数（默认 load_any_media_model_part），便于测试
-      注入桩；签名 (session_id, reference, quality=…) → info|None；
+      注入桩；签名 (session_id, reference, quality=…, start_time=…,
+      end_time=…) → info|None；
     - vision_enabled=False：当前模型不支持视觉时直接拒绝执行（兜底拦截，
       正常情况下工厂层在注入阶段已按 vision 过滤，不会把本工具给到模型）。
 
     返回结构：
     - ok 为 True 时 loaded/injected_references 为成功读取的媒体元信息；
       数据本体（base64 部件）不进入本返回值——工具结果文本会原样落盘 JSONL，
-      且可能被超大结果逻辑截断，媒体数据由调用方按 loaded 项的 reference+quality
-      经 load_any_media_model_part 以 user 多模态部件注入（仅内存）；
-    - 每个拒绝项给出 reason（已注入/超限/下载或读取失败）。
+      且可能被超大结果逻辑截断，媒体数据由调用方按 loaded 项的
+      reference+quality+start_time+end_time 经 load_any_media_model_part
+      以 user 多模态部件注入（仅内存）；视频/动图附带 video 元信息块；
+    - 每个拒绝项给出 reason（已注入/超限/参数错误/下载或读取失败）。
     """
-    references, quality, arg_error = normalize_read_media_args(tool_args)
+    references, quality, arg_error, start_time, end_time = normalize_read_media_args(tool_args)
     if arg_error:
         return {"ok": False, "error": arg_error, "loaded": [], "skipped": [], "injected_references": []}
     # 模型不支持视觉：拒绝执行并说明原因（切回支持视觉的模型后可正常使用）
@@ -1580,7 +1853,9 @@ def execute_read_media(
         ):
             skipped.append({"reference": reference, "reason": "not_in_current_task"})
             continue
-        if reference in injected:
+        # 去重键带区间：同视频引用不同区间是新的读取（分段续读），相同区间才去重
+        injected_key = _media_injected_key(reference, start_time, end_time)
+        if injected_key in injected:
             skipped.append({"reference": reference, "reason": "already_injected"})
             continue
         allowed.append(reference)
@@ -1590,7 +1865,17 @@ def execute_read_media(
         allowed = allowed[:READ_MEDIA_MAX_ITEMS]
     loaded_items: list[dict[str, Any]] = []
     for reference in allowed:
-        info = loader(session_id, reference, quality=quality)
+        # 每个引用的去重键在注入时逐项计算（勿复用 allowed 构建循环的旧变量）
+        injected_key = _media_injected_key(reference, start_time, end_time)
+        try:
+            info = loader(
+                session_id, reference, quality=quality,
+                start_time=start_time, end_time=end_time,
+            )
+        except file_memory.MediaSendTooLargeError as gate_error:
+            # 超过发送/读取上限：明确拒绝（绝不回退注入原始大文件）
+            skipped.append({"reference": reference, "reason": str(gate_error)})
+            continue
         if info is None:
             # media:// 引用解析失败 = 会话媒体库中不存在（引用无效或文件已删除）
             reason = (
@@ -1607,12 +1892,17 @@ def execute_read_media(
             continue
         loaded_items.append({
             "reference": reference,
+            "injected_key": _media_injected_key(reference, start_time, end_time),
             "source_type": info.get("source_type"),
             "kind": info.get("kind"),
             "mime": info.get("mime"),
             "size": info.get("size"),
             "downsampled": info.get("downsampled"),
             "quality": info.get("quality"),
+            "start_time": start_time,
+            "end_time": end_time,
+            "converted": info.get("converted"),
+            "video": info.get("video"),
         })
     loaded = bool(loaded_items)
     return {
@@ -1624,5 +1914,7 @@ def execute_read_media(
         ),
         "loaded": loaded_items,
         "skipped": skipped,
-        "injected_references": [item["reference"] for item in loaded_items],
+        # 去重键口径：未指定区间=引用原文；指定区间=引用#start-end
+        # （同视频不同区间是新的读取，不命中 already_injected）
+        "injected_references": [item["injected_key"] for item in loaded_items],
     }

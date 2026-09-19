@@ -669,44 +669,43 @@ def _pick_web_charset(content_type: str, raw: bytes, encoding: str) -> str:
 
 
 # ============================ 工具实现 ============================
-
-def _list_items_impl(dir_path, pattern, search_mode, max_depth) -> str:
-    root = _resolve_dir_path(dir_path)
-    mode = (search_mode or "all").lower()
-    if mode not in ("file", "dir", "all"):
-        raise ValueError(f"search_mode 仅支持 file/dir/all，当前为 {search_mode}")
-    name_pattern = (pattern or "").strip()
-    entries = []
-    truncated = False
-    for path, kind in _walk_entries(root, max(0, int(max_depth))):
-        if mode == "file" and kind != "file":
-            continue
-        if mode == "dir" and kind != "dir":
-            continue
-        if name_pattern and not fnmatch.fnmatch(path.name, name_pattern):
-            continue
-        if len(entries) >= _LIST_DIR_MAX_ENTRIES:
-            truncated = True
-            break
-        item = {"name": path.name, "type": kind, "path": _display_path(path)}
-        if kind == "file":
-            try:
-                item["size"] = path.stat().st_size
-            except OSError:
-                item["size"] = None
-        entries.append(item)
-    payload = {
-        "dir": _display_path(root),
-        "search_mode": mode,
-        "pattern": name_pattern or None,
-        "total": len(entries),
-        "truncated": truncated,
-        "entries": entries,
-    }
-    text = json.dumps(payload, ensure_ascii=False)
-    if truncated:
-        text += f"\n[列表已达上限 {_LIST_DIR_MAX_ENTRIES} 条被截断；请用 pattern 过滤或缩小目录范围]"
-    return text
+# def _list_items_impl(dir_path, pattern, search_mode, max_depth) -> str:
+#     root = _resolve_dir_path(dir_path)
+#     mode = (search_mode or "all").lower()
+#     if mode not in ("file", "dir", "all"):
+#         raise ValueError(f"search_mode 仅支持 file/dir/all，当前为 {search_mode}")
+#     name_pattern = (pattern or "").strip()
+#     entries = []
+#     truncated = False
+#     for path, kind in _walk_entries(root, max(0, int(max_depth))):
+#         if mode == "file" and kind != "file":
+#             continue
+#         if mode == "dir" and kind != "dir":
+#             continue
+#         if name_pattern and not fnmatch.fnmatch(path.name, name_pattern):
+#             continue
+#         if len(entries) >= _LIST_DIR_MAX_ENTRIES:
+#             truncated = True
+#             break
+#         item = {"name": path.name, "type": kind, "path": _display_path(path)}
+#         if kind == "file":
+#             try:
+#                 item["size"] = path.stat().st_size
+#             except OSError:
+#                 item["size"] = None
+#         entries.append(item)
+#     payload = {
+#         "dir": _display_path(root),
+#         "search_mode": mode,
+#         "pattern": name_pattern or None,
+#         "total": len(entries),
+#         "truncated": truncated,
+#         "entries": entries,
+#     }
+#     text = json.dumps(payload, ensure_ascii=False)
+#     if truncated:
+#         text += f"\n[列表已达上限 {_LIST_DIR_MAX_ENTRIES} 条被截断；请用 pattern 过滤或缩小目录范围]"
+#     return text
 
 
 def _read_file_impl(full_file_name, start_line, end_line, encoding, show_line_numbers, char_offset=0) -> str:
@@ -1672,22 +1671,21 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
     return "\n".join(lines)
 
 
-# ============================ 工具注册 ============================
-
-@sys_mcp_server.tool()
-async def list_items(dir_path: str = ".", pattern: str = "", search_mode: str = "all", max_depth: int = 1) -> str:
-    """列出目录下的文件与子目录，返回 JSON 列表
-    参数：
-        dir_path:    目录路径，默认为当前目录（生成任务中即会话工作目录）；相对/绝对路径均可
-        pattern:     文件名通配符过滤（fnmatch 语法），例如 *.py、data_??.json；空串表示不过滤
-        search_mode: 过滤类型，all=文件+目录（默认）、file=仅文件、dir=仅目录
-        max_depth:   递归深度，0=仅当前目录，1=含一级子目录，以此类推；默认 1
-    返回：
-        JSON 字符串：{"dir", "search_mode", "pattern", "total", "truncated", "entries"}；
-        每个 entry 含 name/type（file|dir）/path（绝对路径，分隔符为 /）/size（仅文件）。
-        超过 1000 条时截断并附提示；隐藏目录与 node_modules/__pycache__/.git 等目录自动跳过
-    """
-    return await asyncio.to_thread(_list_items_impl, dir_path, pattern, search_mode, max_depth)
+# # ============================ 工具注册 ============================
+# @sys_mcp_server.tool()
+# async def list_items(dir_path: str = ".", pattern: str = "", search_mode: str = "all", max_depth: int = 1) -> str:
+#     """列出目录下的文件与子目录，返回 JSON 列表
+#     参数：
+#         dir_path:    目录路径，默认为当前目录（生成任务中即会话工作目录）；相对/绝对路径均可
+#         pattern:     文件名通配符过滤（fnmatch 语法），例如 *.py、data_??.json；空串表示不过滤
+#         search_mode: 过滤类型，all=文件+目录（默认）、file=仅文件、dir=仅目录
+#         max_depth:   递归深度，0=仅当前目录，1=含一级子目录，以此类推；默认 1
+#     返回：
+#         JSON 字符串：{"dir", "search_mode", "pattern", "total", "truncated", "entries"}；
+#         每个 entry 含 name/type（file|dir）/path（绝对路径，分隔符为 /）/size（仅文件）。
+#         超过 1000 条时截断并附提示；隐藏目录与 node_modules/__pycache__/.git 等目录自动跳过
+#     """
+#     return await asyncio.to_thread(_list_items_impl, dir_path, pattern, search_mode, max_depth)
 
 
 # ---------------- 已迁移为后端内置工具（factory/agent_runtime/builtin_tools.py） ----------------
