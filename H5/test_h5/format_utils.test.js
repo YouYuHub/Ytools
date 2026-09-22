@@ -48,9 +48,9 @@ test("usageText: 生成本轮 token 文案", function () {
 test("compactionUsageText: 压缩 usage 文案", function () {
   assert.equal(
     formatUtils.compactionUsageText({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, compressed_rounds: 2 }),
-    "压缩消耗 15 tokens（输入 10 · 输出 5） · 已压缩 2 个旧轮次");
+    "压缩消耗 15 tokens（压缩模型输入 10 · 输出 5） · 已压缩 2 个旧轮次");
   assert.equal(
     formatUtils.compactionUsageText({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, before_tokens: 500, after_tokens: 300 }),
-    "压缩消耗 15 tokens（输入 10 · 输出 5） · 上下文 500 → 300 tokens");
+    "压缩消耗 15 tokens（压缩模型输入 10 · 输出 5） · 上下文 500 → 300 tokens");
   assert.equal(formatUtils.compactionUsageText(null), "");
 });

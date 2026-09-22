@@ -218,6 +218,10 @@ window.App = window.App || {};
   const toolResultMaxLength = $("#toolResultMaxLength");
   const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
   const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
+  const compactionRetryMaxAttempts = $("#compactionRetryMaxAttempts");
+  const subAgentFinalReplyRetryMax = $("#subAgentFinalReplyRetryMax");
+  const subAgentStreamErrorRetryMax = $("#subAgentStreamErrorRetryMax");
+  const subAgentTodoRemindMax = $("#subAgentTodoRemindMax");
   const videoReadMaxSeconds = $("#videoReadMaxSeconds");
   const mcpToolWorkers = $("#mcpToolWorkers");
   const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
@@ -261,6 +265,10 @@ window.App = window.App || {};
     tool_result_max_length: -1,
     call_timeout_seconds: 300,
     network_retry_max_attempts: 3,
+    compaction_retry_max_attempts: 2,
+    sub_agent_final_reply_retry_max: 3,
+    sub_agent_stream_error_retry_max: 3,
+    sub_agent_todo_remind_max: 3,
     video_read_max_seconds: 60,
     mcp_tool_workers: 3,
     sub_agent_max_concurrent: 3,
@@ -566,7 +574,8 @@ window.App = window.App || {};
   chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
-  toolCallTimeoutSeconds, networkRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
+  toolCallTimeoutSeconds, networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
+  subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
   subAgentMaxConcurrent, keepRounds,
   triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,

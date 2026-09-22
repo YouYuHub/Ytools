@@ -192,6 +192,7 @@
       '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
       "</div>" +
       '<div class="md-svg-actions">' +
+      '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">⛶ 全屏</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
       "</div>" +
@@ -226,6 +227,7 @@
       "</div>" +
       '<div class="md-svg-actions">' +
       '<button type="button" class="md-svg-btn" data-svg-action="rerender" title="重新渲染此图">↻ 重渲染</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">⛶ 全屏</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
       "</div>" +

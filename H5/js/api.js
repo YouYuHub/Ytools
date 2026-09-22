@@ -450,6 +450,45 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   /**
+   * 获取上下文压缩失败重试次数配置
+   */
+  function getCompactionRetryConfig() {
+    return request("/chat_config/compaction_retry");
+  }
+
+  /**
+   * 更新上下文压缩失败重试次数
+   * @param {{max_attempts: number}} config 一次尝试=一条完整降级链；0 或负数=不限制，正数=N 条链耗尽后终止任务
+   */
+  function updateCompactionRetryConfig(config) {
+    return request("/chat_config/compaction_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取子智能体交付保障重试配置（空收尾重试/断流续跑/todo 未完成提醒）
+   */
+  function getSubAgentRetryConfig() {
+    return request("/chat_config/sub_agent_retry");
+  }
+
+  /**
+   * 更新子智能体交付保障重试配置
+   * @param {{final_reply_max_attempts: number, stream_error_max_attempts: number, todo_remind_max: number}} config
+   *   final_reply/stream_error：0 或负数=不限制；todo_remind：0=关闭，负数=不限制（每次工具执行轮后额度重置）
+   */
+  function updateSubAgentRetryConfig(config) {
+    return request("/chat_config/sub_agent_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
    * 获取视频区间读取最大秒数配置（read_media 工具）
    */
   function getVideoReadLimitConfig() {
@@ -900,6 +939,10 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateToolConcurrencyConfig,
     getNetworkRetryConfig,
     updateNetworkRetryConfig,
+    getCompactionRetryConfig,
+    updateCompactionRetryConfig,
+    getSubAgentRetryConfig,
+    updateSubAgentRetryConfig,
     getVideoReadLimitConfig,
     updateVideoReadLimitConfig,
     getWorkDirConfig,

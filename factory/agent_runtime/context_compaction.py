@@ -15,6 +15,7 @@ from typing import Any
 from chat.chat_llm import ChatLLM
 from config import (
     ChatLLMRequest,
+    DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS,
     DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_HISTORY_TRIGGER_RATIO,
     DEFAULT_SUMMARY_BUDGET_RATIO,
@@ -33,7 +34,9 @@ from env_manager import (
     require_default_chat_config,
 )
 from memory.chat_history_format import (
+    SUMMARY_SECTION_FIELDS,
     format_tool_call_history_line,
+    normalize_context_summary,
     parse_summary_sections,
     render_context_summary,
     round_entry_to_compaction_text,
@@ -58,6 +61,8 @@ _SUMMARY_SEGMENT_MAX_TOKENS = 8192
 _OVERSIZED_PREVIEW_TOKEN_BUDGET = 2048
 _OVERSIZED_FEEDBACK_EXCERPT_TOKEN_BUDGET = 600
 _COMPACTION_EVENT_EXCERPT_TOKEN_BUDGET = 800
+# 压缩调用链路重试固定间隔（秒）：不做成配置，避免配置项膨胀
+_COMPACTION_RETRY_INTERVAL_SECONDS = 1.0
 _ROUND_SUMMARY_MARKER = "_context_compaction_scope"
 _ROUND_SUMMARY_INDEX_MARKER = "_context_compaction_index"
 _ROUND_SUMMARY_SCOPE = "active_round"
@@ -72,6 +77,22 @@ def get_context_compaction_defaults() -> dict[str, int | float]:
         "oversized_reject_factor": DEFAULT_OVERSIZED_REJECT_FACTOR,
         "max_oversized_rejections": DEFAULT_MAX_OVERSIZED_REJECTIONS,
     }
+
+
+def resolve_compaction_retry_max_attempts() -> int:
+    """压缩调用链路重试次数（聊天设置可配，持久化在 .env）。
+
+    一次"尝试"=一条完整降级链（压缩模型 -> 失败时聊天模型重试）。
+    返回值语义：正数 N = 完整降级链最多执行 N 次，耗尽后抛 ContextCompactionError
+    终止任务；0 或负数 = 不限制（一直重试直到手动停止）。默认值与既有行为一致
+    （此前跨轮压缩的外层 attempt (1, 2) 即 2 次尝试）。
+    """
+    try:
+        return int(load_var(
+            "COMPACTION_RETRY_MAX_ATTEMPTS", DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS
+        ))
+    except (TypeError, ValueError):
+        return DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS
 
 
 class ContextCompactionError(RuntimeError):
@@ -498,8 +519,10 @@ async def summarize_context_text(
 ) -> SummaryBuildResult:
     """用配置的压缩模型将内容变成普通文本摘要。
 
-    调用链：压缩模型 ->（失败或返回空时）当前聊天模型重试一次 ->
-    （仍失败）抛 ContextCompactionError 终止任务，不再做节选降级。
+    重试策略（聊天设置可配 COMPACTION_RETRY_MAX_ATTEMPTS，固定间隔 1 秒）：
+    每次"尝试"=一条完整降级链——压缩模型 ->（失败或返回空时）当前聊天模型重试一次。
+    与压缩模型配置不同源时的整条降级链按配置次数重复；重试耗尽（或同源链路失败）
+    抛 ContextCompactionError 终止任务，不再做节选降级。0 或负数=不限制（一直重试）。
     `output_token_budget` 用于把单段摘要约束在摘要预算之内（单轮场景）。
 
     `delta_emitter` 为可选异步回调：提供时压缩请求走**流式接口**，模型每产生
@@ -627,45 +650,76 @@ async def summarize_context_text(
             return await _invoke_non_stream(request, config)
         return await _invoke_stream(request, config)
 
-    try:
-        text, usage = await _invoke(summary_request, model_config)
-    except asyncio.CancelledError:
-        raise
-    except ContextCompactionError:
-        raise
-    except Exception as first_error:
-        # 压缩模型失败：换当前聊天模型重试一次；同一模型则不重复尝试
+    retry_max_attempts = resolve_compaction_retry_max_attempts()
+    # 展示/日志口径：0 或负数表示不限制
+    retry_limit_label = str(retry_max_attempts) if retry_max_attempts > 0 else "∞"
+    attempt_index = 0
+    while True:
+        attempt_index += 1
         try:
-            chat_config = require_default_chat_config()
-        except ChatModelConfigurationError as exc:
-            raise ContextCompactionError(
-                f"压缩失败且聊天模型不可用：{exc}（首次错误：{first_error}）"
-            ) from first_error
-        same_model = (
-            str(chat_config.get("selected_provider_name") or "") == str(model_config.get("selected_provider_name") or "")
-            and str(chat_config.get("selected_model_id") or "") == str(model_config.get("selected_model_id") or "")
-        )
-        if same_model:
-            raise ContextCompactionError(f"压缩模型调用失败：{first_error}") from first_error
-        print(f"[WARN] 压缩模型失败（{first_error}），改用当前聊天模型重试压缩")
-        retry_limit = _summary_output_token_limit(
-            tool_request, chat_config, output_token_budget=output_token_budget
-        )
-        retry_max_input = resolve_config_max_input_tokens(chat_config)
-        retry_source_budget = max(
-            256,
-            retry_max_input - estimate_text_tokens(prompt) - retry_limit - 256,
-        )
-        retry_source = _truncate_text_to_token_budget(source_text, retry_source_budget)
-        retry_request = _build_summary_request(prompt, retry_source, retry_limit, tool_request.session_id)
-        try:
-            text, usage = await _invoke(retry_request, chat_config)
+            text, usage = await _invoke(summary_request, model_config)
+            break
         except asyncio.CancelledError:
             raise
-        except Exception as retry_error:
-            raise ContextCompactionError(
-                f"聊天模型重试压缩仍失败，任务终止：{retry_error}（首次错误：{first_error}）"
-            ) from retry_error
+        except ContextCompactionError:
+            raise
+        except Exception as first_error:
+            # 压缩模型失败：换当前聊天模型重试一次；同一模型则不重复尝试
+            try:
+                chat_config = require_default_chat_config()
+            except ChatModelConfigurationError as exc:
+                raise ContextCompactionError(
+                    f"压缩失败且聊天模型不可用：{exc}（首次错误：{first_error}）"
+                ) from first_error
+            same_model = (
+                str(chat_config.get("selected_provider_name") or "") == str(model_config.get("selected_provider_name") or "")
+                and str(chat_config.get("selected_model_id") or "") == str(model_config.get("selected_model_id") or "")
+            )
+            if same_model:
+                # 无第二级降级目标：本条链只有压缩模型一次调用。网络偶发
+                # 空/断流在重试后大概率恢复，因此与完整链同样按配置整链
+                # 重试（链间隔固定 1 秒），耗尽后才终止任务。
+                if 0 < retry_max_attempts <= attempt_index:
+                    raise ContextCompactionError(
+                        f"上下文压缩失败（已尝试 {attempt_index} 次仍失败），"
+                        f"任务终止：{first_error}"
+                    ) from first_error
+                print(
+                    f"[WARN] 压缩模型第 {attempt_index} 次调用失败"
+                    f"（{first_error}），{_COMPACTION_RETRY_INTERVAL_SECONDS:g} 秒后"
+                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）"
+                )
+                await asyncio.sleep(_COMPACTION_RETRY_INTERVAL_SECONDS)
+                continue
+            retry_limit = _summary_output_token_limit(
+                tool_request, chat_config, output_token_budget=output_token_budget
+            )
+            retry_max_input = resolve_config_max_input_tokens(chat_config)
+            retry_source_budget = max(
+                256,
+                retry_max_input - estimate_text_tokens(prompt) - retry_limit - 256,
+            )
+            retry_source = _truncate_text_to_token_budget(source_text, retry_source_budget)
+            retry_request = _build_summary_request(prompt, retry_source, retry_limit, tool_request.session_id)
+            try:
+                text, usage = await _invoke(retry_request, chat_config)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as retry_error:
+                # 本条完整降级链（压缩模型 + 聊天模型重试）均失败：
+                # 达到配置上限前按固定间隔整链重试，耗尽后终止任务。
+                if 0 < retry_max_attempts <= attempt_index:
+                    raise ContextCompactionError(
+                        f"上下文压缩失败（已尝试 {attempt_index} 条完整降级链仍失败），"
+                        f"任务终止：{retry_error}（首次错误：{first_error}）"
+                    ) from retry_error
+                print(
+                    f"[WARN] 压缩降级链第 {attempt_index} 次尝试失败"
+                    f"（{retry_error}），{_COMPACTION_RETRY_INTERVAL_SECONDS:g} 秒后"
+                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）"
+                )
+                await asyncio.sleep(_COMPACTION_RETRY_INTERVAL_SECONDS)
 
     return SummaryBuildResult(
         text=text,
@@ -768,6 +822,53 @@ def _select_compaction_count(
     return max(1, selected) if round_entries else 0
 
 
+def _concat_summary_text(
+    previous_summary: Any,
+    new_summary_text: str,
+) -> str | None:
+    """把新批摘要按分段标题拼入旧累计摘要，返回合并后的纯文本（不调用模型）。
+
+    累计摘要与压缩模型输出都遵循同一套【标题+短条目】结构
+    （parse_summary_sections / render_summary_block 互逆），因此新批内容可以
+    直接本地拼接：自由文本段以空行连接、各结构化段落条目顺序追加（完全相同
+    的条目去重以延缓摘要增长）。拼接结果语义等价于"继承旧摘要并吸收新增"，
+    但省掉一次压缩模型调用；仅当拼接后超出摘要总预算时才回退为一次模型合并
+    （把整块重新收敛压缩）。
+
+    返回 None 表示无法走拼接路径（旧摘要为多块遗留结构、两者均无内容或合并
+    结果为空），由调用方回退为模型合并。
+    """
+    old_normalized = normalize_context_summary(previous_summary)
+    if not old_normalized:
+        return None
+    old_blocks = old_normalized.get("blocks") or []
+    # 多块是旧版遗留结构，交给模型合并收敛为单块（_collapse 同语义）
+    if len(old_blocks) > 1:
+        return None
+    old_block = old_blocks[0] if old_blocks else {}
+    new_sections = parse_summary_sections(new_summary_text)
+    lines: list[str] = []
+    old_free = _to_text(old_block.get("summary"))
+    new_free = _to_text(new_sections.get("summary"))
+    lines.extend(part for part in (old_free, new_free) if part)
+    for field, header in SUMMARY_SECTION_FIELDS:
+        items: list[str] = []
+        for item in (
+            [str(raw).strip() for raw in (old_block.get(field) or []) if str(raw).strip()]
+            + [str(raw).strip() for raw in (new_sections.get(field) or []) if str(raw).strip()]
+        ):
+            # 顺序保持 + 完全重复条目去重
+            if item not in items:
+                items.append(item)
+        if items:
+            lines.append(header)
+            lines.extend(f"- {item}" for item in items)
+    merged_text = "\n".join(lines).strip()
+    if not merged_text:
+        return None
+    return merged_text
+
+
 async def _build_cumulative_summary(
     previous_summary: Any,
     new_summary: SummaryBuildResult,
@@ -775,10 +876,15 @@ async def _build_cumulative_summary(
     settings: ContextCompactionSettings,
     delta_emitter: Any = None,
 ) -> tuple[str, dict[str, Any]]:
-    """把新摘要并入一个有界累计摘要，避免旧摘要块只取最近几块。
+    """把新摘要并入一个有界累计摘要。
 
-    `delta_emitter` 透传合并调用的流式增量：合并大历史时这也是一次完整的
-    模型调用，不透传会让前端在第一批摘要结束后经历数分钟静默，看起来像卡死。
+    拼接优先：新旧摘要同为标准分段结构时直接本地合并，不消耗模型调用；
+    仅当拼接结果超过摘要总预算（或无法拼接，如旧版多块结构）时才调用一次
+    压缩模型做"继承式"收敛合并，避免旧摘要块只取最近几块。
+
+    `delta_emitter` 透传合并调用的流式增量（仅模型合并路径需要）：合并大历史
+    时这也是一次完整的模型调用，不透传会让前端在第一批摘要结束后经历数分钟
+    静默，看起来像卡死；拼接路径无模型调用、无增量。
     """
     previous_text = render_context_summary(previous_summary) or ""
     usage: dict[str, Any] = {}
@@ -786,6 +892,15 @@ async def _build_cumulative_summary(
         _merge_usage_dict(usage, new_summary.usage)
     if not previous_text:
         return new_summary.text, usage
+
+    try:
+        merged_text = _concat_summary_text(previous_summary, new_summary.text)
+    except Exception as exc:
+        print(f"[WARN] 摘要拼接合并失败，回退为模型合并：{exc}")
+        merged_text = None
+    summary_budget = resolve_summary_total_budget(settings)
+    if merged_text is not None and estimate_text_tokens(merged_text) <= summary_budget:
+        return merged_text, usage
 
     merge_result = await summarize_context_text(
         (
@@ -856,6 +971,9 @@ async def compact_session_history_if_needed(
     budget_tokens: int | None = None,
     enforce: bool = False,
     force_all: bool = False,
+    trigger_reason: str = "auto",
+    trigger_context_tokens: int | None = None,
+    trigger_threshold: int | None = None,
 ) -> int:
     """按统一的跨轮流程压缩已完成的旧会话轮次。
 
@@ -873,6 +991,18 @@ async def compact_session_history_if_needed(
     的历史轮次都纳入累计摘要，即使它们当前尚未超过预算。模型上下文按
     HISTORY_COMPACT_KEEP_ROUNDS 总轮次窗口回传：未压缩轮次完整对话占窗口，
     已压缩轮次问题按剩余窗口保真（见 memory.chat_history_format.split_context_window）。
+
+    `trigger_reason` 记录本次压缩的触发来源（随 done 事件下发，供前端展示"为何
+    此时压缩"）：`auto`=任务开始时自动（历史超阈值/轮数超保护）、`task`=任务内
+    上下文检查点（当前轮轨迹推高全量超阈值，强制压缩历史）、`first_call`=首次
+    调用超窗降级、`post`=任务收尾、`manual`=用户手动触发。
+
+    `trigger_context_tokens` 为触发路径的真实规模（task/first_call 传全量上下文
+    估算；auto/manual 留空由 done 事件的 before_tokens 呈现历史规模）。
+
+    `trigger_threshold` 为触发判断的真实阈值（task 传单轮压缩阈值 = min(聊天,压缩)
+    窗口 × trigger_ratio；first_call 传模型窗口；auto/manual 留空，此时阈值即
+    token_limit）。前端据此显示"全量上下文 X > 触发阈值 Y"，与"本批预算"区分。
     """
     settings = settings or load_context_compaction_settings()
     if budget_tokens is not None and budget_tokens > 0:
@@ -962,7 +1092,11 @@ async def compact_session_history_if_needed(
             context_messages.extend(
                 round_entry_to_context_messages(round_entry, history_tool_result_max_length)
             )
-        within_budget = estimate_messages_tokens(context_messages) <= budget_limit
+        # 本批压缩前的历史全量估算（= 触发判断的左值）：随 done 事件下发，
+        # 前端压缩块显示"上下文 X → Y"，与单轮压缩口径一致——此前只显示
+        # 压缩模型调用的输入量（prompt_tokens），易被误读为"触发点偏低"
+        batch_before_tokens = estimate_messages_tokens(context_messages)
+        within_budget = batch_before_tokens <= budget_limit
         if not force_all and within_budget:
             break
         tail_rounds: list[dict[str, Any]] = []
@@ -1021,32 +1155,23 @@ async def compact_session_history_if_needed(
                 })
             except Exception as exc:
                 print(f"[WARN] 跨轮压缩开始事件推送失败：{exc}")
-        # 压缩调用带一次自动重试：上游偶发超时/断流时直接重试而不是立即失败；
-        # 重试仍失败才视为本批失败——失败不落盘任何摘要（update_context_summary
-        # 只在成功路径执行），并补发 aborted 闭合 start 事件。
-        summary_result = None
-        last_error: Exception | None = None
-        for attempt in (1, 2):
-            try:
-                summary_result = await summarize_context_text(
-                    chunk_source,
-                    tool_request,
-                    scope="跨轮会话历史",
-                    settings=settings,
-                    output_token_budget=resolve_summary_total_budget(settings),
-                    delta_emitter=session_delta_emitter,
-                )
-                break
-            except asyncio.CancelledError:
-                # 任务中断（客户端断开等）：不补 aborted，交由既有孤儿 start
-                # 标记机制在下一次请求开始时统一收尾。
-                raise
-            except Exception as exc:
-                last_error = exc
-                if attempt == 1:
-                    print(f"[WARN] 跨轮压缩第 1 次尝试失败（{exc}），自动重试")
-                    continue
-        if summary_result is None:
+        # 压缩调用链路自带可配置重试（summarize_context_text 内部整链循环）；
+        # 耗尽抛 ContextCompactionError——失败不落盘任何摘要（update_context_summary
+        # 只在成功路径执行），在此补发 aborted 闭合 start 事件。
+        try:
+            summary_result = await summarize_context_text(
+                chunk_source,
+                tool_request,
+                scope="跨轮会话历史",
+                settings=settings,
+                output_token_budget=resolve_summary_total_budget(settings),
+                delta_emitter=session_delta_emitter,
+            )
+        except asyncio.CancelledError:
+            # 任务中断（客户端断开等）：不补 aborted，交由既有孤儿 start
+            # 标记机制在下一次请求开始时统一收尾。
+            raise
+        except Exception as last_error:
             # 压缩失败：补发 aborted 使 start 有闭合事件（前端据此把压缩块
             # 标记为失败态），否则 JSONL 会遗留"永远转圈"的孤儿 start 行。
             if event_emitter is not None:
@@ -1072,7 +1197,7 @@ async def compact_session_history_if_needed(
                     f"{last_error}（此前已成功压缩 {compacted_rounds} 轮并写入累计摘要，"
                     "重试将从剩余轮次继续）",
                 )
-            raise last_error
+            raise
         previous_count = _summary_source_round_count(summary_state)
         try:
             cumulative_text, cumulative_usage = await _build_cumulative_summary(
@@ -1121,6 +1246,17 @@ async def compact_session_history_if_needed(
                     await update_history_usage(cumulative_usage)
                 except Exception as exc:
                     print(f"[WARN] 跨轮压缩 usage 落盘失败：{exc}")
+        # 本批压缩后的历史估算（新累计摘要 + 剩余未压缩轮次）：done 事件携带
+        # 前后对比（口径 = 触发判断的历史部分，不含系统提示/当前轮/工具定义）
+        after_summary_message = render_context_summary(summary_state)
+        after_context_messages: list[dict[str, Any]] = []
+        if after_summary_message:
+            after_context_messages.append({"role": "system", "content": after_summary_message})
+        for round_entry in raw_rounds[summarize_count:]:
+            after_context_messages.extend(
+                round_entry_to_context_messages(round_entry, history_tool_result_max_length)
+            )
+        batch_after_tokens = estimate_messages_tokens(after_context_messages)
         if event_emitter is not None:
             try:
                 chunk_usage: dict[str, Any] = {}
@@ -1139,6 +1275,24 @@ async def compact_session_history_if_needed(
                     # 累计摘要全文随 done 事件推送并落盘，刷新后仍可完整回放
                     "summary_text": cumulative_text,
                     "summary_usage": chunk_usage,
+                    # 触发时的历史规模与压缩后的历史规模（前端显示"上下文 X → Y"；
+                    # 与单轮压缩同口径，供用户核对触发点是否符合配置阈值）
+                    "before_tokens": batch_before_tokens,
+                    "after_tokens": batch_after_tokens,
+                    # 本批实际使用的预算（自动路径 = 阈值；首调用降级/强制压缩
+                    # 路径为按可用空间计算的 budget_tokens）：前端显示"触发阈值"
+                    "token_limit": budget_limit,
+                    # 触发来源：auto=任务开始自动 / task=任务内检查点 /
+                    # first_call=首调用超窗降级 / post=任务收尾 / manual=手动
+                    "trigger_reason": trigger_reason,
+                    # 触发路径的真实规模（task/first_call 为全量上下文估算，
+                    # 供前端展示"全量上下文 X > 阈值 Z"的触发依据）
+                    **({"trigger_context_tokens": int(trigger_context_tokens)}
+                       if trigger_context_tokens is not None else {}),
+                    # 触发判断的真实阈值（task/first_call 与"本批预算"token_limit
+                    # 不同：前者是触发比较基准，后者是压缩批的输入预算）
+                    **({"trigger_threshold": int(trigger_threshold)}
+                       if trigger_threshold is not None else {}),
                 })
             except Exception as exc:
                 print(f"[WARN] 跨轮压缩完成事件推送失败：{exc}")
@@ -1334,11 +1488,39 @@ async def compact_active_round_context_if_needed(
     retained_prefix, previous_blocks = _split_previous_round_summaries(
         original_messages[:round_start]
     )
-    # 旧格式可能包含多个本轮摘要块；先合并为一个输入，之后统一保存为累计块。
-    previous_summary_text = "\n\n".join(
-        _to_text(block.get("content")) for block in previous_blocks if _to_text(block.get("content"))
-    )
-    previous_summary = {"summary": previous_summary_text} if previous_summary_text else None
+    # 旧格式可能包含多个本轮摘要块；先合并为一个结构化累计摘要状态再交由
+    # 统一合并逻辑处理（拼接优先 / 超预算才模型合并）。自由文本与各分段条目
+    # 分别归并，避免同一内容既进正文又进结构化字段导致渲染重复。
+    previous_sections_list = [
+        parse_summary_sections(_to_text(block.get("content")))
+        for block in previous_blocks
+        if _to_text(block.get("content"))
+    ]
+    previous_summary = None
+    if previous_sections_list:
+        free_parts = [
+            _to_text(sections.get("summary"))
+            for sections in previous_sections_list
+            if _to_text(sections.get("summary"))
+        ]
+        merged_sections: dict[str, Any] = {
+            "summary": "\n\n".join(free_parts).strip(),
+        }
+        for field, _header in SUMMARY_SECTION_FIELDS:
+            items: list[str] = []
+            for sections in previous_sections_list:
+                for raw in sections.get(field) or []:
+                    item = str(raw).strip()
+                    if item and item not in items:
+                        items.append(item)
+            merged_sections[field] = items
+        previous_summary = (
+            merged_sections
+            if merged_sections["summary"] or any(
+                merged_sections.get(field) for field, _ in SUMMARY_SECTION_FIELDS
+            )
+            else None
+        )
     blocks: list[dict[str, Any]] = []
     summary_budget = resolve_summary_total_budget(settings)
     merged_usage: dict[str, Any] = {}
@@ -1455,6 +1637,9 @@ async def compact_active_round_context_if_needed(
                 "role": "assistant",
                 "before_tokens": before_tokens,
                 "after_tokens": after_tokens,
+                # 触发阈值（min(聊天,压缩)窗口 × trigger_ratio）：前端显示"触发阈值 X"，
+                # 供用户核对触发点是否符合配置（before_tokens > token_limit 才触发）
+                "token_limit": token_limit,
                 "compress_index": resolved_compression_index,
                 "block_count": 1,
                 "summary_text": cumulative_text,

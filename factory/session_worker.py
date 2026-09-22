@@ -95,6 +95,8 @@ class _WorkerStreamAdapter:
         self.session_id = session_id
         self._evt_queue = evt_queue
         self._question_text = ""
+        self._question_parts = None
+        self._live_round_no = None
         self.user_stop_requested = False
         self.done = False
         self._finish_sent = False
@@ -119,6 +121,37 @@ class _WorkerStreamAdapter:
         self._question_text = value
         self._evt_queue.put({"type": "question_text", "text": value})
 
+    # 提问原始部件（多模态时含 media:// 引用）：生成循环经 question_parts 属性
+    # 保存副本后，经 evt 队列同步到主进程 stream.question_parts（回放补气泡用）
+    @property
+    def question_parts(self):
+        return self._question_parts
+
+    @question_parts.setter
+    def question_parts(self, value) -> None:
+        self._question_parts = value if isinstance(value, list) or value is None else None
+        self._evt_queue.put({
+            "type": "question_parts",
+            "parts": self._question_parts,
+        })
+
+    # 本轮最终轮次号：round_started 推送时由生成循环写入，经 evt 队列同步到
+    # 主进程 stream.live_round_no（附接回放 marker 携带 round 字段用）
+    @property
+    def live_round_no(self):
+        return self._live_round_no
+
+    @live_round_no.setter
+    def live_round_no(self, value) -> None:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is not None and normalized < 1:
+            normalized = None
+        self._live_round_no = normalized
+        self._evt_queue.put({"type": "live_round_no", "round": normalized})
+
     def emit(self, chunk: str) -> None:
         if isinstance(chunk, str) and chunk:
             self._evt_queue.put({"type": "sse", "chunk": chunk})
@@ -138,6 +171,29 @@ class _WorkerStreamAdapter:
         if not self._finish_sent:
             self._finish_sent = True
             self._evt_queue.put({"type": "task_done"})
+
+
+def _emit_uncaught_generate_error(task: "asyncio.Task", adapter: "_WorkerStreamAdapter") -> None:
+    """生成任务逃逸异常的统一上报：error SSE 帧 + task_done 收尾。
+
+    生成任务是 fire-and-forget：内部逃逸异常（含 chat_factory 兜底 except
+    块内二次抛出等场景）若无上报，任务会静默终止、用户侧看不到任何提示，
+    SSE 消费端也要等 worker 空闲退出才能收到结束信号。正常路径（兜底已捕获
+    异常后正常返回 / 用户停止取消）不会进入本分支。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None or isinstance(exc, asyncio.CancelledError):
+        return
+    adapter.emit_event({"error": f"生成任务异常终止（未捕获异常）：{exc}"})
+    if not adapter.done:
+        try:
+            asyncio.ensure_future(adapter.finish())
+        except RuntimeError:
+            # 事件循环已关闭（worker 退出中）：无法再调度收尾任务，evt 写线程
+            # 随进程退出，主进程 reader 会走崩溃合成路径兜底
+            pass
 
 
 async def _worker_generate(session_id: str, request_data: dict, adapter: _WorkerStreamAdapter) -> None:
@@ -259,6 +315,14 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                     current_task = asyncio.create_task(
                         _worker_generate(session_id, raw.get("request") or {}, adapter)
                     )
+
+                    def _on_generate_done(
+                        task: asyncio.Task,
+                        _adapter: _WorkerStreamAdapter = adapter,
+                    ) -> None:
+                        _emit_uncaught_generate_error(task, _adapter)
+
+                    current_task.add_done_callback(_on_generate_done)
                 elif ctype == "inject":
                     # 运行中注入用户消息（消息引导）：投递到当前适配器队列，
                     # 生成循环在下一轮检查点取出并作为新一轮继续
@@ -419,14 +483,46 @@ class SessionWorkerProxy:
             conn.close()
         except Exception:
             pass
-        # worker 进程退出/崩溃：感知并合成收尾事件，避免 SSE 消费端悬挂
+        # worker 进程退出/崩溃：感知并合成收尾事件，避免 SSE 消费端悬挂。
+        # 之前只合成 task_done——用户侧"任务终止且什么提示没有"；现在补一条
+        # 同构 error SSE 帧并把错误说明落盘 JSONL（与聊天循环错误路径一致）。
         with self._state_lock:
             was_running = self._generation_running
             self._alive = False
             self._generation_running = False
         if was_running:
+            crash_message = "生成任务因 worker 进程退出/崩溃而终止（可能是工具执行导致 worker 异常）"
+            self._dispatch({
+                "type": "sse",
+                "chunk": 'data: ' + json.dumps({'error': crash_message}, ensure_ascii=False) + '\n\n',
+            })
+            self._dispatch_crash_record(crash_message)
             self._dispatch({"type": "task_done", "reason": "worker_exit_or_crash"})
         self._dispatch({"type": "worker_exit"})
+
+    def _dispatch_crash_record(self, message: str) -> None:
+        """worker 崩溃时把错误说明落盘会话 JSONL（与聊天循环错误路径同结构）。
+
+        reader 线程不能直接写盘（JSONL 写入靠事件循环侧的管理器缓存与
+        跨进程文件锁），这里回主事件循环执行；失败只打日志不影响收尾。
+        """
+        loop = self.loop
+        session_id = self.session_id
+        if loop is None or loop.is_closed():
+            return
+
+        async def _record() -> None:
+            try:
+                from memory.chat_memory import get_chat_memory_manager
+                manager = await get_chat_memory_manager(session_id)
+                await manager.add_chat_history({"role": "assistant", "error": message})
+            except Exception as exc:
+                print(f"[WARN] 会话 [{session_id}] worker 崩溃错误说明落盘失败: {exc}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_record(), loop)
+        except RuntimeError as exc:
+            print(f"[WARN] 会话 [{session_id}] worker 崩溃错误说明调度失败: {exc}")
 
     def _dispatch(self, evt: dict) -> None:
         if not isinstance(evt, dict):
@@ -610,6 +706,19 @@ def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], No
             stream.set_round_start()
         elif evt_type == "question_text":
             stream.question_text = str(evt.get("text") or "")
+        elif evt_type == "question_parts":
+            # 提问原始部件（media:// 引用形态）：直接赋值不回发事件队列
+            #（_SessionStream 为普通属性，无 setter 副作用）
+            try:
+                stream.question_parts = evt.get("parts")
+            except Exception:
+                pass
+        elif evt_type == "live_round_no":
+            # 本轮最终轮次号：附接回放 marker 携带 round 字段用
+            try:
+                stream.live_round_no = evt.get("round")
+            except Exception:
+                pass
         elif evt_type == "task_done":
             if not stream.done and loop is not None:
                 try:

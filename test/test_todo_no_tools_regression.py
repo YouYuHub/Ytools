@@ -24,6 +24,9 @@ class _FakeStream:
         self.seq = 0
         self.done = False
         self.question_text = ""
+        # 与 _SessionStream 鸭子类型对齐：回放补气泡/轮次标记相关属性
+        self.question_parts = None
+        self.live_round_no = None
         self.round_start_seq = 0
 
     def emit(self, chunk):

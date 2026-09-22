@@ -90,10 +90,18 @@ async def main():
     attached = await collect_stream(cf.tool_chat_server(attach_req))
     replays = [c for c in attached if '"replay"' in c]
     assert replays, "附接应收到回放标记"
+    # 回放标记必须携带本轮最终轮次号（round_started 帧在回放起点之前，
+    # 附接消费端收不到，前端按 round 精确去重历史提问气泡依赖此字段）
+    marker = json.loads(replays[0].split("data:", 1)[1].strip())
+    assert marker.get("replay") is True
+    assert marker.get("round") == 3, f"回放标记轮次号应为 3（实际 {marker.get('round')}）"
+    # 纯文本提问归一为单个 text 部件（前端多部件气泡重建/编辑入口数据源）
+    assert marker.get("question_parts") == [{"type": "text", "text": "再来一轮"}], \
+        f"回放标记应携带提问原始部件（实际 {marker.get('question_parts')}）"
     joined_text = "".join(attached)
     assert "块" in joined_text, "应有回放/后续内容块"
     assert any("[DONE]" in c for c in attached), "附接流应收到 [DONE]"
-    print("场景3 附接回放:", "OK")
+    print("场景3 附接回放:", "OK", "| marker.round =", marker.get("round"))
     await cleanup_chat_memory_manager(sid)
 
     # 场景4: 运行中带新用户消息 → 平滑打断旧任务并开始新一轮生成

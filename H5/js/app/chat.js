@@ -80,6 +80,25 @@
     let curAnswer = null;
     let answerText = "";
     let hasStage = false;
+    // 主回答流式渲染节流：deepseek 等高速模型的逐帧 delta 频率远超渲染所需，
+    // 每帧全量 Markdown.render + Prism 高亮 + innerHTML 重建是 O(n²) 热路径
+    // （长回复+长思考时页面越来越卡）。60ms 合并一次渲染（≈16fps，视觉上
+    // 仍是连续打字），收尾/分块 seal 时强制 flush 一次保证内容完整。
+    let answerRenderTimer = null;
+    function flushAnswerRender() {
+      if (!answerRenderTimer) return;
+      clearTimeout(answerRenderTimer);
+      answerRenderTimer = null;
+      if (curAnswer && answerText) {
+        App.renderPreservingWidgets(curAnswer, Markdown.render(answerText));
+        App.highlightCodeBlocks(curAnswer);
+        App.updateCodeblockCopyButtons();
+      }
+    }
+    function scheduleAnswerRender() {
+      if (answerRenderTimer) return;
+      answerRenderTimer = setTimeout(flushAnswerRender, 60);
+    }
     const toolBlocks = [];
     let activeToolBlocks = null;
     // 子任务块（sub_agent）：按父级 tool_call id / agent_id 双键索引，同一块
@@ -104,6 +123,7 @@
     function sealTextBlocks() {
       if (curThink) curThink.done();
       if (curAnswer) curAnswer.classList.remove("msg-cursor");
+      flushAnswerRender();
       curThink = null;
       curAnswer = null;
     }
@@ -195,8 +215,11 @@
       const data = evt.data || {};
 
       // 轮次开始：后端任务启动后推送本轮最终轮次号（普通发送），前端就地
-      // 补挂本轮提问气泡的编辑/复制/删除入口（此前收尾不重载就没有入口）
+      // 补挂本轮提问气泡的编辑/复制/删除入口（此前收尾不重载就没有入口）；
+      // 同时同步到 activeStream.round——中途切走再切回会话时，openSession
+      // 的历史裁剪/去重按轮次精确匹配（编辑重发路径 send() 已提前打标）
       if (data.round_started && typeof data.round_started.round === "number") {
+        if (activeStream.round == null) activeStream.round = data.round_started.round;
         App.attachLiveRoundEntry(activeStream, data.round_started.round);
       }
 
@@ -354,6 +377,9 @@
       if (typeof data.reasoning_content === "string" && data.reasoning_content) {
         if (curAnswer) {
           curAnswer.classList.remove("msg-cursor");
+          // 置空前刷出该段挂起的节流渲染帧（answerText 此时仍是本段的，
+          // flush 会把最后一批增量落进 DOM；此后 curAnswer=null 跳过后续渲染）
+          flushAnswerRender();
           curAnswer = null;
         }
         if (!curThink) {
@@ -375,14 +401,15 @@
         if (!curAnswer) {
           curAnswer = el("div", "msg-assistant-body msg-cursor");
           answerText = "";
+          // 上一段挂起帧已在 reasoning 分支/sealTextBlocks 的置空前 flush，
+          // 此处只需重置计时器锚点（curAnswer/answerText 均已指向新段）
           hasStage = true;
           appendStage(curAnswer);
         }
         answerText += data.content;
-        curAnswer.innerHTML = Markdown.render(answerText);
-        App.highlightCodeBlocks(curAnswer);
-        // 流式整块重建后立即同步设置钉住态，避免 MutationObserver 延迟到下一帧造成左右闪切
-        App.updateCodeblockCopyButtons();
+        // 节流渲染（flushAnswerRender 顶部定义）：先累积文本，60ms 后统一
+        // Markdown.render + 高亮 + 重建，高速模型逐帧 delta 不再逐帧全量重排
+        scheduleAnswerRender();
         titleContent += data.content;
       }
       // 工具调用增量：按 index 合并，参数 JSON 逐帧流式展示。
@@ -539,6 +566,8 @@
         App.clearInjectedPending(sessionId);
         // 流结束仍未触发标题：不足 100 字符以已有全文触发一次（有输出才触发）
         maybeTriggerTitle(sessionId, true);
+        // 强制刷出未渲染的回答节流帧（收尾必须完整，不能丢最后 60ms 的字）
+        flushAnswerRender();
         if (curAnswer) curAnswer.classList.remove("msg-cursor");
         msg.querySelectorAll(".think-block.is-streaming").forEach(function (think) {
           think.classList.remove("is-streaming");
@@ -904,6 +933,10 @@
     const activeStream = {
       sessionId: sessionId,
       userText: "",
+      // 附接回放后回填：提问原始 content（部件列表/文本）与本轮最终轮次号，
+      // openSession 的历史裁剪/去重与编辑入口补挂都按这两个字段精确匹配
+      userContent: null,
+      round: null,
       userNode: null,
       messageNode: msg,
       completed: false,
@@ -920,17 +953,61 @@
           const data = evt.data || {};
           if (data && data.replay) {
             sawReplay = true;
-            if (data.question_text) {
-              activeStream.userText = data.question_text;
-              // 历史文件已落盘时可能已经渲染过本轮提问，避免重复气泡
-              const duplicated = Array.from(chatInner.querySelectorAll(".msg-user .msg-bubble"))
-                .some(function (node) { return node.textContent === data.question_text; });
-              if (!duplicated) {
+            // 本轮最终轮次号（后端 round_started 推送时同步记录、随 marker 下发）：
+            // 历史裁剪/去重/补挂编辑入口统一按轮次精确匹配——同文本历史提问
+            // 不再被误判成本轮、多模态（部件数组）提问也能命中
+            if (typeof data.round === "number" && data.round > 0) {
+              activeStream.round = data.round;
+            }
+            // question_parts 为提问原始 content 部件（多模态时含 media:// 引用；
+            // 纯文本提问后端归一为单个 text 部件）：用多部件气泡重建（缩略图
+            // 可点开预览），缺失时才退回纯文本
+            const parts = Array.isArray(data.question_parts) ? data.question_parts : null;
+            if (data.question_text) activeStream.userText = data.question_text;
+            else if (parts) {
+              activeStream.userText = parts
+                .map(function (p) { return p && p.type === "text" && typeof p.text === "string" ? p.text : ""; })
+                .filter(function (t) { return t.trim(); })
+                .join("\n");
+            }
+            // 原始 content（重建/复用气泡后补挂编辑入口的数据源）：部件优先，
+            // 缺失时退化为文本字符串（编辑重发按文本处理）
+            if (parts) activeStream.userContent = parts;
+            else if (activeStream.userContent == null && activeStream.userText) {
+              activeStream.userContent = activeStream.userText;
+            }
+            if (activeStream.userText || parts) {
+              // 历史文件已落盘时可能已经渲染过本轮提问（生成中刷新，提问事件
+              // 已随检查点/收尾写入）：优先按轮次精确匹配并复用该节点补挂
+              // 编辑入口。轮次号有效但未命中 = 本轮尚未落盘（生成中），直接
+              // 新建气泡——不回退文本匹配，否则会误复用历史中同文本的旧提问
+              // 节点（后续编辑/删除定位错轮）。仅无轮次号（旧后端）时回退
+              // 文本全等比较（两侧 trim，与历史回放同口径）
+              let existing = null;
+              if (activeStream.round != null) {
+                existing = chatInner.querySelector(
+                  '.msg-user[data-round="' + activeStream.round + '"]'
+                );
+              } else {
+                const wanted = String(activeStream.userText || "").trim();
+                existing = Array.from(chatInner.querySelectorAll(".msg-user"))
+                  .find(function (node) {
+                    const bubble = node.querySelector(".msg-bubble");
+                    return Boolean(bubble) && bubble.textContent.trim() === wanted;
+                  }) || null;
+              }
+              if (existing) {
+                activeStream.userNode = existing;
+              } else {
                 // 提问气泡必须排在回答上方：回答容器 msg 已先入列，把气泡插入到它之前
-                const userNode = App.appendUserMessage(data.question_text);
+                const userNode = parts
+                  ? App.appendUserMessage(parts, null, sessionId)
+                  : App.appendUserMessage(data.question_text, null, sessionId);
                 chatInner.insertBefore(userNode, msg);
                 activeStream.userNode = userNode;
               }
+              // 补挂轮次标记与编辑/复制/删除入口（复用节点时幂等跳过）
+              App.attachLiveRoundEntry(activeStream, activeStream.round);
             }
             return;
           }

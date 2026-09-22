@@ -210,6 +210,12 @@ def execute_tool_round(
         except Exception as exc:
             ret = f"工具执行失败【{exc}】"
             return index, tool_call, tool_name, tool_args, ret, exc
+        except BaseException as exc:
+            # SystemExit 等 BaseException 派生异常（MCP 客户端内部逃逸）不能穿透
+            # 包装：一旦逃出 execute_tool_round 会经 to_thread 一路上抛终止整个
+            # 生成任务。统一转为工具错误反馈，让模型改用其他工具继续任务。
+            ret = f"工具执行失败【{exc.__class__.__name__}: {exc}】，该工具当前不可用；请改用其他可用工具完成任务，或直接向用户说明情况"
+            return index, tool_call, tool_name, tool_args, ret, exc
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {

@@ -167,6 +167,9 @@
         summary_usage: rec.scope === "session" ? rec.usage : null,
         before_tokens: rec.before_tokens,
         after_tokens: rec.after_tokens,
+        token_limit: rec.token_limit,
+        trigger_reason: rec.trigger_reason,
+        trigger_context_tokens: rec.trigger_context_tokens,
         compress_index: rec.compress_index,
         block_count: rec.block_count,
         error: rec.error || "",
@@ -469,11 +472,30 @@
       return pre;
     }
 
+    // 压缩块内部 pre 的滚动守卫：delta 高频追加时默认贴底，用户上滚阅读即暂停，
+    // 滚回底部附近自动恢复。不做会表现为"生成中拖动滚动条立刻被拉回底部"。
+    function isNearBottom(pre) {
+      return pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    }
+    function attachScrollGuard(pre) {
+      if (!pre || pre.__scrollGuarded) return;
+      pre.__scrollGuarded = true;
+      pre.__stickUser = true;
+      pre.addEventListener("wheel", function (e) {
+        if (e.deltaY < 0) pre.__stickUser = false;
+        else if (isNearBottom(pre)) pre.__stickUser = true;
+      }, { passive: true });
+      pre.addEventListener("scroll", function () {
+        // 程序贴底后此事件同样触发，但此时已在底部，判定结果不变（幂等）
+        pre.__stickUser = isNearBottom(pre);
+      }, { passive: true });
+    }
     function scrollToPreBottom(pre) {
-      if (pre) {
-        pre.scrollTop = pre.scrollHeight;
-        pre.scrollLeft = 0;
-      }
+      if (!pre) return;
+      attachScrollGuard(pre);
+      if (pre.__stickUser === false) return; // 用户上滚阅读中：不拉回
+      pre.scrollTop = pre.scrollHeight;
+      pre.scrollLeft = 0;
     }
 
     /**
@@ -590,8 +612,50 @@
         const after = safeNumber(latestCompaction.after_tokens != null
           ? latestCompaction.after_tokens : latestUsage && latestUsage.after_tokens);
         if (before !== null && after !== null) {
-          detail.push("上下文 " + FormatUtils.fmtNum(before) + " → " + FormatUtils.fmtNum(after) +
+          // session 压缩的 before/after 为"历史部分"规模（触发判断口径），
+          // round 压缩为全量上下文——标签区分，避免与压缩模型输入混淆
+          const contextLabel = scope === "session" ? "历史上下文" : "上下文";
+          detail.push(contextLabel + " " + FormatUtils.fmtNum(before) + " → " + FormatUtils.fmtNum(after) +
             "（节省 " + FormatUtils.fmtNum(Math.max(0, before - after)) + "）");
+        }
+        // 触发阈值与触发依据：task/first_call 路径的触发判断是全量上下文
+        // （含当前轮轨迹/首调用请求）超阈值，而 before/after 只是历史部分——
+        // trigger_context_tokens/trigger_threshold 呈现真实触发比较，消除
+        // "历史没到阈值为何压缩"的困惑；auto/manual 路径无这些字段，
+        // 此时本批预算即触发阈值，以 before 对照 token_limit 即可
+        const tokenLimit = safeNumber(latestCompaction.token_limit);
+        const triggerContextTokens = safeNumber(latestCompaction.trigger_context_tokens);
+        const triggerThreshold = safeNumber(latestCompaction.trigger_threshold);
+        if (triggerThreshold !== null && triggerThreshold > 0) {
+          // 强制路径：显示真实触发阈值 + 本批预算（两者不同才有意义）
+          detail.push("触发阈值 " + FormatUtils.fmtNum(triggerThreshold));
+          if (tokenLimit !== null && tokenLimit > 0 && tokenLimit !== triggerThreshold) {
+            detail.push("本批预算 " + FormatUtils.fmtNum(tokenLimit));
+          }
+        } else if (tokenLimit !== null && tokenLimit > 0) {
+          const triggered = before !== null && before > tokenLimit;
+          detail.push((triggered ? "触发阈值" : "本批预算") + " " + FormatUtils.fmtNum(tokenLimit));
+        }
+        // 触发来源（auto=历史超阈值/轮数保护自动、task=任务内检查点、
+        // first_call=首调用超窗降级、post=任务收尾、manual=手动）：历史回放同样可见
+        const triggerReason = latestCompaction.trigger_reason != null
+          ? String(latestCompaction.trigger_reason) : "";
+        const REASON_LABELS = {
+          auto: "历史超阈值/轮数保护自动",
+          task: "任务内检查点",
+          first_call: "首调用超窗降级",
+          post: "任务收尾",
+          manual: "手动",
+        };
+        if (REASON_LABELS[triggerReason]) {
+          let reasonText = "触发来源 " + REASON_LABELS[triggerReason];
+          const compareThreshold = triggerThreshold !== null && triggerThreshold > 0
+            ? triggerThreshold : tokenLimit;
+          if (triggerContextTokens !== null && compareThreshold !== null && compareThreshold > 0) {
+            reasonText += "（全量上下文 " + FormatUtils.fmtNum(triggerContextTokens) +
+              " > 阈值 " + FormatUtils.fmtNum(compareThreshold) + "）";
+          }
+          detail.push(reasonText);
         }
         const compressedRounds = safeNumber(latestUsage && latestUsage.compressed_rounds);
         const blockCount = safeNumber(latestCompaction.block_count != null
@@ -633,6 +697,91 @@
   // Prism 语法高亮：仅处理容器内 language-* 的代码元素（diff 组合语言由插件处理）
   function highlightCodeBlocks(container) {
     if (window.Prism && container) Prism.highlightAllUnder(container);
+  }
+
+  // ---------- 保活渲染：innerHTML 重渲染时保留 md-svg 控件内部状态 ----------
+  // 流式期间正文按 Markdown.render 全量重建，```svg/mermaid/canvas 控件会随节点
+  // 一起被销毁重建：代码视图滚动位置每帧丢失回顶、运行中的 canvas iframe 被丢弃
+  // （表现为"生成中点运行无反应"、切到代码视图拖动滚动条立刻回滚）。
+  // 修复采用「锚点挖洞」整块移植：
+  //   1. 配对决策走 WidgetReuse.plan（kind+源码精确 → svg/canvas 流式前缀 →
+  //      运行中 canvas iframe 兜底）；
+  //   2. 保留的旧块**绝不脱离文档**——HTML5 规范 iframe 摘下再插回会重建
+  //      browsing context 导致重载重跑；因此新树里对应位置换成 marker 占位，
+  //      以保留块为锚把新内容分段 insertBefore，最后清理旧残留节点；
+  //   3. 配不上的控件按新建处理（正常升级/重建）。
+  function renderPreservingWidgets(host, html) {
+    if (!host || typeof html !== "string") return;
+    const oldBlocks = Array.prototype.slice.call(host.querySelectorAll(".md-svg-block"));
+    if (!oldBlocks.length) {
+      host.innerHTML = html;
+      return;
+    }
+    const fresh = document.createElement("div");
+    fresh.innerHTML = html;
+    const newBlocks = Array.prototype.slice.call(fresh.querySelectorAll(".md-svg-block"));
+    if (!newBlocks.length) {
+      // 新渲染里已无控件（源码被改掉/删除）：正常替换，控件随之消失
+      host.innerHTML = html;
+      return;
+    }
+    const describe = function (block) {
+      return {
+        kind: block.dataset.svgKind || "",
+        code: Markdown.unescapeHtml(block.dataset.svgCode || ""),
+        hasFrame: Boolean(block.querySelector(".md-canvas-frame")),
+      };
+    };
+    const plan = WidgetReuse.plan(
+      oldBlocks.map(describe),
+      newBlocks.map(describe)
+    );
+    // 新树中配对成功的位置换成 marker 占位（保留块原地不动）；
+    // 同时把最新源码同步到保留节点（复制代码/重跑按钮始终用当前版本）
+    const markerFor = new Map(); // marker element -> reuseIndex
+    const keepSet = new Set();
+    for (let k = 0; k < newBlocks.length; k++) {
+      const reuseIndex = plan[k].reuseIndex;
+      if (reuseIndex < 0) continue;
+      const keep = oldBlocks[reuseIndex];
+      if (newBlocks[k].dataset.svgCode != null) {
+        keep.dataset.svgCode = newBlocks[k].dataset.svgCode;
+      }
+      const marker = document.createElement("span");
+      marker.className = "md-rpw-slot";
+      marker.hidden = true;
+      markerFor.set(marker, reuseIndex);
+      keepSet.add(keep);
+      fresh.replaceChild(marker, newBlocks[k]);
+    }
+    if (!markerFor.size) {
+      host.innerHTML = html;
+      return;
+    }
+    // 分段搬移：以最靠前的保留块为锚插入其前内容；遇 marker 则推进锚点到
+    // 该保留块的下一个兄弟（保留块本身永不脱离文档，iframe 不重载）；
+    // 尾部剩余内容追加到最后。
+    const nodes = Array.prototype.slice.call(fresh.childNodes);
+    let refNode = null;
+    for (let i = 0; i < oldBlocks.length; i++) {
+      if (keepSet.has(oldBlocks[i])) { refNode = oldBlocks[i]; break; }
+    }
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      const reuseIndex = markerFor.get(node);
+      if (reuseIndex !== undefined) {
+        refNode = oldBlocks[reuseIndex].nextSibling;
+        continue;
+      }
+      node.__rpwFresh = true;
+      host.insertBefore(node, refNode);
+    }
+    // 清理旧残留：顶层节点既非本轮新插入、也非保留块的一律移除
+    // （快照后遍历，避免 live childNodes 边删边移位）
+    Array.prototype.slice.call(host.childNodes).forEach(function (n) {
+      if (n.__rpwFresh || keepSet.has(n)) return;
+      if (n.parentNode) n.parentNode.removeChild(n);
+    });
   }
 
   // 用户气泡：content 可为字符串或多部件列表（多模态消息与其历史回放）。
@@ -911,6 +1060,9 @@
    * round_started 事件到达时调用：普通发送的 userNode 此前 round=null 没有
    * 挂入口（收尾不重载就永远没有），后端在任务启动后立即推送本轮最终
    * 轮次号，前端补上 data-round/_editData/操作行；answer 节点同步打标。
+   * 附接回放（刷新重连）同样调用：replay marker 携带轮次号与提问原始部件，
+   * 复用历史节点或新建气泡后即可挂完整入口（旧后端缺部件时 userContent
+   * 为空，跳过打标等收尾重载随历史回放补挂）。
    * targetRound/insertRound 路径已在 send() 内打标，此函数幂等跳过。
    * @param {object} activeStream 活动流对象（含 userNode/messageNode/userContent）
    * @param {number} round 本轮最终轮次号（1-based）
@@ -918,10 +1070,14 @@
   function attachLiveRoundEntry(activeStream, round) {
     if (!activeStream || typeof round !== "number" || round < 1) return;
     const userNode = activeStream.userNode;
-    if (!userNode || userNode.dataset.round) return;
-    // 附接的后台流（刷新重连）拿不到首问完整 content（replay 只有纯文本），
-    // 挂入口会导致编辑重发丢失多模态附件——此时不打标，等收尾重载后随
-    // 历史回放自然挂上完整入口
+    if (!userNode) return;
+    // 已有轮次标记（历史渲染节点 / send() 内编辑重发路径已打标）：视为幂等
+    // 命中直接返回，不改写——节点归属与入口数据以先打的标为准，避免错轮
+    if (userNode.dataset.round) {
+      return;
+    }
+    // 提问完整 content 未知（旧后端 replay 无部件、纯媒体提问无文本）时
+    // 不挂入口：编辑重发会丢失多模态附件，等收尾重载随历史回放补挂
     if (activeStream.userContent == null) return;
     userNode.dataset.round = String(round);
     userNode._editData = { content: activeStream.userContent, round: round };
@@ -1199,11 +1355,31 @@
     let previewTimer = null;
     const PREVIEW_THROTTLE_MS = 200;
 
+    // 思考文本双缓冲：textContent += / getter 在长思考时是 O(全长) 的
+    // 序列化+重排热路径（高速模型逐帧追加时页面卡顿主源之一）。
+    // 权威文本留在内存缓冲，80ms 批量落 DOM 一次；读取走缓冲（零 DOM 开销）
+    let fullText = "";      // 权威累积文本（含未落 DOM 部分）
+    let dirtyText = false;  // 缓冲有未落 DOM 增量
+    let bufTimer = null;
+    function flushText() {
+      if (bufTimer) { clearTimeout(bufTimer); bufTimer = null; }
+      if (!dirtyText) return;
+      dirtyText = false;
+      content.textContent = fullText;
+      content.scrollTop = content.scrollHeight;
+    }
+    function scheduleTextFlush() {
+      dirtyText = true;
+      if (bufTimer) return;
+      bufTimer = setTimeout(flushText, 80);
+    }
+
     // 取累积文本的最后一个非空行作为预览（新行替代旧行）；全部空白则清空。
     // 截断到 160 字符兜底：即使环境样式异常（按钮内容宽度计算不受控），
     // DOM 文本也不会超长
     function latestLine() {
-      const text = content.textContent;
+      // 走内存缓冲：避免每次渲染预览都对整个思考块做 textContent 序列化
+      const text = fullText;
       let tail = "";
       for (let i = text.length - 1; i >= 0; i--) {
         const ch = text[i];
@@ -1255,11 +1431,26 @@
 
     return {
       wrap: wrap,
-      setText: function (t) { content.textContent = t; schedulePreview(); },
-      add: function (delta) { content.textContent += delta; schedulePreview(); },
-      textContent: function () { return content.textContent; },
+      setText: function (t) {
+        fullText = String(t || "");
+        if (bufTimer) { clearTimeout(bufTimer); bufTimer = null; }
+        dirtyText = false;
+        content.textContent = fullText;
+        content.scrollTop = content.scrollHeight;
+        schedulePreview();
+      },
+      add: function (delta) {
+        fullText += delta;
+        scheduleTextFlush();
+        schedulePreview();
+      },
+      textContent: function () { return fullText; },
       streaming: function () { wrap.classList.add("is-streaming"); },
-      done: function () { clearPreview(); wrap.classList.remove("is-streaming"); },
+      done: function () {
+        clearPreview();
+        flushText(); // 收尾强制刷出缓冲增量（不能丢最后 80ms 的思考内容）
+        wrap.classList.remove("is-streaming");
+      },
     };
   }
 
@@ -1860,7 +2051,7 @@
       }
       if (typeof evt.content === "string" && evt.content) {
         round.contentText = evt.content;
-        round.contentEl.innerHTML = Markdown.render(evt.content);
+        renderPreservingWidgets(round.contentEl, Markdown.render(evt.content));
         round.contentLabel.classList.remove("is-empty");
         App.highlightCodeBlocks(round.contentEl);
         App.updateCodeblockCopyButtons();
@@ -1913,7 +2104,7 @@
       round.contentRenderTimer = setTimeout(function () {
         round.contentRenderTimer = null;
         if (round.contentText) {
-          round.contentEl.innerHTML = Markdown.render(round.contentText);
+          renderPreservingWidgets(round.contentEl, Markdown.render(round.contentText));
           App.highlightCodeBlocks(round.contentEl);
           App.updateCodeblockCopyButtons();
         }
@@ -2021,7 +2212,7 @@
           clearTimeout(r.contentRenderTimer);
           r.contentRenderTimer = null;
           if (r.contentText) {
-            r.contentEl.innerHTML = Markdown.render(r.contentText);
+            renderPreservingWidgets(r.contentEl, Markdown.render(r.contentText));
             App.highlightCodeBlocks(r.contentEl);
             App.updateCodeblockCopyButtons();
           }
@@ -2083,6 +2274,17 @@
           return;
         }
         if (phase === "done") { applyDone(evt); return; }
+        if (phase === "notice") {
+          // 交付保障重试提示（空收尾重试/断流续跑/todo 提醒）：
+          // 以浅色条目追加到块内；历史回放侧 history_parser 对该 phase
+          // 走通用条目兜底，hydrate 忽略（仅实时流展示）
+          const message = typeof evt.message === "string" ? evt.message : "";
+          if (message) {
+            body.appendChild(el("div", "agent-notice", "↻ " + message));
+            autoOpen();
+          }
+          return;
+        }
       },
       /** 历史回放：entries 逐条重放 + done 聚合字段。 */
       hydrate: function (record) {
@@ -2097,6 +2299,9 @@
             fillToolEntry(evt);
           } else if (entry.phase === "todo") {
             applyEventTodo(evt);
+          } else if (entry.phase === "notice") {
+            const message = typeof entry.message === "string" ? entry.message : "";
+            if (message) body.appendChild(el("div", "agent-notice", "↻ " + message));
           }
         });
         applyDone({
@@ -2201,6 +2406,22 @@
       });
       block.querySelectorAll(".md-svg-tab").forEach(function (tab) {
         tab.classList.toggle("is-active", tab === btn);
+      });
+      return;
+    }
+    // 全屏（SVG/Mermaid 控件共用）：作用于整个控件块，当前视图（图片/代码）
+    // 铺满全屏视口；Esc 或再点一次退出。fullscreenchange 统一刷新按钮文案
+    if (action === "full") {
+      if (document.fullscreenElement === block) {
+        document.exitFullscreen();
+        return;
+      }
+      if (!document.fullscreenEnabled) {
+        App.toast("当前环境不支持全屏显示");
+        return;
+      }
+      block.requestFullscreen().catch(function (err) {
+        App.toast("进入全屏失败：" + (err && err.message || err));
       });
       return;
     }
@@ -2855,13 +3076,52 @@
     App.toast("已下载画布截图 PNG");
   }
 
-  // 全屏状态同步按钮文案（Esc 退出 / 多块同时存在时统一刷新）
+  // SVG/Mermaid 全屏尺寸同步：图片视图的 svg 带流式渲染注入的内联样式
+  // （width:min(100%,170vh*宽高比)，内联优先级高于 CSS 且每图比例不同），
+  // 全屏"整图限高完整可见"的宽度必须按各图比例在 JS 里算：
+  // 进入全屏 → 改写内联 width = min(块宽, (视口高-96px)*比例)；退出 → 还原。
+  function syncSvgFullscreenLayout() {
+    const fsEl = document.fullscreenElement;
+    chatInner.querySelectorAll(".md-svg-block").forEach(function (block) {
+      const svg = block.querySelector(".md-svg-view svg");
+      if (!svg) return;
+      if (fsEl === block) {
+        if (block.__svgStyleBackup == null) {
+          block.__svgStyleBackup = svg.getAttribute("style") || "";
+        }
+        const m = /aspect-ratio:\s*([\d.]+)/.exec(svg.getAttribute("style") || "");
+        const ar = m ? parseFloat(m[1]) : 0;
+        const maxH = Math.max(240, window.innerHeight - 96);
+        const w = ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth;
+        svg.style.width = Math.floor(w) + "px";
+        svg.style.height = "auto";
+        svg.style.maxHeight = maxH + "px";
+      } else if (block.__svgStyleBackup != null) {
+        svg.setAttribute("style", block.__svgStyleBackup);
+        block.__svgStyleBackup = null;
+      }
+    });
+  }
+  // 全屏状态同步按钮文案（Esc 退出 / 多块同时存在时统一刷新）：
+  // canvas 与 SVG/Mermaid 控件各有一套 full 按钮，两套委托都在此统一刷新
   document.addEventListener("fullscreenchange", function () {
+    syncSvgFullscreenLayout();
     const fullscreen = Boolean(document.fullscreenElement);
     chatInner.querySelectorAll('[data-canvas-action="full"]').forEach(function (btn) {
       btn.textContent = fullscreen ? "⤡ 退出全屏" : "⛶ 全屏";
       btn.title = fullscreen ? "退出全屏（Esc）" : "全屏显示画布（Esc 退出）";
     });
+    chatInner.querySelectorAll('.md-svg-block [data-svg-action="full"]').forEach(function (btn) {
+      btn.textContent = fullscreen ? "⤡ 退出全屏" : "⛶ 全屏";
+      btn.title = fullscreen ? "退出全屏（Esc）" : "全屏显示（Esc 退出）";
+    });
+  });
+  // 全屏期间窗口尺寸变化：重算当前全屏块的图片尺寸
+  window.addEventListener("resize", function () {
+    const fsEl = document.fullscreenElement;
+    if (fsEl && fsEl.classList && fsEl.classList.contains("md-svg-block")) {
+      syncSvgFullscreenLayout();
+    }
   });
 
   // 媒体元素加载失败（404/路径失效等）：capture 捕获 media error 事件
@@ -3329,4 +3589,5 @@
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
+  App.renderPreservingWidgets = renderPreservingWidgets;
 })(window.App);

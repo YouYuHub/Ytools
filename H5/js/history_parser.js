@@ -8,14 +8,45 @@
 (function (global) {
   "use strict";
 
+  /** 记录 content 的正文文本：字符串原样返回，多部件列表取 text 部件拼接。 */
+  function recordContentText(content) {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return content == null ? "" : String(content);
+    return content
+      .map(function (part) {
+        return part && part.type === "text" && typeof part.text === "string" ? part.text : "";
+      })
+      .filter(function (text) { return text.trim(); })
+      .join("\n");
+  }
+
   /**
    * 打开会话时，若该会话正有后台流在跑，历史中应剔除当前轮提问，
    * 避免与 restoreActiveStream/attachStreamSession 补建的提问气泡重复。
+   *
+   * 优先按轮次号精确匹配（activeRound 为后端 round_started / 回放 marker
+   * 下发的本轮最终轮次号）：历史中存在同文本提问时不会再被误判成当前轮；
+   * 多模态提问（content 为部件数组）也能匹配。轮次号有效但未命中说明本轮
+   * 尚未落盘（生成中），此时直接返回全部——不能回退文本匹配，否则会误裁
+   * 历史中同文本的旧提问（连同其后的整段记录）。无 activeRound（旧后端/
+   * 旧调用方）时才回退文本匹配——对部件数组先取 text 部件拼接再比较，
+   * 避免多模态提问因 content 不是字符串而匹配失败（气泡重建后重复渲染）。
    */
-  function recordsBeforeActiveRound(records, userText) {
+  function recordsBeforeActiveRound(records, userText, activeRound) {
     let activeIndex = -1;
+    const round = Number(activeRound);
+    if (Number.isFinite(round) && round > 0) {
+      records.forEach(function (record, index) {
+        if (record.kind === "user" && Number(record.round) === round) activeIndex = index;
+      });
+      return activeIndex >= 0 ? records.slice(0, activeIndex) : records;
+    }
+    const text = typeof userText === "string" ? userText : "";
+    if (!text) return records;
     records.forEach(function (record, index) {
-      if (record.kind === "user" && record.content === userText) activeIndex = index;
+      if (record.kind === "user" && recordContentText(record.content) === text) {
+        activeIndex = index;
+      }
     });
     return activeIndex >= 0 ? records.slice(0, activeIndex) : records;
   }
@@ -33,6 +64,16 @@
         ? obj.before_tokens : compactionUsage && compactionUsage.before_tokens,
       after_tokens: obj.after_tokens != null
         ? obj.after_tokens : compactionUsage && compactionUsage.after_tokens,
+      // 触发阈值（min(聊天,压缩)窗口 × 触发比例）：历史回放同样显示，
+      // 供用户核对"为何此时触发"；旧数据无此字段则不显示
+      token_limit: obj.token_limit != null
+        ? obj.token_limit : compactionUsage && compactionUsage.token_limit,
+      // 触发来源与真实触发比较（task/first_call 路径：全量上下文 vs 阈值）
+      trigger_reason: obj.trigger_reason != null ? obj.trigger_reason : "",
+      trigger_context_tokens: obj.trigger_context_tokens != null
+        ? obj.trigger_context_tokens : null,
+      trigger_threshold: obj.trigger_threshold != null
+        ? obj.trigger_threshold : null,
       compress_index: obj.compress_index != null
         ? obj.compress_index : compactionUsage && compactionUsage.compress_index,
       block_count: obj.block_count != null

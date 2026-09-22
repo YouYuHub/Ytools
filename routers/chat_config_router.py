@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 from config import (
+    DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS,
     DEFAULT_HISTORY_TRIGGER_RATIO,
     DEFAULT_MAX_OVERSIZED_REJECTIONS,
     DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
@@ -18,7 +19,10 @@ from config import (
     DEFAULT_OVERSIZED_REJECT_FACTOR,
     DEFAULT_ONE_TASK_MAX_WORKERS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
+    DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
     DEFAULT_SUB_AGENT_MAX_CONCURRENT,
+    DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
+    DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
     DEFAULT_SUMMARY_BUDGET_RATIO,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     set_current_dir,
@@ -26,6 +30,7 @@ from config import (
     get_persisted_work_dir,
     resolve_work_dir,
     PROJECT_ROOT,
+    CompactionRetryConfig,
     HistoryCompactionConfig,
     ChatModelSelection,
     ContextReturnConfig,
@@ -34,6 +39,7 @@ from config import (
     NetworkRetryConfig,
     RetitleSettingPayload,
     SessionWorkDirConfig,
+    SubAgentRetryConfig,
     ToolConcurrencyConfig,
 )
 import env_manager
@@ -57,6 +63,7 @@ from factory.agent_runtime.context_compaction import (
     get_context_compaction_defaults,
     get_context_compaction_model_status,
     load_context_compaction_settings,
+    resolve_compaction_retry_max_attempts,
     resolve_config_max_input_tokens,
     resolve_context_compaction_model_config,
     resolve_context_compaction_threshold,
@@ -556,6 +563,156 @@ async def update_network_retry_config(payload: NetworkRetryConfig):
         "state": "succeed",
         "updated": updated,
         "config": _network_retry_config_payload(),
+    })
+
+
+# ---------- 上下文压缩失败重试配置 ----------
+
+_COMPACTION_RETRY_ENV_NAME = "COMPACTION_RETRY_MAX_ATTEMPTS"
+
+
+def _compaction_retry_config_payload() -> dict:
+    return {
+        "max_attempts": resolve_compaction_retry_max_attempts(),
+        "defaults": {
+            "max_attempts": DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS,
+        },
+        "semantics": {
+            "attempt": "一次尝试=一条完整\"压缩模型->聊天模型\"降级链",
+            "0_or_negative": "不限制重试次数（整条降级链一直重试，直到手动停止任务）",
+            "positive": "完整降级链累计执行达到 N 次仍失败时终止当前任务",
+            "retry_interval_seconds": 1,
+        },
+        "env_names": {"max_attempts": _COMPACTION_RETRY_ENV_NAME},
+        "memory_state": {
+            _COMPACTION_RETRY_ENV_NAME: env_manager.env_vars.get(_COMPACTION_RETRY_ENV_NAME),
+        },
+    }
+
+
+@api_chat_config_router.get("/chat_config/compaction_retry")
+async def get_compaction_retry_config():
+    """获取上下文压缩调用失败重试次数配置。"""
+    return JSONResponse(content=_compaction_retry_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/compaction_retry")
+async def update_compaction_retry_config(payload: CompactionRetryConfig):
+    """实时更新上下文压缩失败重试次数并持久化。
+
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次压缩调用立即生效
+    - 一次"尝试"=一条完整降级链（压缩模型 -> 失败时聊天模型重试）
+    - 0 或负数表示不限制（整条降级链一直重试直到手动停止）；重试间隔固定 1 秒
+    """
+    try:
+        max_attempts = int(payload.max_attempts)
+    except (TypeError, ValueError):
+        max_attempts = DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS
+    try:
+        updated = set_env_vars({
+            _COMPACTION_RETRY_ENV_NAME: max_attempts,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content={
+        "state": "succeed",
+        "updated": updated,
+        "config": _compaction_retry_config_payload(),
+        "memory_state": {
+            _COMPACTION_RETRY_ENV_NAME: env_manager.env_vars.get(_COMPACTION_RETRY_ENV_NAME),
+        },
+    })
+
+
+# ---------- 子智能体交付保障重试配置 ----------
+
+_SUB_AGENT_RETRY_ENV_NAMES = {
+    "final_reply_max_attempts": "SUB_AGENT_FINAL_REPLY_RETRY_MAX",
+    "stream_error_max_attempts": "SUB_AGENT_STREAM_ERROR_RETRY_MAX",
+    "todo_remind_max": "SUB_AGENT_TODO_REMIND_MAX",
+}
+
+_SUB_AGENT_RETRY_DEFAULTS = {
+    "final_reply_max_attempts": DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
+    "stream_error_max_attempts": DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
+    "todo_remind_max": DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
+}
+
+
+def _parse_sub_agent_retry_value(value: Any, default: int) -> int:
+    """解析子智能体重试配置；非整数回退默认值（0 与负数语义见端点描述）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _sub_agent_retry_config_payload() -> dict:
+    values = {
+        key: _parse_sub_agent_retry_value(
+            load_var(env_name, _SUB_AGENT_RETRY_DEFAULTS[key]),
+            _SUB_AGENT_RETRY_DEFAULTS[key],
+        )
+        for key, env_name in _SUB_AGENT_RETRY_ENV_NAMES.items()
+    }
+    return {
+        **values,
+        "defaults": dict(_SUB_AGENT_RETRY_DEFAULTS),
+        "semantics": {
+            "final_reply_max_attempts": {
+                "positive": "子任务最终回复为空时最多注入内部消息重试 N 次，耗尽后按 error 收尾",
+                "0_or_negative": "不限制（一直重试，仍受 max_rounds/timeout 硬封顶）",
+            },
+            "stream_error_max_attempts": {
+                "positive": "模型流式调用出错后最多从断点续跑 N 次，耗尽后按 error 收尾",
+                "0_or_negative": "不限制（仍受 max_rounds/timeout 硬封顶）",
+            },
+            "todo_remind_max": {
+                "positive": "收尾时 todo 未完成最多提醒 N 次（每次完整工具执行轮后额度重置）",
+                "0": "关闭提醒（收尾即结束）",
+                "negative": "不限制提醒（仍受 max_rounds/timeout 硬封顶）",
+            },
+        },
+        "env_names": dict(_SUB_AGENT_RETRY_ENV_NAMES),
+        "memory_state": {
+            env_name: env_manager.env_vars.get(env_name)
+            for env_name in _SUB_AGENT_RETRY_ENV_NAMES.values()
+        },
+    }
+
+
+@api_chat_config_router.get("/chat_config/sub_agent_retry")
+async def get_sub_agent_retry_config():
+    """获取子智能体交付保障重试配置（空收尾重试/流错误续跑/todo 提醒）。"""
+    return JSONResponse(content=_sub_agent_retry_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/sub_agent_retry")
+async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
+    """实时更新子智能体交付保障重试配置并持久化。
+
+    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次子任务立即生效
+    - final_reply / stream_error：0 或负数=不限制（仍受 max_rounds/timeout 硬封顶）
+    - todo_remind_max：0=关闭提醒，负数=不限制，正数=每工具轮后额度重置的提醒次数
+    """
+    update_env = {
+        env_name: _parse_sub_agent_retry_value(
+            getattr(payload, key), _SUB_AGENT_RETRY_DEFAULTS[key]
+        )
+        for key, env_name in _SUB_AGENT_RETRY_ENV_NAMES.items()
+    }
+    try:
+        updated = set_env_vars(update_env)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content={
+        "state": "succeed",
+        "updated": updated,
+        "config": _sub_agent_retry_config_payload(),
+        "memory_state": {
+            env_name: env_manager.env_vars.get(env_name)
+            for env_name in _SUB_AGENT_RETRY_ENV_NAMES.values()
+        },
     })
 
 

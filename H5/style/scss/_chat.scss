@@ -2006,36 +2006,121 @@ html[data-theme="dark"] {
 
   // 全屏模式（Fullscreen API 作用于整个 .md-canvas-block，操作按钮保留在
   // 全屏内可用）：深色背景，画布视图撑满剩余空间（沙箱内 #stage 以
-  // object-fit:contain 等比缩放，不随容器比例变形），日志区压到底部
-  .md-canvas-block:fullscreen {
-    display: flex;
-    flex-direction: column;
-    background: #111318;
-    padding: 10px;
-    overflow: hidden;
+  // object-fit:contain 等比缩放，不随容器比例变形）。
+  // 注意：该规则必须写在顶层——曾经嵌套在本容器内，SCSS 编译自动加父级
+  // 前缀变成 ".md-canvas-block .md-canvas-block:fullscreen"（要求全屏块
+  // 嵌套在另一 canvas 块内，永假），整段全屏样式从未生效，iframe 固定
+  // 420px 高导致全屏时下方留出一大片空白。见 _chat.scss 末尾顶层段。
+}
 
-    .md-svg-head {
-      flex: none;
+// ---------- SVG/Mermaid 控件：全屏布局（必须顶层书写，原因同 Canvas 段） ----------
+// 全屏元素是 .md-svg-block 自身：深色背景、头栏置顶、视图区铺满剩余空间。
+// 注意：图片视图的精确宽度不在这里用 CSS 定——svg 带流式渲染注入的内联
+// width:min(100%,170vh*宽高比)，内联优先级高于 CSS 且每张图比例不同，
+// 纯 CSS 无法在"铺满宽度"与"限高完整可见"间按比例取最优。
+// 尺寸由 messages.js 的 fullscreenchange 同步函数按各图比例计算并写内联样式，
+// 退出全屏时还原原内联样式（见 syncSvgFullscreenLayout）。
+.md-svg-block:fullscreen {
+  display: flex;
+  flex-direction: column;
+  background: #111318;
+  padding: 10px;
+  overflow: hidden;
+
+  .md-svg-head {
+    flex: none;
+  }
+
+  .md-svg-view,
+  .md-svg-code {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+
+    &[hidden] {
+      display: none;
+    }
+  }
+
+  // 兜底限高（正常路径由 JS 按各图宽高比写内联尺寸接管，见
+  // messages.js syncSvgFullscreenLayout；这里仅防 JS 未生效时溢出视口）
+  .md-svg-view svg {
+    max-height: calc(100vh - 96px);
+  }
+
+  // 代码视图：pre 铺满剩余高度滚动查看
+  .md-svg-code {
+    .md-svg-pre {
+      width: 100%;
+      margin: 0;
+      overflow: auto;
     }
 
-    .md-canvas-view {
+    code {
+      white-space: pre;
+    }
+  }
+}
+
+// ---------- Canvas 程序控件：全屏布局（必须顶层书写，原因见上） ----------
+// 头栏置顶，画布铺满剩余空间，日志区移到右侧竖排（窄屏回落为上下堆叠）。
+.md-canvas-block:fullscreen {
+  display: flex;
+  flex-direction: column;
+  background: #111318;
+  padding: 10px;
+  overflow: hidden;
+
+  .md-svg-head {
+    flex: none;
+  }
+
+  .md-canvas-view {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+    overflow: hidden;
+
+    .md-canvas-frame {
       flex: 1;
+      height: auto;
       min-height: 0;
+    }
+
+    // 日志右移：固定宽竖栏铺满全高（不再是画布下方的短横条），上限放开
+    .md-canvas-log {
+      flex: none;
+      width: 300px;
+      max-width: 36vw;
+      height: auto;
+      max-height: none;
+      margin-top: 0;
+      margin-left: 8px;
+    }
+
+    .md-canvas-placeholder {
+      flex: 1;
       display: flex;
-      flex-direction: column;
-      overflow: hidden;
+      align-items: center;
+      justify-content: center;
+    }
+  }
+}
 
-      .md-canvas-frame {
-        flex: 1;
-        height: auto;
-        min-height: 0;
-      }
+@media (max-width: 720px) {
+  .md-canvas-block:fullscreen .md-canvas-view {
+    flex-direction: column;
 
-      .md-canvas-log {
-        flex: none;
-        max-height: 140px;
-        margin-top: 8px;
-      }
+    .md-canvas-log {
+      width: auto;
+      max-width: none;
+      max-height: 140px;
+      margin-left: 0;
+      margin-top: 8px;
     }
   }
 }

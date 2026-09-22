@@ -26,6 +26,12 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self._original_chat = compaction.ChatLLM.chat_completions
         self._original_resolver = compaction.resolve_context_compaction_model_config
         self._original_context_limit = compaction.resolve_model_max_input_tokens
+        # 重试策略固定为 1 条降级链 + 零间隔：与旧行为语义一致，且测试不受
+        # .env/默认重试配置与 1 秒 sleep 影响（显式验证重试语义的用例单独展开）
+        self._original_retry_attempts = compaction.resolve_compaction_retry_max_attempts
+        self._original_retry_interval = compaction._COMPACTION_RETRY_INTERVAL_SECONDS
+        compaction.resolve_compaction_retry_max_attempts = lambda: 1
+        compaction._COMPACTION_RETRY_INTERVAL_SECONDS = 0
         self.captured_requests = []
 
         def fake_chat_completions(*, request=None, stream=False, model_config=None, **_kwargs):
@@ -61,6 +67,8 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         compaction.ChatLLM.chat_completions = staticmethod(self._original_chat)
         compaction.resolve_context_compaction_model_config = self._original_resolver
         compaction.resolve_model_max_input_tokens = self._original_context_limit
+        compaction.resolve_compaction_retry_max_attempts = self._original_retry_attempts
+        compaction._COMPACTION_RETRY_INTERVAL_SECONDS = self._original_retry_interval
 
     @staticmethod
     def _settings(oversized_factor=1.5, max_rejections=3, keep_rounds=1):
@@ -142,6 +150,91 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             compaction.require_default_chat_config = original_require
+
+    async def test_summarize_retries_full_chain_until_configured_limit(self):
+        """重试次数=完整降级链次数：每次尝试都走 压缩模型 -> 聊天模型，耗尽后抛错。"""
+        calls = []
+
+        def fake_chat(*, request=None, stream=False, model_config=None, **_kwargs):
+            calls.append(str(model_config.get("selected_model_id")))
+            raise RuntimeError(f"{model_config.get('selected_model_id')} 不可用")
+
+        original_require = compaction.require_default_chat_config
+        original_attempts = compaction.resolve_compaction_retry_max_attempts
+        original_interval = compaction._COMPACTION_RETRY_INTERVAL_SECONDS
+        compaction.ChatLLM.chat_completions = staticmethod(fake_chat)
+        compaction.resolve_context_compaction_model_config = lambda _settings: {
+            "selected_provider_name": "Test Provider",
+            "selected_model_id": "test-model",
+            "apiType": "chat-completions",
+            "maxInputTokens": 20_000,
+            "maxOutputTokens": 512,
+        }
+        compaction.require_default_chat_config = lambda: {
+            "selected_provider_name": "Chat Provider",
+            "selected_model_id": "chat-model",
+            "apiType": "chat-completions",
+            "maxInputTokens": 20_000,
+            "maxOutputTokens": 512,
+        }
+        compaction.resolve_compaction_retry_max_attempts = lambda: 2
+        compaction._COMPACTION_RETRY_INTERVAL_SECONDS = 0
+        try:
+            with self.assertRaises(compaction.ContextCompactionError) as ctx:
+                await compaction.summarize_context_text(
+                    "源文本", ChatLLMRequest(messages=[{"role": "user", "content": "q"}]),
+                    scope="跨轮会话历史",
+                )
+            # 2 条完整链：每条都是 压缩模型 -> 聊天模型 的顺序
+            self.assertEqual(calls, ["test-model", "chat-model", "test-model", "chat-model"])
+            self.assertIn("已尝试 2 条完整降级链", str(ctx.exception))
+        finally:
+            compaction.require_default_chat_config = original_require
+            compaction.resolve_compaction_retry_max_attempts = original_attempts
+            compaction._COMPACTION_RETRY_INTERVAL_SECONDS = original_interval
+
+    async def test_summarize_zero_or_negative_retry_means_unlimited(self):
+        """0 或负数=不限制重试：整条降级链一直重试直到成功。"""
+        calls = []
+
+        def fake_chat(*, request=None, stream=False, model_config=None, **_kwargs):
+            calls.append(str(model_config.get("selected_model_id")))
+            if len(calls) < 5:
+                raise RuntimeError(f"{model_config.get('selected_model_id')} 不可用")
+            return {"content": "第 3 条链的压缩模型调用成功"}
+
+        original_require = compaction.require_default_chat_config
+        original_attempts = compaction.resolve_compaction_retry_max_attempts
+        original_interval = compaction._COMPACTION_RETRY_INTERVAL_SECONDS
+        compaction.ChatLLM.chat_completions = staticmethod(fake_chat)
+        compaction.resolve_context_compaction_model_config = lambda _settings: {
+            "selected_provider_name": "Test Provider",
+            "selected_model_id": "test-model",
+            "apiType": "chat-completions",
+            "maxInputTokens": 20_000,
+            "maxOutputTokens": 512,
+        }
+        compaction.require_default_chat_config = lambda: {
+            "selected_provider_name": "Chat Provider",
+            "selected_model_id": "chat-model",
+            "apiType": "chat-completions",
+            "maxInputTokens": 20_000,
+            "maxOutputTokens": 512,
+        }
+        compaction.resolve_compaction_retry_max_attempts = lambda: 0
+        compaction._COMPACTION_RETRY_INTERVAL_SECONDS = 0
+        try:
+            result = await compaction.summarize_context_text(
+                "源文本", ChatLLMRequest(messages=[{"role": "user", "content": "q"}]),
+                scope="跨轮会话历史",
+            )
+            # 前 2 条完整链（4 次调用）失败，第 5 次调用（第 3 条链的压缩模型）成功
+            self.assertEqual(calls, ["test-model", "chat-model", "test-model", "chat-model", "test-model"])
+            self.assertEqual(result.text, "第 3 条链的压缩模型调用成功")
+        finally:
+            compaction.require_default_chat_config = original_require
+            compaction.resolve_compaction_retry_max_attempts = original_attempts
+            compaction._COMPACTION_RETRY_INTERVAL_SECONDS = original_interval
 
     async def test_large_single_tool_result_compacts_active_round_as_plain_text(self):
         large_result = "关键输出" * 4000
@@ -363,8 +456,71 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         # done 携带摘要全文；压缩请求应走流式接口
         self.assertTrue(done_payloads[0].get("summary_text"))
         self.assertIn("任务仍需继续", done_payloads[0]["summary_text"])
+        # 前后对比字段：before = 触发时的历史全量估算，after = 压缩后的历史估算；
+        # token_limit = 本批预算（自动路径 = 阈值）——前端据此显示
+        # "历史上下文 X → Y · 触发阈值 Z"，消除把压缩模型输入误读为触发点的歧义
+        done = done_payloads[0]
+        self.assertIsNotNone(done.get("before_tokens"))
+        self.assertIsNotNone(done.get("after_tokens"))
+        self.assertGreater(done["before_tokens"], done["after_tokens"])
+        self.assertIsNotNone(done.get("token_limit"))
+        self.assertGreater(done["token_limit"], 0)
+        # 触发来源默认 auto（任务开始自动）；调用方可传 task/first_call/manual/post
+        self.assertEqual(done.get("trigger_reason"), "auto")
         self.assertTrue(self.captured_requests)
         self.assertTrue(self.captured_requests[-1]["stream"])
+
+    async def test_session_compaction_done_carries_task_trigger_reason(self):
+        """task/first_call 路径：done 事件携带触发来源与真实触发规模（全量上下文）。"""
+
+        def make_round(index):
+            return {
+                "event": "chat_round",
+                "question": f"问题 {index}",
+                "events": [
+                    {"role": "user", "content": f"问题 {index}"},
+                    {"role": "assistant", "content": "回答内容" * 150},
+                    {"role": "assistant", "done": "[DONE]"},
+                ],
+            }
+
+        memory = _MemoryStub([make_round(index) for index in range(1, 8)])
+        compaction.resolve_model_max_input_tokens = lambda default=8192: 1_000
+        request = ChatLLMRequest(
+            session_id="session_trigger_reason_test",
+            messages=[{"role": "user", "content": "新问题"}],
+            max_tokens=512,
+        )
+        emitted = []
+
+        async def emitter(payload):
+            emitted.append(payload)
+
+        # 模拟任务内检查点触发：预算按历史预算传入，trigger_context_tokens 传全量规模
+        # （预算下限守卫 max(1024, ...)，用 2048 避免被抬升）
+        compacted = await compaction.compact_session_history_if_needed(
+            memory,
+            request,
+            settings=self._settings(),
+            budget_tokens=2048,
+            enforce=True,
+            force_all=True,
+            event_emitter=emitter,
+            trigger_reason="task",
+            trigger_context_tokens=123_456,
+            trigger_threshold=9_999,
+        )
+
+        self.assertGreater(compacted, 0)
+        done = [
+            p for p in emitted
+            if p.get("event") == "context_compaction" and p.get("phase") == "done"
+        ][0]
+        self.assertEqual(done.get("trigger_reason"), "task")
+        self.assertEqual(done.get("trigger_context_tokens"), 123_456)
+        # 触发阈值（触发比较基准）与本批预算（压缩批输入预算）分离
+        self.assertEqual(done.get("trigger_threshold"), 9_999)
+        self.assertEqual(done.get("token_limit"), 2048)
 
     async def test_small_history_does_not_trigger_session_compaction(self):
         memory = _MemoryStub([{
@@ -566,9 +722,13 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocks[0]["round_start"], 1)
         self.assertEqual(blocks[0]["round_end"], 4)
         self.assertEqual(memory.summary["return_blocks"], 1)
-        self.assertIn("【已有累计摘要】", calls[-1])
-        self.assertIn("本轮摘要：1", calls[-1])
-        self.assertIn("本轮摘要：2", calls[-1])
+        # 拼接优先：新批摘要为纯文本（无分段标题）时，作为自由文本段直接
+        # 拼入旧累计摘要，预算内不再发起独立的模型合并调用——calls 只有
+        # 两次批压缩，最后一块同时承载旧摘要正文与新批摘要正文。
+        self.assertEqual(len(calls), 2)
+        cumulative_text = memory.summary["summary"] or ""
+        self.assertIn("本轮摘要：1", cumulative_text)
+        self.assertIn("本轮摘要：2", cumulative_text)
 
     async def test_history_compaction_parses_section_fields_into_blocks(self):
         """压缩模型按标题分段输出时，段落内容回填到结构化字段。"""
@@ -921,14 +1081,13 @@ class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_result.triggered)
         self.assertEqual(len(second_result.summary_blocks), 1)
         self.assertEqual(second_result.summary_blocks[0]["index"], 2)
-        # 第二次压缩本身只读取新轨迹；随后由独立合并请求归并旧摘要。
+        # 第二次压缩本身只读取新轨迹（不含旧摘要与此前轨迹渲染标记）。
         second_source = self.captured_requests[1].messages[-1].content
         self.assertNotIn("段摘要：1", second_source)
         self.assertNotIn("【此前本轮摘要】", second_source)
-        # 合并请求必须同时包含旧摘要和新摘要
-        merge_source = self.captured_requests[2].messages[-1].content
-        self.assertIn("段摘要：1", merge_source)
-        self.assertIn("段摘要：2", merge_source)
+        # 拼接优先：新旧摘要同为标准分段结构时在本地直接合并，预算内不再
+        # 消耗模型调用——整个流程只有两次批压缩调用，无独立合并请求。
+        self.assertEqual(len(self.captured_requests), 2)
         # 累计摘要只保留一个块，游标覆盖到最新工具结果
         markers = [
             msg for msg in second_result.messages

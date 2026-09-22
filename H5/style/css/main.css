@@ -2450,34 +2450,92 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   word-break: break-word;
   color: var(--text-secondary);
 }
-.md-canvas-block .md-canvas-block:fullscreen {
+
+.md-svg-block:fullscreen {
   display: flex;
   flex-direction: column;
   background: #111318;
   padding: 10px;
   overflow: hidden;
 }
-.md-canvas-block .md-canvas-block:fullscreen .md-svg-head {
+.md-svg-block:fullscreen .md-svg-head {
   flex: none;
 }
-.md-canvas-block .md-canvas-block:fullscreen .md-canvas-view {
+.md-svg-block:fullscreen .md-svg-view,
+.md-svg-block:fullscreen .md-svg-code {
   flex: 1;
   min-height: 0;
   display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+.md-svg-block:fullscreen .md-svg-view[hidden],
+.md-svg-block:fullscreen .md-svg-code[hidden] {
+  display: none;
+}
+.md-svg-block:fullscreen .md-svg-view svg {
+  max-height: calc(100vh - 96px);
+}
+.md-svg-block:fullscreen .md-svg-code .md-svg-pre {
+  width: 100%;
+  margin: 0;
+  overflow: auto;
+}
+.md-svg-block:fullscreen .md-svg-code code {
+  white-space: pre;
+}
+
+.md-canvas-block:fullscreen {
+  display: flex;
   flex-direction: column;
+  background: #111318;
+  padding: 10px;
   overflow: hidden;
 }
-.md-canvas-block .md-canvas-block:fullscreen .md-canvas-view .md-canvas-frame {
+.md-canvas-block:fullscreen .md-svg-head {
+  flex: none;
+}
+.md-canvas-block:fullscreen .md-canvas-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+.md-canvas-block:fullscreen .md-canvas-view .md-canvas-frame {
   flex: 1;
   height: auto;
   min-height: 0;
 }
-.md-canvas-block .md-canvas-block:fullscreen .md-canvas-view .md-canvas-log {
+.md-canvas-block:fullscreen .md-canvas-view .md-canvas-log {
   flex: none;
-  max-height: 140px;
-  margin-top: 8px;
+  width: 300px;
+  max-width: 36vw;
+  height: auto;
+  max-height: none;
+  margin-top: 0;
+  margin-left: 8px;
+}
+.md-canvas-block:fullscreen .md-canvas-view .md-canvas-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
+@media (max-width: 720px) {
+  .md-canvas-block:fullscreen .md-canvas-view {
+    flex-direction: column;
+  }
+  .md-canvas-block:fullscreen .md-canvas-view .md-canvas-log {
+    width: auto;
+    max-width: none;
+    max-height: 140px;
+    margin-left: 0;
+    margin-top: 8px;
+  }
+}
 .ask-block {
   width: 100%;
   border: 1px solid var(--border-strong);

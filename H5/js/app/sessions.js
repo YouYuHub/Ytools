@@ -804,7 +804,11 @@
       if (seq !== sessionOpenSeq) return;
       const parsed = HistoryParser.parseHistory(text);
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
-      const visibleRecords = active ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText) : parsed.records;
+      // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
+      // marker / round_started 回填），无轮次号时回退提问文本匹配
+      const visibleRecords = active
+        ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText, active.round)
+        : parsed.records;
       App.setSessionUsage(parsed.metaUsage);
       App.refreshContextTokenStats(id);
       state.hasConversation = visibleRecords.length > 0 || Boolean(active);
@@ -837,10 +841,35 @@
     const active = state.activeStream;
     if (!active || active.sessionId !== sessionId || active.completed) return false;
 
-    const hasUserMessage = Array.from(chatInner.querySelectorAll(".msg-user .msg-bubble"))
-      .some(function (node) { return node.textContent === active.userText; });
-    if (!hasUserMessage && active.userNode && active.userNode.parentNode !== chatInner) {
-      chatInner.appendChild(active.userNode);
+    // 当前轮提问气泡是否已在聊天区：优先按轮次号精确匹配（同文本历史提问
+    // 不再误判成本轮；附接回放已按同一规则去重，两处口径一致）。轮次号有效
+    // 但未命中 = 本轮尚未落盘（生成中），按未渲染处理（不回退文本比较，
+    // 否则会误复用历史中同文本的旧提问节点）；无轮次号时回退文本比较
+    // （两侧 trim，与历史回放同口径）
+    let userNode = active.round != null
+      ? chatInner.querySelector('.msg-user[data-round="' + active.round + '"]')
+      : null;
+    if (!userNode && active.round == null) {
+      const wanted = String(active.userText || "").trim();
+      if (wanted) {
+        userNode = Array.from(chatInner.querySelectorAll(".msg-user"))
+          .find(function (node) {
+            const bubble = node.querySelector(".msg-bubble");
+            return Boolean(bubble) && bubble.textContent.trim() === wanted;
+          }) || null;
+      }
+    }
+    if (userNode) {
+      // 复用历史渲染的节点：同步回活动流引用（后续补挂入口/重载都以它为准）
+      active.userNode = userNode;
+    } else if (active.userNode && active.userNode.parentNode !== chatInner) {
+      // 历史渲染清空了聊天区（chatInner.innerHTML=""），把流式节点挂回：
+      // 提问气泡必须排在回答容器之前（回答容器可能已在历史渲染中补建）
+      if (active.messageNode && active.messageNode.parentNode === chatInner) {
+        chatInner.insertBefore(active.userNode, active.messageNode);
+      } else {
+        chatInner.appendChild(active.userNode);
+      }
     }
     if (active.messageNode && active.messageNode.parentNode !== chatInner) {
       chatInner.appendChild(active.messageNode);

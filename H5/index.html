@@ -485,6 +485,18 @@
                         <span>子智能体并发上限<small>同一轮最多同时运行的子任务数量，超出的排队执行</small></span>
                         <input id="subAgentMaxConcurrent" type="number" min="1" step="1">
                     </label>
+                    <label class="chat-setting-field">
+                        <span>子任务空收尾重试次数<small>子任务最终回复为空时注入内部消息要求重新交付；0/负数=不限制（一直重试，仍受轮次/超时硬封顶）</small></span>
+                        <input id="subAgentFinalReplyRetryMax" type="number" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>子任务断流续跑次数<small>子任务模型调用失败后从已有进度继续（工具轨迹不丢失）；0/负数=不限制</small></span>
+                        <input id="subAgentStreamErrorRetryMax" type="number" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>子任务计划未完成提醒次数<small>收尾时 todo 仍有未完成项则提醒继续（每次调用工具后额度重置）；0=关闭提醒，负数=不限制</small></span>
+                        <input id="subAgentTodoRemindMax" type="number" step="1">
+                    </label>
                 </section>
                 <section class="chat-settings-section">
                     <h3>历史压缩策略</h3>
@@ -509,6 +521,10 @@
                     <label class="chat-setting-field">
                         <span>连续拒绝上限<small>连续超长拒绝达到该次数时终止任务</small></span>
                         <input id="maxOversizedRejections" type="number" min="1" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>压缩失败重试次数<small>每次尝试=一条"压缩模型→聊天模型"完整降级链；达到次数终止任务；负数/0=不限制（一直重试）</small></span>
+                        <input id="compactionRetryMaxAttempts" type="number" step="1">
                     </label>
                     <p class="chat-settings-note">压缩模型请在「参数」面板的「压缩模型」选项卡中选择（该字段已由 /chat_config/models/select 接管）。</p>
                 </section>
@@ -797,6 +813,7 @@
     <!-- KaTeX 数学公式渲染引擎：须在 markdown.js 之前加载（全局 window.katex） -->
     <script src="js/vendor/katex/katex.min.js"></script>
     <script src="js/markdown.js"></script>
+    <script src="js/widget_reuse.js"></script>
     <script src="js/table_canvas.js"></script>
     <script src="js/session_list_utils.js"></script>
     <script src="js/session_utils.js"></script>

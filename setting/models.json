@@ -1,4 +1,8 @@
 {
+  "Ollama": {
+    "vendor": "ollama",
+    "url": "http://localhost:11434/v1"
+  },
   "Wsl Completions": {
     "vendor": "wsl",
     "apiKey": "not-needed",
@@ -19,12 +23,12 @@
     "apiKey": "sk-deepseek-api-key",
     "apiType": "chat-completions",
     "models": {
-      "Deepseek V4 Flash": {
-        "id": "deepseek-v4-flash",
+      "Deepseek Flash": {
+        "id": "deepseek-flash",
         "url": "https://api.deepseek.com/v1",
         "toolCalling": true,
         "vision": false,
-        "maxInputTokens": 100000,
+        "maxInputTokens": 1000000,
         "maxOutputTokens": 384000
       },
       "Deepseek V4 Pro": {
@@ -60,6 +64,21 @@
       }
     }
   },
+  "ApiYi Claude": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-apiyi-api-key",
+    "apiType": "messages",
+    "models": {
+      "Claude Opus 4.8": {
+        "id": "claude-opus-4-8",
+        "url": "https://api.apiyi.com/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 928000,
+        "maxOutputTokens": 24000
+      }
+    }
+  },
   "Qwen Completions": {
     "vendor": "custom_endpoint",
     "apiKey": "sk-ws-qwen-api-key",
@@ -73,8 +92,8 @@
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
       },
-      "Qwen3.7 Plus": {
-        "id": "qwen3.7-plus-2026-05-26",
+      "Qwen3.8 Flash": {
+        "id": "qwen3.8-flash",
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
@@ -89,12 +108,12 @@
         "maxInputTokens": 128000,
         "maxOutputTokens": 26000
       },
-      "Qwen3.7 Max": {
-        "id": "qwen3.7-max-2026-05-17",
+      "Qwen3.5 OCR": {
+        "id": "qwen3.5-ocr",
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
-        "maxInputTokens": 428000,
+        "maxInputTokens": 228000,
         "maxOutputTokens": 26000
       },
       "Qwen3.8 27B": {
@@ -104,6 +123,37 @@
         "vision": true,
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
+      }
+    }
+  },
+  "OpenCode Message": {
+    "vendor": "custom_endpoint",
+    "apiKey": "sk-opencode-message-api-key",
+    "apiType": "messages",
+    "models": {
+      "Qwen3.7 Max": {
+        "id": "qwen3.7-max",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 888888,
+        "maxOutputTokens": 16000
+      },
+      "Minimax M3": {
+        "id": "minimax-m3",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 428000,
+        "maxOutputTokens": 65536
+      },
+      "Qwen3.7 Plus": {
+        "id": "qwen3.7-plus",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 888888,
+        "maxOutputTokens": 65536
       }
     }
   },
@@ -132,42 +182,50 @@
         "id": "deepseek-v4-pro",
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
-        "vision": true,
+        "vision": false,
         "maxInputTokens": 888888,
         "maxOutputTokens": 65536
       },
-      "Deepseek V4 Flash": {
-        "id": "deepseek-v4-flash",
+      "Deepseek V4.1 Flash": {
+        "id": "deepseek-v4.1-flash",
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
-        "maxInputTokens": 428000,
-        "maxOutputTokens": 26000
+        "maxInputTokens": 528000,
+        "maxOutputTokens": 226000
       },
       "GLM 5.3 Flash": {
         "id": "glm-5.3-flash",
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "maxInputTokens": 500000,
+        "maxOutputTokens": 116000
+      },
+      "Omen Alpha": {
+        "id": "omen-alpha",
+        "url": "https://opencode.ai/zen/go/v1",
+        "toolCalling": true,
+        "vision": true,
         "maxInputTokens": 428000,
-        "maxOutputTokens": 16000
+        "maxOutputTokens": 106000
       }
     }
   },
   "model_selection": {
     "chat_model": {
-      "ownership_name": "ZaiOrg Completions",
-      "model_name": "GLM 5.3 Flash",
+      "ownership_name": "OpenCode Completions",
+      "model_name": "Omen Alpha",
       "parameter": {
         "chat_completions": {
-          "temperature": 0.7,
-          "top_p": 1,
-          "presence_penalty": 2,
+          "temperature": 0.8,
+          "top_p": 0.8,
+          "presence_penalty": 0.5,
           "reasoning_effort": "max",
           "extra_body": {
             "enable_thinking": true
           },
-          "max_tokens": 131072
+          "max_tokens": 105984
         },
         "messages": {
           "temperature": 0.7,
@@ -180,11 +238,17 @@
           "max_tokens": 65536
         }
       },
-      "api_type": "chat_completions"
+      "api_type": "chat_completions",
+      "headers": [
+        {
+          "name": "x-opencode-session",
+          "value": "your-session-id"
+        }
+      ]
     },
     "compaction_model": {
-      "ownership_name": "DeepSeek Completions",
-      "model_name": "Deepseek V4 Flash",
+      "ownership_name": "OpenCode Completions",
+      "model_name": "Omen Alpha",
       "parameter": {
         "chat_completions": {
           "temperature": 0.2,
@@ -194,16 +258,62 @@
           "extra_body": {
             "enable_thinking": true
           },
-          "max_tokens": 384000
+          "max_tokens": 105984
         }
       },
-      "api_type": "chat_completions"
+      "api_type": "chat_completions",
+      "headers": [
+        {
+          "name": "x-opencode-session",
+          "value": "your-session-id"
+        }
+      ]
     },
     "title_model": {
-      "ownership_name": null,
-      "model_name": null,
-      "parameter": {},
-      "api_type": null
+      "ownership_name": "OpenCode Completions",
+      "model_name": "Deepseek V4.1 Flash",
+      "parameter": {
+        "chat_completions": {
+          "temperature": 0.7,
+          "top_p": 1,
+          "presence_penalty": 2,
+          "reasoning_effort": "high",
+          "extra_body": {
+            "enable_thinking": true
+          },
+          "max_tokens": 8192
+        }
+      },
+      "api_type": "chat_completions",
+      "headers": [
+        {
+          "name": "x-opencode-session",
+          "value": "your-session-id"
+        }
+      ]
+    },
+    "sub_agent_model": {
+      "ownership_name": "OpenCode Completions",
+      "model_name": "Omen Alpha",
+      "parameter": {
+        "chat_completions": {
+          "temperature": 1,
+          "top_p": 1,
+          "presence_penalty": 0,
+          "reasoning_effort": "high",
+          "extra_body": {
+            "enable_thinking": true
+          },
+          "max_tokens": 105984
+        }
+      },
+      "api_type": "chat_completions",
+      "headers": [
+        {
+          "name": "x-opencode-session",
+          "value": "your-session-id"
+        }
+      ]
     }
   }
 }

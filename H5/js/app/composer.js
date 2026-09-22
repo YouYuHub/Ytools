@@ -15,7 +15,8 @@
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
-    networkRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
+    networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
+    subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
     oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint,
     settingsRetitleRow, settingsRetitleToggle, settingsRetitleStatus
   } = App;
@@ -699,19 +700,25 @@
       API.getHistoryCompactionConfig(state.sessionId).catch(function () { return null; }),
       API.getMcpToolConfig().catch(function () { return null; }),
       API.getNetworkRetryConfig().catch(function () { return null; }),
+      API.getCompactionRetryConfig().catch(function () { return null; }),
       API.getVideoReadLimitConfig().catch(function () { return null; }),
       API.getToolConcurrencyConfig().catch(function () { return null; }),
+      API.getSubAgentRetryConfig().catch(function () { return null; }),
     ]);
     chatSettingsConfirm.disabled = false;
     const ctx = results[0];
     const comp = results[1];
     const mcp = results[2];
     const retry = results[3];
-    const videoLimit = results[4];
-    const conc = results[5];
+    const compRetry = results[4];
+    const videoLimit = results[5];
+    const conc = results[6];
+    const subRetry = results[7];
     const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, comp && comp.defaults || {},
       mcp && mcp.defaults || {}, retry && retry.defaults || {},
-      videoLimit && videoLimit.defaults || {}, conc && conc.defaults || {});
+      compRetry && compRetry.defaults || {},
+      videoLimit && videoLimit.defaults || {}, conc && conc.defaults || {},
+      subRetry && subRetry.defaults || {});
     if (ctx && ctx.defaults) {
       Object.assign(defaults, ctx.defaults);
     }
@@ -723,25 +730,35 @@
       ? mcp.call_timeout_seconds : defaults.call_timeout_seconds;
     networkRetryMaxAttempts.value = retry && retry.max_attempts != null
       ? retry.max_attempts : defaults.network_retry_max_attempts;
+    compactionRetryMaxAttempts.value = compRetry && compRetry.max_attempts != null
+      ? compRetry.max_attempts : defaults.compaction_retry_max_attempts;
     videoReadMaxSeconds.value = videoLimit && videoLimit.max_seconds != null
       ? videoLimit.max_seconds : defaults.video_read_max_seconds;
     mcpToolWorkers.value = conc && conc.mcp_tool_workers != null
       ? conc.mcp_tool_workers : defaults.mcp_tool_workers;
     subAgentMaxConcurrent.value = conc && conc.sub_agent_max_concurrent != null
       ? conc.sub_agent_max_concurrent : defaults.sub_agent_max_concurrent;
+    subAgentFinalReplyRetryMax.value = subRetry && subRetry.final_reply_max_attempts != null
+      ? subRetry.final_reply_max_attempts : defaults.sub_agent_final_reply_retry_max;
+    subAgentStreamErrorRetryMax.value = subRetry && subRetry.stream_error_max_attempts != null
+      ? subRetry.stream_error_max_attempts : defaults.sub_agent_stream_error_retry_max;
+    subAgentTodoRemindMax.value = subRetry && subRetry.todo_remind_max != null
+      ? subRetry.todo_remind_max : defaults.sub_agent_todo_remind_max;
     keepRounds.value = comp && comp.keep_rounds != null ? comp.keep_rounds : defaults.keep_rounds;
     triggerRatio.value = comp && comp.trigger_ratio != null ? comp.trigger_ratio : defaults.trigger_ratio;
     summaryBudgetRatio.value = comp && comp.summary_budget_ratio != null ? comp.summary_budget_ratio : defaults.summary_budget_ratio;
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
     renderEffectiveThresholdHint(comp);
-    if (!ctx || !comp || !mcp || !retry || !videoLimit || !conc) {
+    if (!ctx || !comp || !mcp || !retry || !compRetry || !videoLimit || !conc || !subRetry) {
       toast((ctx ? "" : "回传长度配置加载失败；") +
         (comp ? "" : "压缩策略配置加载失败；") +
         (mcp ? "" : "MCP 工具超时配置加载失败；") +
         (retry ? "" : "网络重试配置加载失败；") +
+        (compRetry ? "" : "压缩重试配置加载失败；") +
         (videoLimit ? "" : "视频读取上限配置加载失败；") +
-        (conc ? "" : "工具并发配置加载失败"));
+        (conc ? "" : "工具并发配置加载失败；") +
+        (subRetry ? "" : "子智能体重试配置加载失败"));
     }
   }
 
@@ -780,9 +797,13 @@
     toolResultMaxLength.value = defaults.tool_result_max_length;
     toolCallTimeoutSeconds.value = defaults.call_timeout_seconds;
     networkRetryMaxAttempts.value = defaults.network_retry_max_attempts;
+    compactionRetryMaxAttempts.value = defaults.compaction_retry_max_attempts;
     videoReadMaxSeconds.value = defaults.video_read_max_seconds;
     mcpToolWorkers.value = defaults.mcp_tool_workers;
     subAgentMaxConcurrent.value = defaults.sub_agent_max_concurrent;
+    subAgentFinalReplyRetryMax.value = defaults.sub_agent_final_reply_retry_max;
+    subAgentStreamErrorRetryMax.value = defaults.sub_agent_stream_error_retry_max;
+    subAgentTodoRemindMax.value = defaults.sub_agent_todo_remind_max;
     keepRounds.value = defaults.keep_rounds;
     triggerRatio.value = defaults.trigger_ratio;
     summaryBudgetRatio.value = defaults.summary_budget_ratio;
@@ -798,19 +819,24 @@
   // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
   // - 工具执行超时/网络重试次数：>=0（0=不限制）
+  // - 压缩失败重试次数：任意整数（0 或负数=不限制，一直重试）
   // - 视频最大读取秒数：5–3600（越界/非法值读取端自动钳制，此处前置校验）
   // - 工具并发执行两项：>=1
   // - 触发比例/摘要预算比例/连续拒绝上限：>0
-  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, videoLimitConfig, concConfig) {
+  function collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, compRetryConfig, videoLimitConfig, concConfig, subRetryConfig) {
     const isNum = function (v) { return v != null && Number.isFinite(v); };
     const rows = [
       ["思考过程回传长度", ctxConfig.reasoning_max_length, function (v) { return isNum(v); }],
       ["工具结果回传长度", ctxConfig.tool_result_max_length, function (v) { return isNum(v); }],
       ["工具执行超时", mcpConfig.call_timeout_seconds, function (v) { return isNum(v) && v >= 0; }],
       ["网络失败重试次数", retryConfig.max_attempts, function (v) { return isNum(v) && v >= 0; }],
+      ["压缩失败重试次数", compRetryConfig.max_attempts, function (v) { return isNum(v); }],
       ["视频最大读取秒数", videoLimitConfig.max_seconds, function (v) { return isNum(v) && v >= 5 && v <= 3600; }],
       ["MCP 工具并发线程数", concConfig.mcp_tool_workers, function (v) { return isNum(v) && v >= 1; }],
       ["子智能体并发上限", concConfig.sub_agent_max_concurrent, function (v) { return isNum(v) && v >= 1; }],
+      ["子任务空收尾重试次数", subRetryConfig.final_reply_max_attempts, function (v) { return isNum(v); }],
+      ["子任务断流续跑次数", subRetryConfig.stream_error_max_attempts, function (v) { return isNum(v); }],
+      ["子任务计划未完成提醒次数", subRetryConfig.todo_remind_max, function (v) { return isNum(v); }],
       ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
       ["触发比例", compConfig.trigger_ratio, function (v) { return isNum(v) && v > 0; }],
       ["摘要预算比例", compConfig.summary_budget_ratio, function (v) { return isNum(v) && v > 0; }],
@@ -838,6 +864,9 @@
     const retryConfig = {
       max_attempts: readSettingNumber(networkRetryMaxAttempts),
     };
+    const compRetryConfig = {
+      max_attempts: readSettingNumber(compactionRetryMaxAttempts),
+    };
     const videoLimitConfig = {
       max_seconds: readSettingNumber(videoReadMaxSeconds),
     };
@@ -845,7 +874,12 @@
       mcp_tool_workers: readSettingNumber(mcpToolWorkers),
       sub_agent_max_concurrent: readSettingNumber(subAgentMaxConcurrent),
     };
-    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, videoLimitConfig, concConfig);
+    const subRetryConfig = {
+      final_reply_max_attempts: readSettingNumber(subAgentFinalReplyRetryMax),
+      stream_error_max_attempts: readSettingNumber(subAgentStreamErrorRetryMax),
+      todo_remind_max: readSettingNumber(subAgentTodoRemindMax),
+    };
+    const invalid = collectInvalidChatSettings(ctxConfig, compConfig, mcpConfig, retryConfig, compRetryConfig, videoLimitConfig, concConfig, subRetryConfig);
     if (invalid.length) {
       toast("请填写有效数值：" + invalid.join("、"));
       return;
@@ -856,8 +890,10 @@
       API.updateHistoryCompactionConfig(compConfig, state.sessionId),
       API.updateMcpToolConfig(mcpConfig),
       API.updateNetworkRetryConfig(retryConfig),
+      API.updateCompactionRetryConfig(compRetryConfig),
       API.updateVideoReadLimitConfig(videoLimitConfig),
       API.updateToolConcurrencyConfig(concConfig),
+      API.updateSubAgentRetryConfig(subRetryConfig),
     ]);
     chatSettingsConfirm.disabled = false;
     const failed = results.filter(function (r) { return r.status === "rejected"; });

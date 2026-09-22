@@ -9,13 +9,12 @@
 ```
 agent_tool_sse/
 ├── main.py                      # FastAPI 入口：init_path → 注册4个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 → uvicorn(48621)
-├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入
+├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）
 ├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载
 ├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp，可选 fitz/docx/pandas）
 ├── .env                         # 一些全局配置
 ├── project_structure.md         # 本文档
 ├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
-├── tmp_repro.py                 # 调试/问题复现用临时脚本
 ├── game/                        # 小实验：guess_number.py / snake.html
 │
 ├── setting/
@@ -30,11 +29,11 @@ agent_tool_sse/
 │   ├── agent_runtime/           # Agent 编排所需的可复用运行时组件
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
-│   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值
+│   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）
 │   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
 │   │   └── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
-│   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理
+│   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理；生成任务逃逸异常与 worker 崩溃均可见化（error SSE 帧 + JSONL 错误说明 + task_done 收尾）
 │   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则+回传长度/工具超时等可变配置实时说明
 │   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝、sub_agent 派发/并发/事件双写（JSONL+SSE）
 │   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）
@@ -49,7 +48,7 @@ agent_tool_sse/
 │
 ├── routers/                     # API 路由层
 │   ├── chat_router.py           # 聊天主接口 + 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
-│   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置
+│   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置；压缩失败重试 GET/POST /chat_config/compaction_retry
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
 │   ├── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频500MB流式）/Range 读取
@@ -75,6 +74,7 @@ agent_tool_sse/
 │   ├── index.html               # 单页应用入口（Ytools）
 │   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
 │   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
+│   │                            #   widget_reuse.js（流式保活渲染的控件复用配对决策，纯逻辑）/
 │   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
 │   │                            #   session_utils.js 等工具模块 + app.js（入口）+
 │   │                            #   app/（14 个功能模块：core/sessions/stats/workdir/
@@ -87,10 +87,10 @@ agent_tool_sse/
 │                                #   session_list_utils/session_utils/table_export，node --test）
 │
 ├── docs/
-│   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式）
+│   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
 │   ├── sub_agent_v1.md          # 子智能体（sub_agent 内置工具）V1 设计与实现依据文档
 │   ├── chat_momory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
-│   └── compact.md               # 压缩逻辑说明文档
+│   └── compact.md               # 压缩逻辑说明文档（含压缩失败重试链、失败终止任务策略、拼接优先累计合并）
 │
 ├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
 │                                 #   上传记录目录 history_files/session_files/<session>/（upload 改名而来）：文件解析 JSON + media/ + files/ + file_diffs/
@@ -193,7 +193,7 @@ agent_tool_sse/
 - **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入——`check_tool_exists` 检查工具在当前轮次任务中是否可用（区分"后端不存在"与"已注册但被用户禁用"，后者返回 exists=True + disabled=True 并提示本轮无法使用；选了外部工具时自动注入）；`todo_write` 模型自我规划（落盘侧车 `<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；系统提示终态注入收官提醒）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）
    - **上下文压缩**：由 `agent_runtime/context_compaction.py` 统一负责。压缩模型调用支持**流式接口**：传入 `event_emitter` 时以 `stream=True` 请求，模型思考/正文增量经 `phase="delta"` 事件（`reasoning_content`/`content` 与聊天 SSE 同名字段）实时推 SSE，delta 帧不落盘；done 事件携带 `summary_text` 最终累计摘要全文并随同一 payload 落盘 JSONL，前端刷新后可在压缩块回放摘要。跨轮历史与单轮工具轨迹达到「`min(聊天窗口,压缩窗口)×ratio`」时，使用压缩模型输出普通文本摘要，并归并为一个累计摘要块；已完成原始轮次只存储在 JSONL，不再回传给模型，全部历史原始用户问题保留最近 ≤10k tokens（`context_summary.recent_questions`），渲染为独立 system 消息；单次超大工具结果也会在下一次模型调用前触发；原始结果仍写入 JSONL 与 SSE。
 - **超大结果拒绝**：单次工具结果估算 token 超过 `min(聊天窗口,压缩窗口)×系数`（默认 1.5）时，结果不进入模型上下文，改写"输出过长，请重新考虑工具"反馈并让模型重新规划；JSONL 只落头尾节选预览（`result_preview`）。连续超长拒绝达到上限（默认 3）时终止任务并写入说明。
-- **错误处理**：上游流错误/用户停止/异常分别记录不同状态，避免误记；服务端取消（CancelledError）尽力落盘后重抛
+- **错误处理**：上游流错误/用户停止/异常分别记录不同状态，避免误记；服务端取消（CancelledError）尽力落盘后重抛。worker 模式下生成任务逃逸异常与 worker 进程崩溃均可见化：补发同构 error SSE 帧、错误说明落盘 JSONL 并合成 task_done 收尾（`session_worker._emit_uncaught_generate_error` / reader 崩溃合成路径），不再出现"任务静默终止无任何提示"。
 
 ### 3. Agent 运行时工具组件（`factory/agent_runtime/`）
 - 注册表：读 `setting/mcp_servers.json`，信号量并发探测（默认4并发、12s超时，可用 MCP_DISCOVERY_MAX_CONCURRENCY / MCP_DISCOVERY_TIMEOUT_SECONDS 配置），失败的服务器记录 metrics 不阻塞；schema 做白名单字段过滤防模型误用；返回的每个工具附带 `server_id`
@@ -204,7 +204,7 @@ agent_tool_sse/
 
 ### 4. MCP 客户端（`util/mcp_client.py`）
 - `build_stdio_server_parameters`：按扩展名自动选启动方式（.py→python / .js→node / .jar→java -jar / .exe→直启 / 命令字符串→PATH 查找 / shebang）
-- `call_mcp_tool`：会话初始化 → 校验工具存在 → 调用 → 递归解包 `ExceptionGroup` 提取真实异常
+- `call_mcp_tool`：会话初始化 → 校验工具存在 → 调用 → 版本无关解包异常组提取真实异常（`_is_exception_group` 鸭子类型识别：兼容 Python 3.11+ 内建 ExceptionGroup 与旧解释器 + mcp 1.x 的 exceptiongroup 回退包，旧环境不再报 `name 'ExceptionGroup' is not defined`）
 - `mcp_servers.json` 中相对路径的 args 自动解析为项目内绝对路径
 
 ### 5. 记忆管理（`memory/`）

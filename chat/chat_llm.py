@@ -561,6 +561,11 @@ class ChatLLM:
                     last_step = "read_sse_stream"
                     saw_finish_reason = False
                     saw_done = False
+                    # 零输出检测：任一正文/思考/工具调用增量出现即置位。
+                    # HTTP 200 但整条流没有任何有效输出（网关吞错返回空流、
+                    # 供应商过载、内容被上游静默丢弃）与连接失败同源且瞬时
+                    # 概率高，纳入 NETWORK_RETRY_MAX_ATTEMPTS 重连重发
+                    saw_any_output = False
                     for line in ChatLLM._iter_sse_body_lines(f, is_chunked):
                         line = line.strip()
                         if not line or not line.startswith(b"data: "):
@@ -592,6 +597,8 @@ class ChatLLM:
                         content = delta.get("content")
                         reasoning_content = delta.get("reasoning_content")
                         tool_calls_delta = delta.get("tool_calls")
+                        if content or reasoning_content or tool_calls_delta:
+                            saw_any_output = True
                         sse_data = {}
                         if chunk_id is not None:
                             sse_data["id"] = chunk_id
@@ -613,6 +620,25 @@ class ChatLLM:
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if not saw_any_output:
+                        # 200 + 正常收尾（或空收尾标记）但零输出：视同连接失败
+                        # 纳入网络重试，重连重发同一 payload（messages 未变，
+                        # 已 yield 的增量帧为空所以无重复内容风险）。达到上限
+                        # 才发终止性错误帧（retrying=False），由调用方落盘报错
+                        retry_count += 1
+                        empty_error = (
+                            f"API 返回 {status_str} 但整个响应流没有任何模型输出"
+                            f"（步骤:{last_step}）"
+                        )
+                        if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                            print(f"[ERROR] API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            yield f"data: {json.dumps({'error': f'{empty_error}，已重试 {retry_max_attempts} 次仍为空', 'error_type': 'empty_response', 'step': last_step, 'error_detail': empty_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        yield f"data: {json.dumps({'error': f'{empty_error}', 'error_type': 'empty_response', 'step': last_step, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                        print(f"[WARN] API 200 空响应，进入重试 #{retry_count}"
+                              + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
+                        continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     if not saw_done and not saw_finish_reason:
                         # 上游连接在流式响应完成前被关闭（EOF 且未收到
                         # finish_reason）：内容不完整。补发标记帧告知调用方
@@ -770,12 +796,11 @@ class ChatLLM:
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
-                    # 上游提前断开检测：EOF 结束且未收到 finish_reason（也未收到
-                    # [DONE]）说明内容不完整。EOF 与"上游正常发 [DONE]"走同一收尾
-                    # 路径，此前调用方无从区分——在合成 [DONE] 前补 stream_truncated
-                    # 标记帧供调用方决定重试策略（标记帧无 choices，前端自动忽略）
                     saw_finish_reason = False
                     saw_done = False
+                    # 零输出检测（语义见同步版注释）：HTTP 200 但整条流没有
+                    # 任何有效输出时纳入 NETWORK_RETRY_MAX_ATTEMPTS 重连重发
+                    saw_any_output = False
                     async for line in ChatLLM._aiter_sse_body_lines(reader, is_chunked, timeout_read, stop_checker):
                         line = line.strip()
                         if not line or not line.startswith(b"data: "):
@@ -807,6 +832,8 @@ class ChatLLM:
                         content = delta.get("content")
                         reasoning_content = delta.get("reasoning_content")
                         tool_calls_delta = delta.get("tool_calls")
+                        if content or reasoning_content or tool_calls_delta:
+                            saw_any_output = True
                         sse_data = {}
                         if chunk_id is not None:
                             sse_data["id"] = chunk_id
@@ -828,6 +855,23 @@ class ChatLLM:
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if not saw_any_output:
+                        # 200 + 正常收尾（或空收尾标记）但零输出：视同连接失败
+                        # 纳入网络重试（语义见同步版注释）
+                        retry_count += 1
+                        empty_error = (
+                            f"API 返回 {status_str} 但整个响应流没有任何模型输出"
+                            f"（步骤:{last_step}）"
+                        )
+                        if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                            print(f"[ERROR] API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            yield f"data: {json.dumps({'error': f'{empty_error}，已重试 {retry_max_attempts} 次仍为空', 'error_type': 'empty_response', 'step': last_step, 'error_detail': empty_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        yield f"data: {json.dumps({'error': f'{empty_error}', 'error_type': 'empty_response', 'step': last_step, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
+                        print(f"[WARN] API 200 空响应，进入重试 #{retry_count}"
+                              + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
+                        continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     if not saw_done and not saw_finish_reason:
                         # 上游连接在流式响应完成前被关闭（EOF 且未收到
                         # finish_reason）：内容不完整。补发标记帧告知调用方
@@ -910,11 +954,6 @@ class ChatLLM:
         chat_config = ChatLLM._resolve_chat_config(model_config)
         url = ChatLLM.confirm_completions_url(chat_config["url"])
         api_key = chat_config.get("apiKey") or "not-needed"
-        payload = ChatLLM._build_request_payload(
-            request,
-            stream=False,
-            model_name=chat_config["selected_model_id"],
-        )
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
         port = parsed.port
@@ -922,93 +961,118 @@ class ChatLLM:
         use_ssl = parsed.scheme == "https"
         if port is None:
             port = 443 if use_ssl else 80
-        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        sock = socket.create_connection((host, port), timeout=timeout_connect)
-        if use_ssl:
-            sock.settimeout(timeout_connect)
-            ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(sock, server_hostname=host)
-        try:
-            request_line = f"POST {path} HTTP/1.1\r\n"
-            header_lines = (
-                f"Host: {host}\r\n"
-                f"Content-Type: application/json\r\n"
-                f"Authorization: Bearer {api_key}\r\n"
-                # 模型配置的自定义请求头（model_selection.<role>.headers）
-                f"{_build_custom_header_lines(chat_config)}"
-                f"Content-Length: {len(body_bytes)}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
+        # 非流式零输出重试：HTTP 200 但响应无任何模型输出（空 body/空 choices/
+        # 空 message 字段）与连接失败同源，纳入 NETWORK_RETRY_MAX_ATTEMPTS
+        # 重连重发；达到上限抛 RuntimeError（调用方按既有异常语义兜底）
+        last_step = "none"
+        retry_count = 0
+        retry_max_attempts = _resolve_network_retry_max_attempts()
+        while True:
+            payload = ChatLLM._build_request_payload(
+                request,
+                stream=False,
+                model_name=chat_config["selected_model_id"],
             )
-            sock.settimeout(timeout_drain)
-            sock.sendall((request_line + header_lines).encode("utf-8") + body_bytes)
-            sock.settimeout(timeout_read)
-            f = sock.makefile("rb")
-            status_line = f.readline()
-            status_str = status_line.decode("utf-8", errors="replace").strip()
-            while "100" in status_str or "Continue" in status_str:
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            last_step = "connect"
+            sock = socket.create_connection((host, port), timeout=timeout_connect)
+            if use_ssl:
+                sock.settimeout(timeout_connect)
+                ctx = ssl.create_default_context()
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            try:
+                request_line = f"POST {path} HTTP/1.1\r\n"
+                header_lines = (
+                    f"Host: {host}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Authorization: Bearer {api_key}\r\n"
+                    # 模型配置的自定义请求头（model_selection.<role>.headers）
+                    f"{_build_custom_header_lines(chat_config)}"
+                    f"Content-Length: {len(body_bytes)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                )
+                sock.settimeout(timeout_drain)
+                sock.sendall((request_line + header_lines).encode("utf-8") + body_bytes)
+                sock.settimeout(timeout_read)
+                f = sock.makefile("rb")
+                status_line = f.readline()
+                status_str = status_line.decode("utf-8", errors="replace").strip()
+                while "100" in status_str or "Continue" in status_str:
+                    while True:
+                        header_line = f.readline()
+                        header_str = header_line.decode("utf-8", errors="replace").strip()
+                        if not header_str:
+                            break
+                    status_line = f.readline()
+                    status_str = status_line.decode("utf-8", errors="replace").strip()
+                resp_headers = {}
                 while True:
                     header_line = f.readline()
                     header_str = header_line.decode("utf-8", errors="replace").strip()
                     if not header_str:
                         break
-                status_line = f.readline()
-                status_str = status_line.decode("utf-8", errors="replace").strip()
-            resp_headers = {}
-            while True:
-                header_line = f.readline()
-                header_str = header_line.decode("utf-8", errors="replace").strip()
-                if not header_str:
-                    break
-                if ":" in header_str:
-                    h_key, h_val = header_str.split(":", 1)
-                    resp_headers[h_key.strip().lower()] = h_val.strip()
-            is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
-            if "200" not in status_str and "201" not in status_str:
-                error_body = ChatLLM._read_full_response_body(f, is_chunked)
-                raise RuntimeError(f"HTTP Error: {status_str}: {error_body.decode('utf-8', errors='replace')}")
-            response_body = ChatLLM._read_full_response_body(f, is_chunked)
-            response_text = response_body.decode("utf-8", errors="replace")
-            try:
-                response_json = json.loads(response_text) if response_text else {}
-            except json.JSONDecodeError as exc:
-                # 带上下文抛出，便于诊断网关返回非 JSON（HTML 错误页/空体/分块未解码等）
-                raise RuntimeError(
-                    f"压缩/非流式响应不是有效 JSON（{status_str}）：{exc}；"
-                    f"body 前 300 字符：{response_text[:300]!r}"
-                ) from exc
-            choices = response_json.get("choices", [])
-            if not choices:
+                    if ":" in header_str:
+                        h_key, h_val = header_str.split(":", 1)
+                        resp_headers[h_key.strip().lower()] = h_val.strip()
+                is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
+                if "200" not in status_str and "201" not in status_str:
+                    last_step = "read_error_body"
+                    error_body = ChatLLM._read_full_response_body(f, is_chunked)
+                    raise RuntimeError(f"HTTP Error: {status_str}: {error_body.decode('utf-8', errors='replace')}")
+                last_step = "read_body"
+                response_body = ChatLLM._read_full_response_body(f, is_chunked)
+                response_text = response_body.decode("utf-8", errors="replace")
+                try:
+                    response_json = json.loads(response_text) if response_text else {}
+                except json.JSONDecodeError as exc:
+                    # 带上下文抛出，便于诊断网关返回非 JSON（HTML 错误页/空体/分块未解码等）
+                    raise RuntimeError(
+                        f"压缩/非流式响应不是有效 JSON（{status_str}）：{exc}；"
+                        f"body 前 300 字符：{response_text[:300]!r}"
+                    ) from exc
+                choices = response_json.get("choices", [])
+                message = (choices[0].get("message", {}) or {}) if choices else {}
+                content = message.get("content")
+                reasoning_content = message.get("reasoning_content")
+                tool_calls = message.get("tool_calls")
+                has_output = bool(
+                    (isinstance(content, str) and content.strip())
+                    or (isinstance(reasoning_content, str) and reasoning_content.strip())
+                    or tool_calls
+                )
+                if not has_output:
+                    # 200 但零输出：纳入网络重试重发同一 payload
+                    retry_count += 1
+                    empty_error = (
+                        f"API 返回 {status_str} 但响应没有模型输出"
+                        f"（步骤:{last_step}，body 前 200 字符：{response_text[:200]!r}）"
+                    )
+                    if retry_max_attempts > 0 and retry_count > retry_max_attempts:
+                        raise RuntimeError(
+                            f"API 200 空响应（步骤:{last_step}），已重试 {retry_max_attempts} 次仍为空: {empty_error}"
+                        )
+                    print(
+                        f"[WARN] API 200 空响应，进入重试 #{retry_count}"
+                        + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到手动停止）")
+                    )
+                    continue  # finally 先关闭当前连接，随后重连重发同一 payload
+                finish_reason = choices[0].get("finish_reason")
+                usage = response_json.get("usage")
                 return {
                     "id": response_json.get("id"),
-                    "content": "",
-                    "reasoning_content": "",
-                    "tool_calls": [],
-                    "finish_reason": None,
-                    "usage": response_json.get("usage"),
+                    "content": content,
+                    "reasoning_content": reasoning_content,
+                    "tool_calls": tool_calls,
+                    "finish_reason": finish_reason,
+                    "usage": usage,
                     "raw": response_json,
                 }
-            choice = choices[0]
-            message = choice.get("message", {}) or {}
-            content = message.get("content")
-            reasoning_content = message.get("reasoning_content")
-            tool_calls = message.get("tool_calls")
-            finish_reason = choice.get("finish_reason")
-            usage = response_json.get("usage")
-            return {
-                "id": response_json.get("id"),
-                "content": content,
-                "reasoning_content": reasoning_content,
-                "tool_calls": tool_calls,
-                "finish_reason": finish_reason,
-                "usage": usage,
-                "raw": response_json,
-            }
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

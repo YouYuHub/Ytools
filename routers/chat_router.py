@@ -930,6 +930,8 @@ async def compact_chat_context_manual(
             force_all=True,
             # 手动压缩无 SSE 流可推，仅落盘同一结构的事件行，历史加载时可见
             event_emitter=lambda payload: manager.add_context_compaction_event(payload),
+            # 触发来源 = 用户手动触发
+            trigger_reason="manual",
         )
         stats = await manager.get_context_token_stats(
             tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
@@ -1008,6 +1010,8 @@ async def _manual_compaction_event_stream(
                 enforce=True,
                 force_all=True,
                 event_emitter=emit,
+                # 触发来源 = 用户手动触发
+                trigger_reason="manual",
             )
             result["stats"] = await manager.get_context_token_stats(
                 tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,

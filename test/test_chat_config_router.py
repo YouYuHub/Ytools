@@ -627,6 +627,74 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env_vars.get("ONE_TASK_MAX_WORKERS"), "6")
         self.assertEqual(env_vars.get("SUB_AGENT_MAX_CONCURRENT"), "7")
 
+    async def test_compaction_retry_config_get_and_post(self) -> None:
+        before = await self.router.get_compaction_retry_config()
+        before_body = json.loads(before.body.decode("utf-8"))
+        self.assertEqual(before.status_code, 200)
+        # 默认 2 条完整降级链（与既有外层 attempt (1,2) 行为一致）
+        self.assertEqual(before_body["max_attempts"], 2)
+        self.assertEqual(before_body["defaults"]["max_attempts"], 2)
+        self.assertEqual(before_body["env_names"]["max_attempts"], "COMPACTION_RETRY_MAX_ATTEMPTS")
+        self.assertEqual(before_body["semantics"]["retry_interval_seconds"], 1)
+
+        response = await self.router.update_compaction_retry_config(
+            self.router.CompactionRetryConfig(max_attempts=5)
+        )
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["config"]["max_attempts"], 5)
+        self.assertEqual(body["memory_state"]["COMPACTION_RETRY_MAX_ATTEMPTS"], "5")
+        content = (self._temp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn("COMPACTION_RETRY_MAX_ATTEMPTS=5", content)
+
+        from env_manager import env_vars
+        self.assertEqual(env_vars.get("COMPACTION_RETRY_MAX_ATTEMPTS"), "5")
+
+        # 0 或负数合法 = 不限制（一直重试）
+        response_unlimited = await self.router.update_compaction_retry_config(
+            self.router.CompactionRetryConfig(max_attempts=0)
+        )
+        unlimited_body = json.loads(response_unlimited.body.decode("utf-8"))
+        self.assertEqual(unlimited_body["config"]["max_attempts"], 0)
+
+    async def test_sub_agent_retry_config_get_and_post(self) -> None:
+        before = await self.router.get_sub_agent_retry_config()
+        before_body = json.loads(before.body.decode("utf-8"))
+        self.assertEqual(before.status_code, 200)
+        self.assertEqual(before_body["final_reply_max_attempts"], 3)
+        self.assertEqual(before_body["stream_error_max_attempts"], 3)
+        self.assertEqual(before_body["todo_remind_max"], 3)
+        self.assertEqual(
+            before_body["env_names"],
+            {
+                "final_reply_max_attempts": "SUB_AGENT_FINAL_REPLY_RETRY_MAX",
+                "stream_error_max_attempts": "SUB_AGENT_STREAM_ERROR_RETRY_MAX",
+                "todo_remind_max": "SUB_AGENT_TODO_REMIND_MAX",
+            },
+        )
+
+        response = await self.router.update_sub_agent_retry_config(
+            self.router.SubAgentRetryConfig(
+                final_reply_max_attempts=5,
+                stream_error_max_attempts=-1,
+                todo_remind_max=0,
+            )
+        )
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["config"]["final_reply_max_attempts"], 5)
+        self.assertEqual(body["config"]["stream_error_max_attempts"], -1)
+        self.assertEqual(body["config"]["todo_remind_max"], 0)
+        content = (self._temp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn("SUB_AGENT_FINAL_REPLY_RETRY_MAX=5", content)
+        self.assertIn("SUB_AGENT_STREAM_ERROR_RETRY_MAX=-1", content)
+        self.assertIn("SUB_AGENT_TODO_REMIND_MAX=0", content)
+
+        from env_manager import env_vars
+        self.assertEqual(env_vars.get("SUB_AGENT_FINAL_REPLY_RETRY_MAX"), "5")
+        self.assertEqual(env_vars.get("SUB_AGENT_STREAM_ERROR_RETRY_MAX"), "-1")
+        self.assertEqual(env_vars.get("SUB_AGENT_TODO_REMIND_MAX"), "0")
+
 
 if __name__ == "__main__":
     unittest.main()

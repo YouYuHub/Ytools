@@ -356,6 +356,13 @@ class SubAgentRunner:
  "todos":[{"id":"1","content":"...","status":"in_progress"}],
  "timestamp":"..."}
 
+// —— notice（交付保障重试提示：空收尾重试/断流续跑/todo 提醒，§10.1）——
+{"event":"sub_agent", "agent_id":"agent_7f82c1a9", "parent_tool_call_id":"call_abc123",
+ "agent_index":0, "phase":"notice",
+ "message":"todo 计划仍有 1 项未完成，已提醒子模型继续（第 1 次，上限 3）",
+ "retry_kind":"todo_remind | final_reply | stream_error", "seq":2,
+ "timestamp":"..."}
+
 // —— done（收尾，唯一收口）——
 {"event":"sub_agent", "agent_id":"agent_7f82c1a9", "parent_tool_call_id":"call_abc123",
  "agent_index":0, "phase":"done",
@@ -371,13 +378,14 @@ class SubAgentRunner:
 - 所有条目**不带 role 字段**（区别于消息类事件）；
 - `agent_index`、`parent_agent_id` 属冗余便利字段：前端不必逐条解析父调用链即可排序/命名；
 - `phase=delta` / `phase=heartbeat` 仅实时 SSE 推送、**不落盘**（与 `context_compaction` 的 delta 策略一致）；
+- `phase=notice` 落盘（历史回放可见，交付保障审计），`message` 必须为非空文案；
 - todo 校验失败（父给的 `todo` 参数不合法）时 start 事件缺省 todo 字段并在 task 前追加一行告警说明。
 
 ### 7.2 持久层改动清单（精确到函数）
 
 | 文件 | 改动 | 原因 |
 |---|---|---|
-| `memory/chat_round_store.py` `_is_valid_event()` | 新增 `event=="sub_agent"` 分支：校验 `agent_id`/`parent_tool_call_id` 非空、`phase` ∈ {start, model_call, tool_start, tool_result, todo, done}；start 需 task 非空；done 需 status ∈ 白名单 | **不改则全部子事件被静默丢弃（最大坑）** |
+| `memory/chat_round_store.py` `_is_valid_event()` | 新增 `event=="sub_agent"` 分支：校验 `agent_id`/`parent_tool_call_id` 非空、`phase` ∈ {start, model_call, tool_start, tool_result, todo, notice, done}；start 需 task 非空；notice 需 message 非空；done 需 status ∈ 白名单 | **不改则全部子事件被静默丢弃（最大坑）** |
 | `chat_round_store.ChatRoundStore` | 新增 `record_sub_agent_event(payload)`：pending_round 存在性校验（子任务只存在于父轮进行中）→ `_is_valid_event` → 补 timestamp → append；不触发收尾 | 落盘入口 |
 | `memory/chat_memory.py` | 新增 `add_sub_agent_event(payload)`：`_write_guard` 内调 record_sub_agent_event + 检查点快照（同 add_chat_history 模式） | 崩溃恢复不丢子轨迹 |
 | `memory/chat_history_format.py` | `round_entry_to_context_messages`（两模式）与 `round_entry_to_compaction_text` 循环开头统一：`if event.get("event") == "sub_agent": continue` | 历史重建/压缩输入**显式排除**子轨迹（text/tool_result 模式虽因无 role 天然跳过，compaction 渲染必须显式排除） |
@@ -400,6 +408,7 @@ class SubAgentRunner:
 | `{event:"sub_agent", phase:"tool_start", agent_id, tool_call_id, function_name, arguments}` | ✅ | 块内工具块置"执行中" |
 | `{event:"sub_agent", phase:"tool_result", agent_id, ...}` | ✅ | 块内工具块填充结果（含 blocked/timeout/oversized 标记） |
 | `{event:"sub_agent", phase:"todo", agent_id, todos}` | ✅ | 块内 todo 卡片（复用父级 todo 渲染组件） |
+| `{event:"sub_agent", phase:"notice", agent_id, message, retry_kind, seq}` | ✅ | 块内浅色条目展示交付保障重试提示（空收尾重试/断流续跑/todo 提醒，§10.1） |
 | `{event:"sub_agent", phase:"heartbeat", agent_id, rounds, elapsed_seconds}` | ❌ | 块状态条更新"仍在执行"（长工具调用期间 15s 间隔） |
 | `{event:"sub_agent", phase:"done", agent_id, status, final_reply, rounds, usage_total, error}` | ✅ | 块收口折叠为摘要条，可展开回看全量轨迹 |
 
@@ -438,8 +447,23 @@ class SubAgentRunner:
 | `SUB_AGENT_MAX_CONCURRENT` | 3 | 同一父轮并发子任务上限（Semaphore；超出的排队执行） |
 | `SUB_AGENT_TIMEOUT_SECONDS` | 900 | 单个子任务整体超时 |
 | `SUB_AGENT_REPLY_MAX_CHARS` | 30000 | 最终回复截断保护（完整轨迹始终在 JSONL 块） |
+| `SUB_AGENT_FINAL_REPLY_RETRY_MAX` | 3 | 空收尾重试上限：收尾轮最终回复为空时注入内部消息要求重新交付；0/负=不限制；耗尽按 `error` 收尾（不再伪装 done+占位文本） |
+| `SUB_AGENT_STREAM_ERROR_RETRY_MAX` | 3 | 流式调用错误断点续跑上限：出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；0/负=不限制 |
+| `SUB_AGENT_TODO_REMIND_MAX` | 3 | 收尾时 todo 未完成提醒上限（每次完整工具执行轮后额度重置）；0=关闭，负=不限制 |
 
 读取口径与项目一致（`load_var` 实时求值，可变说明进子/父系统提示）。
+
+### 10.1 交付保障机制（delivery guarantee）
+
+子任务三层递进的"确保最终输出"机制（`SubAgentRunner._run_inner` 收尾分支 + 模型调用后判定，配置见 `load_sub_agent_retry_limits`）：
+
+1. **todo 未完成提醒**：收尾轮 `self.todo` 仍有 pending/in_progress 项时注入内部消息要求继续（或先更新 todo 再收尾）；额度在**每次完整工具执行轮后重置**（工具轮后再次"忘记"可重新提醒），子任务给出有效最终回复即正常收尾不再催促；
+2. **空收尾重试**：`full_response` 为空（含"仅思考输出"场景）不算有效交付——注入内部消息让子模型再次交付；累计耗尽按 `error` 收尾，final_reply 为进展说明（带最后正文预览 + todo 状态），父级可据此重派或换路径；
+3. **流错误断点续跑**：模型调用 `stream_error`（ChatLLM 网络层重试耗尽后的最终失败）不再直接终止——已生成的部分内容进入 messages，注入内部消息让子模型从断点继续（已完成的工作不丢失）；累计耗尽才 error 收尾。
+
+约束：所有重试均以内部消息推进并消耗 rounds，受 `max_rounds`/`timeout_seconds` 双重硬封顶——配置为不限制（0/负）也不会失控。每次重试向父循环推送 `notice` phase 事件（SSE + JSONL 落盘，字段 `{message, retry_kind: final_reply|stream_error|todo_remind, seq}`），前端在子任务块内以浅色条目展示，历史回放可见。
+
+> 父级聊天主循环**没有** todo 提醒机制（主智能体不调工具即正常收尾，由用户重发消息驱动），也没有空收尾重试——父级的空响应防护由 ChatLLM 层"零输出检测重发"承担（见 api_docs「网络请求失败重试」）。
 
 ---
 

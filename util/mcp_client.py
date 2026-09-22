@@ -20,6 +20,35 @@ try:
 except NameError:
     BaseExceptionGroup = tuple()  # type: ignore[assignment,misc]
 
+
+def _is_exception_group(exc: BaseException) -> bool:
+    """版本无关的 ExceptionGroup 识别（Python < 3.11 无内建名也能用）。
+
+    mcp SDK 经由 anyio 并发关闭连接/取消任务时会抛异常组：新版本是内建
+    ExceptionGroup / BaseExceptionGroup；旧版本（mcp 1.x 常配 Python 3.10-）
+    是 exceptiongroup 回退包或 anyio 内部的同结构类——这些类型互不继承，
+    `isinstance(exc, ExceptionGroup)` 或 `except ExceptionGroup` 在旧解释器上
+    会因内建名缺失直接 NameError（求值 except 子句时抛出），导致所有工具
+    调用必失败。统一按「类型名 + .exceptions 结构」鸭子类型识别。
+    """
+    # 新环境命中内建基类；旧环境该名回退为空元组，isinstance 恒 False 不误判
+    if isinstance(exc, BaseExceptionGroup):  # type: ignore[arg-type]
+        return True
+    return (
+        type(exc).__name__ in {"ExceptionGroup", "BaseExceptionGroup"}
+        and hasattr(exc, "exceptions")
+    )
+
+
+def _unwrap_exception_group(exc: BaseException) -> BaseException:
+    """递归解包异常组，取第一个非组子异常；普通异常原样返回。"""
+    if not _is_exception_group(exc):
+        return exc
+    subs = getattr(exc, "exceptions", None)
+    if not subs:
+        return exc
+    return _unwrap_exception_group(subs[0])
+
 # 第三方库
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -207,8 +236,8 @@ def build_stdio_server_parameters(mcp_service: str) -> StdioServerParameters:
 
 
 def _format_mcp_error(exc: BaseException) -> str:
-    """提取 ExceptionGroup 中的子异常消息，便于诊断。"""
-    if isinstance(exc, BaseExceptionGroup):
+    """提取异常组中的子异常消息，便于诊断（版本无关）。"""
+    if _is_exception_group(exc):
         messages = []
         for sub in exc.exceptions:
             msg = _format_mcp_error(sub)
@@ -393,30 +422,22 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
                 except Exception as call_error:
                     # 重新抛出工具调用错误
                     raise call_error
-    except ExceptionGroup as eg:
-        # 解包 ExceptionGroup，提取第一个有意义的异常
-        # ExceptionGroup 可能嵌套多层，需要递归查找
-
-        def extract_real_exception(exc_group):
-            """递归提取 ExceptionGroup 中的真实异常"""
-            if hasattr(exc_group, 'exceptions') and exc_group.exceptions:
-                # 取第一个异常
-                first_exc = exc_group.exceptions[0]
-                # 如果还是 ExceptionGroup，继续递归
-                if isinstance(first_exc, ExceptionGroup):
-                    return extract_real_exception(first_exc)
-                return first_exc
-            return exc_group
-        
-        real_exception = extract_real_exception(eg)
-        # 如果是 ValueError（工具验证错误），直接抛出
+    except Exception as error:
+        # 统一异常收口（版本无关）：
+        # - anyio 在退出 stdio_client/ClientSession 上下文时会把底层异常打包成
+        #   异常组抛出（Python 3.11+ 是内建 ExceptionGroup / BaseExceptionGroup；
+        #   旧解释器 + mcp 1.x 是 exceptiongroup 回退包的同结构类）。直接写
+        #   `except ExceptionGroup` 在旧解释器上因内建名缺失求值即 NameError，
+        #   所有工具调用必失败——这里按鸭子类型解包到真实子异常。
+        # - 保留 ValueError 原样抛出（工具校验/结果错误，语义已明确）；
+        #   其余包装为 RuntimeError 并保留真实异常链。
+        real_exception = _unwrap_exception_group(error)
         if isinstance(real_exception, ValueError):
-            raise real_exception
-        # 其他异常，包装后抛出
-        raise RuntimeError(f"MCP 调用失败: {real_exception}") from real_exception
-    except Exception as e:
-        # 其他异常直接抛出
-        raise e
+            raise real_exception from error
+        if real_exception is not error:
+            detail = _format_mcp_error(error)
+            raise RuntimeError(f"MCP 调用失败: {detail}") from real_exception
+        raise error
 
 
 async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:

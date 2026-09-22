@@ -32,8 +32,8 @@
 - `tool_calls`：工具调用增量（按 index 合并）
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
-- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）
-- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行——上一轮正常完成后**无需重载会话**即可继续编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口）。覆盖式回答截断可能使轮次偏移，事件在截断后统一推送；失败路径不推送（前端走失败重载兜底）；仅实时推送不落盘
+- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）。推送时同步记录到任务流（`live_round_no`），供回放标记携带——`round_started` 帧位于回放起点之前，附接消费端收不到，轮次号必须随回放标记下发
+- `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
@@ -45,9 +45,9 @@
 | 场景 | 阶段 | payload 字段 |
 |---|---|---|
 | 单轮压缩开始 | `start` | `{"event":"context_compaction","scope":"round","phase":"start","role":"assistant","compress_context":<将被压缩的本轮轨迹节选，≤800 tokens>}` |
-| 单轮压缩完成 | `done` | `{"event":"context_compaction","scope":"round","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"compress_usage":{usage..., before_tokens, after_tokens, fallback, block_count, cumulative:true}}` |
+| 单轮压缩完成 | `done` | `{"event":"context_compaction","scope":"round","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时全量上下文估算>,"after_tokens":<压缩后全量上下文估算>,"token_limit":<触发阈值 = min(聊天,压缩)窗口 × trigger_ratio>,"compress_usage":{usage..., before_tokens, after_tokens, fallback, block_count, cumulative:true}}` |
 | 跨轮压缩开始 | `start` | `{"event":"context_compaction","scope":"session","phase":"start","role":"assistant","context_summary":<将压缩的旧轮次节选，≤800 tokens>}` |
-| 跨轮压缩完成 | `done` | `{"event":"context_compaction","scope":"session","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"summary_usage":{usage..., compressed_rounds, fallback, cumulative:true}}` |
+| 跨轮压缩完成 | `done` | `{"event":"context_compaction","scope":"session","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时历史部分估算>,"after_tokens":<压缩后历史部分估算>,"token_limit":<本批预算（压缩批输入预算）>,"trigger_reason":<auto\|task\|first_call\|post\|manual>,"trigger_context_tokens":<task/first_call 路径的真实触发规模（全量上下文），其余路径省略>,"trigger_threshold":<task/first_call 路径的真实触发阈值（单轮阈值/模型窗口），其余路径省略>,"summary_usage":{usage..., compressed_rounds, fallback, cumulative:true}}` |
 | 累计摘要更新 | `done` | `{"event":"context_compaction","scope":"round/session","phase":"done","summary_text":<累计摘要全文>,"...usage":{usage..., cumulative:true}}` |
 | 压缩中断标记 | `aborted` | `{"event":"context_compaction","scope":"round/session","phase":"aborted","role":"assistant","reason":"task_interrupted"}` |
 
@@ -55,6 +55,8 @@
 - JSONL 落盘行在 `timestamp` 之外与 SSE payload 逐字段一致；该行不参与 `usage`/`user_questions`/`chat_round` 统计（仅 `record_count` 计数）。
 - 跨轮和单轮压缩都将新摘要合并为一个累计摘要块；合并结果随当前 `done` 事件返回，不再额外发送 `merge_block_count` 事件。
 - 单轮压缩的 `before_tokens` 为全量上下文（历史+系统提示+当前轮+工具定义）；当前轮轨迹不足阈值一半时跳过压缩（防空转，超窗主要来自历史时交由跨轮压缩/首调用预算检查处理）。
+- **触发点核对**：`done` 事件同时携带 `before_tokens`（触发规模）与 `token_limit`（触发阈值），前端压缩块显示"上下文/历史上下文 X → Y · 触发阈值 Z"。注意与 `compress_usage.prompt_tokens`（**压缩模型调用自身的输入量**，即被压缩节选文本的规模）区分——后者不是触发点，触发判断始终是 `before_tokens > token_limit`（任务内压缩）或历史估算 > 阈值（跨轮压缩）。
+- **触发来源**（`trigger_reason`，随 done 事件落盘，历史回放可见）：`auto`=任务开始自动（历史超阈值或未压缩轮次超 keep_rounds 保护）、`task`=任务内检查点（当前轮工具轨迹推高全量上下文超阈值，强制压缩历史；`trigger_context_tokens` 为全量规模、`trigger_threshold` 为单轮阈值）、`first_call`=首次调用超窗降级（`trigger_context_tokens` 为首调用全量规模、`trigger_threshold` 为模型窗口）、`post`=任务收尾、`manual`=用户手动。前端 detail 行显示"触发阈值 … · 本批预算 … · 触发来源 …（全量上下文 X > 阈值 Z）"，与"本批预算"（压缩批输入预算）明确区分。
 - **压缩失败策略**：压缩模型未配置或配置不可用时自动使用当前聊天模型压缩；压缩模型调用失败时换聊天模型重试一次；聊天模型仍失败则抛出终止级错误，**任务终止**（不再节选降级）——请求前/单轮压缩失败会立即推送错误帧并停止生成。
 - **任务中断恢复**：压缩结果采用"完成后一次性写入"，中断不会留下半成品数据。若上次任务在压缩进行中被终止（有 `start` 无 `done`），下次请求开始时会自动补一条 `aborted` 事件（前端把对应条目置为中断态），未覆盖的轮次由常规压缩按预算**重新压缩**。
 
@@ -70,6 +72,7 @@
 | `tool_start` | `{agent_id, seq, tool_call_id, tool_name, arguments}` |
 | `tool_result` | `{agent_id, seq, tool_call_id, tool_name, arguments, result, oversized?}` |
 | `todo` | `{agent_id, todos[]}`（子任务私有计划，只存事件块内） |
+| `notice` | `{agent_id, message, retry_kind: final_reply\|stream_error\|todo_remind, seq}`（交付保障重试提示，§10.1；落盘供历史回放） |
 | `done` | `{agent_id, status, final_reply, rounds, usage_total, error, ended_at}`；status ∈ `done|error|stopped|interrupted|timeout|max_rounds` |
 
 - 身份模型：`agent_id`（`agent_<8hex>`，子智能体实例 ID，轮内唯一）与 `parent_tool_call_id`（父级 tool_call id，用于归属父轮与关联父级工具气泡）分离；同一父级 tool_call 一次重派不会复用旧 `agent_id`。
@@ -239,6 +242,12 @@ manifest.json                     # {version, exported_at, sessions: [{session_i
 | /chat_config/video_read_limit | POST | Body `{max_seconds}`（整数，缺省用默认 60） | `{state, updated, config}`；写回 .env 并同步内存，下一次 read_media 调用即按新值读取（工具描述动态构建现读）；越界值保存原样、生效值钳制 5–3600 |
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.j |
+| /chat_config/network_retry | GET | - | `{max_attempts, defaults, semantics, env_names, memory_state}`；模型网络请求连续失败重试上限（.env `NETWORK_RETRY_MAX_ATTEMPTS`，默认 3） |
+| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。**覆盖范围**：连接失败/读超时/非 2xx/**HTTP 200 但整条响应流没有任何模型输出（空流）**、非流式 200 空响应（空 body/空 choices/空 message 字段）——空响应按同一计数纳入重试并重发同一 payload，`error_type=empty_response`；重试对所有模型角色（聊天/压缩/标题/子智能体）统一生效 |
+| /chat_config/compaction_retry | GET | - | `{max_attempts, defaults, semantics{attempt, 0_or_negative, positive, retry_interval_seconds}, env_names, memory_state}`；上下文压缩调用失败重试上限（.env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）。一次"尝试"=一条完整"压缩模型→聊天模型"降级链（同源时本条链只有一次调用），链间隔固定 1 秒；达到次数抛 `ContextCompactionError` 终止当前任务 |
+| /chat_config/compaction_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次压缩调用立即生效；0 或负数=不限制（整条降级链一直重试直到手动停止） |
+| /chat_config/sub_agent_retry | GET | - | `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max, defaults, semantics, env_names, memory_state}`；子智能体交付保障重试配置（详见"子智能体（sub_agent）配置"节 §10.1） |
+| /chat_config/sub_agent_retry | POST | Body `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次子任务立即生效。`final_reply`/`stream_error`：0 或负数=不限制（仍受 max_rounds/timeout 硬封顶）；`todo_remind`：0=关闭提醒，负数=不限制（每次完整工具执行轮后额度重置） |
 | /chat_config/retitle_setting | GET | `session_id`（必填） | `{state, session_id, enabled, exists, title_state: {title_generated, attempted}}`；读取会话「每条消息重新标题」开关（`_meta.retitle_each_message`，会话独立配置，未设置视为关闭）与标题生成状态概览 |
 | /chat_config/retitle_setting | POST | Body `{session_id, enabled}` | `{state, session_id, enabled, message}`；写入会话「每条消息重新标题」开关：开启时每轮任务收尾都重新生成标题（开启瞬间清除 `_title_state.attempted`），关闭时仅首轮生成一次；会话不存在返回 404 |son（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；空 `inputs` 清除会话覆盖恢复跟随全局默认；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 
@@ -321,7 +330,22 @@ SUB_AGENT_MAX_ROUNDS=40         # 子任务工具调用轮次上限，达到后�
 SUB_AGENT_MAX_CONCURRENT=3      # 一批子任务的并发信号量
 SUB_AGENT_TIMEOUT_SECONDS=900   # 子任务整体超时（0=不限制），超时取消并兜底补写 done(timeout)
 SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（完整轨迹始终在 JSONL 事件块）
+SUB_AGENT_FINAL_REPLY_RETRY_MAX=3  # 空收尾重试上限（0/负=不限制）；耗尽按 error 收尾，不再伪装 done
+SUB_AGENT_STREAM_ERROR_RETRY_MAX=3 # 流式调用错误断点续跑上限（0/负=不限制）
+SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关闭，负=不限制；每次工具执行轮后额度重置）
 ```
+
+前端配置：「聊天设置」模态框新增三个输入项（子任务空收尾重试次数 / 子任务断流续跑次数 / 子任务计划未完成提醒次数），经 `GET/POST /chat_config/sub_agent_retry` 读写上述 env。
+
+**交付保障机制**（详见 docs/sub_agent_v1.md §10.1）：三项重试均为"注入内部消息让子模型继续"的语义——
+
+- **todo 未完成提醒**：收尾轮计划仍有 pending/in_progress 项时提醒继续；额度在每次完整工具执行轮后重置；给出有效最终回复即正常收尾、不再催促；
+- **空收尾重试**：最终回复为空（含仅思考输出）不算有效交付，要求重新交付；耗尽按 `error` 收尾并附进展说明（最后正文预览 + todo 状态），父级可据此重派——**消除旧版"done + （子智能体未输出有效内容）占位文本"的伪成功**；
+- **流错误断点续跑**：模型调用失败后从已有进度继续（工具轨迹/todo 都在上下文不丢失），耗尽才 error 收尾。
+
+每次重试推送 `notice` phase 事件（SSE + JSONL，字段 `{message, retry_kind, seq}`），前端子任务块内浅色条目展示、历史回放可见。所有重试消耗 rounds，受 `max_rounds`/`timeout_seconds` 双重硬封顶，配置为不限制也不会失控。
+
+> 另：所有模型调用共用的"HTTP 200 但响应流零输出"防护由 ChatLLM 层承担——见「网络请求失败重试」（`NETWORK_RETRY_MAX_ATTEMPTS`），空流自动重发同一 payload，对聊天/压缩/标题/子智能体全部角色生效。
 
 启用方式：「配置工具」模态框「内置工具」分组勾选 `sub_agent`（伪服务 `__builtin__`）。父智能体调用参数：`task`（必填，自包含任务描述：目标/路径/已有结论/验收标准）+ `todo`（可选，预置计划数组，最多 20 项，随 start 事件显示在子任务块内）。子任务自身的 todo 独立存储（只显示在子任务块内，不写入父会话 `_meta.todo`）。
 
@@ -485,6 +509,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - `max_oversized_rejections`（可选，对应 env `HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS`，默认 3）：**连续**超长拒绝次数达到该值时终止当前任务（写入一条 assistant 说明消息并正常收尾）。
 
 > 说明：压缩模型**不再**由本接口配置。压缩模型选择统一由 `POST /chat_config/models/select`（`role=compaction_model`）管理；本接口请求体若带多余 `compaction_model` 字段会被忽略。压缩模型当前状态见 `GET /chat_config/models?role=compaction_model` 的 `role_info.compaction_status`（`available_compaction_models` 列出可选项，`effective` 为最终生效模型）。
+>
+> **压缩失败重试**由独立接口 `GET/POST /chat_config/compaction_retry` 管理（env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）：一次"尝试"=一条完整"压缩模型→聊天模型"降级链（压缩模型与聊天模型同源时本条链只有一次调用），整条链失败后固定间隔 1 秒再试；正数 N = 最多 N 条链，耗尽抛 `ContextCompactionError` **终止当前任务**（生成中的所有压缩点一致，避免带着未压缩的超长上下文继续对话导致下次超窗）；0 或负数 = 一直重试直到手动停止。
 
 压缩模型仅被要求输出普通文本备忘，不要求 JSON mode。工具原始输出仍完整写入 JSONL 和 SSE；压缩只影响后续模型调用的临时工作上下文。进入摘要模式后，模型上下文固定为累计摘要 + 全历史最近 10k tokens 用户问题 + 当前任务。
 单轮压缩摘要会随对应 `chat_round` 保存到 `events` 中的 round `context_compaction` done 事件，事件同时携带 `summary_text`、`compress_usage`、`before_tokens`、`after_tokens` 和 `compress_index`。`index` 按该轮 `role=tool` 事件计数，表示前 N 个工具结果已经被摘要覆盖，后续历史格式化会跳过这部分原始工具轨迹，避免摘要与原文重复。活动任务期间最新状态暂存于 `_meta._active_round_compaction`，轮次结束时转入 `chat_round.events`。

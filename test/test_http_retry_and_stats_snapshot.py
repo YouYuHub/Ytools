@@ -152,6 +152,125 @@ class HttpRetryStreamTests(unittest.TestCase):
         self.assertEqual(terminal[0]["max_attempts"], 3)
         self.assertEqual(fake_socket.closed, 4)
 
+    def test_empty_stream_retries_then_succeeds(self):
+        """200 + 正常 [DONE] 但零输出：纳入网络重试重发，第二次返回内容。"""
+        empty_body = b"data: [DONE]\n"
+        ok_body = (
+            b'data: {"id":"c1","choices":[{"delta":{"content":"hi"}}]}\n'
+            b"data: [DONE]\n"
+        )
+        responses = [_sse_http(empty_body), _sse_http(ok_body)]
+        fake_socket = _FakeSocket(responses)
+        with patch("chat.chat_llm.socket.create_connection", return_value=fake_socket):
+            chunks = list(ChatLLM.std_completions_sse(
+                request=_request(), model_config=_model_config()
+            ))
+        frames = [json.loads(c[6:]) for c in chunks if c.startswith("data: {")]
+        retry_frames = [f for f in frames if f.get("retrying") is True]
+        self.assertEqual(len(retry_frames), 1)
+        self.assertEqual(retry_frames[0]["error_type"], "empty_response")
+        self.assertIn("没有任何模型输出", retry_frames[0]["error"])
+        self.assertIn("hi", "".join(chunks))  # 重发后内容正常返回
+        self.assertEqual(fake_socket.closed, 2)
+
+    def test_empty_stream_gives_up_after_max_attempts(self):
+        """200 空流连续达到上限：发 retrying=False 终止帧（error_type=empty_response）。"""
+        empty_body = b"data: [DONE]\n"
+        responses = [_sse_http(empty_body) for _ in range(4)]  # 首次 + 3 次重试
+        fake_socket = _FakeSocket(responses)
+        with patch("chat.chat_llm.socket.create_connection", return_value=fake_socket):
+            chunks = list(ChatLLM.std_completions_sse(
+                request=_request(), model_config=_model_config()
+            ))
+        frames = [json.loads(c[6:]) for c in chunks if c.startswith("data: {")]
+        terminal = [f for f in frames if f.get("retrying") is False]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_type"], "empty_response")
+        self.assertEqual(terminal[0]["retry"], 4)
+        self.assertEqual(terminal[0]["max_attempts"], 3)
+        self.assertEqual(fake_socket.closed, 4)
+
+    def test_reasoning_only_stream_is_not_empty(self):
+        """只有 reasoning_content 增量的流不算空（推理模型正常形态），不触发重发。"""
+        body = (
+            '{"id":"c1","choices":[{"delta":{"reasoning_content":"思考"}}]}\n'
+            '{"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}]}\n'
+        ).encode("utf-8")
+        sse_body = (
+            b"data: " + body.splitlines()[0] + b"\n"
+            b"data: " + body.splitlines()[1] + b"\n"
+            b"data: [DONE]\n"
+        )
+        responses = [_sse_http(sse_body)]
+        fake_socket = _FakeSocket(responses)
+        with patch("chat.chat_llm.socket.create_connection", return_value=fake_socket):
+            chunks = list(ChatLLM.std_completions_sse(
+                request=_request(), model_config=_model_config()
+            ))
+        frames = [json.loads(c[6:]) for c in chunks if c.startswith("data: {")]
+        self.assertFalse(any(f.get("retrying") for f in frames))
+        self.assertTrue(any(
+            f.get("reasoning_content") == "思考" for f in frames
+        ))
+
+    def test_non_stream_empty_choices_retries_then_succeeds(self):
+        """非流式 200 空响应：纳入网络重试重发，第二次返回内容。"""
+        import json as _json
+
+        def _nonstream_chunked(payload: bytes) -> bytes:
+            return (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"\r\n"
+                + hex(len(payload))[2:].encode() + b"\r\n" + payload + b"\r\n0\r\n\r\n"
+            )
+
+        ok_payload = _json.dumps({
+            "id": "c1",
+            "choices": [{"message": {"content": "非流式回复"}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 5},
+        }).encode("utf-8")
+        responses = [
+            _nonstream_chunked(b'{"id":"c0","choices":[]}'),
+            _nonstream_chunked(ok_payload),
+        ]
+        fake_socket = _FakeSocket(responses)
+        with patch("chat.chat_llm.socket.create_connection", return_value=fake_socket):
+            result = ChatLLM.chat_completions(
+                request=_request(),
+                stream=False,
+                model_config=_model_config(),
+            )
+        self.assertEqual(result["content"], "非流式回复")
+        self.assertEqual(fake_socket.closed, 2)
+
+    def test_non_stream_empty_choices_gives_up(self):
+        """非流式 200 空响应达到上限：抛 RuntimeError（调用方依赖异常语义）。"""
+        import json as _json
+
+        def _nonstream_chunked(payload: bytes) -> bytes:
+            return (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"\r\n"
+                + hex(len(payload))[2:].encode() + b"\r\n" + payload + b"\r\n0\r\n\r\n"
+            )
+
+        responses = [
+            _nonstream_chunked(b'{"id":"c0","choices":[]}') for _ in range(4)
+        ]
+        fake_socket = _FakeSocket(responses)
+        with patch("chat.chat_llm.socket.create_connection", return_value=fake_socket):
+            with self.assertRaises(RuntimeError) as ctx:
+                ChatLLM.chat_completions(
+                    request=_request(),
+                    stream=False,
+                    model_config=_model_config(),
+                )
+        self.assertIn("空响应", str(ctx.exception))
+
     def test_async_http_400_retries_then_succeeds(self):
         ok_body = (
             b'data: {"id":"c1","choices":[{"delta":{"content":"hi"}}]}\n'

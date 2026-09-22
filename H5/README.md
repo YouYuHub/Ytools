@@ -118,7 +118,7 @@ H5/
 | 会话历史 | `listSessions` / `streamStatus` / `getSessionMeta` / `getContextTokenStats` / `updateSessionTitle` / `fetchSessionFile` / `deleteSession` / `uploadChatHistory` | `/chat_history/*`、`/chat_stream/status`、`/chat_context/token_stats` |
 | 工具 | `listTools(refresh?)` | `/tools/list`；后端默认返回 TTL 内的探测缓存（毫秒级，首屏友好），`refresh=true` 追加 `?refresh=1` 强制重探 |
 | 模型配置 | `getModels(role)` / `selectModel(provider, model, role, parameter)` | `/chat_config/models[/select]` |
-| 聊天设置 | `getHistoryCompactionConfig` / `updateHistoryCompactionConfig` / `getContextReturnConfig` / `updateContextReturnConfig` | `/chat_config/history_compaction`、`/chat_config/context_return` |
+| 聊天设置 | `getHistoryCompactionConfig` / `updateHistoryCompactionConfig` / `getContextReturnConfig` / `updateContextReturnConfig` / `getSubAgentRetryConfig` / `updateSubAgentRetryConfig` | `/chat_config/history_compaction`、`/chat_config/context_return`、`/chat_config/sub_agent_retry` |
 | 工作目录 | `getWorkDirConfig` / `changeChatDir` | `/chat_config/work_dir`、`/change_chat_dir` |
 | MCP 工具执行 | `getMcpToolConfig` / `updateMcpToolConfig` | `/chat_config/mcp_tools` |
 | 文件 | `uploadSessionFiles` / `getSessionFiles` / `deleteSessionFile` | `/file/*` |
@@ -203,7 +203,7 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | “+”功能菜单（app/composer.js） | 上传文件 / 选择工具 / 聊天设置 / Skills 提示词四个入口，分发至 history/tools/composer/skills 各自的处理逻辑；菜单以 fixed 定位锚定「+」按钮上方（打开时按按钮视口坐标计算，多行输入撑高输入框也不会漂移） |
 
 聊天设置弹窗「模型与工具配置」区顶部含「每条消息重新标题」开关（仅会话内显示，新对话不显示；切换即保存不占确定键）：会话独立配置（`_meta.retitle_each_message`），开启后每轮收尾重新生成标题、关闭仅首轮生成一次；开关旁展示标题状态（已生成/已尝试失败/未生成）。**标题生成前端驱动（与聊天主链路解耦，零轮询）**：流式管线在前端收集思考/正文 delta，累计达 100 字符（取较长者）即 POST `/chat_config/generate_title` 一次（流结束不足 100 字符以已有全文触发；后端同会话 2s 防抖、已生成过/失败标记/未配置时直接回显当前标题），后端生成写盘并同步返回标题，前端收到即替换侧栏标题——不再轮询 `/chat_history/meta`。
-| 聊天设置弹窗（app/composer.js） | 并行读写四组配置：回传长度（思考过程/工具结果，0=不回传、负数=全部回传、正数=N 字符）、工具超时（MCP 单次执行超时 / 工具调用流式阶段无响应超时，正数为秒数、0=不限制；后者超时不终止任务，按工具调用失败反馈模型继续）、视频读取上限（read_media 单次视频区间读取最大秒数，5–3600，越界/非法值读取端自动钳制）与历史压缩策略（历史轮数/统一触发比例、累计摘要预算比例、超大拒绝系数等）；逐项数值校验，全成功才关闭 |
+| 聊天设置弹窗（app/composer.js） | 并行读写五组配置：回传长度（思考过程/工具结果，0=不回传、负数=全部回传、正数=N 字符）、工具超时（MCP 单次执行超时 / 工具调用流式阶段无响应超时，正数为秒数、0=不限制；后者超时不终止任务，按工具调用失败反馈模型继续）、视频读取上限（read_media 单次视频区间读取最大秒数，5–3600，越界/非法值读取端自动钳制）、历史压缩策略（历史轮数/统一触发比例、累计摘要预算比例、超大拒绝系数等）与子智能体重试（空收尾重试/断流续跑：0 或负数=不限制；计划未完成提醒：0=关闭、负数=不限制、每次工具执行轮后额度重置）；逐项数值校验，全成功才关闭 |
 | Skills 提示词库（app/skills.js） | “+”菜单打开可拖拽对话框（标题栏按住拖动、位置会话内记忆、Esc/背景/×关闭）；左侧文件列表（新建行内输入、名称自动补 .md）+ 右侧「预览 / 编辑」单栏切换（Typora 风格合并视图）：预览为博客式 Markdown 渲染（多级标题/表格/```lang 代码块高亮/引用，不支持图片），编辑为「格式工具栏 + 编辑器」单栏——选中文字即可加粗/斜体/行内代码、设 H1-H3、切换有序/无序列表与引用（再点取消），一键插入表格/代码块/分割线/链接（URL 占位自动选中），表格弹出 6×8 网格划选行列（含表头行，实时显示「N 行 × M 列」），支持 Ctrl+B/I，替换走 execCommand 保留原生 Ctrl+Z 撤销；保存（Ctrl+S）写回 `prompt/md_files/`；删除为两段式确认（3 秒内再点一次）；未保存修改暂存内存草稿，切文件/关弹窗不丢（列表与标题栏显示 ● 未保存）；「加载到输入框」把当前内容填进消息框并聚焦，直接发送 |
 | 文件 chips（app/history.js） | 上传限制 ≤10 个、单个 ≤10MB（超出 toast 截断/跳过）；chip 可单独删除；解析文本下一轮注入系统提示词 |
 | 发送与停止（app/chat.js） | 见下节 SSE 管线；停止 = 先调后端 `/stop_chat` 再本地 abort |

@@ -184,6 +184,43 @@ def load_sub_agent_limits() -> dict[str, Any]:
     }
 
 
+def load_sub_agent_retry_limits() -> dict[str, int]:
+    """读取子智能体交付保障重试配置（.env 可配，前端聊天设置可改）。
+
+    - final_reply_max_attempts：空收尾重试上限（0/负=不限制）——
+      子任务收尾轮最终回复为空时注入内部消息让子模型再次交付；
+    - stream_error_max_attempts：流式错误断点续跑上限（0/负=不限制）——
+      模型调用出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；
+    - todo_remind_max：todo 未完成提醒上限（0=关闭，负=不限制）——
+      每次完整工具执行轮后额度重置，子任务给出有效最终回复即正常收尾。
+
+    三项全部受 max_rounds/timeout 双重硬封顶，配置为不限制也不会失控。
+    """
+    from config import (
+        DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
+        DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
+        DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
+    )
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(load_var(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    return {
+        "final_reply_max_attempts": _int(
+            "SUB_AGENT_FINAL_REPLY_RETRY_MAX", DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX
+        ),
+        "stream_error_max_attempts": _int(
+            "SUB_AGENT_STREAM_ERROR_RETRY_MAX", DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX
+        ),
+        "todo_remind_max": _int(
+            "SUB_AGENT_TODO_REMIND_MAX", DEFAULT_SUB_AGENT_TODO_REMIND_MAX
+        ),
+    }
+
+
 def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
     if not isinstance(delta, dict):
         return
@@ -312,6 +349,13 @@ class SubAgentRunner:
         self._error: str | None = None
         self._final_reply = ""
         self._consecutive_oversized = 0
+        # 交付保障重试计数（配置见 load_sub_agent_retry_limits）：
+        # - 空收尾重试 / 流错误续跑：累计计数，耗尽按 error 收尾；
+        # - todo 提醒：每次完整工具执行轮后重置（工具轮后又"忘记"可再次提醒）
+        self._final_reply_retries_used = 0
+        self._stream_error_retries_used = 0
+        self._todo_remind_used = 0
+        self._retry_limits = load_sub_agent_retry_limits()
         # read_media 数据注入坐标（子任务版，与父循环同语义）：
         # pending_parts 为 (reference, quality, start_time, end_time) 坐标，
         # 工具结果统一处理后现场加载 base64 部件注入为 user 消息（仅内存，
@@ -867,7 +911,44 @@ class SubAgentRunner:
             self._seq += 1
             call = await self._model_call()
             if call["stream_error"] is not None:
-                detail = f"子任务模型流式响应出错：{call['stream_error']}"
+                stream_error_detail = f"子任务模型流式响应出错：{call['stream_error']}"
+                # 断点续跑重试：已生成的部分内容进入 messages（内部消息不落盘），
+                # 让子模型从已有进度继续——工具轨迹/todo 都在上下文中不丢失；
+                # 0/负=不限制（仍受 max_rounds/timeout 硬封顶），耗尽才 error 收尾
+                se_limit = self._retry_limits["stream_error_max_attempts"]
+                if se_limit <= 0 or self._stream_error_retries_used < se_limit:
+                    self._stream_error_retries_used += 1
+                    se_label = str(se_limit) if se_limit > 0 else "∞"
+                    print(
+                        f"[WARN] 子任务模型调用失败，断点续跑重试 "
+                        f"#{self._stream_error_retries_used}（上限 {se_label}）"
+                    )
+                    if call["full_response"]:
+                        self.messages.append({"role": "assistant", "content": call["full_response"]})
+                    elif call["full_reasoning"]:
+                        self.messages.append({"role": "assistant", "content": f"...{call['full_reasoning'][-100:]}"})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            f"刚才的模型调用失败（{stream_error_detail}），本次请求没有产生可用回复。"
+                            "请基于已有进度继续任务；如任务已经完成，请直接给出最终回复。"
+                        ),
+                        "_internal": True,
+                    })
+                    await self._emit(
+                        "notice",
+                        message=(
+                            f"模型调用失败，正在从断点续跑"
+                            f"（第 {self._stream_error_retries_used} 次，上限 {se_label}）"
+                        ),
+                        retry_kind="stream_error",
+                        seq=self._seq,
+                    )
+                    continue
+                detail = stream_error_detail + (
+                    f"（断点续跑重试 {self._stream_error_retries_used} 次后放弃）"
+                    if self._stream_error_retries_used else ""
+                )
                 self._status = "error"
                 self._error = detail
                 self._final_reply = self._build_progress_reply("error", error=detail)
@@ -950,11 +1031,98 @@ class SubAgentRunner:
                         "_internal": True,
                     })
                     continue
+                # ---- 交付保障（子任务限定；父级循环无此机制）----
+                # 优先级：todo 未完成提醒 > 空收尾重试 > 接受收尾。
+                # 子智能体一旦给出有效最终回复即正常收尾、不再催促调工具；
+                # todo 提醒额度在每次完整工具执行轮后重置（工具轮后再次"忘记"
+                # 可再次提醒），空收尾/提醒都以内部消息推进，消耗 rounds，
+                # 受 max_rounds/timeout 双重硬封顶。
+                pending_todo = [
+                    item for item in self.todo
+                    if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
+                ]
+                tr_limit = self._retry_limits["todo_remind_max"]
+                if pending_todo and (
+                    tr_limit < 0 or self._todo_remind_used < tr_limit
+                ):
+                    self._todo_remind_used += 1
+                    tr_label = str(tr_limit) if tr_limit > 0 else "∞"
+                    print(
+                        f"[WARN] 子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
+                        f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）"
+                    )
+                    if full_response:
+                        self.messages.append({"role": "assistant", "content": full_response})
+                    elif full_reasoning:
+                        self.messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            f"你准备结束子任务，但计划中仍有 {len(pending_todo)} 项未完成"
+                            "（pending/in_progress）。请继续调用工具完成它们；"
+                            "如相关步骤实际已完成或无需执行，请先用 todo 工具更新计划"
+                            "（标记 done 或说明原因），然后再给出最终回复。"
+                        ),
+                        "_internal": True,
+                    })
+                    await self._emit(
+                        "notice",
+                        message=(
+                            f"todo 计划仍有 {len(pending_todo)} 项未完成，"
+                            f"已提醒子模型继续（第 {self._todo_remind_used} 次，上限 {tr_label}）"
+                        ),
+                        retry_kind="todo_remind",
+                        seq=self._seq,
+                    )
+                    continue
                 final_reply = full_response.strip()
-                if not final_reply and full_reasoning:
-                    final_reply = f"（无正文输出，思考摘要）{full_reasoning[-300:]}"
                 if not final_reply:
-                    final_reply = "（子智能体未输出有效内容）"
+                    # 空收尾重试：正文为空（含"仅思考输出"场景）不算有效交付——
+                    # 注入内部消息让子模型再次交付；额度耗尽后按 error 收尾，
+                    # 不再伪装成 done+占位文本（父级可据此重派或换路径）
+                    fr_limit = self._retry_limits["final_reply_max_attempts"]
+                    if fr_limit <= 0 or self._final_reply_retries_used < fr_limit:
+                        self._final_reply_retries_used += 1
+                        fr_label = str(fr_limit) if fr_limit > 0 else "∞"
+                        print(
+                            f"[WARN] 子任务最终回复为空，空收尾重试 "
+                            f"#{self._final_reply_retries_used}（上限 {fr_label}）"
+                        )
+                        if full_reasoning:
+                            self.messages.append({
+                                "role": "assistant",
+                                "content": f"...{full_reasoning[-100:]}",
+                                "reasoning_content": full_reasoning,
+                            })
+                        self.messages.append({
+                            "role": "user",
+                            "content": (
+                                "你上一轮没有输出任何最终回复内容。请基于已完成的工作"
+                                "直接输出最终回复（结论/结果/遗留问题）；"
+                                "如任务确实无法完成，请说明原因。"
+                            ),
+                            "_internal": True,
+                        })
+                        await self._emit(
+                            "notice",
+                            message=(
+                                "子任务最终回复为空，已要求重新交付"
+                                f"（第 {self._final_reply_retries_used} 次，上限 {fr_label}）"
+                            ),
+                            retry_kind="final_reply",
+                            seq=self._seq,
+                        )
+                        continue
+                    detail = (
+                        f"子任务最终回复为空（空收尾重试 {self._final_reply_retries_used} 次后放弃）"
+                        if self._final_reply_retries_used
+                        else "子任务最终回复为空（空收尾重试已配置为关闭）"
+                    )
+                    self._status = "error"
+                    self._error = detail
+                    self._final_reply = self._build_progress_reply("error", error=detail)
+                    await self._emit_done("error", self._final_reply, detail)
+                    return self._make_result()
                 self.messages.append(
                     assistant_message if full_response else {"role": "assistant", "content": final_reply}
                 )
@@ -1055,6 +1223,9 @@ class SubAgentRunner:
                     "content": ret,
                     "_tool_name": tool_name,
                 })
+            # 本轮完整工具执行结束：todo 提醒额度重置——模型再次收尾时若计划
+            # 仍未完成可重新获得一次提醒（"调工具后忘记→再提醒"语义）
+            self._todo_remind_used = 0
             # read_media 数据注入（子任务版）：按坐标现场加载媒体 base64 部件，
             # 作为 user 消息追加进 messages（仅内存，不落盘——任务文本里的
             # media:// 引用即子任务媒体台账）。加载失败的坐标以占位文本告知
@@ -1118,6 +1289,18 @@ class SubAgentRunner:
         parts = [f"子任务未完成：{reason_map.get(status, status)}。"]
         if error:
             parts.append(f"错误信息：{error}")
+        pending_todo = [
+            item for item in self.todo
+            if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
+        ]
+        if pending_todo:
+            parts.append(
+                f"计划进度：共 {len(self.todo)} 项，其中 {len(pending_todo)} 项未完成"
+                "（pending/in_progress）；"
+                + "；".join(str(item.get("content") or item.get("id") or "?") for item in pending_todo)
+            )
+        elif self.todo:
+            parts.append(f"计划进度：{len(self.todo)} 项全部标记完成")
         if last_text:
             preview = last_text[:1500]
             parts.append(f"已完成进展（最后一段正文）：{preview}")

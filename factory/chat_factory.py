@@ -359,6 +359,28 @@ def _sse_error_payload(message: str) -> str:
     return f"data: {json.dumps({'error': message}, ensure_ascii=False)}\n\n"
 
 
+def _normalize_question_parts(content) -> list | None:
+    """克隆当前轮提问的 content 部件供回放补气泡（深拷贝防后续就地改写）。
+
+    统一归一为「部件列表」：纯文本 content 包装成单个 text 部件——前端回放
+    补建提问气泡时 content 形态一致（编辑回填/媒体芯片解析共用同一数据源），
+    文本提问也能拿到完整 content。多模态时部件内 media:// 引用串很小，可直接
+    深拷贝持有——必须在 resolve_message_media_refs 把原消息就改为 base64
+    之前调用，否则副本会被巨型 data URL 污染。
+    """
+    if isinstance(content, str):
+        text = content.strip()
+        return [{"type": "text", "text": content}] if text else None
+    if not isinstance(content, list) or not content:
+        return None
+    try:
+        import copy as _copy
+
+        return _copy.deepcopy(content)
+    except Exception:
+        return None
+
+
 def _tool_name_from_definition(tool_def: dict) -> str:
     if not isinstance(tool_def, dict):
         return ""
@@ -389,6 +411,8 @@ class _SessionStream:
         self._round_start_set = False
         self.done = False
         self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
+        self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
+        self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.cond = asyncio.Condition()
         # 运行中注入的用户消息队列（消息引导，inline 模式）：inject 接口写入，
@@ -595,6 +619,12 @@ async def _compact_task_context_if_needed(
         enforce=True,
         force_all=True,
         event_emitter=event_emitter,
+        # 触发来源 = 任务内检查点：全量上下文（含当前轮轨迹）超阈值，
+        # 强制压缩历史；trigger_context_tokens / trigger_threshold 传
+        # 真实触发规模与阈值（全量 vs 363,800 式单轮阈值），与历史预算区分
+        trigger_reason="task",
+        trigger_context_tokens=context_now,
+        trigger_threshold=threshold,
     )
     history_messages = await session_chat_memory.get_context_messages(
         # <=0 表示无限窗口（keep_rounds=0），原样透传；否则至少保留 1 轮
@@ -619,10 +649,6 @@ async def _compact_task_context_if_needed(
     after_tokens = estimate_request_context_tokens(rebuilt, tool_request.tools)
     print(f"[INFO] 任务内历史重建完成：{context_now} -> {after_tokens} tokens")
     return rebuilt
-
-
-# 任务内自动压缩连续失败上限：达到后本任务停止自动压缩尝试（推 warning 通知）
-_AUTO_COMPACTION_MAX_CONSECUTIVE_FAILURES = 2
 
 
 async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, Any]) -> None:
@@ -998,6 +1024,10 @@ async def _run_chat_generation(
         if emit_round_started:
             try:
                 live_round_no = await session_chat_memory.get_current_round_number()
+                # 记录本轮最终轮次号：附接回放 marker 携带（前端按轮次精确去重/
+                # 补挂编辑入口），round_started 帧本身在回放起点之后，附接消费
+                # 端收不到——必须在推送时同步写入 stream。
+                stream.live_round_no = int(live_round_no)
                 await _stream_emit(
                     stream,
                     f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n",
@@ -1076,6 +1106,8 @@ async def _run_chat_generation(
                         tool_request,
                         settings=history_compaction_settings,
                         event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                        # 触发来源 = 任务开始自动（历史超阈值或未压缩轮次超保护）
+                        trigger_reason="auto",
                     )
             except ContextCompactionError as exc:
                 # 压缩模型与聊天模型均失败：终止任务，不回退到原始历史。
@@ -1113,6 +1145,14 @@ async def _run_chat_generation(
             await session_chat_memory.add_chat_history(latest_user_message)
             if not stream.question_text:
                 stream.question_text = latest_user_text
+            # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
+            # 必须在下方 resolve_message_media_refs 就地改写为 base64 之前克隆，
+            # 否则副本会被污染成巨型 data URL（仅引用串很小）。
+            # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+            if getattr(stream, "question_parts", None) is None:
+                stream.question_parts = _normalize_question_parts(
+                    latest_user_message.get("content")
+                )
         # read_media 的 media:// 引用常规集合（当前任务轮用户消息中出现的引用）；
         # 当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
         # 常规过滤传给 execute_read_media（本地/网络来源不在此列、不受过滤）。
@@ -1254,6 +1294,10 @@ async def _run_chat_generation(
                             enforce=True,
                             force_all=True,
                             event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                            # 触发来源 = 首调用超窗降级（全量上下文 > 模型窗口）
+                            trigger_reason="first_call",
+                            trigger_context_tokens=first_call_tokens,
+                            trigger_threshold=model_window,
                         )
                     except ContextCompactionError as exc:
                         # 压缩模型与聊天模型均失败：终止任务，不再走后续降级
@@ -1340,10 +1384,6 @@ async def _run_chat_generation(
         context_compaction_threshold = resolve_context_compaction_threshold(compaction_settings)
         max_oversized_rejections = compaction_settings.max_oversized_rejections
         consecutive_oversized_count = 0
-        # 任务内自动压缩连续失败熔断：失败不再终止任务，但连续多次失败后停止
-        # 尝试（每批工具结果都会触发检查，避免反复白烧失败的模型调用）
-        auto_compact_failures = 0
-        auto_compact_disabled_notified = False
 
         # 运行中注入的用户消息（消息引导）：每轮检查点取出，作为新一轮
         # 用户消息追加到上下文并落盘；模型在下一轮调用时即可看到。
@@ -2361,33 +2401,19 @@ async def _run_chat_generation(
                 except asyncio.CancelledError:
                     raise
                 except ContextCompactionError as exc:
-                    # 自动压缩失败不再终止任务：此时上下文通常仍在模型窗口内，
-                    # 原样继续生成（超大结果拒绝仍在保护）；下一批工具结果写入后
-                    # 会再次尝试压缩。连续失败达到上限后本任务停止尝试，避免
-                    # 每批都白烧一次失败的模型调用。
-                    auto_compact_failures += 1
-                    detail = f"任务内历史压缩失败（连续第 {auto_compact_failures} 次）：{exc}"
-                    print(f"[WARN] {detail}")
-                    if (
-                        auto_compact_failures >= _AUTO_COMPACTION_MAX_CONSECUTIVE_FAILURES
-                        and not auto_compact_disabled_notified
-                    ):
-                        auto_compact_disabled_notified = True
-                        notify = (
-                            f"自动压缩连续 {auto_compact_failures} 次失败，本次任务将不再自动压缩"
-                            "（对话继续，上下文按原样回传）；请检查压缩模型的 API Key/网络，"
-                            "或稍后使用手动压缩。"
-                        )
-                        await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'CONTEXT_COMPACTION_DISABLED', 'message': notify}}, ensure_ascii=False)}\n\n")
-                    else:
-                        await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'CONTEXT_COMPACTION_FAILED', 'message': f'自动压缩失败，已跳过并继续对话：{exc}'}}, ensure_ascii=False)}\n\n")
-                    rebuilt_messages = None
+                    # 严格"失败则停止"：任务内自动压缩的整条重试降级链已耗尽仍失败，
+                    # 继续生成只会让上下文持续膨胀、下一批极易超窗（原始问题场景），
+                    # 因此与任务前/首调用压缩同策略——终止当前任务。
+                    detail = f"任务内历史压缩失败（重试降级链已耗尽），任务已终止：{exc}"
+                    print(f"[ERROR] {detail}")
+                    session_chat_memory.run_task = False
+                    await _stream_emit(stream, _sse_error_payload(detail))
+                    return
                 except Exception as exc:
                     print(f"[WARN] 任务内历史压缩跳过：{exc}")
                     rebuilt_messages = None
                 if rebuilt_messages is not None:
                     messages = rebuilt_messages
-                    auto_compact_failures = 0
                 try:
                     current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
                     round_compaction = await compact_active_round_context_if_needed(
@@ -2399,11 +2425,13 @@ async def _run_chat_generation(
                 except asyncio.CancelledError:
                     raise
                 except ContextCompactionError as exc:
-                    # 单轮压缩失败同样不终止任务：本轮工具轨迹按原样保留，
-                    # 由超大结果拒绝与窗口硬限制兜底。
-                    print(f"[WARN] 单轮上下文压缩失败（本轮轨迹原样保留）：{exc}")
-                    await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'ROUND_COMPACTION_FAILED', 'message': f'本轮工具轨迹压缩失败，已按原样继续：{exc}'}}, ensure_ascii=False)}\n\n")
-                    round_compaction = None
+                    # 严格"失败则停止"：单轮压缩重试降级链耗尽后本轮工具轨迹无法
+                    # 收缩，下一批工具结果大概率超窗，终止当前任务而不是原样继续。
+                    detail = f"单轮工具轨迹压缩失败（重试降级链已耗尽），任务已终止：{exc}"
+                    print(f"[ERROR] {detail}")
+                    session_chat_memory.run_task = False
+                    await _stream_emit(stream, _sse_error_payload(detail))
+                    return
                 except Exception as exc:
                     print(f"[WARN] 单轮工具上下文压缩跳过：{exc}")
                     round_compaction = None
@@ -2420,6 +2448,8 @@ async def _run_chat_generation(
                 tool_request,
                 settings=final_compaction_settings,
                 event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                # 触发来源 = 任务收尾（完成后把新轮次纳入累计摘要）
+                trigger_reason="post",
             )
         except ContextCompactionError as exc:
             detail = f"收尾历史压缩失败（聊天模型重试仍不可用）：{exc}"
@@ -2644,8 +2674,18 @@ async def tool_chat_server(
         else:
             seen = stream.round_start_seq
             if not creating:
-                # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件
+                # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
+                # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
+                # 纯文本提问归一为单个 text 部件），前端重建气泡/补挂编辑入口用；
+                # round 为本轮最终轮次号（round_started 帧在回放起点之前，消费端
+                # 收不到，必须随标记下发）——前端按轮次精确去重历史提问气泡。
+                # worker 模式由 evt 队列的 question_text/question_parts/
+                # live_round_no 事件同步到 stream 对应属性。
                 marker = {"replay": True, "question_text": stream.question_text or ""}
+                if stream.question_parts:
+                    marker["question_parts"] = stream.question_parts
+                if stream.live_round_no:
+                    marker["round"] = int(stream.live_round_no)
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
         while True:
             while seen < stream.seq:

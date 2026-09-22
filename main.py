@@ -164,7 +164,6 @@ def _prewarm_tool_registry() -> None:
     # 失败不致命——缓存缺失时 /tools/list 与发送路径会现场重探
     threading.Thread(target=_prewarm, name="tool-registry-prewarm", daemon=True).start()
 
-
 _prewarm_tool_registry()
 
 

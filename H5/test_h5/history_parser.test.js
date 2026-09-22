@@ -132,6 +132,10 @@ test("parseHistory: chat_round.events 中的单轮压缩按实际顺序展开且
       summary_text: "【已完成工作】已完成文件扫描",
       before_tokens: 5000,
       after_tokens: 1200,
+      token_limit: 4000,
+      trigger_reason: "task",
+      trigger_context_tokens: 123456,
+      trigger_threshold: 9000,
       compress_index: 1,
       compress_usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
     },
@@ -143,6 +147,10 @@ test("parseHistory: chat_round.events 中的单轮压缩按实际顺序展开且
   assert.equal(parsed.records[3].phase, "start");
   assert.equal(parsed.records[4].summary_text, "【已完成工作】已完成文件扫描");
   assert.equal(parsed.records[4].before_tokens, 5000);
+  assert.equal(parsed.records[4].token_limit, 4000);
+  assert.equal(parsed.records[4].trigger_reason, "task");
+  assert.equal(parsed.records[4].trigger_context_tokens, 123456);
+  assert.equal(parsed.records[4].trigger_threshold, 9000);
   assert.equal(parsed.records[4].usage.total_tokens, 15);
 });
 
@@ -195,6 +203,56 @@ test("recordsBeforeActiveRound: 只保留当前轮提问之前的记录", functi
 test("recordsBeforeActiveRound: 未匹配到提问时返回全部", function () {
   const records = [{ kind: "user", content: "x" }];
   assert.equal(historyParser.recordsBeforeActiveRound(records, "不存在"), records);
+});
+
+test("recordsBeforeActiveRound: 按轮次号精确匹配优先于文本", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    // 历史中存在与当前轮同文本的旧提问：不能按文本误删
+    { kind: "user", content: "重复的问题", round: 2 },
+    { kind: "assistant", content: "旧回答", round: 2 },
+    { kind: "user", content: "重复的问题", round: 3 },
+  ];
+  const kept = historyParser.recordsBeforeActiveRound(records, "重复的问题", 3)
+    .map(function (r) { return r.round; });
+  assert.deepEqual(kept, [1, 1, 2, 2]);
+});
+
+test("recordsBeforeActiveRound: 多模态部件数组提问按 text 部件拼接匹配", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    {
+      kind: "user",
+      round: 2,
+      content: [
+        { type: "image_url", image_url: { url: "media://a.png" } },
+        { type: "text", text: "看图说话（流式中）" },
+      ],
+    },
+  ];
+  const kept = historyParser.recordsBeforeActiveRound(
+    records, "看图说话（流式中）"
+  ).map(function (r) { return r.round; });
+  assert.deepEqual(kept, [1, 1]);
+});
+
+test("recordsBeforeActiveRound: 无 userText 时安全返回原记录", function () {
+  const records = [{ kind: "user", content: "第一问", round: 1 }];
+  assert.equal(historyParser.recordsBeforeActiveRound(records, ""), records);
+});
+
+test("recordsBeforeActiveRound: 轮次号有效但未命中时不回退文本匹配", function () {
+  // 生成中刷新：本轮（第 3 轮）尚未落盘，历史里存在同文本旧提问（第 1 轮）
+  const records = [
+    { kind: "user", content: "重复的问题", round: 1 },
+    { kind: "assistant", content: "旧回答", round: 1 },
+    { kind: "user", content: "第二问", round: 2 },
+    { kind: "assistant", content: "第二答", round: 2 },
+  ];
+  // 若回退文本匹配会把第 1 轮及其后整段误裁，这里必须原样返回
+  assert.equal(historyParser.recordsBeforeActiveRound(records, "重复的问题", 3), records);
 });
 
 // ---------- sub_agent 子任务事件块聚合 ----------

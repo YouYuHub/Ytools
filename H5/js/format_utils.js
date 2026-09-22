@@ -52,7 +52,10 @@
     const c = usage.completion_tokens || 0;
     const t = usage.total_tokens || p + c;
     const parts = [];
-    if (t) parts.push("压缩消耗 " + fmtNum(t) + " tokens（输入 " + fmtNum(p) + " · 输出 " + fmtNum(c) + "）");
+    // "压缩模型输入"限定语义：这是压缩调用本身消耗的输入 tokens（被压缩的
+    // 节选文本），不是触发压缩的上下文规模——避免被误读为"触发点偏低"
+    //（触发规模看 detail 行的"上下文 X → Y"，X 为触发时实际估算值）
+    if (t) parts.push("压缩消耗 " + fmtNum(t) + " tokens（压缩模型输入 " + fmtNum(p) + " · 输出 " + fmtNum(c) + "）");
     if (usage.compressed_rounds) parts.push("已压缩 " + fmtNum(usage.compressed_rounds) + " 个旧轮次");
     if (usage.before_tokens !== undefined && usage.after_tokens !== undefined) {
       parts.push("上下文 " + fmtNum(usage.before_tokens) + " → " + fmtNum(usage.after_tokens) + " tokens");

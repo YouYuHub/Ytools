@@ -14,8 +14,9 @@ _VALID_ROUND_STATUSES = {"done", "error", "stopped", "interrupted"}
 # 合法事件角色：与历史文件中实际出现的 role 字段保持一致
 _VALID_EVENT_ROLES = {"user", "assistant", "tool", "system"}
 # sub_agent 事件 phase 白名单（docs/sub_agent_v1.md §7.1）；
-# delta / heartbeat 仅实时 SSE 推送、不落盘，故不在落盘白名单中
-_VALID_SUB_AGENT_PHASES = {"start", "model_call", "tool_start", "tool_result", "todo", "done"}
+# delta / heartbeat 仅实时 SSE 推送、不落盘，故不在落盘白名单中；
+# notice = 交付保障重试提示（空收尾重试/断流续跑/todo 提醒），落盘供历史回放审计
+_VALID_SUB_AGENT_PHASES = {"start", "model_call", "tool_start", "tool_result", "todo", "done", "notice"}
 _VALID_SUB_AGENT_STATUSES = {"done", "error", "stopped", "interrupted", "timeout", "max_rounds"}
 
 
@@ -330,6 +331,11 @@ def _is_valid_sub_agent_event(event: dict[str, Any]) -> bool:
             return False
     elif phase == "todo":
         if not isinstance(event.get("todos"), list):
+            return False
+    elif phase == "notice":
+        # 交付保障重试提示：必须携带非空 message 文案
+        message = event.get("message")
+        if not isinstance(message, str) or not message.strip():
             return False
     elif phase == "done":
         if event.get("status") not in _VALID_SUB_AGENT_STATUSES:
