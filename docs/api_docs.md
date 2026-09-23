@@ -131,7 +131,7 @@
   - `dry_run`(默认 false)：预演——只返回明细不写盘不删文件；
   - `keep_media_refs`：清理时排除的媒体 stored_name（编辑重发时被编辑消息的复用附件）。
 - **返回**：dry_run 时 `{state: "planned", planned_rounds: [{round, question, status}], planned_files: {media_files, doc_files}}`；正式执行 `{state: "succeed", removed_rounds, planned_*, files_cleanup: {removed, failed}, meta_after, usage_after}`。
-- **一致性保障**：写盘前生成 `<历史文件>.bak` 侧车备份（覆盖式）；`context_summary` 失效（下次聊天前从剩余原始轮次重建）；meta（usage/user_questions/标题）按剩余条目重算。
+- **一致性保障**：写盘前生成 `<历史文件>.bak` 侧车备份（覆盖式）；`context_summary` 不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置平移游标/块范围/问题编号三处锚点，摘要继续生效（见 compact.md §6）；meta（usage/user_questions/标题）按剩余条目重算。
 
 **编辑重发两种模式的前端语义**：
 
@@ -140,7 +140,9 @@
 | `single` + `target_round=N` | 删第 N 轮整轮 | `/chat_with_tool` 带 `target_round: N` 原地重跑 | 上下文截到第 N-1 轮；新回复替换历史第 N 轮位置；后续轮次保留但其历史依据不含旧第 N 轮 |
 | `truncate` + 普通发送 | 删第 N 轮及之后 | 普通发送（追加） | GPT 同款：后续轮次一并删除，新回复追加末尾 |
 
-**`target_round` 原地重跑（ChatLLMRequest 新字段）**：轮次收尾替换历史第 N 轮条目而非追加（用户消息相同则保留原 `started_at`，不同则视为已编辑同样整轮替换）；`get_current_round_number` 覆盖为 N（file_history 版本链 round 标注仍为 N）；`get_context_messages` 截到第 N-1 轮；越界（历史被并发删除）自动降级为追加；任务异常中断时同样按替换式收尾（stopped/interrupted 占据原轮次位置）。旧累计摘要失效后本次任务按原始轮次+截断窗口构建，且任务内**跳过前置压缩**（防旧第 N 轮内容被压进摘要重新进入上下文）。
+**`target_round` 原地重跑（ChatLLMRequest 新字段）**：轮次收尾替换历史第 N 轮条目而非追加（用户消息相同则保留原 `started_at`，不同则视为已编辑同样整轮替换）；`get_current_round_number` 覆盖为 N（file_history 版本链 round 标注仍为 N）；`get_context_messages` 截到第 N-1 轮；越界（历史被并发删除）自动降级为追加；任务异常中断时同样按替换式收尾（stopped/interrupted 占据原轮次位置）。累计摘要**保留**并用游标钳制参与拼装（替换不减轮次总数、游标仍有效，摘要对被编辑轮次的旧描述按现状保留），且任务内**跳过前置压缩**（防旧第 N 轮内容被压进摘要重新进入上下文）。
+
+**`insert_round` 回答插入（ChatLLMRequest 新字段）**：`ask_user` 卡片再答专用——新回答轮插入历史第 N 轮之后、后续轮次整体后推；`get_current_round_number` 覆盖为 N+1（file_history 版本链 round 标注）；`get_context_messages` 截到第 N 轮为止（提问轮本身保留在上下文，回答驱动其继续）；越界（历史被并发删除）自动降级为追加。累计摘要**不整份失效**：`clamp_context_summary_for_insert_round` 把覆盖范围钳到第 N 轮（游标/块范围/问题编号三处锚点同步收缩），插入轮及其后轮次以原始对话回传，下一次压缩再自然纳入新批次——旧实现整份失效会让下次任务全部轮次退回未压缩、auto 压缩从第 1 轮整段重压（表现为"回答模型提问后立即大规模压缩"）。任务内同样跳过前置压缩。
 
 ### POST /chat_history/upload_chat_file
 接收前端上传的 jsonl 聊天历史文件，按现有格式过滤后保存到 `history_files` 目录。

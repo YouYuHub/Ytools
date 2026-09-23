@@ -1054,7 +1054,13 @@ async def compact_session_history_if_needed(
             number for number, _question in recent_question_items
         ]
         updated_state["recent_questions_scope"] = "all_history"
-        await session_chat_memory.update_context_summary(updated_state)
+        try:
+            await session_chat_memory.update_context_summary(updated_state)
+        except Exception as exc:
+            # 问题索引同步失败不影响压缩结果（摘要正文与游标已落盘）：
+            # update_context_summary 对写盘失败改为抛出后，这里降级为告警，
+            # 避免索引同步失败把整个压缩流程拖垮
+            print(f"[WARN] 最近问题索引同步失败（不影响压缩结果）: {exc}")
 
     if not raw_rounds:
         legacy_blocks = summary_state.get("blocks") if isinstance(summary_state, dict) else None
@@ -1070,7 +1076,12 @@ async def compact_session_history_if_needed(
                     summarized_count,
                     recent_questions,
                 )
-                await session_chat_memory.update_context_summary(summary_state)
+                try:
+                    await session_chat_memory.update_context_summary(summary_state)
+                except Exception as exc:
+                    # 旧版多块摘要迁移失败不影响任务：迁移属优化路径，
+                    # 原摘要结构仍可渲染，下次压缩再重试迁移
+                    print(f"[WARN] 累计摘要迁移落盘失败（保留旧结构）: {exc}")
                 update_history_usage = getattr(session_chat_memory, "add_history_compression_usage", None)
                 if collapsed_usage and callable(update_history_usage):
                     try:

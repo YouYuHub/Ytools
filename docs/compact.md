@@ -249,6 +249,14 @@
 
 **游标自愈**：`source_round_count` 大于现存轮次数（导入不匹配等异常漂移）时，旧摘要整体作废并从原始轮次重建。
 
+**回答插入钳制摘要（insert_round）**：`ask_user` 卡片再答时新回答轮插入第 N 轮之后、后续轮次整体后推。摘要正文对插入点之前轮次的描述仍然有效（内容与编号未变），因此**不整份失效**——`clamp_context_summary_for_insert_round` 把覆盖范围钳到第 N 轮为止（`source_round_count`、`blocks[].round_start/round_end`、`recent_question_numbers + recent_questions` 三处编号锚点同步收缩；`round_start` 超过插入点的块整体丢弃）。插入轮及其后轮次以原始对话回传，下一次压缩再自然纳入新批次。旧实现整份失效摘要会让下次任务全部轮次退回未压缩、auto 压缩从第 1 轮整段重压（表现为"回答模型提问后立即大规模压缩"，模型调用成本极高）。上下文截断口径同步修正为保留到第 N 轮（提问轮本身需要进上下文，`_history_cutoff_rounds = N + 1`）。
+
+**摘要写盘失败可见化**：`update_context_summary` 写盘失败（Windows 文件占用 WinError 5、杀软/索引器扫描大 JSONL 等）不再静默跳过——静默降级会让"摘要已生成但未生效"，下一次压缩基于原始历史从头重压。失败改为抛出 `RuntimeError`，由调用方按关键性分级处理：压缩核心路径（摘要落盘）按批次失败补发 `aborted` 并按既有语义续跑/终止；非关键路径（保真问题索引同步、旧版多块摘要迁移）降级为告警，不影响任务。
+
+**覆盖式重答截断平移摘要**：`truncate_rounds_for_reanswer`（对最新提问再次回答时截断其后的旧回答轮）同样按删除位置平移摘要锚点，而不是留着越界游标触发"游标自愈"整份作废——后者会让下次任务从第 1 轮整段重压。
+
+**摘要清空点全量收敛**：此前"整份清空摘要"散落在 5 处（请求开始的 `invalidate_context_summary`、`add_chat_history` 插入收尾、`stop_current_round` 插入收尾、`truncate_rounds_for_reanswer`、按行删除）。除按行删除（旧行号接口，轮次结构不可对齐、确需重建）外，其余全部改为**钳制/平移**（保留摘要正文与已覆盖事实，只收缩编号锚点）。
+
 **删除轮次不停摘要**：`delete_rounds`（truncate/single）删除轮次只改变后续轮次编号，不改变摘要正文承载的历史事实，因此摘要不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置同步平移三处编号锚点：`source_round_count` 游标（减去被删的已压缩轮次数）、`blocks[].round_start/round_end`（覆盖轮次全部被删的块丢弃）、`recent_question_numbers + recent_questions`（被删轮次的问题移除、其后编号前移）。丢弃摘要会让下轮上下文退化为原始轮次全量回传，大会话直接超出模型窗口。例外：按行删除（旧行号接口）仍会重置 `context_summary`。
 
 ---

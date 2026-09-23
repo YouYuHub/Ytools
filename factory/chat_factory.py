@@ -963,14 +963,17 @@ async def _run_chat_generation(
             pass
     # 回答插入（insert_round，ask_user 卡片再答）：收尾轮次插入历史第 N 轮
     # 之后、后续轮次整体后推；上下文截到第 N 轮为止（提问轮行为保留，回答
-    # 驱动其继续）。摘要同样失效：插入后轮次编号整体变化，旧游标不再成立
+    # 驱动其继续）。摘要不失效：把覆盖范围钳到插入点（第 N 轮）之前——插入
+    # 轮及其后轮次以原始对话回传，摘要正文对插入点之前轮次的描述保持有效。
+    # 此前直接失效整份摘要：下一次任务全部轮次退回未压缩，auto 压缩从 R1
+    # 整段重压（表现为"回答模型提问后立即大规模压缩"，压缩调用成本极高）。
     request_insert_round = getattr(tool_request, "insert_round", None)
     if request_insert_round is not None:
         session_chat_memory.set_insert_round(request_insert_round)
         try:
-            session_chat_memory.invalidate_context_summary()
+            session_chat_memory.clamp_context_summary_for_insert_round(request_insert_round)
         except Exception as summary_error:
-            print(f"[WARN] insert_round 摘要失效失败（不影响本轮）: {summary_error}")
+            print(f"[WARN] insert_round 摘要钳制失败（不影响本轮）: {summary_error}")
         try:
             await _stream_emit(
                 stream,

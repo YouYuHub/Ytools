@@ -393,6 +393,7 @@ def resolve_session_model_selection(
 from memory.chat_history_format import (
     normalize_context_summary as _normalize_context_summary,
     adjust_context_summary_for_deleted_rounds as _adjust_summary_for_deleted_rounds,
+    clamp_context_summary_to_rounds as _clamp_summary_to_rounds,
     render_context_summary as _render_context_summary,
     render_recent_questions_message as _render_recent_questions_message,
     extract_recent_questions as _extract_recent_questions,
@@ -829,7 +830,10 @@ class ChatMemoryManager:
         if normalized is not None and normalized < 1:
             normalized = None
         self._insert_round_number = normalized
-        self._history_cutoff_rounds = normalized
+        # 插入语义：上下文包含提问轮（第 N 轮）本身——模型需要看到提问卡片
+        # 内容才能作答。截断口径 [:cutoff-1] 与 target_round 共用（后者截到
+        # 第 N-1 轮），这里 +1 表示保留前 N 轮（提问轮及其之前）。
+        self._history_cutoff_rounds = normalized + 1 if normalized is not None else None
         if normalized is not None:
             self._target_round_number = None
 
@@ -846,9 +850,14 @@ class ChatMemoryManager:
     def invalidate_context_summary(self) -> None:
         """使跨轮压缩累计摘要失效（下次聊天前从剩余原始轮次重建）。
 
-        原地重跑（编辑重发）开始时调用：被编辑轮次的旧内容仍在 JSONL，
-        若带着旧摘要生成，旧回复会经摘要重新进入上下文，违背「截到第 N-1 轮」
-        语义；失效后本次任务按原始轮次+截断窗口构建历史。
+        语义 = "摘要整体不再可信，必须整段重建"（历史被外部改写、游标与现存
+        轮次无法对齐时的兜底）。注意：回答插入（insert_round）已改用
+        clamp_context_summary_for_insert_round（钳制覆盖范围、保留摘要），不再
+        调用本方法——整份失效会让下次任务全部轮次退回未压缩、auto 从第 1 轮
+        整段重压（用户可见的"回答模型提问后立即大规模压缩"即此现象）。
+
+        写盘失败会抛出（不再静默吞掉）：静默失效失败会让旧摘要带着失效游标
+        继续参与上下文拼装。
         """
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
@@ -857,6 +866,44 @@ class ChatMemoryManager:
             meta["context_summary"] = None
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)
+
+    def clamp_context_summary_for_insert_round(self, insert_round: int | None) -> None:
+        """回答插入（insert_round）前把累计摘要的覆盖范围钳到插入点。
+
+        新回答轮插入第 N 轮之后：摘要对插入点之前轮次的描述继续有效（内容与
+        编号未变），但覆盖范围必须收缩到第 N 轮为止——否则插入轮落在摘要覆盖
+        范围内却没有摘要正文，模型看不到它。钳制后插入轮及其后轮次以原始对话
+        回传，下一次压缩再自然纳入新批次（不再整份失效、从第 1 轮重压）。
+
+        写盘失败抛出 RuntimeError：静默跳过会让"游标覆盖插入轮但摘要正文缺失"
+        的畸形状态进入模型上下文，由调用方决定终止或降级。
+        """
+        if insert_round is None:
+            return
+        try:
+            limit = int(insert_round)
+        except (TypeError, ValueError):
+            return
+        if limit < 1:
+            return
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            current = meta.get("context_summary")
+            clamped = _clamp_summary_to_rounds(current, limit)
+            if clamped is current:
+                # 游标已在插入点之内（含相等）：插入不改变已压缩轮次的内容与
+                # 编号，摘要与索引原样可用，无需写盘
+                return
+            meta["context_summary"] = _normalize_context_summary(clamped)
+            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+            try:
+                _write_meta_and_entries(self._file_path, meta, entries)
+            except OSError as write_error:
+                print(
+                    f"[ERROR] insert_round 摘要钳制写盘失败（游标将覆盖插入轮，"
+                    f"上下文会缺摘要正文）: {write_error}"
+                )
+                raise RuntimeError(f"摘要钳制写盘失败：{write_error}") from write_error
 
     async def get_file_text(self) -> str | None:
         """锁内读取完整 jsonl 文本（文件不存在返回 None），
@@ -958,8 +1005,12 @@ class ChatMemoryManager:
                 elif insert_round is not None:
                     # 回答插入（ask_user 卡片再答）：回答轮插入历史第 N 轮之后，
                     # 第 N+1 轮及之后整体后推（原 N+1 轮变为 N+2…）。插入点越界
-                    # （历史被并发删除）时降级为追加。插入完成后旧轮次的编号
-                    # 全部变化，累计摘要游标随之失效重建
+                    # （历史被并发删除）时降级为追加。累计摘要保留并把覆盖范围
+                    # 钳到插入点（第 N 轮）：插入点之前轮次的编号与内容未变、
+                    # 摘要正文继续有效；插入轮及其后轮次以原始对话回传，下次
+                    # 压缩再自然纳入。清空整份摘要会让下次任务全部轮次退回
+                    # 未压缩、从第 1 轮整段重压（请求开始时已钳制，这里是收尾
+                    # 防御，两处幂等）
                     round_positions = [
                         index for index, entry in enumerate(entries)
                         if isinstance(entry, dict) and entry.get("event") == "chat_round"
@@ -969,7 +1020,9 @@ class ChatMemoryManager:
                         entries.insert(after_index, completed_round)
                         self._insert_round_number = None
                         self._history_cutoff_rounds = None
-                        meta["context_summary"] = None
+                        meta["context_summary"] = _clamp_summary_to_rounds(
+                            meta.get("context_summary"), insert_round
+                        )
                         self._backup_history_file()
                     else:
                         print(
@@ -979,7 +1032,9 @@ class ChatMemoryManager:
                         entries.append(completed_round)
                         self._insert_round_number = None
                         self._history_cutoff_rounds = None
-                        meta["context_summary"] = None
+                        meta["context_summary"] = _clamp_summary_to_rounds(
+                            meta.get("context_summary"), insert_round
+                        )
                         self._backup_history_file()
                 else:
                     # 正常追加语义：新收尾轮次挂到末尾
@@ -1101,7 +1156,9 @@ class ChatMemoryManager:
                     # 与 add_chat_history 替换分支同口径）
                     self._backup_history_file()
                 elif insert_round is not None:
-                    # 回答插入（ask_user 卡片再答）：中断收尾同样插入第 N 轮之后
+                    # 回答插入（ask_user 卡片再答）：中断收尾同样插入第 N 轮之后。
+                    # 累计摘要保留并钳到插入点（与 add_chat_history 插入分支同口径，
+                    # 见其注释）；清空整份摘要会让下次任务从第 1 轮整段重压
                     round_positions = [
                         index for index, entry in enumerate(entries)
                         if isinstance(entry, dict) and entry.get("event") == "chat_round"
@@ -1112,7 +1169,9 @@ class ChatMemoryManager:
                         entries.append(completed_round)
                     self._insert_round_number = None
                     self._history_cutoff_rounds = None
-                    meta["context_summary"] = None
+                    meta["context_summary"] = _clamp_summary_to_rounds(
+                        meta.get("context_summary"), insert_round
+                    )
                     self._backup_history_file()
                 else:
                     entries.append(completed_round)
@@ -1161,6 +1220,19 @@ class ChatMemoryManager:
             first_question = removed[0].get("question") if isinstance(removed[0], dict) else ""
             if not str(first_question or "").startswith(ASK_ANSWER_PREFIX):
                 return 0
+            # 截断删除的是提问轮之后的轮次（编号后移整体消失）：累计摘要
+            # 按删除位置平移（与 delete_rounds 同口径）而不是留着越界游标
+            # 触发"游标自愈"整份作废——后者会让下次任务从第 1 轮整段重压
+            round_positions = [
+                index for index, entry in enumerate(entries)
+                if isinstance(entry, dict) and entry.get("event") == "chat_round"
+            ]
+            ask_round_number = sum(1 for index in round_positions if index <= ask_idx)
+            total_rounds = len(round_positions)
+            deleted_round_numbers = list(range(ask_round_number + 1, total_rounds + 1))
+            meta["context_summary"] = _adjust_summary_for_deleted_rounds(
+                meta.get("context_summary"), deleted_round_numbers
+            )
             entries = entries[:ask_idx + 1]
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)
@@ -1880,18 +1952,25 @@ class ChatMemoryManager:
         return _normalize_context_summary(meta.get("context_summary"))
 
     async def update_context_summary(self, summary: dict[str, Any] | str | None) -> str:
+        """写入累计摘要（成功返回"记录成功"）。
+
+        写盘失败（Windows 文件占用 WinError 5、杀软/索引器扫描大 JSONL 等）
+        不再静默跳过：静默降级会让"摘要已生成但未生效"，下一次压缩基于原始
+        历史从头重压——跨轮压缩反复整段执行的诱因之一。失败改为抛出
+        RuntimeError 由调用方决策：压缩核心路径（context_compaction）作为批次
+        失败补发 aborted 并按既有语义续跑/终止；非关键路径（问题索引同步、
+        旧版多块迁移）调用方已降级为告警，不影响任务。
+        """
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             meta["context_summary"] = _normalize_context_summary(summary)
             try:
                 _write_meta_and_entries(self._file_path, meta, entries)
             except OSError as write_error:
-                # 摘要写盘被 Windows 文件占用（杀软/索引器扫描大 JSONL，WinError 5）
-                # 时降级不抛错：摘要正文此时已由压缩模型成功生成，为写 meta 失败
-                # 终止整个生成任务得不偿失——本轮摘要暂不生效（模型上下文按原始
-                # 轮次回传，可能略大），下一次压缩流程会基于原始历史重新压缩。
-                print(f"[WARN] 累计摘要写盘失败（文件被占用，本次暂不生效，下轮重新压缩）: {write_error}")
-                return "摘要写盘繁忙，已跳过（下轮重新压缩）"
+                print(
+                    f"[ERROR] 累计摘要写盘失败（不再静默跳过，交由调用方处理）: {write_error}"
+                )
+                raise RuntimeError(f"累计摘要写盘失败：{write_error}") from write_error
         return "记录成功"
 
     def _load_for_read(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
