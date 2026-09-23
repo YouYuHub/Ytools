@@ -99,6 +99,10 @@ window.App = window.App || {};
       return;
     }
     const apply = function (data) {
+      // 数据已刷新为最新：消费跨窗口变更标记（编辑器页写操作留下的）
+      try {
+        if (window.FileHistorySync) window.FileHistorySync.consumeDirty();
+      } catch (_) { /* 标记失败不影响徽标渲染 */ }
       panelFiles = data.files || [];
       const stats = data.stats || { total: 0, added: 0, removed: 0 };
       btn.classList.remove("hidden");
@@ -140,6 +144,21 @@ window.App = window.App || {};
     if (state.sessionId === lastNotedSession) return;
     lastNotedSession = state.sessionId;
     refreshBadge(undefined, true); // 会话切换是数据变更源：强制刷新不受节流限制
+  }
+
+  /**
+   * 标记驱动的条件刷新（focus / 可见性恢复兜底路径）：仅当存在未消费的
+   * 跨窗口变更标记时才拉取——无任何文件链写操作时焦点事件零请求，静默期
+   * 不再产生轮询式请求。拉取成功后由 apply 消费标记；失败则标记保留，
+   * 下次焦点自动重试。
+   */
+  function refreshBadgeIfDirty() {
+    try {
+      if (!window.FileHistorySync || !window.FileHistorySync.peekDirty()) return;
+    } catch (_) {
+      return;
+    }
+    refreshBadge(undefined, true);
   }
 
   function renderPanel() {
@@ -382,14 +401,21 @@ window.App = window.App || {};
         if (confirmModal && !confirmModal.classList.contains("hidden")) closeConfirm();
       }
     });
-    // 编辑器页（独立窗口）内保留/撤回后回到主页面：focus / 可见性恢复时同步徽标。
-    // 不带 force——受同会话节流窗口约束：焦点事件可能被输入法/扩展/系统通知
-    // 打成风暴，节流后同一风暴窗口内最多 1 次 /file_diff/list（静默期零请求）
+    // 跨窗口即时同步：编辑器页写操作成功即写标记并广播（file_history_sync.js），
+    // 主页面收到广播立即刷新徽标——无需等待用户切回窗口
+    if (window.FileHistorySync) {
+      window.FileHistorySync.subscribe(function () {
+        refreshBadge(undefined, true);
+      });
+    }
+    // 编辑器页（独立窗口）内保留/撤回后回到主页面：focus / 可见性恢复兜底同步。
+    // 标记驱动：仅当存在未消费的变更标记时才刷新（成功后消费标记）——
+    // 无文件链写操作时焦点事件零请求；广播丢失时靠标记兜底，刷新失败下次重试
     window.addEventListener("focus", function () {
-      refreshBadge();
+      refreshBadgeIfDirty();
     });
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) refreshBadge();
+      if (!document.hidden) refreshBadgeIfDirty();
     });
     // 初始同步一次（此后全部事件驱动：openSession / startNewChat /
     // ensureSessionId / 历史导入钩子调用 noteSessionChanged；

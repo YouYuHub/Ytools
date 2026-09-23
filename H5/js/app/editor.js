@@ -92,6 +92,19 @@
     confirmAction = null;
   }
 
+  /**
+   * 文件链写操作成功后的跨窗口变更标记（js/file_history_sync.js）：
+   * 主页面收到广播即时刷新徽标；即使广播丢失，主页面 focus 时读标记也会补刷。
+   * 编辑器操作本身不依赖标记——标记失败静默忽略，不影响保存/撤回等主流程。
+   */
+  function notifyFileChainChanged() {
+    try {
+      if (global.FileHistorySync) global.FileHistorySync.markDirty();
+    } catch (_) {
+      /* 标记失败不影响编辑器操作 */
+    }
+  }
+
   /** 推断文件语言的 Prism 语言名（无匹配返回空串）。 */
   function langOf(path) {
     const base = String(path || "").replace(/\\/g, "/").split("/").pop().toLowerCase();
@@ -1177,6 +1190,7 @@
     API.fileSave(sessionId, st.key, content, st.hash)
       .then(function (result) {
         toast("已保存（新版本 v" + result.version.v + "）");
+        notifyFileChainChanged();
         load();
       })
       .catch(function (err) {
@@ -1191,6 +1205,7 @@
       .then(function (result) {
         toast("已撤回 " + (result.undone_count || 1) + " 个差异块（新版本 v"
           + (result.version ? result.version.v : "?") + "）");
+        notifyFileChainChanged();
         load();
       })
       .catch(function (err) { toast("撤回失败：" + err.message); });
@@ -1200,6 +1215,7 @@
     API.fileHunkKeep(sessionId, st.key, hunkIndex, untilHunk)
       .then(function () {
         toast("已保留该差异块（其余还原，新基线已写盘）");
+        notifyFileChainChanged();
         load();
       })
       .catch(function (err) { toast("保留失败：" + err.message); });
@@ -1215,7 +1231,11 @@
         "把整个文件回退到基线（本轮任务首次修改前的状态）？磁盘文件将被覆盖，此操作经版本链仍可再回退。",
         function () {
           API.fileRollback(sessionId, st.key, { target: "baseline" })
-            .then(function () { toast("已回退到基线"); load(); })
+            .then(function () {
+              toast("已回退到基线");
+              notifyFileChainChanged();
+              load();
+            })
             .catch(function (err) { toast("回退失败：" + err.message); });
         }
       );
@@ -1229,7 +1249,11 @@
         "把该文件回退到第 " + round + " 轮会话发起时的状态？（之后的修改将被还原，磁盘文件同步改写）",
         function () {
           API.fileRollback(sessionId, st.key, { to_round: round })
-            .then(function () { toast("已回退到第 " + round + " 轮发起时的状态"); load(); })
+            .then(function () {
+              toast("已回退到第 " + round + " 轮发起时的状态");
+              notifyFileChainChanged();
+              load();
+            })
             .catch(function (err) { toast("回退失败：" + err.message); });
         }
       );
@@ -1241,6 +1265,7 @@
           toast(result.synced
             ? "已并入磁盘最新内容（v" + result.version.v + "），diff 已重算"
             : (result.message || "磁盘内容与版本链一致"));
+          if (result.synced) notifyFileChainChanged(); // 未并入（磁盘一致）不产生链变更
           load();
         })
         .catch(function (err) { toast("刷新失败：" + err.message); });
@@ -1251,7 +1276,11 @@
         "保留后该文件的当前历史代将被锁定（不可再撤回/回退到其中的版本），并以当前内容开新代跟踪。确定保留？",
         function () {
           API.fileKeep(sessionId, st.key)
-            .then(function () { toast("已保留：历史已锁定，此后变更在新代跟踪"); load(); })
+            .then(function () {
+              toast("已保留：历史已锁定，此后变更在新代跟踪");
+              notifyFileChainChanged();
+              load();
+            })
             .catch(function (err) { toast("保留失败：" + err.message); });
         }
       );
