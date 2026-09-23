@@ -7,12 +7,15 @@ sys_tools_server.py 的手动验证脚本：通过项目自身的 MCP 客户端�
     python test/manual_sys_tools_check.py
 
 说明：
-    - 文件类/命令类工具在临时沙箱目录中验证，结束后自动清理；
+    - 当前 SysServer 注册 3 个工具：run_command / fetch_url / web_search
+      （read/write/edit/search 文件四件套已迁移为主项目后端内置工具，
+       其验证见 test/test_builtin_file_tools.py；list_dir 已停用）；
+    - run_command 用例覆盖：cmd/中文/退出码/超时杀进程/work_dir/超长截断落盘/
+      后台模式，以及 PowerShell 多行+引号（历史回归场景）与 bash（可用时）；
     - fetch_url / web_search 依赖外网连通性，失败时仅告警不判定为失败；
     - 每次工具调用都会新起一个 MCP 服务器子进程，整体耗时约 1-2 分钟。
 """
 import asyncio
-import json
 import os
 import shutil
 import sys
@@ -30,15 +33,7 @@ PY = sys.executable
 
 def _make_sandbox() -> Path:
     sandbox = Path(tempfile.mkdtemp(prefix="sys_tools_check_"))
-    (sandbox / "f1.txt").write_text("hello world\nsecond line\n", encoding="utf-8")
-    (sandbox / "script.py").write_text(
-        "def first_func():\n    return 1\n\n\ndef second_func():\n    return 2\n",
-        encoding="utf-8",
-    )
-    (sandbox / "gbk_file.txt").write_bytes("中文内容测试\n第二行\n".encode("gbk"))
-    (sandbox / "crlf_file.txt").write_bytes(b"alpha one\r\nalpha two\r\nbeta three\r\n")
-    (sandbox / "sub").mkdir()
-    (sandbox / "sub" / "inner.txt").write_text("nested file content\n", encoding="utf-8")
+    (sandbox / "marker.txt").write_text("sandbox marker\n", encoding="utf-8")
     return sandbox
 
 
@@ -87,129 +82,11 @@ class Checker:
         print(f"❌ {name}: 期望报错但成功返回：{str(result)[:200]}")
 
 
-async def run_file_cases(checker: Checker, sandbox: Path):
-    join = lambda *parts: str(Path(sandbox, *parts)).replace("\\", "/")  # noqa: E731
-
-    # ---- list_dir ----
-    data = await checker.check(
-        "list_dir 默认", "list_dir", {"dir_path": "."},
-        must_contain=['"f1.txt"', '"script.py"', '"gbk_file.txt"', '"total"'],
-    )
-    if data:
-        payload = json.loads(data.split("\n")[0])
-        names = {item["name"] for item in payload["entries"]}
-        assert "sub" in names and "f1.txt" in names, names
-        assert all(item["path"].startswith("/") or ":" in item["path"] or "/" in item["path"] for item in payload["entries"])
-    await checker.check(
-        "list_dir pattern+depth", "list_dir",
-        {"dir_path": ".", "pattern": "*.txt", "search_mode": "file", "max_depth": 0},
-        must_contain=['"f1.txt"'], must_not_contain=['"script.py"', '"inner.txt"'],
-    )
-
-    # ---- read_file ----
-    await checker.check(
-        "read_file 行号", "read_file", {"full_file_name": join("f1.txt")},
-        must_contain=["1| hello world", "2| second line", "共 2 行"],
-    )
-    await checker.check(
-        "read_file 行范围", "read_file",
-        {"full_file_name": join("f1.txt"), "start_line": 2, "end_line": 2, "show_line_numbers": False},
-        must_contain=["second line"], must_not_contain=["hello world"],
-    )
-    await checker.check(
-        "read_file GBK 自动解码", "read_file", {"full_file_name": join("gbk_file.txt")},
-        must_contain=["中文内容测试", "编码 gbk"],
-    )
-    await checker.check(
-        "read_file start 超界", "read_file",
-        {"full_file_name": join("f1.txt"), "start_line": 99},
-        must_contain=["超出文件总行数"],
-    )
-    await checker.check_error(
-        "read_file 不存在", "read_file", {"full_file_name": join("nope.txt")}, "不存在")
-
-    # ---- write_file ----
-    await checker.check(
-        "write_file 新建(多级目录)", "write_file",
-        {"full_file_name": join("a/b/new.txt"), "content": "第一行\n第二行"},
-        must_contain=["已写入"],
-    )
-    await checker.check(
-        "write_file 追加", "write_file",
-        {"full_file_name": join("a/b/new.txt"), "content": "\n第三行", "append": True},
-        must_contain=["已追加"],
-    )
-    await checker.check(
-        "write_file 回读", "read_file", {"full_file_name": join("a/b/new.txt"), "show_line_numbers": False},
-        must_contain=["第一行", "第二行", "第三行"],
-    )
-
-    # ---- edit_file ----
-    await checker.check(
-        "edit_file 唯一替换", "edit_file",
-        {"full_file_name": join("f1.txt"), "old_string": "hello world", "new_string": "hi world"},
-        must_contain=["替换 1 处"],
-    )
-    await checker.check_error(
-        "edit_file 歧义报错", "edit_file",
-        {"full_file_name": join("script.py"), "old_string": "return", "new_string": "yield"},
-        "歧义",
-    )
-    await checker.check(
-        "edit_file 全部替换", "edit_file",
-        {"full_file_name": join("script.py"), "old_string": "return", "new_string": "return  # ret", "replace_all": True},
-        must_contain=["替换 2 处"],
-    )
-    await checker.check(
-        "edit_file CRLF 适配", "edit_file",
-        {"full_file_name": join("crlf_file.txt"), "old_string": "alpha two", "new_string": "alpha 2"},
-        must_contain=["替换 1 处", "CRLF"],
-    )
-    crlf_after = Path(sandbox, "crlf_file.txt").read_bytes()
-    if b"alpha 2\r\n" in crlf_after and b"\r\n" in crlf_after:
-        checker.passed += 1
-        print("✅ edit_file CRLF 写回保持")
-    else:
-        checker.failed += 1
-        print(f"❌ edit_file CRLF 写回丢失: {crlf_after!r}")
-    await checker.check(
-        "edit_file 多行 old_string(\\n)", "edit_file",
-        {"full_file_name": join("crlf_file.txt"), "old_string": "alpha one\nalpha 2", "new_string": "alpha one\nalpha two"},
-        must_contain=["替换 1 处"],
-    )
-    await checker.check_error(
-        "edit_file 0 处匹配", "edit_file",
-        {"full_file_name": join("f1.txt"), "old_string": "not-exist-string", "new_string": "x"}, "0 处匹配")
-
-    # ---- search_files ----
-    await checker.check(
-        "search_files 正则+上下文", "search_files",
-        {"pattern": r"def \w+_func", "dir_path": ".", "file_pattern": "*.py", "context_lines": 1},
-        must_contain=["script.py:1", "script.py:5", "扫描"],
-    )
-    await checker.check(
-        "search_files 忽略大小写", "search_files",
-        {"pattern": "SECOND LINE", "dir_path": ".", "ignore_case": True, "is_regex": False},
-        must_contain=["f1.txt:2"],
-    )
-    await checker.check(
-        "search_files 子目录递归", "search_files",
-        {"pattern": "nested file"},
-        must_contain=["sub/inner.txt"],
-    )
-    await checker.check(
-        "search_files 无命中", "search_files",
-        {"pattern": "zzz_no_such_content_zzz", "dir_path": "."},
-        must_contain=["无匹配结果"],
-    )
-    await checker.check_error(
-        "search_files 非法正则", "search_files", {"pattern": "["}, "正则表达式不合法")
-
-
-async def run_command_cases(checker: Checker):
+async def run_command_cases(checker: Checker, sandbox: Path):
+    # ---- 基础：echo / 中文 / 退出码 ----
     await checker.check(
         "run_command echo", "run_command", {"command": "echo hello_cmd"},
-        must_contain=["exit_code=0", "hello_cmd"],
+        must_contain=["exit=0", "hello_cmd"],
     )
     await checker.check(
         "run_command 中文输出", "run_command",
@@ -219,18 +96,74 @@ async def run_command_cases(checker: Checker):
     await checker.check(
         "run_command 非零退出码", "run_command",
         {"command": "cmd /c exit 3"},
-        must_contain=["exit_code=3"],
+        must_contain=["exit=3"],
     )
+    # ---- 超时终止（进程树强制终止）----
     await checker.check(
         "run_command 超时终止", "run_command",
         {"command": "ping -n 30 127.0.0.1", "timeout_seconds": 2},
-        must_contain=["超时被强制终止"],
+        must_contain=["命令超时，进程树已被强制终止"],
+    )
+    # ---- work_dir 指定工作目录 ----
+    await checker.check(
+        "run_command 指定 work_dir", "run_command",
+        {"command": "cd", "work_dir": os.environ.get("SystemRoot", r"C:\Windows")},
+        must_contain=["exit=0", "Windows"],
+    )
+    # ---- PowerShell：多行 + 引号 + 分号（历史回归：内联引号破坏曾必失败）----
+    await checker.check(
+        "run_command PowerShell 多行+引号", "run_command",
+        {"command": "$a = 1\n$b = 2\nWrite-Output \"sum=$($a+$b) | 'q' ok\"",
+         "shell": "powershell"},
+        must_contain=["sum=3 | 'q' ok"],
     )
     await checker.check(
-        "run_command 指定 cwd", "run_command",
-        {"command": "cd", "cwd": os.environ.get("SystemRoot", r"C:\\Windows")},
-        must_contain=["exit_code=0"],
+        "run_command PowerShell 中文", "run_command",
+        {"command": "Write-Output '中文PS输出ok'", "shell": "powershell"},
+        must_contain=["中文PS输出ok"],
     )
+    # ---- bash（WSL/Git Bash；首次启动较慢，失败仅告警）----
+    if shutil.which("bash"):
+        await checker.check(
+            "run_command bash", "run_command",
+            {"command": "echo bash_ok && pwd", "shell": "bash"},
+            must_contain=["bash_ok"], fatal=False,
+        )
+    else:
+        print("⚠️  run_command bash: 系统未安装 bash，跳过")
+        checker.warned += 1
+    # ---- 超长输出：截断 + 完整输出落盘提示 ----
+    await checker.check(
+        "run_command 超长截断+落盘", "run_command",
+        {"command": f'"{PY}" -c "print(\'x\'*30000)"'},
+        must_contain=["过长已截断", "完整输出:", "可用 read_file 读取"],
+    )
+    # ---- 后台模式：启动 + 输出文件轮询 ----
+    bg = await checker.check(
+        "run_command 后台模式", "run_command",
+        {"command": "echo bg_manual_ok", "background": True},
+        must_contain=["后台模式已启动", "输出文件:"],
+    )
+    if bg:
+        out_path = None
+        for line in bg.splitlines():
+            if line.startswith("输出文件:"):
+                out_path = line.split(":", 1)[1].strip().split("（")[0].strip()
+        if out_path:
+            await asyncio.sleep(2.5)
+            try:
+                content = Path(out_path).read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                content = f"<读取失败: {exc}>"
+            if "bg_manual_ok" in content:
+                checker.passed += 1
+                print("✅ run_command 后台输出落盘: bg_manual_ok")
+            else:
+                checker.failed += 1
+                print(f"❌ run_command 后台输出缺失: {content[:120]!r}")
+        else:
+            checker.failed += 1
+            print("❌ run_command 后台模式: 未能解析输出文件路径")
 
 
 async def run_network_cases(checker: Checker):
@@ -263,14 +196,13 @@ async def main():
     try:
         tools = await get_mcp_tools("SysServer")
         names = sorted(tool.name for tool in tools)
-        expected = sorted(["list_dir", "read_file", "write_file", "edit_file",
-                           "search_files", "run_command", "fetch_url", "web_search"])
+        expected = sorted(["run_command", "fetch_url", "web_search"])
         if names == expected:
             checker.passed += 1
             print(f"✅ 工具发现: {names}")
         else:
             checker.failed += 1
-            print(f"❌ 工具发现不一致: {names}")
+            print(f"❌ 工具发现不一致: {names}（期望 {expected}）")
         # schema 快速体检：参数 schema 均为 object 且带 description
         bad = [t.name for t in tools if (t.parameters or {}).get("type") != "object"]
         if bad:
@@ -280,10 +212,8 @@ async def main():
             checker.passed += 1
             print("✅ 工具参数 schema 均为 object")
 
-        print("\n---------- 文件类工具 ----------")
-        await run_file_cases(checker, sandbox)
         print("\n---------- 命令执行 ----------")
-        await run_command_cases(checker)
+        await run_command_cases(checker, sandbox)
         print("\n---------- 网络抓取/搜索（失败仅告警） ----------")
         await run_network_cases(checker)
     finally:

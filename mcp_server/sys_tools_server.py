@@ -2,9 +2,8 @@
 """
 系统的 mcp 服务模块：为聊天模型提供一组通用本地工具。
 
-当前注册工具（4 个；read/write/edit/search 文件四件套已迁移为主项目后端内置工具）：
-    list_items      目录浏览（通配符过滤、递归深度、文件/目录过滤）
-    run_command     执行终端命令（多 shell；超时保护、输出截断、编码自适应、后台分离模式）
+当前注册工具（3 个；read/write/edit/search 文件四件套已迁移为主项目后端内置工具，list_items 已停用）：
+    run_command     执行终端命令（多 shell；超时保护、输出截断并落盘完整输出、编码自适应、后台分离模式）
     fetch_url       抓取网页/HTTP 接口（纯文本提取、标签/正则抽取、gzip/deflate 自动解压、截断）
     web_search      网页搜索（Bing 主 + DuckDuckGo 回退合并、重定向解包、返回标题/链接/摘要）
 
@@ -1082,17 +1081,27 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     done_path = _BG_LOG_DIR / f"{base}.done.txt"
     launcher_path = _BG_LOG_DIR / f"{base}.cmd"
     vbs_path = _BG_LOG_DIR / f"{base}.vbs"
-    if shell_prefix:
-        # 非 cmd shell：还原为 "[exe, 前缀..., 命令]" 的调用形式，括号分组后整体重定向
-        # （命令内部的 |、& 等在引号内由目标 shell 解释，不会被外层 cmd 拆段）
-        exec_line = f'( {subprocess.list2cmdline([shell_exe, *shell_prefix, command])} )'
-        runner_path = None
-    else:
+    if shell_kind == "cmd":
         # cmd 家族：命令原文写入独立 runner 文件，规避引号/管道等特殊字符的二次解析；
         # 直接写 "命令 < nul > 文件" 时重定向只绑定最后一个管道段/链式命令，
         # 会丢掉前段输出（如 echo）甚至覆盖管道输入（如 dir|findstr 变空）
         runner_path = _BG_LOG_DIR / f"{base}.run.cmd"
         exec_line = f'call "{runner_path}"'
+    elif shell_kind in ("powershell", "pwsh"):
+        # PowerShell：命令写入 .ps1 由 -File 执行。不能把命令内联进启动器：
+        # cmd 解析层会把 list2cmdline 的 \" 转义当裸引号处理，含引号/分号/换行的
+        # 命令必然失败（"\"; \"... was unexpected at this time."）
+        runner_path = _BG_LOG_DIR / f"{base}.run.ps1"
+        exec_line = subprocess.list2cmdline([
+            shell_exe, "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(runner_path)])
+    else:
+        # bash/sh/zsh：命令写入 .sh 并以 stdin 喂给 shell（Windows 上 bash 常为
+        # WSL 启动器，无法按 Windows 路径直接执行脚本文件；stdin 方式两种 bash 通吃）。
+        # 必须用括号包住：外层 launcher 还会加 "< nul"，同层两个 stdin 重定向时
+        # cmd 取最后一个，会把脚本 stdin 覆盖成 nul 导致命令空跑
+        runner_path = _BG_LOG_DIR / f"{base}.run.sh"
+        exec_line = f'( {subprocess.list2cmdline([shell_exe])} < "{runner_path}" )'
     launcher_text = (
         "@echo off\r\n"
         + "".join(line + "\r\n" for line in _batch_env_lines())
@@ -1112,14 +1121,11 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     try:
         launcher_path.write_text(launcher_text, encoding="mbcs")
         vbs_path.write_text(vbs_text, encoding="mbcs")
-        if runner_path is not None:
-            runner_path.write_text("@echo off\r\n" + command.rstrip() + "\r\n", encoding="mbcs")
     except (OSError, LookupError):
         launcher_path.write_text(launcher_text, encoding="utf-8", errors="replace")
         vbs_path.write_text(vbs_text, encoding="utf-8", errors="replace")
-        if runner_path is not None:
-            runner_path.write_text(
-                "@echo off\r\n" + command.rstrip() + "\r\n", encoding="utf-8", errors="replace")
+    if runner_path is not None:
+        _write_runner_script(runner_path, shell_kind, command)
     # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
     pid = _wmi_create_process(f'wscript.exe //nologo "{vbs_path}"')
     return {
@@ -1128,9 +1134,32 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     }
 
 
-def _cleanup_relay_files(info: dict) -> None:
-    """清理中转脚本临时文件（out 输出文件由调用方负责）。"""
-    for key in ("launcher", "runner", "vbs", "done"):
+def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> None:
+    """写执行脚本：cmd→.run.cmd（mbcs）；powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；
+    bash/sh/zsh→.run.sh（UTF-8，stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，
+    让中转链 done 文件记录命令本身的退出码。"""
+    if shell_kind == "cmd":
+        try:
+            runner_path.write_text("@echo off\r\n" + command.rstrip() + "\r\n", encoding="mbcs")
+        except (OSError, LookupError):
+            runner_path.write_text(
+                "@echo off\r\n" + command.rstrip() + "\r\n", encoding="utf-8", errors="replace")
+        return
+    text = command.rstrip() + "\n"
+    if shell_kind in ("powershell", "pwsh"):
+        text += "if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\n"
+        runner_path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+        return
+    text += "exit $?\n"
+    runner_path.write_bytes(text.encode("utf-8"))
+
+
+def _cleanup_relay_files(info: dict, include_streams: bool = False) -> None:
+    """清理中转脚本临时文件；include_streams=True 时连 out/err 输出文件一并删除。"""
+    keys = ["launcher", "runner", "vbs", "done"]
+    if include_streams:
+        keys += ["out", "err"]
+    for key in keys:
         path = info.get(key)
         if path is None:
             continue
@@ -1138,6 +1167,28 @@ def _cleanup_relay_files(info: dict) -> None:
             Path(path).unlink()
         except OSError:
             pass
+
+
+def _save_full_output(stdout_text: str, stderr_text: str) -> Optional[Path]:
+    """把完整输出（stdout+stderr 分段）落盘到日志目录，返回文件路径；失败返回 None。
+
+    仅在前台输出超长截断时调用：工具返回中省略的中间部分可从该文件续读。
+    文件名前缀 fg_，与中转文件同规则（24h 自动清理）。
+    """
+    try:
+        _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = f"fg_{stamp}_{next(_BG_NAME_SEQ) % 10000:04d}_{os.getpid()}"
+        path = _BG_LOG_DIR / f"{base}.full.txt"
+        sections = []
+        if stdout_text:
+            sections.append("----- stdout -----\n" + stdout_text)
+        if stderr_text:
+            sections.append("----- stderr -----\n" + stderr_text)
+        path.write_text("\n".join(sections), encoding="utf-8")
+        return path
+    except OSError:
+        return None
 
 
 def _kill_process_tree(proc: subprocess.Popen, is_nt: bool) -> None:
@@ -1203,7 +1254,7 @@ def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
 
 def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
                             cwd, timeout, is_nt) -> tuple:
-    """前台执行命令，返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒)。
+    """前台执行命令，返回 (退出码, stdout 文本, stderr 文本, 是否超时, 耗时秒, 中转信息或 None)。
 
     Windows 上本服务进程被宿主放入受限 Job 对象（实测 LimitFlags 含
     KILL_ON_JOB_CLOSE），部分原生程序（nvidia-smi 等）在该 Job 内初始化会
@@ -1212,16 +1263,18 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
     中转链启动失败时回退 Popen 直接执行。POSIX 仍走 Popen 直接执行。
     """
     if not is_nt:
-        return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
-                                      cwd, timeout, is_nt)
+        result = _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
+                                        cwd, timeout, is_nt)
+        return (*result, None)
     started = time.monotonic()
     try:
         info = _write_relay_script(
             command, cwd, shell_exe, shell_kind, shell_prefix, "fg",
             split_streams=True)
     except Exception:
-        return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
-                                      cwd, timeout, is_nt)
+        result = _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
+                                        cwd, timeout, is_nt)
+        return (*result, None)
     timed_out = False
     deadline = started + timeout
     done_path = Path(info["done"])
@@ -1240,9 +1293,10 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
         except (ValueError, OSError):
             exit_code = None
     if exit_code is None:
-        # 超时：终止执行侧进程树（runner 存在杀 runner，否则杀启动器 cmd）
+        # 超时：终止执行侧进程树。wscript 包装器是树根（wscript → cmd → 命令），
+        # taskkill /T 连带子孙一起杀；原实现把脚本路径传给 /PID 导致从未真正终止
         timed_out = True
-        root_pid = info.get("runner") or info.get("cmd")
+        root_pid = info.get("pid")
         if root_pid:
             try:
                 subprocess.run(
@@ -1259,7 +1313,7 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
     err_bytes = err_path.read_bytes() if err_path and Path(err_path).exists() else b""
     stdout_text = _decode_bytes(out_bytes, candidates=candidates).replace("\r\n", "\n")
     stderr_text = _decode_bytes(err_bytes, candidates=candidates).replace("\r\n", "\n")
-    return exit_code, stdout_text, stderr_text, timed_out, elapsed
+    return exit_code, stdout_text, stderr_text, timed_out, elapsed, info
 
 
 def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt) -> str:
@@ -1278,8 +1332,9 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
             f" | shell={shell_kind} | pid={info['pid']}",
             f"输出文件: {_display_path(info['out'])}",
             f"结束标记: {_display_path(info['done'])}（命令结束后写入退出码；该文件出现即已结束）",
-            "轮询建议: 用 read_file 读取输出文件，或再次 run_command 执行 type 查看尾部；"
-            "确认退出码时读取结束标记文件内容",
+            "轮询建议: 用 read_file 读取输出文件（推荐）；确认退出码时读取结束标记文件内容",
+            f"终止建议: taskkill /PID {info['pid']} /T /F（必须带 /T 终止整棵进程树；"
+            "只杀该 pid 会留下实际服务进程）",
         ])
     # POSIX：setsid 分离 + 输出重定向到日志文件
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1294,6 +1349,7 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
         f"[run_command] 后台模式已启动 | shell={shell_kind} | pid={proc.pid}",
         f"输出文件: {_display_path(out_path)}（stdout+stderr 合并追加）",
         "轮询建议: 用 read_file 读取输出文件，或用 ps -p <pid> 确认进程仍在运行",
+        f"终止建议: kill -TERM -{proc.pid}（负号=整个进程组，含子进程）",
     ])
 
 
@@ -1302,6 +1358,8 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
     if not command:
         raise ValueError("command 不能为空")
     is_nt = os.name == "nt"
+    # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
+    _prune_old_bg_files()
     shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
     work_text = str(work_dir or "").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
@@ -1311,10 +1369,29 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
         timeout = 120.0
     if background:
         return _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt)
-    exit_code, stdout_text, stderr_text, timed_out, elapsed = _run_command_foreground(
+    exit_code, stdout_text, stderr_text, timed_out, elapsed, relay_info = _run_command_foreground(
         command, shell_exe, shell_kind, shell_prefix, cwd, timeout, is_nt)
-    stdout_text = _truncate_text(stdout_text, _RUN_COMMAND_MAX_CHARS, "stdout 过长已截断")
-    stderr_text = _truncate_text(stderr_text, 3000, "stderr 过长已截断")
+    raw_stdout, raw_stderr = stdout_text, stderr_text
+    keep_streams = False
+    more_hint = ""
+    if len(raw_stdout) > _RUN_COMMAND_MAX_CHARS or len(raw_stderr) > 3000:
+        # 超长截断：把完整输出落盘，返回里附文件路径（中间被省略部分可用 read_file 续读）
+        full_path = _save_full_output(raw_stdout, raw_stderr)
+        if full_path is not None:
+            more_hint = f"；完整输出: {_display_path(full_path)}（可用 read_file 读取）"
+        else:
+            # 落盘失败：保留中转输出文件并在返回中给出路径
+            refs = [relay_info.get("out"), relay_info.get("err")] if relay_info else []
+            refs = [path for path in refs if path]
+            if refs:
+                keep_streams = True
+                more_hint = "；完整输出保留在: " + " | ".join(
+                    _display_path(Path(path)) for path in refs)
+    stdout_text = _truncate_text(raw_stdout, _RUN_COMMAND_MAX_CHARS, "stdout 过长已截断" + more_hint)
+    stderr_text = _truncate_text(raw_stderr, 3000, "stderr 过长已截断" + more_hint)
+    if relay_info is not None:
+        # 输出已读入内存（或已另存完整版）：清理本次中转临时文件，避免日志目录无限堆积
+        _cleanup_relay_files(relay_info, include_streams=not keep_streams)
     header = (f"[run_command] shell={shell_kind} | cwd={_display_path(Path(cwd))}"
               f" | exit={exit_code} | 耗时 {elapsed:.1f}s"
               + (" | 命令超时，进程树已被强制终止" if timed_out else ""))
@@ -1775,30 +1852,23 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
 @sys_mcp_server.tool()
 async def run_command(command: str, shell: str = "auto", work_dir: str = "",
                       timeout_seconds: float = 120.0, background: bool = False) -> str:
-    """执行一条终端命令并返回退出码与输出（支持多 shell：cmd/powershell/pwsh/bash/sh/zsh）
+    """执行终端命令并返回退出码与输出（多 shell：cmd/powershell/pwsh/bash/sh/zsh）
     参数：
-        command:         要执行的命令原文，由目标 shell 直接解释（管道、重定向、链式命令均可）；
-                         空串报错。Windows PowerShell 中用 `;` 与 if ($?) 串联依赖命令，
-                         不要用 &&（PowerShell 5.1 不支持）
-        shell:           解释器：auto=Windows 用 cmd、非 Windows 用 bash/sh（默认）；
-                         cmd=Windows 批处理；powershell=Windows PowerShell 5.1；
-                         pwsh=PowerShell 7+（未安装报错）；bash/sh/zsh=POSIX shell（Windows 上需 Git Bash/WSL）
-        work_dir:        工作目录，默认当前目录（生成任务中即会话工作目录）；相对/绝对路径均可；
-                         目录不存在时报错
-        timeout_seconds: 前台超时秒数（1-1800），默认 120；超时后强制终止整棵进程树并返回已捕获的输出
+        command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行命令均可；
+                         多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持（请用
+                         work_dir 或链式命令）；PowerShell 5.1 不支持 &&，用 `;` 串联命令
+        shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/
+                         pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）
+        work_dir:        工作目录，默认当前目录（生成任务中即会话工作目录）；目录不存在时报错
+        timeout_seconds: 前台超时秒数（1-1800），默认 120；超时强制终止整棵进程树并返回已捕获输出
         background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径，适合构建、
                          训练、常驻服务等长任务；默认 false 前台等待
     返回：
-        头部（shell/工作目录/退出码/耗时）+ stdout 与 stderr 分段内容；
-        输出过长截断（保留头 2/3 + 尾 1/3）；无输出时明确标注。
-        后台模式返回输出文件与结束标记文件路径：结束标记文件出现即命令已结束（内容为退出码），
-        可用 read_file 或再次 run_command 轮询输出
-    说明：
-        - 输出按系统代码页自适应解码（GBK/UTF-8 互串已做乱码评分兜底），跨 shell 编码稳定；
-        - Windows 前台执行不弹出控制台窗口；后台经 WMI+VBS 隐藏链路启动，脱离本进程树，
-          不受宿主"命令结束后清理整棵进程树"影响；
-        - 文件浏览/读写/搜索请优先使用专用工具，本工具用于真正需要终端的能力（安装依赖、
-          运行脚本、git、进程管理等）
+        头部（shell/工作目录/退出码/耗时）+ stdout 与 stderr 分段内容（系统代码页自适应解码）；
+        超长截断保留头尾，完整输出自动落盘并附文件路径（可用 read_file 续读中间省略部分）。
+        后台模式：读输出文件轮询内容；结束标记文件出现即已结束（内容为退出码）。
+        文件读写/搜索请优先使用专用工具（read_file/write_file/edit_file/search_files）；
+        本工具适用于安装依赖、运行脚本、git、进程管理等终端操作。
     """
     return await asyncio.to_thread(
         _run_command_impl, command, shell, work_dir, timeout_seconds, background)

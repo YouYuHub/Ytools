@@ -236,18 +236,17 @@ agent_tool_sse/
 - `set_env_vars`：写回 .env 并保持内存 env_vars 一致（防 hot-reload 覆盖）
 
 ### 8. 系统 MCP 服务器（`mcp_server/sys_tools_server.py`）
+当前注册 3 个工具（read/write/edit/search 文件四件套已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`，list_items 已停用）：
+
 | 工具 | 业务 |
 |---|---|
-| list_dir | 目录浏览（通配符过滤、递归深度、文件/目录过滤，JSON 输出） |
-| read_file | 读取文件（行号显示、行范围、utf-8/gbk 自适应、2000 行截断保护） |
-| write_file | 写入文件（整文件覆盖/追加，自动创建多级目录） |
-| edit_file | 精确字符串替换编辑（0 处/多处歧义校验，自动适配 CRLF/LF） |
-| search_files | 跨文件正则搜索（类似 grep，文件名通配符、忽略大小写、上下文行） |
-| run_command | 终端命令执行（超时杀进程树、输出截断、gbk/utf-8 编码自适应） |
+| run_command | 终端命令执行（多 shell：cmd/powershell/pwsh/bash/sh/zsh；超时杀进程树、超长输出截断并落盘完整输出、gbk/utf-8 编码自适应、后台分离模式） |
 | fetch_url | 抓取网页/HTTP 接口（正文纯文本、按标签/正则抽取、超长截断） |
 | web_search | 网页搜索（解析 Bing 网页版，返回标题/链接/摘要） |
 
-另注册命名管道终端服务器 `PipeIpcMCP.exe`（工具：setup_pipe / run_pipe_command / read_pipe_history）。
+Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐藏中转链执行（脱离宿主受限 Job 与进程树）；非 cmd shell 命令写入独立执行脚本（powershell/pwsh→.run.ps1 以 -File 执行、bash/sh/zsh→.run.sh 以 stdin 喂入），绕开 cmd 解析层对 `\"` 转义的二次破坏；中转临时文件（含超长输出的完整版落盘 fg_*.full.txt）每次调用后即时清理、超 24h 自动回收。
+
+另注册命名管道终端服务器 `PipeIpcMCP.exe`（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）。
 
 可用 `python test/manual_sys_tools_check.py` 通过真实 MCP 客户端逐工具自检（临时沙箱，自动清理）。
 
