@@ -59,6 +59,7 @@ from factory.agent_runtime.chat_runtime import (
     build_request_messages,
     copy_for_request,
     estimate_request_context_tokens,
+    estimate_send_context_tokens,
     estimate_text_tokens,
     load_tool_call_stream_timeout,
     merge_function_call_delta,
@@ -187,7 +188,8 @@ def load_sub_agent_retry_limits() -> dict[str, int]:
     - stream_error_max_attempts：流式错误断点续跑上限（0/负=不限制）——
       模型调用出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；
     - todo_remind_max：todo 未完成提醒上限（0=关闭，负=不限制）——
-      每次完整工具执行轮后额度重置，子任务给出有效最终回复即正常收尾。
+      只对「模型创建/更新过的计划」生效（父级预置但从未被触碰的计划
+      不拦截有效交付）；每次完整工具执行轮后额度重置。
 
     三项全部受 max_rounds/timeout 双重硬封顶，配置为不限制也不会失控。
     """
@@ -312,6 +314,34 @@ def _collect_task_media_references(task: str) -> list[str]:
     return refs
 
 
+def _format_initial_todo_hint(items: list[dict[str, Any]]) -> str:
+    """把父级预置计划渲染为注入文案（随第二条 user 消息进入子模型上下文）。
+
+    预置计划过去只存在于 Runner 内部状态：收尾时才被突击检查「计划未完成」，
+    而子模型对此毫不知情（现场表现：模型困惑地补一次 todo_write 再重复交付）。
+    注入后计划可见，与收尾处「未触碰的预置计划不拦截有效交付」规则配套。
+    """
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or item.get("id") or "").strip()
+        if not content:
+            continue
+        status = str(item.get("status") or "pending")
+        marker = {"done": "[已完成]", "in_progress": "[进行中]"}.get(status, "[待办]")
+        lines.append(f"{index}. {marker} {content}")
+    if not lines:
+        return ""
+    return (
+        "【预置计划】父智能体为本任务预置了以下参考计划（可参照推进，"
+        "也可按实际情况调整；如需更新进度或调整计划，请调用 todo 工具"
+        "全量提交列表）：\n"
+        + "\n".join(lines)
+        + "\n任务完成后直接给出最终回复即可。"
+    )
+
+
 def _tool_definition_name(tool_def: Any) -> str:
     """从工具定义 dict 取函数名（畸形定义返回空串）。"""
     if not isinstance(tool_def, dict):
@@ -334,6 +364,19 @@ class SubAgentRunner:
             {"role": "user", "content": context.task},
         ]
         self.todo: list[dict[str, Any]] = list(context.initial_todo or [])
+        # 父级预置计划必须对子模型可见：过去它只存在于 Runner 内部状态，
+        # 收尾时的「计划未完成」提醒对模型而言凭空出现——现场表现是模型
+        # 困惑地补一次 todo_write 再重复交付一遍。注入为第二条 user 消息
+        #（_internal 仅本地标记，构造请求前剥离；配合收尾处「未触碰的
+        # 预置计划不拦截有效交付」规则，见 _run_inner 收尾分支）。
+        if self.todo:
+            todo_hint = _format_initial_todo_hint(self.todo)
+            if todo_hint:
+                self.messages.append({
+                    "role": "user",
+                    "content": todo_hint,
+                    "_internal": True,
+                })
         self.usage_accumulator = UsageAccumulator()
         self.rounds = 0
         self.started_at = now_str()
@@ -350,6 +393,10 @@ class SubAgentRunner:
         self._final_reply_retries_used = 0
         self._stream_error_retries_used = 0
         self._todo_remind_used = 0
+        # 计划是否被模型触碰过（成功调用 todo_write 即置位）：收尾提醒只
+        # 约束「模型知情且维护过」的计划；父级预置但从未被触碰的计划属隐藏
+        # 状态，不拦截有效交付（否则模型完成工作后会被迫补计划再重复交付）
+        self._todo_touched = False
         self._retry_limits = load_sub_agent_retry_limits()
         # read_media 数据注入坐标（子任务版，与父循环同语义）：
         # pending_parts 为 (reference, quality, start_time, end_time) 坐标，
@@ -688,6 +735,7 @@ class SubAgentRunner:
                     todo_result: dict[str, Any] = {"error": error_reason or "todos 参数无效"}
                 else:
                     self.todo = items
+                    self._todo_touched = True
                     await self._emit("todo", todos=items)
                     done_count = sum(1 for item in items if item["status"] == "done")
                     in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
@@ -874,7 +922,7 @@ class SubAgentRunner:
             if model_config is not None
             else resolve_model_max_input_tokens(default=8192)
         )
-        estimated = estimate_request_context_tokens(self.messages, visible_tools)
+        estimated = estimate_send_context_tokens(self.messages, visible_tools)
         if window > 0 and estimated > window:
             detail = (
                 f"子任务上下文预估 {estimated} tokens 超过模型窗口 {window}："
@@ -1049,16 +1097,17 @@ class SubAgentRunner:
                     continue
                 # ---- 交付保障（子任务限定；父级循环无此机制）----
                 # 优先级：todo 未完成提醒 > 空收尾重试 > 接受收尾。
-                # 子智能体一旦给出有效最终回复即正常收尾、不再催促调工具；
-                # todo 提醒额度在每次完整工具执行轮后重置（工具轮后再次"忘记"
-                # 可再次提醒），空收尾/提醒都以内部消息推进，消耗 rounds，
-                # 受 max_rounds/timeout 双重硬封顶。
+                # todo 提醒只对「模型创建/更新过的计划」生效（它知情、做出过
+                # 承诺）；父级预置但从未被触碰的计划是隐藏状态，不拦截有效
+                # 交付——否则模型完成工作后仍会被迫补计划再重复交付一遍。
+                # 提醒额度在每次完整工具执行轮后重置；空收尾/提醒都以内部
+                # 消息推进，消耗 rounds，受 max_rounds/timeout 双重硬封顶。
                 pending_todo = [
                     item for item in self.todo
                     if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
                 ]
                 tr_limit = self._retry_limits["todo_remind_max"]
-                if pending_todo and (
+                if pending_todo and self._todo_touched and (
                     tr_limit < 0 or self._todo_remind_used < tr_limit
                 ):
                     self._todo_remind_used += 1

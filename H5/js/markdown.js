@@ -124,14 +124,16 @@
   }
 
   // 把「填满宽度 + 超长钳制」声明合并进 <svg> 开标签的 style（不覆盖其它内联样式）：
-  // aspect-ratio + width:min(100%, 170vh*比例) —— 默认填满控件宽度（左右仅剩
-  // 视图自身的 4px 窄边距），高度按比例联动；仅当填满宽度后高度会超过约
-  // 1.7 屏（极竖长内容）才按高度收窄，避免页面被无限拉高。
+  // aspect-ratio + width:calc(min(100%, 170vh*比例) * var(--md-zoom, 1)) —— 默认
+  // 填满控件宽度（左右仅剩视图自身的 4px 窄边距），高度按比例联动；仅当填满宽度
+  // 后高度会超过约 1.7 屏（极竖长内容）才按高度收窄，避免页面被无限拉高。
+  // 末尾乘 --md-zoom 是「显示缩放」通道：倍率由 messages.js 写在控件块元素上，
+  // 放大后由视图容器（overflow:auto）滚动查看、缩小则居中（margin:0 auto）。
   // 注意不能把这里钳制值压回 70vh：一旦触顶，等比内容只能居中缩小，
   // 两侧会重新出现大片透明留白（"图片只占中间一部分宽度"）
   function applyAdaptiveStyle(open, ar) {
     const styleVal = "aspect-ratio:" + ar +
-      ";width:min(100%,calc(170vh*" + ar + "));height:auto";
+      ";width:calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1));height:auto";
     const styleMatch = /\sstyle\s*=\s*["']([^"']*)["']/i.exec(open);
     if (styleMatch) {
       // 追加到原值末尾：同名声明后写的生效，净化源码自带的 width/height 干扰
@@ -172,6 +174,19 @@
     return svg;
   }
 
+  // 缩放按钮组（三控件 svg/mermaid/canvas 共用）：[−] [百分比] [＋]。
+  // 纯静态标记——点击行为、状态与 --md-zoom 的应用由 messages.js 统一接线
+  // （事件委托 + Ctrl+滚轮；点百分比按钮复位 100%）。
+  function buildZoomGroupHtml() {
+    return (
+      '<div class="md-zoom-group" title="显示缩放：按钮或 Ctrl+滚轮（点百分比复位 100%）">' +
+      '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="out" title="缩小一档">-</button>' +
+      '<button type="button" class="md-svg-btn md-zoom-btn md-zoom-reset" data-zoom-action="reset" title="点击复位 100%">100%</button>' +
+      '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="in" title="放大一档">+</button>' +
+      "</div>"
+    );
+  }
+
   // SVG 代码 → 双视图控件：头部（名称 + 代码/图片切换 + 复制代码 + 复制图片），
   // 主体「代码视图」（语法高亮 pre/code，与普通代码块同款复制语义）与
   // 「图片视图」（inline SVG，整行一张独占显示）二选一显示，默认看图片。
@@ -192,6 +207,7 @@
       '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
       "</div>" +
       '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
       '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">⛶ 全屏</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
@@ -226,6 +242,7 @@
       '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
       "</div>" +
       '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
       '<button type="button" class="md-svg-btn" data-svg-action="rerender" title="重新渲染此图">↻ 重渲染</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">⛶ 全屏</button>' +
       '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
@@ -264,6 +281,7 @@
       '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
       "</div>" +
       '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
       '<button type="button" class="md-svg-btn md-canvas-run" data-canvas-action="run">▶ 运行</button>' +
       '<button type="button" class="md-svg-btn" data-canvas-action="shot" title="导出当前画布为 PNG">截图</button>' +
       '<button type="button" class="md-svg-btn" data-canvas-action="full" title="全屏显示画布（Esc 退出）">⛶ 全屏</button>' +
@@ -367,8 +385,9 @@
     const svgEl = holder.querySelector("svg");
     if (svgEl) {
       // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
-      // min(100%, 70vh*比例)，高度随比例联动——宽图触 70vh 上限时
-      // 容器跟着收窄，消除 100% 宽 + 居中缩放的两侧透明留白
+      // min(100%, 170vh*比例)，高度随比例联动——宽图触上限时容器跟着收窄，
+      // 消除 100% 宽 + 居中缩放的两侧透明留白；宽度/上限同乘 --md-zoom
+      // （显示缩放通道，见 applyAdaptiveStyle 注释）
       const vb = String(svgEl.getAttribute("viewBox") || "")
         .trim().split(/[\s,]+/).map(Number);
       if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
@@ -376,12 +395,12 @@
         // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
         const ar = Number((vb[2] / vb[3]).toFixed(6));
         svgEl.style.aspectRatio = String(ar);
-        svgEl.style.width = "min(100%, calc(170vh * " + ar + "))";
-        svgEl.style.maxWidth = "100%";
+        svgEl.style.width = "calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1))";
+        svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
         svgEl.style.height = "auto";
       } else {
-        svgEl.style.maxWidth = "100%";
-        svgEl.style.width = "100%";
+        svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
+        svgEl.style.width = "calc(100% * var(--md-zoom, 1))";
         svgEl.style.height = "auto";
       }
       svgEl.style.display = "block";

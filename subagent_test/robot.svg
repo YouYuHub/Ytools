@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#dfe9f3"/>
+      <stop offset="1" stop-color="#b8c6db"/>
+    </linearGradient>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9fd8ef"/>
+      <stop offset="1" stop-color="#5aa9d6"/>
+    </linearGradient>
+    <radialGradient id="headGrad" cx="0.4" cy="0.35" r="0.9">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d3e8f5"/>
+    </radialGradient>
+    <linearGradient id="bookGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff9a76"/>
+      <stop offset="1" stop-color="#e26a4a"/>
+    </linearGradient>
+    <radialGradient id="screenGrad" cx="0.5" cy="0.4" r="0.8">
+      <stop offset="0" stop-color="#3c4a6b"/>
+      <stop offset="1" stop-color="#22293f"/>
+    </radialGradient>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="400" height="300" fill="url(#bgGrad)"/>
+  <circle cx="60" cy="55" r="26" fill="#ffffff" opacity="0.35"/>
+  <circle cx="340" cy="70" r="18" fill="#ffffff" opacity="0.3"/>
+  <circle cx="310" cy="40" r="10" fill="#ffffff" opacity="0.3"/>
+  <rect x="0" y="240" width="400" height="60" fill="#9fb4cc"/>
+
+  <!-- floor shadow -->
+  <ellipse cx="200" cy="258" rx="105" ry="14" fill="#5f7288" opacity="0.4"/>
+
+  <!-- robot antenna -->
+  <line x1="200" y1="52" x2="200" y2="30" stroke="#4a6fa5" stroke-width="5"/>
+  <circle cx="200" cy="26" r="8" fill="#ffd166"/>
+  <circle cx="197" cy="23" r="3" fill="#fff3c4"/>
+
+  <!-- robot head -->
+  <rect x="140" y="50" width="120" height="92" rx="26" fill="url(#headGrad)" stroke="#7fa8c9" stroke-width="3"/>
+  <!-- eyes -->
+  <circle cx="172" cy="96" r="13" fill="#22293f"/>
+  <circle cx="228" cy="96" r="13" fill="#22293f"/>
+  <circle cx="176" cy="92" r="4.5" fill="#ffffff"/>
+  <circle cx="232" cy="92" r="4.5" fill="#ffffff"/>
+  <!-- cheeks -->
+  <circle cx="158" cy="112" r="6" fill="#f7a8b8" opacity="0.7"/>
+  <circle cx="242" cy="112" r="6" fill="#f7a8b8" opacity="0.7"/>
+  <!-- mouth -->
+  <path d="M188 116 Q200 126 212 116" fill="none" stroke="#22293f" stroke-width="4" stroke-linecap="round"/>
+  <!-- head highlight -->
+  <rect x="152" y="60" width="46" height="12" rx="6" fill="#ffffff" opacity="0.55"/>
+
+  <!-- robot body -->
+  <rect x="152" y="146" width="96" height="86" rx="20" fill="url(#bodyGrad)" stroke="#4a6fa5" stroke-width="3"/>
+  <!-- chest screen with Python hint -->
+  <rect x="170" y="162" width="60" height="42" rx="8" fill="url(#screenGrad)" stroke="#2c3654" stroke-width="2"/>
+  <circle cx="185" cy="183" r="7" fill="#ffd43b"/>
+  <circle cx="215" cy="183" r="7" fill="#4b8bbe"/>
+  <circle cx="187" cy="180" r="2" fill="#22293f"/>
+  <circle cx="213" cy="186" r="2" fill="#22293f"/>
+  <rect x="176" y="168" width="24" height="5" rx="2.5" fill="#ffffff" opacity="0.35"/>
+
+  <!-- arms -->
+  <line x1="152" y1="165" x2="118" y2="185" stroke="#4a6fa5" stroke-width="10" stroke-linecap="round"/>
+  <line x1="248" y1="165" x2="282" y2="185" stroke="#4a6fa5" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="118" cy="187" r="10" fill="#9fd8ef" stroke="#4a6fa5" stroke-width="3"/>
+  <circle cx="282" cy="187" r="10" fill="#9fd8ef" stroke="#4a6fa5" stroke-width="3"/>
+
+  <!-- legs -->
+  <rect x="168" y="232" width="18" height="20" rx="8" fill="#4a6fa5"/>
+  <rect x="214" y="232" width="18" height="20" rx="8" fill="#4a6fa5"/>
+
+  <!-- open book held in front -->
+  <g transform="translate(0,4)">
+    <path d="M132 214 Q166 200 200 214 Q234 200 268 214 L268 246 Q234 232 200 246 Q166 232 132 246 Z" fill="url(#bookGrad)" stroke="#b04a2e" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M200 214 L200 246" stroke="#b04a2e" stroke-width="3"/>
+    <path d="M146 220 Q170 210 192 220" fill="none" stroke="#ffe0d1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M146 232 Q170 222 192 232" fill="none" stroke="#ffe0d1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M208 220 Q232 210 254 220" fill="none" stroke="#ffe0d1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M208 232 Q232 222 254 232" fill="none" stroke="#ffe0d1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M136 216 Q168 204 198 216 L198 242 Q168 230 138 242 Z" fill="#ffffff" opacity="0.12"/>
+  </g>
+
+  <!-- floating learning sparks -->
+  <text x="322" y="150" font-family="sans-serif" font-size="20" fill="#ffd166" opacity="0.9">★</text>
+  <text x="70" y="180" font-family="sans-serif" font-size="16" fill="#ff9a76" opacity="0.9">★</text>
+</svg>

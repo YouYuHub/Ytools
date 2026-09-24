@@ -48,6 +48,7 @@ from memory.chat_round_store import merge_usage_dict as _merge_usage_dict
 from .chat_runtime import (
     estimate_messages_tokens,
     estimate_request_context_tokens,
+    estimate_send_context_tokens,
     estimate_text_tokens,
     parse_return_length,
     resolve_config_max_input_tokens,
@@ -1455,7 +1456,9 @@ async def compact_active_round_context_if_needed(
     """
     settings = settings or load_context_compaction_settings()
     original_messages = list(messages)
-    before_tokens = estimate_request_context_tokens(original_messages, tool_request.tools)
+    # 发送口径：与 copy_for_request 的实际请求一致（历史思考不回传），
+    # 避免长任务思考全文虚高估算导致提前触发（记录值即含虚高）
+    before_tokens = estimate_send_context_tokens(original_messages, tool_request.tools)
     token_limit = resolve_context_compaction_threshold(settings)
     if token_limit <= 0 or before_tokens <= token_limit:
         return RoundContextCompactionResult(
@@ -1484,7 +1487,7 @@ async def compact_active_round_context_if_needed(
     # 防空转：before_tokens 是全量上下文（含历史）。若超窗主要来自历史而非本轮轨迹
     # （本轮轨迹不足阈值一半），本轮压缩压不掉历史，只会空转消耗压缩模型调用；
     # 此类场景留给跨轮压缩（按轮数 > keep_rounds 触发）与首调用预算检查处理。
-    active_tokens = estimate_messages_tokens(active_messages)
+    active_tokens = estimate_send_context_tokens(active_messages)
     if active_tokens <= max(256, token_limit // 2):
         print(
             f"[INFO] 单轮上下文压缩跳过：本轮轨迹 {active_tokens} tokens 未达阈值一半"
@@ -1619,7 +1622,7 @@ async def compact_active_round_context_if_needed(
         + retained_prefix[leading_system_count:]
         + preserved_user_messages
     )
-    after_tokens = estimate_request_context_tokens(compacted_messages, tool_request.tools)
+    after_tokens = estimate_send_context_tokens(compacted_messages, tool_request.tools)
     merged_usage.update(cumulative_usage)
     summary_text = cumulative_text
     print(

@@ -75,6 +75,7 @@ from factory.agent_runtime.chat_runtime import (
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_request_context_tokens,
+    estimate_send_context_tokens,
     estimate_text_tokens,
     estimate_tool_definition_tokens,
     resolve_model_max_input_tokens,
@@ -609,7 +610,9 @@ async def _compact_task_context_if_needed(
 
     返回重建后的 messages；未触发返回 None。
     """
-    context_now = estimate_request_context_tokens(messages, tool_request.tools)
+    # 发送口径：历史思考不随请求回传（copy_for_request 剥离），估算需一致，
+    # 否则长任务的大量思考会把全量估算推高到远低于真实规模的阈值时误触发
+    context_now = estimate_send_context_tokens(messages, tool_request.tools)
     if threshold <= 0 or context_now <= threshold:
         return None
     round_start = _find_current_round_start(messages)
@@ -656,7 +659,7 @@ async def _compact_task_context_if_needed(
         }]
     rebuilt.extend(history_messages)
     rebuilt.extend(active_messages)
-    after_tokens = estimate_request_context_tokens(rebuilt, tool_request.tools)
+    after_tokens = estimate_send_context_tokens(rebuilt, tool_request.tools)
     print(f"[INFO] 任务内历史重建完成：{context_now} -> {after_tokens} tokens")
     return rebuilt
 
@@ -1249,7 +1252,7 @@ async def _run_chat_generation(
         # 超窗请求直接发往上游只会得到 400 或静默截断，这里先诊断并按需降级。
         # 基准使用模型窗口（硬限制）；单轮压缩阈值（窗口×比例）由任务内压缩负责。
         try:
-            first_call_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+            first_call_tokens = estimate_send_context_tokens(messages, tool_request.tools)
             model_window = resolve_model_max_input_tokens(default=8192)
             if first_call_tokens > model_window:
                 print(
@@ -1268,7 +1271,7 @@ async def _run_chat_generation(
                             f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
                             f"{downgraded_text}"
                         )
-                    downgraded_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+                    downgraded_tokens = estimate_send_context_tokens(messages, tool_request.tools)
                     active_file_block = (
                         f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
                         f"{downgraded_text}"
@@ -1361,14 +1364,14 @@ async def _run_chat_generation(
                             recent_questions_token_budget=question_budget,
                         )
                         candidate = _assemble_candidate(candidate_backend)
-                        if estimate_request_context_tokens(candidate, tool_request.tools) <= model_window:
+                        if estimate_send_context_tokens(candidate, tool_request.tools) <= model_window:
                             degraded_messages = candidate
                             if question_budget != question_budgets[0]:
                                 print("[INFO] 摘要上下文已按窗口收紧最近问题索引")
                             break
                     if degraded_messages is not None:
                         messages = degraded_messages
-                        first_call_tokens = estimate_request_context_tokens(messages, tool_request.tools)
+                        first_call_tokens = estimate_send_context_tokens(messages, tool_request.tools)
                         history_tokens = max(
                             0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens
                         )

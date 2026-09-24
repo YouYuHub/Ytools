@@ -788,6 +788,122 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dispatcher未完成", memory.summary["open_items"])
         self.assertIn("src/session.cpp", memory.summary["files"])
 
+    async def test_send_caliber_ignores_historical_reasoning_for_trigger(self):
+        """发送口径回归：历史轮次思考不随请求回传，不应把全量估算推高到误触发。
+
+        历史背景：运行时 messages 保留每轮思考全文（REASONING_RETURN_MAX_LENGTH=-1
+        时为原始全文），而真实请求（copy_for_request）只回传最近一条思考。此前
+        触发判断直接用运行时 messages 估算，长任务的大量历史思考会虚高到数倍，
+        导致压缩在远低于真实规模的阈值时提前触发（用户实测 386k 触发 / 实际请求
+        仅约 168k）。本用例保证：仅历史思考超阈值时不触发，且旧口径确实会误触发。
+        """
+        original_limit = compaction.resolve_model_max_input_tokens
+        compaction.resolve_model_max_input_tokens = lambda default=8192: 20_000
+        try:
+            huge_reasoning = "思考过程" * 500  # 2000 字符 ≈ 2000 tokens/条
+            messages = [
+                {"role": "system", "content": "系统提示"},
+                {"role": "user", "content": "请处理这个任务"},
+            ]
+            for index in range(10):
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": huge_reasoning,
+                    "tool_calls": [{
+                        "id": f"call_{index}",
+                        "type": "function",
+                        "function": {"name": "read_data", "arguments": "{}"},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": "ok",
+                    "_tool_name": "read_data",
+                })
+            # 当前轮只有小规模轨迹（真实请求规模远低于阈值）
+            messages.append({"role": "user", "content": "当前轮提问"})
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "短思考",
+                "tool_calls": [{
+                    "id": "call_cur",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": "{}"},
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": "call_cur",
+                "content": "14:20",
+                "_tool_name": "get_time",
+            })
+
+            token_limit = compaction.resolve_context_compaction_threshold(self._settings())
+            # 旧口径（含全部历史思考）会超过阈值——正是被修复的误触发场景
+            old_style = compaction.estimate_request_context_tokens(messages, None)
+            self.assertGreater(old_style, token_limit)
+
+            request = ChatLLMRequest(
+                session_id="send_caliber_skip_test",
+                messages=[{"role": "user", "content": "当前轮提问"}],
+                max_tokens=512,
+            )
+            request.tools = []
+            result = await compaction.compact_active_round_context_if_needed(
+                messages,
+                request,
+                settings=self._settings(),
+            )
+            # 发送口径：真实请求规模未超阈值，不触发
+            self.assertFalse(result.triggered)
+            self.assertEqual(len(self.captured_requests), 0)
+        finally:
+            compaction.resolve_model_max_input_tokens = original_limit
+
+    async def test_send_caliber_still_triggers_on_current_round_reasoning(self):
+        """发送口径仍保留当前轮最新思考：当前轮轨迹真实超阈值时必须触发（防漏报）。"""
+        original_limit = compaction.resolve_model_max_input_tokens
+        compaction.resolve_model_max_input_tokens = lambda default=8192: 20_000
+        try:
+            messages = [
+                {"role": "system", "content": "系统提示"},
+                {"role": "user", "content": "请处理这个任务"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "思考过程" * 1500,  # 6000 字符
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_data", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "关键输出" * 2000,  # 8000 字符
+                    "_tool_name": "read_data",
+                },
+            ]
+            request = ChatLLMRequest(
+                session_id="send_caliber_trigger_test",
+                messages=[{"role": "user", "content": "请处理这个任务"}],
+                max_tokens=512,
+            )
+            request.tools = []
+            result = await compaction.compact_active_round_context_if_needed(
+                messages,
+                request,
+                settings=self._settings(),
+            )
+            self.assertTrue(result.triggered)
+            self.assertEqual(len(self.captured_requests), 1)
+        finally:
+            compaction.resolve_model_max_input_tokens = original_limit
+
 
 class OversizedResultHelpersTests(unittest.TestCase):
     def setUp(self):

@@ -1890,6 +1890,26 @@ html[data-theme="dark"] {
     }
   }
 
+  // 缩放按钮组（[−] [百分比] [＋]）：三控件（svg/mermaid/canvas）头部共用，
+  // 百分比按钮即复位钮（点击回 100%）；尺寸与普通操作钮一致，紧凑成组
+  .md-zoom-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 2px;
+
+    .md-zoom-btn {
+      min-width: 26px;
+      padding: 3px 6px;
+      text-align: center;
+    }
+
+    .md-zoom-reset {
+      min-width: 46px;
+      font-variant-numeric: tabular-nums;
+    }
+  }
+
   .md-svg-code {
     max-height: 420px;
     overflow: auto;
@@ -1930,6 +1950,14 @@ html[data-theme="dark"] {
       height: auto;
       margin: 0 auto;
     }
+  }
+
+  // 缩放态（≠100%）的图片视图：给有界滚动区——放大后由控件内部滚动查看
+  // （不把消息流拉得无限长）；缩小态内容更小不会触发滚动（同挂无害）。
+  // canvas 沙箱的缩放发生在 iframe 内部（沙箱 body 滚动），此规则对其无害
+  &.is-zoomed .md-svg-view {
+    max-height: 85vh;
+    overflow: auto;
   }
 
   // Mermaid 异步渲染占位/错误态
@@ -2038,6 +2066,11 @@ html[data-theme="dark"] {
     display: flex;
     align-items: center;
     justify-content: center;
+    // safe center：缩放放大到超出视口时退化为从左/上起排（普通居中在
+    // 溢出场景会把左侧内容裁剪到滚动不可达）；不支持 safe 的浏览器
+    // 自动忽略这两行、回落到上一行普通居中
+    align-items: safe center;
+    justify-content: safe center;
     overflow: auto;
 
     &[hidden] {

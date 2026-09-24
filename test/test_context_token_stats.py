@@ -70,6 +70,26 @@ class ContextTokenStatsTests(unittest.IsolatedAsyncioTestCase):
             stats["round_tokens"][0]["tokens"],
         )
 
+    async def test_stats_includes_latest_reasoning_in_send_caliber(self):
+        """发送口径补偿：当前轮（pending）最后一条非空思考会随请求回传，统计须计入。"""
+        await self.manager.add_chat_history({"role": "user", "content": "进行中的问题"})
+        await self.manager.add_chat_history({
+            "role": "assistant",
+            "content": "回答",
+            "reasoning_content": "思考过程" * 500,
+        })
+        stats = await self.manager.get_context_token_stats()
+        self.assertGreater(stats["reasoning_tokens"], 0)
+        self.assertGreaterEqual(stats["messages_tokens"], stats["reasoning_tokens"])
+        # 单轮明细同步计入（与总额一致）
+        pending_entry = stats["round_tokens"][-1]
+        self.assertEqual(pending_entry["reasoning_tokens"], stats["reasoning_tokens"])
+        # request_context_tokens 包含补偿后的 messages_tokens
+        self.assertEqual(
+            stats["request_context_tokens"],
+            stats["messages_tokens"] + stats["system_prompt_tokens"] + stats["tool_definition_tokens"],
+        )
+
     async def test_stats_counts_retained_rounds_and_estimates_tokens(self):
         await self._add_round("第一问", tool_result="结果A")
         await self._add_round("第二问", tool_result="结果B" * 50)

@@ -2775,6 +2775,21 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   opacity: 0.6;
   cursor: default;
 }
+.md-svg-block .md-zoom-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 2px;
+}
+.md-svg-block .md-zoom-group .md-zoom-btn {
+  min-width: 26px;
+  padding: 3px 6px;
+  text-align: center;
+}
+.md-svg-block .md-zoom-group .md-zoom-reset {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
 .md-svg-block .md-svg-code {
   max-height: 420px;
   overflow: auto;
@@ -2802,6 +2817,10 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   width: 100%;
   height: auto;
   margin: 0 auto;
+}
+.md-svg-block.is-zoomed .md-svg-view {
+  max-height: 85vh;
+  overflow: auto;
 }
 .md-svg-block .md-mermaid-loading {
   padding: 14px 10px;
@@ -2877,6 +2896,8 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   display: flex;
   align-items: center;
   justify-content: center;
+  align-items: safe center;
+  justify-content: safe center;
   overflow: auto;
 }
 .md-svg-block:fullscreen .md-svg-view[hidden],

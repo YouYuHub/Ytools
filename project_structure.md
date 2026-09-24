@@ -75,6 +75,8 @@ agent_tool_sse/
 │   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
 │   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
 │   │                            #   widget_reuse.js（流式保活渲染的控件复用配对决策，纯逻辑）/
+│   │                            #   zoom_utils.js（```mermaid/```svg/```canvas 三控件显示缩放纯逻辑：
+│   │                            #   档位表 50%~800%、步进/百分比归一；接线在 app/messages.js）/
 │   │                            #   file_history_sync.js（文件版本链跨窗口变更标记：编辑器页
 │   │                            #   写操作 markDirty 广播，主页面订阅即时刷新 + 标记兜底，纯逻辑）/
 │   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
@@ -91,7 +93,7 @@ agent_tool_sse/
 │   └── test_h5/                 # 前端单元测试（api/format_utils/history_parser/markdown/
 │                                #   session_list_utils/session_group_utils/session_utils/
 │                                #   session_marquee/session_open_guard/session_title_flow/table_export/
-│                                #   widget_reuse/file_history_sync，node --test）
+│                                #   zoom_utils/widget_reuse/file_history_sync，node --test）
 │
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）

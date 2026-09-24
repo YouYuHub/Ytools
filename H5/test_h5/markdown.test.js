@@ -472,3 +472,55 @@ test("render: canvas 控件带 ↺ 重置按钮", function () {
   assert.ok(html.includes('data-canvas-action="reset"'), html);
   assert.ok(html.includes("↺ 重置"), html);
 });
+
+// ---------- 三控件显示缩放（zoom_utils.js + --md-zoom 宽度表达式） ----------
+
+test("render: 三控件头部均带缩放按钮组（− / 百分比 / ＋）", function () {
+  const svgHtml = Markdown.render('```svg\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100"/></svg>\n```');
+  const merHtml = Markdown.render("```mermaid\ngraph TD\nA-->B\n```");
+  const cvsHtml = Markdown.render("```canvas\nconsole.log(1);\n```");
+  [svgHtml, merHtml, cvsHtml].forEach(function (html, idx) {
+    assert.ok(html.includes('class="md-zoom-group"'), "控件#" + idx + " 带缩放组");
+    assert.ok(html.includes('data-zoom-action="out"'), "控件#" + idx + " 缩小钮");
+    assert.ok(html.includes('data-zoom-action="in"'), "控件#" + idx + " 放大钮");
+    assert.ok(html.includes('data-zoom-action="reset"'), "控件#" + idx + " 复位钮");
+    assert.ok(html.includes('class="md-svg-btn md-zoom-btn md-zoom-reset"'), "控件#" + idx + " 百分比钮样式");
+    assert.ok(html.includes(">100%</button>"), "控件#" + idx + " 初始 100%");
+  });
+});
+
+test("render: svg/mermaid 图片视图宽度乘 --md-zoom（缩放通道）", function () {
+  const svgCode = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100"/></svg>';
+  const html = Markdown.render("```svg\n" + svgCode + "\n```");
+  assert.ok(html.includes("var(--md-zoom, 1)"), html);
+  assert.ok(html.includes("aspect-ratio:2"), html);
+  // 内联宽度表达式：min(100%, 170vh*比例) * var(--md-zoom)
+  assert.ok(/width:calc\(min\(100%, 170vh \* 2\) \* var\(--md-zoom, 1\)\)/.test(html), html);
+});
+
+test("mermaid: applyMermaidSvg 注入的宽度同乘 --md-zoom", async function () {
+  global.mermaid = {
+    initialize: function () {},
+    render: function () {
+      return Promise.resolve({ svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 150"><rect width="300" height="150"/></svg>' });
+    },
+  };
+  const holder = {
+    innerHTML: "",
+    classList: { remove: function () {}, add: function () {} },
+    querySelector: function () { return this._svg || null; },
+  };
+  // innerHTML 赋值后需要能查询到 svg：用 setter 模拟最小 DOM
+  Object.defineProperty(holder, "innerHTML", {
+    get: function () { return this._html || ""; },
+    set: function (v) {
+      this._html = v;
+      this._svg = { style: {}, getAttribute: function () { return "0 0 300 150"; } };
+    },
+  });
+  await Markdown.renderMermaidInto("md-mermaid-zoom-t", "graph TD\nZ1-->Z2", holder, { renderId: "md-mermaid-zoom-t", cachedCode: "" });
+  assert.ok(String(holder._svg.style.width).includes("var(--md-zoom, 1)"), String(holder._svg.style.width));
+  assert.ok(String(holder._svg.style.maxWidth).includes("var(--md-zoom, 1)"), String(holder._svg.style.maxWidth));
+  delete global.mermaid;
+});
+

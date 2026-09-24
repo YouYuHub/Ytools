@@ -106,7 +106,7 @@ class SubAgentContext:
 
     # 任务
     task: str                         # 子任务目标（父级写入，要求自包含）
-    initial_todo: list[dict] | None   # 父级派发时预置的初始计划（可空）
+    initial_todo: list[dict] | None   # 父级派发时预置的初始计划（可空；运行时注入子模型上下文）
 
     # 工具（派发时刻固化，子任务内不随外部变化）
     tools: list[dict]                 # 工具定义列表（已剔除 sub_agent；含 ask_user 占位定义）
@@ -329,7 +329,7 @@ class SubAgentRunner:
  "parent_tool_call_id":"call_abc123", "agent_index":0,
  "phase":"start",
  "task":"<子任务目标全文>",
- "todo":[{"id":"1","content":"...","status":"pending"}],      // 预置计划，可缺省
+ "todo":[{"id":"1","content":"...","status":"pending"}],      // 预置计划，可缺省（会注入子模型上下文，见 §10.1）
  "tools":["read_file","search_files"],                        // 实际注入的工具名列表
  "rounds_limit":40, "timeout_seconds":900,
  "timestamp":"YYYY-MM-DD HH:MM:SS"}
@@ -449,7 +449,7 @@ class SubAgentRunner:
 | `SUB_AGENT_REPLY_MAX_CHARS` | 30000 | 最终回复截断保护（完整轨迹始终在 JSONL 块） |
 | `SUB_AGENT_FINAL_REPLY_RETRY_MAX` | 3 | 空收尾重试上限：收尾轮最终回复为空时注入内部消息要求重新交付；0/负=不限制；耗尽按 `error` 收尾（不再伪装 done+占位文本） |
 | `SUB_AGENT_STREAM_ERROR_RETRY_MAX` | 3 | 流式调用错误断点续跑上限：出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；0/负=不限制 |
-| `SUB_AGENT_TODO_REMIND_MAX` | 3 | 收尾时 todo 未完成提醒上限（每次完整工具执行轮后额度重置）；0=关闭，负=不限制 |
+| `SUB_AGENT_TODO_REMIND_MAX` | 3 | 收尾时 todo 未完成提醒上限（每次完整工具执行轮后额度重置）；仅约束模型维护过的计划（预置但未触碰的计划不拦截有效交付）；0=关闭，负=不限制 |
 
 读取口径与项目一致（`load_var` 实时求值，可变说明进子/父系统提示）。
 
@@ -457,7 +457,7 @@ class SubAgentRunner:
 
 子任务三层递进的"确保最终输出"机制（`SubAgentRunner._run_inner` 收尾分支 + 模型调用后判定，配置见 `load_sub_agent_retry_limits`）：
 
-1. **todo 未完成提醒**：收尾轮 `self.todo` 仍有 pending/in_progress 项时注入内部消息要求继续（或先更新 todo 再收尾）；额度在**每次完整工具执行轮后重置**（工具轮后再次"忘记"可重新提醒），子任务给出有效最终回复即正常收尾不再催促；
+1. **todo 未完成提醒（门控）**：收尾轮 `self.todo` 仍有 pending/in_progress 项、且该计划**被模型触碰过**（成功调用过 todo_write）时注入内部消息要求继续（或先更新 todo 再收尾）；**父级预置计划可见化**——派发时带 `todo` 参数的预置计划以第二条 user 消息注入子模型上下文（【预置计划】标号清单 + 「任务完成后直接给出最终回复即可」，`_internal` 标记构造请求前剥离）；预置但从未被模型触碰的计划属隐藏状态，**不拦截有效交付**（直接收尾），修复现场「模型对凭空出现的未完成计划感到困惑、被迫补 todo 再重复交付」；额度在**每次完整工具执行轮后重置**（工具轮后再次"忘记"可重新提醒），子任务给出有效最终回复即正常收尾不再催促；
 2. **空收尾重试**：`full_response` 为空（含"仅思考输出"场景）不算有效交付——注入内部消息让子模型再次交付；累计耗尽按 `error` 收尾，final_reply 为进展说明（带最后正文预览 + todo 状态），父级可据此重派或换路径；
 3. **流错误断点续跑**：模型调用 `stream_error`（ChatLLM 网络层重试耗尽后的最终失败）不再直接终止——已生成的部分内容进入 messages，注入内部消息让子模型从断点继续（已完成的工作不丢失）；累计耗尽才 error 收尾。
 

@@ -11,6 +11,9 @@ from factory.agent_runtime.chat_runtime import (
     frontend_provides_full_history,
     UsageAccumulator,
     resolve_model_max_input_tokens,
+    copy_for_request,
+    estimate_request_context_tokens,
+    estimate_send_context_tokens,
 )
 from env_manager import init_path, get_default_chat_config
 from memory.chat_memory import ChatMemoryManager
@@ -251,6 +254,45 @@ class ChatRuntimeTests(unittest.TestCase):
             self.assertNotIn("_active_round_compaction", (asyncio.run(manager.get_meta())))
         finally:
             ChatMemoryManager.delete_chat_session_file(session_id)
+
+    def test_estimate_send_context_tokens_matches_copy_for_request(self):
+        """发送口径估算与 copy_for_request 实际请求一致：历史思考剥离、仅保留最新一条。"""
+        big = "思考过程" * 2000
+        messages = [
+            {"role": "system", "content": "系统提示"},
+            {"role": "user", "content": "问题一"},
+            {"role": "assistant", "content": "回答一", "reasoning_content": big},
+            {"role": "tool", "tool_call_id": "c1", "content": "结果一"},
+            {"role": "assistant", "content": "回答二", "reasoning_content": big},
+            {"role": "tool", "tool_call_id": "c2", "content": "结果二"},
+            {"role": "assistant", "content": "调工具", "reasoning_content": big, "tool_calls": [
+                {"id": "c3", "type": "function",
+                 "function": {"name": "run_command", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c3", "content": "结果三"},
+            {"role": "assistant", "content": "最新回答", "reasoning_content": big},
+        ]
+        raw = estimate_request_context_tokens(messages)
+        send = estimate_send_context_tokens(messages)
+        real = estimate_request_context_tokens(copy_for_request(messages))
+        # 与真实请求逐口径一致
+        self.assertEqual(send, real)
+        # 历史思考被剥离：新口径显著低于含全部思考的旧口径
+        self.assertLess(send, raw)
+        # 整形后的请求中仍携带完整思考的 assistant 只有最新一条
+        kept = [
+            m for m in copy_for_request(messages)
+            if m.get("role") == "assistant" and m.get("reasoning_content") == big
+        ]
+        self.assertEqual(len(kept), 1)
+
+    def test_estimate_send_context_tokens_edge_cases(self):
+        """空列表 / 无 assistant 消息的边界行为。"""
+        self.assertEqual(estimate_send_context_tokens([]), 0)
+        self.assertGreater(
+            estimate_send_context_tokens([{"role": "user", "content": "hi"}]),
+            0,
+        )
 
     def test_models_json_drives_default_chat_config_and_context_limit(self):
         repo_root = Path(__file__).resolve().parents[1]

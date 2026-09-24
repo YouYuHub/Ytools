@@ -217,7 +217,8 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 查看指定会话**模型上下文 token 构成**统计。进入摘要模式后，口径为“累计摘要 + 全历史最近问题 + 当前 pending 任务”；未生成摘要的旧会话暂以原始轮次估算，供首次压缩前展示：
 
 - `context_token_limit`：当前聊天模型最大输入窗口（model.json `maxInputTokens`）
-- `messages_tokens`：历史消息（含跨轮摘要 system 消息）估算 token
+- `messages_tokens`：历史消息（含跨轮摘要 system 消息）估算 token；**发送口径**——按真实请求规则计入当前轮（pending）最后一条非空思考（历史轮次思考不回传、不计入），与压缩触发/预算检查口径一致
+- `reasoning_tokens`：`messages_tokens` 中属于“随请求回传的最新思考”的估算 token（发送口径补偿项；无思考时为 0）
 - `tool_definition_tokens`：MCP 工具定义估算 token（仅 `include_tools=true` 时计入）
 - `tool_names`：前端当前选择的工具名称；与 `include_tools=true` 一起传入时只统计这些工具定义，并包含运行时注入的 `check_tool_exists` schema
 - `request_context_tokens`：`messages_tokens + system_prompt_tokens + tool_definition_tokens`

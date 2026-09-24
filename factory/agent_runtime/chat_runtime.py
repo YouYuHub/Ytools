@@ -527,18 +527,17 @@ def sanitize_tool_call_pairing(messages: List[dict[str, Any]]) -> tuple[List[dic
     return result, removed
 
 
-def copy_for_request(
+def _shape_reasoning_for_send(
     messages: List[dict[str, Any]],
-    *,
     limit: int | None = None,
 ) -> List[dict[str, Any]]:
-    """构造发往上游的请求副本：思考过程只在此处做"回传"整形。
+    """按“发送口径”整形思考回传（copy_for_request 与发送口径估算共用核心）。
 
     运行时 messages 始终保持模型原始输出（每轮思考均为原始全文），落盘
     （record_message 深拷贝）也以真实值为源——历史工具轮的思考全部完整
     保留，绝不替换为 "..."。本函数只在副本上做回传侧语义：请求里最多只
     保留一条真实思考（最近一次 API 调用输出的那条），其余一律占位/剥离，
-    既满足严格上游（GLM/DeepSeek）"reasoning_content 必须存在"的校验，
+    既满足严格上游（GLM/DeepSeek）“reasoning_content 必须存在”的校验，
     又避免真实思考跨轮累积发给上游：
     - 旧工具轮 / 旧非工具 assistant：剥离 reasoning_content（历史思考
       一律不回传，只保留运行时/落盘里的原始值）；
@@ -548,23 +547,17 @@ def copy_for_request(
       limit==0 时回传占位符（字段仅为通过上游校验而存在）；
     - 最新非工具轮：思考非必须，已有则按长度裁剪，limit==0 直接剥离。
 
-    请求副本在返回前还会统一执行一次「悬空 tool_call 清理」
-    （sanitize_tool_call_pairing）：上游对声明/结果配对做严格校验，悬空
-    直接 400 空响应体（todo 归并/中断轮次等历史遗留均由此兜底）。
-
-    只对"需要修改"的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
+    只对“需要修改”的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
     直接复用引用——避免对整包 messages（可能含 MB 级 base64 多模态部件）
-    做深拷贝的每轮开销。
+    做深拷贝的每轮开销；不修改入参；不做悬空 tool_call 清理（由
+    copy_for_request 统一执行）。
     """
     assistant_indexes = [
         index for index, message in enumerate(messages)
         if isinstance(message, dict) and message.get("role") == "assistant"
     ]
     if not assistant_indexes:
-        cleaned, removed = sanitize_tool_call_pairing(list(messages))
-        if removed:
-            print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
-        return cleaned
+        return list(messages)
     latest_index = assistant_indexes[-1]
     # 回退思考：最新一次 API 调用没有输出思考时，向前找最近一次真实思考
     # （运行时 messages 每轮都保存原始全文，历史值可直接回溯；跳过占位符）
@@ -619,7 +612,42 @@ def copy_for_request(
             copied.append(message)
             continue
         copied.append(_mutated(message, None, drop=True))
-    cleaned, removed = sanitize_tool_call_pairing(copied)
+    return copied
+
+
+def copy_for_request(
+    messages: List[dict[str, Any]],
+    *,
+    limit: int | None = None,
+) -> List[dict[str, Any]]:
+    """构造发往上游的请求副本：思考整形 + 悬空 tool_call 清理。
+
+    思考回传整形规则见 _shape_reasoning_for_send（历史思考不回传、仅保留
+    最近一条真实思考）；请求副本在返回前统一执行一次「悬空 tool_call 清理」
+    （sanitize_tool_call_pairing）：上游对声明/结果配对做严格校验，悬空
+    直接 400 空响应体（todo 归并/中断轮次等历史遗留均由此兜底）。
+    """
+    shaped = _shape_reasoning_for_send(messages, limit)
+    cleaned, removed = sanitize_tool_call_pairing(shaped)
     if removed:
         print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
     return cleaned
+
+
+def estimate_send_context_tokens(
+    messages: List[dict[str, Any]],
+    tools: List[Any] | None = None,
+    *,
+    limit: int | None = None,
+) -> int:
+    """按真实发送口径估算请求上下文规模（触发判断/预算检查/统计共用）。
+
+    与 estimate_request_context_tokens 的区别：先执行与 copy_for_request
+    一致的思考回传整形——历史轮次的思考一律剥离，仅保留最近一次 API 调用
+    的思考（按 REASONING_RETURN_MAX_LENGTH 裁剪）。运行时 messages 保存的
+    是每轮思考的原始全文（长任务中可达上下文的数倍），直接估算会造成
+    虚高，导致压缩/降级在远低于真实请求规模时提前触发；本函数保证估算
+    口径与实际发往上游的请求一致。
+    """
+    shaped = _shape_reasoning_for_send(messages, limit)
+    return estimate_request_context_tokens(shaped, tools)

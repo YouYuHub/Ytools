@@ -2385,6 +2385,91 @@
     }
   });
 
+  // ---------- 三控件（svg/mermaid/canvas）显示缩放 ----------
+  // 缩放状态 = 块的 data-zoom（倍率）+ CSS 变量 --md-zoom：
+  // - svg/mermaid 图片视图：内联宽度表达式乘 var(--md-zoom)，放大后由视图
+  //   容器（overflow:auto）滚动查看、缩小则居中（margin:0 auto）；
+  // - canvas 沙箱：iframe 尺寸不变，倍率经 postMessage 下发给沙箱，stage
+  //   元素尺寸乘倍率（object-fit:contain 等比放大 + body 滚动）。
+  // 导出 PNG 不受查看缩放影响：svgBlockToPngBlob 除以当前倍率还原基准尺寸。
+  const ZoomUtils = window.ZoomUtils || {
+    normalizeScale: function (s) {
+      const n = Number(s);
+      return Number.isFinite(n) && n > 0 ? n : 1;
+    },
+    stepScale: function (s, d) {
+      const n = Number(s) > 0 ? Number(s) : 1;
+      return d > 0 ? n * 1.1 : n / 1.1;
+    },
+    canStep: function () { return true; },
+  };
+
+  function zoomScaleOf(block) {
+    const s = block && block.dataset ? parseFloat(block.dataset.zoom) : NaN;
+    return Number.isFinite(s) && s > 0 ? s : 1;
+  }
+
+  function updateZoomControls(block) {
+    const scale = zoomScaleOf(block);
+    const resetBtn = block.querySelector(".md-zoom-reset");
+    if (resetBtn) resetBtn.textContent = Math.round(scale * 100) + "%";
+    const outBtn = block.querySelector('[data-zoom-action="out"]');
+    const inBtn = block.querySelector('[data-zoom-action="in"]');
+    if (outBtn) outBtn.disabled = !ZoomUtils.canStep(scale, -1);
+    if (inBtn) inBtn.disabled = !ZoomUtils.canStep(scale, +1);
+  }
+
+  // 应用倍率：写 dataset 与 CSS 变量；canvas 运行中同步下发沙箱；
+  // 全屏中的 svg/mermaid 由 syncSvgFullscreenLayout 按新倍率重算 px 宽度
+  function applyZoomScale(block, scale) {
+    if (!block) return;
+    const next = ZoomUtils.normalizeScale(scale);
+    block.dataset.zoom = String(next);
+    block.style.setProperty("--md-zoom", String(next));
+    block.classList.toggle("is-zoomed", next !== 1);
+    updateZoomControls(block);
+    if (document.fullscreenElement === block) syncSvgFullscreenLayout();
+    if (block.classList.contains("md-canvas-block")) {
+      const frame = block.querySelector(".md-canvas-frame");
+      if (frame && frame.contentWindow) {
+        frame.contentWindow.postMessage({
+          type: "canvas-zoom",
+          id: block.dataset.canvasId || "",
+          zoom: next,
+        }, "*");
+      }
+    }
+  }
+
+  function stepZoom(block, dir) {
+    applyZoomScale(block, ZoomUtils.stepScale(zoomScaleOf(block), dir));
+  }
+
+  // 缩放按钮（三控件共用）：独立委托，早于 SVG/Canvas 两套 action 委托判断
+  // （缩放按钮无 data-svg-action/data-canvas-action，天然不冲突）
+  chatInner.addEventListener("click", function (e) {
+    const btn = e.target.closest("[data-zoom-action]");
+    if (!btn) return;
+    const block = btn.closest(".md-svg-block");
+    if (!block) return;
+    const action = btn.dataset.zoomAction;
+    if (action === "in") stepZoom(block, +1);
+    else if (action === "out") stepZoom(block, -1);
+    else if (action === "reset") applyZoomScale(block, 1);
+  });
+
+  // Ctrl+滚轮缩放（仅 svg/mermaid 图片视图；canvas 在跨源 iframe 内，
+  // 滚轮事件到不了父文档，其缩放走按钮/沙箱消息）
+  chatInner.addEventListener("wheel", function (e) {
+    if (!e.ctrlKey) return;
+    const view = e.target.closest ? e.target.closest(".md-svg-view") : null;
+    if (!view) return;
+    const block = view.closest(".md-svg-block");
+    if (!block) return;
+    e.preventDefault();
+    stepZoom(block, e.deltaY < 0 ? +1 : -1);
+  }, { passive: false });
+
   // ---------- SVG 生成控件（```svg 双视图块）交互 ----------
   // 视图切换/复制代码/复制图片全部事件委托：markdown 流式重渲染会重建节点
   chatInner.addEventListener("click", async function (e) {
@@ -2551,6 +2636,10 @@
         baseW = rect.width;
         baseH = rect.height;
       }
+      // 除当前显示缩放：导出始终按 100% 基准尺寸，不随查看倍率放大/缩小
+      const zoom = zoomScaleOf(block);
+      baseW = baseW / zoom;
+      baseH = baseH / zoom;
     }
     if (!(baseW > 2 && baseH > 2)) {
       if (vbOk) {
@@ -2650,10 +2739,15 @@
 
   const CANVAS_RUNTIME_CSS =
     // height:100%：body 高度必须显式铺满 iframe，#stage 的百分比高度才有
-    // 确定的解析基准（否则随内容收缩，画布位图与点击坐标全部失真）
-    "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;}" +
-    // object-fit:contain：画布位图等比缩放居中，常规/全屏下都不拉伸变形
-    "#stage{display:block;width:100%;height:100%;object-fit:contain;}";
+    // 确定的解析基准（否则随内容收缩，画布位图与点击坐标全部失真）；
+    // html 锁定不滚动、body 承担滚动——显示缩放（stage 尺寸乘倍率）放大后
+    // 舞台超出 iframe 视口时由 body 滚动查看
+    "html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;}" +
+    "html{overflow:hidden;}" +
+    "body{overflow:auto;}" +
+    // object-fit:contain：画布位图等比缩放居中，常规/全屏下都不拉伸变形；
+    // margin:0 auto 让未溢出时水平居中，放大溢出时 auto 归零（从左起边可滚）
+    "#stage{display:block;width:100%;height:100%;object-fit:contain;margin:0 auto;}";
 
   // 沙箱内宿主脚本：监听父页指令，执行用户脚本并回传日志/异常/快照
   const CANVAS_BOOT_JS = [
@@ -2719,8 +2813,15 @@
     "    parent.postMessage({type:'canvas-shot-data',id:d.id,shot:shot()},'*');",
     "    return;",
     "  }",
+    // 显示缩放：父页把倍率下发为 stage 元素尺寸百分比（object-fit:contain
+    // 等比放大位图），body 滚动查看；toDataURL 快照不受影响（位图原始尺寸）
+    "  if(d.type==='canvas-zoom'){",
+    "    try{stage.style.width=(d.zoom*100)+'%';stage.style.height=(d.zoom*100)+'%';}catch(_){}",
+    "    return;",
+    "  }",
     "  if(d.type!=='canvas-run')return;",
     "  __runId=d.id;",
+    "  if(d.zoom&&d.zoom!==1){try{stage.style.width=(d.zoom*100)+'%';stage.style.height=(d.zoom*100)+'%';}catch(_){}}",
     "  var sc={log:function(){push(join(arguments));},",
     "    info:function(){push(join(arguments));},",
     "    warn:function(){push('[warn] '+join(arguments));},",
@@ -2842,6 +2943,7 @@
               type: "canvas-run",
               id: block.dataset.canvasId || "",
               code: Markdown.unescapeHtml(block.dataset.svgCode || ""),
+              zoom: zoomScaleOf(block),
             }, "*");
           }
           return;
@@ -3080,6 +3182,7 @@
   // （width:min(100%,170vh*宽高比)，内联优先级高于 CSS 且每图比例不同），
   // 全屏"整图限高完整可见"的宽度必须按各图比例在 JS 里算：
   // 进入全屏 → 改写内联 width = min(块宽, (视口高-96px)*比例)；退出 → 还原。
+  // 显示缩放（--md-zoom）生效时基准宽/高上限同乘倍率（放大后容器滚动查看）。
   function syncSvgFullscreenLayout() {
     const fsEl = document.fullscreenElement;
     chatInner.querySelectorAll(".md-svg-block").forEach(function (block) {
@@ -3092,10 +3195,11 @@
         const m = /aspect-ratio:\s*([\d.]+)/.exec(svg.getAttribute("style") || "");
         const ar = m ? parseFloat(m[1]) : 0;
         const maxH = Math.max(240, window.innerHeight - 96);
-        const w = ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth;
+        const zoom = zoomScaleOf(block);
+        const w = (ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth) * zoom;
         svg.style.width = Math.floor(w) + "px";
         svg.style.height = "auto";
-        svg.style.maxHeight = maxH + "px";
+        svg.style.maxHeight = Math.floor(maxH * zoom) + "px";
       } else if (block.__svgStyleBackup != null) {
         svg.setAttribute("style", block.__svgStyleBackup);
         block.__svgStyleBackup = null;

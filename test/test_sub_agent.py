@@ -635,10 +635,24 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(done_payloads[0]["status"], "error")
 
     def test_todo_remind_and_quota_reset_after_tool_round(self):
-        """todo 提醒：未完成收尾被提醒 → 工具轮后额度重置 → 再次收尾可交付。"""
+        """todo 提醒（模型触碰过的计划）：未完成收尾被提醒 → 工具轮后额度重置 → 收尾可交付。"""
         from chat.chat_llm import ChatLLM
         from factory.agent_runtime.sub_agent import SubAgentRunner
 
+        todo_pending_chunks = [
+            _sse({"tool_calls": [{
+                "index": 0, "id": "call_t0", "type": "function",
+                "function": {
+                    "name": "todo_write",
+                    "arguments": json.dumps(
+                        {"todos": [{"id": "1", "content": "写文件", "status": "pending"}]},
+                        ensure_ascii=False,
+                    ),
+                },
+            }]}),
+            _sse({"finish_reason": "tool_calls"}),
+            "data: [DONE]\n\n",
+        ]
         todo_done_chunks = [
             _sse({"tool_calls": [{
                 "index": 0, "id": "call_t1", "type": "function",
@@ -658,7 +672,9 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
             _sse({"finish_reason": "stop"}),
             "data: [DONE]\\n\\n",
         ]
-        fake, _state = _fake_llm_script([FINAL_CHUNKS, todo_done_chunks, final_say_chunks])
+        fake, _state = _fake_llm_script([
+            todo_pending_chunks, FINAL_CHUNKS, todo_done_chunks, final_say_chunks,
+        ])
         ChatLLM.chat_completions = fake
         ctx, emitted = _make_retry_context(
             initial_todo=[{"id": "1", "content": "写文件", "status": "pending"}]
@@ -668,8 +684,9 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
             result = asyncio.run(runner.run())
         self.assertEqual(result.status, "done")
         self.assertIn("计划已完成", result.final_reply)
-        # 第 1 轮收尾被 todo 提醒（额度 1 次用掉），第 2 轮工具执行后重置，
-        # 第 3 轮直接给出有效最终回复正常收尾（不再催促）
+        # 第 1 轮模型触碰计划（todo_write pending）→ 第 2 轮未完成收尾被提醒
+        #（额度 1 次用掉）→ 第 3 轮工具执行标记完成后额度重置 → 第 4 轮收尾交付
+        self.assertTrue(runner._todo_touched)
         notices = [p for ph, p in emitted if ph == "notice"]
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0].get("retry_kind"), "todo_remind")
@@ -679,6 +696,8 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
             m.get("_internal") and "未完成" in str(m.get("content"))
             for m in runner.messages
         ))
+        # 工具轮后提醒额度已重置（此后再无提醒）
+        self.assertEqual(runner._todo_remind_used, 0)
 
     def test_todo_remind_respects_zero_limit(self):
         """todo 提醒额度 0：关闭提醒，直接收尾（done），不注入提醒消息。"""
@@ -695,6 +714,59 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         notices = [p for ph, p in emitted if ph == "notice"]
         self.assertEqual(len(notices), 0)
+
+    def test_preset_todo_untouched_accepts_delivery(self):
+        """A2 回归：父级预置但从未被模型触碰的计划，不拦截有效交付。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        fake, _state = _fake_llm_script([FINAL_CHUNKS])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(
+            initial_todo=[{"id": "1", "content": "写文件", "status": "pending"}]
+        )
+        runner = SubAgentRunner(ctx)
+        with _retry_limits_patch(todo_remind_max=3):
+            result = asyncio.run(runner.run())
+        # 一轮有效交付直接收尾：不因未触碰的预置计划被提醒重跑
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.rounds, 1)
+        self.assertIn("子任务结论", result.final_reply)
+        self.assertFalse(runner._todo_touched)
+        notices = [p for ph, p in emitted if ph == "notice"]
+        self.assertEqual(len(notices), 0)
+        self.assertFalse(any(
+            m.get("_internal") and "未完成" in str(m.get("content"))
+            for m in runner.messages
+        ))
+
+    def test_preset_todo_hint_injected_into_context(self):
+        """预置计划注入可见性：进入子模型上下文（第二条 user 消息），请求侧剥离 _internal。"""
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        ctx, _emitted = _make_retry_context(
+            initial_todo=[{"id": "1", "content": "写文件", "status": "pending"}]
+        )
+        runner = SubAgentRunner(ctx)
+        hint = runner.messages[1]
+        self.assertEqual(hint.get("role"), "user")
+        self.assertTrue(hint.get("_internal"))
+        self.assertIn("【预置计划】", str(hint.get("content")))
+        self.assertIn("写文件", str(hint.get("content")))
+        self.assertIn("[待办]", str(hint.get("content")))
+        # 请求构造剥离下划线内部键（_internal 不进上游 payload）
+        request = runner._build_request({})
+        self.assertEqual(request.messages[1].content, hint.get("content"))
+        self.assertFalse(hasattr(request.messages[1], "_internal"))
+
+    def test_preset_todo_hint_absent_without_initial_todo(self):
+        """无预置计划时不注入提示消息（上下文保持单条任务文本）。"""
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        ctx, _emitted = _make_retry_context(initial_todo=None)
+        runner = SubAgentRunner(ctx)
+        self.assertEqual(len(runner.messages), 1)
+        self.assertEqual(runner.messages[0].get("content"), "交付保障测试任务")
 
     def test_stream_error_resumes_and_completes(self):
         """流错误断点续跑：出错轮注入内部消息继续，下一轮正常完成。"""

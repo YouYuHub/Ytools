@@ -34,6 +34,7 @@ from util.file_lock import cross_process_lock
 from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str
 from config import (
     DEFAULT_CONTEXT_HISTORY_ROUNDS,
+    DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_global_tool_inputs,
     get_persisted_work_dir,
@@ -636,6 +637,42 @@ from factory.agent_runtime.chat_runtime import (
     parse_return_length as _parse_return_length,
     resolve_model_max_input_tokens as _resolve_model_max_input_tokens,
 )
+
+
+def _estimate_pending_reasoning_tokens(pending_round: Any) -> int:
+    """发送口径补偿：估算"随请求回传的最新思考"token 数。
+
+    真实请求（copy_for_request）只回传最近一次 API 调用输出的思考，历史轮次
+    思考一律剥离；而历史展开器不携带思考字段。当前轮（pending）的最后一条
+    非空思考会保留在真实请求中，统计需按同一规则补偿（否则前端显示低估）。
+    返回 0 表示无补偿（无 pending 轮 / 无思考 / 配置为 0 不回传）。
+    """
+    if not isinstance(pending_round, dict):
+        return 0
+    pending_events = pending_round.get("events")
+    if not isinstance(pending_events, list):
+        return 0
+    for event in reversed(pending_events):
+        if not isinstance(event, dict) or event.get("role") != "assistant":
+            continue
+        reasoning = event.get("reasoning_content")
+        if not (isinstance(reasoning, str) and reasoning.strip()):
+            continue
+        reasoning_limit = _parse_return_length(
+            _load_var(
+                "REASONING_RETURN_MAX_LENGTH",
+                DEFAULT_REASONING_RETURN_MAX_LENGTH,
+            ),
+            DEFAULT_REASONING_RETURN_MAX_LENGTH,
+        )
+        if reasoning_limit == 0:
+            return 0  # 不回传（仅占位符）：无补偿
+        kept_reasoning = (
+            reasoning if reasoning_limit < 0
+            else reasoning[-reasoning_limit:]
+        )
+        return _estimate_text_tokens(kept_reasoning) + 4
+    return 0
 
 
 def _default_context_history_rounds() -> int:
@@ -2409,6 +2446,9 @@ class ChatMemoryManager:
         if recent_questions_message:
             messages.append(recent_questions_message)
         round_tokens: list[dict[str, Any]] = []
+        # 发送口径补偿：当前轮（pending）最后一条非空思考随请求回传，
+        # 单轮明细与总额同步计入（历史轮次思考不回传、不计入）
+        pending_reasoning_tokens = _estimate_pending_reasoning_tokens(pending_round)
         for round_entry in retained_rounds:
             round_messages = _round_entry_to_context_messages(
                 round_entry, max_tool_result_length
@@ -2426,11 +2466,15 @@ class ChatMemoryManager:
                     "content": round_entry["question"].strip(),
                 }]
             compress_usage = _round_entry_compression_usage(round_entry)
+            entry_reasoning_tokens = (
+                pending_reasoning_tokens if round_entry is pending_round else 0
+            )
             round_tokens.append({
                 "question": round_entry.get("question", ""),
                 "status": round_entry.get("status", ""),
                 "messages": len(round_messages),
-                "tokens": _estimate_messages_tokens(round_messages),
+                "tokens": _estimate_messages_tokens(round_messages) + entry_reasoning_tokens,
+                "reasoning_tokens": entry_reasoning_tokens,
                 "compress_count": (
                     compress_usage.get("compression_count", 0)
                     if isinstance(compress_usage, dict) else 0
@@ -2439,6 +2483,11 @@ class ChatMemoryManager:
             messages.extend(round_messages)
 
         messages_tokens = _estimate_messages_tokens(messages)
+        # 发送口径对齐：真实请求（copy_for_request）只回传"最近一条真实思考"，
+        # 历史轮次思考一律剥离；当前轮（pending）的最后一条非空思考会保留，
+        # 这里按同一规则补偿估算（详见 _estimate_pending_reasoning_tokens）。
+        reasoning_tokens = pending_reasoning_tokens
+        messages_tokens += reasoning_tokens
         tool_definition_tokens = _estimate_tool_definition_tokens(tools)
         # 运行时系统提示词（工作路径+系统提示）：真实请求追加在首条 system 消息，
         # 单独统计并计入请求上下文总额，避免低估
@@ -2468,6 +2517,7 @@ class ChatMemoryManager:
         return {
             "context_token_limit": context_token_limit,
             "messages_tokens": messages_tokens,
+            "reasoning_tokens": reasoning_tokens,
             "system_prompt_tokens": system_prompt_tokens,
             "tool_definition_tokens": tool_definition_tokens,
             "request_context_tokens": request_context_tokens,
