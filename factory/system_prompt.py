@@ -174,7 +174,10 @@ def build_media_tag_prompt() -> str:
     )
 
 
-def build_sys_prompt(include_media_prompt: bool = True) -> str:
+def build_sys_prompt(
+    include_media_prompt: bool = True,
+    include_read_media_note: bool = False,
+) -> str:
     """构建系统提示词。
 
     思考过程/历史工具结果的回传长度提示只在配置为正数（截断回传）时出现：
@@ -185,6 +188,13 @@ def build_sys_prompt(include_media_prompt: bool = True) -> str:
     include_media_prompt=False 用于子智能体（build_sub_agent_system_text）：
     媒体伪标签/SVG/KaTeX/Mermaid/Canvas 渲染说明面向用户界面，子任务回复
     受众是父模型，整段去除。
+
+    include_read_media_note（默认 False）：read_media 使用指引的条件开关，
+    只有调用方确认本轮真实注入了该工具（用户勾选且模型支持视觉，与
+    chat_factory.read_media_requested 同口径）才传 True。提示词提及的工具
+    必须与请求 tools 字段一致：未注入却提及会诱导模型凭空调用（实证：
+    无工具模式下输出 <tool name="read_media"> 伪调用，参数名都是编的）；
+    默认保守 False，宁可少说明也不给模型"工具可用"的假指引。
     """
     reasoning_limit = _load_reasoning_return_max_length()
     tool_result_limit = parse_return_length(
@@ -203,16 +213,26 @@ def build_sys_prompt(include_media_prompt: bool = True) -> str:
             "MCP 工具执行不限制超时：单次调用可能长时间阻塞，"
             "耗时不确定的操作请主动拆分并阶段性反馈进度。"
         )
-    # 媒体附件说明按当前生效模型的视觉能力分叉（vision 读取口径与真实
-    # 请求一致）：不支持视觉的模型绝不能看到 read_media 可用的指引——
-    # 否则会照着提示词模仿文本版工具调用（实证：无工具模式下输出
-    # <tool name="read_media"> 伪调用，参数名都是编的）
+    # 媒体附件说明按「模型视觉能力 × 本轮是否真实注入 read_media」二维分叉
+    # （vision 读取口径与真实请求一致）：
+    # - 不支持视觉的模型绝不能看到 read_media 可用的指引——否则会照着提示词
+    #   模仿文本版工具调用（实证：无工具模式下输出 <tool name="read_media">
+    #   伪调用，参数名都是编的）；
+    # - 支持视觉但本轮未注入该工具时同样不提及 read_media：提示词与请求
+    #   tools 必须一致，"如果可用"式模糊措辞仍会诱导模型凭空调用。
     if _load_chat_vision_enabled():
-        media_note = (
-            "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等形式出现在上下文里"
-            "（media:// 为会话媒体库的稳定引用）；需要重新查看历史图片/音频时，"
-            "用 read_media（如果可用）传入对应 media:// 引用即可。"
-        )
+        if include_read_media_note:
+            media_note = (
+                "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等形式出现在上下文里"
+                "（media:// 为会话媒体库的稳定引用）；需要重新查看历史图片/音频时，"
+                "用 read_media 传入对应 media:// 引用即可。"
+            )
+        else:
+            media_note = (
+                "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等文本占位形式"
+                "出现在上下文里（media:// 为会话媒体库的稳定引用；本轮未启用媒体读取工具，"
+                "附件内容不会自动回传）。"
+            )
     else:
         media_note = (
             # "历史轮次中的用户媒体附件会以 [图片 media://xxx] / [音频 media://xxx] 等纯文本占位出现在上下文里："
@@ -249,7 +269,10 @@ def build_sys_prompt(include_media_prompt: bool = True) -> str:
     )
 
 
-def build_runtime_system_text(work_dir: str | None = None) -> str:
+def build_runtime_system_text(
+    work_dir: str | None = None,
+    include_read_media_note: bool = False,
+) -> str:
     """构造运行时系统提示附加文本（工作路径 + 系统提示）。
 
     与任务内 runtime_sys_text 同源：真实请求会把它追加到首条 system 消息，
@@ -258,11 +281,15 @@ def build_runtime_system_text(work_dir: str | None = None) -> str:
     work_dir 缺省时取当前进程 cwd：worker 进程内已在任务开始时 chdir 到
     会话目录，天然正确；主进程调用方（token 统计等）应显式传入按会话
     解析的目录（resolve_session_work_dir），避免跨会话读到全局 cwd。
+
+    include_read_media_note：仅当调用方确认本轮真实注入了 read_media 工具
+    （用户勾选且模型支持视觉，与 chat_factory.read_media_requested 同口径）
+    才传 True，保证提示词提及的工具与请求 tools 字段一致。
     """
     dir_text = work_dir if isinstance(work_dir, str) and work_dir.strip() else get_current_dir()
     return (
         f"当前工作路径为<{_format_tool_result(dir_text)}>\n"
-        + build_sys_prompt()
+        + build_sys_prompt(include_read_media_note=include_read_media_note)
     )
 
 

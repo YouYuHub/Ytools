@@ -104,6 +104,44 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/chat_history/delete_file?session_id=" + encodeURIComponent(sessionId), { method: "DELETE" });
   }
 
+  // ---------- 会话分组 ----------
+  /** 列出全部分组 + 会话归属映射（{groups:[...], assignments:{sid:gid}}）。 */
+  function listSessionGroups() {
+    return request("/chat_history/groups");
+  }
+
+  /** 新建分组；同名已存在时后端返回既有分组（幂等）。 */
+  function createSessionGroup(name) {
+    return request("/chat_history/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+  }
+
+  /** 重命名分组 / 更新折叠状态（字段省略表示不修改）。 */
+  function updateSessionGroup(groupId, payload) {
+    return request("/chat_history/groups/" + encodeURIComponent(groupId), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+  }
+
+  /** 删除分组（后端连带解除其全部成员会话的归属）。 */
+  function deleteSessionGroup(groupId) {
+    return request("/chat_history/groups/" + encodeURIComponent(groupId), { method: "DELETE" });
+  }
+
+  /** 把会话加入分组 / 移出分组（groupId 传 null 或空串 = 移出）。 */
+  function assignSessionGroup(sessionId, groupId) {
+    return request("/chat_history/group_assign", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", group_id: groupId || null }),
+    });
+  }
+
   /**
    * 上传 jsonl 聊天历史文件到后端（保存为后端会话）
    * @param {string} sessionId 目标会话ID（可传文件名，后端会自动去掉后缀并规整）
@@ -918,6 +956,11 @@ const api_url = localStorage.getItem("ytools-api-base")
     updateSessionTitle,
     fetchSessionFile,
     deleteSession,
+    listSessionGroups,
+    createSessionGroup,
+    updateSessionGroup,
+    deleteSessionGroup,
+    assignSessionGroup,
     uploadChatHistory,
     exportSessionsZip,
     previewImport,

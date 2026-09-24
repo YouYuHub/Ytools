@@ -96,5 +96,48 @@ class ConditionalNoteTests(unittest.TestCase):
         self.assertIn("思考过程只保留最近一次", prompt)
 
 
+class ReadMediaNoteTests(unittest.TestCase):
+    """read_media 使用指引的条件注入：提示词提及的工具必须与请求 tools 一致。
+
+    核心回归：用户未选择（或后端未注入）read_media 时，系统提示词不得
+    提及该工具——"如果可用"式模糊措辞会诱导模型凭空编造工具调用。
+    """
+
+    def _sys_prompt(self, *, vision: bool, note: bool) -> str:
+        # 显式钉住视觉判定，避免受本机 .env 会话模型配置影响
+        original = sp._load_chat_vision_enabled
+        sp._load_chat_vision_enabled = lambda: vision
+        try:
+            return sp.build_sys_prompt(include_read_media_note=note)
+        finally:
+            sp._load_chat_vision_enabled = original
+
+    def test_note_present_when_tool_injected(self):
+        prompt = self._sys_prompt(vision=True, note=True)
+        self.assertIn("用 read_media 传入对应 media:// 引用", prompt)
+
+    def test_note_absent_by_default(self):
+        # 默认 False：调用方未确认注入时绝不提及（本 bug 的核心回归点）
+        prompt = self._sys_prompt(vision=True, note=False)
+        self.assertNotIn("read_media", prompt)
+
+    def test_note_absent_without_vision_even_if_selected(self):
+        # 视觉能力分叉优先于勾选：不支持视觉的模型永远看不到该指引
+        prompt = self._sys_prompt(vision=False, note=True)
+        self.assertNotIn("read_media", prompt)
+        self.assertIn("不支持视觉", prompt)
+
+    def test_runtime_text_propagates_flag(self):
+        original = sp._load_chat_vision_enabled
+        sp._load_chat_vision_enabled = lambda: True
+        try:
+            with_note = sp.build_runtime_system_text("C:/tmp/demo", include_read_media_note=True)
+            without_note = sp.build_runtime_system_text("C:/tmp/demo")
+        finally:
+            sp._load_chat_vision_enabled = original
+        self.assertIn("用 read_media 传入对应 media:// 引用", with_note)
+        self.assertNotIn("read_media", without_note)
+
+
 if __name__ == "__main__":
     unittest.main()

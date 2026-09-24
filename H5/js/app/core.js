@@ -505,12 +505,13 @@ window.App = window.App || {};
 
   // ---------- 会话搜索 ----------
   $("#searchBtn").addEventListener("click", function () {
+    const willShow = !searchBox.classList.contains("show");
     searchBox.classList.toggle("show");
-    if (searchBox.classList.contains("show")) {
-      searchInput.value = "";
-      filterSessions("");
-      searchInput.focus();
-    }
+    // 打开：清空旧关键词并聚焦；收起：同样清空过滤——否则列表停留在
+    // "看不见的过滤态"（用户无从清除），多选分组视图也会残留搜索强制展开
+    searchInput.value = "";
+    filterSessions("");
+    if (willShow) searchInput.focus();
   });
 
   searchInput.addEventListener("input", function () {
@@ -522,6 +523,18 @@ window.App = window.App || {};
       const name = node.querySelector(".session-name").textContent.toLowerCase();
       node.style.display = !keyword || name.includes(keyword) ? "" : "none";
     });
+    // 多选分组视图：过滤后隐藏没有任何可见成员的组块（避免空组头残留）
+    sessionList.querySelectorAll(".bulk-group").forEach(function (block) {
+      const visible = Array.from(block.querySelectorAll(".session-item"))
+        .some(function (node) { return node.style.display !== "none"; });
+      block.style.display = visible ? "" : "none";
+    });
+    // 多选分组视图：搜索期间强制展开分组（命中结果不应藏在折叠组内）
+    sessionList.classList.toggle("bulk-search-open", Boolean(keyword));
+    // 可见集变化后同步总控「全选/取消全选」按钮状态
+    if (App.updateBulkSelectAllBtn) App.updateBulkSelectAllBtn();
+    // 搜索时隐藏分组区（「最近」已含全部会话，搜索结果在扁平列表中呈现）
+    if (App.sessionGroups && App.sessionGroups.applyFilter) App.sessionGroups.applyFilter(keyword);
   }
 
   // ---------- 工具行描述悬浮提示 ----------

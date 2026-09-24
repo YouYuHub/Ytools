@@ -35,9 +35,11 @@
     const showStopGroup = currentStreaming || compacting;
     // 语音录音中：识别文本实时写入输入框（hasText 为真），麦克风按钮保持显示
     // 并进入录音态（再点停止），发送按钮隐藏避免边录边发
+    // 有文本时语音钮不隐藏：与发送钮并排（边打字边听写，或补充录入），
+    // 仅当前会话流式/压缩时随发送钮一起让位给停止钮
     composer.classList.toggle("has-text", hasText);
     sendBtn.classList.toggle("hidden", !hasText || speechActive || currentStreaming || compacting);
-    voiceBtn.classList.toggle("hidden", (hasText && !speechActive) || currentStreaming || compacting);
+    voiceBtn.classList.toggle("hidden", currentStreaming || compacting);
     stopGroup.classList.toggle("hidden", !showStopGroup);
     stopGroup.classList.toggle("compact-only", compacting);
     stopMenuBtn.classList.toggle("hidden", !currentStreaming || compacting);

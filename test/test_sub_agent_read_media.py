@@ -36,7 +36,12 @@ from memory import file_memory as fm
 
 _TEST_SESSION = "sub_read_media_test"
 _TEST_MEDIA_DIR = fm.HISTORY_ROOT / _TEST_SESSION
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+# 真实有效的最小 PNG（1x1 RGB，69 字节）：媒体加载内核会做 Pillow 解码校验，
+# 伪造的"魔数 + 填充零字节"会被判为损坏文件而拒绝注入（既有测试数据缺陷）
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c4944415478da63f8cfc0000003010100f70341430000000049454e44ae426082"
+)
 
 
 def _cleanup():

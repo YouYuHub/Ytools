@@ -98,9 +98,39 @@
                     <input class="search-input" id="searchInput" type="text" placeholder="搜索会话...">
                 </div>
 
-                <!-- 「最近」标题行（预留后续分组扩展） -->
+                <!-- 分组区：「最近」上方；悬停 / 点击标题展开分组列表，+ 新建分组 -->
+                <div class="session-groups" id="sessionGroups">
+                    <div class="session-groups-head" id="sessionGroupsHead" role="button" tabindex="0"
+                        aria-label="展开或收起分组列表">
+                        <span class="session-groups-caret">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <path d="m9 6 6 6-6 6" />
+                            </svg>
+                        </span>
+                        <span class="session-label">分组</span>
+                        <span class="session-groups-count" id="sessionGroupsCount"></span>
+                        <!-- 钉住状态标识：未钉住默认隐藏（悬停淡显提示可固定），钉住后常显高亮 -->
+                        <span class="session-groups-pin" id="sessionGroupsPin" aria-hidden="true">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <path d="M12 17v5" />
+                                <path
+                                    d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+                            </svg>
+                        </span>
+                        <button type="button" class="session-groups-add" id="sessionGroupAddBtn" title="新建分组">
+                            <svg class="icon" viewBox="0 0 24 24">
+                                <path d="M12 5v14M5 12h14" />
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="session-groups-body" id="sessionGroupsBody"></div>
+                </div>
+
+                <!-- 「最近」标题行：展示全部会话（与分组无关）；多选模式下右侧为总控全选 -->
                 <div class="session-head" id="sessionHead">
                     <span class="session-label">最近</span>
+                    <button type="button" class="bulk-select-all" id="bulkSelectAllBtn"
+                        title="全选/取消全选所有可见会话">全选</button>
                 </div>
 
                 <div class="session-list" id="sessionList"></div>
@@ -570,6 +600,19 @@
         </section>
     </div>
 
+    <!-- 分组删除确认弹窗（组内会话仅回到未分组，不删除会话本身） -->
+    <div class="confirm-modal hidden" id="groupDeleteModal" aria-hidden="true">
+        <div class="confirm-modal-backdrop" id="groupDeleteBackdrop"></div>
+        <section class="confirm-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="groupDeleteTitle">
+            <h2 id="groupDeleteTitle">删除分组？</h2>
+            <p>删除分组后，组内会话将回到「未分组」（不会删除会话本身），确定继续吗？</p>
+            <div class="confirm-modal-actions">
+                <button class="confirm-cancel" id="groupDeleteCancel">取消</button>
+                <button class="confirm-danger" id="groupDeleteConfirm">确认删除</button>
+            </div>
+        </section>
+    </div>
+
     <!-- 导入冲突决策弹窗：同名会话选择「覆盖」或「重命名另存」（逐会话列表） -->
     <div class="confirm-modal hidden" id="importConflictModal" aria-hidden="true">
         <div class="confirm-modal-backdrop" id="importConflictBackdrop"></div>
@@ -817,6 +860,7 @@
     <script src="js/widget_reuse.js"></script>
     <script src="js/table_canvas.js"></script>
     <script src="js/session_list_utils.js"></script>
+    <script src="js/session_group_utils.js"></script>
     <script src="js/session_utils.js"></script>
     <script src="js/format_utils.js"></script>
     <script src="js/history_parser.js"></script>
@@ -825,6 +869,7 @@
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
     <script src="js/app/core.js"></script>
     <script src="js/app/sessions.js"></script>
+    <script src="js/app/session_groups.js"></script>
     <script src="js/app/stats.js"></script>
     <script src="js/app/workdir.js"></script>
     <script src="js/app/messages.js"></script>

@@ -22,6 +22,51 @@
   }
 
   /**
+   * 发送消息时的侧边栏标题决策：优先沿用"当前标题"（后端 _meta.title /
+   * 标题模型生成 / 用户手动重命名 / 上次落定的占位——这些才是用户期望
+   * 一直显示的标题），只有从未见过的新会话才退回"提问前 40 字"临时占位，
+   * 等标题模型生成后由 applySessionTitle 替换。
+   *
+   * 旧行为是无条件用"当前提问前 40 字"，导致已有会话（含已生成的模型标题）
+   * 在发新消息瞬间被临时占位文本顶掉，刷新后才恢复。
+   *
+   * @param {string} knownTitle 当前已知标题（调用方注册表；空串 = 没有）
+   * @param {string} userText   本次提问文本（可为空，如纯附件）
+   * @param {string} sessionId  会话 ID（占位兜底值）
+   */
+  function pickSendTitle(knownTitle, userText, sessionId) {
+    const known = knownTitle == null ? "" : String(knownTitle).trim();
+    // 已知标题与会话 ID 相同视为"没有标题"（后端兜底值，不值得沿用）
+    if (known && known !== sessionId) return known;
+    return firstQuestionTitle(userText) || sessionId;
+  }
+
+  /**
+   * 侧边栏会话行点击决策：点击“已完整显示的当前会话 / 正在加载的当前会话”
+   * 时跳过重新加载，避免无谓的重复请求与 DOM 重建（视口被拉回底部）。
+   *
+   * 判定口径：
+   *   - 目标 === readySessionId（该会话历史已完整显示在聊天区）→ 跳过；
+   *   - 目标 === loadingSessionId（该会话正在加载中）→ 跳过（防并发重复加载）；
+   *   - 其余情况（别的会话 / 新对话 / 空值）→ 放行，正常切换。
+   *
+   * @param {string} clickedId        被点击行的会话 id
+   * @param {string} readySessionId   当前视图已就绪的会话 id（无则空）
+   * @param {string} loadingSessionId 当前正在加载的会话 id（无则空）
+   * @returns {boolean} true = 应执行 openSession；false = 跳过
+   */
+  function shouldOpenSessionOnClick(clickedId, readySessionId, loadingSessionId) {
+    const target = clickedId == null ? "" : String(clickedId).trim();
+    // 空 id 属异常数据：维持旧行为（交给 openSession 的兜底规整），不在此拦截
+    if (!target) return true;
+    const ready = readySessionId == null ? "" : String(readySessionId).trim();
+    if (ready && target === ready) return false;
+    const loading = loadingSessionId == null ? "" : String(loadingSessionId).trim();
+    if (loading && target === loading) return false;
+    return true;
+  }
+
+  /**
    * 对会话行按“最近更新时间倒序”排序（稳定，返回新数组，不改入参）。
    * rows: [{ id, title, updated, created }]
    * recency: { id -> 毫秒时间戳 }（本地近期触碰时间：发送/重命名等）
@@ -46,6 +91,8 @@
     TITLE_MAX: TITLE_MAX,
     timeValue: timeValue,
     firstQuestionTitle: firstQuestionTitle,
+    pickSendTitle: pickSendTitle,
+    shouldOpenSessionOnClick: shouldOpenSessionOnClick,
     sortRows: sortRows,
   };
 

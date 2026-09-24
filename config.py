@@ -31,6 +31,7 @@ DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒�
 DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS = 300  # 工具调用流式阶段（模型 SSE 输出 tool_calls 期间）无输出超时秒数；超时按工具调用失败反馈模型并继续任务；0 或负数表示不限制
 DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS = 3       # 模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试）
 DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS = 2    # 压缩调用重试：一次尝试=一条完整"压缩模型->聊天模型"降级链；达到该次数终止任务；0 或负数表示不限制
+DEFAULT_REQUEST_HARD_LIMIT_TOKENS = 1048576  # 供应商请求硬限制：input_tokens + max_tokens 之和上限（实测 opencode 网关 2^20=1048576 超限即 HTTP 400 且响应体为空）；0 或负数表示禁用发送前预检
 
 # sub_agent 子智能体（docs/sub_agent_v1.md §10）
 DEFAULT_SUB_AGENT_ENABLED = True             # 总开关：false 时不注入 sub_agent 工具定义

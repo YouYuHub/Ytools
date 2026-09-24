@@ -304,6 +304,41 @@ class TodoApplyTests(unittest.TestCase):
         todo2 = asyncio.run(self.manager.get_session_todo())
         self.assertEqual(todo2[0]["content"], "新计划")
 
+    def test_replace_todo_context_no_dangling_tool_call(self):
+        """悬空回归（400 空响应体根因）：归并 todo 时必须同步清除 tool_calls。
+
+        历史 bug：assistant（正文 + 单独一个 todo_write 调用）被归并时只删除
+        配对 tool 结果、保留 tool_calls 声明 → 悬空调用 → 上游严格校验
+        返回 400 空响应体，重试同一 payload 必然全败（每次 todo 收官后必现）。
+        """
+        from factory import chat_factory
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "我先更新计划。", "tool_calls": [
+                {"id": "call_todo_1", "type": "function",
+                 "function": {"name": "todo_write", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_todo_1",
+             "_tool_name": "todo_write", "content": "ok"},
+            {"role": "assistant", "content": "继续执行"},
+        ]
+        chat_factory._replace_todo_context(messages, [
+            {"content": "步骤一", "status": "done"},
+        ])
+        # 全上下文无悬空：每个声明的 id 都有配对结果（或声明已清除）
+        pending = []
+        for message in messages:
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                pending.extend(tc.get("id") for tc in message["tool_calls"])
+            elif message.get("role") == "tool":
+                if message.get("tool_call_id") in pending:
+                    pending.remove(message["tool_call_id"])
+        self.assertEqual(pending, [])
+        # 正文保留、声明清除
+        self.assertEqual(messages[1]["content"], "我先更新计划。")
+        self.assertNotIn("tool_calls", messages[1])
+
 
 if __name__ == "__main__":
     unittest.main()

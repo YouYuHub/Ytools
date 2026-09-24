@@ -91,22 +91,18 @@ class SubAgentContext:
     parent_tool_index: int        # 父级 parsed_tools 枚举 index（tool_results 排序用）
     agent_index: int              # 本轮第几个子任务（0 起，展示用）
     session_id: str
-
     # 任务
     task: str
     initial_todo: list[dict[str, Any]] | None
-
     # 工具（父级本轮快照，已剔除 sub_agent；ask_user 替换为占位定义）
     tools: list[dict[str, Any]]
     tool_servers: Dict[str, str]
     configured_tool_names: set[str]
     configured_tool_servers: Dict[str, str]
-
     # 限制
     max_rounds: int
     timeout_seconds: float
     reply_max_chars: int
-
     # 回调（父循环注入）
     emit_event: Callable[[dict[str, Any]], Awaitable[None]]  # JSONL 追加 + SSE 推送
     stop_checker: Callable[[], bool]                          # 父级停止信号查询
@@ -115,7 +111,6 @@ class SubAgentContext:
     parent_vision_enabled: bool | None = None
     # V2 文件版本链：父级会话轮次号（子任务内文件工具入链标注 round 用）
     parent_round_number: int = 0
-
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -390,7 +385,6 @@ class SubAgentRunner:
         return tools
 
     # ----------------------------- 事件发射 -----------------------------
-
     async def _emit(self, phase: str, **fields: Any) -> None:
         payload: dict[str, Any] = {
             "event": "sub_agent",
@@ -459,7 +453,6 @@ class SubAgentRunner:
         )
 
     # ----------------------------- 模型调用 -----------------------------
-
     def _resolve_request_model_config(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """解析子任务模型配置（docs/sub_agent_v1.md §6.5 模型配置）。
 
@@ -645,7 +638,6 @@ class SubAgentRunner:
         }
 
     # ----------------------------- 工具执行 -----------------------------
-
     async def _execute_tool_round(self, tool_calls: list[dict]) -> list[dict[str, Any]]:
         """子任务自己的工具执行轮：内置拦截 + 文件工具 + MCP 线程池。
 
@@ -667,6 +659,20 @@ class SubAgentRunner:
                 "tool_name": tn,
                 "tool_args": ta,
                 "result": f"工具 {tn} 未在子任务工具列表中，禁止调用（子智能体不支持再派发子任务）",
+                "error": None,
+            })
+        # over_task 结束信号（prepare_tool_execution 会把它从 parsed_tools 分离，
+        # 不进入执行）：执行侧不实际执行，但必须为声明生成配对结果——否则
+        # assistant 的 tool_calls 悬空（无配对 tool 结果），回放上游时被严格
+        # 校验拒绝（400 空响应体）
+        if plan.over_task_call:
+            ot_index, ot_tc, ot_tn, ot_ta = plan.over_task_call
+            results.append({
+                "index": ot_index,
+                "tool_call": ot_tc,
+                "tool_name": ot_tn,
+                "tool_args": ot_ta,
+                "result": "子任务已由模型宣布结束（over_task）。",
                 "error": None,
             })
         builtin_results: list[tuple[int, dict, str, dict, Any]] = []
@@ -968,7 +974,17 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 continue
-            # 构建带 tool_calls 的 assistant 消息（只保留已知工具）
+            # 归一化工具调用（流式拼接异常修复）：与执行侧共用同一份列表，
+            # 保证下面 assistant 声明的 id 与 _execute_tool_round 产出的结果
+            # 一一配对——上游对声明/结果严格校验，任何"结果无声明"的孤儿或
+            # "声明无结果"的悬空都会触发 400 空响应体（父循环同款契约）。
+            normalized_tool_calls = normalize_tool_calls(
+                tool_calls, list(ctx.tool_servers.keys())
+            )
+            # 构建带 tool_calls 的 assistant 消息。
+            # 未知/未授权工具同样保留在声明里（与父循环一致）：执行侧会为
+            # blocked 调用生成拒绝结果，若此处剔除就会形成孤儿结果 → 400。
+            # 仅剔除连函数名都没有的结构损坏调用（执行侧同样跳过、不产生结果）。
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if full_response:
                 assistant_message["content"] = full_response
@@ -977,10 +993,10 @@ class SubAgentRunner:
             if full_reasoning:
                 assistant_message["reasoning_content"] = full_reasoning
             formatted_tool_calls = []
-            for tc in tool_calls:
+            for tc in normalized_tool_calls:
                 function_info = tc.get("function") or {}
                 tool_name = function_info.get("name")
-                if tool_name not in ctx.tool_servers:
+                if not tool_name:
                     continue
                 formatted_tool_calls.append({
                     "id": tc.get("id", ""),
@@ -1140,8 +1156,8 @@ class SubAgentRunner:
                 content=assistant_message.get("content"),
                 tool_calls=formatted_tool_calls,
             )
-            # 工具执行
-            tool_results = await self._execute_tool_round(tool_calls)
+            # 工具执行（传入与声明同一份归一化列表，保证 id 一一配对）
+            tool_results = await self._execute_tool_round(normalized_tool_calls)
             if not tool_results:
                 self.messages.append({
                     "role": "user",

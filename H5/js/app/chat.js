@@ -1101,6 +1101,14 @@
 
   function applySessionTitle(sessionId, title) {
     const sid = SessionUtils.sanitizeSessionId(sessionId);
+    // 记入可信标题表：后续发消息时沿用该标题（不再退回"提问前 40 字"占位）
+    if (App.rememberSessionTitle) App.rememberSessionTitle(sid, title);
+    // 本地兜底数据源同步（后端落盘慢时 loadSessions 重建列表用的 recency 标题）
+    if (state.sessionRecency[sid]) state.sessionRecency[sid].title = title;
+    // 分组区内的同名行同步（组内展开时存在副本；未归组时为空操作）
+    if (App.sessionGroups && App.sessionGroups.updateRowTitle) {
+      App.sessionGroups.updateRowTitle(sid, title);
+    }
     const node = sessionList.querySelector('[data-session="' + sid + '"] .session-name');
     if (!node) {
       // 侧栏还没有该会话条目（极端时序）：重载会话列表建立条目后再替换

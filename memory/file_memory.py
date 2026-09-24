@@ -1293,6 +1293,24 @@ def _media_model_part_from_path(
     except OSError:
         return None
 
+    # 损坏图片拦截：供应商视觉 API 对无法解码的图片直接整请求 400
+    # （实证：仅含 PNG 签名 + 零填充的伪造/截断文件注入后，报
+    # "Failed to load image: cannot identify image file <_io.BytesIO>"，
+    # 连带同请求的文本也无法返回）。注入前做一次完整解码校验（load()
+    # 全量解码，覆盖头部合法但像素数据截断的损坏），失败返回错误占位、
+    # 绝不注入；动图 gif 不经过此处（已走上方视频区间管线）。
+    if kind == "image":
+        try:
+            with Image.open(io.BytesIO(data)) as decode_probe:
+                decode_probe.load()
+        except Exception as decode_error:
+            return {
+                "error": (
+                    f"{path.name} 无法解码为图片（文件可能损坏、不完整或扩展名"
+                    f"与实际内容不符）：{decode_error}；未注入"
+                ),
+            }
+
     # 统一转换内核：视觉 API 拒绝的格式在发送前转换；成功时 kind/mime/
     # 数据以转换结果为准，失败静默回退原图（与缩略图失败回退同口径）
     try:

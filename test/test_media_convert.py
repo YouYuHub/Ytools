@@ -229,28 +229,30 @@ class MediaConvertTests(unittest.TestCase):
         self.assertIsNotNone(third)
         self.assertNotEqual(first[1], third[1])
 
-    # ---------- 转换失败回退原图 ----------
-    def test_corrupt_unsafe_image_falls_back(self):
+    # ---------- 转换失败回退原图（仅限可解码文件；坏图一律拒绝注入） ----------
+    def test_corrupt_unsafe_image_rejected_not_injected(self):
+        # 解码失败的图片不再回退注入原图：供应商视觉 API 对无法解码的图片
+        # 直接整请求 400（实证 cannot identify image file），改为错误占位
         path = fm._media_dir(TEST_SESSION) / "broken.bmp"
         path.write_bytes(b"BM" + b"junk" * 32)
         info = fm._media_model_part_from_path(
             path, transcode_cache_dir=fm._transcode_cache_dir(TEST_SESSION),
         )
-        # 转换失败：converted=None，按原图 gif 口径原样回传
-        self.assertIsNone(info["converted"])
-        self.assertEqual(info["kind"], "image")
-        self.assertTrue(info["part"]["image_url"]["url"].startswith("data:image/bmp;base64,"))
+        self.assertIn("error", info)
+        self.assertIn("无法解码为图片", info["error"])
+        self.assertNotIn("part", info)
 
-    def test_corrupt_gif_falls_back_to_original(self):
-        # 动图判定失败也按 False（静图）处理，但 PNG 转换失败 → 回退原图
+    def test_corrupt_gif_rejected_not_injected(self):
+        # 动图判定失败按静图处理，但解码校验在转换内核之前：
+        # 坏 gif（未显式指定区间）同样拒绝注入、不回退原图
         path = fm._media_dir(TEST_SESSION) / "broken.gif"
         path.write_bytes(b"GIF89a" + b"junk" * 32)
         info = fm._media_model_part_from_path(
             path, transcode_cache_dir=fm._transcode_cache_dir(TEST_SESSION),
         )
-        self.assertIsNone(info["converted"])
-        self.assertEqual(info["kind"], "image")
-        self.assertTrue(info["part"]["image_url"]["url"].startswith("data:image/gif;base64,"))
+        self.assertIn("error", info)
+        self.assertIn("无法解码为图片", info["error"])
+        self.assertNotIn("part", info)
 
     # ---------- 附件注入路径（resolve_media_content_parts）----------
     def test_resolve_parts_static_gif_becomes_png(self):
@@ -409,14 +411,15 @@ class SendLimitTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_animated_gif_kernel_failure_final_gate_blocks_oversized_original(self):
-        # 集成：35MB 动图（超过 30MB 图片档）转码链路全失败时，兜底门控
-        # 拦截原图注入（绝不发送原始 gif）；文件内容为头部+零块（转码必失败）
+        # 集成：35MB 动图（内容为头部+零块，解码与转码均失败）——新契约下
+        # 解码校验先于 30MB 兜底门控触发，同样拒绝注入、绝不发送原始 gif
+        # （合法但超大的静图仍由大小门控拦截，见 30MB 用例）
         with patch.object(fm, "gif_is_animated", return_value=True):
             big = b"GIF89a" + b"\x00" * (35 * 1024 * 1024)
             info = self._info(self._write("mid_anim_over.gif", big))
         self.assertIn("error", info)
         self.assertNotIn("part", info)
-        self.assertIn("30MB", info["error"])
+        self.assertIn("无法解码为图片", info["error"])
 
     def test_oversized_animated_gif_gate_before_conversion(self):
         # 动图判定 True + 超过 600MB：读取门控直接拒绝（转换前拦截）

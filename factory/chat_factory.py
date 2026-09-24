@@ -275,7 +275,13 @@ def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
 
 
 def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
-    """用一条紧凑的任务状态 system 消息替换历史 todo 调用与结果。"""
+    """用一条紧凑的任务状态 system 消息替换历史 todo 调用与结果。
+
+    关键约束：删除 todo 结果消息时，必须在声明处同步清除对应的 tool_calls——
+    只删结果、保留"声明了 todo_write 但无配对结果"的 assistant 消息会留下
+    悬空 tool_call，上游网关对该结构直接返回 400 空响应体（实测 opencode
+    网关 400 + body `0\\r\\n\\r\\n`），且重试同一 payload 必然全败。
+    """
     todo_call_ids = set()
     compacted: list[dict[str, Any]] = []
     for message in messages:
@@ -295,8 +301,12 @@ def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, 
                     kept_calls.append(tool_call)
             if kept_calls:
                 message["tool_calls"] = kept_calls
-            elif not message.get("content"):
-                continue
+            else:
+                # 全部调用都是 todo：tool_calls 字段整体清除（连同配对结果一起
+                # 消失，保持消息序列自洽）；有正文时保留正文，无正文则丢弃整条
+                message.pop("tool_calls", None)
+                if not message.get("content"):
+                    continue
         if (
             message.get("role") == "tool"
             and (message.get("_tool_name") == TODO_TOOL_NAME
@@ -1074,7 +1084,11 @@ async def _run_chat_generation(
         # 任务内历史重建（压缩后）与降级链重建候选消息时复用同一份文本。
         # 主 system 必须先于后端历史拼接合成：拼接后 messages[0] 会是后端的
         # 【历史压缩摘要】system 消息，不能把运行时文本追加给它，否则 persona 缺位。
-        runtime_sys_text = build_runtime_system_text()
+        # read_media 使用指引按本轮真实注入状态条件化（用户勾选且模型支持视觉）：
+        # 提示词提及的工具必须与请求 tools 字段一致，未注入不得提及。
+        runtime_sys_text = build_runtime_system_text(
+            include_read_media_note=read_media_requested,
+        )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             messages[0]["content"] += runtime_sys_text
         else:
@@ -1881,6 +1895,28 @@ async def _run_chat_generation(
             parsed_tools = plan.parsed_tools
             if plan.has_parse_error:
                 print("[WARNING] 检测到工具参数解析错误，可能导致工具执行失败")
+            # over_task 结束信号的配对结果：声明（assistant_message）已在上方
+            # 落盘，无论本轮是否还有其他工具调用，都必须生成配对 tool 结果——
+            # 否则历史里留下"声明无结果"的悬空 tool_call，下一轮回放发上游时
+            # 校验失败（400 空响应体）。生成与收尾判定分离：仅当没有其他可执行
+            # 工具时才按原语义收尾（见下方两处 not parsed_tools 分支）。
+            if plan.over_task_call:
+                _, ot_tc, _, _ = plan.over_task_call
+                ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
+                ot_ret = "任务已由模型宣布结束（over_task）。"
+                await session_chat_memory.add_chat_history({
+                    "role": "tool",
+                    "tool_call_id": ot_id,
+                    "tool_name": "over_task",
+                    "arguments": "{}",
+                    "result": ot_ret,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": ot_id,
+                    "content": ot_ret,
+                    "_tool_name": "over_task",
+                })
             blocked_tools = [item for item in parsed_tools if item[2] not in round_tool_servers]
             parsed_tools = [item for item in parsed_tools if item[2] in round_tool_servers]
             if blocked_tools:
@@ -1920,27 +1956,8 @@ async def _run_chat_generation(
                 if not parsed_tools:
                     continue
             if not parsed_tools and not round_tool_servers:
-                # over_task 语义为"模型宣布任务结束"：先为该声明生成配对的
-                # tool 结果（assistant.tool_call_id 与 tool 结果一一配对的
-                # 契约），再以普通回答收尾——否则历史里留下无结果孤儿，
-                # 下一轮回放发上游时校验失败断流
-                if plan.over_task_call:
-                    _, ot_tc, _, _ = plan.over_task_call
-                    ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
-                    ot_ret = "任务已由模型宣布结束（over_task）。"
-                    await session_chat_memory.add_chat_history({
-                        "role": "tool",
-                        "tool_call_id": ot_id,
-                        "tool_name": "over_task",
-                        "arguments": "{}",
-                        "result": ot_ret,
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": ot_id,
-                        "content": ot_ret,
-                        "_tool_name": "over_task",
-                    })
+                # over_task 结束信号：配对结果已在上方统一生成（含与其它
+                # 工具并发调用的场景），此处按原语义以普通回答收尾
                 assistant_message = {"role": "assistant", "content": full_response} if full_response else None
                 if assistant_message is not None:
                     messages.append(assistant_message)
@@ -1949,25 +1966,7 @@ async def _run_chat_generation(
                 break
             # 如果没有任何有效工具可执行，退出
             if not parsed_tools:
-                # 同上：over_task 结束信号也要生成配对结果再退出，
-                # 避免落盘历史里出现"声明无结果"的孤儿 tool_call
-                if plan.over_task_call:
-                    _, ot_tc, _, _ = plan.over_task_call
-                    ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
-                    ot_ret = "任务已由模型宣布结束（over_task）。"
-                    await session_chat_memory.add_chat_history({
-                        "role": "tool",
-                        "tool_call_id": ot_id,
-                        "tool_name": "over_task",
-                        "arguments": "{}",
-                        "result": ot_ret,
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": ot_id,
-                        "content": ot_ret,
-                        "_tool_name": "over_task",
-                    })
+                # over_task 结束信号：配对结果已在上方统一生成；此处直接退出
                 print("[WARNING] 没有可执行的有效工具，退出循环")
                 break
             print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具")
@@ -2007,6 +2006,15 @@ async def _run_chat_generation(
             # 读取的坐标含区间，注入时现场按坐标加载 base64 部件
             read_media_injected_refs: set[str] = set()
             read_media_pending_parts: list[tuple[str, Any]] = []
+            # 同轮并发守卫：供应商单请求最多稳定注入 1 次媒体数据（实证：同一
+            # 模型回复并发 2 个 read_media 调用时，多个媒体部件同批注入触发
+            # 供应商 400）。本轮解析出的 read_media 调用数 >1 时只执行第 1 个，
+            # 其余返回结构化错误占位（不执行、不注入媒体部件），引导模型把
+            # 多个来源合并到 references 列表或下一轮再读。
+            read_media_calls_total = sum(
+                1 for _, _, call_name, _ in parsed_tools if call_name == READ_MEDIA_NAME
+            )
+            read_media_calls_seen = 0
             for idx, tc, tn, ta in parsed_tools:
                 if tn == TODO_TOOL_NAME:
                     # 模型自我规划：校验并写入会话 todo（_meta.todo），随后推 SSE 给前端
@@ -2053,6 +2061,34 @@ async def _run_chat_generation(
                     })
                     continue
                 if tn == READ_MEDIA_NAME:
+                    # 同轮并发守卫：只执行本轮第 1 个 read_media 调用；其余
+                    # 不执行、不注入媒体部件，返回错误占位引导模型改为把多个
+                    # 来源合并进单次调用的 references 列表（或下一轮再读）。
+                    # 原因见 read_media_calls_total 初始化处注释。
+                    read_media_calls_seen += 1
+                    if read_media_calls_seen > 1:
+                        duplicate_result: dict[str, Any] = {
+                            "ok": False,
+                            "error": (
+                                f"同一条模型回复里出现了 {read_media_calls_total} 个 read_media 调用，"
+                                "本调用是第 "
+                                f"{read_media_calls_seen} 个已被跳过：同一轮只允许执行 1 个"
+                                " read_media（多个媒体部件并发注入会导致供应商请求报错）。"
+                                "请把要读的多个来源合并到一次调用的 references 列表里"
+                                "（最多 5 个），或改为分多轮逐个读取。"
+                            ),
+                            "duplicate_call": True,
+                            "read_media_calls_in_round": read_media_calls_total,
+                        }
+                        builtin_results.append({
+                            "index": idx,
+                            "tool_call": tc,
+                            "tool_name": tn,
+                            "tool_args": ta,
+                            "result": duplicate_result,
+                            "error": None,
+                        })
+                        continue
                     # 读取当前任务媒体：把 media:// 引用解析为媒体加载坐标
                     #（reference+quality+区间），数据本体（base64）不进入工具结果
                     # 文本（避免刷 JSONL / 超大结果截断），在下方统一处理时按坐标

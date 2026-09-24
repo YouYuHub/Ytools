@@ -16,8 +16,29 @@
 
   // ---------- 会话列表 ----------
   // 会话标识规整请见 SessionUtils.sanitizeSessionId（js/session_utils.js）
+  let lastSortedRows = [];   // 最近一次排序后的会话行（多选分组视图的数据源）
+
+  // 「当前标题」注册表：记录每个会话侧边栏正在显示的标题，来源依次为
+  //   后端 _meta.title（loadSessions / openSession 拉取）
+  //   → 标题模型生成结果（chat.js applySessionTitle 回填）
+  //   → 用户手动重命名
+  //   → 全新会话首条消息的"提问前 40 字"临时占位
+  // 发送消息时优先沿用本表中的值：已有标题不被本轮提问顶掉；本轮标题模型
+  // 尚未生成时也保持"之前的"标题（用户要求），仅从未见过的会话才新建占位。
+  const currentTitles = new Map();
+  function rememberSessionTitle(sessionId, title) {
+    if (!sessionId) return;
+    const text = (title == null ? "" : String(title)).trim();
+    if (!text) return;
+    // 后端兜底标题（session_<id> / 与会话 ID 相同）不算有效标题，不登记
+    if (text === sessionId || text === "session_" + sessionId) return;
+    currentTitles.set(sessionId, text);
+  }
+  function knownSessionTitle(sessionId) {
+    return currentTitles.get(sessionId) || "";
+  }
   function clearSessionItems() {
-    sessionList.querySelectorAll(".session-item, .empty-tip").forEach(function (n) { n.remove(); });
+    sessionList.querySelectorAll(".session-item, .empty-tip, .bulk-group").forEach(function (n) { n.remove(); });
   }
 
   async function loadSessions() {
@@ -43,6 +64,9 @@
           title = SessionUtils.getSessionTitle(id, meta.title || (meta.user_questions && meta.user_questions[0]) || id);
           updated = meta.updated_at || "";
           created = meta.created_at || "";
+          // 后端标题是权威来源：登记为当前标题（发送消息时优先沿用，
+          // 不再被"提问前 40 字"临时占位顶掉）
+          if (meta.title) rememberSessionTitle(id, meta.title);
         } catch (_) { /* 元数据读取失败时用 id 兜底 */ }
         return { id: id, title: title, updated: updated, created: created };
       }));
@@ -57,7 +81,9 @@
     });
 
     if (!items.length) {
-      sessionList.appendChild(el("div", "empty-tip", "暂无历史会话"));
+      lastSortedRows = [];
+      renderSessionItems();
+      if (App.sessionGroups) App.sessionGroups.render([]);
       return;
     }
 
@@ -66,10 +92,12 @@
       recencyMap[id] = state.sessionRecency[id].ts;
     });
     // 按最近更新倒序（后更新的在前）：后端 updated_at 为主，本地 recency 兜底，created_at 再兜底
-    SessionListUtils.sortRows(items, recencyMap).forEach(function (item) {
-      sessionList.appendChild(buildSessionItem(item.id, item.title));
-    });
+    const sorted = SessionListUtils.sortRows(items, recencyMap);
+    lastSortedRows = sorted;
+    renderSessionItems();
     refreshSessionFades();
+    // 分组区同步最新会话行（展开的分组内显示组内会话标题）
+    if (App.sessionGroups) App.sessionGroups.render(sorted);
   }
 
   // 溢出淡出标记：给真正被截断的标题加 .truncated（右缘渐隐遮罩，替代「…」占位）。
@@ -100,6 +128,9 @@
   let marqueeMoved = 0;          // 已滚动位移（px）
   let marqueeLast = 0;           // 上一帧时间戳
   let marqueeAnimatingReset = false; // 复位动画进行中标记
+  let marqueeContainer = null;       // 当前滚动标题所属容器（同一会话可能同时出现在
+                                     // 「最近」与分组区，重渲染后按容器找回接任元素，
+                                     // 避免串到另一个容器里的同名行）
 
   const MARQUEE_DELAY = 250;         // hover 触发延迟（ms），快速划过不触发
   const MARQUEE_SPEED_MAX = 160;     // 起步最高速度（px/s）
@@ -135,12 +166,22 @@
     return true;
   }
 
-  // 行被列表重渲染替换后，凭会话 id 找到接任的同名标题元素
+  // 行被列表重渲染替换后，凭会话 id 在「当前滚动标题所属容器」内找回接任元素
+  // （限定容器：同一会话在「最近」与分组区可能各有一行，不能跨容器乱找；
+  // 容器必须是稳定节点——会话列表 / 分组区 body，分组块整体重建不影响）
   function marqueeSuccessor() {
     if (!marqueeSession) return null;
-    const item = sessionList.querySelector(
-      '.session-item[data-session="' + (window.CSS && CSS.escape ? CSS.escape(marqueeSession) : marqueeSession) + '"]');
-    return item ? item.querySelector(".session-name") : null;
+    const selector = '.session-item[data-session="' +
+      (window.CSS && CSS.escape ? CSS.escape(marqueeSession) : marqueeSession) +
+      '"] .session-name';
+    const scope = marqueeContainer || sessionList;
+    if (scope.isConnected) return scope.querySelector(selector);
+    // 防御分支：容器本身被替换时退化为全局查找首个仍在文档中的同名行
+    const all = document.querySelectorAll(selector);
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].isConnected) return all[i];
+    }
+    return null;
   }
 
   // 把元素摆到"已滚动 moved px"的位置（transform 载体：合成层属性，
@@ -165,6 +206,7 @@
     }
     marqueeName = null;
     marqueeSession = null;
+    marqueeContainer = null;
     marqueeMoved = 0;
     marqueeAnimatingReset = false;
   }
@@ -180,6 +222,15 @@
     }
     clearMarqueeRaf();
     resetMarqueeDom();
+  }
+
+  // 行容器整体重建前调用：若正在滚动的标题属于该容器（或其子孙容器），先停止
+  // 复位——动画载体随旧 DOM 脱离文档后，接任查找可能串到别的容器里的同名行
+  // （如「最近」列表），出现悬停在分组区却滚动顶部的错觉
+  function stopTitleMarqueeIn(container) {
+    if (container && marqueeContainer && container.contains(marqueeContainer)) {
+      stopTitleMarquee();
+    }
   }
 
   // 复位回滚动画：从当前位移平滑归零（移出 hover 时不再瞬间跳回句首）
@@ -244,57 +295,68 @@
     marqueeRaf = requestAnimationFrame(step);
   }
 
-  sessionList.addEventListener("mouseover", function (e) {
-    const name = e.target.closest(".session-name");
-    if (!name) return;
-    // 防抖窗口内回到同一标题，或复位回滚动画进行中重新进入：
-    // 停止回滚、继续正向滚动（保留已滚动位移，不从头重放）
-    if ((marqueeResetTimer || marqueeAnimatingReset) && name === marqueeName) {
-      clearTimeout(marqueeResetTimer);
-      marqueeResetTimer = null;
-      marqueeAnimatingReset = false;
-      marqueeLast = 0;
-      runMarqueeFrame();
-      return;
-    }
-    if (name === marqueeName) return;
-    stopTitleMarquee();
-    marqueeTimer = setTimeout(function () {
-      marqueeTimer = null;
-      if (!name.isConnected || marqueeName) return;
-      const overflow = name.scrollWidth - name.clientWidth;
-      if (overflow <= 2) return;
-      marqueeName = name;
-      marqueeSession = marqueeSessionId(name);
-      marqueeShift = overflow + MARQUEE_RIGHT_INSET;
-      marqueeMoved = 0;
-      marqueeLast = 0;
-      name.classList.add("is-marquee");
-      runMarqueeFrame();
-    }, MARQUEE_DELAY);
-  });
+  // 跑马灯监听绑定到「行容器」：任何承载 .session-item 行的滚动容器都可复用
+  // （会话列表 #sessionList、分组区 .session-group-sessions；同一容器只绑一次）。
+  // 交互细节与最初实现完全一致，仅把容器从写死的 sessionList 参数化。
+  function bindTitleMarquee(container) {
+    if (!container || container.dataset.marqueeBound === "1") return;
+    container.dataset.marqueeBound = "1";
 
-  sessionList.addEventListener("mouseout", function (e) {
-    const name = e.target.closest(".session-name");
-    if (!name) return;
-    // 启动延迟期内移出：直接取消
-    if (marqueeTimer) {
-      clearTimeout(marqueeTimer);
-      marqueeTimer = null;
-      return;
-    }
-    if (name !== marqueeName) return;
-    // 复位回滚已在进行：无需再防抖，等它自然归零
-    if (marqueeAnimatingReset) return;
-    // 滚动中移出：防抖后平滑回滚；80ms 内回到同一标题则继续正向滚动
-    if (marqueeResetTimer) clearTimeout(marqueeResetTimer);
-    clearMarqueeRaf();
-    marqueeResetTimer = setTimeout(function () {
-      marqueeResetTimer = null;
-      if (name !== marqueeName || marqueeAnimatingReset) return;
-      runMarqueeReset();
-    }, MARQUEE_RESET_DEBOUNCE);
-  });
+    container.addEventListener("mouseover", function (e) {
+      const name = e.target.closest(".session-name");
+      if (!name) return;
+      // 防抖窗口内回到同一标题，或复位回滚动画进行中重新进入：
+      // 停止回滚、继续正向滚动（保留已滚动位移，不从头重放）
+      if ((marqueeResetTimer || marqueeAnimatingReset) && name === marqueeName) {
+        clearTimeout(marqueeResetTimer);
+        marqueeResetTimer = null;
+        marqueeAnimatingReset = false;
+        marqueeLast = 0;
+        runMarqueeFrame();
+        return;
+      }
+      if (name === marqueeName) return;
+      stopTitleMarquee();
+      marqueeTimer = setTimeout(function () {
+        marqueeTimer = null;
+        if (!name.isConnected || marqueeName) return;
+        const overflow = name.scrollWidth - name.clientWidth;
+        if (overflow <= 2) return;
+        marqueeName = name;
+        marqueeSession = marqueeSessionId(name);
+        marqueeContainer = container;
+        marqueeShift = overflow + MARQUEE_RIGHT_INSET;
+        marqueeMoved = 0;
+        marqueeLast = 0;
+        name.classList.add("is-marquee");
+        runMarqueeFrame();
+      }, MARQUEE_DELAY);
+    });
+
+    container.addEventListener("mouseout", function (e) {
+      const name = e.target.closest(".session-name");
+      if (!name) return;
+      // 启动延迟期内移出：直接取消
+      if (marqueeTimer) {
+        clearTimeout(marqueeTimer);
+        marqueeTimer = null;
+        return;
+      }
+      if (name !== marqueeName) return;
+      // 复位回滚已在进行：无需再防抖，等它自然归零
+      if (marqueeAnimatingReset) return;
+      // 滚动中移出：防抖后平滑回滚；80ms 内回到同一标题则继续正向滚动
+      if (marqueeResetTimer) clearTimeout(marqueeResetTimer);
+      clearMarqueeRaf();
+      marqueeResetTimer = setTimeout(function () {
+        marqueeResetTimer = null;
+        if (name !== marqueeName || marqueeAnimatingReset) return;
+        runMarqueeReset();
+      }, MARQUEE_RESET_DEBOUNCE);
+    });
+  }
+
+  bindTitleMarquee(sessionList);
 
   function buildSessionItem(id, title) {
     const item = el("div", "session-item" + (id === state.sessionId ? " active" : ""));
@@ -322,6 +384,9 @@
         return;
       }
       closeSessionMenus();
+      // 重复点击已打开的当前会话（或正在加载中的会话）：跳过重载，避免无谓的
+      // 历史请求与聊天区整体重建；点击其他会话照常切换
+      if (!SessionListUtils.shouldOpenSessionOnClick(id, readySessionId, loadingSessionId)) return;
       openSession(id);
     });
     item.appendChild(select);
@@ -345,24 +410,203 @@
   // ---------- 会话多选（批量分享 / 批量删除） ----------
   let bulkMode = false;
   const bulkSelected = new Set();
+  const bulkExpanded = new Set();   // 多选分组视图中「已展开」的组 key（默认全部折叠）
 
-  function selectedVisibleIds() {
-    // 只统计当前可见（未被搜索过滤；filterSessions 用 style.display 隐藏）的选中项
+  /** 渲染会话行：普通模式扁平列表；多选模式按分组展开（未分组殿后）。 */
+  function renderSessionItems() {
+    clearSessionItems();
+    if (!lastSortedRows.length) {
+      sessionList.appendChild(el("div", "empty-tip", "暂无历史会话"));
+      syncBulkSelectionUi();
+      return;
+    }
+    if (bulkMode) {
+      renderBulkGroupedView();
+    } else {
+      lastSortedRows.forEach(function (item) {
+        sessionList.appendChild(buildSessionItem(item.id, item.title));
+      });
+    }
+    syncBulkSelectionUi();
+  }
+
+  /** 多选分组视图：组块（组头 + 成员行）；数据来自分组模块，未接线时退化为单一「未分组」桶。 */
+  function renderBulkGroupedView() {
+    let buckets = null;
+    const hasUtils = typeof SessionGroupUtils !== "undefined" && Boolean(SessionGroupUtils.bucketForBulk);
+    if (App.sessionGroups && App.sessionGroups.getGroups && hasUtils) {
+      buckets = SessionGroupUtils.bucketForBulk(
+        lastSortedRows,
+        App.sessionGroups.getGroups(),
+        App.sessionGroups.getAssignments ? App.sessionGroups.getAssignments() : {}
+      );
+    }
+    if (!buckets || !buckets.length) {
+      buckets = [{
+        key: (hasUtils && SessionGroupUtils.UNGROUPED_KEY) || "__ungrouped__",
+        name: "未分组",
+        sessions: lastSortedRows.slice(),
+      }];
+    }
+    buckets.forEach(function (bucket) {
+      sessionList.appendChild(buildBulkGroupBlock(bucket));
+    });
+  }
+
+  /** 多选分组视图的组块：组头（折叠箭头 + 勾选气泡 + 组名 + 计数）可全选/取消全选该分组。 */
+  function buildBulkGroupBlock(bucket) {
+    const expanded = bulkExpanded.has(bucket.key);
+    const block = el("div", "bulk-group" + (expanded ? " expanded" : ""));
+    block.dataset.bulkGroup = bucket.key;
+
+    const headRow = el("div", "bulk-group-head");
+    headRow.setAttribute("role", "button");
+    headRow.tabIndex = 0;
+    headRow.title = "全选/取消全选该分组";
+
+    // 折叠按钮（组头最左）：独立命中区，点击/回车只折叠不触发全选
+    const caret = el("button", "bulk-group-caret");
+    caret.type = "button";
+    caret.title = expanded ? "折叠该分组" : "展开该分组";
+    caret.setAttribute("aria-label", caret.title);
+    caret.setAttribute("aria-expanded", expanded ? "true" : "false");
+    caret.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>';
+    caret.addEventListener("click", function (event) {
+      event.stopPropagation();
+      toggleBulkGroupCollapsed(bucket, block);
+    });
+    headRow.appendChild(caret);
+
+    const check = el("span", "bulk-group-check");
+    check.innerHTML =
+      '<svg class="icon check-mark" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>' +
+      '<svg class="icon check-dash" viewBox="0 0 24 24"><path d="M5 12h14"/></svg>';
+    headRow.appendChild(check);
+    headRow.appendChild(el("span", "bulk-group-name", bucket.name));
+    headRow.appendChild(el("span", "bulk-group-count",
+      bucket.sessions.length ? String(bucket.sessions.length) : "0"));
+    const onToggle = function () { toggleBulkGroupSelect(bucket); };
+    headRow.addEventListener("click", onToggle);
+    headRow.addEventListener("keydown", function (event) {
+      // 焦点在折叠按钮上时由其自身处理 Enter/Space（避免冒泡误触全选）
+      if (event.target.closest && event.target.closest(".bulk-group-caret")) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        onToggle();
+      }
+    });
+    block.appendChild(headRow);
+
+    const listBox = el("div", "bulk-group-list");
+    if (!bucket.sessions.length) {
+      listBox.appendChild(el("div", "bulk-group-empty", "分组内暂无会话"));
+    } else {
+      bucket.sessions.forEach(function (row) {
+        const item = buildSessionItem(row.id, row.title);
+        // 行仍在 #sessionList 内：hover 跑马灯（事件委托）照常生效；原生 tooltip
+        // 作为无 JS 场景兜底提示完整标题；.truncated 渐隐遮罩由 refreshSessionFades 挂上
+        const select = item.querySelector(".session-select");
+        if (select) select.title = row.title;
+        listBox.appendChild(item);
+      });
+    }
+    block.appendChild(listBox);
+    return block;
+  }
+
+  /** 分组折叠/展开切换：仅更新视觉与展开集合，不影响选中集。 */
+  function toggleBulkGroupCollapsed(bucket, block) {
+    const expanded = !bulkExpanded.has(bucket.key);
+    if (expanded) bulkExpanded.add(bucket.key);
+    else bulkExpanded.delete(bucket.key);
+    block.classList.toggle("expanded", expanded);
+    const caret = block.querySelector(".bulk-group-caret");
+    if (caret) {
+      caret.title = expanded ? "折叠该分组" : "展开该分组";
+      caret.setAttribute("aria-label", caret.title);
+      caret.setAttribute("aria-expanded", expanded ? "true" : "false");
+    }
+    refreshSessionFades();   // 新展开的标题按实际宽度重挂渐隐遮罩
+  }
+
+  /** 分组全选/取消全选：组成员全部已选 → 全部取消；否则全部选中。 */
+  function toggleBulkGroupSelect(bucket) {
+    const ids = bucket.sessions.map(function (row) { return row.id; });
+    if (!ids.length) return;
+    const allSelected = ids.every(function (id) { return bulkSelected.has(id); });
+    ids.forEach(function (id) {
+      if (allSelected) bulkSelected.delete(id);
+      else bulkSelected.add(id);
+    });
+    syncBulkSelectionUi();
+  }
+
+  /** 当前可见（未被搜索过滤；filterSessions 用 style.display 隐藏）的会话 id。 */
+  function bulkVisibleIds() {
     return Array.from(sessionList.querySelectorAll(".session-item"))
       .filter(function (node) { return node.style.display !== "none"; })
-      .map(function (node) { return node.dataset.session; })
-      .filter(function (id) { return bulkSelected.has(id); });
+      .map(function (node) { return node.dataset.session; });
+  }
+
+  function selectedVisibleIds() {
+    return bulkVisibleIds().filter(function (id) { return bulkSelected.has(id); });
   }
 
   function toggleBulkSelect(id, item) {
-    if (bulkSelected.has(id)) {
-      bulkSelected.delete(id);
-      item.classList.remove("bulk-selected");
-    } else {
-      bulkSelected.add(id);
-      item.classList.add("bulk-selected");
-    }
+    if (bulkSelected.has(id)) bulkSelected.delete(id);
+    else bulkSelected.add(id);
+    syncBulkSelectionUi();
+  }
+
+  /** 同步多选 UI：行选中态、组头三态、总控全选按钮、操作条计数。 */
+  function syncBulkSelectionUi() {
+    sessionList.querySelectorAll(".session-item").forEach(function (node) {
+      node.classList.toggle("bulk-selected", bulkSelected.has(node.dataset.session));
+    });
+    sessionList.querySelectorAll(".bulk-group").forEach(function (block) {
+      const head = block.querySelector(".bulk-group-head");
+      if (!head) return;
+      const members = Array.from(block.querySelectorAll(".session-item"))
+        .map(function (node) { return node.dataset.session; });
+      const chosen = members.filter(function (id) { return bulkSelected.has(id); }).length;
+      head.classList.toggle("selected", members.length > 0 && chosen === members.length);
+      head.classList.toggle("partial", chosen > 0 && chosen < members.length);
+    });
+    updateBulkSelectAllBtn();
     updateBulkBarState();
+  }
+
+  /** 总控「全选」按钮：全部可见会话已选时显示「取消全选」。 */
+  function updateBulkSelectAllBtn() {
+    const btn = $("#bulkSelectAllBtn");
+    if (!btn) return;
+    const ids = bulkVisibleIds();
+    const allSelected = ids.length > 0 && ids.every(function (id) { return bulkSelected.has(id); });
+    btn.textContent = allSelected ? "取消全选" : "全选";
+    btn.disabled = ids.length === 0;
+    btn.classList.toggle("is-all", allSelected);
+  }
+
+  /** 总控全选：所有可见会话一键选中 / 一键取消。 */
+  function toggleBulkSelectAll() {
+    const ids = bulkVisibleIds();
+    if (!ids.length) return;
+    const allSelected = ids.every(function (id) { return bulkSelected.has(id); });
+    ids.forEach(function (id) {
+      if (allSelected) bulkSelected.delete(id);
+      else bulkSelected.add(id);
+    });
+    syncBulkSelectionUi();
+  }
+
+  /**
+   * 重建列表后重新应用当前搜索过滤（style.display 会被新节点重置）。
+   * 空关键词也调用（幂等）：同步清理多选视图的搜索强制展开类等状态。
+   */
+  function reapplySessionFilter() {
+    const box = $("#searchInput");
+    const keyword = box ? String(box.value || "").trim().toLowerCase() : "";
+    if (App.filterSessions) App.filterSessions(keyword);
   }
 
   function updateBulkBarState() {
@@ -394,14 +638,15 @@
   function enterBulkMode() {
     bulkMode = true;
     bulkSelected.clear();
+    bulkExpanded.clear();   // 多选默认全部折叠（每次进入重置）
     document.body.classList.add("bulk-mode");
     // 多选按钮变为「取消多选」，并展开操作条（分享/删除/已选计数）
     setBulkToggle(true);
     $("#sessionBulkBar").classList.remove("hidden");
-    sessionList.querySelectorAll(".session-item").forEach(function (item) {
-      item.classList.remove("bulk-selected");
-    });
-    updateBulkBarState();
+    // 列表切换为分组视图（已定义分组 + 未分组殿后；每组组头可全选）
+    renderSessionItems();
+    refreshSessionFades();
+    reapplySessionFilter();
   }
 
   function exitBulkMode() {
@@ -410,10 +655,10 @@
     document.body.classList.remove("bulk-mode");
     setBulkToggle(false);
     $("#sessionBulkBar").classList.add("hidden");
-    sessionList.querySelectorAll(".session-item").forEach(function (item) {
-      item.classList.remove("bulk-selected");
-    });
-    updateBulkBarState();
+    // 恢复扁平列表
+    renderSessionItems();
+    refreshSessionFades();
+    reapplySessionFilter();
   }
 
   /** 批量分享：所选会话打包 zip 下载（复用后端 export_zip 接口）。 */
@@ -532,11 +777,20 @@
     const menu = el("div", "menu session-menu");
     const shareIcon = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 15V3m0 0 4 4m-4-4L8 7"/><path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3"/></svg>';
     const editIcon = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
-    const archiveIcon = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18M5 6v14h14V6M8 10h8M9 3h6l1 3H8l1-3Z"/></svg>';
+    const groupIcon = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>';
     const deleteIcon = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6"/></svg>';
     menu.appendChild(sessionMenuButton("分享", shareIcon, function () { App.downloadSession(id); }));
     menu.appendChild(sessionMenuButton("重命名", editIcon, function () { renameSession(id, item); }));
-    menu.appendChild(sessionMenuButton("归档", archiveIcon, function () { toast("归档功能暂未接入后端"); }, "disabled"));
+    // 「分组」不关菜单：点击后由分组模块把菜单内容改写为分组选择器
+    const groupBtn = el("button", "menu-item");
+    groupBtn.type = "button";
+    groupBtn.innerHTML = groupIcon + '<span class="menu-item-label"></span>';
+    groupBtn.querySelector(".menu-item-label").textContent = "分组";
+    groupBtn.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (App.sessionGroups) App.sessionGroups.openPicker(id, menu, anchor);
+    });
+    menu.appendChild(groupBtn);
     menu.appendChild(sessionMenuButton("删除", deleteIcon, function () { openDeleteModal(id, item); }, "danger"));
     document.body.appendChild(menu);
 
@@ -634,6 +888,7 @@
     try {
       await API.deleteSession(pending.id);
       pending.node.remove();
+      if (App.sessionGroups) App.sessionGroups.removeSession(pending.id);
       delete state.sessionRecency[pending.id];
       const overrides = readTitleOverrides();
       delete overrides[pending.id];
@@ -652,21 +907,42 @@
     sessionList.querySelectorAll(".session-item").forEach(function (node) {
       node.classList.toggle("active", node.dataset.session === state.sessionId);
     });
+    // 分组区内的会话行同步高亮（组内展开时存在同名副本）
+    if (App.sessionGroups && App.sessionGroups.markActive) App.sessionGroups.markActive(state.sessionId);
   }
 
   /**
    * 发送消息 / 重命名后立即把该会话插入侧边栏列表并置顶。
    * 纯本地操作：不请求后端 _meta，后端落盘慢也不影响立即显示。
-   * - { userText }：新会话标题取首条提问前 40 个字符（与后端一致）
-   * - { title }：直接使用指定标题（重命名场景，不截断）
+   * 标题策略（SessionListUtils.pickSendTitle）：
+   * - { userText }：优先沿用「当前标题」（后端 _meta.title / 标题模型生成 /
+   *   手动重命名 / 上次占位）；仅从未见过的会话才用提问前 40 字临时占位，
+   *   等标题模型返回后由 applySessionTitle 替换——已有标题不再被本轮提问
+   *   文本顶掉（旧行为是每次发送都覆盖为 40 字占位）；
+   * - { title }：直接使用指定标题（重命名场景，不截断）并登记到当前标题表。
    * 同时记录本地 recency，后续 loadSessions 重建列表时仍按此排在最前。
    */
   function upsertLocalSession(sessionId, opts) {
     opts = opts || {};
-    const title = opts.userText != null
-      ? (SessionListUtils.firstQuestionTitle(opts.userText) || sessionId)
-      : (opts.title || sessionId);
+    let title;
+    if (opts.userText != null) {
+      title = SessionListUtils.pickSendTitle(knownSessionTitle(sessionId), opts.userText, sessionId);
+    } else {
+      title = opts.title || sessionId;
+    }
+    // 登记本次落定的标题：新会话占位也要记住——下一轮发送继续沿用，
+    // 直到标题模型生成（applySessionTitle）或后端 meta 拉取带来更新
+    rememberSessionTitle(sessionId, title);
     state.sessionRecency[sessionId] = { title: title, ts: Date.now() };
+
+    // 多选模式：列表为分组视图（由 renderSessionItems 整体重建），跳过单行
+    // DOM 操作；仅同步数据源与分组区，退出多选时按最新数据重建
+    if (bulkMode) {
+      lastSortedRows = [{ id: sessionId, title: title, updated: "", created: "" }]
+        .concat(lastSortedRows.filter(function (row) { return row.id !== sessionId; }));
+      if (App.sessionGroups) App.sessionGroups.upsertRow(sessionId, title);
+      return null;
+    }
 
     const tip = sessionList.querySelector(".empty-tip");
     if (tip) tip.remove();
@@ -675,14 +951,17 @@
       const label = sessionList.querySelector(".session-label");
       item = buildSessionItem(sessionId, title);
       sessionList.insertBefore(item, label ? label.nextSibling : sessionList.firstChild);
-    } else if (opts.title) {
-      const name = item.querySelector(".session-name");
-      setSessionNameText(name, title);
+    } else {
+      // 已有行：确保显示最终标题（沿用可信标题时通常同值，setSessionNameText
+      // 会自行短路；占位标题与 DOM 不一致时同步修正）
+      setSessionNameText(item.querySelector(".session-name"), title);
     }
     // 置顶（本会话刚发生交互，应排在列表最前）
     const label = sessionList.querySelector(".session-label");
     const topRef = label ? label.nextSibling : sessionList.firstChild;
     if (item !== topRef && topRef) sessionList.insertBefore(item, topRef);
+    // 分组区同步（标题变化 / 新会话行入库；仅当该会话在分组内才重渲染）
+    if (App.sessionGroups) App.sessionGroups.upsertRow(sessionId, title);
     markActiveSession();
     refreshSessionFades();
     return item;
@@ -691,6 +970,14 @@
   // ---------- 会话切换 ----------
   // 会话打开请求序号：切会话瞬间旧请求仍可能在途，过期响应直接丢弃
   let sessionOpenSeq = 0;
+
+  // 视图就绪跟踪（重复点击同一会话时跳过重载）：
+  //   readySessionId   = 当前聊天区已完整显示的会话（历史渲染完成 / 本地导入预览）
+  //   loadingSessionId = 正在加载中的会话（加载期间重复点击同样跳过，防并发重载）
+  // 点击判定见 SessionListUtils.shouldOpenSessionOnClick；显式调用 openSession
+  // 的路径（删除轮次后重载、流失败对齐、深链启动等）不受影响，始终真实重载。
+  let readySessionId = "";
+  let loadingSessionId = "";
 
   /**
    * 惰性生成会话 ID：仅在真正产生会话内容时分配（发送消息 / 上传文件）。
@@ -703,6 +990,10 @@
       // 文件变更徽标事件驱动同步（替代旧 2s 轮询看门狗；未变化时零请求）
       if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     }
+    // 首次分配 ID（发送/上传）后聊天区即进入"本会话"视图：标记就绪，
+    // 点击侧边栏该行不再整段重载（生成中也不打断当前流式渲染）
+    readySessionId = state.sessionId;
+    loadingSessionId = "";
     return state.sessionId;
   }
 
@@ -712,6 +1003,9 @@
     App.saveSessionDraft();
     // 只进入"待开始"状态，不生成本地 ID；首次发送消息时才由 ensureSessionId() 分配
     state.sessionId = null;
+    // 清空视图就绪跟踪：新对话不属于任何已打开会话
+    readySessionId = "";
+    loadingSessionId = "";
     App.loadWorkDir(); // 新对话未覆盖目录：显示全局默认
     App.loadToolSelection(); // 新对话未覆盖工具：应用全局默认选择
     // 模型面板打开中时按"新对话=全局默认"刷新（否则缓存仍是上一会话的生效选择）
@@ -756,6 +1050,8 @@
   }
   if (bulkShareBtn) bulkShareBtn.addEventListener("click", bulkShareSessions);
   if (bulkDeleteBtn) bulkDeleteBtn.addEventListener("click", openBulkDeleteModal);
+  const bulkSelectAllBtn = $("#bulkSelectAllBtn");
+  if (bulkSelectAllBtn) bulkSelectAllBtn.addEventListener("click", toggleBulkSelectAll);
 
   async function openSession(id) {
     const seq = ++sessionOpenSeq;
@@ -765,6 +1061,10 @@
     if (App.stopVoiceInput) App.stopVoiceInput();
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
+    // 视图就绪跟踪：加载期间同会话的重复点击被跳过；本次加载完成前旧的
+    // 就绪标记失效（成功/空/异常分支各自落定最终状态）
+    loadingSessionId = id;
+    readySessionId = "";
     // 文件变更徽标事件驱动同步（会话切换即刷新一次；未变化时零请求）
     if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     App.loadWorkDir();
@@ -790,6 +1090,8 @@
     state.todoPanelOpen = false;
     App.renderTodoWidget();
     API.getSessionMeta(id).then(function (meta) {
+      // 打开会话即登记后端权威标题：发送消息时优先沿用（不被 40 字占位顶掉）
+      if (meta && meta.title) rememberSessionTitle(id, meta.title);
       if (state.sessionId !== id) return;
       App.applySessionTodo(meta && meta.todo);
     }).catch(function () { /* ignore */ });
@@ -825,6 +1127,9 @@
         App.rebuildQnav();
         scrollToBottom(true);
       }
+      // 历史已完整显示：本会话进入就绪态（重复点击侧边栏行不再重载）
+      loadingSessionId = "";
+      readySessionId = id;
     } catch (err) {
       state.hasConversation = false;
       state.importedHistoryText = null;
@@ -832,9 +1137,25 @@
       App.updateExportButton();
       setEmpty(!restoreActiveStream(id));
       if (err.message !== "加载会话失败") toast("历史加载失败：" + err.message);
+      // 仅当本请求仍是最新一次打开时才落定就绪跟踪：加载失败不置就绪，
+      // 允许再次点击重试（恢复旧行为）；过期响应不得清掉新加载的状态
+      if (seq === sessionOpenSeq) {
+        loadingSessionId = "";
+        readySessionId = "";
+      }
     }
     // 刷新后若同一会话仍有后台生成任务，自动附接续看
     if (seq === sessionOpenSeq) App.maybeAttachRunningStream(id);
+  }
+
+  /**
+   * 标记某会话的聊天区视图已就绪（重复点击其侧边栏行跳过重载）。
+   * 供不经 openSession 却直接铺开内容的路径调用（如 history.js 本地导入预览）。
+   */
+  function markSessionViewReady(sessionId) {
+    if (!sessionId) return;
+    readySessionId = sessionId;
+    loadingSessionId = "";
   }
 
   function restoreActiveStream(sessionId) {
@@ -893,14 +1214,32 @@
   App.markActiveSession = markActiveSession;
   App.refreshSessionFades = refreshSessionFades;
   App.upsertLocalSession = upsertLocalSession;
+  // 当前标题登记（后端 _meta.title / 标题模型生成 / 手动重命名）：发送消息时
+  // 优先沿用，避免被"提问前 40 字"临时占位覆盖（chat.js 标题回填处调用）
+  App.rememberSessionTitle = rememberSessionTitle;
   App.setSessionNameText = setSessionNameText;
+  // 标题 hover 跑马灯监听绑定（分组区等其它行容器复用；同一容器只绑一次）
+  App.bindTitleMarquee = bindTitleMarquee;
+  // 容器整体重建前的跑马灯收尾（容器内含正在滚动的标题时停止复位）
+  App.stopTitleMarqueeIn = stopTitleMarqueeIn;
   App.ensureSessionId = ensureSessionId;
   App.startNewChat = startNewChat;
   App.openSession = openSession;
+  // 视图就绪标记（本地导入预览等直接铺开内容的路径调用；重复点击守卫依据）
+  App.markSessionViewReady = markSessionViewReady;
   App.restoreActiveStream = restoreActiveStream;
   // 多选批量操作（分享 zip / 删除）
   App.enterBulkMode = enterBulkMode;
   App.exitBulkMode = exitBulkMode;
   App.bulkShareSessions = bulkShareSessions;
   App.openBulkDeleteModal = openBulkDeleteModal;
+  // 分组数据变化时的多选视图刷新（session_groups.js 调用；非多选时无操作）
+  App.refreshBulkGroupedView = function () {
+    if (!bulkMode) return;
+    renderSessionItems();
+    refreshSessionFades();
+    reapplySessionFilter();
+  };
+  // 搜索过滤联动（core.js filterSessions 调用；可见集变化后刷新总控按钮状态）
+  App.updateBulkSelectAllBtn = updateBulkSelectAllBtn;
 })(window.App);

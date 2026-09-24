@@ -82,7 +82,7 @@
         link.click();
         link.remove();
         setTimeout(function () { URL.revokeObjectURL(url); }, 0);
-        toast("已打包分享（含附件数据）：" + name);
+        toast("已打包分享（含附件/分组数据）：" + name);
       } else {
         downloadText(name, await res.text());
       }
@@ -174,10 +174,16 @@
     const conflicts = preview.conflicts || [];
     pendingImport = { preview: preview, file: file };
     importConflictList.innerHTML = "";
+    const groups = preview.groups || [];
+    const groupNote = groups.length
+      ? "，包含 " + groups.length + " 个分组（" + groups.map(function (g) { return g.name; })
+          .slice(0, 3).join("、") + (groups.length > 3 ? " 等" : "")
+        + "，导入后按分组名自动还原归属）"
+      : "";
     if (preview.type === "jsonl") {
       importConflictHint.textContent = "该会话与本地已有会话同名，请选择处理方式：";
     } else {
-      importConflictHint.textContent = "包内 " + preview.total + " 个会话"
+      importConflictHint.textContent = "包内 " + preview.total + " 个会话" + groupNote
         + (conflicts.length ? "，其中 " + conflicts.length + " 个与本地同名：" : "，均可直接导入：");
     }
     preview.sessions.forEach(function (s) {
@@ -196,6 +202,7 @@
       const bits = [];
       if (s.imported_rounds != null) bits.push(s.imported_rounds + " 轮");
       if (s.media_count) bits.push(s.media_count + " 个媒体文件");
+      if (s.group_name) bits.push("分组：" + s.group_name);
       if (isConflict) bits.push("本地已存在同名会话");
       info.textContent = bits.join(" · ") || (isConflict ? "本地已存在同名会话" : "新会话");
       main.appendChild(title);
@@ -251,12 +258,17 @@
         return;
       }
       await App.loadSessions();
+      // 导入可能新建/复用分组并写入归属：刷新侧边栏分组区数据（loadSessions
+      // 已注入最新会话行，此处再拉注册表与归属映射并重渲染）
+      if (App.sessionGroups && App.sessionGroups.refresh) await App.sessionGroups.refresh();
       // 打开最后一个导入成功的会话（多选导入时通常就是最新项）
       const last = importedList[importedList.length - 1];
       await App.openSession(SessionUtils.sanitizeSessionId(last.session_id));
       const collisionCount = importedList.filter(function (r) { return r.collision; }).length;
+      const groupedCount = importedList.filter(function (r) { return r.group_name; }).length;
       let msg = "已导入 " + importedList.length + " 个会话";
       if (collisionCount) msg += "（" + collisionCount + " 个重名已另存）";
+      if (groupedCount) msg += "，" + groupedCount + " 个已归入分组";
       if (skippedList.length) msg += "，跳过 " + skippedList.length + " 个";
       toast(msg + failedMsg);
     } catch (err) {
@@ -293,6 +305,8 @@
   function previewLocalHistory(text, parsed, sessionId, toastMsg) {
     App.resetContextTokenStats();
     state.sessionId = sessionId;
+    // 预览内容已直接铺进聊天区：标记视图就绪，重复点击该会话行不再重载
+    if (App.markSessionViewReady) App.markSessionViewReady(sessionId);
     if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     state.importedHistoryText = text;
     state.hasConversation = true;

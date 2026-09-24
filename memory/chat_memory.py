@@ -10,6 +10,7 @@ import threading
 import time
 import copy
 import tempfile
+import uuid
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime
@@ -259,6 +260,223 @@ def read_session_meta_value(session_id: str, key: str) -> Any:
         if isinstance(meta, dict):
             return meta.get(key)
     return None
+
+
+# ---------- 会话分组（分组注册表 + 会话归属） ----------
+# 归属真源：会话 JSONL 首行 _meta.group_id（None/缺失 = 未分组）。
+# 分组定义真源：history_files/session_groups.json（单文件小 JSON，跨进程锁 +
+# 原子写）。双写一致性规则：删除分组时解除其全部成员归属；会话删除时注册表
+# 不记录成员、天然一致；重命名分组只动注册表。
+
+SESSION_GROUPS_FILENAME = "session_groups.json"
+SESSION_GROUP_NAME_MAX = 40
+SESSION_GROUP_ID_PREFIX = "g-"
+
+
+def _session_groups_file() -> Path:
+    """分组注册表文件路径（惰性求值：测试会把 HISTORY_ROOT 指向临时目录）。"""
+    return HISTORY_ROOT / SESSION_GROUPS_FILENAME
+
+
+def _session_groups_lock_path() -> Path:
+    return LOCK_ROOT / f"{SESSION_GROUPS_FILENAME}.lock"
+
+
+def _new_group_id() -> str:
+    return SESSION_GROUP_ID_PREFIX + uuid.uuid4().hex[:12]
+
+
+def _normalize_group_name(raw: Any) -> str:
+    """规整分组名：trim、折叠控制字符、截断到上限；空名抛 ValueError。"""
+    name = re.sub(r"[\r\n\t]+", " ", str(raw or "")).strip()
+    if not name:
+        raise ValueError("分组名不能为空")
+    return name[:SESSION_GROUP_NAME_MAX]
+
+
+def _read_session_groups_raw() -> list[dict[str, Any]]:
+    """读注册表原始条目；文件缺失/损坏返回空列表（尽力而为，不抛错）。"""
+    path = _session_groups_file()
+    try:
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    groups = raw.get("groups") if isinstance(raw, dict) else raw
+    if not isinstance(groups, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        gid = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not gid or not name:
+            continue
+        cleaned.append({
+            "id": gid,
+            "name": name[:SESSION_GROUP_NAME_MAX],
+            "created_at": str(item.get("created_at") or ""),
+            "collapsed": bool(item.get("collapsed")),
+            "order": item.get("order") if isinstance(item.get("order"), int) else 0,
+        })
+    return cleaned
+
+
+def _write_session_groups_raw(groups: list[dict[str, Any]]) -> None:
+    """原子写注册表（tmp + os.replace + 占用重试，与 _meta 写同口径）。"""
+    path = _session_groups_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _sidecar_dir() / f"{SESSION_GROUPS_FILENAME}.tmp"
+    payload = json.dumps({"groups": groups}, ensure_ascii=False, indent=2)
+    last_error: OSError | None = None
+    for delay in _ATOMIC_WRITE_RETRY_DELAYS:
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, path)
+            return
+        except OSError as err:
+            last_error = err
+            time.sleep(delay)
+    raise last_error
+
+
+def list_session_groups() -> list[dict[str, Any]]:
+    """列出全部分组（按 order、created_at 排序）。"""
+    groups = _read_session_groups_raw()
+    groups.sort(key=lambda g: (g.get("order") or 0, g.get("created_at") or ""))
+    return groups
+
+
+def list_session_group_assignments() -> dict[str, str]:
+    """扫描全部会话首行 _meta，返回 {session_id: group_id} 归属映射。
+
+    归属随会话文件走（会话删除/新增无需维护注册表），首行只读解析，
+    损坏/旧格式文件静默跳过。
+    """
+    assignments: dict[str, str] = {}
+    try:
+        files = list(HISTORY_ROOT.glob("*_chat.jsonl"))
+    except OSError:
+        return assignments
+    for file_path in files:
+        meta = _read_meta_first_line(file_path)
+        if not isinstance(meta, dict):
+            continue
+        gid = meta.get("group_id")
+        if not isinstance(gid, str) or not gid.strip():
+            continue
+        name = file_path.name
+        session_id = name[:-len("_chat.jsonl")] if name.endswith("_chat.jsonl") else file_path.stem
+        assignments[session_id] = gid.strip()
+    return assignments
+
+
+def create_session_group(name: str) -> dict[str, Any]:
+    """新建分组；同名分组已存在时直接返回既有分组（幂等）。"""
+    clean_name = _normalize_group_name(name)
+    with cross_process_lock(_session_groups_lock_path()):
+        groups = _read_session_groups_raw()
+        for item in groups:
+            if item.get("name") == clean_name:
+                return item
+        group = {
+            "id": _new_group_id(),
+            "name": clean_name,
+            "created_at": now_str(),
+            "collapsed": False,
+            "order": len(groups),
+        }
+        groups.append(group)
+        _write_session_groups_raw(groups)
+    return group
+
+
+def update_session_group(
+    group_id: str,
+    name: str | None = None,
+    collapsed: bool | None = None,
+) -> dict[str, Any]:
+    """更新分组名 / 折叠状态；分组不存在抛 ValueError。"""
+    gid = str(group_id or "").strip()
+    if not gid:
+        raise ValueError("group_id 不能为空")
+    with cross_process_lock(_session_groups_lock_path()):
+        groups = _read_session_groups_raw()
+        target = next((g for g in groups if g["id"] == gid), None)
+        if target is None:
+            raise ValueError(f"分组不存在: {gid}")
+        if name is not None:
+            target["name"] = _normalize_group_name(name)
+        if collapsed is not None:
+            target["collapsed"] = bool(collapsed)
+        _write_session_groups_raw(groups)
+    return target
+
+
+def _set_session_group_id(session_id: str, group_id: str | None) -> bool:
+    """写会话 _meta.group_id（None=清除归属）；成功返回 True。
+
+    不改动 updated_at：归组不是内容更新，不应扰乱「最近」排序。
+    """
+    try:
+        sid = normalize_session_id(session_id)
+        file_path = _get_chat_history_file(sid)
+    except Exception:
+        return False
+    if not file_path.exists():
+        return False
+    with cross_process_lock(LOCK_ROOT / f"{file_path.name}.lock"):
+        try:
+            meta, entries = _load_meta_and_entries(file_path, sid)
+        except OSError:
+            return False
+        if group_id is None:
+            meta.pop("group_id", None)
+        else:
+            meta["group_id"] = group_id
+        try:
+            _write_meta_and_entries(file_path, meta, entries)
+        except OSError:
+            return False
+    return True
+
+
+def delete_session_group(group_id: str) -> dict[str, Any]:
+    """删除分组：先解除全部成员会话的 _meta.group_id，再移除注册表条目。"""
+    gid = str(group_id or "").strip()
+    if not gid:
+        raise ValueError("group_id 不能为空")
+    released = 0
+    for session_id, assigned in list_session_group_assignments().items():
+        if assigned != gid:
+            continue
+        if _set_session_group_id(session_id, None):
+            released += 1
+    with cross_process_lock(_session_groups_lock_path()):
+        groups = _read_session_groups_raw()
+        remaining = [g for g in groups if g["id"] != gid]
+        removed = len(groups) - len(remaining)
+        if removed:
+            _write_session_groups_raw(remaining)
+    return {"state": "succeed", "group_id": gid, "removed": removed, "released_sessions": released}
+
+
+def assign_session_group(session_id: str, group_id: str | None) -> dict[str, Any]:
+    """把会话加入分组（group_id=None/空 = 移出分组）。
+
+    写入前校验分组存在；会话文件不存在/写盘失败抛 ValueError。
+    """
+    sid = normalize_session_id(session_id)
+    gid = str(group_id or "").strip() or None
+    if gid is not None:
+        exists = any(g["id"] == gid for g in _read_session_groups_raw())
+        if not exists:
+            raise ValueError(f"分组不存在: {gid}")
+    if not _set_session_group_id(sid, gid):
+        raise ValueError(f"会话不存在或写入失败: {sid}")
+    return {"state": "succeed", "session_id": sid, "group_id": gid}
 
 
 def mark_title_attempted(session_id: str) -> dict[str, Any] | None:
@@ -541,6 +759,12 @@ def _recompute_meta_from_entries(
     elif not meta.get("updated_at"):
         meta["updated_at"] = now
     meta["context_summary"] = _normalize_context_summary(meta.get("context_summary"))
+    # 会话分组归属：None/缺失 = 未分组（保留原样）；非字符串/空白视为非法清除。
+    # 只做格式校验，不校验分组是否仍存在（分组删除时由 delete_session_group
+    # 主动解除归属；注册表损坏时残留的孤儿归属由前端「分组不存在则归入未分组」兜底）
+    group_id = meta.get("group_id")
+    if group_id is not None and (not isinstance(group_id, str) or not group_id.strip()):
+        meta.pop("group_id", None)
     if (
         meta.get("title") == _default_title(session_id)
         and questions
@@ -2828,7 +3052,10 @@ def _import_jsonl_payload(
 # zip 内目录布局：
 #   <session>_chat.jsonl                  # 会话历史（与 history_files 根一致）
 #   session_files/<upload_id>/...         # 该会话上传数据（文件解析记录/media/files/file_diffs 等）
-#   manifest.json                         # {version, sessions: [{session_id, filename, title, upload_id}]}
+#   manifest.json                         # {version: 2, groups: [{id, name}], sessions: [{session_id,
+#                                         #   filename, title, upload_id, group_id}]}
+#                                         # groups 为随包携带的分组定义（v1 包无此键按空处理；
+#                                         #   导入端按组名映射还原归属，跨机器 ID 不同也能还原）
 EXPORT_MANIFEST_NAME = "manifest.json"
 # 单个导入包的大小上限（视频等媒体原字节在 session_files/ 内，放宽到 512MB）
 IMPORT_PACKAGE_MAX_BYTES = 512 * 1024 * 1024
@@ -2880,6 +3107,7 @@ def _export_session_payload(session_id: str) -> dict[str, Any] | None:
         "files": files,
         "title": str(meta.get("title") or "") if isinstance(meta, dict) else "",
         "updated_at": str(meta.get("updated_at") or "") if isinstance(meta, dict) else "",
+        "group_id": str(meta.get("group_id") or "").strip() if isinstance(meta, dict) else "",
     }
 
 
@@ -2909,6 +3137,7 @@ def export_sessions_to_zip(session_ids: list[str]) -> tuple[bytes, str, list[str
 
     used_names: set[str] = {"EXPORT_MANIFEST_NAME"}
     manifest_sessions: list[dict[str, Any]] = []
+    referenced_group_ids: list[str] = []
     skipped: list[str] = []
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2917,6 +3146,9 @@ def export_sessions_to_zip(session_ids: list[str]) -> tuple[bytes, str, list[str
             if payload is None:
                 skipped.append(sid)
                 continue
+            gid = str(payload.get("group_id") or "").strip()
+            if gid and gid not in referenced_group_ids:
+                referenced_group_ids.append(gid)
             # jsonl 归档名与会话 ID 对应（同名会话理论上不可能重复出现：ID 即唯一标识）
             jsonl_name = payload["filename"]
             zf.writestr(jsonl_name, payload["text"].encode("utf-8"))
@@ -2929,10 +3161,20 @@ def export_sessions_to_zip(session_ids: list[str]) -> tuple[bytes, str, list[str
                 "filename": payload["filename"],
                 "title": payload["title"],
                 "upload_id": upload_dir_name,
+                "group_id": gid,
             })
+        # 分组定义随包携带（version 2）：导入端按「组名」映射还原归属
+        # （本地同名分组复用、缺失则新建；无归属会话不携带任何分组信息）
+        name_by_id = {g["id"]: g["name"] for g in _read_session_groups_raw()}
+        manifest_groups = [
+            {"id": gid, "name": name_by_id[gid]}
+            for gid in referenced_group_ids
+            if gid in name_by_id
+        ]
         manifest = {
-            "version": 1,
+            "version": 2,
             "exported_at": now_str(),
+            "groups": manifest_groups,
             "sessions": manifest_sessions,
         }
         zf.writestr(EXPORT_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -2956,7 +3198,12 @@ def list_zip_sessions(raw_bytes: bytes) -> dict[str, Any]:
     Raises:
         ValueError: 非 zip / 无 manifest / manifest 不合法时抛出
     """
-    entries = _parse_import_zip(raw_bytes)
+    parsed = _parse_import_zip(raw_bytes)
+    entries = parsed["items"]
+    group_name_by_id = {g["id"]: g["name"] for g in parsed["groups"]}
+    # 本机回导兜底：旧包（v1）/裸 zip 无分组定义时，同 ID 分组的名称从本地
+    # 注册表解析，仅供前端展示（导入端「按名映射 / 本地已知保留」逻辑不变）
+    local_name_by_id = {g["id"]: g["name"] for g in _read_session_groups_raw()}
     sessions: list[dict[str, Any]] = []
     for item in entries:
         meta, round_entries, total_lines, skipped_lines = _parse_jsonl_payload(item["data"])
@@ -2968,6 +3215,9 @@ def list_zip_sessions(raw_bytes: bytes) -> dict[str, Any]:
         if isinstance(meta, dict) and isinstance(meta.get("upload_id"), str) and meta["upload_id"].strip():
             upload_dir_name = _safe_session_id(str(meta["upload_id"]))
         media_count = sum(1 for rel in item["file_names"] if rel.startswith("media/"))
+        group_id = ""
+        if isinstance(meta, dict) and isinstance(meta.get("group_id"), str) and meta["group_id"].strip():
+            group_id = meta["group_id"].strip()
         sessions.append({
             "session_id": item["session_id"],
             "filename": f"{item['session_id']}_chat.jsonl",
@@ -2978,15 +3228,26 @@ def list_zip_sessions(raw_bytes: bytes) -> dict[str, Any]:
             "exists": exists,
             "upload_dir_name": upload_dir_name,
             "media_count": media_count,
+            "group_id": group_id,
+            "group_name": (group_name_by_id.get(group_id)
+                           or local_name_by_id.get(group_id, "")),
         })
-    return {"sessions": sessions, "total": len(sessions)}
+    # 仅返回被包内会话实际引用的分组定义（供前端提示展示）
+    referenced_groups = [
+        g for g in parsed["groups"]
+        if any(s.get("group_id") == g["id"] for s in sessions)
+    ]
+    return {"sessions": sessions, "total": len(sessions), "groups": referenced_groups}
 
 
-def _parse_import_zip(raw_bytes: bytes) -> list[dict[str, Any]]:
-    """解析 zip 包字节流为会话条目列表，校验 manifest 并防路径穿越。
+def _parse_import_zip(raw_bytes: bytes) -> dict[str, Any]:
+    """解析 zip 包字节流，校验 manifest 并防路径穿越。
 
     Returns:
-        [{session_id, data(jsonl 字节), files: [(zip 内相对路径, 字节)], file_names}]
+        {
+          "items": [{session_id, data(jsonl 字节), files: [(zip 内相对路径, 字节)], file_names}],
+          "groups": [{id, name}]  # 随包携带的分组定义（v1 包/裸 zip 为空列表）
+        }
     """
     if raw_bytes is None:
         raise ValueError("raw_bytes 不能为空")
@@ -2995,6 +3256,7 @@ def _parse_import_zip(raw_bytes: bytes) -> list[dict[str, Any]]:
     except zipfile.BadZipFile as exc:
         raise ValueError("不是有效的 zip 分享包") from exc
     names = zf.namelist()
+    manifest_groups: list[dict[str, str]] = []
     if EXPORT_MANIFEST_NAME not in names:
         # 不是 Ytools 分享包：按无 manifest 的裸 zip 处理（仅收根级 *_chat.jsonl）
         manifest_sessions: list[dict[str, Any]] | None = None
@@ -3011,6 +3273,18 @@ def _parse_import_zip(raw_bytes: bytes) -> list[dict[str, Any]]:
         manifest_sessions = manifest.get("sessions")
         if not isinstance(manifest_sessions, list) or not manifest_sessions:
             raise ValueError("分享包 manifest 无会话数据")
+        raw_groups = manifest.get("groups")
+        if isinstance(raw_groups, list):
+            for entry in raw_groups:
+                if not isinstance(entry, dict):
+                    continue
+                gid = str(entry.get("id") or "").strip()
+                gname = str(entry.get("name") or "").strip()
+                if gid and gname:
+                    manifest_groups.append({
+                        "id": gid,
+                        "name": gname[:SESSION_GROUP_NAME_MAX],
+                    })
         jsonl_names = []
         for entry in manifest_sessions:
             filename = entry.get("filename") if isinstance(entry, dict) else None
@@ -3041,7 +3315,7 @@ def _parse_import_zip(raw_bytes: bytes) -> list[dict[str, Any]]:
         })
     if not items:
         raise ValueError("分享包中没有可导入的会话 jsonl")
-    return items
+    return {"items": items, "groups": manifest_groups}
 
 
 def _write_imported_session(
@@ -3093,6 +3367,14 @@ def _write_imported_session(
         else:
             # 不能证明摘要游标与导入轮次对应时，宁可下次重建，也不要静默跳过历史。
             merged_meta["context_summary"] = None
+        # 导入分组归属规整：包内 group_id 指向本地不存在的分组时清除（避免孤儿
+        # 引用；zip 导入随后会按「组名」映射还原有效归属，jsonl 导入保持清除，
+        # 本机回导（ID 仍存在）则原样保留）
+        group_id = merged_meta.get("group_id")
+        if isinstance(group_id, str) and group_id.strip():
+            known_ids = {g["id"] for g in _read_session_groups_raw()}
+            if group_id.strip() not in known_ids:
+                merged_meta.pop("group_id", None)
         _write_meta_and_entries(file_path, merged_meta, final_entries)
     return actual_session_id, file_path, collision, merged_meta
 
@@ -3121,7 +3403,9 @@ async def import_sessions_from_zip(
     if strategy not in {"ask", "overwrite", "rename", "skip"}:
         raise ValueError(f"未知的冲突策略: {conflict_strategy}")
     per_decisions = {str(k): str(v).strip().lower() for k, v in (decisions or {}).items()}
-    entries = _parse_import_zip(raw_bytes)
+    parsed = _parse_import_zip(raw_bytes)
+    entries = parsed["items"]
+    package_group_names = {g["id"]: g["name"] for g in parsed["groups"]}
     imported: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -3149,6 +3433,13 @@ async def import_sessions_from_zip(
                 data_files=item["files"],
                 overwrite=(decision == "overwrite"),
             )
+            resolved_id, resolved_name = _restore_import_group(
+                str(result.get("session_id") or session_id),
+                base_meta,
+                package_group_names,
+            )
+            result["group_id"] = resolved_id
+            result["group_name"] = resolved_name
             imported.append(result)
         except Exception as exc:  # 单会话失败不阻断其他会话
             failed.append({"session_id": session_id, "error": str(exc)})
@@ -3158,6 +3449,46 @@ async def import_sessions_from_zip(
         "skipped": skipped,
         "failed": failed,
     }
+
+
+def _restore_import_group(
+    actual_session_id: str,
+    base_meta: dict[str, Any] | None,
+    package_group_names: dict[str, str],
+) -> tuple[str, str]:
+    """导入后的分组归属还原：包内 group_id → 本地分组（按「组名」映射）。
+
+    规则：
+    - 包内提供分组定义（manifest.groups，v2）→ 按组名映射：本地同名分组复用、
+      缺失则新建（跨机器导入分组 ID 必然不同，组名是唯一可迁移的锚点）；
+    - 包内无定义（v1 旧包 / 裸 zip / 单 jsonl）→ 仅当本地已存在同 ID 分组
+      （本机回导场景）时保留，否则清除（界面显示为未分组）。
+    返回 (最终 group_id 或空串, 最终分组名或空串)。
+    """
+    gid = ""
+    if isinstance(base_meta, dict) and isinstance(base_meta.get("group_id"), str):
+        gid = base_meta["group_id"].strip()
+    if not gid:
+        return "", ""
+    name = package_group_names.get(gid, "")
+    if name:
+        group: dict[str, Any] | None = None
+        try:
+            group = create_session_group(name)  # 同名幂等：复用既有分组
+        except Exception:
+            group = None
+        if group:
+            resolved_id = str(group.get("id") or "")
+            resolved_name = str(group.get("name") or "")
+            if resolved_id and resolved_id != gid:
+                _set_session_group_id(actual_session_id, resolved_id)
+            return resolved_id, resolved_name
+        # 新建失败：退回「本地已知则保留 / 否则清除」逻辑
+    known_ids = {g["id"] for g in _read_session_groups_raw()}
+    if gid in known_ids:
+        return gid, ""
+    _set_session_group_id(actual_session_id, None)
+    return "", ""
 
 
 async def _import_session_with_data(

@@ -464,6 +464,69 @@ def retain_latest_reasoning(messages: List[dict[str, Any]], *, limit: int | None
             message.pop("reasoning_content", None)
 
 
+def sanitize_tool_call_pairing(messages: List[dict[str, Any]]) -> tuple[List[dict[str, Any]], int]:
+    """清理悬空 tool_calls（声明了调用但上下文中无配对 tool 结果）。
+
+    上游（opencode / DeepSeek 等严格网关）要求 assistant.tool_calls 里每个
+    id 都必须有配对的 tool 结果消息；违反时直接 HTTP 400 且响应体为空
+    （实测 body 恰为 "0\\r\\n\\r\\n"），客户端重试同一 payload 必然全败。
+
+    悬空来源（源头已分别修复，这里是发请求前的统一防线）：
+    - todo 上下文归并曾只删结果、保留声明（_replace_todo_context 已修复）；
+    - 历史里中断/停止的轮次（工具调用未执行完就断流，落盘无结果）。
+
+    只对需要修改的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息复用
+    引用；返回 (新列表, 被清除的悬空调用数)。函数不修改入参。
+
+    判定保守：只有"id 为非空字符串、且上下文中不存在同 id 的 tool 结果"的
+    调用才视为悬空清除；无 id / 空 id 的畸形声明无法可靠判断，保留原样
+    （不主动引入新的行为差异）。
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages, 0
+    paired_ids: set[str] = set()
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            tid = message.get("tool_call_id")
+            if isinstance(tid, str) and tid:
+                paired_ids.add(tid)
+    removed = 0
+    result: List[dict[str, Any]] = []
+    for message in messages:
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("tool_calls"), list)
+        ):
+            result.append(message)
+            continue
+
+        def _paired(tool_call: dict[str, Any]) -> bool:
+            call_id = tool_call.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                return True  # 无法判断：保留
+            return call_id in paired_ids
+
+        kept = [
+            tool_call for tool_call in message["tool_calls"]
+            if isinstance(tool_call, dict) and _paired(tool_call)
+        ]
+        removed += len(message["tool_calls"]) - len(kept)
+        if len(kept) == len(message["tool_calls"]):
+            result.append(message)  # 全部配对：原样复用
+            continue
+        clone = dict(message)
+        if kept:
+            clone["tool_calls"] = kept
+            result.append(clone)
+        else:
+            # 声明全部悬空：清除 tool_calls 字段；有正文保留，无正文丢弃整条
+            clone.pop("tool_calls", None)
+            if clone.get("content"):
+                result.append(clone)
+    return result, removed
+
+
 def copy_for_request(
     messages: List[dict[str, Any]],
     *,
@@ -485,6 +548,10 @@ def copy_for_request(
       limit==0 时回传占位符（字段仅为通过上游校验而存在）；
     - 最新非工具轮：思考非必须，已有则按长度裁剪，limit==0 直接剥离。
 
+    请求副本在返回前还会统一执行一次「悬空 tool_call 清理」
+    （sanitize_tool_call_pairing）：上游对声明/结果配对做严格校验，悬空
+    直接 400 空响应体（todo 归并/中断轮次等历史遗留均由此兜底）。
+
     只对"需要修改"的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
     直接复用引用——避免对整包 messages（可能含 MB 级 base64 多模态部件）
     做深拷贝的每轮开销。
@@ -494,7 +561,10 @@ def copy_for_request(
         if isinstance(message, dict) and message.get("role") == "assistant"
     ]
     if not assistant_indexes:
-        return list(messages)
+        cleaned, removed = sanitize_tool_call_pairing(list(messages))
+        if removed:
+            print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
+        return cleaned
     latest_index = assistant_indexes[-1]
     # 回退思考：最新一次 API 调用没有输出思考时，向前找最近一次真实思考
     # （运行时 messages 每轮都保存原始全文，历史值可直接回溯；跳过占位符）
@@ -549,4 +619,7 @@ def copy_for_request(
             copied.append(message)
             continue
         copied.append(_mutated(message, None, drop=True))
-    return copied
+    cleaned, removed = sanitize_tool_call_pairing(copied)
+    if removed:
+        print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
+    return cleaned

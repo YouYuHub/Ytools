@@ -78,16 +78,20 @@ agent_tool_sse/
 │   │                            #   file_history_sync.js（文件版本链跨窗口变更标记：编辑器页
 │   │                            #   写操作 markDirty 广播，主页面订阅即时刷新 + 标记兜底，纯逻辑）/
 │   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
-│   │                            #   session_utils.js 等工具模块 + app.js（入口）+
-│   │                            #   app/（14 个功能模块：core/sessions/stats/workdir/
+│   │                            #   session_utils.js / session_group_utils.js（会话分组纯逻辑：
+│   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
+│   │                            #   名称校验）等工具模块 + app.js（入口）+
+│   │                            #   app/（15 个功能模块：core/sessions/session_groups/stats/workdir/
 │   │                            #   messages/history/compaction/builtin/media/skills/composer/
-│   │                            #   model_panel/tools/chat；skills=提示词库可拖拽对话框）
+│   │                            #   model_panel/tools/chat；session_groups=侧边栏分组区
+│   │                            #   UI/交互；skills=提示词库可拖拽对话框）
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
 │   └── test_h5/                 # 前端单元测试（api/format_utils/history_parser/markdown/
-│                                #   session_list_utils/session_utils/table_export/widget_reuse/
-│                                #   file_history_sync，node --test）
+│                                #   session_list_utils/session_group_utils/session_utils/
+│                                #   session_marquee/session_open_guard/session_title_flow/table_export/
+│                                #   widget_reuse/file_history_sync，node --test）
 │
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
@@ -96,10 +100,13 @@ agent_tool_sse/
 │   └── compact.md               # 压缩逻辑说明文档（含压缩失败重试链、失败终止任务策略、拼接优先累计合并）
 │
 ├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
+│                                 #   session_groups.json（会话分组注册表，含 collapsed/order；随分享包
+│                                 #   manifest v2 的 groups 携带，导入端按组名映射还原归属）
 │                                 #   上传记录目录 history_files/session_files/<session>/（upload 改名而来）：文件解析 JSON + media/ + files/ + file_diffs/
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
-                                 #   test_context_compaction / test_chat_router / test_sub_agent 等）
+                                 #   test_context_compaction / test_chat_router / test_sub_agent /
+                                 #   test_session_groups 等）
 ```
 
 ---
@@ -204,6 +211,10 @@ agent_tool_sse/
   - `normalize_tool_calls`：修复流式拼接粘连（多个工具名/多个 JSON 参数被连成一个字符串时自动拆分）
   - `prepare_tool_execution`：解析参数、提取 `over_task` 信号、标记解析错误
   - `execute_tool_round`：线程池并发执行，pipe 类工具（setup_pipe/run_pipe_command/read_pipe_history）连接失败自动重试3次
+- **tool_call 配对契约**（上游严格校验：声明必有配对结果，违反即 400 空响应体）：
+  - `chat_runtime.sanitize_tool_call_pairing`：请求前统一防线（挂在 `copy_for_request` 请求副本出口，父/子共用）——清理全部悬空声明（有正文保留正文、无正文丢弃整条；部分悬空仅剔除悬空项），畸形声明（无 id）保守保留；
+  - 源头修复：`_replace_todo_context` 归并时同步清除 todo 声明；历史轮次构建清理中断轮次悬空、结果声明不匹配时不再错挂；子智能体对 `over_task`/未授权工具生成配对结果；
+  - 详细契约与实测证据见 `docs/api_docs.md`「tool_call 声明/结果配对契约」。
 
 ### 4. MCP 客户端（`util/mcp_client.py`）
 - `build_stdio_server_parameters`：按扩展名自动选启动方式（.py→python / .js→node / .jar→java -jar / .exe→直启 / 命令字符串→PATH 查找 / shebang）

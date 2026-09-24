@@ -6,14 +6,19 @@
 - list_zip_sessions：预检清单与本地冲突标记（不落盘）
 - import_sessions_from_zip：create / rename / overwrite / skip 四种决策路径
   （含上传数据目录归属改名与 _meta.upload_id 回写）
+- 分组随包携带与还原（manifest v2）：导出携带 groups 定义、预检显示组名、
+  跨机导入按组名新建/复用、旧版 v1 包兼容、本机回导保留、冲突另存 + 还原并存、
+  单会话分享带分组时回退 zip（SessionGroupShareTests，临时目录隔离）
 """
 import asyncio
 import io
 import json
 import shutil
+import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from memory import chat_memory as cm
 from memory import file_memory as fm
@@ -274,7 +279,7 @@ def _repo_history(session_id: str) -> Path:
     return cm._get_chat_history_file(session_id)
 
 
-def _meta_line(title: str) -> str:
+def _meta_line(title: str, group_id: str = "") -> str:
     meta = {
         "title": title,
         "user_questions": [],
@@ -285,7 +290,230 @@ def _meta_line(title: str) -> str:
         "created_at": "2026-09-15 12:00:00",
         "updated_at": "2026-09-15 12:00:00",
     }
+    if group_id:
+        meta["group_id"] = group_id
     return json.dumps({"_meta": meta}, ensure_ascii=False)
+
+
+class SessionGroupShareTests(unittest.TestCase):
+    """分组随包携带与还原（manifest v2）——临时目录隔离，不触碰真实 history_files。"""
+
+    SID_A = "grpshare_ut_a"
+    SID_B = "grpshare_ut_b"
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        (root / "sidecars").mkdir(parents=True, exist_ok=True)
+        (root / "lock").mkdir(parents=True, exist_ok=True)
+        (root / "session_files").mkdir(parents=True, exist_ok=True)
+        self._patches = [
+            patch.object(cm, "HISTORY_ROOT", root),
+            patch.object(cm, "LOCK_ROOT", root / "lock"),
+            patch.object(fm, "HISTORY_ROOT", root / "session_files"),
+        ]
+        for item in self._patches:
+            item.start()
+
+    def tearDown(self):
+        for item in self._patches:
+            item.stop()
+        self._tmp.cleanup()
+        self.loop.close()
+        asyncio.set_event_loop(None)
+
+    def _write_session(self, sid: str, group_id: str = "", title: str = "") -> None:
+        path = cm._get_chat_history_file(sid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            _meta_line(title or f"{sid} 标题", group_id),
+            json.dumps(_make_round(f"{sid} 问", "答"), ensure_ascii=False),
+        ]
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def _build_package(
+        self,
+        sid: str = "",
+        group_id: str = "",
+        group_name: str = "",
+        version: int = 2,
+        title: str = "",
+    ) -> bytes:
+        """构造分享包：jsonl 首行 _meta 携带 group_id，manifest 按版本携带 groups。"""
+        sid = sid or self.SID_A
+        title = title or f"{sid} 标题"
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            jsonl_text = "\n".join([
+                _meta_line(title, group_id),
+                json.dumps(_make_round(f"{sid} 问", "答"), ensure_ascii=False),
+            ]) + "\n"
+            zf.writestr(f"{sid}_chat.jsonl", jsonl_text)
+            session_entry = {
+                "session_id": sid,
+                "filename": f"{sid}_chat.jsonl",
+                "title": title,
+                "upload_id": "",
+            }
+            if group_id:
+                session_entry["group_id"] = group_id
+            manifest = {"version": version, "sessions": [session_entry]}
+            if version >= 2:
+                manifest["groups"] = (
+                    [{"id": group_id, "name": group_name}] if group_id else []
+                )
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+        return buffer.getvalue()
+
+    # ---------- 导出携带分组 ----------
+    def test_01_export_carries_referenced_groups(self):
+        g1 = cm.create_session_group("工作")
+        cm.create_session_group("学习")  # 未被任何导出会话引用，不应随包
+        self._write_session(self.SID_A, g1["id"])
+        self._write_session(self.SID_B)
+        zip_bytes, _name, _skipped = cm.export_sessions_to_zip([self.SID_A, self.SID_B])
+        manifest = json.loads(
+            zipfile.ZipFile(io.BytesIO(zip_bytes)).read("manifest.json").decode("utf-8"))
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["groups"], [{"id": g1["id"], "name": "工作"}])
+        by_id = {s["session_id"]: s for s in manifest["sessions"]}
+        self.assertEqual(by_id[self.SID_A]["group_id"], g1["id"])
+        self.assertEqual(by_id[self.SID_B]["group_id"], "")
+
+    def test_02_preview_shows_group_name(self):
+        g1 = cm.create_session_group("工作")
+        self._write_session(self.SID_A, g1["id"])
+        zip_bytes, _name, _skipped = cm.export_sessions_to_zip([self.SID_A])
+        preview = cm.list_zip_sessions(zip_bytes)
+        self.assertEqual(preview["groups"], [{"id": g1["id"], "name": "工作"}])
+        self.assertEqual(preview["sessions"][0]["group_name"], "工作")
+        self.assertEqual(preview["sessions"][0]["group_id"], g1["id"])
+
+    # ---------- 导入还原 ----------
+    def test_03_import_creates_group_by_name_across_machines(self):
+        # 跨机：包内分组 id 本地不存在，按组名新建并归入
+        pkg = self._build_package(group_id="g-remote000001", group_name="工作")
+        result = asyncio.run(cm.import_sessions_from_zip(pkg))
+        imported = result["imported"][0]
+        self.assertEqual(imported["group_name"], "工作")
+        self.assertTrue(imported["group_id"].startswith("g-"))
+        self.assertNotEqual(imported["group_id"], "g-remote000001")
+        names = {g["name"] for g in cm.list_session_groups()}
+        self.assertIn("工作", names)
+        self.assertEqual(
+            cm.read_session_meta_value(imported["session_id"], "group_id"),
+            imported["group_id"])
+
+    def test_04_import_reuses_existing_group_same_name(self):
+        local = cm.create_session_group("工作")
+        pkg = self._build_package(group_id="g-other999", group_name="工作")
+        result = asyncio.run(cm.import_sessions_from_zip(pkg))
+        imported = result["imported"][0]
+        self.assertEqual(imported["group_id"], local["id"])
+        same_name = [g for g in cm.list_session_groups() if g["name"] == "工作"]
+        self.assertEqual(len(same_name), 1, "同名分组应复用，不得重复新建")
+
+    def test_05_legacy_v1_package_clears_unknown_group(self):
+        # 旧版包（无 groups 定义）+ 本地无该分组 id → 归属清除（界面未分组）
+        pkg = self._build_package(group_id="g-legacy0000", group_name="", version=1)
+        result = asyncio.run(cm.import_sessions_from_zip(pkg))
+        imported = result["imported"][0]
+        self.assertEqual(imported["group_id"], "")
+        self.assertIsNone(
+            cm.read_session_meta_value(imported["session_id"], "group_id"))
+
+    def test_06_v1_package_keeps_locally_known_group(self):
+        # 本机回导：本地已有同 id 分组 → 归属保留（预检也兜底显示组名）
+        local = cm.create_session_group("工作")
+        pkg = self._build_package(group_id=local["id"], group_name="", version=1)
+        preview = cm.list_zip_sessions(pkg)
+        self.assertEqual(preview["sessions"][0]["group_name"], "工作")
+        result = asyncio.run(cm.import_sessions_from_zip(pkg))
+        imported = result["imported"][0]
+        self.assertEqual(imported["group_id"], local["id"])
+        self.assertEqual(
+            cm.read_session_meta_value(imported["session_id"], "group_id"),
+            local["id"])
+
+    def test_07_conflict_rename_still_restores_group(self):
+        # 冲突另存（rename）+ 分组还原并存：新会话拿到新 id，也归入按名映射的分组
+        self._write_session(self.SID_A)  # 本地已存在同名会话
+        pkg = self._build_package(group_id="g-remote000002", group_name="工作")
+        result = asyncio.run(cm.import_sessions_from_zip(
+            pkg, decisions={self.SID_A: "rename"}))
+        imported = result["imported"][0]
+        self.assertTrue(imported["collision"])
+        self.assertNotEqual(imported["session_id"], self.SID_A)
+        self.assertEqual(imported["group_name"], "工作")
+        self.assertEqual(
+            cm.read_session_meta_value(imported["session_id"], "group_id"),
+            imported["group_id"])
+
+    def test_08_overwrite_keeps_group_restore(self):
+        # 覆盖导入：会话内容替换，分组归属仍按包内组名还原
+        self._write_session(self.SID_A)
+        pkg = self._build_package(group_id="g-remote000003", group_name="工作")
+        result = asyncio.run(cm.import_sessions_from_zip(
+            pkg, decisions={self.SID_A: "overwrite"}))
+        imported = result["imported"][0]
+        self.assertFalse(imported["collision"])
+        self.assertEqual(imported["group_name"], "工作")
+
+    def test_11_same_title_different_id_kept_as_two(self):
+        # 用户关注的极端场景：本地已有「共同标题」的会话，包内是另一份同标题
+        # （不同 ID）且带分组的会话 → 必须加载两份（不覆盖、不互相顶替）
+        local_id = "grpshare_ut_local"
+        self._write_session(local_id, title="共同标题")
+        pkg = self._build_package(
+            sid=self.SID_A, group_id="g-remote000004", group_name="工作", title="共同标题")
+        result = asyncio.run(cm.import_sessions_from_zip(pkg))
+        imported = result["imported"][0]
+        # 不同 ID → 直接新建（无需冲突决策），两份文件并存
+        self.assertEqual(imported["session_id"], self.SID_A)
+        self.assertFalse(imported["collision"])
+        self.assertTrue(cm._get_chat_history_file(local_id).exists())
+        self.assertTrue(cm._get_chat_history_file(self.SID_A).exists())
+        # 两份标题一致；新会话已归入分组，本地旧会话归属未被牵连
+        self.assertEqual(
+            cm.read_session_meta_value(local_id, "title"),
+            cm.read_session_meta_value(self.SID_A, "title"))
+        assignments = cm.list_session_group_assignments()
+        self.assertIn(self.SID_A, assignments)
+        self.assertNotIn(local_id, assignments)
+
+    def test_12_same_title_overwrite_replaces_only_target(self):
+        # 同标题 + 同 ID（本机回导）→ 走冲突决策：overwrite 只替换目标 ID，
+        # 其它同标题会话（不同 ID）不受影响
+        other_id = "grpshare_ut_other"
+        self._write_session(other_id, title="共同标题")
+        self._write_session(self.SID_A, title="共同标题")
+        pkg = self._build_package(
+            sid=self.SID_A, group_id="g-remote000005", group_name="工作", title="共同标题")
+        result = asyncio.run(cm.import_sessions_from_zip(
+            pkg, decisions={self.SID_A: "overwrite"}))
+        imported = result["imported"][0]
+        self.assertEqual(imported["session_id"], self.SID_A)
+        # 其它同标题会话仍在、内容未被改动
+        self.assertTrue(cm._get_chat_history_file(other_id).exists())
+        self.assertEqual(cm.read_session_meta_value(other_id, "title"), "共同标题")
+        self.assertEqual(imported["group_name"], "工作")
+
+    # ---------- 单会话分享快捷路径 ----------
+    def test_09_single_share_with_group_falls_back_to_zip(self):
+        from routers.chat_router import _export_single_session_payload_for_share
+        g1 = cm.create_session_group("工作")
+        self._write_session(self.SID_A, g1["id"])
+        # 无附件但带分组 → 不走 jsonl 明文，回退 zip（分组定义需随包）
+        self.assertIsNone(_export_single_session_payload_for_share(self.SID_A))
+
+    def test_10_single_share_without_group_returns_jsonl(self):
+        from routers.chat_router import _export_single_session_payload_for_share
+        self._write_session(self.SID_A)
+        payload = _export_single_session_payload_for_share(self.SID_A)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["filename"], f"{self.SID_A}_chat.jsonl")
 
 
 if __name__ == "__main__":

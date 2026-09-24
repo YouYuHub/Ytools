@@ -245,6 +245,252 @@
     }
   }
 
+  // ---------- 会话分组区（「最近」上方，固定高度不参与列表滚动） ----------
+  // 折叠态只显示标题行；悬停临时展开 / 点击固定展开（.open 由 session_groups.js 控制）
+  .session-groups {
+    flex-shrink: 0;
+    padding: 6px 12px 0;
+
+    // 多选模式（body.bulk-mode）下整体隐藏：批量选择只针对扁平「最近」列表，
+    // 组内会话行是同一会话的第二份副本，两处选中态无法自然同步
+    body.bulk-mode & {
+      display: none;
+    }
+
+    .session-groups-head {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      user-select: none;
+      transition: background-color 0.15s ease;
+
+      &:hover {
+        background: var(--bg-hover);
+      }
+
+      &:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: -2px;
+      }
+
+      .session-groups-caret {
+        display: flex;
+        align-items: center;
+        color: var(--text-tertiary);
+        transition: transform 0.15s ease;
+
+        .icon {
+          width: 14px;
+          height: 14px;
+        }
+      }
+
+      .session-label {
+        flex: 1;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-tertiary);
+        padding: 0 6px;
+      }
+
+      .session-groups-count {
+        font-size: 11px;
+        color: var(--text-tertiary);
+        background: var(--bg-hover);
+        border-radius: 8px;
+        padding: 1px 6px;
+        min-width: 16px;
+        text-align: center;
+
+        &:empty {
+          display: none;
+        }
+      }
+
+      // 钉住状态标识（图钉）：未钉住默认隐藏，钉住后常显高亮
+      .session-groups-pin {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        flex-shrink: 0;
+        color: var(--text-tertiary);
+        opacity: 0;
+        transition: opacity 0.15s ease, color 0.15s ease;
+
+        .icon {
+          width: 13px;
+          height: 13px;
+        }
+      }
+
+      .session-groups-add {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+        color: var(--text-tertiary);
+        flex-shrink: 0;
+
+        &:hover {
+          background: var(--bg-hover);
+          color: var(--text);
+        }
+
+        .icon {
+          width: 15px;
+          height: 15px;
+        }
+      }
+    }
+
+    &.open .session-groups-head .session-groups-caret {
+      transform: rotate(90deg);
+    }
+
+    // 未钉住：悬停标题行时淡显图钉（提示可点击固定）
+    &:not(.pinned) .session-groups-head:hover .session-groups-pin {
+      opacity: 0.55;
+    }
+
+    // 钉住：图钉常显 + 高亮（与多选激活同款粉色锚点，深色主题换浅粉）
+    &.pinned .session-groups-head .session-groups-pin {
+      opacity: 1;
+      color: #e875a5;
+
+      html[data-theme="dark"] & {
+        color: #f7a8c4;
+      }
+    }
+
+    .session-groups-body {
+      display: none;
+      max-height: 42vh;
+      overflow-y: auto;
+      padding: 2px 0 6px;
+    }
+
+    &.open .session-groups-body {
+      display: block;
+    }
+
+    .session-groups-empty {
+      padding: 8px 14px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+  }
+
+  // 单个分组块（标题行 + 组内会话）
+  .session-group {
+    .session-group-head {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      border-radius: var(--radius-sm);
+      transition: background-color 0.15s ease;
+
+      &:hover {
+        background: var(--bg-hover);
+      }
+
+      &:hover .session-group-actions,
+      &.menu-open .session-group-actions {
+        display: flex;
+      }
+    }
+
+    .session-group-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+      padding: 8px 6px 8px 10px;
+      text-align: left;
+      color: var(--text);
+      font-size: 13px;
+
+      .session-group-caret {
+        width: 13px;
+        height: 13px;
+        color: var(--text-tertiary);
+        flex-shrink: 0;
+        transition: transform 0.15s ease;
+      }
+
+      .session-group-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-weight: 500;
+      }
+
+      .session-group-count {
+        font-size: 11px;
+        color: var(--text-tertiary);
+        flex-shrink: 0;
+      }
+    }
+
+    &.expanded .session-group-caret {
+      transform: rotate(90deg);
+    }
+
+    .session-group-actions {
+      display: none;
+      width: 24px;
+      height: 24px;
+      margin-right: 4px;
+      border-radius: 6px;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-tertiary);
+      flex-shrink: 0;
+
+      &:hover {
+        background: var(--bg-hover);
+        color: var(--text);
+      }
+
+      .icon {
+        width: 14px;
+        height: 14px;
+      }
+    }
+
+    // 组内会话容器：复用 .session-list 的行样式，但自身不滚动（外层 body 滚动）
+    .session-group-sessions.session-list {
+      flex: none;
+      overflow: visible;
+      padding: 0 0 2px 14px;
+      gap: 1px;
+
+      .session-item {
+        min-height: 36px;
+        font-size: 13px;
+
+        .session-select {
+          padding: 6px;
+        }
+      }
+    }
+
+    .session-group-empty {
+      padding: 6px 14px 8px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+  }
+
   // 会话列表（滚动区：仅会话项，标题栏与多选操作条固定在其上方）
   .session-list {
     flex: 1;
@@ -548,12 +794,13 @@ body.bulk-mode {
   }
 
   // 多选气泡：非 bulk-mode 隐藏；选中态给对勾上色
+  // （22px 命中区，与组头 .bulk-group-check 对齐，便于点按）
   .session-check {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     margin-right: 6px;
     margin-left: 4px;
     flex-shrink: 0;
@@ -563,8 +810,8 @@ body.bulk-mode {
     transition: all 0.15s ease;
 
     .icon {
-      width: 13px;
-      height: 13px;
+      width: 14px;
+      height: 14px;
     }
   }
 
@@ -572,21 +819,286 @@ body.bulk-mode {
     background: #e875a5;
     border-color: #e875a5;
     color: #fff;
-  }
 
-  html[data-theme="dark"] .session-item.bulk-selected .session-check {
-    background: #f7a8c4;
-    border-color: #f7a8c4;
-    color: #1a1a24;
+    html[data-theme="dark"] & {
+      background: #f7a8c4;
+      border-color: #f7a8c4;
+      color: #1a1a24;
+    }
   }
 
   // 多选模式下隐藏三点操作，避免误触菜单
   .session-actions {
     display: none !important;
   }
+
+  // 「最近」标题行的总控全选（仅多选模式显示；文本随状态切换为「取消全选」）
+  .bulk-select-all {
+    display: inline-flex;
+    align-items: center;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 26px;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    &.is-all {
+      color: #e875a5;
+    }
+
+    &:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+
+    html[data-theme="dark"] & {
+      &.is-all {
+        color: #f7a8c4;
+      }
+    }
+  }
+
+  // 多选分组视图：会话列表按分组展开（未分组殿后）
+  .bulk-group {
+    display: flex;
+    flex-direction: column;
+  }
+
+  // 组头：折叠按钮（最左）+ 勾选气泡（三态）+ 组名 + 计数；
+  // 点击行内其余区域 = 全选/取消全选该分组
+  .bulk-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px 6px 4px;
+    margin: 4px 8px 0;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    user-select: none;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    font-weight: 600;
+    transition: background-color 0.15s ease;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+
+    .bulk-group-name {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .bulk-group-count {
+      flex-shrink: 0;
+      opacity: 0.75;
+    }
+  }
+
+  // 折叠按钮（组头最左）：24px 命中区，箭头展开时旋转 90°
+  .bulk-group-caret {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    border-radius: 6px;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    transition: transform 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+
+    .icon {
+      width: 15px;
+      height: 15px;
+    }
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+  }
+
+  .bulk-group.expanded .bulk-group-caret {
+    transform: rotate(90deg);
+  }
+
+  // 组头勾选气泡：空圈 → 部分选中（横杠）→ 全选（对勾 + 粉底）
+  .bulk-group-check {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+    border: 1.5px solid var(--border-strong);
+    border-radius: 50%;
+    color: transparent;
+    transition: all 0.15s ease;
+
+    .icon {
+      width: 14px;
+      height: 14px;
+    }
+
+    .check-mark,
+    .check-dash {
+      display: none;
+    }
+  }
+
+  .bulk-group-head.partial .bulk-group-check {
+    border-color: #e875a5;
+    color: #e875a5;
+
+    .check-dash {
+      display: block;
+    }
+
+    html[data-theme="dark"] & {
+      border-color: #f7a8c4;
+      color: #f7a8c4;
+    }
+  }
+
+  .bulk-group-head.selected .bulk-group-check {
+    background: #e875a5;
+    border-color: #e875a5;
+    color: #fff;
+
+    .check-mark {
+      display: block;
+    }
+
+    html[data-theme="dark"] & {
+      background: #f7a8c4;
+      border-color: #f7a8c4;
+      color: #1a1a24;
+    }
+  }
+
+  // 成员列表：默认折叠（进入多选时全部收起），组块展开才显示
+  .bulk-group-list {
+    display: none;
+    flex-direction: column;
+  }
+
+  .bulk-group.expanded .bulk-group-list {
+    display: flex;
+  }
+
+  // 搜索期间强制展开分组（命中结果不应藏在折叠组内）
+  .session-list.bulk-search-open .bulk-group-list {
+    display: flex;
+  }
+
+  .bulk-group-empty {
+    padding: 6px 12px 8px 34px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+}
+
+// 非多选模式下不渲染总控全选按钮
+.bulk-select-all {
+  display: none;
 }
 
 // 非 bulk-mode 下不渲染气泡
 .session-check {
   display: none;
+}
+
+
+// ---------- 会话分组：body 级浮层与输入控件（菜单挂 body，必须顶层定义） ----------
+.session-group-new {
+  display: flex;
+  align-items: center;
+  padding: 4px 10px 6px;
+}
+
+.session-group-edit {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+}
+
+.session-group-name-editor {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  outline: none;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+
+  &:focus {
+    border-color: #0b84d8;
+  }
+}
+
+// 会话菜单内的分组选择器（改写 .session-menu 内容）
+.session-picker {
+  .session-picker-title {
+    padding: 7px 12px 5px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-tertiary);
+  }
+
+  .session-picker-empty {
+    padding: 6px 12px 8px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  .session-picker-item {
+    .menu-check {
+      width: 15px;
+      height: 15px;
+      color: var(--accent);
+      visibility: hidden;
+      flex-shrink: 0;
+    }
+
+    &.selected .menu-check {
+      visibility: visible;
+    }
+  }
+
+  .session-picker-remove .menu-item-label {
+    color: #d9534f;
+  }
+
+  .session-picker-input-row {
+    padding: 4px 8px 6px;
+  }
 }

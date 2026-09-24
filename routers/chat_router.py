@@ -52,6 +52,12 @@ from memory.chat_memory import (
     list_zip_sessions,
     import_sessions_from_zip,
     IMPORT_PACKAGE_MAX_BYTES,
+    list_session_groups,
+    list_session_group_assignments,
+    create_session_group,
+    update_session_group,
+    delete_session_group,
+    assign_session_group,
 )
 from memory.file_memory import cleanup_file_memory_manager
 from routers.chat_config_router import get_chat_work_dir_config
@@ -335,6 +341,92 @@ async def remove_media_tag_from_history(payload: MediaTagRemoveRequest):
     return JSONResponse(content=result)
 
 
+class SessionGroupCreateRequest(BaseModel):
+    """新建会话分组的请求体。"""
+    name: str
+
+
+class SessionGroupUpdateRequest(BaseModel):
+    """更新会话分组（重命名 / 折叠状态）的请求体；None 字段表示不修改。"""
+    name: Optional[str] = None
+    collapsed: Optional[bool] = None
+
+
+class SessionGroupAssignRequest(BaseModel):
+    """会话归组请求体；group_id 为 None/空 表示移出分组。"""
+    session_id: str = "default"
+    group_id: Optional[str] = None
+
+
+@api_chat_router.get("/chat_history/groups")
+async def list_chat_session_groups():
+    """列出全部会话分组 + 会话归属映射。
+
+    返回:
+        {"groups": [...], "assignments": {session_id: group_id}}
+        分组定义在 history_files/session_groups.json；归属真源在各会话
+        JSONL 首行 _meta.group_id（扫描时只读首行，损坏文件跳过）。
+    """
+    try:
+        groups = list_session_groups()
+        assignments = list_session_group_assignments()
+        return JSONResponse(content={"groups": groups, "assignments": assignments})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_chat_router.post("/chat_history/groups")
+async def create_chat_session_group(payload: SessionGroupCreateRequest):
+    """新建会话分组；同名分组已存在时直接返回既有分组（幂等）。"""
+    try:
+        group = create_session_group(payload.name)
+        return JSONResponse(content={"state": "succeed", "group": group})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_chat_router.put("/chat_history/groups/{group_id}")
+async def update_chat_session_group(group_id: str, payload: SessionGroupUpdateRequest):
+    """重命名分组 / 更新折叠状态。"""
+    try:
+        group = update_session_group(
+            group_id,
+            name=payload.name,
+            collapsed=payload.collapsed,
+        )
+        return JSONResponse(content={"state": "succeed", "group": group})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_chat_router.delete("/chat_history/groups/{group_id}")
+async def delete_chat_session_group(group_id: str):
+    """删除分组并解除其全部成员会话的归属（成员回到「未分组/最近」）。"""
+    try:
+        result = delete_session_group(group_id)
+        return JSONResponse(content=result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_chat_router.put("/chat_history/group_assign")
+async def assign_chat_session_group(payload: SessionGroupAssignRequest):
+    """把会话加入分组 / 移出分组（group_id 为 None 或空串 = 移出）。"""
+    try:
+        result = assign_session_group(payload.session_id, payload.group_id)
+        return JSONResponse(content=result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class DeleteRoundsRequest(BaseModel):
     """按轮次号删除历史轮次的请求体（用户消息编辑重发 / 整轮删除）。"""
     session_id: str = "default"
@@ -508,10 +600,11 @@ async def export_chat_sessions_zip(
     该会话在 session_files/ 下的全部上传数据（media/ 图片视频音频、files/ 文档、
     thumbs/ 缩略图、diffs/ 文件版本链）+ manifest.json 清单。
 
-    单会话且该会话在 session_files/ 下没有任何附件数据时，直接返回 jsonl
-    明文（media_type: application/x-ndjson，Content-Disposition 为
-    `<session_id>_chat.jsonl`）——前端按 Content-Type 区分落地方式；
-    有附件（目录非空）时打 zip（单会话 `<session_id>_chat.zip`）。
+    单会话且该会话在 session_files/ 下没有任何附件数据、且不带分组归属时，
+    直接返回 jsonl 明文（media_type: application/x-ndjson，Content-Disposition
+    为 `<session_id>_chat.jsonl`）——前端按 Content-Type 区分落地方式；
+    有附件（目录非空）或带分组归属时打 zip（单会话 `<session_id>_chat.zip`，
+    manifest 携带 groups 分组定义）。
     多会话始终打 zip（`ytools_sessions_<时间戳>.zip`）。
     """
     ids = [sid.strip() for sid in (session_ids or "").split(",") if sid.strip()]
@@ -552,6 +645,8 @@ def _export_single_session_payload_for_share(session_id: str) -> dict[str, Any] 
 
     附件目录判定与 _export_session_payload 同口径（目录名优先 _meta.upload_id）；
     目录不存在或递归枚举无文件（media/files/thumbs/diffs 均为空）→ 仅 jsonl。
+    会话带分组归属（_meta.group_id）时同样返回 None 回退 zip——分组定义需随
+    包携带（manifest.groups），导入端才能按组名还原归属。
     """
     from memory.chat_memory import _export_session_payload, HISTORY_ROOT, _safe_session_id
 
@@ -565,7 +660,8 @@ def _export_single_session_payload_for_share(session_id: str) -> dict[str, Any] 
     )
     session_data_root = HISTORY_ROOT / "session_files" / upload_dir_name
     has_files = session_data_root.is_dir() and any(session_data_root.rglob("*"))
-    if has_files:
+    has_group = bool(str(payload.get("group_id") or "").strip())
+    if has_files or has_group:
         return None
     return {"filename": payload["filename"], "text": payload["text"]}
 
@@ -574,6 +670,7 @@ class ImportPreviewResponse(BaseModel):
     type: str  # zip / jsonl
     sessions: List[dict[str, Any]]
     conflicts: List[str]  # 与本地已有会话同名的 session_id 列表
+    groups: List[dict[str, Any]] = []  # 随包携带的分组定义（zip v2；jsonl/旧包为空）
 
 
 @api_chat_router.post('/chat_history/import_preview')
@@ -583,7 +680,8 @@ async def preview_chat_import(
     """
     导入预检（不落盘）：解析 zip/jsonl 并返回会话清单与本地冲突信息。
 
-    - zip：逐会话返回 {session_id, title, imported_rounds, exists, media_count}；
+    - zip：逐会话返回 {session_id, title, imported_rounds, exists, media_count,
+      group_id, group_name}，并附随包分组定义 groups（manifest v2）；
     - jsonl：按单会话解析（与 upload_chat_file 同一解析器），exists 标记本地同名会话。
     前端据 conflicts 弹出「覆盖 / 重命名」决策弹窗后调用 import_package 提交。
     """
@@ -629,6 +727,8 @@ async def preview_chat_import(
         "total": len(sessions),
         "sessions": sessions,
         "conflicts": conflicts,
+        # 随包携带的分组定义（zip manifest v2；jsonl / 旧包为空列表）
+        "groups": (preview.get("groups") or []) if lower.endswith(".zip") else [],
     })
 
 
@@ -654,7 +754,8 @@ async def import_chat_package(
     提交导入（第二阶段）：按预检时用户选择的冲突策略写入会话。
 
     - zip 包：逐会话导入 jsonl + session_files 数据目录（冲突另存时同步改名
-      上传目录归属并回写 _meta.upload_id）；
+      上传目录归属并回写 _meta.upload_id）；分组归属按包内分组定义的「组名」
+      映射还原（本地同名复用、缺失新建），导入结果附带 group_id / group_name；
     - jsonl：单会话导入，冲突策略与 zip 相同（overwrite 覆盖 / rename 另存）。
     返回 {state, imported, skipped, failed} 汇总。
     """
@@ -816,13 +917,19 @@ async def get_chat_context_token_stats(
                             include_search_files=SEARCH_FILES_NAME in selected_names,
                             include_read_media=READ_MEDIA_NAME in selected_names,
                         )
+            # read_media 指引条件开关：与真实请求同口径（显式传名才提示）。
+            # 视觉过滤由 build_sys_prompt 内部按 ambient 会话模型统一判定。
+            read_media_selected = False
+            if include_tools and tool_names is not None:
+                read_media_selected = READ_MEDIA_NAME in selected_names
             stats = await manager.get_context_token_stats(
                 max_rounds=effective_max_rounds,
                 tools=context_tools,
                 # 系统提示词按会话生效目录计算（worker 内由任务开始时 chdir 保证，
                 # 主进程统计侧需显式解析），与真实请求口径一致
                 system_prompt_text=build_runtime_system_text(
-                    work_dir=resolve_session_work_dir(normalized_session_id)[0]
+                    work_dir=resolve_session_work_dir(normalized_session_id)[0],
+                    include_read_media_note=read_media_selected,
                 ),
             )
         finally:

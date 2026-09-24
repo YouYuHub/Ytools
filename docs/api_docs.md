@@ -114,10 +114,17 @@
 | /chat_history/delete_lines | DELETE | startline(必填,≥1), endline(必填,≥1,包含), session_id | `{state, describe, meta_after, usage_after}`；行号**不含** `_meta` 首行；startline>endline 报 400 |
 | /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs}` | 见下方「按轮次号删除（用户消息编辑重发）」；生成任务运行中报 409 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
-| /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；详见下方「会话分享 / 导入」 |
+| /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；**manifest v2 随包携带分组定义**（groups），单会话无附件且无分组时仍回 jsonl 明文；详见下方「会话分享 / 导入」 |
 | /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
 | /chat_history/import_package | POST | 见下方说明 | 见下方说明 |
+| /chat_history/groups | GET | - | `{groups: [{id, name, created_at, collapsed, order}], assignments: {session_id: group_id}}`；分组定义读 `history_files/session_groups.json`，归属扫描各会话首行 `_meta.group_id`（只读首行，损坏文件跳过） |
+| /chat_history/groups | POST | `{name}` | `{state, group}`；新建分组，**同名幂等**（返回既有分组）；空名报 400；名称折叠控制字符并截断 40 字 |
+| /chat_history/groups/{group_id} | PUT | `{name?, collapsed?}` | `{state, group}`；重命名分组 / 更新折叠状态（字段省略 = 不修改）；分组不存在报 400 |
+| /chat_history/groups/{group_id} | DELETE | - | `{state, group_id, removed, released_sessions}`；删除分组并**连带解除其全部成员会话的 `_meta.group_id`**（成员回到未分组，不删会话本身） |
+| /chat_history/group_assign | PUT | `{session_id, group_id}` | `{state, session_id, group_id}`；把会话加入分组；`group_id` 传 null/空串 = 移出分组；分组或会话不存在报 400 |
 
+> **会话分组（`_meta.group_id` + `history_files/session_groups.json`）**：归属真源为会话首行 `_meta.group_id`（缺失/None = 未分组，由 `_recompute_meta_from_entries` 做格式规范化：非字符串/空白自动清除）；分组定义真源为单文件小 JSON `history_files/session_groups.json`（`{"groups": [...]}`，跨进程锁 + 原子写）。归组写入**不改动 `updated_at`**（不扰乱「最近」排序）；会话删除时归属随文件消失、无需维护注册表；分组删除时先解除全部成员归属再移除条目（双写一致性）。分组名上限 40 字符（控制字符折叠为空格）。前端分组区位于侧边栏「最近」上方：悬停/点击标题展开，右上角 + 新建，分组可折叠/重命名/删除，会话菜单「分组」选择器可移入/移出/新建并移入。
+>
 > **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/session_files/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。目录原名 `history_files/upload/`（upload 改名为 session_files）。
 
 ### POST /chat_history/delete_rounds（按轮次号删除，用户消息编辑重发）
@@ -162,25 +169,32 @@
 把一个或多个会话打包为 zip 下载，zip 内布局：
 
 ```
-<session>_chat.jsonl              # 会话历史（与 history_files 根一致）
+<session>_chat.jsonl              # 会话历史（与 history_files 根一致；首行 _meta 携带 group_id 归属）
 session_files/<upload_id>/...     # 该会话在 session_files/ 下的全部上传数据（解析记录/media/files/file_diffs）
-manifest.json                     # {version, exported_at, sessions: [{session_id, filename, title, upload_id}]}
+manifest.json                     # {version: 2, exported_at, groups: [{id, name}],
+                                  #  sessions: [{session_id, filename, title, upload_id, group_id}]}
 ```
 
 - 单会话下载名 `<session_id>_chat.zip`，多会话 `ytools_sessions_<时间戳>.zip`；
-- 不存在的会话列入响应头 `X-Skipped-Sessions`（URL 编码逗号分隔），全部不存在时报 400。
+- 不存在的会话列入响应头 `X-Skipped-Sessions`（URL 编码逗号分隔），全部不存在时报 400；
+- **分组随包**：manifest `groups` 为被导出会话实际引用的分组定义（未被引用的分组不随包）；
+  导入端按「组名」映射还原归属（跨机器分组 ID 不同也能还原）。无归属会话 group_id 为空串。
+- 单会话快捷路径（返回 jsonl 明文）附加条件：该会话**不带分组归属**——带分组时回退 zip
+  以保证分组定义随包携带。
 
 **导入两阶段**（前端弹窗逐会话选择「覆盖 / 重命名另存 / 跳过」）：
 
 1. `POST /chat_history/import_preview`（Form: `file`，支持 .zip / .jsonl）——**预检不落盘**：
-   - 返回 `{type(zip|jsonl), filename, total, sessions[], conflicts[]}`；
-   - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count}`；`exists=true` 表示本地已有同名会话（即冲突，列入 `conflicts`）；
+   - 返回 `{type(zip|jsonl), filename, total, sessions[], conflicts[], groups[]}`；
+   - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count, group_id, group_name}`；`exists=true` 表示本地已有同名会话（即冲突，列入 `conflicts`）；`group_name` 来自包内分组定义（旧包为空串）；
+   - `groups[]` 为随包携带的分组定义 `[{id, name}]`（zip manifest v2；jsonl / 旧版 v1 包为空列表），前端弹窗据此提示「导入后按分组名自动还原归属」；
    - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析（含路径穿越防护）。
 2. `POST /chat_history/import_package?conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（Form: `file`）——**提交导入**：
    - 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`（ask 且无逐项决策时该会话跳过，绝不静默改名/覆盖）；
    - 无冲突会话直接导入；zip 包同时落盘各会话的 `session_files/<upload_id>/` 数据；
    - 冲突「重命名」：会话 ID 追加时间戳另存，上传数据目录归属同步改名为新会话 ID，并回写首行 `_meta.upload_id`；「覆盖」：清空旧 jsonl 与旧上传目录后写入；
-   - 返回 `{state, imported[], skipped[], failed[]}`，单会话失败不阻断其他会话。
+   - **分组归属还原**（逐会话独立于冲突决策）：包内会话带 `group_id` 且 manifest 提供对应分组名时，按组名映射——本地同名分组**复用**、缺失则**新建**，随后把会话归属改写到映射后的分组；包内无分组定义（v1 旧包 / 裸 zip / 单 jsonl）时，仅当本地已存在同 ID 分组（本机回导场景）才保留，否则清除（界面显示未分组）；
+   - 返回 `{state, imported[], skipped[], failed[]}`；`imported[]` 每项附 `group_id` / `group_name`（还原后的归属，未归入为空），单会话失败不阻断其他会话。
 
 ## 3. 上下文 Context
 
@@ -245,7 +259,7 @@ manifest.json                     # {version, exported_at, sessions: [{session_i
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.j |
 | /chat_config/network_retry | GET | - | `{max_attempts, defaults, semantics, env_names, memory_state}`；模型网络请求连续失败重试上限（.env `NETWORK_RETRY_MAX_ATTEMPTS`，默认 3） |
-| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。**覆盖范围**：连接失败/读超时/非 2xx/**HTTP 200 但整条响应流没有任何模型输出（空流）**、非流式 200 空响应（空 body/空 choices/空 message 字段）——空响应按同一计数纳入重试并重发同一 payload，`error_type=empty_response`；重试对所有模型角色（聊天/压缩/标题/子智能体）统一生效 |
+| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。**覆盖范围**：连接失败/读超时/非 2xx/**HTTP 200 但整条响应流没有任何模型输出（空流）**、非流式 200 空响应（空 body/空 choices/空 message 字段）——空响应按同一计数纳入重试并重发同一 payload，`error_type=empty_response`；重试对所有模型角色（聊天/压缩/标题/子智能体）统一生效。**重试间隔固定 1 秒**（第 2 次及以后尝试前等待，不做配置）；发送前还会做**请求硬限制预检**（见下节），确定性超限请求不再进入重试 |
 | /chat_config/compaction_retry | GET | - | `{max_attempts, defaults, semantics{attempt, 0_or_negative, positive, retry_interval_seconds}, env_names, memory_state}`；上下文压缩调用失败重试上限（.env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）。一次"尝试"=一条完整"压缩模型→聊天模型"降级链（同源时本条链只有一次调用），链间隔固定 1 秒；达到次数抛 `ContextCompactionError` 终止当前任务 |
 | /chat_config/compaction_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次压缩调用立即生效；0 或负数=不限制（整条降级链一直重试直到手动停止） |
 | /chat_config/sub_agent_retry | GET | - | `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max, defaults, semantics, env_names, memory_state}`；子智能体交付保障重试配置（详见"子智能体（sub_agent）配置"节 §10.1） |
@@ -321,6 +335,34 @@ manifest.json                     # {version, exported_at, sessions: [{session_i
 - `tool_result_max_length`（对应 env `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH`，默认 0）：后端历史轮次重建上下文时，单个工具结果回传前 N 字符；回传格式符合 Chat Completions 规范（`assistant.tool_calls` → `tool.tool_call_id`）。
 - 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。（思考过程因上游强校验，`0` 实际回传占位符，见上）
 - 该配置同时作用于父循环与子智能体（`sub_agent`）：子任务请求副本经过同一份思考回传整形（共享 `copy_for_request`，可显式传 limit），子任务工具超长结果同样走 `tool_result` 超长反馈路径。
+
+### tool_call 声明/结果配对契约（悬空清理）
+
+**背景**：上游（opencode / DeepSeek 等严格网关）要求 `assistant.tool_calls` 中**每个声明的 id 都必须有配对的 `role=tool` 结果消息**；违反时返回 `HTTP 400 Bad Request` 且**响应体为空**（实测 body 恰为 `0\r\n\r\n`），客户端重试同一 payload 必然全败——表现为"每次 todo 收官后报 400、重试 10 次全败"。
+
+**悬空来源与修复**（三层防护）：
+
+1. **todo 上下文归并**（`chat_factory._replace_todo_context`）：assistant（正文 + 单独一个 `todo_write` 调用）被归并时，旧实现只删除配对 tool 结果、保留 `tool_calls` 声明 → 悬空。现修复为：全部调用都是 todo 时整体清除 `tool_calls` 字段（有正文保留正文，无正文丢弃整条）。
+2. **历史轮次构建**（`chat_history_format._round_entry_to_tool_result_context_messages`）：中断/停止的轮次（工具调用未执行完就断流）落盘后无结果；结果的声明不在本轮时不再错挂到最近调用（错挂会让真属主声明悬空）。构建末尾统一走悬空清理。
+3. **请求前统一防线**（`chat_runtime.sanitize_tool_call_pairing`）：`copy_for_request`（父循环与子智能体共用的请求副本入口）在返回前清理全部悬空声明——声明全部悬空时清除字段（有正文保留、无正文丢弃），部分悬空时仅剔除悬空项；无法判断的畸形声明（无 id/空 id）保留原样。该防线兜底一切历史遗留脏数据。
+
+另：子智能体执行侧对 `over_task` 声明生成配对结果、未知/未授权工具保留声明并给出拒绝结果（与父循环同契约），杜绝"结果无声明"的孤儿。防御性日志：清理发生时打印 `[WARN] 请求前清理 N 个悬空 tool_call（无配对结果）`。
+
+### 模型请求硬限制预检与重试间隔
+
+**背景**：部分供应商网关对 `input_tokens + max_tokens` 之和有硬上限。实测 opencode.ai（orcarouter 上游）限制为 **1048576（2^20）**：超过即返回 `HTTP 400 Bad Request` 且**响应体为空**（`Content-Type: text/event-stream`，无任何错误 JSON），属**确定性失败**——重发同一 payload 永远失败。旧行为对该 400 无间隔重试 `NETWORK_RETRY_MAX_ATTEMPTS` 次（用户可配 50），造成长时间卡死（实测单次失败耗时约 40 秒上传 + 每次重试重传整个大请求）。
+
+**发送前预检**（`ChatLLM._precheck_hard_limit`，流式/非流式全部路径，每次尝试都执行）：
+
+- 估算口径与项目统一 token 估算一致（ASCII//4 + 非 ASCII 逐字），多模态部件（image_url/input_audio）按固定占位（1024 tokens）计费，避免 base64 字符数虚高；
+- `估算输入 + max_tokens ≤ 硬限制` → 通过，正常发送；
+- 输入在限额内但 `+ max_tokens` 超限 → **自动降级 max_tokens**（保留安全余量 512、最低输出预算 1024）并打印 `[WARN]`，请求照常发送；
+- 输入本身超限（降到底也无法发送）→ 直接推送 `error_type=hard_limit`、`retrying=false` 错误帧并结束，**不再进入网络重试**（0.4 秒内失败，替代旧行为约 20 分钟卡死）；
+- 硬限制默认 `1048576`，可用 `.env` 的 `REQUEST_HARD_LIMIT_TOKENS` 覆盖（其他供应商无此限制时可设为 `0` 或负数禁用预检）。
+
+**重试间隔**：网络重试（连接失败/非 2xx/空响应）第 2 次及以后尝试前固定等待 **1 秒**（`_NETWORK_RETRY_INTERVAL_SECONDS`，不做配置项），避免无间隔连续轰炸供应商网关。
+
+**诊断增强**：非 2xx 且**响应体为空**时，错误信息自动附带响应头 `x-opencode-log-id` / `x-opencode-endpoint-id`（供应商侧追查凭据）；SSE 流中出现供应商错误帧（`data: {"error": ...}`）时不再静默吞掉，提取真实错误内容并以 `error_type=upstream_error_frame` 终止（避免仅表现为"空响应"无从定位）。
 
 ### 子智能体（sub_agent）配置
 

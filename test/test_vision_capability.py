@@ -188,7 +188,7 @@ class SystemPromptVisionBranchTests(unittest.TestCase):
     必须明确「read_media 工具不可用、不要尝试读取」。
     """
 
-    def _prompt_with_vision(self, vision_value):
+    def _prompt_with_vision(self, vision_value, include_read_media_note=False):
         import env_manager
         from factory import system_prompt as sp
         original = env_manager.get_default_chat_config
@@ -197,7 +197,7 @@ class SystemPromptVisionBranchTests(unittest.TestCase):
                 env_manager.get_default_chat_config = lambda: None
             else:
                 env_manager.get_default_chat_config = lambda: {"vision": vision_value}
-            return sp.build_sys_prompt()
+            return sp.build_sys_prompt(include_read_media_note=include_read_media_note)
         finally:
             env_manager.get_default_chat_config = original
 
@@ -211,12 +211,22 @@ class SystemPromptVisionBranchTests(unittest.TestCase):
         self.assertIn("不会回传给你", prompt)
 
     def test_vision_true_keeps_read_media_guidance(self):
-        prompt = self._prompt_with_vision(True)
+        # 支持视觉且本轮真实注入 read_media（include_read_media_note=True）：
+        # 保留使用指引
+        prompt = self._prompt_with_vision(True, include_read_media_note=True)
         self.assertIn("用 read_media", prompt)
 
+    def test_vision_true_without_tool_injection_hides_guidance(self):
+        # 支持视觉但本轮未注入 read_media（默认 False）：提示词与请求 tools
+        # 必须一致——不出现使用指引，只说明附件不会自动回传
+        prompt = self._prompt_with_vision(True)
+        self.assertNotIn("用 read_media", prompt)
+        self.assertIn("本轮未启用媒体读取工具", prompt)
+
     def test_config_missing_falls_back_to_vision_true(self):
-        # 配置获取失败（None）保守按支持处理：不发误导性禁用提示
-        prompt = self._prompt_with_vision(None)
+        # 配置获取失败（None）保守按支持处理：不发误导性禁用提示；
+        # 本轮注入了工具时保留使用指引
+        prompt = self._prompt_with_vision(None, include_read_media_note=True)
         self.assertIn("用 read_media", prompt)
 
 

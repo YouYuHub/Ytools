@@ -13,7 +13,7 @@ import json
 import re
 from typing import Any
 # 自定义模块
-from factory.agent_runtime.chat_runtime import estimate_text_tokens
+from factory.agent_runtime.chat_runtime import estimate_text_tokens, sanitize_tool_call_pairing
 from memory.chat_round_store import merge_usage_dict
 from memory.file_memory import content_part_to_text
 
@@ -474,11 +474,17 @@ def _round_entry_to_tool_result_context_messages(
             tool_call_id = event.get("tool_call_id")
             if not (isinstance(tool_call_id, str) and tool_call_id.strip()):
                 tool_call_id = None
-            if tool_call_id is None or tool_call_id not in tool_calls_by_id:
+            if tool_call_id is None:
+                # 结果缺少 tool_call_id（旧格式数据兜底）：回退挂到最近一次调用
                 if last_tool_call_id is not None:
                     tool_call_id = last_tool_call_id
                 else:
                     continue
+            elif tool_call_id not in tool_calls_by_id:
+                # 该结果的声明不在本轮（已被压缩摘要覆盖 / 属中断残留）：
+                # 跳过该结果——错误挂到最近调用会让真属主声明悬空、该调用多收
+                # 结果，两者都会被严格上游判为不合法（400 空响应体）
+                continue
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call_id,
@@ -525,7 +531,13 @@ def _round_entry_to_tool_result_context_messages(
     _flush_pending_text()
     # has_round_output 为 False 时 messages 只包含初始用户消息（或为空）：
     # 中断/停止且无助手输出的轮次同样要保留用户问题，不因无回复而整轮丢弃。
-    return messages
+    # 最后统一清理悬空声明：中断轮次里"声明了调用但没有结果"的 assistant
+    # 消息若原样进入请求会触发上游 400 空响应体（同请求侧防护，
+    # 见 chat_runtime.sanitize_tool_call_pairing）
+    cleaned, removed = sanitize_tool_call_pairing(messages)
+    if removed:
+        print(f"[WARN] 历史轮次构建清理 {removed} 个悬空 tool_call（无配对结果）")
+    return cleaned
 
 
 

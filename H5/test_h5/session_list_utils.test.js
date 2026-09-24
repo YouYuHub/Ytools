@@ -26,6 +26,21 @@ test("firstQuestionTitle: 去空格并截断到 40 字符", function () {
   assert.equal(utils.firstQuestionTitle(42), "42");
 });
 
+test("pickSendTitle: 已有可信标题时沿用（不被本轮提问覆盖）", function () {
+  assert.equal(utils.pickSendTitle("修复压缩中断问题", "新的一轮提问内容", "s-1"), "修复压缩中断问题");
+  assert.equal(utils.pickSendTitle("  模型标题  ", "提问", "s-1"), "模型标题");
+});
+
+test("pickSendTitle: 无可信标题时退回提问前 40 字占位", function () {
+  assert.equal(utils.pickSendTitle("", "第一条提问", "s-1"), "第一条提问");
+  assert.equal(utils.pickSendTitle(null, "\u4e00".repeat(60), "s-1"), "\u4e00".repeat(40));
+  assert.equal(utils.pickSendTitle(undefined, null, "s-1"), "s-1");
+});
+
+test("pickSendTitle: 标题等于会话 ID（后端兜底值）视为无标题", function () {
+  assert.equal(utils.pickSendTitle("s-1", "真正的第一条提问", "s-1"), "真正的第一条提问");
+});
+
 test("sortRows: 后更新的排前面", function () {
   const rows = [
     { id: "old", title: "a", updated: "2026-08-01 10:00:00", created: "2026-08-01 08:00:00" },
@@ -74,4 +89,24 @@ test("sortRows: 完全相同时保持原有顺序（稳定）", function () {
     { id: "a", title: "a", updated: "2026-08-08 12:00:00", created: "2026-08-01 08:00:00" },
   ];
   assert.deepEqual(utils.sortRows(rows, {}).map(function (r) { return r.id; }), ["c", "b", "a"]);
+});
+
+test("shouldOpenSessionOnClick: 点击已就绪/加载中的当前会话跳过", function () {
+  assert.equal(utils.shouldOpenSessionOnClick("s-1", "s-1", ""), false);
+  assert.equal(utils.shouldOpenSessionOnClick("s-1", "", "s-1"), false);
+  assert.equal(utils.shouldOpenSessionOnClick("s-1", "s-1", "s-1"), false);
+});
+
+test("shouldOpenSessionOnClick: 点击其他会话照常打开", function () {
+  assert.equal(utils.shouldOpenSessionOnClick("s-2", "s-1", ""), true);
+  assert.equal(utils.shouldOpenSessionOnClick("s-2", "", "s-1"), true);
+  assert.equal(utils.shouldOpenSessionOnClick("s-1", "", ""), true);
+});
+
+test("shouldOpenSessionOnClick: 空值/空白安全（trim 后比较；异常空 id 维持旧行为）", function () {
+  assert.equal(utils.shouldOpenSessionOnClick(" s-1 ", "s-1", ""), false);
+  assert.equal(utils.shouldOpenSessionOnClick("s-1", " s-1 ", null), false);
+  assert.equal(utils.shouldOpenSessionOnClick("", "s-1", ""), true);
+  assert.equal(utils.shouldOpenSessionOnClick(null, "s-1", "s-1"), true);
+  assert.equal(utils.shouldOpenSessionOnClick(undefined, "", ""), true);
 });

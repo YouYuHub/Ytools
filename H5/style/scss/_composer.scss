@@ -463,6 +463,21 @@ html:not([data-theme="dark"]) #voiceBtn {
   color: #757575;
 }
 
+// 有文本时语音钮与发送钮并排：语音弱化为次级样式，让主操作（发送）保持强调。
+// :not(.is-recording) 必须保留——否则本规则（含 .composer.has-text 提权）会
+// 盖过 .round-btn.is-recording 的红色录音态
+.composer.has-text #voiceBtn:not(.is-recording) {
+  background: var(--bg-active);
+  color: var(--text-secondary);
+
+  // hover 只提亮文字 + 描边（不换背景：两种主题下都能稳定表达"可点击"）
+  &:hover {
+    opacity: 1;
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+}
+
 // 语音录音中：红色按钮 + 呼吸光圈（识别文本实时写入输入框，再点停止）
 .round-btn.is-recording {
   background: var(--danger, #dc2626);

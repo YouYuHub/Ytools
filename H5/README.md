@@ -62,12 +62,14 @@ H5/
 │   ├── markdown.js             # 轻量 Markdown 渲染器（先转义 HTML 再解析）
 │   ├── session_utils.js        # 会话 ID 规整（与后端 normalize_session_id 对齐）
 │   ├── session_list_utils.js   # 会话列表排序/标题兜底规则
+│   ├── session_group_utils.js  # 会话分组纯逻辑（注册表/归属规整、分桶、名称校验）
 │   ├── format_utils.js         # 数字/时间/JSON 格式化、token 用量文案
 │   ├── history_parser.js       # 历史 JSONL -> 渲染记录列表
 │   ├── app.js                  # 应用入口：一次性迁移旧配置并执行 init 启动序列（约 60 行）
 │   ├── app/                    # 主逻辑模块（IIFE 挂 window.App 共享命名空间，见"四"）
 │   │   ├── core.js             # 共享核心：state/常量/DOM 引用/通用工具（须最先加载）
 │   │   ├── sessions.js         # 会话列表与会话切换（重命名/删除/新对话/恢复流）
+│   │   ├── session_groups.js   # 侧边栏分组区（悬停/点击展开、新建/折叠/重命名/删除、会话归组选择器）
 │   │   ├── stats.js            # 侧边栏累计 token 与上下文统计条
 │   │   ├── workdir.js          # 工作路径显示与内联编辑
 │   │   ├── messages.js         # 历史渲染装配/消息渲染/问题导航 qnav
@@ -96,14 +98,21 @@ H5/
 │   └── css/main.css            # 编译产物（页面实际引用）
 │
 └── test_h5/                    # 单元测试（node:test + node:assert）
+    ├── file_history_sync.test.js
     ├── format_utils.test.js
     ├── history_parser.test.js
     ├── markdown.test.js
     ├── session_list_utils.test.js
-    └── session_utils.test.js
+    ├── session_group_utils.test.js
+    ├── session_marquee.test.js     # 标题 hover 跑马灯可复用化（容器绑定/滚动/重建收尾）
+    ├── session_open_guard.test.js  # 重复点击已打开会话跳过重载（就绪跟踪/切换/失败重试）
+    ├── session_title_flow.test.js  # 发送消息标题策略（沿用当前标题，不被提问 40 字顶掉）
+    ├── session_utils.test.js
+    ├── table_export.test.js
+    └── widget_reuse.test.js
 ```
 
-脚本加载顺序（index.html 底部）：`theme.js` → `api.js` → prism 系列 → `markdown.js` → `session_list_utils.js` → `session_utils.js` → `format_utils.js` → `history_parser.js` → `app/core.js`（共享核心，须最先于其余 app/ 模块）→ `app/sessions.js` → `app/stats.js` → `app/workdir.js` → `app/messages.js` → `app/history.js` → `app/compaction.js` → `app/builtin.js` → `app/media.js` → `app/skills.js` → `app/composer.js` → `app/model_panel.js` → `app/tools.js` → `app/chat.js` → `app.js`（入口，最后执行 init）。工具函数模块均为「浏览器挂 window 全局 / Node 下 module.exports」的双端写法，因此可直接被 node:test 测试；app/ 各模块间的跨模块调用统一走 `App.xxx(...)`（运行期解析，仅要求 core 先加载、入口最后加载）。
+脚本加载顺序（index.html 底部）：`theme.js` → `api.js` → prism 系列 → `markdown.js` → `session_list_utils.js` → `session_group_utils.js` → `session_utils.js` → `format_utils.js` → `history_parser.js` → `app/core.js`（共享核心，须最先于其余 app/ 模块）→ `app/sessions.js` → `app/session_groups.js` → `app/stats.js` → `app/workdir.js` → `app/messages.js` → `app/history.js` → `app/compaction.js` → `app/builtin.js` → `app/media.js` → `app/skills.js` → `app/composer.js` → `app/model_panel.js` → `app/tools.js` → `app/chat.js` → `app.js`（入口，最后执行 init）。工具函数模块均为「浏览器挂 window 全局 / Node 下 module.exports」的双端写法，因此可直接被 node:test 测试；app/ 各模块间的跨模块调用统一走 `App.xxx(...)`（运行期解析，仅要求 core 先加载、入口最后加载）。
 
 ---
 
@@ -116,6 +125,7 @@ H5/
 | 分组 | 方法 | 对应接口 |
 |---|---|---|
 | 会话历史 | `listSessions` / `streamStatus` / `getSessionMeta` / `getContextTokenStats` / `updateSessionTitle` / `fetchSessionFile` / `deleteSession` / `uploadChatHistory` | `/chat_history/*`、`/chat_stream/status`、`/chat_context/token_stats` |
+| 会话分组 | `listSessionGroups` / `createSessionGroup` / `updateSessionGroup` / `deleteSessionGroup` / `assignSessionGroup` | `/chat_history/groups[/{id}]`、`/chat_history/group_assign` |
 | 工具 | `listTools(refresh?)` | `/tools/list`；后端默认返回 TTL 内的探测缓存（毫秒级，首屏友好），`refresh=true` 追加 `?refresh=1` 强制重探 |
 | 模型配置 | `getModels(role)` / `selectModel(provider, model, role, parameter)` | `/chat_config/models[/select]` |
 | 聊天设置 | `getHistoryCompactionConfig` / `updateHistoryCompactionConfig` / `getContextReturnConfig` / `updateContextReturnConfig` / `getSubAgentRetryConfig` / `updateSubAgentRetryConfig` | `/chat_config/history_compaction`、`/chat_config/context_return`、`/chat_config/sub_agent_retry` |
@@ -145,6 +155,7 @@ H5/
 |---|---|---|
 | session_utils.js | `sanitizeSessionId` / `fileNameToSessionId` | 会话标识以文件名为准（`<id>_chat.jsonl`），保留 Unicode/空格/下划线/点/横线，替换危险字符并拦截 `..` 路径穿越，兜底 `"default"` |
 | session_list_utils.js | `sortRows` / `firstQuestionTitle` / `timeValue` | 列表按 `max(后端 updated_at, 本地 recency)` 倒序、created_at 兜底；标题取首条提问前 40 字符（与后端 `_meta.title` 规则一致） |
+| session_group_utils.js | `normalizeGroups` / `normalizeAssignments` / `bucketSessions` / `bucketForBulk` / `validateGroupName` / `UNGROUPED_KEY` | 分组注册表与会话归属规整（过滤非法条目、order 稳定排序）、会话按归属分桶（未知分组归未分组）、多选分组视图分桶（已定义分组按注册顺序、空组保留、末尾「未分组」伪桶仅在存在未分组会话时返回）、分组名校验（控制字符折叠 + 40 字上限，与后端 `_normalize_group_name` 一致） |
 | format_utils.js | `fmtNum` / `fmtTime` / `prettyJson` / `normalizeUsage` / `usageText` / `compactionUsageText` | 千分位数字、时间去日期前缀、JSON 美化、usage 三字段归一化、「本轮消耗 N tokens（输入 x · 输出 y）」及压缩消耗文案 |
 | history_parser.js | `parseHistory` / `recordsBeforeActiveRound` | 解析后端 JSONL：首行 `_meta` 取累计 usage；`chat_round.events` 展开为 user/think/assistant/tool/toolResult/usage/notice 记录；`context_compaction` 事件行转为 compaction 记录（`phase=aborted` 回溯置中断态）；打开会话时剔除正在流式的当前轮避免重复渲染 |
 
@@ -152,7 +163,7 @@ H5/
 
 ## 四、主逻辑（js/app/ 模块 + app.js 入口）
 
-主逻辑按功能拆分为 `js/app/` 下 14 个 IIFE 模块 + 瘦入口 `app.js`（一次性迁移旧配置并执行 init 启动序列）。共享机制：
+主逻辑按功能拆分为 `js/app/` 下 15 个 IIFE 模块 + 瘦入口 `app.js`（一次性迁移旧配置并执行 init 启动序列）。共享机制：
 
 - `app/core.js` 创建 `window.App` 并以 `Object.assign(App, {...})` 导出共享 state、常量、DOM 引用与通用工具；其余模块在头部解构所需核心成员（`const { state, el, toast } = App;`），并以 `App.foo = foo;` 注册自己的导出；
 - **跨模块调用一律写 `App.xxx(...)`**（运行期解析）：加载顺序只要求 core 最先、入口最后，模块之间无顺序耦合；
@@ -187,17 +198,19 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | 主题菜单（app/core.js） | profileCard 弹出 system/light/dark 菜单，选中态与 `themechange` 事件联动 |
 | 侧边栏（app/core.js） | 折叠/展开（窄栏 rail ↔ 完整面板），移动端联动 scrim 遮罩，Esc 关闭所有浮层 |
 | 会话搜索（app/core.js） | 展开搜索框按会话名过滤列表 |
-| 会话列表（app/sessions.js） | 加载列表 + 逐个拉 meta（title/updated_at）；三点菜单支持重命名（原地 input，Enter/blur 保存、Esc 取消）与删除（确认弹窗；正在生成的会话禁止删除；删当前会话则自动新建）；首条消息即时以提问前 40 字符置顶显示；标题溢出不用「…」，ChatGPT 式右缘 ~28px 渐隐遮罩（refreshSessionFades 仅给真截断的标题加 .truncated，mask 作用于文字本身、悬浮/选中背景均成立） |
+| 会话列表（app/sessions.js） | 加载列表 + 逐个拉 meta（title/updated_at）；三点菜单支持重命名（原地 input，Enter/blur 保存、Esc 取消）与删除（确认弹窗；正在生成的会话禁止删除；删当前会话则自动新建）；**标题策略**：发送消息时优先沿用「当前标题」（后端 _meta.title / 标题模型生成 / 手动重命名 / 上次占位；`session_list_utils.pickSendTitle`），仅全新会话才用提问前 40 字临时占位、等标题模型回填替换——已有标题不再被本轮提问顶掉（刷新前后一致）；标题溢出不用「…」，ChatGPT 式右缘 ~28px 渐隐遮罩（refreshSessionFades 仅给真截断的标题加 .truncated，mask 作用于文字本身、悬浮/选中背景均成立）；**溢出标题 hover 250ms 跑马灯**（rAF 逐帧对双层结构的内层 `.session-name-text` 写 transform，起步顶速→按剩余距离减速，移出 80ms 防抖后平滑回滚，列表重渲染时凭会话 id 在所属容器内接管新元素无缝续滚）。跑马灯监听经 `App.bindTitleMarquee(container)` 绑定到任意行容器（按容器去重），`App.stopTitleMarqueeIn(container)` 供容器整体重建前收尾 |
+| 会话分组区（app/session_groups.js） | 「最近」上方的分组区：**悬停临时展开 / 点击标题固定展开**（固定态持久化于 localStorage）；右上角 + 新建分组（回车创建）；每个分组可折叠/展开（展开显示组内会话标题，复用会话行组件，支持点击打开/高亮/搜索过滤、**溢出标题 hover 跑马灯**），三点菜单可重命名（原地 input，Enter/blur 保存、Esc 取消）与删除（确认弹窗，组内会话回到未分组、不删会话本身）。分组定义与归属真源在后端：定义存 `history_files/session_groups.json`，归属写会话首行 `_meta.group_id`（**不改 updated_at**，不扰乱「最近」排序）。会话三点菜单「分组」入口为分组选择器：列出全部分组（当前所在组带对勾）→ 点击移入 / 「移出分组」/ 「新建分组并移入」。**标题行带钉住状态标识**（图钉图标：未钉住悬停淡显提示、钉住后常显高亮）。**分享/导入联动**：会话带归属时分享走 zip 并随包携带分组定义（manifest v2），导入端按组名映射还原（同名复用/缺失新建）。多选模式下分组区隐藏（分组信息改由多选视图内联呈现：会话列表按分组展开、组头可全选）；搜索时隐藏（「最近」已含全部会话） |
+| 会话多选（app/sessions.js） | 「多选」按钮进入批量模式（按钮变「取消多选」并展开分享/删除操作条）。**列表按分组展示**：已定义分组（按注册顺序，空组也显示空组头）+ 末尾「未分组」（无归属/归属指向已删分组的会话）。**分组可折叠**：组头最左为折叠箭头（24px 命中区，展开时旋转 90°），**进入多选默认全部折叠**、每次进入重置；组头勾选气泡（22px，三态：空圈 / 部分选中横杠 / 全选对勾粉底）点击即**全选/取消全选该组**（折叠状态下依然生效，选中态在组头气泡上可见），「最近」标题行右侧另有**总控全选**（全部会话一键选/取消，含折叠组内成员）。搜索期间分组强制展开（命中结果不会藏在折叠组内）、无可见成员的组块自动隐藏；分组数据变化（移入/移出/建组/删组）时视图实时重建；多选期间单行置顶/新会话只同步数据不动 DOM，退出多选后按最新数据恢复扁平列表。批量分享/删除沿用原有逻辑（只统计可见选中项） |
 | token 统计（app/stats.js） | 侧边栏累计 token；流结束后以会话文件 meta 校准 |
 | 上下文统计条（app/stats.js） | composer 下方常显「30.1k/100k (30.1%)」（小屏只显百分比）；ratio≥0.8 黄色警告、≥1 红色危险；详细构成放 hover 提示。不做轮询，仅在 usage 到达/压缩完成/切会话/发消息等事件后 120ms 防抖刷新，in-flight 期间新请求排队合并 |
 | 工作路径（app/workdir.js） | 常显工作目录，双击内联编辑调用 `changeChatDir` 实时切换，hover tooltip 显示完整路径 |
-| 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接 |
+| 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接。**重复点击跳过重载**：视图就绪跟踪（`readySessionId` / `loadingSessionId`）+ `session_list_utils.shouldOpenSessionOnClick` 判定——点击已完整显示的当前会话（或加载中的会话）不再重新加载，点击其他会话照常切换；显式 `App.openSession(...)`（删除轮次后重载、流失败对齐、深链启动等）不受影响始终真实重载；加载失败不置就绪，可再次点击重试 |
 | 历史渲染（app/messages.js） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对）、轮次 usage 行、提示/出错横幅、压缩块（含中断态）；历史轮用户气泡 hover 操作行（复制/编辑/删除）：编辑进 GPT 同款编辑面板重发（「重新生成该轮」target_round 原地替换 /「删除该轮及之后」truncate 预演确认），**运行中也允许编辑**——确认发送弹「任务正在进行中」确认框，确认后先 `/stop_chat` 停止生成再删重发；「删除」弹确认框后 `single` 模式删除该轮整轮（后续轮次前移）；任务启动后端推 `round_started` 轮次号，前端就地补挂本轮操作行（最后一轮无需重载即可编辑/删除） |
 | 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——复制=原始 Markdown，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
 | 问题导航 qnav（app/messages.js） | 用户问题 ≥2 条出现：右侧虚线轨（上限 40 根）hover 展开编号面板，点击瞬跳，滚动 rAF 节流高亮当前位置 |
-| 导出/加载（app/history.js） | 顶栏为图标按钮：空态点击直接进入"加载 JSONL"文件选择；有会话内容时点击展开三选项菜单——**分享对话**（下载 `<id>_chat.jsonl`）、**加载 JSONL**（校验后上传导入，重名自动另存，导入失败本地预览兜底）、**压缩对话**（见下） |
+| 导出/加载（app/history.js） | 顶栏为图标按钮：空态点击直接进入"加载 JSONL"文件选择；有会话内容时点击展开三选项菜单——**分享对话**（单会话无附件且无分组时为 `<id>_chat.jsonl` 明文，否则打包 zip；**分组定义随包携带**，manifest v2）、**加载 JSONL**（校验后上传导入，重名自动另存，导入失败本地预览兜底；**zip 包导入时按组名还原分组归属**，导入弹窗展示包内分组名与还原说明、完成 toast 补「N 个已归入分组」，随后刷新侧边栏分组区）、**压缩对话**（见下） |
 | 手动压缩（app/compaction.js） | 点击"压缩对话"后：① 并行读取 token_stats 与历史压缩配置，仅用于确认弹窗展示当前上下文和摘要预算；② 二次确认（仅防误点击）；③ 确认后 POST `compact_manual?stream=true` 的 SSE 流，事件结构与自动压缩一致（start/delta/done + summary_text），复用 `buildCompactionBlock` 实时渲染压缩模型思考与累计摘要正文，结尾 result 帧提示纳入累计摘要的轮数并刷新用量/上下文统计。后端手动压缩与自动压缩共用多轮流程，覆盖全部已完成轮次，原始历史只存储不回传；模型上下文为累计摘要 + 全历史最近 10k tokens 用户问题 + 当前任务 |
-| 输入区（app/composer.js） | textarea 自增高；Enter 发送 / Shift 换行（排除中文输入法组合态）；发送/语音/停止三态按钮只反映当前会话状态；建议 chip 点击即发送 |
+| 输入区（app/composer.js） | textarea 自增高；Enter 发送 / Shift 换行（排除中文输入法组合态）；发送/语音/停止三态按钮只反映当前会话状态；**有文本时语音钮保留**（与发送钮并排，弱化为次级灰底样式；录音中仍为红色呼吸圈，Enter 发送会先结束听写避免识别结果写回已清空输入框）；建议 chip 点击即发送 |
 | 模型参数面板 enhancePanel（app/model_panel.js / composer.js） | boost 按钮开关；body 级浮层（打开时临时重挂 document.body，关闭挂回 .composer 原位）——脱离底部输入区堆叠上下文后 z-index(110) 才能压过顶栏(26)，避免顶栏累计 token 描述盖住面板；fixed 定位垂直锚定参数按钮（空态向下展开到视口底、聊天态向上展开到视口顶），水平与输入框同宽对齐，高度不随输入框行数漂移；四角色选项卡（聊天模型/压缩模型/标题模型/子智能体）；**自定义请求头编辑器**：思考深度行下方的键值两列编辑区（可逐行「+ 添加 / × 删除」，输入或增减行即置 dirty），回填该角色生效头（会话覆盖 → 全局默认），确定时有改动即随参数一并提交（headers 全量替换语义、`null` 保持不变）；随角色模型选择持久化，请求上游时 ChatLLM 注入原始 HTTP 头（opencode 等供应商要求的会话头在此配置）；「恢复默认」不触碰请求头；自绘模型 picker 按 provider 分组，附能力标签（视觉/工具）与 api_type/url；选新模型未手调过 max tokens 时随其 max_output_tokens 重设范围；任一参数改动置 dirty，「恢复默认」按 api_type 协议预设 + 角色默认；确定时仅 dirty 才组装 parameter 提交 `selectModel`（responses 协议字段为 max_output_tokens） |
 | 会话标题自动生成（后端 factory/agent_runtime/title_generator.py，前端零改动） | 「标题模型」tab 选择的模型在会话**首个提问的任务正常收尾后**被消费：后端在生成流内采集首轮模型输出（思考/正文取较长者）前 100 字符，与用户问题（截 300 字）组装为资料，由后台异步任务（asyncio.create_task，不阻塞收尾、无独立线程）请求标题模型输出 ≤30 字标题，写回会话 `_meta.title` 并打 `_title_state` 标记；**多模态标题**：首问带图片/视频/音频时，标题模型支持视觉则媒体解析 base64 一并送入（大图自动缩略），不支持则转「[图片 media://x.png]」文本占位；前端无需改动——侧边栏标题本就跟随 `getSessionMeta().title`（发送后 1.2s 的 refreshSessionTitle 会拉到新标题）。未配置标题模型或调用失败时保持旧机制标题（首个用户问题前 40 字）；所选模型需在其网关侧可用（部分网关按角色做区域门控，403 时更换标题模型即可） |
 | “+”功能菜单（app/composer.js） | 上传文件 / 选择工具 / 聊天设置 / Skills 提示词四个入口，分发至 history/tools/composer/skills 各自的处理逻辑；菜单以 fixed 定位锚定「+」按钮上方（打开时按按钮视口坐标计算，多行输入撑高输入框也不会漂移） |

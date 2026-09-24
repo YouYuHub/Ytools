@@ -6,6 +6,7 @@ import json
 # import urllib.request
 # import urllib.error
 import re
+import time
 import urllib.parse
 import socket
 import ssl
@@ -36,7 +37,11 @@ except ImportError:
 
     require_default_chat_config = None
 # 导入配置模型
-from config import ChatLLMRequest, DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
+from config import (
+    ChatLLMRequest,
+    DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
+    DEFAULT_REQUEST_HARD_LIMIT_TOKENS,
+)
 
 
 def _resolve_network_retry_max_attempts() -> int:
@@ -50,6 +55,87 @@ def _resolve_network_retry_max_attempts() -> int:
         return int(raw)
     except (TypeError, ValueError):
         return DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS
+
+
+# 网络重试固定间隔（秒）：重试之间等待，避免对供应商网关形成无间隔轰炸。
+# 按需求固定 1 秒、不做配置项（详见 docs/api_docs.md 重试语义）。
+_NETWORK_RETRY_INTERVAL_SECONDS = 1.0
+
+# 供应商请求硬限制的安全余量与最低输出预算：
+# 估算口径与真实 tokenizer 有偏差，预留余量；max_tokens 降到最低仍超限才判定不可发送。
+_HARD_LIMIT_SAFETY_MARGIN_TOKENS = 512
+_HARD_LIMIT_MIN_MAX_TOKENS = 1024
+
+# 多模态部件固定占位（与 chat_runtime.MULTIMODAL_PART_PLACEHOLDER_TOKENS 同口径）：
+# image_url / input_audio 的 base64 数据按字符估算会虚高数万倍，按单图 ~1k token 计
+_MULTIMODAL_PART_PLACEHOLDER_TOKENS = 1024
+
+
+def _resolve_request_hard_limit_tokens() -> int:
+    """解析供应商请求硬限制（input_tokens + max_tokens 之和上限）。
+
+    实测 opencode.ai 网关（orcarouter 上游）：input + max_tokens > 1048576（2^20）
+    时返回 HTTP 400 且响应体为空（Content-Type: text/event-stream），属确定性
+    失败，重试同一 payload 无意义。默认 1048576；0 或负数 = 禁用预检
+    （其他供应商无此限制时可关闭）。可用 .env 的 REQUEST_HARD_LIMIT_TOKENS 覆盖。
+    """
+    raw = load_var("REQUEST_HARD_LIMIT_TOKENS", DEFAULT_REQUEST_HARD_LIMIT_TOKENS)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_REQUEST_HARD_LIMIT_TOKENS
+
+
+def _estimate_payload_input_tokens(payload: dict[str, Any]) -> int:
+    """估算请求 payload 的输入 tokens（发送前硬限制预检用）。
+
+    口径与项目统一估算一致（ASCII//4 + 非 ASCII 逐字），宁可略高估以拦截
+    确定性失败；多模态部件（image_url / input_audio）按固定占位计费，
+    避免 base64/data URL 字符数虚高估算。
+    """
+    def _text_tokens(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                text = str(value)
+        else:
+            text = str(value)
+        if not text:
+            return 0
+        ascii_chars = sum(1 for char in text if ord(char) < 128)
+        non_ascii_chars = len(text) - ascii_chars
+        return max(1, ascii_chars // 4 + non_ascii_chars)
+
+    total = 0
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("image_url", "input_audio"):
+                    total += _MULTIMODAL_PART_PLACEHOLDER_TOKENS
+                elif part.get("type") == "text":
+                    total += _text_tokens(part.get("text"))
+                else:
+                    total += _text_tokens(part)
+        else:
+            total += _text_tokens(content)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            total += _text_tokens(tool_calls)
+        reasoning_content = message.get("reasoning_content")
+        if isinstance(reasoning_content, str):
+            total += _text_tokens(reasoning_content)
+    tools = payload.get("tools")
+    if tools:
+        total += _text_tokens(tools)
+    return total
 
 
 def _build_custom_header_lines(chat_config: dict[str, Any]) -> str:
@@ -271,6 +357,45 @@ class ChatLLM:
         return payload
 
     @staticmethod
+    def _precheck_hard_limit(payload: dict[str, Any]) -> str | None:
+        """发送前硬限制预检（input + max_tokens 不得超过供应商上限）。
+
+        返回 None = 通过（必要时已就地降级 payload["max_tokens"]，日志提示）；
+        返回字符串 = 不可挽救的确定性失败说明（调用方应直接失败、跳过网络重试）。
+        每次尝试（含重试）都会调用：payload 每次重建，降级结果不跨尝试保留。
+        """
+        hard_limit = _resolve_request_hard_limit_tokens()
+        if hard_limit <= 0:
+            return None
+        try:
+            estimated_input = _estimate_payload_input_tokens(payload)
+        except Exception:
+            return None  # 估算失败不阻断发送（保守放行）
+        raw_max_tokens = payload.get("max_tokens")
+        try:
+            max_tokens_value = int(raw_max_tokens) if raw_max_tokens is not None else 0
+        except (TypeError, ValueError):
+            max_tokens_value = 0
+        if estimated_input + max_tokens_value <= hard_limit:
+            return None
+        # 输入本身在限额内：自动降级 max_tokens 保发送（保留最低输出预算）
+        headroom = hard_limit - estimated_input - _HARD_LIMIT_SAFETY_MARGIN_TOKENS
+        if headroom >= _HARD_LIMIT_MIN_MAX_TOKENS:
+            payload["max_tokens"] = headroom
+            print(
+                f"[WARN] 请求规模预检：估算输入 {estimated_input} + max_tokens "
+                f"{max_tokens_value} 超过供应商硬限制 {hard_limit}，"
+                f"已自动降 max_tokens 至 {headroom}"
+            )
+            return None
+        return (
+            f"请求规模超过供应商硬限制：估算输入 {estimated_input} tokens + "
+            f"max_tokens {max_tokens_value} > {hard_limit}（2^20）；"
+            f"max_tokens 已无压缩空间，无法发送（确定性失败，跳过网络重试）。"
+            f"请压缩上下文或缩减工具结果后重试"
+        )
+
+    @staticmethod
     def _resolve_timeouts(request: Optional[ChatLLMRequest], timeout_connect: int, timeout_read: int, timeout_drain: int):
         if request is None:
             return timeout_connect, timeout_read, timeout_drain
@@ -478,6 +603,10 @@ class ChatLLM:
         retry_count = 0
         retry_max_attempts = _resolve_network_retry_max_attempts()
         while True:
+            # 网络重试固定间隔：第 2 次及以后尝试前等待，避免无间隔轰炸
+            # 供应商网关（重试均为同一 payload，间隔不改变请求内容）
+            if retry_count > 0:
+                time.sleep(_NETWORK_RETRY_INTERVAL_SECONDS)
             try:
                 chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
@@ -494,6 +623,14 @@ class ChatLLM:
                 use_ssl = parsed.scheme == "https"
                 if port is None:
                     port = 443 if use_ssl else 80
+                # 每次尝试都预检：payload 每次重试都会重建（max_tokens 回到
+                # 配置原值），若仅首次预检，降级结果会在重试时丢失导致再次超限
+                hard_limit_error = ChatLLM._precheck_hard_limit(payload)
+                if hard_limit_error is not None:
+                    print(f"[ERROR] {hard_limit_error}")
+                    yield f"data: {json.dumps({'error': hard_limit_error, 'error_type': 'hard_limit', 'step': 'precheck', 'retry': 0, 'max_attempts': None, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 last_step = "connect"
                 sock = socket.create_connection((host, port), timeout=timeout_connect)
@@ -547,6 +684,16 @@ class ChatLLM:
                         last_step = "read_error_body"
                         error_body = ChatLLM._read_full_response_body(f, is_chunked)
                         error_text = error_body.decode("utf-8", errors="replace")
+                        # 400 空响应体（网关规模超限/过载等）补充响应头诊断信息：
+                        # x-opencode-log-id / x-opencode-endpoint-id 供供应商侧追查
+                        if not error_text:
+                            error_text = (
+                                "[空响应体] log-id=%s endpoint-id=%s"
+                                % (
+                                    resp_headers.get("x-opencode-log-id", "-"),
+                                    resp_headers.get("x-opencode-endpoint-id", "-"),
+                                )
+                            )
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -580,6 +727,17 @@ class ChatLLM:
                             continue
                         choices = chunk.get("choices", [])
                         if not choices:
+                            # 供应商错误帧（如 data: {"error": {...}}）不再静默吞掉：
+                            # 提取真实错误信息上报并终止，避免仅表现为"空响应"无从定位
+                            error_frame = chunk.get("error")
+                            if error_frame is not None:
+                                try:
+                                    error_frame_text = json.dumps(error_frame, ensure_ascii=False)
+                                except Exception:
+                                    error_frame_text = str(error_frame)
+                                yield f"data: {json.dumps({'error': '供应商错误帧: ' + error_frame_text, 'error_type': 'upstream_error_frame', 'retrying': False}, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
                             usage_only = chunk.get("usage")
                             chunk_id_only = chunk.get("id")
                             if usage_only is not None or chunk_id_only is not None:
@@ -709,6 +867,10 @@ class ChatLLM:
             if ChatLLM._should_stop(stop_checker):
                 yield "data: [DONE]\n\n"
                 return
+            # 网络重试固定间隔：第 2 次及以后尝试前等待，避免无间隔轰炸
+            # 供应商网关（重试均为同一 payload，间隔不改变请求内容）
+            if retry_count > 0:
+                await asyncio.sleep(_NETWORK_RETRY_INTERVAL_SECONDS)
             try:
                 chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
@@ -725,6 +887,14 @@ class ChatLLM:
                 use_ssl = parsed.scheme == "https"
                 if port is None:
                     port = 443 if use_ssl else 80
+                # 每次尝试都预检：payload 每次重试都会重建（max_tokens 回到
+                # 配置原值），若仅首次预检，降级结果会在重试时丢失导致再次超限
+                hard_limit_error = ChatLLM._precheck_hard_limit(payload)
+                if hard_limit_error is not None:
+                    print(f"[ERROR] {hard_limit_error}")
+                    yield f"data: {json.dumps({'error': hard_limit_error, 'error_type': 'hard_limit', 'step': 'precheck', 'retry': 0, 'max_attempts': None, 'retrying': False}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 last_step = "connect"
                 reader, writer = await ChatLLM._open_connection(
@@ -784,6 +954,15 @@ class ChatLLM:
                             reader, is_chunked, timeout_read, stop_checker
                         )
                         error_text = error_body.decode("utf-8", errors="replace")
+                        # 400 空响应体（网关规模超限/过载等）补充响应头诊断信息
+                        if not error_text:
+                            error_text = (
+                                "[空响应体] log-id=%s endpoint-id=%s"
+                                % (
+                                    resp_headers.get("x-opencode-log-id", "-"),
+                                    resp_headers.get("x-opencode-endpoint-id", "-"),
+                                )
+                            )
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -815,6 +994,17 @@ class ChatLLM:
                             continue
                         choices = chunk.get("choices", [])
                         if not choices:
+                            # 供应商错误帧（如 data: {"error": {...}}）不再静默吞掉：
+                            # 提取真实错误信息上报并终止，避免仅表现为"空响应"无从定位
+                            error_frame = chunk.get("error")
+                            if error_frame is not None:
+                                try:
+                                    error_frame_text = json.dumps(error_frame, ensure_ascii=False)
+                                except Exception:
+                                    error_frame_text = str(error_frame)
+                                yield f"data: {json.dumps({'error': '供应商错误帧: ' + error_frame_text, 'error_type': 'upstream_error_frame', 'retrying': False}, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
                             usage_only = chunk.get("usage")
                             chunk_id_only = chunk.get("id")
                             if usage_only is not None or chunk_id_only is not None:
@@ -968,11 +1158,19 @@ class ChatLLM:
         retry_count = 0
         retry_max_attempts = _resolve_network_retry_max_attempts()
         while True:
+            # 网络重试固定间隔：第 2 次及以后尝试前等待（语义同流式版）
+            if retry_count > 0:
+                time.sleep(_NETWORK_RETRY_INTERVAL_SECONDS)
             payload = ChatLLM._build_request_payload(
                 request,
                 stream=False,
                 model_name=chat_config["selected_model_id"],
             )
+            # 每次尝试都预检（语义见流式版注释）
+            hard_limit_error = ChatLLM._precheck_hard_limit(payload)
+            if hard_limit_error is not None:
+                print(f"[ERROR] {hard_limit_error}")
+                raise RuntimeError(hard_limit_error)
             body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             last_step = "connect"
             sock = socket.create_connection((host, port), timeout=timeout_connect)
@@ -1019,7 +1217,17 @@ class ChatLLM:
                 if "200" not in status_str and "201" not in status_str:
                     last_step = "read_error_body"
                     error_body = ChatLLM._read_full_response_body(f, is_chunked)
-                    raise RuntimeError(f"HTTP Error: {status_str}: {error_body.decode('utf-8', errors='replace')}")
+                    error_text = error_body.decode("utf-8", errors="replace")
+                    # 400 空响应体补充响应头诊断信息（语义同流式版）
+                    if not error_text:
+                        error_text = (
+                            "[空响应体] log-id=%s endpoint-id=%s"
+                            % (
+                                resp_headers.get("x-opencode-log-id", "-"),
+                                resp_headers.get("x-opencode-endpoint-id", "-"),
+                            )
+                        )
+                    raise RuntimeError(f"HTTP Error: {status_str}: {error_text}")
                 last_step = "read_body"
                 response_body = ChatLLM._read_full_response_body(f, is_chunked)
                 response_text = response_body.decode("utf-8", errors="replace")

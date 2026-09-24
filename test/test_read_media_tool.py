@@ -602,5 +602,76 @@ class LoadAnyMediaTests(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class ConcurrencyGuardAndCorruptImageTests(unittest.TestCase):
+    """同轮并发守卫说明 + 损坏图片拦截（供应商 400 防御）。
+
+    背景：同一模型回复并发 2+ 个 read_media 时多个媒体部件同批注入会触发
+    供应商 400；伪 PNG（仅签名+零填充）等损坏文件注入同样整请求 400
+    （"cannot identify image file <_io.BytesIO>"）。三层防御：
+    - 工具描述写明"同回复只允许 1 个调用"；
+    - chat_factory 执行层只跑首个、其余错误占位（主循环内，单测覆盖描述文案）；
+    - 加载内核注入前完整解码校验，坏图返回错误占位、绝不注入。
+    """
+
+    def test_tool_description_mentions_concurrency_limit(self):
+        definition = bt.build_read_media_tool_definition()
+        description = definition["function"]["description"]
+        self.assertIn("并发限制", description)
+        self.assertIn("仅首个会执行", description)
+        self.assertIn("references 列表", description)
+
+    def test_corrupt_local_image_rejected_not_injected(self):
+        # 复刻实证案例：仅 PNG 签名 + 零填充的 40 字节伪 PNG
+        corrupt = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        tmp_dir = fm.HISTORY_ROOT / "corrupt_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "伪损坏.png"
+        tmp_path.write_bytes(corrupt)
+        try:
+            result = bt.load_any_media_model_part(TEST_SESSION, str(tmp_path))
+            self.assertIsInstance(result, dict)
+            self.assertIn("error", result)
+            self.assertIn("无法解码为图片", result["error"])
+            self.assertNotIn("part", result)
+            # execute_read_media 整体无成功项（ok=False），该引用进 skipped
+            # 且带解码失败原因、不注入——模型收到明确错误说明而非坏数据
+            exec_result = bt.execute_read_media(
+                {"references": [str(tmp_path)]}, TEST_SESSION, None,
+            )
+            self.assertFalse(exec_result["ok"])
+            self.assertEqual(exec_result["injected_references"], [])
+            self.assertIn("没有可读取的媒体", exec_result["message"])
+            reasons = {s["reference"]: s["reason"] for s in exec_result["skipped"]}
+            self.assertIn("无法解码为图片", reasons.get(str(tmp_path), ""))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_valid_png_still_loads(self):
+        png = _make_png_bytes(20, 16)
+        tmp_dir = fm.HISTORY_ROOT / "valid_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "合法.png"
+        tmp_path.write_bytes(png)
+        try:
+            result = bt.load_any_media_model_part(TEST_SESSION, str(tmp_path))
+            self.assertIsInstance(result, dict)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["kind"], "image")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_corrupt_session_media_reference_rejected(self):
+        # media:// 会话引用路径同样走共享加载内核（save_session_media 不做
+        # 解码校验——上传链路保持宽松，read_media 读取时才拦截）
+        saved = fm.save_session_media(TEST_SESSION, "假图.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        try:
+            result = bt.load_any_media_model_part(TEST_SESSION, saved["media_ref"])
+            self.assertIsInstance(result, dict)
+            self.assertIn("error", result)
+            self.assertIn("无法解码为图片", result["error"])
+        finally:
+            _cleanup_test_session()
+
+
 if __name__ == "__main__":
     unittest.main()
