@@ -26,11 +26,13 @@ EDIT_FILE_NAME = "edit_file"
 READ_FILE_NAME = "read_file"
 SEARCH_FILES_NAME = "search_files"
 READ_MEDIA_NAME = "read_media"
+READ_DOCUMENT_NAME = "read_document"
 SUB_AGENT_TOOL_NAME = "sub_agent"
 # 内置工具在工具选择（_meta.tool_selection / mcp_servers.json inputs）中的伪服务键：
 # 前端把它作为“内置工具”分组渲染在工具模态框首位，保存/加载与 MCP 工具走同一链路
 BUILTIN_TOOL_SERVER_KEY = "__builtin__"
-# 工具选择中允许出现的内置工具名（check_tool_exists 由后端按外部工具自动注入，不开放手选）
+# 工具选择中允许出现的内置工具名（check_tool_exists 由后端按外部工具自动注入、
+# read_document 由后端按会话上传文件自动注入，均不开放手选）
 SELECTABLE_BUILTIN_TOOL_NAMES = (
     TODO_TOOL_NAME, ASK_USER_TOOL_NAME, WRITE_FILE_NAME, EDIT_FILE_NAME,
     READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME, SUB_AGENT_TOOL_NAME,
@@ -66,10 +68,12 @@ def inject_builtin_tools(
     include_read_file: bool = False,
     include_search_files: bool = False,
     include_read_media: bool = False,
+    include_read_document: bool = False,
     include_sub_agent: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """注入本地内置工具：check_tool_exists（选了外部工具时）、todo_write、
-    ask_user、write_file、edit_file、read_file、search_files、read_media
+    ask_user、write_file、edit_file、read_file、search_files、read_media、
+    read_document（会话存在上传文件且本轮携带工具时由 chat_factory 自动注入）
     与 sub_agent（用户在工具选择中勾选时）。"""
     tools = list(selected_tools)
     servers = dict(selected_tool_servers)
@@ -98,6 +102,9 @@ def inject_builtin_tools(
     if include_read_media and READ_MEDIA_NAME not in servers:
         tools.append(build_read_media_tool_definition())
         servers[READ_MEDIA_NAME] = BUILTIN_TOOL_SERVER_KEY
+    if include_read_document and READ_DOCUMENT_NAME not in servers:
+        tools.append(READ_DOCUMENT_TOOL_DEFINITION)
+        servers[READ_DOCUMENT_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_sub_agent and SUB_AGENT_TOOL_NAME not in servers:
         tools.append(SUB_AGENT_TOOL_DEFINITION)
         servers[SUB_AGENT_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
@@ -108,7 +115,7 @@ def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in (
         CHECK_TOOL_EXISTS_NAME, TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
         WRITE_FILE_NAME, EDIT_FILE_NAME, READ_FILE_NAME, SEARCH_FILES_NAME,
-        READ_MEDIA_NAME, SUB_AGENT_TOOL_NAME,
+        READ_MEDIA_NAME, READ_DOCUMENT_NAME, SUB_AGENT_TOOL_NAME,
     )
 
 
@@ -286,7 +293,7 @@ def execute_builtin_tool(
     all_known_names = (
         {str(n).strip() for n in available_tool_names if str(n).strip()}
         | set(SELECTABLE_BUILTIN_TOOL_NAMES)
-        | {CHECK_TOOL_EXISTS_NAME}
+        | {CHECK_TOOL_EXISTS_NAME, READ_DOCUMENT_NAME}
     )
     exists = bool(query_name in all_known_names) if query_name else False
     # 当前轮启用集合缺省回退全集（旧调用方未传时行为不变）
@@ -315,7 +322,10 @@ def execute_builtin_tool(
         server_value = ""
     elif query_name in available_tool_servers:
         server_value = available_tool_servers[query_name]
-    elif query_name in SELECTABLE_BUILTIN_TOOL_NAMES or query_name == CHECK_TOOL_EXISTS_NAME:
+    elif (
+        query_name in SELECTABLE_BUILTIN_TOOL_NAMES
+        or query_name in (CHECK_TOOL_EXISTS_NAME, READ_DOCUMENT_NAME)
+    ):
         server_value = BUILTIN_TOOL_SERVER_KEY
     else:
         server_value = ""
@@ -1207,6 +1217,134 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         "total_matches": total_matches,
         "truncated": len(blocks) >= limit,
     }
+
+
+# ------------------- read_document：读取上传文件的解析文本（按需/分页） -------------------
+# 用户上传文档（pdf/docx/doc/xls/xlsx/csv/md/txt）解析出的文本由系统提示词以
+# 「文件清单」形式注入：小文件内联全文、大文件仅开头节选（见
+# memory.file_memory.build_file_manifest_text）。需要文件其余内容时模型调用
+# 本工具，按字符区间分页读取完整解析文本。
+# 由 chat_factory 在「会话存在上传文件且本轮携带工具」时自动注入（不开放手选，
+# 与 check_tool_exists 同类）；只读工具，无内容安全边界（文件由用户自己上传）。
+
+_READ_DOCUMENT_DEFAULT_MAX_CHARS = 8000
+_READ_DOCUMENT_MAX_CHARS = 20000
+
+
+def _read_document_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+READ_DOCUMENT_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+      "name": READ_DOCUMENT_NAME,
+      "description": (
+          "读取用户上传文件（PDF/Word/Excel/CSV/MD/TXT 等已解析文档）的完整内容。"
+          "系统提示词中会列出上传文件清单：小文件已内联全文，大文件仅显示开头节选；"
+          "需要文件其余内容时用本工具读取。支持按字符区间分页（start_char/max_chars），"
+          "返回带 total_chars 与 has_more，据此继续读取后续区间。"
+      ),
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filename": {
+            "type": "string",
+            "description": "上传文件的原始文件名（见系统提示词文件清单中的文件名）",
+          },
+          "start_char": {
+            "type": "integer",
+            "description": "起始字符位置（从 0 开始，默认 0）",
+          },
+          "max_chars": {
+            "type": "integer",
+            "description": (
+                f"本次读取的最大字符数（默认 {_READ_DOCUMENT_DEFAULT_MAX_CHARS}，"
+                f"最大 {_READ_DOCUMENT_MAX_CHARS}）"
+            ),
+          },
+        },
+        "required": ["filename"],
+      },
+    },
+}
+
+
+def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[str, Any]:
+    """执行内置 read_document：按文件名读取上传文件的解析文本（分页）。
+
+    返回 {filename, type, total_chars, start_char, end_char, content, has_more,
+    next_start_char?, message}；失败返回 {"error": ...}（模型可见的错误反馈）。
+    """
+    args = tool_args if isinstance(tool_args, dict) else {}
+    filename = str(args.get("filename") or "").strip()
+    if not filename:
+        return {"error": "filename 不能为空（文件名见系统提示词中的上传文件清单）"}
+    start = _read_document_int(args.get("start_char"), 0, minimum=0, maximum=10**9)
+    max_chars = _read_document_int(
+        args.get("max_chars"),
+        _READ_DOCUMENT_DEFAULT_MAX_CHARS,
+        minimum=1,
+        maximum=_READ_DOCUMENT_MAX_CHARS,
+    )
+    try:
+        record = file_memory.find_file_memory_record(session_id, filename)
+    except Exception as exc:
+        return {"error": f"读取文件记录失败：{exc}"}
+    if record is None:
+        try:
+            names = [
+                str(item.get("filename") or "未命名")
+                for item in file_memory.list_session_file_records(session_id)
+            ]
+        except Exception:
+            names = []
+        hint = f"；当前会话已上传文件：{'、'.join(names)}" if names else "；当前会话没有上传文件"
+        return {"error": f"未找到文件「{filename}」{hint}"}
+    content = str(record.get("content") or "")
+    total = len(content)
+    if total == 0:
+        return {
+            "filename": record.get("filename") or filename,
+            "type": record.get("type") or "",
+            "total_chars": 0,
+            "start_char": 0,
+            "end_char": 0,
+            "content": "",
+            "has_more": False,
+            "message": "该文件解析文本为空（可能是扫描版 PDF 等无可提取文本）",
+        }
+    if start >= total:
+        return {
+            "error": (
+                f"start_char={start} 已超出文件总长度 {total}；"
+                "请用 start_char=0 重新开始或检查文件名是否正确"
+            )
+        }
+    chunk = content[start:start + max_chars]
+    end = start + len(chunk)
+    result: dict[str, Any] = {
+        "filename": record.get("filename") or filename,
+        "type": record.get("type") or "",
+        "total_chars": total,
+        "start_char": start,
+        "end_char": end,
+        "content": chunk,
+        "has_more": end < total,
+    }
+    if end < total:
+        result["next_start_char"] = end
+        result["message"] = (
+            f"已返回第 {start}-{end} 字符（共 {total} 字）；"
+            f"如需继续，用 start_char={end} 再次调用"
+        )
+    else:
+        result["message"] = f"已返回第 {start}-{end} 字符（全文结束，共 {total} 字）"
+    return result
 
 
 # ------------------- read_media：读取图片/音频/视频（统一入口） -------------------

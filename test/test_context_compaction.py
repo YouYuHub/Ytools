@@ -1,5 +1,6 @@
 ﻿import json
 import unittest
+from dataclasses import replace as dataclasses_replace
 
 from config import ChatLLMRequest
 from factory.agent_runtime import context_compaction as compaction
@@ -71,9 +72,8 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         compaction._COMPACTION_RETRY_INTERVAL_SECONDS = self._original_retry_interval
 
     @staticmethod
-    def _settings(oversized_factor=1.5, max_rejections=3, keep_rounds=1):
+    def _settings(oversized_factor=1.5, max_rejections=3):
         return compaction.ContextCompactionSettings(
-            keep_rounds=keep_rounds,
             trigger_ratio=0.5,
             summary_budget_ratio=0.2,
             oversized_reject_factor=oversized_factor,
@@ -105,7 +105,9 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
                 scope="单轮工具执行上下文",
             )
             self.assertEqual(result.text, "聊天模型生成的摘要")
-            self.assertFalse(result.used_fallback)
+            # 降级链真实发生过（压缩模型失败 → 聊天模型产出）：used_fallback 置 True。
+            # 此前该字段恒为 False（死字段），前端"降级=False"无信息量且掩盖了实际降级。
+            self.assertTrue(result.used_fallback)
             self.assertEqual(calls, ["test-model", "chat-model"])
 
             # 聊天模型也失败 -> 终止任务
@@ -542,7 +544,7 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         compacted = await compaction.compact_session_history_if_needed(
             memory,
             request,
-            settings=self._settings(keep_rounds=4),
+            settings=self._settings(),
         )
 
         self.assertEqual(compacted, 0)
@@ -586,8 +588,8 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory.summary["source_round_count"], 2)
         self.assertIn("工具已返回关键结果", memory.summary["summary"])
 
-    async def test_enforce_mode_breaks_keep_rounds_floor(self):
-        """enforce 强制模式：keep_rounds 保护放宽，预算自适应一批压完。"""
+    async def test_enforce_mode_compacts_more_with_smaller_budget(self):
+        """预算越小压得越多；无轮次窗口保护后压缩量完全由预算决定。"""
         def make_round(index):
             return {
                 "event": "chat_round",
@@ -613,21 +615,20 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
             max_tokens=512,
         )
 
-        # 常规模式：keep_rounds=4 保护下 5 轮只可压 1 轮
+        # 默认预算（阈值 = 1000 × 0.5 = 500）：预算内的最近轮次保留原始对话
         compacted = await compaction.compact_session_history_if_needed(
             memory,
             request,
-            settings=self._settings(keep_rounds=4),
+            settings=self._settings(),
         )
-        self.assertEqual(compacted, 1)
+        self.assertGreater(compacted, 0)
 
-        # enforce 模式：放宽 keep_rounds 保护，继续压缩剩余历史
-        memory.summary = None  # 重置后用 enforce 全量重跑
+        # 极小预算：超出预算的轮次更多（不再有"保留最近 N 轮"下限）
         memory = _MemoryStub([make_round(index) for index in range(1, 6)])
         compacted = await compaction.compact_session_history_if_needed(
             memory,
             request,
-            settings=self._settings(keep_rounds=4),
+            settings=self._settings(),
             budget_tokens=512,
             enforce=True,
         )
@@ -920,7 +921,6 @@ class OversizedResultHelpersTests(unittest.TestCase):
 
     def test_oversized_threshold_disabled_when_factor_zero(self):
         compaction.load_context_compaction_settings = lambda: compaction.ContextCompactionSettings(
-            keep_rounds=4,
             trigger_ratio=0.8,
             summary_budget_ratio=0.2,
             oversized_reject_factor=0.0,
@@ -935,7 +935,6 @@ class OversizedResultHelpersTests(unittest.TestCase):
             "apiType": "chat-completions",
         }
         compaction.load_context_compaction_settings = lambda: compaction.ContextCompactionSettings(
-            keep_rounds=4,
             trigger_ratio=0.8,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,
@@ -951,7 +950,6 @@ class OversizedResultHelpersTests(unittest.TestCase):
             "apiType": "chat-completions",
         }
         compaction.load_context_compaction_settings = lambda: compaction.ContextCompactionSettings(
-            keep_rounds=4,
             trigger_ratio=0.8,
             summary_budget_ratio=0.2,
             oversized_reject_factor=0.5,
@@ -1042,21 +1040,18 @@ class CompactionSettingsParsingTests(unittest.TestCase):
             return values.get(name, default)
         compaction.load_var = fake_load_var
 
-    def test_keep_rounds_zero_preserved_for_unlimited_window(self):
-        # 0 = 无限轮次窗口（仅按阈值压缩），不能回落为默认值
+    def test_keep_rounds_no_longer_part_of_settings(self):
+        """历史轮次窗口已废弃：settings 不再包含该字段，环境变量被忽略。"""
         self._with_env({"HISTORY_COMPACT_KEEP_ROUNDS": "0"})
         settings = compaction.load_context_compaction_settings()
-        self.assertEqual(settings.keep_rounds, 0)
+        self.assertFalse(hasattr(settings, "keep_rounds"))
 
-    def test_keep_rounds_negative_falls_back_to_default(self):
-        self._with_env({"HISTORY_COMPACT_KEEP_ROUNDS": "-5"})
+    def test_keep_rounds_env_value_does_not_affect_compaction(self):
+        """设置 HISTORY_COMPACT_KEEP_ROUNDS 不再影响压缩（仅按阈值/目标控制）。"""
+        self._with_env({"HISTORY_COMPACT_KEEP_ROUNDS": "3"})
         settings = compaction.load_context_compaction_settings()
-        self.assertEqual(settings.keep_rounds, compaction.DEFAULT_CONTEXT_HISTORY_ROUNDS)
-
-    def test_keep_rounds_invalid_falls_back_to_default(self):
-        self._with_env({"HISTORY_COMPACT_KEEP_ROUNDS": "abc"})
-        settings = compaction.load_context_compaction_settings()
-        self.assertEqual(settings.keep_rounds, compaction.DEFAULT_CONTEXT_HISTORY_ROUNDS)
+        self.assertEqual(compaction.resolve_history_target_tokens(settings), 0)
+        self.assertFalse(hasattr(settings, "keep_rounds"))
 
 
 class ContextCompactionThresholdTests(unittest.TestCase):
@@ -1073,7 +1068,6 @@ class ContextCompactionThresholdTests(unittest.TestCase):
     @staticmethod
     def _settings(trigger_ratio=0.8):
         return compaction.ContextCompactionSettings(
-            keep_rounds=4,
             trigger_ratio=trigger_ratio,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,
@@ -1134,7 +1128,6 @@ class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _settings():
         return compaction.ContextCompactionSettings(
-            keep_rounds=1,
             trigger_ratio=0.5,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,
@@ -1279,7 +1272,6 @@ class RecentQuestionsRetentionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _settings():
         return compaction.ContextCompactionSettings(
-            keep_rounds=1,
             trigger_ratio=0.5,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,
@@ -1319,19 +1311,18 @@ class RecentQuestionsRetentionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(compacted, 0)
         self.assertIsNotNone(memory.summary)
-        # keep_rounds=1：窗口被未压缩的第 3 轮完整对话占用，已压缩问题无窗口空间
-        self.assertEqual(memory.summary["recent_questions"], [])
-        self.assertEqual(memory.summary["recent_question_numbers"], [])
-        # 再次压缩后索引按新游标重算：第 3 轮也已压缩，但窗口 1 仍被未压缩的第 4 轮
-        # 完整对话占用，已压缩问题依然没有窗口空间
+        # 未压缩的第 3 轮以完整对话回传（不再有轮次窗口限制）：已压缩轮次的
+        # 问题进入保真索引（第 1、2 轮）
+        self.assertEqual(memory.summary["recent_questions"], ["问题 1", "问题 2"])
+        self.assertEqual(memory.summary["recent_question_numbers"], [1, 2])
+        # 再次压缩后索引按新游标重算：已压缩轮次增加到第 3 轮
         memory.entries = [self._make_round(1), self._make_round(2), self._make_round(3), self._make_round(4)]
         await compaction.compact_session_history_if_needed(
             memory,
             request,
             settings=self._settings(),
         )
-        self.assertEqual(memory.summary["recent_questions"], [])
-        self.assertEqual(memory.summary["recent_question_numbers"], [])
+        self.assertIn("问题 3", memory.summary["recent_questions"])
 
     async def test_force_all_compacts_history_even_when_under_target_budget(self):
         memory = _MemoryStub([self._make_round(1), self._make_round(2), self._make_round(3)])
@@ -1351,12 +1342,197 @@ class RecentQuestionsRetentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compacted, 3)
         self.assertEqual(memory.summary["source_round_count"], 3)
         self.assertEqual(len(memory.summary["blocks"]), 1)
-        # 全部轮次已压缩且无未压缩轮次占窗口：keep_rounds=1 的窗口全部给保真索引
+        # 全部轮次已压缩：保真索引收录全部轮次问题（不再受轮次窗口限制）
         self.assertEqual(
             memory.summary["recent_questions"],
-            ["问题 3"],
+            ["问题 1", "问题 2", "问题 3"],
         )
-        self.assertEqual(memory.summary["recent_question_numbers"], [3])
+        self.assertEqual(memory.summary["recent_question_numbers"], [1, 2, 3])
+
+    def test_target_tokens_clamped_to_window_derived_range(self):
+        """目标夹取：窗口 <500k → 下限 = 窗口×8%；窗口 ≥500k → 下限 40k；上限 = 窗口×40%。"""
+        original_chat = compaction.resolve_model_max_input_tokens
+        original_model = compaction.resolve_context_compaction_model_config
+        try:
+            # 小窗口（300k）：下限 = 300k × 8% = 24k，上限 = 300k × 40% = 120k
+            compaction.resolve_model_max_input_tokens = lambda default=8192: 300_000
+            compaction.resolve_context_compaction_model_config = lambda _s: {
+                "maxInputTokens": 300_000, "apiType": "chat-completions"}
+            settings = compaction.ContextCompactionSettings(
+                trigger_ratio=0.5, summary_budget_ratio=0.2,
+                oversized_reject_factor=1.5, max_oversized_rejections=3,
+                target_tokens=80_000,
+            )
+            self.assertEqual(
+                compaction.resolve_history_target_limits(settings), (24_000, 120_000))
+            # 区间内 → 原值
+            self.assertEqual(compaction.resolve_history_target_tokens(settings), 80_000)
+            # 低于下限 → 按下限
+            self.assertEqual(
+                compaction.resolve_history_target_tokens(
+                    dataclasses_replace(settings, target_tokens=1)),
+                24_000,
+            )
+            # 高于上限 → 按上限
+            self.assertEqual(
+                compaction.resolve_history_target_tokens(
+                    dataclasses_replace(settings, target_tokens=999_999)),
+                120_000,
+            )
+            # 0 → 不设目标
+            self.assertEqual(
+                compaction.resolve_history_target_tokens(
+                    dataclasses_replace(settings, target_tokens=0)),
+                0,
+            )
+
+            # 大窗口（528k ≥ 500k）：下限 = 40k（固定），上限 = 528k × 40% = 211.2k
+            compaction.resolve_model_max_input_tokens = lambda default=8192: 528_000
+            compaction.resolve_context_compaction_model_config = lambda _s: {
+                "maxInputTokens": 500_000, "apiType": "chat-completions"}
+            lower, upper = compaction.resolve_history_target_limits(settings)
+            self.assertEqual(lower, 40_000)
+            self.assertEqual(upper, int(500_000 * 0.4))
+            self.assertEqual(
+                compaction.resolve_history_target_tokens(
+                    dataclasses_replace(settings, target_tokens=1)),
+                40_000,
+            )
+        finally:
+            compaction.resolve_model_max_input_tokens = original_chat
+            compaction.resolve_context_compaction_model_config = original_model
+
+    def test_effective_summary_budget_shrinks_under_target(self):
+        """设了目标后摘要预算按目标收紧（给保留的原始轮次留空间）。"""
+        base = compaction.ContextCompactionSettings(
+            trigger_ratio=0.8, summary_budget_ratio=0.2,
+            oversized_reject_factor=1.5, max_oversized_rejections=3,
+        )
+        # 无目标：保持"窗口 × 比例"
+        self.assertEqual(
+            compaction.resolve_effective_summary_budget(base),
+            compaction.resolve_summary_total_budget(base),
+        )
+        # 有目标：min(原预算, 目标 × 0.6)
+        with_target = compaction.ContextCompactionSettings(
+            trigger_ratio=0.8, summary_budget_ratio=0.2,
+            oversized_reject_factor=1.5, max_oversized_rejections=3,
+            target_tokens=80_000,
+        )
+        self.assertEqual(
+            compaction.resolve_effective_summary_budget(with_target),
+            min(compaction.resolve_summary_total_budget(with_target), 48_000),
+        )
+
+    @staticmethod
+    def _make_big_round(index):
+        """构造一个较大的轮次：上下文视图（user + assistant 正文）约 3k tokens。
+
+        注意：已完成轮次的工具结果不回传给模型（摘要-only 模式），因此衡量
+        "历史是否超目标"要看上下文视图，而不是原始工具输出。
+        """
+        return {
+            "event": "chat_round",
+            "question": f"问题 {index}",
+            "events": [
+                {"role": "user", "content": f"问题 {index}"},
+                {"role": "assistant", "content": "回答内容片段" * 700},
+                {
+                    "role": "tool",
+                    "tool_name": "query",
+                    "arguments": "{}",
+                    "result": "工具输出片段" * 500,
+                },
+                {"role": "assistant", "done": "[DONE]"},
+            ],
+        }
+
+
+
+    async def test_target_tokens_pulls_history_below_target(self):
+        """目标模式下历史被压到目标以内（不再有轮次窗口保护阻止压缩）。"""
+        original_chat = compaction.resolve_model_max_input_tokens
+        original_model = compaction.resolve_context_compaction_model_config
+        try:
+            # 大窗口（528k/500k）：下限 40k，上限 211.2k
+            compaction.resolve_model_max_input_tokens = lambda default=8192: 528_000
+            compaction.resolve_context_compaction_model_config = lambda _s: {
+                "maxInputTokens": 500_000, "apiType": "chat-completions"}
+            rounds = [self._make_big_round(index) for index in range(1, 41)]
+            history_tokens = compaction.estimate_messages_tokens(
+                [msg for entry in rounds
+                 for msg in compaction.round_entry_to_context_messages(entry, -1)]
+            )
+            # 前置条件：上下文视图明显超过目标，压缩才有意义
+            self.assertGreater(history_tokens, 40_000)
+            memory = _MemoryStub(rounds)
+            request = ChatLLMRequest(
+                session_id="target_tokens_test",
+                messages=[{"role": "user", "content": "新问题"}],
+                max_tokens=512,
+            )
+            settings = compaction.ContextCompactionSettings(
+                trigger_ratio=0.5, summary_budget_ratio=0.2,
+                oversized_reject_factor=1.5, max_oversized_rejections=3,
+                target_tokens=40_000,
+            )
+            compacted = await compaction.compact_session_history_if_needed(
+                memory,
+                request,
+                settings=settings,
+                budget_tokens=500_000,
+                enforce=True,
+            )
+            self.assertGreater(compacted, 0)
+            self.assertEqual(memory.summary["source_round_count"], compacted)
+            # 压缩后历史上下文（摘要 + 保留轮次的上下文视图）应小于原始历史
+            summary_text = compaction.render_context_summary(memory.summary) or ""
+            retained = rounds[compacted:]
+            retained_tokens = compaction.estimate_messages_tokens(
+                [msg for entry in retained
+                 for msg in compaction.round_entry_to_context_messages(entry, -1)]
+            )
+            self.assertLess(
+                compaction.estimate_text_tokens(summary_text) + retained_tokens,
+                history_tokens,
+            )
+        finally:
+            compaction.resolve_model_max_input_tokens = original_chat
+            compaction.resolve_context_compaction_model_config = original_model
+
+    async def test_target_tokens_skips_when_history_already_below_target(self):
+        """历史本身已低于目标时不触发压缩（目标只是上限，不是"必须压"）。"""
+        original_chat = compaction.resolve_model_max_input_tokens
+        original_model = compaction.resolve_context_compaction_model_config
+        try:
+            compaction.resolve_model_max_input_tokens = lambda default=8192: 528_000
+            compaction.resolve_context_compaction_model_config = lambda _s: {
+                "maxInputTokens": 500_000, "apiType": "chat-completions"}
+            rounds = [self._make_round(index) for index in range(1, 9)]
+            memory = _MemoryStub(rounds)
+            request = ChatLLMRequest(
+                session_id="target_noop_test",
+                messages=[{"role": "user", "content": "新问题"}],
+                max_tokens=512,
+            )
+            # 目标 = 上限（211.2k），远大于当前历史 → 不压缩
+            settings = compaction.ContextCompactionSettings(
+                trigger_ratio=0.5, summary_budget_ratio=0.2,
+                oversized_reject_factor=1.5, max_oversized_rejections=3,
+                target_tokens=200_000,
+            )
+            compacted = await compaction.compact_session_history_if_needed(
+                memory,
+                request,
+                settings=settings,
+                budget_tokens=500_000,
+                enforce=True,
+            )
+            self.assertEqual(compacted, 0)
+            self.assertIsNone(memory.summary)
+        finally:
+            compaction.resolve_model_max_input_tokens = original_chat
+            compaction.resolve_context_compaction_model_config = original_model
 
 
 if __name__ == "__main__":

@@ -676,15 +676,13 @@ def _estimate_pending_reasoning_tokens(pending_round: Any) -> int:
 
 
 def _default_context_history_rounds() -> int:
-    """读取当前历史压缩设置，作为上下文 API 省略轮数时的默认值。
+    """上下文 API 省略轮数时的默认值：0（无限轮次窗口）。
 
-    0 表示无限轮次窗口（仅按阈值压缩），原样返回。
+    历史轮次窗口（HISTORY_COMPACT_KEEP_ROUNDS）已废弃：历史规模由压缩阈值与
+    历史压缩目标控制，不再按"保留最近 N 轮"截断；保留该函数返回 0 以保持
+    旧调用点语义（<=0 即"不限制轮次"）。
     """
-    try:
-        value = int(_load_var("HISTORY_COMPACT_KEEP_ROUNDS", DEFAULT_CONTEXT_HISTORY_ROUNDS) or 0)
-    except (TypeError, ValueError):
-        return DEFAULT_CONTEXT_HISTORY_ROUNDS
-    return value if value >= 0 else DEFAULT_CONTEXT_HISTORY_ROUNDS
+    return 0
 
 
 def _normalize_usage_record_usage(entry: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -2261,18 +2259,18 @@ class ChatMemoryManager:
         recent_questions_token_budget: int | None = None,
     ) -> list[dict[str, Any]]:
         """
-        获取用于模型上下文的历史视图（按 HISTORY_COMPACT_KEEP_ROUNDS 总轮次窗口）。
+        获取用于模型上下文的历史视图。
 
-        窗口语义（keep_rounds = 模型上下文保留的总轮次窗口）：
-        - 未压缩轮次优先占窗口，以完整对话回传（含助手回答、工具调用等），
-          其问题不重复进入保真索引；
-        - 剩余窗口从最新往回分配给已压缩轮次的原始用户问题（保真索引，
-          受 10k token 预算限制，超出从最旧丢弃）；
-        - keep_rounds <= 0 表示无限窗口（仅按阈值压缩）。
+        历史轮次窗口（原 HISTORY_COMPACT_KEEP_ROUNDS）已废弃：不再按"保留最近
+        N 轮"截断，历史规模由压缩阈值与历史压缩目标控制。
+
+        - 未压缩轮次以完整对话回传（含助手回答、工具调用等），其问题不重复
+          进入保真索引；
+        - 已压缩轮次的原始用户问题进入保真索引（受 10k token 预算限制，
+          超出从最旧丢弃）。
 
         Args:
-            max_rounds: 总轮次窗口；省略时跟随 HISTORY_COMPACT_KEEP_ROUNDS，
-                <=0 表示无限窗口
+            max_rounds: 兼容参数；<=0（默认）表示不限制轮次
             max_tool_result_length: 窗口内完整轮次的工具结果回传长度
             minimal: 兼容参数，不再切换已完成历史表示
             recent_questions_token_budget: 保真问题索引预算；省略时为 10k
@@ -2339,10 +2337,10 @@ class ChatMemoryManager:
         if summary_message:
             messages.append({"role": "system", "content": summary_message})
         if context_summary is not None:
-            # 摘要模式：未压缩轮次完整对话占窗口，已压缩轮次问题按剩余窗口保真
+            # 摘要模式：未压缩轮次全部完整对话回传，已压缩轮次问题进入保真索引
             # （未压缩轮次的问题不重复进入索引）
             question_items, raw_rounds = _split_context_window(
-                round_entries, summarized_count, max_rounds, question_budget
+                round_entries, summarized_count, None, question_budget
             )
             recent_questions_message = _render_recent_questions_message(question_items)
             if recent_questions_message:
@@ -2421,12 +2419,14 @@ class ChatMemoryManager:
         summary_only = context_summary is not None
         if summary_only:
             question_items, raw_rounds = _split_context_window(
-                round_entries, summarized_round_count, max_rounds
+                round_entries, summarized_round_count, None
             )
             retained_rounds: list[dict[str, Any]] = list(raw_rounds)
         else:
             question_items = []
-            retained_rounds = round_entries
+            # 必须取副本：下方会把 pending_round 追加进 retained_rounds，
+            # 若直接引用 round_entries 会连带污染轮次总数统计
+            retained_rounds = list(round_entries)
             if max_rounds > 0:
                 retained_rounds = retained_rounds[-max_rounds:]
         if (
@@ -2489,6 +2489,22 @@ class ChatMemoryManager:
         reasoning_tokens = pending_reasoning_tokens
         messages_tokens += reasoning_tokens
         tool_definition_tokens = _estimate_tool_definition_tokens(tools)
+        # 文件清单块（方案二：小文件内联 / 大文件节选 + 按需读取）：真实请求会把
+        # 「文件清单」追加进首条 system 消息，统计口径需与真实请求一致；无文件时
+        # 为 0。（read_document 自动注入条件近似：会话有文件即视为可用，仅影响
+        # 清单尾部提示文案的少量字数，对总量可忽略。）
+        file_memory_tokens = 0
+        try:
+            file_records = file_memory.list_session_file_records(self.session_id)
+            if file_records:
+                file_records.reverse()  # 与清单构建同序：最近上传在前
+                file_block_text = file_memory.build_file_manifest_text(
+                    file_records, read_document_available=True
+                )
+                if file_block_text:
+                    file_memory_tokens = _estimate_text_tokens(file_block_text)
+        except Exception as file_stats_error:
+            print(f"[WARN] 文件清单统计失败（按 0 计入）: {file_stats_error}")
         # 运行时系统提示词（工作路径+系统提示）：真实请求追加在首条 system 消息，
         # 单独统计并计入请求上下文总额，避免低估
         system_prompt_tokens = (
@@ -2498,6 +2514,7 @@ class ChatMemoryManager:
         )
         request_context_tokens = (
             messages_tokens + system_prompt_tokens + tool_definition_tokens
+            + file_memory_tokens
         )
         context_token_limit = _resolve_model_max_input_tokens(default=8192)
 
@@ -2520,6 +2537,7 @@ class ChatMemoryManager:
             "reasoning_tokens": reasoning_tokens,
             "system_prompt_tokens": system_prompt_tokens,
             "tool_definition_tokens": tool_definition_tokens,
+            "file_memory_tokens": file_memory_tokens,
             "request_context_tokens": request_context_tokens,
             "estimated_budget_ratio": round(
                 request_context_tokens / context_token_limit, 4

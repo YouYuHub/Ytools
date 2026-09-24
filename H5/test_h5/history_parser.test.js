@@ -154,6 +154,62 @@ test("parseHistory: chat_round.events 中的单轮压缩按实际顺序展开且
   assert.equal(parsed.records[4].usage.total_tokens, 15);
 });
 
+test("parseHistory: 压缩 done 的批次诊断字段（P2-1）解析到记录", function () {
+  // 后端 done 事件新增：本批源规模 / 批源预算 / 尾部保留轮次 / 单段输出上限 /
+  // 源截断标记——用于核对"每批吃了多少、是否被截断"；历史回放同样可见。
+  // 注：chat_round.events 内嵌的压缩事件 scope 为 round（session 级为独立 JSONL 行）。
+  const round = fakeRound([
+    {
+      timestamp: "2026-08-08 18:00:01",
+      event: "context_compaction",
+      scope: "round",
+      phase: "done",
+      role: "assistant",
+      summary_text: "【已完成工作】已完成文件扫描",
+      before_tokens: 360000,
+      after_tokens: 189000,
+      token_limit: 200000,
+      trigger_reason: "task",
+      batch_source_tokens: 180000,
+      source_budget: 450000,
+      tail_rounds: 5,
+      output_token_limit: 15020,
+      source_was_truncated: true,
+      warnings: ["batch_source_truncated"],
+    },
+    { timestamp: "2026-08-08 18:00:02", role: "assistant", content: "继续处理" },
+  ]);
+  const rec = historyParser.parseHistory(round).records
+    .filter(function (r) { return r.kind === "compaction"; })[0];
+  assert.equal(rec.batch_source_tokens, 180000);
+  assert.equal(rec.source_budget, 450000);
+  assert.equal(rec.tail_rounds, 5);
+  assert.equal(rec.output_token_limit, 15020);
+  assert.equal(rec.source_was_truncated, true);
+  assert.deepEqual(rec.warnings, ["batch_source_truncated"]);
+});
+
+test("parseHistory: 旧数据无批次诊断字段时保持空值（向后兼容）", function () {
+  const round = fakeRound([
+    {
+      timestamp: "2026-08-08 18:00:01",
+      event: "context_compaction",
+      scope: "round",
+      phase: "done",
+      role: "assistant",
+      summary_text: "旧版摘要",
+      before_tokens: 100,
+      after_tokens: 50,
+    },
+  ]);
+  const rec = historyParser.parseHistory(round).records
+    .filter(function (r) { return r.kind === "compaction"; })[0];
+  // 旧数据无这些字段：解析为 null（未提供），前端据此不渲染该行
+  assert.equal(rec.batch_source_tokens, null);
+  assert.equal(rec.tail_rounds, null);
+  assert.equal(rec.source_was_truncated, false);
+});
+
 test("parseHistory: aborted 压缩事件把同 scope 的 start 置为中断态", function () {
   const roundStart = {
     event: "context_compaction",

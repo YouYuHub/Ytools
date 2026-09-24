@@ -172,6 +172,185 @@ def _list_session_files(session_id: str) -> list[Path]:
     return files
 
 
+# ---------- 文件清单（发送口径：清单 + 按需读取） ----------
+# 上传文件的解析文本不再全量拼接进系统提示，而是构建「文件清单」：
+# 小文件（≤ inline 上限）内联全文；大文件给开头节选 + read_document 读取提示；
+# 清单总预算封顶，超出按「新文件优先」收缩（先截断/省略最旧文件）。模型需要
+# 细节时调用内置工具 read_document 按字符区间读取完整内容（read_document 由
+# chat_factory 在会话存在上传文件且携带工具时自动注入）。
+FILE_MEMORY_INLINE_MAX_CHARS = 4000      # 单文件全文内联上限（解析文本字符数）
+FILE_MEMORY_HEAD_EXCERPT_CHARS = 2000    # 大文件开头节选字符数
+FILE_MEMORY_TOTAL_MAX_CHARS = 16000      # 文件清单总预算（字符）
+FILE_MEMORY_INDEX_MAX_CHARS = 1500       # 文件索引（降级形态）总预算（字符）
+
+
+def list_session_file_records(session_id: str) -> list[dict[str, Any]]:
+    """读取该会话全部文件解析记录（按上传时间升序，旧在前）。"""
+    records: list[dict[str, Any]] = []
+    for record_path in _list_session_files(session_id):
+        data = _read_json_file(record_path)
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def count_session_file_memory(session_id: str) -> int:
+    """会话文件记忆条数（轻量：只数记录文件，不读取内容）。"""
+    session_dir = _get_session_dir(session_id)
+    if not session_dir.exists():
+        return 0
+    return sum(1 for _ in session_dir.glob("*.json"))
+
+
+def find_file_memory_record(session_id: str, filename: str) -> dict[str, Any] | None:
+    """按原始文件名查找解析记录；未找到返回 None。
+
+    优先精确匹配记录内 filename 字段（原始名）；退化匹配清洗后的名字
+    （兼容中文文件名被清洗为纯扩展名的历史记录）。多条同名取最新一条。
+    """
+    target = str(filename or "").strip()
+    if not target:
+        return None
+    safe_target = _safe_filename(target)
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    for record_path in _list_session_files(session_id):
+        data = _read_json_file(record_path)
+        if isinstance(data, dict):
+            candidates.append((record_path, data))
+    for _record_path, data in reversed(candidates):
+        if str(data.get("filename") or "").strip() == target:
+            return data
+    for record_path, data in reversed(candidates):
+        if record_path.stem == safe_target:
+            return data
+        if _safe_filename(str(data.get("filename") or "")) == safe_target:
+            return data
+    return None
+
+
+def _format_file_size(size: Any) -> str:
+    try:
+        number = int(size)
+    except (TypeError, ValueError):
+        return ""
+    if number <= 0:
+        return ""
+    if number < 1024:
+        return f"{number}B"
+    if number < 1024 * 1024:
+        return f"{number / 1024:.1f}KB"
+    return f"{number / (1024 * 1024):.1f}MB"
+
+
+def _file_record_header(index: int, record: dict[str, Any], *, with_length: bool) -> str:
+    filename = str(record.get("filename") or "未命名")
+    file_type = str(record.get("type") or "").strip()
+    size_text = _format_file_size(record.get("size"))
+    meta = "，".join(bit for bit in (file_type, size_text) if bit)
+    if with_length:
+        content_len = len(str(record.get("content") or ""))
+        meta = f"{meta}，共约 {content_len} 字" if meta else f"共约 {content_len} 字"
+    return f"【文件 {index}】{filename}" + (f"（{meta}）" if meta else "")
+
+
+def build_file_manifest_text(
+    records: list[dict[str, Any]],
+    *,
+    read_document_available: bool = True,
+    inline_max_chars: int = FILE_MEMORY_INLINE_MAX_CHARS,
+    head_excerpt_chars: int = FILE_MEMORY_HEAD_EXCERPT_CHARS,
+    total_max_chars: int = FILE_MEMORY_TOTAL_MAX_CHARS,
+) -> str:
+    """构建「文件清单」注入文本（发送口径）。
+
+    - 小文件（解析文本 ≤ inline_max_chars）：内联全文；
+    - 大文件：给开头 head_excerpt_chars 字节选 + read_document 读取提示；
+    - 总预算 total_max_chars：超出时按「新文件优先」收缩（先截断/省略最旧文件）。
+
+    调用方约定记录顺序：最近上传的在前。返回空串表示没有文件。
+    """
+    if not records:
+        return ""
+    parts: list[str] = []
+    used = 0
+    omitted = 0
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            continue
+        content = str(record.get("content") or "")
+        total_len = len(content)
+        inline = total_len <= inline_max_chars
+        body = content if inline else content[:head_excerpt_chars]
+        header = _file_record_header(index, record, with_length=not inline)
+        if inline:
+            block = f"{header}\n{body}" if body else header
+        else:
+            note = f"（内容较长，已节选开头 {len(body)} 字）"
+            if read_document_available:
+                filename = str(record.get("filename") or "")
+                note += f'；可调用 read_document(filename="{filename}") 读取完整内容'
+            block = f"{header}\n{body}\n{note}" if body else f"{header}\n{note}"
+        if used + len(block) + 1 > total_max_chars:
+            remaining = total_max_chars - used - 1
+            if remaining >= 300:
+                parts.append(block[:remaining] + "…（因上下文预算截断）")
+                omitted = max(0, len(records) - index)
+                used = total_max_chars
+            else:
+                omitted = max(0, len(records) - index + 1)
+            break
+        parts.append(block)
+        used += len(block) + 1
+    if not parts:
+        return ""
+    intro = f"\n用户上传了 {len(records)} 个文件，解析内容如下"
+    if read_document_available:
+        intro += "（小文件已内联全文，大文件为开头节选，可用 read_document 读取完整内容）"
+    intro += "：\n"
+    text = intro + "\n".join(parts)
+    if omitted > 0:
+        tail = f"\n（另有 {omitted} 个更早的文件因上下文预算省略"
+        if read_document_available:
+            tail += "，可用 read_document 按文件名读取"
+        tail += "）"
+        text += tail
+    return text
+
+
+def build_file_index_text(
+    records: list[dict[str, Any]],
+    *,
+    read_document_available: bool = True,
+    total_max_chars: int = FILE_MEMORY_INDEX_MAX_CHARS,
+) -> str:
+    """构建「文件索引」文本（首调用超窗时的最小降级形态：仅文件名/类型/大小）。"""
+    if not records:
+        return ""
+    lines: list[str] = []
+    used = 0
+    omitted = 0
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            continue
+        line = f"- {_file_record_header(index, record, with_length=False)}"
+        if used + len(line) + 1 > total_max_chars:
+            omitted = max(0, len(records) - index + 1)
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if not lines:
+        return ""
+    intro = f"\n用户上传了 {len(records)} 个文件"
+    if read_document_available:
+        intro += "（因上下文预算仅保留索引，可用 read_document 读取完整内容）"
+    else:
+        intro += "（因上下文预算仅保留索引）"
+    text = intro + "：\n" + "\n".join(lines)
+    if omitted > 0:
+        text += f"\n（另有 {omitted} 个更早的文件因预算省略）"
+    return text
+
+
 def _convert_image_bytes_to_png(data: bytes) -> bytes:
     """把 ICO/TIFF 等视觉模型不原生接受的图片字节转为 PNG。
 
@@ -1801,6 +1980,32 @@ class FileMemoryManager:
             summary_parts.append(part)
             total_chars += len(part)
         return "\n".join(summary_parts)
+
+    def count_file_memory(self) -> int:
+        """当前会话文件记忆条数（轻量：只数记录文件，不读取内容）。"""
+        return count_session_file_memory(self._session_id)
+
+    def get_file_memory_manifest(self, *, read_document_available: bool = True) -> str:
+        """构建「文件清单」注入文本（发送口径：小文件内联 / 大文件节选 + 按需读取）。
+
+        与旧版 get_file_memory_chat（全量拼接）的区别：受总预算约束、大文件
+        只给开头节选，模型需要细节时用 read_document 工具按需读取。
+        """
+        with self._lock:
+            records = list_session_file_records(self._session_id)
+        records.reverse()  # 最近上传的排前面（预算收缩先挤最旧）
+        return build_file_manifest_text(
+            records, read_document_available=read_document_available
+        )
+
+    def get_file_memory_index(self, *, read_document_available: bool = True) -> str:
+        """构建「文件索引」文本（首调用超窗时的最小降级形态）。"""
+        with self._lock:
+            records = list_session_file_records(self._session_id)
+        records.reverse()
+        return build_file_index_text(
+            records, read_document_available=read_document_available
+        )
 
     def clear_file_memory(self) -> str:
         """

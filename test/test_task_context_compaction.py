@@ -101,11 +101,14 @@ class TaskContextCompactionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(result)
-        # 跨轮压缩以 enforce + 预算（阈值×0.4，下限 2048）调用
+        # 跨轮压缩以 enforce + 动态历史预算调用（按实际可用空间计算）；force_all=False
+        # 让预算内的最近轮次保留为原始对话（保真），仅压缩超出预算的旧轮次。
+        # 历史轮次窗口已废弃：tail_rounds_limit 不再限制保留轮数（由预算决定）。
         self.assertEqual(len(compact_kwargs), 1)
         self.assertTrue(compact_kwargs[0].get("enforce"))
-        self.assertTrue(compact_kwargs[0].get("force_all"))
-        self.assertEqual(compact_kwargs[0].get("budget_tokens"), 2048)
+        self.assertFalse(compact_kwargs[0].get("force_all"))
+        self.assertGreaterEqual(compact_kwargs[0].get("budget_tokens"), 2048)
+        self.assertIsNone(compact_kwargs[0].get("tail_rounds_limit"))
         # 首条 system = 原 main system 原样保留（persona+runtime 不丢失）
         self.assertEqual(result[0]["role"], "system")
         self.assertEqual(result[0]["content"], messages[0]["content"])
@@ -119,6 +122,7 @@ class TaskContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[-3]["content"], "当前问题")
 
     async def test_history_budget_floor_and_rounds_argument(self):
+        """历史预算下限 2048；历史轮次窗口已废弃 → 重建上下文时不限制轮次（max_rounds=0）。"""
         messages = _build_messages()
         memory = _MemoryStub([])
 
@@ -137,12 +141,12 @@ class TaskContextCompactionTests(unittest.IsolatedAsyncioTestCase):
                 file_block_text=self.file_block,
                 event_emitter=None,
             )
-        # 历史预算下限 2048
         self.assertGreaterEqual(chat_factory.estimate_request_context_tokens(messages, None), 0)
-        self.assertEqual(memory.calls[0]["max_rounds"], 7)
+        # 轮次窗口已废弃：即使调用方传了 backend_history_rounds，重建时也不再截断
+        self.assertEqual(memory.calls[0]["max_rounds"], 0)
 
     async def test_unlimited_rounds_passed_through_to_context_rebuild(self):
-        """backend_history_rounds<=0（无限窗口）应原样透传，不被 max(1, ...) 限成 1 轮。"""
+        """backend_history_rounds<=0 同样重建为不限制轮次（max_rounds=0）。"""
         messages = _build_messages()
         memory = _MemoryStub([])
 

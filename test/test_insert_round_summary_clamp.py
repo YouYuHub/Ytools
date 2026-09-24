@@ -401,7 +401,7 @@ class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
         # 未覆盖轮次（第 4、5 轮）超预算需要压缩，但压缩源必须从第 4 轮开始
         request = ChatLLMRequest(messages=[{"role": "user", "content": "新任务"}])
         settings = compaction.ContextCompactionSettings(
-            keep_rounds=1,
+
             trigger_ratio=0.5,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,

@@ -18,11 +18,15 @@ DEFAULT_SERVICE_HOST = load_var("DEFAULT_SERVICE_HOST", "0.0.0.0")
 DEFAULT_SERVICE_PORT = load_var("DEFAULT_SERVICE_PORT", 48621)
 
 # 兼容旧版原始历史上下文与统计的默认轮数；摘要-only 模式下已完成轮次不再按轮回传。
-# 历史压缩设置中的 keep_rounds 仍保留为兼容配置，避免旧客户端字段失效。
-DEFAULT_CONTEXT_HISTORY_ROUNDS = 20         # 默认的上下文历史轮数
+# 历史轮次窗口（keep_rounds / HISTORY_COMPACT_KEEP_ROUNDS）已废弃：历史规模由
+# 压缩触发阈值与历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS）控制。
+DEFAULT_CONTEXT_HISTORY_ROUNDS = 20         # 兼容旧字段的默认值（当前不再参与压缩决策）
 DEFAULT_HISTORY_TRIGGER_RATIO = 0.8         # 历史压缩触发比例
 DEFAULT_HISTORY_CHUNK_ROUNDS = 3            # 历史压缩每次处理的轮数
 DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
+# 历史压缩目标（tokens）：>0 时把"历史部分"压到该值以内（与触发阈值无关），
+# 用于压低长任务的单次输入成本；0 表示不设目标（仅按触发阈值/可用空间压缩）。
+DEFAULT_HISTORY_COMPACT_TARGET_TOKENS = 0
 DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模型上下文的系数
 DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务
 DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符
@@ -131,15 +135,12 @@ class ChatModelSelection(BaseModel):
 
 
 class HistoryCompactionConfig(BaseModel):
-    """上下文压缩策略的完整配置请求。"""
+    """上下文压缩策略的完整配置请求。
 
-    keep_rounds: int = Field(
-        DEFAULT_CONTEXT_HISTORY_ROUNDS,
-        ge=0,
-        le=200,
-        description="模型上下文保留的总轮次窗口：未压缩轮次完整对话占窗口，"
-                    "已压缩轮次问题按剩余窗口保真；0 表示无限轮次（仅按阈值压缩）",
-    )
+    keep_rounds（历史轮次窗口）已废弃：历史规模由触发比例与历史压缩目标控制。
+    旧客户端仍可能提交该字段，Pydantic 默认忽略未声明字段，不会报错。
+    """
+
     trigger_ratio: float = Field(
         DEFAULT_HISTORY_TRIGGER_RATIO,
         gt=0,
@@ -151,6 +152,13 @@ class HistoryCompactionConfig(BaseModel):
         gt=0,
         le=0.5,
         description="累计摘要总预算 = 聊天模型窗口 × 该比例（最大 0.5）",
+    )
+    target_tokens: Optional[int] = Field(
+        None,
+        ge=0,
+        le=1000000,
+        description="历史压缩目标（tokens）：>0 时把历史部分压到该值以内（与触发阈值无关，"
+                    "用于压低长任务的单次输入成本）；0 表示不设目标；None 表示保持当前 .env 配置",
     )
     oversized_reject_factor: Optional[float] = Field(
         DEFAULT_OVERSIZED_REJECT_FACTOR,

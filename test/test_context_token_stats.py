@@ -98,7 +98,8 @@ class ContextTokenStatsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["rounds"]["total"], 3)
         self.assertEqual(stats["rounds"]["summarized"], 0)
         self.assertEqual(stats["rounds"]["retained"], 3)
-        self.assertEqual(stats["rounds"]["max_rounds"], 20)
+        # 历史轮次窗口已废弃：不再按轮数限制（max_rounds=0 表示不限制）
+        self.assertEqual(stats["rounds"]["max_rounds"], 0)
         self.assertEqual(len(stats["round_tokens"]), 3)
         self.assertGreater(stats["messages_tokens"], 0)
         self.assertEqual(
@@ -338,7 +339,7 @@ class RoundCompactionUsagePropagationTests(unittest.IsolatedAsyncioTestCase):
             messages,
             request,
             settings=compaction.ContextCompactionSettings(
-                keep_rounds=1,
+
                 trigger_ratio=0.5,
                 summary_budget_ratio=0.2,
                 oversized_reject_factor=1.5,
@@ -387,7 +388,7 @@ class RoundCompactionUsagePropagationTests(unittest.IsolatedAsyncioTestCase):
             messages,
             request,
             settings=compaction.ContextCompactionSettings(
-                keep_rounds=1,
+
                 trigger_ratio=0.5,
                 summary_budget_ratio=0.2,
                 oversized_reject_factor=1.5,

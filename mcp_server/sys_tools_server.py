@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 from html import unescape
@@ -330,7 +331,6 @@ def _merged_child_env():
                 continue
     except ImportError:
         pass
-
     # 补充"易失变量"：COMPUTERNAME 与登录用户信息不落盘在上述键中，
     # 由系统在启动/登录时动态生成，需从专门位置读取（存在则不覆盖已有值）。
     try:
@@ -361,7 +361,6 @@ def _merged_child_env():
             pass
     except ImportError:
         pass
-
     builtin = _builtin_windows_env()
     # 展开用查找表：系统 < 用户/易失 < 进程 < 内置（内置仅兜底，真实值优先）
     lookup = {}
@@ -460,7 +459,6 @@ def _walk_entries(root: Path, max_depth: int):
 
 
 # ============================ HTML 处理辅助 ============================
-
 # 提取纯文本时整段跳过的标签
 _SKIP_HTML_TAGS = {"script", "style", "noscript", "template", "svg", "iframe", "head", "select", "option"}
 # 视为块级、转换行处理的标签
@@ -949,11 +947,423 @@ _BG_LOG_DIR = Path.home() / ".mcp_bg_logs"
 _BG_NAME_SEQ = itertools.count(1)
 
 
+# ==================== run_command 的 cmd 家族健壮性补丁 ====================
+# 以下三处均为实测复现的真实坑（Windows + cmd 家族 shell）：
+#
+# 1) 多行内联代码：命令写入 .run.cmd 后由 cmd 按行解释，`python -c "第一行`
+#    之后的行被 cmd 当成独立命令执行（实测报 `i was unexpected at this time.`），
+#    且首行代码因引号跨行未闭合被破坏 → 必然失败；
+# 2) 管道过滤器：PATH 里的 `tail`/`head` 可能命中"非管道过滤器"实现（实测为
+#    宝塔面板 E:\BtSoft\panel\script\tail.EXE）。该实现直接读 stdin 时"看起来能用"，
+#    但在 cmd 管道中提前退出且不转发输出，上游写入失败（OSError [Errno 22]
+#    Invalid argument）→ 整条管道静默"无输出"；必须用【管道形式】探测才能识别；
+# 3) cmd 不支持 `;` 串联：`echo A; echo B` 把 `; echo B` 当普通参数原样输出
+#    （exit=0），表现为"命令成功但没执行"；另有用 Unix 命令名（ls/cat/...）
+#    在 cmd 下必然失败的情况。
+#
+# 补丁策略：① 多行内联代码改写为临时脚本执行；② 管道过滤器探测 + 替换/本地兜底；
+# ③ 失败或可疑时附语法提示（不改变命令本身）。
+
+# 管道过滤器探测结果缓存：key=(工具名, 参数, exe路径) -> 是否可用
+_PIPE_FILTER_PROBE_CACHE: dict = {}
+# 内联代码改写为脚本时的最大代码长度（防误写超大文件）
+_INLINE_SCRIPT_MAX_CHARS = 200000
+# cmd 内建（internal）命令：不是磁盘上的可执行文件，不能用"文件是否存在"判断，
+# 否则 `del`/`dir`/`copy` 等会被误报为"命令不存在"（实测踩坑）。
+_CMD_INTERNAL_COMMANDS = frozenset({
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del",
+    "dir", "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md",
+    "mkdir", "mklink", "move", "path", "pause", "popd", "prompt", "pushd", "rd",
+    "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time",
+    "title", "type", "ver", "verify", "vol",
+})
+# 仅含行数参数的 tail/head（如 `tail -20`、`head -n 5`）
+_SIMPLE_FILTER_RE = re.compile(
+    r"^\s*(tail|head)\s+(?:(?:-n)\s*(\d+)|-(\d+))\s*$", re.IGNORECASE)
+# 内联代码执行入口：python -c / node -e / node --eval
+_INLINE_CODE_RE = re.compile(
+    r"(?P<interp>(?:^|[\s&|(])(?:python|python3|py|node)(?:\.exe)?)"
+    r"\s+(?P<flag>-c|-e|--eval)\s+(?P<quote>[\"'])",
+    re.IGNORECASE)
+# cmd 下常见的 Unix 命令 → Windows 等价物（仅用于失败后的提示）
+_UNIX_COMMAND_EQUIVALENTS = {
+    "ls": "dir", "cat": "type", "rm": "del", "cp": "copy", "mv": "move",
+    "pwd": "cd", "which": "where", "clear": "cls", "export": "set",
+    "grep": "findstr", "ps": "tasklist", "kill": "taskkill", "ln": "mklink",
+    "touch": "type nul > 文件", "head": "（无等价，可用 shell=bash）",
+    "tail": "（无等价，可用 shell=bash）", "sed": "（无等价，建议 shell=bash）",
+    "awk": "（无等价，建议 shell=bash）", "chmod": "（无等价，建议 shell=bash）",
+}
+
+
+def _cmd_env_path_dirs() -> list:
+    """返回子进程实际使用的 PATH 目录列表（与执行环境一致，非宿主 os.environ）。"""
+    env = _merged_child_env() or os.environ
+    raw = ""
+    for key, value in env.items():
+        if isinstance(key, str) and key.upper() == "PATH" and isinstance(value, str):
+            raw = value
+            break
+    return [item.strip().strip('"') for item in raw.split(os.pathsep) if item.strip()]
+
+
+def _split_top_level_pipes(command: str, quote_chars: tuple = ('"',)) -> list:
+    """按顶层 `|` 切分命令（跳过引号内与 `^` 转义后的 `|`）。"""
+    segments: list = []
+    current: list = []
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "^":
+            current.append(char)
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            current.append(char)
+            continue
+        if char in quote_chars:
+            quote = char
+            current.append(char)
+            continue
+        if char == "|":
+            segments.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    segments.append("".join(current))
+    return segments
+
+
+def _parse_simple_filter(segment: str):
+    """识别"仅含行数参数的 tail/head"管道段，返回 (工具名, 行数)，否则 None。"""
+    match = _SIMPLE_FILTER_RE.match(segment or "")
+    if not match:
+        return None
+    count = int(match.group(2) or match.group(3))
+    if count <= 0:
+        return None
+    return match.group(1).lower(), count
+
+
+def _resolve_filter_path(tool: str) -> str:
+    """按子进程 PATH 把工具名解析为可执行文件路径（找不到返回空串）。
+
+    按 .exe → .com → .bat → 无扩展名 的顺序逐目录查找，与 cmd 的搜索顺序一致；
+    实测坑：`tail` 可能命中 E:\\BtSoft\\panel\\script\\tail.EXE（非管道过滤器实现）。
+    """
+    for directory in _cmd_env_path_dirs():
+        for name in (f"{tool}.exe", f"{tool}.com", f"{tool}.bat", tool):
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def _pipe_filter_works(tool: str, args: str, exe_path: str = "") -> bool:
+    """用【管道形式 + 独立进程生产者】探测过滤器是否真的可用（结果缓存）。
+
+    为什么不能直接调用探测：部分实现（如宝塔 tail.exe）直接读 stdin 时能输出，
+    但在 cmd 管道中提前退出且不转发数据，直接调用探测会误判为"可用"。
+    为什么探针必须是"独立进程生产者"：实测该实现对 cmd 内部命令（`for /l` + `echo`）
+    能正常输出，只有上游是**独立进程**（python.exe 等，自己持有管道写句柄）时
+    才会出现"上游写管道失败（Errno 22）+ 过滤器不转发 → 整条管道静默无输出"；
+    只测内部命令会漏判（本次修复中第一版探针即因此误判为可用）。
+    探测脚本以 .cmd 文件 + `call` 执行，避免命令行引号被二次解析破坏。
+    """
+    key = (tool.lower(), args, exe_path.lower())
+    if key in _PIPE_FILTER_PROBE_CACHE:
+        return _PIPE_FILTER_PROBE_CACHE[key]
+    target = f'"{exe_path}"' if exe_path else tool
+    marker = "run_command_probe_line"
+    total = 5000
+    # 两个探针各自独立断言（不能合并计数：`-1` 这类小行数参数每个探针只产出 1 行，
+    # 合并计数会把"两次都成功"误判成失败，进而错误回退到本地兜底）
+    # 两个探针的输入末行必须一致：cmd `for /l (0,1,4999)` 与 python `range(5000)`
+    # 都产出 marker_0..marker_4999，断言统一取 marker_{total-1}。
+    # （踩坑记录：内部生产者写成 `(1,1,5000)` 时末行是 marker_5000，与断言差 1，
+    #   会让 `-1` 场景永远判"不可用"、而 `-2` 及以上因倒数第二行命中而"假通过"。）
+    probes = [
+        # 探针 1：cmd 内部命令生产者（快速冒烟，覆盖"能否过滤"）
+        f"(for /l %%i in (0,1,{total - 1}) do @echo {marker}_%%i) | {target} {args}\r\n",
+        # 探针 2：独立进程生产者（真实场景；上游程序自己写管道，最易暴露丢数据）
+        (f'"{sys.executable}" -c "[print(\'{marker}_\' + str(i)) for i in range({total})]"'
+         f" | {target} {args}\r\n"),
+    ]
+    ok = True
+    for probe in probes:
+        probe_path = None
+        try:
+            handle, probe_path = tempfile.mkstemp(prefix="rc_probe_", suffix=".cmd")
+            with os.fdopen(handle, "w", encoding="mbcs", errors="replace") as file:
+                file.write("@echo off\r\n")
+                file.write(probe)
+            proc = subprocess.run(
+                [os.environ.get("COMSPEC") or "cmd.exe", "/c", "call", probe_path],
+                capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=_merged_child_env() or None)
+            text = _decode_bytes(proc.stdout or b"", candidates=_command_output_candidates())
+            if f"{marker}_{total - 1}" not in text:
+                ok = False
+        except Exception:
+            ok = False
+        finally:
+            if probe_path:
+                try:
+                    os.unlink(probe_path)
+                except OSError:
+                    pass
+        if not ok:
+            break
+    _PIPE_FILTER_PROBE_CACHE[key] = ok
+    return ok
+
+
+def _find_working_filter(tool: str, args: str, skip_path: str = "") -> Optional[str]:
+    """在 PATH 中寻找同名的可用管道过滤器实现（跳过已知不可用的那个）。"""
+    skip = os.path.normcase(os.path.abspath(skip_path)) if skip_path else ""
+    for directory in _cmd_env_path_dirs():
+        for name in (f"{tool}.exe", f"{tool}.com", f"{tool}.bat", tool):
+            candidate = os.path.join(directory, name)
+            if not os.path.isfile(candidate):
+                continue
+            if skip and os.path.normcase(os.path.abspath(candidate)) == skip:
+                continue
+            if _pipe_filter_works(tool, args, candidate):
+                return candidate
+    return None
+
+
+def _apply_local_line_filter(text: str, kind: str, count: int) -> str:
+    """本地实现 `| tail -N` / `| head -N`（按行取末尾/开头 N 行）。"""
+    if not text:
+        return text
+    trailing_newline = text.endswith("\n")
+    lines = text.split("\n")
+    if trailing_newline:
+        lines = lines[:-1]
+    if kind == "tail":
+        picked = lines[-count:] if count < len(lines) else lines
+    else:
+        picked = lines[:count]
+    return "\n".join(picked) + ("\n" if picked and trailing_newline else "")
+
+
+def _guard_cmd_pipeline(command: str):
+    """cmd 家族管道兜底：处理末尾的简单 `| tail -N` / `| head -N` 段。
+
+    返回 (新命令, 本地过滤说明或 None, 提示列表)：
+    - 过滤器可用（管道形式探测通过）：命令原样返回；
+    - 当前命中的实现不可用、但 PATH 中存在可用实现：替换为可用实现的绝对路径；
+    - 均不可用：去掉该管道段，改由本工具在 Python 侧取头/尾 N 行（输出不丢）。
+    """
+    if "|" not in command:
+        return command, None, []
+    segments = _split_top_level_pipes(command)
+    if len(segments) < 2:
+        return command, None, []
+    parsed = _parse_simple_filter(segments[-1])
+    if parsed is None:
+        return command, None, []
+    tool, count = parsed
+    args = f"-{count}"
+    current_path = _resolve_filter_path(tool)
+    if current_path and _pipe_filter_works(tool, args, current_path):
+        return command, None, []
+    alternative = _find_working_filter(tool, args, current_path)
+    head = "|".join(segments[:-1]).rstrip()
+    if alternative:
+        return (
+            f'{head} | "{alternative}" {args}',
+            None,
+            [f"检测到 `{tool}` 当前命中的实现（{current_path or '未找到'}）不是可用的管道过滤器，"
+             f"已自动改用 {alternative}（输出不再丢失）"],
+        )
+    return (
+        head,
+        (tool, count),
+        [f"检测到 `{tool}` 不可用（{current_path or '未找到'}），"
+         f"已由 run_command 在本地实现 `| {tool} -{count}`（取"
+         f"{'末尾' if tool == 'tail' else '开头'} {count} 行；如需原生过滤请安装可用实现或改用 shell=bash）"],
+    )
+
+
+def _find_inline_code(command: str):
+    """定位多行内联代码执行（python -c / node -e）。
+
+    返回 dict（含解释器、入口 flag 及其在命令中的位置、代码文本）或 None。
+    仅当代码跨行（含换行）时才返回——单行命令交给 shell 原生处理。
+    改写时需要把"入口 flag + 引号内代码"整体替换为"脚本路径"，
+    因此这里同时给出 flag 的起止下标。
+    """
+    match = _INLINE_CODE_RE.search(command)
+    if not match:
+        return None
+    interp_token = match.group("interp")
+    interp = interp_token.strip().lstrip("&|(").strip()
+    quote = match.group("quote")
+    open_index = match.end() - 1
+    # 闭引号：从末尾往前找，要求"后面只剩 shell 尾部语法"（重定向/管道/&&/参数）。
+    # 判据（实测踩坑后放宽）：remainder 为空、或以空白开头且不含引号、不含 ";"。
+    # 例：` 2>&1 | tail -2`（多行代码 + 管道）此前被过严的字符类规则漏判，
+    # 导致不改写 → cmd 拆行 → 管道失效且输出混乱。
+    close_index = None
+    for index in range(len(command) - 1, open_index, -1):
+        if command[index] != quote:
+            continue
+        remainder = command[index + 1:]
+        if remainder == "" or (
+            re.match(r"^\s[^\"']*$", remainder)
+            and ";" not in remainder
+            and "\n" not in remainder
+        ):
+            close_index = index
+            break
+    if close_index is None:
+        return None
+    code = command[open_index + 1: close_index]
+    if "\n" not in code:
+        return None
+    if len(code) > _INLINE_SCRIPT_MAX_CHARS:
+        return None
+    return {
+        "interp": interp,
+        "flag": match.group("flag"),
+        "flag_start": match.start("flag"),
+        "flag_end": match.end("flag"),
+        "open_index": open_index,
+        "close_index": close_index,
+        "code": code,
+    }
+
+
+def _rewrite_multiline_inline_code(command: str, shell_kind: str):
+    """把多行内联代码改写为临时脚本执行（cmd 家族）。
+
+    cmd 按行解释 .cmd 文件，多行内联代码必然被拆行执行；改写为
+    `<解释器> "<临时脚本>"` 后语义与 `-c` 一致（退出码透传），且支持中文与引号。
+    注意必须连入口 flag（`-c`/`-e`）一起替换掉：`python -c "<路径>"` 会把路径
+    当代码字符串执行（实测 SyntaxError），而 `python "<路径>"` 才是执行脚本。
+    返回 (新命令, 提示列表)。
+    """
+    if shell_kind != "cmd" or "\n" not in command:
+        return command, []
+    found = _find_inline_code(command)
+    if not found:
+        # 有多行内联代码痕迹但无法安全改写（尾部语法复杂/含分号等）：给出明确提示，
+        # 避免"首行被当命令执行 + 后续行报错"的混乱结果被误读为成功
+        if _INLINE_CODE_RE.search(command):
+            return command, [
+                "检测到多行内联代码但尾部语法复杂，未自动改写；cmd 按行解释 .cmd 文件，"
+                "多行 `-c` 代码会被拆行执行（可能部分执行并伴随报错）。"
+                "建议把代码写入脚本文件（write_file）后执行，或改用 shell=bash/pwsh"
+            ]
+        return command, []
+    interp = found["interp"]
+    interp_name = Path(interp).stem.lower()
+    extension = "js" if interp_name == "node" else "py"
+    code = found["code"]
+    try:
+        _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        seq = next(_BG_NAME_SEQ) % 10000
+        script_path = _BG_LOG_DIR / f"inline_{stamp}_{seq:04d}_{os.getpid()}.{extension}"
+        script_path.write_text(code if code.endswith("\n") else code + "\n", encoding="utf-8")
+    except OSError as exc:
+        return command, [f"多行内联代码改写失败（{exc}）；cmd 按行解释 .cmd，多行 `-c` 代码会失败，"
+                         "建议改用 write_file 写脚本后执行"]
+    # 用"解释器 + 脚本路径"替换"解释器 + 入口 flag + 引号内代码"
+    new_command = (
+        f'{command[:found["flag_start"]]}"{script_path}"'
+        f'{command[found["close_index"] + 1:]}'
+    )
+    return new_command, [
+        f"检测到多行内联代码（{interp} {found['flag']}）：cmd 按行解释 .cmd 文件会把后续行当命令执行，"
+        f"已自动改写为临时脚本 {_display_path(script_path)} 后执行（语义等价，退出码透传）"
+    ]
+
+
+def _first_token(segment: str) -> str:
+    text = segment.strip().lstrip("&|").strip()
+    match = re.match(r"^([^\s&|<>()]+)", text)
+    return match.group(1) if match else ""
+
+
+def _command_exists_in_child_path(token: str) -> bool:
+    """按子进程 PATH（含 PATHEXT 常见扩展）判断命令是否存在。
+
+    不用宿主 shutil.which：子进程 PATH 经过注册表补全，可能比宿主更全/不同，
+    提示要与实际执行环境一致（例如本机 MSYS2 提供了 ls/cat，就不该提示"不存在"）。
+    """
+    if not token:
+        return False
+    if any(sep in token for sep in ("\\", "/", ":")):
+        return os.path.isfile(token)
+    for directory in _cmd_env_path_dirs():
+        for ext in ("", ".exe", ".com", ".bat", ".cmd"):
+            if os.path.isfile(os.path.join(directory, token + ext)):
+                return True
+    return False
+
+
+def _cmd_syntax_hints(command: str, exit_code, stdout_text: str, stderr_text: str) -> list:
+    """cmd 家族的常见语法误用提示（不改命令，只解释现象并给等价写法）。
+
+    - 顶层 `;`：cmd 不把它当分隔符，`echo A; echo B` 会把后半段原样输出（exit=0，
+      表现为"命令成功但后续没执行"）——实测坑；
+    - 命令名不存在（如 Unix 命令 ls/cat/grep）：给出 Windows 等价物或 shell=bash 建议。
+    """
+    hints: list = []
+    segments = _split_top_level_pipes(command)
+    joined = "|".join(segments)
+    stripped = re.sub(r'"[^"]*"', '""', joined)
+    if ";" in stripped:
+        hints.append(
+            '命令包含顶层 ";"：cmd 不支持用 ";" 分隔命令（会被当普通字符原样输出，'
+            'exit=0 但后续命令没执行）。请改用 "&&"（前一条成功才执行）或 "&"（无条件顺序执行）；'
+            "需要 \";\" 语义请指定 shell=powershell/pwsh/bash。")
+    for segment in segments:
+        token = _first_token(segment)
+        if not token or any(ch in token for ch in ('%', '$', '"', "'")):
+            continue
+        if token.lower() in _CMD_INTERNAL_COMMANDS:
+            continue
+        if not _command_exists_in_child_path(token):
+            equivalent = _UNIX_COMMAND_EQUIVALENTS.get(token.lower())
+            extra = f"；Windows 等价：{equivalent}" if equivalent else ""
+            hints.append(
+                f'命令 "{token}" 在当前 PATH 中不存在{extra}。'
+                "如为 Unix 命令，请指定 shell=bash（需 Git Bash/WSL）或改用 Windows 原生命令。")
+    # 去重并限制条数，避免提示本身占满输出
+    unique: list = []
+    for hint in hints:
+        if hint not in unique:
+            unique.append(hint)
+    return unique[:3]
+
+
+def _append_command_notes(text: str, notes: list) -> str:
+    """把补丁/语法提示追加到工具返回末尾（不改动正文结构，便于模型识别）。"""
+    if not notes:
+        return text
+    lines = [f"[run_command] {note}" for note in notes if note]
+    if not lines:
+        return text
+    return text + "\n" + "\n".join(lines)
+
+
 def _prune_old_bg_files() -> None:
     """清理后台日志/WMI 中转临时文件中超过 24 小时的旧文件（忽略一切错误）。"""
     try:
         cutoff = time.time() - 24 * 3600
-        patterns = ("bg_*", "fg_*")  # bg_=后台日志；fg_=前台命令 WMI 中转的临时文件
+        # bg_=后台日志；fg_=前台命令 WMI 中转的临时文件；inline_=多行内联代码改写出的脚本
+        patterns = ("bg_*", "fg_*", "inline_*")
         for pattern in patterns:
             for item in _BG_LOG_DIR.glob(pattern):
                 try:
@@ -1137,15 +1547,23 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
 def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> None:
     """写执行脚本：cmd→.run.cmd（mbcs）；powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；
     bash/sh/zsh→.run.sh（UTF-8，stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，
-    让中转链 done 文件记录命令本身的退出码。"""
+    让中转链 done 文件记录命令本身的退出码。
+
+    换行统一为 LF 再按目标 shell 组装：命令原文若已含 CRLF（如从文件复制而来），
+    直接拼接会产生 CR CR LF，cmd 解析层会出现空行/多余回车（实测 runner 文件里
+    出现 `\\r\\r\\n`），属于不必要的风险源。
+    """
+    normalized = command.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
     if shell_kind == "cmd":
+        # cmd 按行解释 .cmd：行尾必须是 CRLF；行内 LF 会被当命令结束（多行内联代码
+        # 已在上游改写为临时脚本，此处只做兜底归一化）
+        text = "@echo off\r\n" + normalized.replace("\n", "\r\n") + "\r\n"
         try:
-            runner_path.write_text("@echo off\r\n" + command.rstrip() + "\r\n", encoding="mbcs")
+            runner_path.write_text(text, encoding="mbcs")
         except (OSError, LookupError):
-            runner_path.write_text(
-                "@echo off\r\n" + command.rstrip() + "\r\n", encoding="utf-8", errors="replace")
+            runner_path.write_text(text, encoding="utf-8", errors="replace")
         return
-    text = command.rstrip() + "\n"
+    text = normalized + "\n"
     if shell_kind in ("powershell", "pwsh"):
         text += "if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\n"
         runner_path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
@@ -1361,6 +1779,21 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
     # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
     _prune_old_bg_files()
     shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
+    # ===== cmd 家族健壮性补丁（详见文件头补丁说明）=====
+    # ① 多行内联代码（python -c / node -e）改写为临时脚本：cmd 按行解释 .cmd，
+    #    多行 `-c` 代码必然被拆行执行（实测 `i was unexpected at this time.`）
+    command, guard_notes = _rewrite_multiline_inline_code(command, shell_kind)
+    # ② 管道过滤器兜底：PATH 里可能命中"非管道过滤器"实现（实测宝塔 tail.exe），
+    #    在管道中提前退出且不转发输出 → 整条管道静默无输出；此处探测并替换/本地兜底
+    local_filter = None
+    if shell_kind == "cmd":
+        command, local_filter, pipe_notes = _guard_cmd_pipeline(command)
+        guard_notes = guard_notes + pipe_notes
+        if local_filter is not None and background:
+            # 后台模式无法对输出做本地过滤：回退为"提示 + 保持原命令"，避免静默丢结果
+            guard_notes.append(
+                "后台模式不支持本地 tail/head 兜底：如输出为空，请改用前台执行或安装可用的 tail/head 实现")
+            local_filter = None
     work_text = str(work_dir or "").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
     try:
@@ -1368,9 +1801,14 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
     except (TypeError, ValueError):
         timeout = 120.0
     if background:
-        return _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt)
+        result_text = _run_command_background(
+            command, shell_exe, shell_kind, shell_prefix, cwd, is_nt)
+        return _append_command_notes(result_text, guard_notes)
     exit_code, stdout_text, stderr_text, timed_out, elapsed, relay_info = _run_command_foreground(
         command, shell_exe, shell_kind, shell_prefix, cwd, timeout, is_nt)
+    # 本地 tail/head 兜底：在读取完整输出后按行取头/尾（不改变退出码）
+    if local_filter is not None:
+        stdout_text = _apply_local_line_filter(stdout_text, local_filter[0], local_filter[1])
     raw_stdout, raw_stderr = stdout_text, stderr_text
     keep_streams = False
     more_hint = ""
@@ -1395,8 +1833,12 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
     header = (f"[run_command] shell={shell_kind} | cwd={_display_path(Path(cwd))}"
               f" | exit={exit_code} | 耗时 {elapsed:.1f}s"
               + (" | 命令超时，进程树已被强制终止" if timed_out else ""))
+    # ③ 失败或可疑时的 cmd 语法提示（分号串联 / && 串联 / Unix 命令名）
+    if shell_kind == "cmd":
+        guard_notes = guard_notes + _cmd_syntax_hints(
+            command, exit_code, stdout_text, stderr_text)
     if not stdout_text and not stderr_text:
-        return f"{header}\n（无输出）"
+        return _append_command_notes(f"{header}\n（无输出）", guard_notes)
     parts = [header]
     if stdout_text:
         parts.append("--- stdout ---\n" + stdout_text)
@@ -1406,7 +1848,7 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
         parts.append(
             f"[run_command] 已超过 timeout={timeout:g}s；长任务请改用 background=true，"
             "随后用输出文件路径轮询结果")
-    return "\n".join(parts)
+    return _append_command_notes("\n".join(parts), guard_notes)
 
 
 def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
@@ -1707,7 +2149,6 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
         engine_key = "ddg"
     elif engine_key not in ("auto", "bing"):
         raise ValueError("engine 仅支持 auto/bing/ddg（duckduckgo）")
-
     results, engine_name = [], ""
     if engine_key in ("auto", "bing"):
         try:
@@ -1854,21 +2295,22 @@ async def run_command(command: str, shell: str = "auto", work_dir: str = "",
                       timeout_seconds: float = 120.0, background: bool = False) -> str:
     """执行终端命令并返回退出码与输出（多 shell：cmd/powershell/pwsh/bash/sh/zsh）
     参数：
-        command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行命令均可；
-                         多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持（请用
-                         work_dir 或链式命令）；PowerShell 5.1 不支持 &&，用 `;` 串联命令
+        command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行均可；
+                         多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持
+                         （用 work_dir 或链式命令）。cmd 家族用 `&&`/`&` 串联（不支持 `;`，
+                         写了会被当普通字符原样输出）；PowerShell 5.1 用 `;` 串联。
+                         多行内联代码（python -c）与 `| tail/head -N` 会自动适配，无需特殊写法
         shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/
                          pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）
-        work_dir:        工作目录，默认当前目录（生成任务中即会话工作目录）；目录不存在时报错
-        timeout_seconds: 前台超时秒数（1-1800），默认 120；超时强制终止整棵进程树并返回已捕获输出
-        background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径，适合构建、
-                         训练、常驻服务等长任务；默认 false 前台等待
+        work_dir:        工作目录，默认当前目录；目录不存在时报错
+        timeout_seconds: 默认 120，可能受限于系统配置
+        background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径（适合长任务）；
+                         默认 false 前台等待
     返回：
-        头部（shell/工作目录/退出码/耗时）+ stdout 与 stderr 分段内容（系统代码页自适应解码）；
-        超长截断保留头尾，完整输出自动落盘并附文件路径（可用 read_file 续读中间省略部分）。
-        后台模式：读输出文件轮询内容；结束标记文件出现即已结束（内容为退出码）。
-        文件读写/搜索请优先使用专用工具（read_file/write_file/edit_file/search_files）；
-        本工具适用于安装依赖、运行脚本、git、进程管理等终端操作。
+        头部（shell/工作目录/退出码/耗时）+ stdout/stderr 分段；超长截断保留头尾，
+        完整输出落盘并附文件路径。后台模式读输出文件轮询，结束标记出现即已结束（内容为退出码）。
+        命令被自动改写/兜底或疑似语法误用时，末尾附 `[run_command] …` 说明行。
+        文件读写/搜索请优先使用专用工具；本工具适用于安装依赖、运行脚本、git、进程管理等。
     """
     return await asyncio.to_thread(
         _run_command_impl, command, shell, work_dir, timeout_seconds, background)
@@ -1881,20 +2323,19 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
     """抓取网页或 HTTP 接口内容：支持纯文本提取、按标签/正则抽取，超长自动截断
     参数：
         url:             完整链接，仅支持 http/https
-        mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音并优先正文容器）、
+        mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音）、
                          html=原始 HTML、tag=按标签抽取、regex=按正则抽取
-        pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）；
-                         每条匹配展示长度与 max_chars 联动（不再固定 500 字符）
-        tag:             mode=tag 时必填，标签选择器，支持 div、div#id、div.class（同名标签嵌套时按最短块匹配）
+        pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
+        tag:             mode=tag 时必填，标签选择器：div、div#id、div.class
         max_chars:       返回内容最大字符数（200-100000）；默认 8000
         timeout_seconds: 请求超时秒数（1-120），默认 30
-        encoding:        指定响应编码（如 gbk）；留空按 BOM/响应头/meta 自动判断
+        encoding:        指定响应编码（如 gbk）；留空自动判断
         method:          HTTP 方法，默认 GET；POST 时配合 body 使用
         body:            请求体（POST 等使用），默认按 application/json 发送
-        headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}；覆盖默认浏览器头中的同名项
+        headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}
     返回：
-        头部（状态码/最终 URL/Content-Type/标题/提取模式/长度）+ 提取的内容；
-        内容过长会截断并提示，网页太大时建议用 tag/regex 只抽取需要的部分
+        头部（状态码/最终 URL/Content-Type/标题/长度）+ 提取的内容；内容过长会截断，
+        网页太大时建议用 tag/regex 只抽取需要的部分
     """
     return await asyncio.to_thread(
         _fetch_url_impl, url, mode, pattern, tag, max_chars, timeout_seconds,
@@ -1910,13 +2351,10 @@ async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> 
         engine:      搜索引擎：auto=Bing 失败/无结果时自动回退 DuckDuckGo（默认）、
                      bing=仅用 Bing（失败即报错）、ddg=仅用 DuckDuckGo
     返回：
-        编号结果列表，每条含标题、链接、摘要；头部标注实际使用的引擎；
-        结果已按与 query 的关键词相关性重排（标题命中 > 摘要 > URL，文档类路径加权）；
+        编号结果列表，每条含标题、链接、摘要（已按相关性排序，头部标注实际使用的引擎）；
         需要正文时把链接交给 fetch_url 抓取
     说明：
-        无 API Key，通过解析搜索引擎网页版实现；已做 Bing 重定向解包、广告过滤与 URL 去重；
-        多抓候选后按相关性排序，泛化首页/下载页会排到相关文档之后；
-        站点改版或访问受限时可能失败并给出替代建议
+        无 API Key（解析搜索引擎网页版）；站点改版或访问受限时可能失败
     """
     return await asyncio.to_thread(_web_search_impl, query, max_results, engine)
 

@@ -42,11 +42,13 @@ from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
     CHECK_TOOL_EXISTS_NAME,
     READ_MEDIA_NAME,
+    READ_DOCUMENT_NAME,
     SUB_AGENT_TOOL_NAME,
     TODO_TOOL_NAME,
     execute_ask_user_placeholder,
     execute_builtin_tool,
     execute_read_media,
+    execute_read_document,
     load_any_media_model_part,
     normalize_todo_items,
     roll_recent_media_parts,
@@ -833,6 +835,12 @@ class SubAgentRunner:
                     )
                     self.read_media_injected_refs.difference_update(evicted_refs)
                 builtin_results.append((idx, tc, tn, ta, read_media_result))
+                continue
+            if tn == READ_DOCUMENT_NAME:
+                # 读取用户上传文件的解析文本（与父循环 execute_read_document
+                # 同接口）：按文件名读取会话内已上传文件，支持字符区间分页
+                read_document_result = execute_read_document(ta, ctx.session_id)
+                builtin_results.append((idx, tc, tn, ta, read_document_result))
                 continue
             builtin_result = execute_builtin_tool(
                 tn, ta, ctx.configured_tool_names, ctx.configured_tool_servers,

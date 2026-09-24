@@ -78,6 +78,24 @@
         ? obj.compress_index : compactionUsage && compactionUsage.compress_index,
       block_count: obj.block_count != null
         ? obj.block_count : compactionUsage && compactionUsage.block_count,
+      // 批次诊断（P2-1）：本批喂入压缩模型的源规模 / 批源预算 / 保留原始对话的
+      // 尾部轮次数 / 单段输出上限 / 源截断标记——历史回放同样可见，供用户核对
+      // "每批到底吃了多少、是否被截断"
+      batch_source_tokens: obj.batch_source_tokens != null
+        ? obj.batch_source_tokens : compactionUsage && compactionUsage.batch_source_tokens,
+      source_budget: obj.source_budget != null
+        ? obj.source_budget : compactionUsage && compactionUsage.source_budget,
+      tail_rounds: obj.tail_rounds != null
+        ? obj.tail_rounds : compactionUsage && compactionUsage.tail_rounds,
+      output_token_limit: obj.output_token_limit != null
+        ? obj.output_token_limit : compactionUsage && compactionUsage.output_token_limit,
+      source_was_truncated: obj.source_was_truncated != null
+        ? !!obj.source_was_truncated
+        : !!(compactionUsage && compactionUsage.source_was_truncated),
+      warnings: Array.isArray(obj.warnings)
+        ? obj.warnings
+        : (compactionUsage && Array.isArray(compactionUsage.warnings)
+          ? compactionUsage.warnings : null),
       ts: obj.timestamp || "",
     };
   }

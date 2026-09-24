@@ -318,7 +318,11 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         before_body = json.loads(before.body.decode("utf-8"))
         self.assertNotIn("round_context_token_ratio", before_body)
         self.assertIn("defaults", before_body)
-        self.assertEqual(before_body["defaults"]["keep_rounds"], 20)
+        # 历史轮次窗口已废弃：配置与默认值都不再包含 keep_rounds
+        self.assertNotIn("keep_rounds", before_body)
+        self.assertNotIn("keep_rounds", before_body["defaults"])
+        self.assertIn("target_tokens", before_body)
+        self.assertIn("target_limits", before_body)
         self.assertIn("trigger_ratio", before_body)
         self.assertNotIn("max_summary_blocks", before_body)
         # chunk_rounds 已不再作为配置暴露（内部常量保护单次摘要输入规模）
@@ -330,7 +334,6 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.router.update_history_compaction_config(
             self.router.HistoryCompactionConfig(
-                keep_rounds=7,
                 trigger_ratio=0.85,
                 summary_budget_ratio=0.25,
             )
@@ -339,8 +342,8 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         body = json.loads(response.body.decode("utf-8"))
         self.assertNotIn("round_context_token_ratio", body["config"])
         self.assertEqual(body["config"]["summary_budget_ratio"], 0.25)
-        self.assertEqual(body["config"]["keep_rounds"], 7)
         self.assertEqual(body["config"]["trigger_ratio"], 0.85)
+        self.assertNotIn("keep_rounds", body["config"])
 
         # 压缩模型不写入 .env；压缩策略配置写入 .env 并同步内存
         content = (self._temp_path / ".env").read_text(encoding="utf-8")
@@ -348,7 +351,8 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HISTORY_COMPACT_SUMMARY_BUDGET_RATIO=0.25", content)
         self.assertNotIn("HISTORY_COMPACT_MODEL_PROVIDER", content)
         self.assertNotIn("HISTORY_COMPACT_MODEL_NAME", content)
-        self.assertIn("HISTORY_COMPACT_KEEP_ROUNDS=7", content)
+        # 历史轮次窗口已废弃：不再写入 .env
+        self.assertNotIn("HISTORY_COMPACT_KEEP_ROUNDS", content)
 
         # 压缩模型改由 select 接口配置后，GET 状态应体现
         select_response = await self.router.select_active_chat_model(

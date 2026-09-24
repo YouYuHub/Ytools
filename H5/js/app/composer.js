@@ -15,7 +15,7 @@
     themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, reasoningMaxLength, toolResultMaxLength, toolCallTimeoutSeconds,
-    networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, keepRounds, triggerRatio, summaryBudgetRatio,
+    networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint,
     subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
     oversizedRejectFactor, maxOversizedRejections, effectiveThresholdHint,
     settingsRetitleRow, settingsRetitleToggle, settingsRetitleStatus
@@ -746,9 +746,10 @@
       ? subRetry.stream_error_max_attempts : defaults.sub_agent_stream_error_retry_max;
     subAgentTodoRemindMax.value = subRetry && subRetry.todo_remind_max != null
       ? subRetry.todo_remind_max : defaults.sub_agent_todo_remind_max;
-    keepRounds.value = comp && comp.keep_rounds != null ? comp.keep_rounds : defaults.keep_rounds;
     triggerRatio.value = comp && comp.trigger_ratio != null ? comp.trigger_ratio : defaults.trigger_ratio;
     summaryBudgetRatio.value = comp && comp.summary_budget_ratio != null ? comp.summary_budget_ratio : defaults.summary_budget_ratio;
+    historyTargetTokens.value = comp && comp.target_tokens != null ? comp.target_tokens : defaults.target_tokens;
+    renderHistoryTargetHint(comp);
     oversizedRejectFactor.value = comp && comp.oversized_reject_factor != null ? comp.oversized_reject_factor : defaults.oversized_reject_factor;
     maxOversizedRejections.value = comp && comp.max_oversized_rejections != null ? comp.max_oversized_rejections : defaults.max_oversized_rejections;
     renderEffectiveThresholdHint(comp);
@@ -793,6 +794,31 @@
     effectiveThresholdHint.hidden = false;
   }
 
+  // 压缩目标提示：显示该模型窗口下的可设区间（后端会把越界值夹取到区间内），
+  // 并区分"用户设定值"与"实际生效值"（被夹取时明确提示）。
+  function renderHistoryTargetHint(comp) {
+    if (!historyTargetHint) { return; }
+    const limits = comp && comp.target_limits;
+    const fmt = function (n) {
+      return n >= 1000000 ? (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M"
+        : n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
+    };
+    if (!limits || !limits.max) {
+      historyTargetHint.textContent = "";
+      historyTargetHint.hidden = true;
+      return;
+    }
+    const raw = readSettingNumber(historyTargetTokens);
+    let text = "可设区间 " + fmt(limits.min) + " – " + fmt(limits.max) + " tokens"
+      + "（窗口 " + fmt(limits.window) + " × 8%/40% 下限、40% 上限）";
+    if (raw != null && raw > 0 && (raw < limits.min || raw > limits.max)) {
+      const clamped = Math.max(limits.min, Math.min(raw, limits.max));
+      text += "；当前 " + fmt(raw) + " 越界，将按 " + fmt(clamped) + " 生效";
+    }
+    historyTargetHint.textContent = text;
+    historyTargetHint.hidden = false;
+  }
+
   function applyChatSettingsDefaults() {
     const defaults = Object.assign({}, CHAT_SETTINGS_DEFAULTS, state.chatSettingsDefaults || {});
     reasoningMaxLength.value = defaults.reasoning_max_length;
@@ -806,9 +832,9 @@
     subAgentFinalReplyRetryMax.value = defaults.sub_agent_final_reply_retry_max;
     subAgentStreamErrorRetryMax.value = defaults.sub_agent_stream_error_retry_max;
     subAgentTodoRemindMax.value = defaults.sub_agent_todo_remind_max;
-    keepRounds.value = defaults.keep_rounds;
     triggerRatio.value = defaults.trigger_ratio;
     summaryBudgetRatio.value = defaults.summary_budget_ratio;
+    historyTargetTokens.value = defaults.target_tokens;
     oversizedRejectFactor.value = defaults.oversized_reject_factor;
     maxOversizedRejections.value = defaults.max_oversized_rejections;
     toast("已恢复聊天设置默认值，点击确定后生效");
@@ -818,7 +844,6 @@
 
   // 聊天设置字段校验：返回无效字段名列表。校验域与后端一致：
   // - 回传长度：任意整数（0=不回传，负数=全部回传，正数=截断）
-  // - 历史轮数窗口：>=0（0=无限窗口，仅按阈值压缩）
   // - 超长结果拒绝系数：>=0（0=关闭该功能）
   // - 工具执行超时/网络重试次数：>=0（0=不限制）
   // - 压缩失败重试次数：任意整数（0 或负数=不限制，一直重试）
@@ -839,9 +864,9 @@
       ["子任务空收尾重试次数", subRetryConfig.final_reply_max_attempts, function (v) { return isNum(v); }],
       ["子任务断流续跑次数", subRetryConfig.stream_error_max_attempts, function (v) { return isNum(v); }],
       ["子任务计划未完成提醒次数", subRetryConfig.todo_remind_max, function (v) { return isNum(v); }],
-      ["历史轮数窗口", compConfig.keep_rounds, function (v) { return isNum(v) && v >= 0; }],
       ["触发比例", compConfig.trigger_ratio, function (v) { return isNum(v) && v > 0; }],
       ["摘要预算比例", compConfig.summary_budget_ratio, function (v) { return isNum(v) && v > 0; }],
+      ["压缩目标 tokens", compConfig.target_tokens, function (v) { return isNum(v) && v >= 0; }],
       ["超长结果拒绝系数", compConfig.oversized_reject_factor, function (v) { return isNum(v) && v >= 0; }],
       ["连续拒绝上限", compConfig.max_oversized_rejections, function (v) { return isNum(v) && v > 0; }],
     ];
@@ -854,9 +879,9 @@
       tool_result_max_length: readSettingNumber(toolResultMaxLength),
     };
     const compConfig = {
-      keep_rounds: readSettingNumber(keepRounds),
       trigger_ratio: readSettingNumber(triggerRatio),
       summary_budget_ratio: readSettingNumber(summaryBudgetRatio),
+      target_tokens: readSettingNumber(historyTargetTokens),
       oversized_reject_factor: readSettingNumber(oversizedRejectFactor),
       max_oversized_rejections: readSettingNumber(maxOversizedRejections),
     };

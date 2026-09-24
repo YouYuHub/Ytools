@@ -16,7 +16,7 @@ from chat.chat_llm import ChatLLM
 from config import (
     ChatLLMRequest,
     DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS,
-    DEFAULT_CONTEXT_HISTORY_ROUNDS,
+    DEFAULT_HISTORY_COMPACT_TARGET_TOKENS,
     DEFAULT_HISTORY_TRIGGER_RATIO,
     DEFAULT_SUMMARY_BUDGET_RATIO,
     DEFAULT_OVERSIZED_REJECT_FACTOR,
@@ -57,8 +57,28 @@ from .chat_runtime import (
 
 
 # 上下文压缩阈值 = min(聊天窗口, 压缩窗口) × trigger_ratio
-# 摘要输出上限 = min(模型 maxOutputTokens, 8k, 摘要预算)
-_SUMMARY_SEGMENT_MAX_TOKENS = 8192
+# 单段摘要输出上限 = min(模型 maxOutputTokens, 单段上限, 摘要预算)
+# 单段上限由 8k 提到 32k：批源预算放开后单批可喂满压缩模型输入窗口，
+# 若输出仍封顶 8k，单批压缩比会到 50:1 量级，路径/数值/报错原文等
+# 可核验细节会在摘要里被抹平（保真优先，见 _COMPACTION_MAX_SOURCE_OUTPUT_RATIO）。
+_SUMMARY_SEGMENT_MAX_TOKENS = 32768
+# 单批"源 : 摘要输出"的最大压缩比：每批摘要输出预算 = 本批源规模 ÷ 该比例，
+# 使压缩比恒定（不会因某批源特别大就把细节压没），小批也不虚占输出预算。
+_COMPACTION_MAX_SOURCE_OUTPUT_RATIO = 12
+# 单批源预算占压缩模型窗口的比例上限；真实调用还会减去提示词/输出预留
+# （见 summarize_context_text），0.75 会让每批白少喂约 1/6 窗口。
+_COMPACTION_SOURCE_WINDOW_RATIO = 0.9
+# 历史压缩目标的上下限（基数 = min(聊天窗口, 压缩窗口)）：
+#   下限：窗口 < 500k → 窗口 × 8%；窗口 ≥ 500k → 固定 40k
+#   上限：窗口 × 40%
+# 用户设置小于下限时按下限计算（否则压不到位），大于上限时按上限计算。
+_TARGET_LOWER_SMALL_WINDOW = 500_000
+_TARGET_LOWER_SMALL_RATIO = 0.08
+_TARGET_LOWER_LARGE_WINDOW_TOKENS = 40_000
+_TARGET_UPPER_WINDOW_RATIO = 0.4
+# 设了历史压缩目标时，摘要可占目标的比例（其余留给最近若干轮的原始对话）。
+# 目标 80k → 摘要最多 ~48k，保留 ~32k 原始轮次可读。
+_TARGET_SUMMARY_SHARE = 0.6
 _OVERSIZED_PREVIEW_TOKEN_BUDGET = 2048
 _OVERSIZED_FEEDBACK_EXCERPT_TOKEN_BUDGET = 600
 _COMPACTION_EVENT_EXCERPT_TOKEN_BUDGET = 800
@@ -72,9 +92,9 @@ _ROUND_SUMMARY_SCOPE = "active_round"
 def get_context_compaction_defaults() -> dict[str, int | float]:
     """返回前后端共用的历史压缩默认值，供配置接口和恢复默认功能使用。"""
     return {
-        "keep_rounds": DEFAULT_CONTEXT_HISTORY_ROUNDS,
         "trigger_ratio": DEFAULT_HISTORY_TRIGGER_RATIO,
         "summary_budget_ratio": DEFAULT_SUMMARY_BUDGET_RATIO,
+        "target_tokens": DEFAULT_HISTORY_COMPACT_TARGET_TOKENS,
         "oversized_reject_factor": DEFAULT_OVERSIZED_REJECT_FACTOR,
         "max_oversized_rejections": DEFAULT_MAX_OVERSIZED_REJECTIONS,
     }
@@ -110,13 +130,18 @@ class ContextCompactionSettings:
 
     压缩模型选择不在此处读取：统一由 models.json 顶层 `model_selection.compaction_model`
     管理（见 resolve_context_compaction_model_config），未配置时跟随当前聊天模型。
+
+    历史轮次窗口（原 keep_rounds）已废弃：历史不再按"保留最近 N 轮"限制，
+    只按压缩阈值与历史压缩目标控制规模。
     """
-    keep_rounds: int
     trigger_ratio: float
     # 累计摘要总预算占聊天模型窗口的比例
     summary_budget_ratio: float
     oversized_reject_factor: float
     max_oversized_rejections: int
+    # 历史压缩目标（tokens）：>0 时把"历史部分"压到该值以内（与触发阈值无关），
+    # 用于压低长任务的单次输入成本；0 表示不设目标（仅按触发阈值/可用空间压缩）。
+    target_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +150,9 @@ class SummaryBuildResult:
     source_was_truncated: bool
     used_fallback: bool
     usage: dict[str, Any] | None = None
+    # 本次实际生效的单段输出上限（tokens）：供 done 事件展示"这批摘要被允许写多长"，
+    # 便于核对压缩比是否符合保真预期；旧构造点不传时为 None（向后兼容）。
+    output_token_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +232,20 @@ def _parse_oversized_reject_factor(value: Any, default: float) -> float:
     return min(parsed, 10.0)
 
 
+def _parse_target_tokens(value: Any, default: int) -> int:
+    """历史压缩目标（tokens）：0/负数/非法 = 不设目标（0）；上限 100 万防误配置。
+
+    与其它比例型配置不同，这里 0 是合法值（关闭目标），不能回落为默认值。
+    """
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return 0
+    return min(parsed, 1_000_000)
+
+
 def _normalize_optional_name(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -271,17 +313,39 @@ def _summary_output_token_limit(
     model_config: dict[str, Any],
     *,
     output_token_budget: int | None = None,
+    segment_output_limit: int | None = None,
 ) -> int:
-    """单段摘要输出上限 = min(模型 maxOutputTokens, 8k, 摘要预算)。
+    """单段摘要输出上限 = min(模型 maxOutputTokens, 单段上限, 摘要预算)。
 
     `output_token_budget` 为调用方传入的摘要预算（如单轮摘要总预算的剩余份额）；
-    未传时只受模型输出能力与 8k 分段上限约束（跨轮 chunk 摘要场景）。
+    未传时只受模型输出能力与单段上限约束（跨轮 chunk 摘要场景）。
+    `segment_output_limit` 进一步收窄单段上限（跨轮按批源规模推导保真输出预算，
+    见 _batch_summary_output_budget）；两者取更小值。
     """
     model_limit = _parse_positive_int(model_config.get("maxOutputTokens"), _SUMMARY_SEGMENT_MAX_TOKENS)
     limit = min(_SUMMARY_SEGMENT_MAX_TOKENS, model_limit)
+    if segment_output_limit is not None and segment_output_limit > 0:
+        limit = min(limit, segment_output_limit)
     if output_token_budget is not None and output_token_budget > 0:
         limit = min(limit, output_token_budget)
     return max(64, limit)
+
+
+def _batch_summary_output_budget(
+    chunk_source_tokens: int,
+    summary_total_budget: int,
+) -> int:
+    """按批源规模推导该批的摘要输出预算（保真压缩比约束）。
+
+    保真优先：压缩比恒定在 _COMPACTION_MAX_SOURCE_OUTPUT_RATIO 附近，而不是让
+    每批都去撞单段上限——批量放开后若输出仍封顶，压缩比会随批源线性升高，
+    细节被抹平。上限仍受累计摘要总预算（summary_total_budget）约束，防止单批
+    摘要一次吃掉整个累计摘要预算。
+    """
+    if chunk_source_tokens <= 0:
+        return max(64, summary_total_budget)
+    scaled = int(chunk_source_tokens / _COMPACTION_MAX_SOURCE_OUTPUT_RATIO)
+    return max(1024, min(summary_total_budget, scaled))
 
 
 def _clean_summary_text(value: Any) -> str:
@@ -300,10 +364,6 @@ def _clean_summary_text(value: Any) -> str:
 def load_context_compaction_settings() -> ContextCompactionSettings:
     """读取环境变量并做运行时安全规整。"""
     return ContextCompactionSettings(
-        keep_rounds=_parse_non_negative_int(
-            load_var("HISTORY_COMPACT_KEEP_ROUNDS", DEFAULT_CONTEXT_HISTORY_ROUNDS),
-            DEFAULT_CONTEXT_HISTORY_ROUNDS,
-        ),
         trigger_ratio=_parse_trigger_ratio(
             load_var("HISTORY_COMPACT_TRIGGER_RATIO", DEFAULT_HISTORY_TRIGGER_RATIO),
             DEFAULT_HISTORY_TRIGGER_RATIO,
@@ -319,6 +379,10 @@ def load_context_compaction_settings() -> ContextCompactionSettings:
         max_oversized_rejections=_parse_positive_int(
             load_var("HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS", DEFAULT_MAX_OVERSIZED_REJECTIONS),
             DEFAULT_MAX_OVERSIZED_REJECTIONS,
+        ),
+        target_tokens=_parse_target_tokens(
+            load_var("HISTORY_COMPACT_TARGET_TOKENS", DEFAULT_HISTORY_COMPACT_TARGET_TOKENS),
+            DEFAULT_HISTORY_COMPACT_TARGET_TOKENS,
         ),
     )
 
@@ -387,6 +451,27 @@ def get_context_compaction_model_status(
     return status
 
 
+def resolve_effective_window(
+    settings: ContextCompactionSettings | None = None,
+) -> int:
+    """有效窗口 = min(聊天模型窗口, 压缩模型窗口)。
+
+    压缩阈值、压缩目标上下限、超大结果拒绝阈值都以它为基数：取两者较小者，
+    保证压缩产物（摘要）能同时放进聊天与压缩模型的上下文。
+    解析压缩模型失败时退化为聊天窗口。
+    """
+    settings = settings or load_context_compaction_settings()
+    chat_window = resolve_model_max_input_tokens(default=8192)
+    try:
+        compaction_window = resolve_config_max_input_tokens(
+            resolve_context_compaction_model_config(settings),
+            default=8192,
+        )
+    except ChatModelConfigurationError:
+        compaction_window = chat_window
+    return max(1024, min(chat_window, compaction_window))
+
+
 def resolve_context_compaction_threshold(
     settings: ContextCompactionSettings | None = None,
 ) -> int:
@@ -399,15 +484,7 @@ def resolve_context_compaction_threshold(
     settings = settings or load_context_compaction_settings()
     if settings.trigger_ratio <= 0:
         return 0
-    chat_window = resolve_model_max_input_tokens(default=8192)
-    try:
-        compaction_window = resolve_config_max_input_tokens(
-            resolve_context_compaction_model_config(settings),
-            default=8192,
-        )
-    except ChatModelConfigurationError:
-        compaction_window = chat_window
-    window = min(chat_window, compaction_window)
+    window = resolve_effective_window(settings)
     return max(1024, int(window * settings.trigger_ratio))
 
 
@@ -423,15 +500,7 @@ def resolve_oversized_result_token_threshold(
     settings = settings or load_context_compaction_settings()
     if settings.oversized_reject_factor <= 0:
         return 0
-    chat_window = resolve_model_max_input_tokens(default=8192)
-    try:
-        compaction_window = resolve_config_max_input_tokens(
-            resolve_context_compaction_model_config(settings),
-            default=8192,
-        )
-    except ChatModelConfigurationError:
-        compaction_window = chat_window
-    window = min(chat_window, compaction_window)
+    window = resolve_effective_window(settings)
     return max(1024, int(window * settings.oversized_reject_factor))
 
 
@@ -445,6 +514,82 @@ def resolve_summary_total_budget(
     settings = settings or load_context_compaction_settings()
     window = resolve_model_max_input_tokens(default=8192)
     return max(1024, int(window * settings.summary_budget_ratio))
+
+
+def resolve_history_target_tokens(
+    settings: ContextCompactionSettings | None = None,
+) -> int:
+    """历史压缩目标（tokens）：>0 时把"历史部分"压到该值以内；0 = 不设目标。
+
+    与触发阈值解耦：阈值决定"何时压"，目标决定"压到多小"。设了目标后，
+    长任务的单次输入成本可控（历史 ≤ 目标），代价是更激进的摘要（细节减少）。
+    跨轮与单轮压缩共用该目标。
+
+    **用户值会被夹取到有效区间**（`_clamp_history_target_tokens`）：
+    - 下限：窗口 < 500k 时取 窗口 × 8%；窗口 ≥ 500k 时取 40k。
+      低于下限时摘要压不到位、压缩收益被保留轮次吃掉（用户设置更小也按下限算）。
+    - 上限：窗口 × 40%。超过上限会与触发阈值/窗口余量冲突（压无可压）。
+    """
+    settings = settings or load_context_compaction_settings()
+    raw = max(0, int(getattr(settings, "target_tokens", 0) or 0))
+    if raw <= 0:
+        return 0
+    return _clamp_history_target_tokens(raw, settings)
+
+
+def _clamp_history_target_tokens(
+    value: int,
+    settings: ContextCompactionSettings | None = None,
+) -> int:
+    """把历史压缩目标夹取到 [下限, 上限]（均为窗口派生值）。
+
+    下限：窗口 < `_TARGET_LOWER_SMALL_WINDOW`（500k）→ 窗口 × 8%；
+          窗口 ≥ 500k → 固定 `_TARGET_LOWER_LARGE_WINDOW_TOKENS`（40k）。
+    上限：窗口 × 40%。
+    下限高于上限时（极小窗口的边界情形）取上限，保证区间有效。
+    """
+    settings = settings or load_context_compaction_settings()
+    window = resolve_effective_window(settings)
+    if window < _TARGET_LOWER_SMALL_WINDOW:
+        lower = int(window * _TARGET_LOWER_SMALL_RATIO)
+    else:
+        lower = _TARGET_LOWER_LARGE_WINDOW_TOKENS
+    upper = int(window * _TARGET_UPPER_WINDOW_RATIO)
+    lower = max(1024, lower)
+    upper = max(lower, upper)
+    return max(lower, min(int(value), upper))
+
+
+def resolve_history_target_limits(
+    settings: ContextCompactionSettings | None = None,
+) -> tuple[int, int]:
+    """返回历史压缩目标的 (下限, 上限)，供前端提示"可设区间"。"""
+    settings = settings or load_context_compaction_settings()
+    window = resolve_effective_window(settings)
+    if window < _TARGET_LOWER_SMALL_WINDOW:
+        lower = max(1024, int(window * _TARGET_LOWER_SMALL_RATIO))
+    else:
+        lower = _TARGET_LOWER_LARGE_WINDOW_TOKENS
+    upper = max(lower, int(window * _TARGET_UPPER_WINDOW_RATIO))
+    return lower, upper
+
+
+def resolve_effective_summary_budget(
+    settings: ContextCompactionSettings | None = None,
+    target_tokens: int | None = None,
+) -> int:
+    """目标模式下收紧后的摘要预算：给"保留的原始轮次"留出空间。
+
+    设了历史目标时，若摘要本身就能吃掉整个目标（如目标 80k、摘要预算 79.2k），
+    压缩后历史仍接近目标上限、且几乎没有原始轮次可读。这里按目标的固定比例
+    （_TARGET_SUMMARY_SHARE）封顶，其余额度留给最近若干轮的原始对话。
+    """
+    settings = settings or load_context_compaction_settings()
+    base = resolve_summary_total_budget(settings)
+    target = resolve_history_target_tokens(settings) if target_tokens is None else int(target_tokens)
+    if target <= 0:
+        return base
+    return max(1024, min(base, int(target * _TARGET_SUMMARY_SHARE)))
 
 
 def make_oversized_result_preview(
@@ -516,7 +661,9 @@ async def summarize_context_text(
     scope: str,
     settings: ContextCompactionSettings | None = None,
     output_token_budget: int | None = None,
+    segment_output_limit: int | None = None,
     delta_emitter: Any | None = None,
+    concise: bool | None = None,
 ) -> SummaryBuildResult:
     """用配置的压缩模型将内容变成普通文本摘要。
 
@@ -524,7 +671,9 @@ async def summarize_context_text(
     每次"尝试"=一条完整降级链——压缩模型 ->（失败或返回空时）当前聊天模型重试一次。
     与压缩模型配置不同源时的整条降级链按配置次数重复；重试耗尽（或同源链路失败）
     抛 ContextCompactionError 终止任务，不再做节选降级。0 或负数=不限制（一直重试）。
-    `output_token_budget` 用于把单段摘要约束在摘要预算之内（单轮场景）。
+    `output_token_budget` 用于把单段摘要约束在摘要预算之内（单轮场景）；
+    `segment_output_limit` 为跨轮按批源规模推导的保真输出预算（见
+    _batch_summary_output_budget），进一步收窄单段上限。
 
     `delta_emitter` 为可选异步回调：提供时压缩请求走**流式接口**，模型每产生
     一段思考/正文增量即回调一次 `{"reasoning_content"?: chunk, "content"?: chunk}`
@@ -538,8 +687,16 @@ async def summarize_context_text(
         raise ContextCompactionError(f"压缩模型与聊天模型配置均无效：{exc}") from exc
 
     output_tokens = _summary_output_token_limit(
-        tool_request, model_config, output_token_budget=output_token_budget
+        tool_request, model_config,
+        output_token_budget=output_token_budget,
+        segment_output_limit=segment_output_limit,
     )
+    # 源规模提示（保真/精简指导用）：按裁剪前的原始源文本估算，让压缩模型知道
+    # "这批有多少料、允许写多长"。
+    source_tokens_hint = estimate_text_tokens(source_text)
+    # 精简模式：设了历史压缩目标（或调用方显式要求）时，只保留核心内容——
+    # 目标是压低后续单次输入成本，细节让位于"够用即可"。
+    concise = resolve_history_target_tokens(settings) > 0 if concise is None else bool(concise)
     prompt = (
         f"你是{scope}压缩器。请把用户任务、已确认事实、关键数值、路径、错误信息、"
         "工具执行结论以及仍需继续的事项压缩为后续模型可直接使用的中文备忘。\n"
@@ -550,8 +707,22 @@ async def summarize_context_text(
         "【未解决问题】- 仍需继续、受阻或下一步要做的事项\n"
         "【重要文件】- 涉及的关键文件/路径及其作用\n"
         "段落内使用短项目符号。只输出普通文本，不要输出 JSON、XML、代码围栏或任何固定数据结构。\n"
-        "工具原始输出很长时，只保留会影响后续决策的结果、证据、错误和下一步。"
+        "工具原始输出很长时，只保留会影响后续决策的结果、证据、错误和下一步。\n"
+        f"输出规模：本次输入约 {source_tokens_hint} tokens，你最多可写 {output_tokens} tokens 的摘要。"
     )
+    if concise:
+        prompt += (
+            "**只保留核心内容，尽量精简**：任务目标、关键结论与决定、"
+            "必要的文件路径/命令/参数、未完成事项；省略过程性叙述、重复内容、"
+            "可推导的中间细节与失败尝试的完整报错，条目尽量短。"
+            "目标是让后续模型知道「在做什么、做到哪、下一步做什么」即可。"
+        )
+    else:
+        prompt += (
+            "在预算内尽量保留可核验细节（精确路径、文件名、行号、命令、参数、数值、"
+            "报错原文、函数/变量名、接口与字段名、已完成与未完成的明确边界），"
+            "宁可多写也不要为了简短而抹掉这些细节；确实没有信息量的寒暄、重复过程可省略。"
+        )
     if scope == "累计历史摘要":
         prompt += (
             "这是已有累计摘要与新增历史的合并任务：必须继承已有摘要中仍有效的事实、"
@@ -655,6 +826,9 @@ async def summarize_context_text(
     # 展示/日志口径：0 或负数表示不限制
     retry_limit_label = str(retry_max_attempts) if retry_max_attempts > 0 else "∞"
     attempt_index = 0
+    # 真实降级标记：压缩模型调用失败、改由聊天模型产出摘要时置 True
+    # （此前恒为 False，前端"降级=False"无信息量，且掩盖了实际发生的降级）
+    used_fallback = False
     while True:
         attempt_index += 1
         try:
@@ -693,7 +867,9 @@ async def summarize_context_text(
                 await asyncio.sleep(_COMPACTION_RETRY_INTERVAL_SECONDS)
                 continue
             retry_limit = _summary_output_token_limit(
-                tool_request, chat_config, output_token_budget=output_token_budget
+                tool_request, chat_config,
+                output_token_budget=output_token_budget,
+                segment_output_limit=segment_output_limit,
             )
             retry_max_input = resolve_config_max_input_tokens(chat_config)
             retry_source_budget = max(
@@ -704,6 +880,7 @@ async def summarize_context_text(
             retry_request = _build_summary_request(prompt, retry_source, retry_limit, tool_request.session_id)
             try:
                 text, usage = await _invoke(retry_request, chat_config)
+                used_fallback = True
                 break
             except asyncio.CancelledError:
                 raise
@@ -725,8 +902,9 @@ async def summarize_context_text(
     return SummaryBuildResult(
         text=text,
         source_was_truncated=source_was_truncated,
-        used_fallback=False,
+        used_fallback=used_fallback,
         usage=usage,
+        output_token_limit=output_tokens,
     )
 
 
@@ -791,20 +969,40 @@ def _resolve_compaction_source_budget(
     tool_request: ChatLLMRequest,
     settings: ContextCompactionSettings,
 ) -> int:
-    """为每批压缩源预留提示词和输出空间，避免静默丢掉中间轮次。"""
+    """为每批压缩源预留提示词和输出空间，避免静默丢掉中间轮次。
+
+    三个约束取最小：
+    1. 压缩模型窗口 × _COMPACTION_SOURCE_WINDOW_RATIO（真实调用还要减提示词/输出预留，
+       0.75 会让每批白少喂约 1/6 窗口）；
+    2. 窗口 − 输出上限 − 4096（保证提示词与输出放得下）；
+    3. 摘要总预算 × _COMPACTION_MAX_SOURCE_OUTPUT_RATIO（保真压缩比上限：源再大，
+       本批摘要输出预算也不会超过累计摘要总预算，压缩比因此有界，细节不被抹平）。
+    """
     try:
         model_config = resolve_context_compaction_model_config(settings)
         model_limit = resolve_config_max_input_tokens(model_config)
+        summary_budget = resolve_summary_total_budget(settings)
         output_limit = _summary_output_token_limit(
             tool_request,
             model_config,
-            output_token_budget=resolve_summary_total_budget(settings),
+            output_token_budget=summary_budget,
         )
     except ChatModelConfigurationError:
         model_limit = resolve_model_max_input_tokens(default=8192)
+        summary_budget = max(1024, int(model_limit * settings.summary_budget_ratio))
         output_limit = min(_SUMMARY_SEGMENT_MAX_TOKENS, max(64, model_limit // 8))
     reserved = output_limit + 4096
-    return max(2048, min(int(model_limit * 0.75), model_limit - reserved))
+    # 保真压缩比上限：单批源不超过"摘要总预算 × 最大压缩比"，否则该批摘要会被
+    # 压得比目标压缩比更狠（细节丢失）。窗口本身更小时窗口约束自然生效。
+    fidelity_bound = max(2048, summary_budget * _COMPACTION_MAX_SOURCE_OUTPUT_RATIO)
+    return max(
+        2048,
+        min(
+            int(model_limit * _COMPACTION_SOURCE_WINDOW_RATIO),
+            model_limit - reserved,
+            fidelity_bound,
+        ),
+    )
 
 
 def _select_compaction_count(
@@ -899,7 +1097,9 @@ async def _build_cumulative_summary(
     except Exception as exc:
         print(f"[WARN] 摘要拼接合并失败，回退为模型合并：{exc}")
         merged_text = None
-    summary_budget = resolve_summary_total_budget(settings)
+    # 目标模式下摘要预算收紧（见 resolve_effective_summary_budget）：累计摘要
+    # 必须落在这个更小的额度内，否则压缩后历史仍接近目标上限
+    summary_budget = resolve_effective_summary_budget(settings)
     if merged_text is not None and estimate_text_tokens(merged_text) <= summary_budget:
         return merged_text, usage
 
@@ -913,7 +1113,7 @@ async def _build_cumulative_summary(
         tool_request,
         scope="累计历史摘要",
         settings=settings,
-        output_token_budget=resolve_summary_total_budget(settings),
+        output_token_budget=summary_budget,
         delta_emitter=delta_emitter,
     )
     if isinstance(merge_result.usage, dict):
@@ -935,7 +1135,7 @@ async def _collapse_existing_summary(
         tool_request,
         scope="累计历史摘要",
         settings=settings,
-        output_token_budget=resolve_summary_total_budget(settings),
+        output_token_budget=resolve_effective_summary_budget(settings),
     )
     usage = dict(result.usage) if isinstance(result.usage, dict) else {}
     return result.text, usage
@@ -972,6 +1172,7 @@ async def compact_session_history_if_needed(
     budget_tokens: int | None = None,
     enforce: bool = False,
     force_all: bool = False,
+    tail_rounds_limit: int | None = None,
     trigger_reason: str = "auto",
     trigger_context_tokens: int | None = None,
     trigger_threshold: int | None = None,
@@ -988,10 +1189,16 @@ async def compact_session_history_if_needed(
     `budget_tokens` 覆盖默认预算（聊天窗口 × trigger_ratio）。手动和摘要模式使用
     摘要总预算，自动切换到更小窗口模型时也可按实际可用空间计算预算。
 
-    `enforce` 放宽 keep_rounds 保护；`force_all` 在此基础上要求本次把所有未覆盖
-    的历史轮次都纳入累计摘要，即使它们当前尚未超过预算。模型上下文按
-    HISTORY_COMPACT_KEEP_ROUNDS 总轮次窗口回传：未压缩轮次完整对话占窗口，
-    已压缩轮次问题按剩余窗口保真（见 memory.chat_history_format.split_context_window）。
+    `force_all` 要求本次把所有未覆盖的历史轮次都纳入累计摘要，即使它们
+    当前尚未超过预算（手动压缩与首调用降级使用）。历史不再受"保留最近 N 轮"
+    的轮次窗口限制：规模只由压缩阈值与历史压缩目标（target_tokens）控制，
+    未压缩轮次以完整对话回传、已压缩轮次问题进入保真索引
+    （见 memory.chat_history_format.split_context_window）。
+
+    `tail_rounds_limit` 限制"保留为原始对话的最近轮次"数量上限（<=0 或 None 不限制）。
+    窗口外的轮次不会进入模型上下文，因此**必须进摘要**——否则这些轮次既不在
+    上下文、也未进摘要，等于静默丢失（原始数据仍在 JSONL，但模型侧失忆）。
+    任务内路径按 backend_history_rounds 传入，保证"每轮要么进窗口、要么进摘要"。
 
     `trigger_reason` 记录本次压缩的触发来源（随 done 事件下发，供前端展示"为何
     此时压缩"）：`auto`=任务开始时自动（历史超阈值/轮数超保护）、`task`=任务内
@@ -1010,8 +1217,19 @@ async def compact_session_history_if_needed(
         budget_limit = max(1024, int(budget_tokens))
     else:
         budget_limit = resolve_context_compaction_threshold(settings)
-    # keep_rounds <= 0 表示无限窗口：不设保留下限，仅按预算阈值压缩
-    keep_floor = 0 if (enforce or force_all or settings.keep_rounds <= 0) else settings.keep_rounds
+    # 历史压缩目标：设了就把"历史部分"压到目标以内（与触发阈值解耦，用于压低
+    # 长任务的单次输入成本）。目标同时作为本批预算上限与停止条件——否则压缩
+    # 只会停在"阈值"（如 425k），远高于用户期望的 80k。
+    target_tokens = resolve_history_target_tokens(settings)
+    if target_tokens > 0:
+        budget_limit = min(budget_limit, target_tokens)
+        # 目标模式下摘要预算收紧（给保留的原始轮次留空间，见 resolve_effective_summary_budget）
+        summary_total_budget = resolve_effective_summary_budget(settings, target_tokens)
+    else:
+        summary_total_budget = resolve_summary_total_budget(settings)
+    # 历史轮次窗口（原 keep_rounds）已废弃：不再按"保留最近 N 轮"设下限，
+    # 压缩量完全由预算（目标 / 可用空间）与尾部保留逻辑决定。
+    keep_floor = 0
     # 与 ChatMemoryManager.get_context_messages 保持一致：估算时按同样配置回传工具结果
     history_tool_result_max_length = parse_return_length(
             load_var("HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH", DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH),
@@ -1031,10 +1249,10 @@ async def compact_session_history_if_needed(
         stored_source_count = 0
     summarized_count = min(stored_source_count, len(round_entries))
     raw_rounds = round_entries[summarized_count:]
-    # 保真问题索引按总轮次窗口切分：只覆盖已压缩轮次（未压缩轮次以完整对话
-    # 回传，其问题不重复进入索引）；编号与累计摘要 round_start/round_end 同一体系
+    # 保真问题索引：只覆盖已压缩轮次（未压缩轮次以完整对话回传，其问题不重复
+    # 进入索引）；编号与累计摘要 round_start/round_end 同一体系
     recent_question_items, _raw_in_window = split_context_window(
-        round_entries, summarized_count, settings.keep_rounds
+        round_entries, summarized_count
     )
     recent_questions = [question for _number, question in recent_question_items]
 
@@ -1111,28 +1329,77 @@ async def compact_session_history_if_needed(
         within_budget = batch_before_tokens <= budget_limit
         if not force_all and within_budget:
             break
-        tail_rounds: list[dict[str, Any]] = []
-        tail_tokens = estimate_messages_tokens(context_messages[:1]) if summary_message else 0
-        for round_entry in reversed(raw_rounds):
-            round_tokens = estimate_messages_tokens(
-                round_entry_to_context_messages(round_entry, history_tool_result_max_length)
-            )
-            if tail_rounds and tail_tokens + round_tokens > budget_limit:
-                break
-            tail_rounds.append(round_entry)
-            tail_tokens += round_tokens
-        tail_rounds.reverse()
-        if len(tail_rounds) >= len(raw_rounds):
-            if not force_all:
-                break
+        # 尾部保留轮次（本批不进摘要、原样回传的最近若干轮）：只有"按预算保留
+        # 窗口"的自动路径需要它。force_all 的语义是把**全部**未覆盖轮次纳入
+        # 累计摘要（尾部轮次下一批同样要压），此时再做尾部保留只起拆批作用——
+        # 一次能吃满的批被切成"大尾巴 + 小批"，每轮触发多打一次压缩调用。
+        tail_retained = 0
+        if force_all:
             summarize_count = _select_compaction_count(raw_rounds, source_budget)
         else:
+            # summary_total_budget 已在循环外按目标模式解析（含收紧逻辑），
+            # 此处不再重复解析：重复解析会丢掉目标模式的收紧值
+            tail_cap = tail_rounds_limit if (tail_rounds_limit or 0) > 0 else None
+            summary_head_tokens = (
+                estimate_messages_tokens(context_messages[:1]) if summary_message else 0
+            )
+
+            def _select_tail(usable_budget: int, hard_limit: int | None = None) -> list[dict[str, Any]]:
+                """在 usable_budget 内从最新往回挑可原样保留的轮次（最旧在前）。
+
+                `hard_limit`（目标模式传历史目标）只影响"最新一轮放不下时"的取舍：
+                该轮自身不超过硬上限就仍保留（模型能看到最近一轮原文），超过则一并
+                进摘要——否则单轮超过目标时会永远压不下来。
+                """
+                picked: list[dict[str, Any]] = []
+                used = summary_head_tokens
+                for entry in reversed(raw_rounds):
+                    if tail_cap is not None and len(picked) >= tail_cap:
+                        break
+                    entry_tokens = estimate_messages_tokens(
+                        round_entry_to_context_messages(entry, history_tool_result_max_length)
+                    )
+                    if picked:
+                        if used + entry_tokens > usable_budget:
+                            break
+                    elif hard_limit is not None and used + entry_tokens > hard_limit:
+                        # 目标模式：最新一轮本身就超过历史目标 → 不保留，交给摘要
+                        break
+                    picked.append(entry)
+                    used += entry_tokens
+                picked.reverse()
+                return picked
+
+            # 尾部保留必须给"新摘要"留位置：被压缩的轮次会变成一段摘要重新回到
+            # 历史里，若按完整 budget_limit 保留尾部，压缩后 tail + 新摘要 仍可能
+            # 超预算 → 立刻再触发一次小批压缩（多一次模型调用、且这批很小）。
+            # 因此按"新摘要预估长度"迭代收窄可用预算（最多 3 轮，通常 2 轮收敛）。
+            tail_hard_limit = target_tokens if target_tokens > 0 else None
+            usable_budget = budget_limit
+            tail_rounds = _select_tail(usable_budget, tail_hard_limit)
+            for _ in range(2):
+                if len(tail_rounds) >= len(raw_rounds):
+                    break
+                pending = raw_rounds[: len(raw_rounds) - len(tail_rounds)]
+                pending_tokens = sum(
+                    estimate_text_tokens(round_entry_to_compaction_text(entry))
+                    for entry in pending
+                )
+                reserved = _batch_summary_output_budget(pending_tokens, summary_total_budget)
+                narrowed = max(2048, budget_limit - reserved)
+                if narrowed >= usable_budget:
+                    break
+                usable_budget = narrowed
+                tail_rounds = _select_tail(usable_budget, tail_hard_limit)
+            if len(tail_rounds) >= len(raw_rounds):
+                break
             summarize_count = len(raw_rounds) - len(tail_rounds)
-        # 每批压缩量同时受历史目标预算和压缩模型输入预算约束；force_all 模式
-        # 最终会覆盖全部未摘要轮次，不会因为历史当前尚未超预算而提前停止。
-        if not force_all:
+            tail_retained = len(tail_rounds)
+            # 每批压缩量同时受历史目标预算和压缩模型输入预算约束
             summarize_count = min(summarize_count, len(raw_rounds) - keep_floor)
-        summarize_count = min(summarize_count, _select_compaction_count(raw_rounds, source_budget))
+            summarize_count = min(
+                summarize_count, _select_compaction_count(raw_rounds, source_budget)
+            )
         if summarize_count <= 0:
             break
         chunk_rounds = raw_rounds[:summarize_count]
@@ -1140,6 +1407,12 @@ async def compact_session_history_if_needed(
         for index, round_entry in enumerate(chunk_rounds, start=1):
             parts.append(f"【待压缩历史轮次 {index}】\n{round_entry_to_compaction_text(round_entry)}")
         chunk_source = "\n\n".join(parts)
+        chunk_source_tokens = estimate_text_tokens(chunk_source)
+        # 保真压缩比：本批摘要输出预算按源规模推导（上限 = 累计摘要总预算，
+        # 目标模式下为收紧后的预算），避免"批越吃越大、摘要长度却封顶"。
+        batch_output_limit = _batch_summary_output_budget(
+            chunk_source_tokens, summary_total_budget
+        )
         # 压缩模型思考/正文增量 -> phase="delta" 事件（仅实时推送，不落盘）
         session_delta_emitter = None
         if event_emitter is not None:
@@ -1176,7 +1449,8 @@ async def compact_session_history_if_needed(
                 tool_request,
                 scope="跨轮会话历史",
                 settings=settings,
-                output_token_budget=resolve_summary_total_budget(settings),
+                output_token_budget=summary_total_budget,
+                segment_output_limit=batch_output_limit,
                 delta_emitter=session_delta_emitter,
             )
         except asyncio.CancelledError:
@@ -1279,6 +1553,25 @@ async def compact_session_history_if_needed(
                     "fallback": summary_result.used_fallback,
                     "cumulative": True,
                 })
+                # 批次口径可见化（P2-1）：本批实际喂入压缩模型的源规模、批源预算、
+                # 被保留为尾部的轮次数与单段输出上限。此前只显示 before/after（历史
+                # 整体规模），无法核对"这批到底吃了多少、是否被截断"。
+                batch_diagnostics: dict[str, Any] = {
+                    "batch_source_tokens": chunk_source_tokens,
+                    "source_budget": source_budget,
+                    "tail_rounds": tail_retained,
+                    "source_was_truncated": bool(summary_result.source_was_truncated),
+                }
+                if summary_result.output_token_limit:
+                    batch_diagnostics["output_token_limit"] = int(summary_result.output_token_limit)
+                if summary_result.source_was_truncated:
+                    # 单批源超过压缩模型输入预算：头尾保留、中段丢弃。属于保真
+                    # 风险（该批中段细节未进入摘要），显式提示便于前端与排查。
+                    batch_diagnostics["warnings"] = ["batch_source_truncated"]
+                    print(
+                        f"[WARN] 本批压缩源 {chunk_source_tokens} tokens 超过输入预算 "
+                        f"{source_budget}，已头尾截断（中段内容未进入摘要）"
+                    )
                 await event_emitter({
                     "event": "context_compaction",
                     "scope": "session",
@@ -1305,6 +1598,9 @@ async def compact_session_history_if_needed(
                     # 不同：前者是触发比较基准，后者是压缩批的输入预算）
                     **({"trigger_threshold": int(trigger_threshold)}
                        if trigger_threshold is not None else {}),
+                    # 批次诊断字段（P2-1）：本批源规模/批源预算/尾部保留轮次/
+                    # 单段输出上限/是否发生源截断，前端可据此核对压缩比与保真度
+                    **batch_diagnostics,
                 })
             except Exception as exc:
                 print(f"[WARN] 跨轮压缩完成事件推送失败：{exc}")
@@ -1313,7 +1609,7 @@ async def compact_session_history_if_needed(
         # 游标推进后按新游标重算保真问题索引（只覆盖已压缩轮次，
         # 未压缩轮次的问题不重复进入索引）
         recent_question_items, _raw_in_window = split_context_window(
-            round_entries, _summary_source_round_count(summary_state), settings.keep_rounds
+            round_entries, _summary_source_round_count(summary_state)
         )
         recent_questions = [question for _number, question in recent_question_items]
         print(
@@ -1536,7 +1832,9 @@ async def compact_active_round_context_if_needed(
             else None
         )
     blocks: list[dict[str, Any]] = []
-    summary_budget = resolve_summary_total_budget(settings)
+    # 目标模式下收紧（见 resolve_effective_summary_budget）：单轮摘要同样受
+    # 历史目标约束，避免本轮摘要把历史额度吃满、总输入降不下来
+    summary_budget = resolve_effective_summary_budget(settings)
     merged_usage: dict[str, Any] = {}
     compaction_source = _round_messages_to_compaction_text([], active_messages)
     # 压缩模型思考/正文增量 -> phase="delta" 事件（仅实时推送，不落盘）
@@ -1641,7 +1939,15 @@ async def compact_active_round_context_if_needed(
                 "fallback": summary_result.used_fallback,
                 "block_count": 1,
                 "cumulative": True,
+                # 批次口径可见化（P2-1）：本轮实际喂入压缩模型的源规模、
+                # 单段输出上限与是否发生源截断（此前只能看到全量上下文 before/after）
+                "batch_source_tokens": estimate_text_tokens(compaction_source),
+                "source_was_truncated": bool(summary_result.source_was_truncated),
+                **({"output_token_limit": int(summary_result.output_token_limit)}
+                   if summary_result.output_token_limit else {}),
             })
+            if summary_result.source_was_truncated:
+                usage_payload["warnings"] = ["batch_source_truncated"]
             # 摘要全文随 done 事件推送并落盘（同一 payload），前端刷新后仍可在
             # 压缩块中回放摘要正文；思考过程只在 delta 阶段实时展示、不落盘。
             await event_emitter({

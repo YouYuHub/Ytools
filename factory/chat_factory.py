@@ -19,7 +19,6 @@ from env_manager import (
 from chat.chat_llm import ChatLLM
 from config import (
     ChatLLMRequest,
-    DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUB_AGENT_ENABLED,
     DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
@@ -37,6 +36,7 @@ from memory.file_memory import (
     resolve_message_media_refs,
 )
 from memory.chat_history_format import content_part_to_text
+from memory.chat_history_format import RECENT_QUESTIONS_TOKEN_BUDGET
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
@@ -52,6 +52,7 @@ from factory.agent_runtime.builtin_tools import (
     TODO_TOOL_NAME,
     WRITE_FILE_NAME,
     READ_MEDIA_NAME,
+    READ_DOCUMENT_NAME,
     collect_media_references,
     execute_builtin_tool,
     inject_builtin_tools,
@@ -60,6 +61,7 @@ from factory.agent_runtime.builtin_tools import (
     normalize_sub_agent_task,
     normalize_todo_items,
     execute_read_media,
+    execute_read_document,
     load_any_media_model_part,
     roll_recent_media_parts,
     retire_prior_video_parts,
@@ -99,6 +101,8 @@ from factory.agent_runtime.context_compaction import (
     compact_session_history_if_needed,
     load_context_compaction_settings,
     make_oversized_result_preview,
+    resolve_effective_summary_budget,
+    resolve_history_target_tokens,
     resolve_oversized_result_token_threshold,
     resolve_context_compaction_threshold,
     resolve_summary_total_budget,
@@ -121,9 +125,6 @@ from factory.session_worker import (
 )
 
 
-# P1 首调用预算检查：文件记忆超窗降级为摘要时的最大字符数
-# （与 memory/file_memory.py 的 get_file_memory_text 摘要语义一致）
-_FIRST_CALL_FILE_MEMORY_MAX_CHARS = 3000
 
 # 记录当前后台运行的会话生成任务（session_id -> _SessionStream）
 # 前端刷新/断开 SSE 连接时，后台任务不会被取消，事件持续写入缓冲与 JSONL
@@ -618,19 +619,48 @@ async def _compact_task_context_if_needed(
     round_start = _find_current_round_start(messages)
     active_messages = messages[round_start:] if round_start is not None else []
     system_message = messages[0] if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" else None
-    # 历史预算 = 阈值 × 0.4；摘要与最近问题由 summary-only 视图统一回传。
-    history_budget = max(2048, int(threshold * 0.4))
+    # ===== 任务内动态历史预算 =====
+    # 预算 = 阈值扣掉系统提示、工具定义、当前轮轨迹、摘要预留、问题索引与
+    # 安全余量，剩下的就是本批可以"原样保留为原始对话"的历史额度；超出的
+    # 部分才进摘要。这样超窗主因来自当前轮轨迹时（历史本身放得下），历史
+    # 不会被无谓压缩。
+    # 历史轮次窗口（原 keep_rounds）已废弃：不再有"保留最近 N 轮"的下限，
+    # 保留量完全由预算决定。
+    compaction_settings = load_context_compaction_settings()
+    system_tokens = estimate_message_tokens(system_message) if system_message else 0
+    tools_tokens = estimate_tool_definition_tokens(tool_request.tools)
+    active_tokens = estimate_send_context_tokens(active_messages)
+    summary_reserve = resolve_effective_summary_budget(compaction_settings)
+    safety_reserve = max(1024, threshold // 32)
+    history_budget = max(
+        2048,
+        threshold - system_tokens - tools_tokens - active_tokens
+        - summary_reserve - RECENT_QUESTIONS_TOKEN_BUDGET - safety_reserve,
+    )
+    # 设了历史压缩目标时以其为准（目标 < 可用空间才收紧）：目标模式要的是
+    # "历史 ≤ 目标"的稳定低成本，而不是"能塞多少塞多少"
+    history_target = resolve_history_target_tokens(compaction_settings)
+    if history_target > 0:
+        history_budget = min(history_budget, history_target)
     print(
         f"[INFO] 任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
-        f"压缩持久层历史（预算 {history_budget}）并重建内存历史部分"
+        f"动态历史预算 {history_budget}（系统 {system_tokens} + 工具 {tools_tokens} + "
+        f"当前轮 {active_tokens} + 摘要预留 {summary_reserve} + 问题索引 "
+        f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}），"
+        f"预算内轮次保留原始对话，超出部分压缩"
     )
     await compact_session_history_if_needed(
         session_chat_memory,
         tool_request,
-        settings=load_context_compaction_settings(),
+        settings=compaction_settings,
         budget_tokens=history_budget,
         enforce=True,
-        force_all=True,
+        # 不再 force_all：预算内的最近轮次保留为原始对话（保真），仅压缩超出
+        # 预算的旧轮次；压缩量由实际可用空间（或历史压缩目标）决定。
+        force_all=False,
+        # 历史轮次窗口已废弃：尾部保留量由预算（目标 / 可用空间）决定，
+        # 不按轮数截断（窗口外的轮次不再被丢弃，模型侧不会静默失忆）
+        tail_rounds_limit=None,
         event_emitter=event_emitter,
         # 触发来源 = 任务内检查点：全量上下文（含当前轮轨迹）超阈值，
         # 强制压缩历史；trigger_context_tokens / trigger_threshold 传
@@ -640,8 +670,8 @@ async def _compact_task_context_if_needed(
         trigger_threshold=threshold,
     )
     history_messages = await session_chat_memory.get_context_messages(
-        # <=0 表示无限窗口（keep_rounds=0），原样透传；否则至少保留 1 轮
-        max_rounds=backend_history_rounds if backend_history_rounds <= 0 else max(1, backend_history_rounds)
+        # 0 = 不限制轮次（历史轮次窗口已废弃）
+        max_rounds=0
     )
     # 主 system（persona+运行时文本+文件块）保持在首位，累计摘要/最近问题排在
     # 其后：不再把运行时文本混入【历史压缩摘要】消息，也不向已含文件块的
@@ -927,6 +957,12 @@ async def _run_chat_generation(
         SUB_AGENT_TOOL_NAME in (requested_names or [])
         and load_var("SUB_AGENT_ENABLED", DEFAULT_SUB_AGENT_ENABLED)
     )
+    # 会话是否已有上传文件（决定 read_document 自动注入与文件清单口径）
+    session_file_memory = await get_file_memory_manager(session_id)
+    try:
+        uploaded_file_count = session_file_memory.count_file_memory()
+    except Exception:
+        uploaded_file_count = 0
     round_tools, round_tool_servers = inject_builtin_tools(
         round_tools, round_tool_servers, include_todo=todo_requested,
         include_ask_user=ask_requested,
@@ -937,6 +973,16 @@ async def _run_chat_generation(
         include_read_media=read_media_requested,
         include_sub_agent=sub_agent_requested,
     )
+    # read_document 自动注入：会话存在上传文件且本轮携带工具时注入。
+    # 文件内容以「清单+按需读取」方式注入（小文件内联/大文件节选开头，
+    # 见 memory.file_memory.get_file_memory_manifest）；模型需要文件其余
+    # 内容时用 read_document 分页读取。不开放手选（与 check_tool_exists 同类）。
+    read_document_requested = False
+    if uploaded_file_count > 0 and round_tools:
+        round_tools, round_tool_servers = inject_builtin_tools(
+            round_tools, round_tool_servers, include_read_document=True,
+        )
+        read_document_requested = True
     tool_request.tools = round_tools or None
     messages: List[dict] = []
     for message in tool_request.messages or []:
@@ -952,7 +998,6 @@ async def _run_chat_generation(
     incoming_messages = list(messages)
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
-    session_file_memory = await get_file_memory_manager(session_id)
     # 编辑重发（target_round）：设置原地重跑目标轮次号。此后：
     # - 轮次收尾替换历史第 N 轮条目而非追加（add_chat_history / stop_current_round）；
     # - 上下文历史截到第 N-1 轮，旧累计摘要保留并用游标钳制参与拼装
@@ -1054,21 +1099,9 @@ async def _run_chat_generation(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
         )
-        configured_history_value = load_var("HISTORY_COMPACT_KEEP_ROUNDS", None)
-        if configured_history_value is None:
-            # 兼容旧版仅配置 BACKEND_HISTORY_ROUNDS 的项目；一旦聊天设置写入
-            # HISTORY_COMPACT_KEEP_ROUNDS，用户设置应优先于旧环境变量。
-            configured_history_value = load_var(
-                "BACKEND_HISTORY_ROUNDS", DEFAULT_CONTEXT_HISTORY_ROUNDS
-            )
-        configured_history_rounds = parse_int_like(
-            configured_history_value,
-            DEFAULT_CONTEXT_HISTORY_ROUNDS,
-        )
-        backend_history_rounds = parse_int_like(
-            getattr(tool_request, "backend_history_rounds", None),
-            configured_history_rounds,
-        )
+        # 历史轮次窗口（HISTORY_COMPACT_KEEP_ROUNDS / BACKEND_HISTORY_ROUNDS）已废弃：
+        # 历史规模由压缩阈值与历史压缩目标控制，未压缩轮次全部回传、不按轮数截断。
+        backend_history_rounds = 0
         history_compaction_settings = load_context_compaction_settings()
         frontend_history_provided = frontend_provides_full_history(incoming_messages)
         if frontend_history_provided:
@@ -1202,18 +1235,24 @@ async def _run_chat_generation(
                 )
         except Exception as media_error:
             print(f"[WARN] 媒体引用解析失败（按原始引用发送）: {media_error}")
-        # 这里做文件处理，并添加文件解析内容到 "content" 字段
-        user_files = session_file_memory.get_file_memory_chat()
-        file_memory_suffix = ""
+        # 这里做文件处理：注入「文件清单」（方案二：小文件内联全文 / 大文件
+        # 节选开头 + read_document 按需读取提示），替换旧版全量拼接。清单受
+        # 总预算约束（memory.file_memory.FILE_MEMORY_TOTAL_MAX_CHARS），不再
+        # 随文件体积无限膨胀；需要文件其余内容时模型调用 read_document 分页读取。
+        file_manifest_suffix = ""
         # 当前生效的文件块文本：重建降级候选消息时按此复现系统提示内容
         active_file_block = ""
-        if user_files:
-            file_memory_suffix = (
-                f"\n用户上传的 {len(user_files)} 个文件，解析的内容如下：\n"
-                f"{user_files}"
-            )
-            active_file_block = file_memory_suffix
-            messages[0]["content"] += file_memory_suffix
+        if uploaded_file_count > 0:
+            try:
+                file_manifest_suffix = session_file_memory.get_file_memory_manifest(
+                    read_document_available=read_document_requested,
+                )
+            except Exception as manifest_error:
+                print(f"[WARN] 文件清单构建失败（跳过文件注入）: {manifest_error}")
+                file_manifest_suffix = ""
+            if file_manifest_suffix:
+                active_file_block = file_manifest_suffix
+                messages[0]["content"] += file_manifest_suffix
         # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
         # 终态（全部 done）文案必须「新任务感知」：该后缀每轮新任务都会随系统
         # 提示注入，写"请汇总执行结果/无需再调用"是收官时对上一轮说的话，
@@ -1258,35 +1297,27 @@ async def _run_chat_generation(
                 print(
                     f"[WARN] 首次模型调用上下文 {first_call_tokens} tokens 超过模型窗口 {model_window}"
                 )
-                if user_files and file_memory_suffix:
-                    # 文件记忆无上限（get_file_memory_chat 返回全部文件完整内容），
-                    # 是最常见的超窗来源：降级为纯文本摘要后重新估算。
-                    downgraded_text = session_file_memory.get_file_memory_text(
-                        max_total_chars=_FIRST_CALL_FILE_MEMORY_MAX_CHARS
+                if file_manifest_suffix:
+                    # 文件清单已按预算构建（小文件内联/大文件节选）；仍超窗时
+                    # 进一步降级为「文件索引」（仅文件名/类型/大小 + 读取提示）。
+                    downgraded_text = session_file_memory.get_file_memory_index(
+                        read_document_available=read_document_requested,
                     )
-                    if messages[0]["content"].endswith(file_memory_suffix):
-                        messages[0]["content"] = messages[0]["content"][:-len(file_memory_suffix)]
+                    if messages[0]["content"].endswith(file_manifest_suffix):
+                        messages[0]["content"] = messages[0]["content"][:-len(file_manifest_suffix)]
                     if downgraded_text:
-                        messages[0]["content"] += (
-                            f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
-                            f"{downgraded_text}"
-                        )
+                        messages[0]["content"] += downgraded_text
                     downgraded_tokens = estimate_send_context_tokens(messages, tool_request.tools)
-                    active_file_block = (
-                        f"\n用户上传的 {len(user_files)} 个文件，按上下文预算降级为摘要：\n"
-                        f"{downgraded_text}"
-                        if downgraded_text
-                        else ""
-                    )
+                    active_file_block = downgraded_text if downgraded_text else ""
                     print(
-                        f"[WARN] 文件记忆已降级为摘要：{first_call_tokens} -> {downgraded_tokens} tokens"
+                        f"[WARN] 文件清单已降级为文件索引：{first_call_tokens} -> {downgraded_tokens} tokens"
                     )
                     warning_event = {
                         "warning": {
                             "code": "CONTEXT_BUDGET_FILE_DOWNGRADED",
                             "message": (
                                 f"上传文件内容超过模型窗口预算（{first_call_tokens} > {model_window} tokens），"
-                                "已降级为摘要文本，可能影响文件内容的完整性。"
+                                "已降级为文件索引（仅文件名），模型可按需读取文件内容。"
                             ),
                         }
                     }
@@ -1306,6 +1337,13 @@ async def _run_chat_generation(
                         model_window - system_tokens - tools_tokens - frontend_tokens
                         - max(1024, model_window // 16),
                     )
+                    # 设了历史压缩目标时以其为准（更激进）：首调用降级同样服务
+                    # 于"降低后续单次输入成本"，而不是只求塞进窗口
+                    first_call_target = resolve_history_target_tokens(
+                        load_context_compaction_settings()
+                    )
+                    if first_call_target > 0:
+                        history_allowance = min(history_allowance, first_call_target)
                     try:
                         await compact_session_history_if_needed(
                             session_chat_memory,
@@ -2135,6 +2173,20 @@ async def _run_chat_generation(
                         "error": None,
                     })
                     continue
+                if tn == READ_DOCUMENT_NAME:
+                    # 读取用户上传文件的解析文本（按字符区间分页）；系统提示词
+                    # 只注入清单，其余内容由模型按需读取（工具在有上传文件时
+                    # 由后端自动注入，见上方 read_document_requested）
+                    read_document_result = execute_read_document(ta, session_id)
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": read_document_result,
+                        "error": None,
+                    })
+                    continue
                 if tn == SUB_AGENT_TOOL_NAME:
                     # 子智能体派发：解析 task/todo；真正的执行（并发 gather）
                     # 在下方 external_parsed_tools 阶段统一进行，保证子任务与
@@ -2483,22 +2535,10 @@ async def _run_chat_generation(
                         # 写入当前 chat_round.events，不再重复保存顶层摘要状态。
         # 写入结束消息到文件
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
-        try:
-            final_compaction_settings = load_context_compaction_settings()
-            await compact_session_history_if_needed(
-                session_chat_memory,
-                tool_request,
-                settings=final_compaction_settings,
-                event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
-                # 触发来源 = 任务收尾（完成后把新轮次纳入累计摘要）
-                trigger_reason="post",
-            )
-        except ContextCompactionError as exc:
-            detail = f"收尾历史压缩失败（聊天模型重试仍不可用）：{exc}"
-            print(f"[ERROR] {detail}")
-            await _stream_emit(stream, _sse_error_payload(detail))
-        except Exception as exc:
-            print(f"[WARN] 结束后的历史压缩跳过：{exc}")
+        # 收尾压缩（trigger_reason="post"）已移除：任务结束时压缩会把刚完成的
+        # 轮次并入摘要，模型下一轮只能看到摘要而非原文，编辑文件等需要精确
+        # 内容的操作会因细节丢失而失准。历史统一在"任务开始时（auto）"与
+        # "任务内超阈值（task）"两个时机压缩。
     except asyncio.CancelledError:
         # 服务端关停/新消息打断/用户手动停止取消：尽力把已生成内容落盘。
         # 手动停止（stream.user_stop_requested）时以 stopped 状态收尾轮次，

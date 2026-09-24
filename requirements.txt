@@ -16,6 +16,7 @@ pillow
 # 用户机器未安装系统 ffmpeg 时作为回退执行体——装了 requirements 即无需
 # 额外配置 ffmpeg（系统 PATH 的 ffmpeg 优先使用）
 imageio-ffmpeg
+
 #################### necessary end ###################
 
 

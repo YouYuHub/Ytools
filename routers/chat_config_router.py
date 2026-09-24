@@ -67,6 +67,10 @@ from factory.agent_runtime.context_compaction import (
     resolve_config_max_input_tokens,
     resolve_context_compaction_model_config,
     resolve_context_compaction_threshold,
+    resolve_effective_summary_budget,
+    resolve_effective_window,
+    resolve_history_target_limits,
+    resolve_history_target_tokens,
     resolve_summary_total_budget,
 )
 from memory.chat_memory import (
@@ -184,11 +188,20 @@ def _history_compaction_config_payload(session_id: str | None = None) -> dict:
         except Exception:
             ambient_token = None
     try:
+        target_limits = resolve_history_target_limits(settings)
         payload = {
-            "keep_rounds": settings.keep_rounds,
             "trigger_ratio": settings.trigger_ratio,
             "summary_budget_ratio": settings.summary_budget_ratio,
             "summary_total_budget": resolve_summary_total_budget(settings),
+            # 历史压缩目标（夹取后的生效值）与可设区间：前端据此显示"压到多少"，
+            # 并把用户输入限制在 [下限, 上限] 内
+            "target_tokens": resolve_history_target_tokens(settings),
+            "target_limits": {
+                "min": target_limits[0],
+                "max": target_limits[1],
+                "window": resolve_effective_window(settings),
+            },
+            "effective_summary_budget": resolve_effective_summary_budget(settings),
             "effective_threshold": _effective_threshold_payload(settings),
             "oversized_reject_factor": settings.oversized_reject_factor,
             "max_oversized_rejections": settings.max_oversized_rejections,
@@ -196,9 +209,9 @@ def _history_compaction_config_payload(session_id: str | None = None) -> dict:
             "compaction_model": get_context_compaction_model_status(settings),
             "available_compaction_models": _available_compaction_models(),
             "env_names": {
-                "keep_rounds": "HISTORY_COMPACT_KEEP_ROUNDS",
                 "trigger_ratio": "HISTORY_COMPACT_TRIGGER_RATIO",
                 "summary_budget_ratio": "HISTORY_COMPACT_SUMMARY_BUDGET_RATIO",
+                "target_tokens": "HISTORY_COMPACT_TARGET_TOKENS",
                 "oversized_reject_factor": "HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR",
                 "max_oversized_rejections": "HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS",
             },
@@ -363,9 +376,13 @@ async def update_history_compaction_config(
     """
     candidate_settings = replace(
         load_context_compaction_settings(),
-        keep_rounds=int(payload.keep_rounds),
         trigger_ratio=float(payload.trigger_ratio),
         summary_budget_ratio=float(payload.summary_budget_ratio),
+        target_tokens=int(
+            payload.target_tokens
+            if payload.target_tokens is not None
+            else load_context_compaction_settings().target_tokens
+        ),
         oversized_reject_factor=float(
             payload.oversized_reject_factor
             if payload.oversized_reject_factor is not None
@@ -382,10 +399,11 @@ async def update_history_compaction_config(
     except ChatModelConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     update_env: dict[str, Any] = {
-        "HISTORY_COMPACT_KEEP_ROUNDS": int(payload.keep_rounds),
         "HISTORY_COMPACT_TRIGGER_RATIO": float(payload.trigger_ratio),
         "HISTORY_COMPACT_SUMMARY_BUDGET_RATIO": float(payload.summary_budget_ratio),
     }
+    if payload.target_tokens is not None:
+        update_env["HISTORY_COMPACT_TARGET_TOKENS"] = int(payload.target_tokens)
     if payload.oversized_reject_factor is not None:
         update_env["HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR"] = float(payload.oversized_reject_factor)
     if payload.max_oversized_rejections is not None:

@@ -92,6 +92,15 @@ class _FakeFileMemory:
     def get_file_memory_text(self, *args, **kwargs):
         return ""
 
+    def count_file_memory(self):
+        return 0
+
+    def get_file_memory_manifest(self, **kwargs):
+        return ""
+
+    def get_file_memory_index(self, **kwargs):
+        return ""
+
 
 class _FakeLLM:
     """最小模型桩：返回固定的流式回复帧，不发起真实网络请求。"""

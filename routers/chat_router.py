@@ -59,7 +59,10 @@ from memory.chat_memory import (
     delete_session_group,
     assign_session_group,
 )
-from memory.file_memory import cleanup_file_memory_manager
+from memory.file_memory import (
+    cleanup_file_memory_manager,
+    count_session_file_memory,
+)
 from routers.chat_config_router import get_chat_work_dir_config
 
 # 创建 API 路由器实例
@@ -856,6 +859,7 @@ async def get_chat_context_token_stats(
                 "messages_tokens": 0,
                 "system_prompt_tokens": 0,
                 "tool_definition_tokens": 0,
+                "file_memory_tokens": 0,
                 "request_context_tokens": 0,
                 "estimated_budget_ratio": 0.0,
                 "rounds": {
@@ -880,11 +884,7 @@ async def get_chat_context_token_stats(
             resolve_session_model_selection(normalized_session_id)[0]
         )
         try:
-            effective_max_rounds = (
-                max_rounds
-                if max_rounds is not None
-                else load_context_compaction_settings().keep_rounds
-            )
+            effective_max_rounds = max_rounds if max_rounds is not None else 0
             context_tools = None
             if include_tools:
                 available_tools = list(tool_registry.ALL_TOOLS)
@@ -903,7 +903,8 @@ async def get_chat_context_token_stats(
                     ]
                     # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
                     # 内置工具（todo_write / ask_user / write_file / edit_file /
-                    # read_file / search_files / read_media）按前端勾选显式注入。
+                    # read_file / search_files / read_media）按前端勾选显式注入；
+                    # read_document 在「会话存在上传文件且携带工具」时由后端自动注入。
                     # 这里保持 token 统计与真实请求的工具 schema 口径一致。
                     if context_tools or selected_names & set(SELECTABLE_BUILTIN_TOOL_NAMES):
                         context_tools, _ = inject_builtin_tools(
@@ -917,6 +918,14 @@ async def get_chat_context_token_stats(
                             include_search_files=SEARCH_FILES_NAME in selected_names,
                             include_read_media=READ_MEDIA_NAME in selected_names,
                         )
+                        # read_document 自动注入：会话存在上传文件时与真实请求同口径
+                        # （真实请求还要求本轮携带工具；此处用于展示口径）
+                        if count_session_file_memory(normalized_session_id) > 0:
+                            context_tools, _ = inject_builtin_tools(
+                                context_tools,
+                                {},
+                                include_read_document=True,
+                            )
             # read_media 指引条件开关：与真实请求同口径（显式传名才提示）。
             # 视觉过滤由 build_sys_prompt 内部按 ambient 会话模型统一判定。
             read_media_selected = False
@@ -1031,8 +1040,8 @@ async def compact_chat_context_manual(
             manager,
             tool_request,
             budget_tokens=manual_budget_tokens,
-            # 用户已在确认框中明确触发手动压缩；不要再受 keep_rounds 的自动压缩保护限制，
-            # force_all 模式会把全部已完成轮次纳入累计摘要。
+            # 用户已在确认框中明确触发手动压缩：全量把已完成轮次纳入累计摘要
+            # （历史轮次窗口已废弃，无自动压缩保护需要放宽）。
             enforce=True,
             force_all=True,
             # 手动压缩无 SSE 流可推，仅落盘同一结构的事件行，历史加载时可见
@@ -1113,7 +1122,7 @@ async def _manual_compaction_event_stream(
                 manager,
                 tool_request,
                 budget_tokens=budget_tokens,
-                # 手动确认后允许突破 keep_rounds，并覆盖所有未摘要轮次。
+                # 手动确认后覆盖所有未摘要轮次（历史轮次窗口已废弃）。
                 enforce=True,
                 force_all=True,
                 event_emitter=emit,

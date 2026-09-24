@@ -648,41 +648,33 @@ def extract_recent_question_items(
 def split_context_window(
     round_entries: list[dict[str, Any]],
     summarized_count: int,
-    keep_rounds: int,
+    keep_rounds: int | None = None,
     token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
 ) -> tuple[list[tuple[int | None, str]], list[dict[str, Any]]]:
-    """按总轮次窗口切分历史，决定"保真问题索引"与"完整对话轮次"的组成。
+    """切分历史，决定"保真问题索引"与"完整对话轮次"的组成。
 
-    `keep_rounds` 为模型上下文保留的**总轮次窗口**（HISTORY_COMPACT_KEEP_ROUNDS）：
+    历史轮次窗口（原 `keep_rounds`）已废弃，参数保留仅为签名兼容（被忽略）：
 
-    - 未压缩轮次（summarized_count 之后的轮次）优先占窗口，以**完整对话**回传
-      （含助手回答、工具调用等），其问题不再重复进入保真索引；
-    - 剩余窗口从最新往回分配给已压缩轮次的原始用户问题（保真索引，
-      受 token_budget 限制，超出从最旧丢弃）；
-    - `keep_rounds <= 0` 表示无限窗口：全部未压缩轮次完整回传、
-      全部已压缩轮次问题进入保真索引（仍受 token_budget 限制）。
+    - 未压缩轮次（summarized_count 之后的轮次）**全部**以完整对话回传
+      （含助手回答、工具调用等），其问题不重复进入保真索引；
+    - 已压缩轮次的原始用户问题全部进入保真索引（仍受 token_budget 限制，
+      超出从最旧丢弃）——历史规模改由压缩阈值与历史压缩目标控制，
+      不再由"保留最近 N 轮"限制。
 
     返回 (question_items, raw_rounds_in_window)：
     - question_items: (全局轮次编号, 问题) 列表，编号与累计摘要
       round_start/round_end 同一体系；
-    - raw_rounds_in_window: 窗口内未压缩轮次，按时间顺序（最旧在前）。
+    - raw_rounds_in_window: 未压缩轮次，按时间顺序（最旧在前）。
     """
     safe_count = max(0, summarized_count)
     compressed = round_entries[:safe_count]
     raw = round_entries[safe_count:]
-    if keep_rounds is not None and keep_rounds > 0:
-        raw_in_window = raw[-keep_rounds:] if len(raw) > keep_rounds else raw
-        remaining = keep_rounds - len(raw_in_window)
-    else:
-        raw_in_window = raw
-        remaining = len(compressed)
-    compressed_in_window = compressed[-remaining:] if remaining > 0 and compressed else []
-    start_number = safe_count - len(compressed_in_window) + 1
+    raw_in_window = raw
     items: list[tuple[int | None, str]] = []
-    for offset, entry in enumerate(compressed_in_window):
+    for offset, entry in enumerate(compressed):
         question = _round_question(entry)
         if question:
-            items.append((start_number + offset, question))
+            items.append((offset + 1, question))
     items = trim_recent_question_items(items, token_budget)
     return items, raw_in_window
 

@@ -207,7 +207,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
-        "maxInputTokens": 428000,
+        "maxInputTokens": 500000,
         "maxOutputTokens": 106000
       }
     }
@@ -215,7 +215,7 @@
   "model_selection": {
     "chat_model": {
       "ownership_name": "OpenCode Completions",
-      "model_name": "Omen Alpha",
+      "model_name": "Deepseek V4.1 Flash",
       "parameter": {
         "chat_completions": {
           "temperature": 0.8,

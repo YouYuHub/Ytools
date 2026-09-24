@@ -47,7 +47,7 @@
 | 单轮压缩开始 | `start` | `{"event":"context_compaction","scope":"round","phase":"start","role":"assistant","compress_context":<将被压缩的本轮轨迹节选，≤800 tokens>}` |
 | 单轮压缩完成 | `done` | `{"event":"context_compaction","scope":"round","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时全量上下文估算>,"after_tokens":<压缩后全量上下文估算>,"token_limit":<触发阈值 = min(聊天,压缩)窗口 × trigger_ratio>,"compress_usage":{usage..., before_tokens, after_tokens, fallback, block_count, cumulative:true}}` |
 | 跨轮压缩开始 | `start` | `{"event":"context_compaction","scope":"session","phase":"start","role":"assistant","context_summary":<将压缩的旧轮次节选，≤800 tokens>}` |
-| 跨轮压缩完成 | `done` | `{"event":"context_compaction","scope":"session","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时历史部分估算>,"after_tokens":<压缩后历史部分估算>,"token_limit":<本批预算（压缩批输入预算）>,"trigger_reason":<auto\|task\|first_call\|post\|manual>,"trigger_context_tokens":<task/first_call 路径的真实触发规模（全量上下文），其余路径省略>,"trigger_threshold":<task/first_call 路径的真实触发阈值（单轮阈值/模型窗口），其余路径省略>,"summary_usage":{usage..., compressed_rounds, fallback, cumulative:true}}` |
+| 跨轮压缩完成 | `done` | `{"event":"context_compaction","scope":"session","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时历史部分估算>,"after_tokens":<压缩后历史部分估算>,"token_limit":<本批预算（压缩批输入预算）>,"trigger_reason":<auto\|task\|first_call\|manual>,"trigger_context_tokens":<task/first_call 路径的真实触发规模（全量上下文），其余路径省略>,"trigger_threshold":<task/first_call 路径的真实触发阈值（单轮阈值/模型窗口），其余路径省略>,"summary_usage":{usage..., compressed_rounds, fallback, cumulative:true}}` |
 | 累计摘要更新 | `done` | `{"event":"context_compaction","scope":"round/session","phase":"done","summary_text":<累计摘要全文>,"...usage":{usage..., cumulative:true}}` |
 | 压缩中断标记 | `aborted` | `{"event":"context_compaction","scope":"round/session","phase":"aborted","role":"assistant","reason":"task_interrupted"}` |
 
@@ -56,7 +56,7 @@
 - 跨轮和单轮压缩都将新摘要合并为一个累计摘要块；合并结果随当前 `done` 事件返回，不再额外发送 `merge_block_count` 事件。
 - 单轮压缩的 `before_tokens` 为全量上下文（历史+系统提示+当前轮+工具定义）；当前轮轨迹不足阈值一半时跳过压缩（防空转，超窗主要来自历史时交由跨轮压缩/首调用预算检查处理）。
 - **触发点核对**：`done` 事件同时携带 `before_tokens`（触发规模）与 `token_limit`（触发阈值），前端压缩块显示"上下文/历史上下文 X → Y · 触发阈值 Z"。注意与 `compress_usage.prompt_tokens`（**压缩模型调用自身的输入量**，即被压缩节选文本的规模）区分——后者不是触发点，触发判断始终是 `before_tokens > token_limit`（任务内压缩）或历史估算 > 阈值（跨轮压缩）。
-- **触发来源**（`trigger_reason`，随 done 事件落盘，历史回放可见）：`auto`=任务开始自动（历史超阈值或未压缩轮次超 keep_rounds 保护）、`task`=任务内检查点（当前轮工具轨迹推高全量上下文超阈值，强制压缩历史；`trigger_context_tokens` 为全量规模、`trigger_threshold` 为单轮阈值）、`first_call`=首次调用超窗降级（`trigger_context_tokens` 为首调用全量规模、`trigger_threshold` 为模型窗口）、`post`=任务收尾、`manual`=用户手动。前端 detail 行显示"触发阈值 … · 本批预算 … · 触发来源 …（全量上下文 X > 阈值 Z）"，与"本批预算"（压缩批输入预算）明确区分。
+- **触发来源**（`trigger_reason`，随 done 事件落盘，历史回放可见）：`auto`=任务开始自动（历史超阈值）、`task`=任务内检查点（当前轮工具轨迹推高全量上下文超阈值，强制压缩历史；`trigger_context_tokens` 为全量规模、`trigger_threshold` 为单轮阈值）、`first_call`=首次调用超窗降级（`trigger_context_tokens` 为首调用全量规模、`trigger_threshold` 为模型窗口）、`manual`=用户手动。**收尾压缩（`post`）已移除**：任务结束不再压缩（避免刚完成的轮次被并入摘要导致后续编辑失准）；历史数据中仍可能出现该值。前端 detail 行显示"触发阈值 … · 本批预算 … · 触发来源 …（全量上下文 X > 阈值 Z）"，与"本批预算"（压缩批输入预算）明确区分。
 - **压缩失败策略**：压缩模型未配置或配置不可用时自动使用当前聊天模型压缩；压缩模型调用失败时换聊天模型重试一次；聊天模型仍失败则抛出终止级错误，**任务终止**（不再节选降级）——请求前/单轮压缩失败会立即推送错误帧并停止生成。
 - **任务中断恢复**：压缩结果采用"完成后一次性写入"，中断不会留下半成品数据。若上次任务在压缩进行中被终止（有 `start` 无 `done`），下次请求开始时会自动补一条 `aborted` 事件（前端把对应条目置为中断态），未覆盖的轮次由常规压缩按预算**重新压缩**。
 
@@ -200,7 +200,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
-| /chat_context/token_stats | GET | session_id(默认"default"), max_rounds(可选，≤0全部；省略时跟随 `HISTORY_COMPACT_KEEP_ROUNDS`，默认 20), include_tools(默认false), tool_names(可重复，按已选工具过滤) | 见下方说明 |
+| /chat_context/token_stats | GET | session_id(默认"default"), max_rounds(可选，≤0 表示不限制轮次；省略时同 0), include_tools(默认false), tool_names(可重复，按已选工具过滤) | 见下方说明 |
 | /chat_context/compact_manual | POST | session_id(默认"default"), force(默认false；为 true 时跳过下限守卫), stream(默认false) | stream=false: `{state, session_id, compressed_rounds, stats}`；stream=true: SSE 流（见下方说明）；上下文估算低于摘要预算且未 force 时拒绝（stream=false 返回 400 `{detail}`，stream=true 由结果帧 error 带回提示） |
 
 **POST /chat_context/compact_manual?stream=true（SSE 手动压缩）**
@@ -219,9 +219,10 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 - `context_token_limit`：当前聊天模型最大输入窗口（model.json `maxInputTokens`）
 - `messages_tokens`：历史消息（含跨轮摘要 system 消息）估算 token；**发送口径**——按真实请求规则计入当前轮（pending）最后一条非空思考（历史轮次思考不回传、不计入），与压缩触发/预算检查口径一致
 - `reasoning_tokens`：`messages_tokens` 中属于“随请求回传的最新思考”的估算 token（发送口径补偿项；无思考时为 0）
-- `tool_definition_tokens`：MCP 工具定义估算 token（仅 `include_tools=true` 时计入）
+- `tool_definition_tokens`：MCP 工具定义估算 token（仅 `include_tools=true` 时计入；会话存在上传文件时自动注入的 `read_document` schema 一并计入）
 - `tool_names`：前端当前选择的工具名称；与 `include_tools=true` 一起传入时只统计这些工具定义，并包含运行时注入的 `check_tool_exists` schema
-- `request_context_tokens`：`messages_tokens + system_prompt_tokens + tool_definition_tokens`
+- `file_memory_tokens`：会话**文件清单块**估算 token（小文件内联/大文件节选 + 按需读取提示，随首条 system 消息注入；无上传文件时为 0）
+- `request_context_tokens`：`messages_tokens + system_prompt_tokens + tool_definition_tokens + file_memory_tokens`
 - `estimated_budget_ratio`：`request_context_tokens / context_token_limit`（四舍五入到 4 位小数）
 - `rounds`：`{total(总轮数), summarized(已被跨轮摘要覆盖), retained(当前 pending 任务轮数), max_rounds}`
 - `has_context_summary` / `summary_text_length`：是否已有跨轮摘要及正文长度
@@ -245,7 +246,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /change_chat_dir | POST | Query `new_dir`(必填) | `{state, message, current_dir, persisted_env}`；设置**全局默认**工作目录（.env `DEFAULT_CHAT_WORK_DIR`），仅作为新会话初始目录与未覆盖会话的默认值；空路径 400 |
 | /chat_config/work_dir | GET | `session_id`（可选） | 基础字段 `{state, current_dir, persisted_dir, default_dir, is_consistent, env_name, env_value, env_file, source, read_only}`；携带 `session_id` 时附加 `{session_id, session_dir, session_dir_valid, effective_dir, is_overridden, warning}`：`session_dir` 为会话 `_meta.work_dir` 覆盖值（未设置为 null），`effective_dir` 为会话实际生效目录（覆盖 → 全局默认 → 进程 cwd），目录失效回退时 `warning` 给出提示 |
 | /chat_config/work_dir | POST | Body `{session_id, work_dir}` | `{state, message, session_id, session_dir, effective_dir, warning, updated_at}`；设置/清除会话独立工作目录（写会话 `_meta.work_dir`）。`work_dir` 非空时校验目录存在（不存在 400）；空串/None 清除覆盖恢复跟随默认。对正在运行的任务不生效，下一轮生成任务开始时生效 |
-| /chat_config/history_compaction | GET | `session_id`（可选） | `{keep_rounds, trigger_ratio, summary_budget_ratio, summary_total_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
+| /chat_config/history_compaction | GET | `session_id`（可选） | `{trigger_ratio, summary_budget_ratio, summary_total_budget, target_tokens, target_limits{min, max, window}, effective_summary_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
 | /chat_config/history_compaction | POST | Body 见下方完整策略；Query `session_id`（可选） | `{state, updated, config, memory_state}`；返回的 `config.effective_threshold` 同样支持会话口径 |
 | /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present}`；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`，响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示） |
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
@@ -286,7 +287,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 - **全局默认**：`setting/mcp_servers.json` 顶层 `inputs` 键（不携带 `session_id` 的 `POST /chat_config/tool_selection` 修改），作为**新建会话前**选择工具时的默认值（前端在新对话中保存工具选择即写入此处）；
 - **会话级覆盖**：会话历史 JSONL 首行 `_meta.tool_selection`（携带 `session_id` 的 `POST /chat_config/tool_selection` 修改，空 `inputs` 清除覆盖），结构与 `inputs` 一致（`{服务名: [工具名]}`），仅在用户显式设置时落盘（惰性）。
-- **内置工具**（`todo_write` / `ask_user` / `write_file` / `edit_file` / `read_file` / `search_files` / `read_media`，后续可扩展 subAgent 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。
+- **内置工具**（`todo_write` / `ask_user` / `write_file` / `edit_file` / `read_file` / `search_files` / `read_media`，后续可扩展 subAgent 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。`read_document`（读取上传文件解析文本）**不在勾选列表**：由后端在「会话存在上传文件且本轮携带工具」时自动注入（与 `check_tool_exists` 同类），文件内容按「清单 + 按需读取」方式进入上下文（见「文件 FileUpload」章节）。
 
 生成请求 `tool_names` 字段的语义保持「前端传入优先」；仅当请求**完全未携带** `tool_names`（`null`，区别于显式空列表 `[]`）时，后端回退为该会话的生效工具选择（`_meta.tool_selection` → 全局 `inputs`），并向前端推送 `warning` 事件（`code=TOOL_SELECTION_FALLBACK`，全局配置读取失败时触发）。显式传 `[]` 仍表示无工具模式。清空会话历史时 `_meta.tool_selection` 与 `_meta.work_dir` 一样予以保留。
 
@@ -538,15 +539,15 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 ```json
 {
-  "keep_rounds": 20,
   "trigger_ratio": 0.8,
   "summary_budget_ratio": 0.2,
+  "target_tokens": 0,
   "oversized_reject_factor": 1.5,
   "max_oversized_rejections": 3
 }
 ```
 
-- `keep_rounds`：兼容配置；摘要-only 模式下已完成历史不再按该字段回传原始轮次。
+- `target_tokens`：历史压缩目标（tokens）；`>0` 时把历史整体压到该值以内（压低单次输入成本），`0`=不设目标。取值会被夹取到 `[下限, 上限]`：下限 = 有效窗口（min(聊天,压缩)窗口）< 500k 时取 窗口×8%，否则固定 40k；上限 = 有效窗口×40%。越界不报错，按边界值生效。
 - `trigger_ratio`：历史压缩触发比例；未使用强制摘要模式的调用按该比例判断，范围为 $0 < r \le 0.95$。
 - `trigger_ratio`：单轮和跨轮共用的上下文压缩触发比例，范围为 $0 < r \le 0.95$。阈值 = `min(聊天模型窗口, 压缩模型窗口) × 该比例`；单轮触发时会先压缩此前可压缩的多轮历史，再压缩当前轮工具轨迹。
 - `summary_budget_ratio`（对应 env `HISTORY_COMPACT_SUMMARY_BUDGET_RATIO`，默认 0.2，上限 0.5）：累计摘要预算比例，**以聊天窗口为基数**。摘要总预算 = `聊天窗口 × 该比例`（100k × 20% = 20k）；新增摘要单次输出仍受压缩模型上限约束，最终归并为一个累计摘要块。
@@ -569,7 +570,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **先推 SSE 后落盘**：实时显示优先，落盘失败不阻塞推送；
 - 事件行不参与 `usage`/`user_questions`/`chat_round` 统计；
 - 触发门槛：单轮压缩需"全量上下文超 `min(聊天窗口, 压缩模型窗口) × trigger_ratio` **且** 本轮轨迹 > 阈值一半"（防空转，避免历史主导时空转消耗压缩调用）；触发后会先压缩此前可压缩的多轮历史，再处理当前轮轨迹。
-- **任务内预算管理**：长任务进行中，每批工具结果写入后若全量上下文超过统一压缩阈值，会**立即执行跨轮压缩并重建内存历史**——老轮次压成累计摘要（预算 = 阈值 × 0.4），随后内存消息重建为"累计摘要 system（含运行时提示） + 全历史最近问题 + 当前任务轮"；当前任务轮的轨迹仍由单轮压缩管理。
+- **任务内预算管理**：长任务进行中，每批工具结果写入后若全量上下文超过统一压缩阈值，会**立即执行跨轮压缩并重建内存历史**——超出动态历史预算的老轮次压成累计摘要（预算 = 阈值 − 系统提示 − 工具定义 − 当前轮轨迹 − 摘要总预算 − 问题索引 − 余量；预算内的最近轮次保留原始对话），随后内存消息重建为"累计摘要 system（含运行时提示） + 全历史最近问题 + 当前任务轮"；当前任务轮的轨迹仍由单轮压缩管理。**若配置了历史压缩目标 `HISTORY_COMPACT_TARGET_TOKENS`，历史预算改为 `min(动态可用空间, 目标)`**，把历史整体压到目标以内以降低后续单次输入成本。
 - 首调用预算检查：请求开始时若"历史+文件记忆+当前请求+工具定义"估算超过当前聊天模型窗口，文件记忆先降级为 3000 字符摘要并推送 `warning`（`CONTEXT_BUDGET_FILE_DOWNGRADED`）；仍超窗（典型场景：切换到更小窗口的模型）进入**历史降级链**：
   1. **强制跨轮压缩**——预算按实际可用空间计算（窗口−系统−文件−当前请求−工具定义−安全余量），把全部未覆盖历史纳入累计摘要；
   2. **问题索引收紧**——在极小模型窗口下按剩余空间收紧最近问题索引，但不恢复原始历史轮次；
@@ -602,6 +603,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   `results[]` 与 file_memory 记录均携带 `stored_name`（保存失败时为 null，不影响解析结果）；
   上传成功后会把该目录名写入对应聊天会话 jsonl 的 `_meta.upload_id`（会话文件不存在时自动创建），
   供 `/chat_history/delete_file` 连带清理；`upload_id` 为实际记录的目录名（记录失败时为 null，不影响上传结果）。
+- **解析内容注入方式（清单 + 按需读取）**：解析文本不再全量拼接进系统提示——由后端构建「文件清单」注入（小文件内联全文 / 大文件节选开头 + `read_document` 读取提示，总预算 16000 字符），模型需要细节时调用内置工具 `read_document` 按字符区间分页读取（详见下文「内置 read_document 工具」）；清单块计入 `token_stats.file_memory_tokens`。
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
@@ -633,6 +635,17 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - Query: `name`(必填, 即 stored_name，禁止路径分隔符), `session_id`
 - 支持 HTTP Range 请求（206），大 PDF 按需加载
 - 返回: 文件字节流（Content-Type 按扩展名推断）；不存在 404
+
+### 内置 read_document 工具（factory/agent_runtime/builtin_tools.py）
+用户上传文档（pdf/docx/doc/csv/xls/xlsx/md/txt 等）的解析文本按**「文件清单 + 按需读取」**方式进入模型上下文（替换旧版全量拼接）：
+
+- **文件清单**（`memory/file_memory.build_file_manifest_text`，随首条 system 消息注入）：小文件（解析文本 ≤4000 字符）内联全文；大文件仅给开头 2000 字符节选 + `read_document` 读取提示；清单总预算 16000 字符，超出按「新文件优先」收缩（先截断/省略最旧文件并注明）；
+- **read_document 工具**（会话存在上传文件且本轮携带工具时**后端自动注入**，不开放手选，与 `check_tool_exists` 同类）：模型需要文件其余内容时按文件名调用：
+  - `filename`（必填）：上传文件的原始文件名（清单中展示的名字）；
+  - `start_char` / `max_chars`：可选，字符区间分页读取（默认 0 / 8000，单次上限 20000）；
+  - 返回 `{filename, type, total_chars, start_char, end_char, content, has_more, next_start_char?}`，`has_more=true` 时用 `next_start_char` 续读；文件不存在时返回可用文件名列表提示；
+- **首调用超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
+- **token 统计**：`GET /chat_context/token_stats` 新增 `file_memory_tokens` 字段（清单块估算 token），并计入 `request_context_tokens`。
 
 ### 内置 read_media 工具（factory/agent_runtime/builtin_tools.py）
 模型可调用的媒体读取内置工具（「配置工具」→「内置工具」分组勾选 `read_media`），

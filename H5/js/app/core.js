@@ -225,9 +225,10 @@ window.App = window.App || {};
   const videoReadMaxSeconds = $("#videoReadMaxSeconds");
   const mcpToolWorkers = $("#mcpToolWorkers");
   const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
-  const keepRounds = $("#keepRounds");
   const triggerRatio = $("#triggerRatio");
   const summaryBudgetRatio = $("#summaryBudgetRatio");
+  const historyTargetTokens = $("#historyTargetTokens");
+  const historyTargetHint = $("#historyTargetHint");
   const oversizedRejectFactor = $("#oversizedRejectFactor");
   const maxOversizedRejections = $("#maxOversizedRejections");
   const effectiveThresholdHint = $("#effectiveThresholdHint");
@@ -272,9 +273,9 @@ window.App = window.App || {};
     video_read_max_seconds: 60,
     mcp_tool_workers: 3,
     sub_agent_max_concurrent: 3,
-    keep_rounds: 20,
     trigger_ratio: 0.8,
     summary_budget_ratio: 0.2,
+    target_tokens: 0,
     oversized_reject_factor: 1.5,
     max_oversized_rejections: 3,
   };
@@ -589,8 +590,8 @@ window.App = window.App || {};
   chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
   toolCallTimeoutSeconds, networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
   subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
-  subAgentMaxConcurrent, keepRounds,
-  triggerRatio, summaryBudgetRatio, oversizedRejectFactor,
+  subAgentMaxConcurrent,
+  triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
   scrollToBottom, nearBottom, stickToBottom, pauseAutoScroll, setEmpty,

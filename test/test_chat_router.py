@@ -12,7 +12,7 @@ from routers.chat_router import get_chat_work_dir_config
 
 def _settings():
     return ContextCompactionSettings(
-        keep_rounds=20,
+
         trigger_ratio=0.8,
         summary_budget_ratio=0.2,
         oversized_reject_factor=1.5,

@@ -300,7 +300,7 @@
       const chip = el("div", "doc-chip");
       chip.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>';
       chip.appendChild(el("span", "doc-chip-name", doc.filename || "未命名"));
-      chip.title = "已解析文档：内容将注入对话上下文；点击预览";
+      chip.title = "已解析文档：内容以清单形式注入对话上下文（大文件可按需读取）；点击预览";
       chip.classList.add("clickable");
       chip.addEventListener("click", function () {
         openMediaPreviewForDocument(doc);

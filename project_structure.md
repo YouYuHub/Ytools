@@ -29,8 +29,8 @@ agent_tool_sse/
 │   ├── agent_runtime/           # Agent 编排所需的可复用运行时组件
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
-│   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）
-│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
+│   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）+ 保真批次策略（force_all 不做尾部保留、单批源吃满 0.9 窗口、压缩比恒定 12:1、批次诊断字段）+ 历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS，夹取到窗口派生上下限：<500k 时 8% 下限、≥500k 时 40k 下限、40% 上限；目标模式下摘要预算收紧为 min(预算, 目标×0.6) 并走"只保留核心内容"的精简提示词）
+│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体、read_document 按需读取上传文件解析文本（有上传文件时自动注入）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
 │   │   └── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
 │   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理；生成任务逃逸异常与 worker 崩溃均可见化（error SSE 帧 + JSONL 错误说明 + task_done 收尾）
@@ -43,8 +43,8 @@ agent_tool_sse/
 ├── memory/                      # 记忆持久化层
 │   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘 + 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
-│   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、chat_round→上下文消息（含工具结果回传模式）
-│   └── file_memory.py           # FileMemoryManager：上传文件记录管理
+│   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）
+│   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（小文件内联/大文件节选+按需读取）与记录查找
 │
 ├── routers/                     # API 路由层
 │   ├── chat_router.py           # 聊天主接口 + 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
@@ -129,7 +129,7 @@ agent_tool_sse/
    ├─ ③ 工具白名单过滤：前端只允许传 tool_names，后端实时工具为唯一真相
    │     - 未注册工具名 → 忽略并发 warning 事件
    │     - 未选择工具 → 无工具模式继续
-   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 <session>_chat.jsonl.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索：服务端本地执行、语义对齐 MCP 同名工具，相对路径基于会话工作目录；write/edit/read 返回结构化 dict 携带 path/action/replacements/total_lines 等字段，为文件 diff 功能预留）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单轮 ≤5、>2MB 大图按 quality 50-100 降采样为长边 1568 JPEG；数据以 user 多模态部件注入后续请求、仅内存不落盘）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
+   │     - 有选择时注入内置工具 check_tool_exists；工具选择「内置工具」分组勾选的项也注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 <session>_chat.jsonl.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索：服务端本地执行、语义对齐 MCP 同名工具，相对路径基于会话工作目录；write/edit/read 返回结构化 dict 携带 path/action/replacements/total_lines 等字段，为文件 diff 功能预留）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单轮 ≤5、>2MB 大图按 quality 50-100 降采样为长边 1568 JPEG；数据以 user 多模态部件注入后续请求、仅内存不落盘）、read_document（读取用户上传文件的解析文本：文件清单随系统提示注入（小文件内联全文/大文件节选开头），其余内容按字符区间分页读取；会话存在上传文件且本轮携带工具时自动注入，不开放手选）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
    ├─ ④ 上下文构建：
    │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS，默认跟随 HISTORY_COMPACT_KEEP_ROUNDS，前端提供完整历史则跳过）
    │     - 注入系统提示词（含当前工作路径、思考过程回传长度说明）+ 会话已上传文件解析内容
@@ -256,9 +256,17 @@ agent_tool_sse/
 
 | 工具 | 业务 |
 |---|---|
-| run_command | 终端命令执行（多 shell：cmd/powershell/pwsh/bash/sh/zsh；超时杀进程树、超长输出截断并落盘完整输出、gbk/utf-8 编码自适应、后台分离模式） |
+| run_command | 终端命令执行（多 shell：cmd/powershell/pwsh/bash/sh/zsh；超时杀进程树、超长输出截断并落盘完整输出、gbk/utf-8 编码自适应、后台分离模式；cmd 家族健壮性补丁：多行内联代码改写为临时脚本、管道过滤器探测替换/本地兜底、分号与 Unix 命令语法提示） |
 | fetch_url | 抓取网页/HTTP 接口（正文纯文本、按标签/正则抽取、超长截断） |
 | web_search | 网页搜索（解析 Bing 网页版，返回标题/链接/摘要） |
+
+**run_command 的 cmd 家族健壮性补丁**（`mcp_server/sys_tools_server.py`，均为实测复现的真实坑）：
+
+| 坑 | 现象 | 修复 |
+|---|---|---|
+| 多行内联代码（`python -c "…多行…"`） | cmd 按行解释 .run.cmd，后续行被当独立命令执行（报 `i was unexpected at this time.`） | 自动改写为临时脚本（`inline_*.py/.js`，24h 回收）后执行，退出码透传；尾部语法复杂无法安全改写时给出明确提示 |
+| 管道过滤器（`\| tail -N` / `\| head -N`） | PATH 里可能命中"非管道过滤器"实现（实测宝塔 `E:\BtSoft\panel\script\tail.EXE`）：在管道中提前退出且不转发输出 → 上游 `Errno 22` → 整条管道静默"（无输出）" | 用【管道形式 + 独立进程生产者】探针识别（直接调用探测会误判为可用）；不可用时自动替换 PATH 中可用实现，均无则去掉该管道段并在 Python 侧本地取头/尾 N 行 |
+| cmd 语法误用 | `;` 被当普通字符原样输出（exit=0 但后续命令未执行）；Unix 命令名在 cmd 下失败 | 失败或可疑时附提示：`;`/`&&` 等价写法、Unix 命令的 Windows 等价物与 `shell=bash` 建议（按子进程 PATH 判断，避免误报） |
 
 Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐藏中转链执行（脱离宿主受限 Job 与进程树）；非 cmd shell 命令写入独立执行脚本（powershell/pwsh→.run.ps1 以 -File 执行、bash/sh/zsh→.run.sh 以 stdin 喂入），绕开 cmd 解析层对 `\"` 转义的二次破坏；中转临时文件（含超长输出的完整版落盘 fg_*.full.txt）每次调用后即时清理、超 24h 自动回收。
 

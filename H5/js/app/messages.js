@@ -666,6 +666,40 @@
         if (compressedRounds !== null && compressedRounds > 0) {
           detail.push("压缩旧轮次 " + FormatUtils.fmtNum(compressedRounds));
         }
+        // 批次诊断（P2-1）：本批喂入压缩模型的源规模 / 批源预算 / 保留为原始
+        // 对话的尾部轮次 / 单段输出上限——用于核对"每批是否吃满、压缩比是否
+        // 保真"，而不是只看历史整体 before/after（后者无法反映单批行为）
+        const batchSourceTokens = safeNumber(latestCompaction.batch_source_tokens != null
+          ? latestCompaction.batch_source_tokens : latestUsage && latestUsage.batch_source_tokens);
+        const sourceBudget = safeNumber(latestCompaction.source_budget != null
+          ? latestCompaction.source_budget : latestUsage && latestUsage.source_budget);
+        const tailRounds = safeNumber(latestCompaction.tail_rounds != null
+          ? latestCompaction.tail_rounds : latestUsage && latestUsage.tail_rounds);
+        const outputTokenLimit = safeNumber(latestCompaction.output_token_limit != null
+          ? latestCompaction.output_token_limit : latestUsage && latestUsage.output_token_limit);
+        if (batchSourceTokens !== null && batchSourceTokens > 0) {
+          let batchText = "本批压缩源 " + FormatUtils.fmtNum(batchSourceTokens);
+          if (sourceBudget !== null && sourceBudget > 0) {
+            batchText += " / 预算 " + FormatUtils.fmtNum(sourceBudget);
+          }
+          if (outputTokenLimit !== null && outputTokenLimit > 0) {
+            batchText += " · 摘要上限 " + FormatUtils.fmtNum(outputTokenLimit);
+          }
+          detail.push(batchText);
+        }
+        if (tailRounds !== null && tailRounds > 0) {
+          detail.push("保留原始对话 " + FormatUtils.fmtNum(tailRounds) + " 轮");
+        }
+        // 源截断警告：单批源超过压缩模型输入预算时中段被丢弃（保真风险），
+        // 显式提示，避免"摘要看起来正常但细节已缺失"的静默降级
+        const warnings = latestCompaction.warnings
+          || (latestUsage && latestUsage.warnings) || null;
+        const truncated = latestCompaction.source_was_truncated
+          || (latestUsage && latestUsage.source_was_truncated)
+          || (Array.isArray(warnings) && warnings.indexOf("batch_source_truncated") >= 0);
+        if (truncated) {
+          detail.push("⚠ 本批源超输入预算，已头尾截断（中段未进摘要）");
+        }
         if (blockCount !== null && blockCount > 0) {
           detail.push("摘要块 " + FormatUtils.fmtNum(blockCount));
         }
