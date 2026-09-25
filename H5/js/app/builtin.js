@@ -23,6 +23,7 @@
   const EDIT_FILE_TOOL_NAME = "edit_file";
   const READ_FILE_TOOL_NAME = "read_file";
   const SEARCH_FILES_TOOL_NAME = "search_files";
+  const RUN_COMMAND_TOOL_NAME = "run_command";
   const READ_MEDIA_TOOL_NAME = "read_media";
   const SUB_AGENT_TOOL_NAME = "sub_agent";
   const BUILTIN_SERVER_KEY = "__builtin__";
@@ -56,10 +57,53 @@
       description: "跨文件搜索（内置）：类 grep 的正则逐行匹配，跳过依赖目录与大文件",
     },
     {
+      name: RUN_COMMAND_TOOL_NAME,
+      description: "终端命令（内置）：执行 cmd/PowerShell/bash 等命令，超时保护、输出截断并落盘完整输出、支持后台模式",
+    },
+    {
       name: READ_MEDIA_TOOL_NAME,
       description: "读取媒体（内置）：模型读取当前任务消息中的图片/视频（≤5 个）并以视觉形式观察",
     },
   ];
+
+  // 每个内置工具用一枚易辨认的线性图标；同一映射也供工具调用卡片使用。
+  const TOOL_ICON_PATHS = {
+    todo_write: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3 6 1.4 1.4L7 4.8M3 12h3M3 18h3"/>',
+    ask_user: '<path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-5a7.5 7.5 0 1 1 17-4.5Z"/><path d="M10 9a2 2 0 1 1 3.4 1.4c-.9.8-1.4 1.1-1.4 2.1M12 15.5h.01"/>',
+    sub_agent: '<circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M12 7.5v4M12 11.5 5 15.5M12 11.5l7 4"/>',
+    write_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-7"/><path d="M13 3v5h5M8 12h5M8 16h3M19 3v6M16 6h6"/>',
+    edit_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h7"/><path d="M13 3v5h5M8 12h3M8 16h2"/><path d="m15 17 5.8-5.8a1.6 1.6 0 0 1 2.2 2.2L17.2 21H14v-3.2Z"/>',
+    read_file: '<path d="M12 7c-1.5-2.1-3.5-3-6-3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h1c2.5 0 4.5.7 6 2M12 7c1.5-2.1 3.5-3 6-3h1a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-1c-2.5 0-4.5.7-6 2M12 7v15"/><path d="M6 9h2M16 9h2"/>',
+    search_files: '<path d="M4 4h11l4 4v3M15 4v4h4M4 4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M6 11h7M6 15h4"/><circle cx="17" cy="17" r="3.5"/><path d="m19.6 19.6 2 2"/>',
+    run_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+    read_media: '<rect x="7" y="3" width="14" height="15" rx="2" transform="rotate(8 14 10.5)"/><rect x="3" y="6" width="14" height="15" rx="2"/><circle cx="7.5" cy="10.5" r="1.3"/><path d="m4 18 4-4 3 3 2-2 3 3"/>',
+  };
+  const TOOL_DISPLAY_NAMES = {
+    todo_write: "改写计划",
+    ask_user: "询问用户",
+    sub_agent: "委派子智能体",
+    write_file: "写入文件",
+    edit_file: "编辑文件",
+    read_file: "读取文件",
+    search_files: "查找文件",
+    run_command: "运行命令",
+    read_media: "读取媒体",
+  };
+  const DEFAULT_TOOL_ICON_PATH = '<path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/>';
+
+  function toolIconSvg(name, className) {
+    const paths = Object.prototype.hasOwnProperty.call(TOOL_ICON_PATHS, name)
+      ? TOOL_ICON_PATHS[name]
+      : DEFAULT_TOOL_ICON_PATH;
+    const classAttribute = className || "icon tool-icon";
+    return '<svg class="' + classAttribute + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + "</svg>";
+  }
+
+  function toolDisplayName(name) {
+    return Object.prototype.hasOwnProperty.call(TOOL_DISPLAY_NAMES, name)
+      ? TOOL_DISPLAY_NAMES[name]
+      : "";
+  }
 
   function isBuiltinToolName(name) {
     return BUILTIN_TOOLS.some(function (tool) { return tool.name === name; });
@@ -420,9 +464,12 @@
   App.TODO_TOOL_NAME = TODO_TOOL_NAME;
   App.ASK_USER_TOOL_NAME = ASK_USER_TOOL_NAME;
   App.SUB_AGENT_TOOL_NAME = SUB_AGENT_TOOL_NAME;
+  App.RUN_COMMAND_TOOL_NAME = RUN_COMMAND_TOOL_NAME;
   App.BUILTIN_SERVER_KEY = BUILTIN_SERVER_KEY;
   App.BUILTIN_TOOLS = BUILTIN_TOOLS;
   App.isBuiltinToolName = isBuiltinToolName;
+  App.toolIconSvg = toolIconSvg;
+  App.toolDisplayName = toolDisplayName;
   App.renderTodoWidget = renderTodoWidget;
   App.applySessionTodo = applySessionTodo;
   App.buildAskBlock = buildAskBlock;

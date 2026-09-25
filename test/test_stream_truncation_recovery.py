@@ -79,6 +79,32 @@ class SubAgentTruncatingLLM:
         yield "data: [DONE]\n\n"
 
 
+class TextToolCallLLM:
+    """First reply is a text envelope; the next reply is a normal answer."""
+
+    calls = 0
+    last_messages = None
+    always_markup = False
+
+    @staticmethod
+    async def chat_completions(request=None, stream=False, stop_checker=None, **kw):
+        TextToolCallLLM.calls += 1
+        TextToolCallLLM.last_messages = list(request.messages or [])
+        if TextToolCallLLM.calls == 1 or TextToolCallLLM.always_markup:
+            chunks = [
+                "@@<tool_",
+                "call>\n<tool_call>\n",
+                '{"name":"todo_write","arguments":{"todos":[]}}',
+                "\n</tool_call>",
+            ]
+        else:
+            chunks = ["任务已完成，以下是最终结果。"]
+        for content in chunks:
+            yield f"data: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
+        yield 'data: {"finish_reason":"stop"}\n\n'
+        yield "data: [DONE]\n\n"
+
+
 class TruncationTestBase(unittest.IsolatedAsyncioTestCase):
     """公共基座：只放环境搭建与消费工具，不定义测试方法（避免被子类重复继承）。"""
 
@@ -124,6 +150,43 @@ class TruncationTestBase(unittest.IsolatedAsyncioTestCase):
     def _history_path(self, sid):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, "history_files", f"{sid}_chat.jsonl")
+
+
+class TextToolCallRecoveryTests(TruncationTestBase):
+    async def test_text_tool_call_is_hidden_and_model_retries(self):
+        sid = f"mock_text_tool_{uuid.uuid4().hex}"
+        TextToolCallLLM.calls = 0
+        TextToolCallLLM.always_markup = False
+        cf.ChatLLM.chat_completions = TextToolCallLLM.chat_completions
+        try:
+            text = await self._consume(sid)
+            self.assertEqual(TextToolCallLLM.calls, 2)
+            self.assertIn("TEXT_TOOL_CALL_RETRY", text)
+            self.assertIn("任务已完成，以下是最终结果", text)
+            self.assertNotIn("<tool_call>", text)
+            self.assertIn("请勿输出 <tool_call>", json.dumps(
+                TextToolCallLLM.last_messages, ensure_ascii=False, default=str,
+            ))
+            with open(self._history_path(sid), "r", encoding="utf-8") as f:
+                self.assertNotIn("<tool_call>", f.read())
+        finally:
+            await cleanup_chat_memory_manager(sid)
+            ChatMemoryManager.delete_chat_session_file(sid)
+
+    async def test_repeated_text_tool_calls_stop_after_two_retries(self):
+        sid = f"mock_text_tool_stuck_{uuid.uuid4().hex}"
+        TextToolCallLLM.calls = 0
+        TextToolCallLLM.always_markup = True
+        cf.ChatLLM.chat_completions = TextToolCallLLM.chat_completions
+        try:
+            text = await self._consume(sid)
+            self.assertEqual(TextToolCallLLM.calls, 3)
+            self.assertIn("模型连续输出文本形式的工具调用", text)
+            self.assertNotIn("<tool_call>", text)
+        finally:
+            TextToolCallLLM.always_markup = False
+            await cleanup_chat_memory_manager(sid)
+            ChatMemoryManager.delete_chat_session_file(sid)
 
 
 class StreamTruncationRecoveryTests(TruncationTestBase):

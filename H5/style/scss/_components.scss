@@ -513,6 +513,10 @@
     color: var(--text-secondary);
   }
 
+  .tool-row-icon.is-builtin-tool-icon {
+    color: var(--tool-icon-pink);
+  }
+
   @media (max-width: 680px) {
     padding: 8px;
 
@@ -1188,9 +1192,16 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 6px 0;
+    margin: 7px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
     font-size: 13px;
     color: var(--text-secondary);
+
+    &:focus-within {
+      border-color: #0b84d8;
+    }
 
     > span {
       flex: 1;

@@ -50,6 +50,12 @@ DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 3        # 子任务 todo 未完成提醒上
 # 工具并发执行（前端聊天设置可调，GET/POST /chat_config/tool_concurrency）
 DEFAULT_ONE_TASK_MAX_WORKERS = 3             # 同一轮多个 MCP 工具调用并发执行的线程池大小（实际取值与工具数取较小者）
 
+# 访客用户显示名（数据库/账号体系接入前的全局用户标识）：
+# 前端侧边栏点击名字即可修改，后端写入项目 .env 的 USER_NAME 键（清空 = 回退本默认值），
+# 见 routers/user_profile_router.py；后续接入数据库后替换该路由的数据源即可。
+DEFAULT_USER_NAME = "访客用户"
+MAX_USER_NAME_LENGTH = 32                    # 显示名最大字符数（前端输入框同步限制）
+
 
 class Message(BaseModel):
     role: str = "user"       # 角色，可以是 "user" 或 "assistant" 或 "system" 或 "tool"

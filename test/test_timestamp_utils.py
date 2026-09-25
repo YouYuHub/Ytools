@@ -1,8 +1,12 @@
+import os
 import re
+import sys
 import unittest
 from datetime import datetime
 
-from memory.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, format_timestamp, now_str
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, format_timestamp, now_str
 
 
 class TimestampUtilsTests(unittest.TestCase):
@@ -23,7 +27,7 @@ class TimestampUtilsTests(unittest.TestCase):
             "memory/chat_memory.py",
             "memory/chat_round_store.py",
             "memory/file_memory.py",
-            "mcp_server/sys_server.py",
+            "mcp_server/sys_tools_server.py",
         ):
             with open(path, "r", encoding="utf-8") as fp:
                 content = fp.read()

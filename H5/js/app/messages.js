@@ -551,7 +551,7 @@
         ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>'
         : nextPhase === "aborted"
           ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M12 8v5"/><circle cx="12" cy="16.5" r="0.6" fill="currentColor"/><circle cx="12" cy="12" r="9.2"/></svg>'
-          : '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+          : '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M5 4h14M12 4v6m-3-3 3 3 3-3M5 20h14M12 20v-6m-3 3 3-3 3 3"/></svg>';
       title.textContent = nextPhase === "start"
         ? "正在压缩 · " + scopeLabel
         : nextPhase === "aborted"
@@ -1495,21 +1495,83 @@
   function buildToolBlock(name) {
     const wrap = el("div", "tool-block");
     const head = el("button", "tool-block-head");
-    const statusIcon = '<svg class="icon tool-spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>';
+    const toolIconClass = "icon tool-block-tool-icon" +
+      (App.isBuiltinToolName(name) ? " is-builtin-tool-icon" : "");
+    const toolIcon = App.toolIconSvg(name, toolIconClass);
+    const statusIcon = '<svg class="icon tool-status-icon tool-spin" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>';
     head.innerHTML =
-      statusIcon +
-      "<span>调用工具</span>" +
-      '<span class="tool-block-name"></span>' +
+      toolIcon + statusIcon +
+      '<span class="tool-block-generic-action">调用工具</span>' +
+      '<span class="tool-block-action" hidden></span>' +
+      '<span class="tool-block-name" hidden></span>' +
       '<span class="tool-block-file" hidden></span>' +
       '<span class="tool-block-diff" hidden></span>' +
       '<svg class="icon tool-block-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
-    head.querySelector(".tool-block-name").textContent = name || "tool";
 
     const body = el("div", "tool-block-body");
     const inLabel = el("span", "tool-io-label", "输入");
     const inPre = el("pre", "tool-io", "");
     const outLabel = el("span", "tool-io-label", "输出");
     const outPre = el("pre", "tool-io tool-io-out", "");
+    let currentToolName = "";
+    let outputText = "";
+
+    function renderToolOutput() {
+      outPre.textContent = "";
+      if (currentToolName !== "run_command" || !outputText) {
+        outPre.textContent = outputText;
+        return;
+      }
+      const marker = /^--- (stdout|stderr) ---[ \t]*$/gm;
+      const sections = [];
+      let match;
+      while ((match = marker.exec(outputText)) !== null) {
+        sections.push({ start: match.index, type: match[1] });
+      }
+      if (!sections.length) {
+        outPre.textContent = outputText;
+        return;
+      }
+      let cursor = 0;
+      sections.forEach(function (section, index) {
+        if (section.start > cursor) {
+          outPre.appendChild(document.createTextNode(outputText.slice(cursor, section.start)));
+        }
+        const end = index + 1 < sections.length ? sections[index + 1].start : outputText.length;
+        const stream = document.createElement("span");
+        stream.className = "tool-output-stream tool-output-" + section.type;
+        stream.textContent = outputText.slice(section.start, end);
+        outPre.appendChild(stream);
+        cursor = end;
+      });
+      if (cursor < outputText.length) {
+        outPre.appendChild(document.createTextNode(outputText.slice(cursor)));
+      }
+    }
+
+    function updateToolIdentity(nextName) {
+      currentToolName = String(nextName || "tool");
+      const isBuiltin = App.isBuiltinToolName(currentToolName);
+      const actionName = App.toolDisplayName(currentToolName);
+      const icon = head.querySelector(".tool-block-tool-icon");
+      if (icon) {
+        icon.outerHTML = App.toolIconSvg(
+          currentToolName,
+          "icon tool-block-tool-icon" + (isBuiltin ? " is-builtin-tool-icon" : "")
+        );
+      }
+      const genericAction = head.querySelector(".tool-block-generic-action");
+      const action = head.querySelector(".tool-block-action");
+      const nameNode = head.querySelector(".tool-block-name");
+      genericAction.hidden = Boolean(actionName);
+      action.hidden = !actionName;
+      action.textContent = actionName;
+      nameNode.hidden = Boolean(actionName);
+      nameNode.textContent = currentToolName;
+      if (outputText) renderToolOutput();
+    }
+    updateToolIdentity(name);
+
     body.appendChild(inLabel);
     body.appendChild(inPre);
     body.appendChild(outLabel);
@@ -1591,14 +1653,17 @@
     return {
       wrap: wrap,
       setFileTag: setFileTagValue,
-      setName: function (n) { head.querySelector(".tool-block-name").textContent = n || "tool"; },
+      setName: updateToolIdentity,
       setInput: function (t) {
         // 整体重设（结果返回/历史回放路径）：清空揭示队列直接显示最终文本
         stopReveal();
         revealQueue = "";
         inPre.textContent = t || "{}";
       },
-      setOutput: function (t) { outPre.textContent = t || "(无输出)"; },
+      setOutput: function (t) {
+        outputText = t ? String(t) : "(无输出)";
+        renderToolOutput();
+      },
       // 附带展示用 diff 视图（write_file/edit_file 结果）：渲染在输出区上方，
       // 头部显示完整文件路径（可换行、垂直居中）+ "+N绿 / -M红" 双徽标
       setDiff: function (diff) {
@@ -1690,8 +1755,8 @@
         flushReveal();
         wrap.classList.remove("is-streaming");
         wrap.classList.remove("is-executing");
-        head.querySelector(".tool-spin").outerHTML =
-          '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+        const statusIcon = head.querySelector(".tool-status-icon");
+        if (statusIcon) statusIcon.remove();
         if (!outPre.textContent || outPre.textContent === "执行中…") {
           outPre.textContent = "(无输出)";
         }
@@ -1902,6 +1967,10 @@
    * 字段的旧数据里兜底提取完整文件路径（full_file_name），以及为 read_file /
    * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
   function applyToolResult(block, name, resultText, fileDiff, args) {
+    if (name === "edit_file" || name === "write_file") {
+      const toolIcon = block && block.wrap && block.wrap.querySelector(".tool-block-tool-icon");
+      if (toolIcon) toolIcon.classList.toggle("is-failed", isToolFailureResult(resultText));
+    }
     let parsed = null;
     if (fileDiff && typeof fileDiff === "object") {
       try {
@@ -1935,6 +2004,20 @@
     if (!fileDiff || !fileDiff.path) {
       block.setFileTag(extractPathFromArgsValue(args, name));
     }
+  }
+
+  function isToolFailureResult(resultText) {
+    let value = resultText;
+    if (typeof value === "string") {
+      try { value = JSON.parse(value); } catch (_) { /* 按普通文本错误识别 */ }
+    }
+    if (value && typeof value === "object") {
+      if (value.error != null && value.error !== "") return true;
+      if (value.ok === false || value.success === false || value.isError === true || value.is_error === true) return true;
+      if (typeof value.status === "string" && /^(error|failed|failure|aborted)$/i.test(value.status.trim())) return true;
+      return false;
+    }
+    return /^(?:error|failed|failure|错误|失败)(?:\b|[:：\s])/i.test(String(value || "").trim());
   }
 
   // ---------- 子任务块（sub_agent） ----------

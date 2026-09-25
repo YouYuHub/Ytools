@@ -1209,17 +1209,21 @@ async def compact_session_history_if_needed(
     估算；auto/manual 留空由 done 事件的 before_tokens 呈现历史规模）。
 
     `trigger_threshold` 为触发判断的真实阈值（task 传单轮压缩阈值 = min(聊天,压缩)
-    窗口 × trigger_ratio；first_call 传模型窗口；auto/manual 留空，此时阈值即
-    token_limit）。前端据此显示"全量上下文 X > 触发阈值 Y"，与"本批预算"区分。
+    窗口 × trigger_ratio；first_call 传模型窗口；普通历史检查使用配置比例算出的阈值）。
+    `token_limit` 是压缩后的历史预算，设了 target_tokens 时可能小于触发阈值。
     """
     settings = settings or load_context_compaction_settings()
+    activation_limit = resolve_context_compaction_threshold(settings)
     if budget_tokens is not None and budget_tokens > 0:
         budget_limit = max(1024, int(budget_tokens))
     else:
-        budget_limit = resolve_context_compaction_threshold(settings)
+        budget_limit = activation_limit
+    reported_trigger_threshold = trigger_threshold
+    if reported_trigger_threshold is None and not enforce and not force_all:
+        reported_trigger_threshold = activation_limit
     # 历史压缩目标：设了就把"历史部分"压到目标以内（与触发阈值解耦，用于压低
-    # 长任务的单次输入成本）。目标同时作为本批预算上限与停止条件——否则压缩
-    # 只会停在"阈值"（如 425k），远高于用户期望的 80k。
+    # 长任务的单次输入成本）。目标只作为触发后的本批预算上限与停止条件，
+    # 不能让低于触发阈值的历史提前压缩。
     target_tokens = resolve_history_target_tokens(settings)
     if target_tokens > 0:
         budget_limit = min(budget_limit, target_tokens)
@@ -1326,6 +1330,13 @@ async def compact_session_history_if_needed(
         # 前端压缩块显示"上下文 X → Y"，与单轮压缩口径一致——此前只显示
         # 压缩模型调用的输入量（prompt_tokens），易被误读为"触发点偏低"
         batch_before_tokens = estimate_messages_tokens(context_messages)
+        # 首次历史检查只按配置的触发比例判断是否开始压缩；一旦触发，
+        # 后续批次才按较小的历史目标继续压，直到达到目标或没有可压缩轮次。
+        if (
+            compacted_rounds == 0 and not enforce and not force_all
+            and batch_before_tokens <= activation_limit
+        ):
+            break
         within_budget = batch_before_tokens <= budget_limit
         if not force_all and within_budget:
             break
@@ -1584,8 +1595,7 @@ async def compact_session_history_if_needed(
                     # 与单轮压缩同口径，供用户核对触发点是否符合配置阈值）
                     "before_tokens": batch_before_tokens,
                     "after_tokens": batch_after_tokens,
-                    # 本批实际使用的预算（自动路径 = 阈值；首调用降级/强制压缩
-                    # 路径为按可用空间计算的 budget_tokens）：前端显示"触发阈值"
+                    # 本批压缩后的历史预算；目标模式下可小于实际触发阈值。
                     "token_limit": budget_limit,
                     # 触发来源：auto=任务开始自动 / task=任务内检查点 /
                     # first_call=首调用超窗降级 / post=任务收尾 / manual=手动
@@ -1594,10 +1604,9 @@ async def compact_session_history_if_needed(
                     # 供前端展示"全量上下文 X > 阈值 Z"的触发依据）
                     **({"trigger_context_tokens": int(trigger_context_tokens)}
                        if trigger_context_tokens is not None else {}),
-                    # 触发判断的真实阈值（task/first_call 与"本批预算"token_limit
-                    # 不同：前者是触发比较基准，后者是压缩批的输入预算）
-                    **({"trigger_threshold": int(trigger_threshold)}
-                       if trigger_threshold is not None else {}),
+                    # 触发判断的真实阈值；前端与本批预算分别展示。
+                    **({"trigger_threshold": int(reported_trigger_threshold)}
+                       if reported_trigger_threshold is not None else {}),
                     # 批次诊断字段（P2-1）：本批源规模/批源预算/尾部保留轮次/
                     # 单段输出上限/是否发生源截断，前端可据此核对压缩比与保真度
                     **batch_diagnostics,

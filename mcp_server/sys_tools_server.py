@@ -2,8 +2,8 @@
 """
 系统的 mcp 服务模块：为聊天模型提供一组通用本地工具。
 
-当前注册工具（3 个；read/write/edit/search 文件四件套已迁移为主项目后端内置工具，list_items 已停用）：
-    run_command     执行终端命令（多 shell；超时保护、输出截断并落盘完整输出、编码自适应、后台分离模式）
+当前注册工具（2 个；read/write/edit/search 文件四件套与 run_command 已迁移为主项目
+后端内置工具 factory/agent_runtime/builtin_tools.py，list_items 已停用）：
     fetch_url       抓取网页/HTTP 接口（纯文本提取、标签/正则抽取、gzip/deflate 自动解压、截断）
     web_search      网页搜索（Bing 主 + DuckDuckGo 回退合并、重定向解包、返回标题/链接/摘要）
 
@@ -2210,6 +2210,11 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
 # read_file / write_file / edit_file / search_files 四个文件读写检索工具已转为
 # 主项目内置可选工具（服务端本地执行，结果结构化、为文件 diff 预留），不再由
 # 本 MCP 服务注册暴露；下方注册块整体注释保留，需要回滚时取消注释即可。
+# run_command 同样已迁移为主项目内置可选工具（builtin_tools.py 的
+# RUN_COMMAND_NAME / execute_run_command，语义完全对齐：多 shell、超时杀进程树、
+# 超长输出截断并落盘、编码自适应、后台分离模式、cmd 家族健壮性补丁），其注册块
+# 见下方，已整体注释保留；原辅助函数（_resolve_shell/_run_command_impl 等）
+# 仍被保留（仅本文件历史引用，无运行时调用）。
 # 注意：_read_file_impl 等辅助函数仍被保留（仅本文件历史引用，无运行时调用）。
 
 # @sys_mcp_server.tool()
@@ -2290,30 +2295,35 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
 # ---------------- 内置工具迁移注释结束 ----------------
 
 
-@sys_mcp_server.tool()
-async def run_command(command: str, shell: str = "auto", work_dir: str = "",
-                      timeout_seconds: float = 120.0, background: bool = False) -> str:
-    """执行终端命令并返回退出码与输出（多 shell：cmd/powershell/pwsh/bash/sh/zsh）
-    参数：
-        command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行均可；
-                         多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持
-                         （用 work_dir 或链式命令）。cmd 家族用 `&&`/`&` 串联（不支持 `;`，
-                         写了会被当普通字符原样输出）；PowerShell 5.1 用 `;` 串联。
-                         多行内联代码（python -c）与 `| tail/head -N` 会自动适配，无需特殊写法
-        shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/
-                         pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）
-        work_dir:        工作目录，默认当前目录；目录不存在时报错
-        timeout_seconds: 默认 120，可能受限于系统配置
-        background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径（适合长任务）；
-                         默认 false 前台等待
-    返回：
-        头部（shell/工作目录/退出码/耗时）+ stdout/stderr 分段；超长截断保留头尾，
-        完整输出落盘并附文件路径。后台模式读输出文件轮询，结束标记出现即已结束（内容为退出码）。
-        命令被自动改写/兜底或疑似语法误用时，末尾附 `[run_command] …` 说明行。
-        文件读写/搜索请优先使用专用工具；本工具适用于安装依赖、运行脚本、git、进程管理等。
-    """
-    return await asyncio.to_thread(
-        _run_command_impl, command, shell, work_dir, timeout_seconds, background)
+# 已迁移为内置工具（factory/agent_runtime/builtin_tools.py: run_command / execute_run_command）：
+# 终端命令执行改由主项目后端内置可选工具提供（服务端本地执行、经 asyncio.to_thread
+# 放到工作线程），不再由本 MCP 服务注册暴露；下方注册块整体注释保留，需要回滚时
+# 取消注释即可。
+#
+# @sys_mcp_server.tool()
+# async def run_command(command: str, shell: str = "auto", work_dir: str = "",
+#                       timeout_seconds: float = 120.0, background: bool = False) -> str:
+#     """执行终端命令并返回退出码与输出（多 shell：cmd/powershell/pwsh/bash/sh/zsh）
+#     参数：
+#         command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行均可；
+#                          多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持
+#                          （用 work_dir 或链式命令）。cmd 家族用 `&&`/`&` 串联（不支持 `;`，
+#                          写了会被当普通字符原样输出）；PowerShell 5.1 用 `;` 串联。
+#                          多行内联代码（python -c）与 `| tail/head -N` 会自动适配，无需特殊写法
+#         shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/
+#                          pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）
+#         work_dir:        工作目录，默认当前目录；目录不存在时报错
+#         timeout_seconds: 默认 120，可能受限于系统配置
+#         background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径（适合长任务）；
+#                          默认 false 前台等待
+#     返回：
+#         头部（shell/工作目录/退出码/耗时）+ stdout/stderr 分段；超长截断保留头尾，
+#         完整输出落盘并附文件路径。后台模式读输出文件轮询，结束标记出现即已结束（内容为退出码）。
+#         命令被自动改写/兜底或疑似语法误用时，末尾附 `[run_command] …` 说明行。
+#         文件读写/搜索请优先使用专用工具；本工具适用于安装依赖、运行脚本、git、进程管理等。
+#     """
+#     return await asyncio.to_thread(
+#         _run_command_impl, command, shell, work_dir, timeout_seconds, background)
 
 
 @sys_mcp_server.tool()

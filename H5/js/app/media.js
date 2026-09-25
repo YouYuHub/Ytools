@@ -247,7 +247,8 @@
   // 统一附件区：待发送媒体（随消息上传，media:// 进内容部件）+ 会话已解析文档
   // （file_memory，后端注入系统提示词、跨消息生效）
   function renderComposerAttachments() {
-    if (!state.pendingMedia.length && !state.sessionDocs.length) {
+    const visibleDocs = state.pendingDocs.filter(function (item) { return item.sessionId === state.sessionId; });
+    if (!state.pendingMedia.length && !state.sessionDocs.length && !visibleDocs.length) {
       composerAttachments.innerHTML = "";
       composerAttachments.classList.add("hidden");
       composer.classList.remove("has-media");
@@ -258,6 +259,18 @@
     // 附件行占满输入行上方（.has-media 走 flex 换行），输入框区域随之变高
     composer.classList.add("has-media");
     composerAttachments.innerHTML = "";
+    function addProgress(chip, item) {
+      if (!item.phase || item.phase === "done") return;
+      const percent = Math.max(0, Math.min(100, Number(item.percent) || 0));
+      const overlay = el("span", "attachment-progress" + (item.phase === "processing" ? " is-processing" : ""));
+      overlay.style.setProperty("--upload-progress", percent + "%");
+      const label = item.phase === "processing" ? "处理中" : item.phase === "error" ? "失败" : percent + "%";
+      overlay.setAttribute("role", "status");
+      overlay.setAttribute("aria-label", (item.name || item.filename || "附件") + " " + label);
+      overlay.appendChild(el("span", "attachment-progress-label", label));
+      chip.appendChild(overlay);
+      chip.title = (item.name || item.filename || "附件") + "：" + label;
+    }
     state.pendingMedia.forEach(function (item) {
       const chip = el("div", "media-chip");
       if (item.kind === "image" && item.dataUrl) {
@@ -286,6 +299,7 @@
         });
         chip.appendChild(placeholder);
       }
+      addProgress(chip, item);
       const removeBtn = el("button", "media-remove", "✕");
       removeBtn.type = "button";
       removeBtn.title = "移除";
@@ -294,6 +308,13 @@
         renderComposerAttachments();
       });
       chip.appendChild(removeBtn);
+      composerAttachments.appendChild(chip);
+    });
+    visibleDocs.forEach(function (item) {
+      const chip = el("div", "doc-chip doc-chip-pending");
+      chip.appendChild(el("span", "doc-chip-symbol", "▤"));
+      chip.appendChild(el("span", "doc-chip-name", item.filename));
+      addProgress(chip, item);
       composerAttachments.appendChild(chip);
     });
     state.sessionDocs.forEach(function (doc) {

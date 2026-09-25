@@ -215,7 +215,7 @@
   "model_selection": {
     "chat_model": {
       "ownership_name": "OpenCode Completions",
-      "model_name": "Deepseek V4.1 Flash",
+      "model_name": "Omen Alpha",
       "parameter": {
         "chat_completions": {
           "temperature": 0.8,

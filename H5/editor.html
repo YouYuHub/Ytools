@@ -1,13 +1,16 @@
 <!DOCTYPE html>
 <html lang="zh-CN" data-theme="light">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>文件 diff 编辑器 · Ytools</title>
+  <link rel="icon" href="favicon-editor.png" type="image/x-icon" />
   <!-- 主题初始化（读 localStorage ytools-theme，避免闪白） -->
   <script src="js/theme.js"></script>
   <link rel="stylesheet" href="style/css/main.css" />
 </head>
+
 <body class="eh-page">
   <header class="eh-head">
     <div class="eh-title-wrap" id="ehTitleWrap"></div>
@@ -25,10 +28,8 @@
         <option value="dark">主题：深色</option>
       </select>
       <!-- 差异块导航：按当前滚动位置锚定相邻块头跳转（jumpHunk） -->
-      <button type="button" class="fh-btn eh-hunk-nav" id="ehPrevHunk"
-        title="跳转到上一个差异块">↑ 上一块</button>
-      <button type="button" class="fh-btn eh-hunk-nav" id="ehNextHunk"
-        title="跳转到下一个差异块">↓ 下一块</button>
+      <button type="button" class="fh-btn eh-hunk-nav" id="ehPrevHunk" title="跳转到上一个差异块">↑ 上一块</button>
+      <button type="button" class="fh-btn eh-hunk-nav" id="ehNextHunk" title="跳转到下一个差异块">↓ 下一块</button>
       <button type="button" class="fh-btn" id="ehClose" title="关闭本窗口（Esc）">关闭</button>
     </div>
   </header>
@@ -83,4 +84,5 @@
   <script src="js/vendor/prism/prism-diff.min.js"></script>
   <script src="js/app/editor.js"></script>
 </body>
+
 </html>

@@ -8,8 +8,8 @@
 ## 一、目录结构（仅业务代码）
 ```
 agent_tool_sse/
-├── main.py                      # FastAPI 入口：init_path → 注册4个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 → uvicorn(48621)
-├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）
+├── main.py                      # FastAPI 入口：init_path → 注册8个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 → uvicorn(48621)；当前未托管 H5 静态页面
+├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH
 ├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载
 ├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp，可选 fitz/docx/pandas）
 ├── .env                         # 一些全局配置
@@ -51,8 +51,10 @@ agent_tool_sse/
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置；压缩失败重试 GET/POST /chat_config/compaction_retry
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
-│   ├── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频500MB流式）/Range 读取
-│   └── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
+│   ├── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频600MB流式）/Range 读取
+│   ├── file_history_router.py   # 文件版本链与差异块操作接口（/file_diff/*）
+│   ├── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
+│   └── user_profile_router.py   # 访客用户显示名 GET/POST /user/profile（全局唯一，存项目 .env USER_NAME；账号/数据库体系落地前的过渡实现）
 │
 ├── prompt/                      # Skills 提示词库模块
 │   ├── prompt_manager.py        # md_files 目录初始化（空目录播种示例）、文件名规整与增删改查
@@ -66,12 +68,13 @@ agent_tool_sse/
 │
 ├── mcp_server/
  │   ├── sys_tools_server.py            # 系统 MCP 服务器（文件读写/正则搜索/命令执行/网页抓取与搜索）
-│   ├── restart_tools_server.py  # 重启维护 MCP 服务器（restart_service/restart_cancel/restart_status：跨进程重启 Ytools 并向原会话注入续任务消息；配套项目根 restart_helper.py 恢复进程）
+│   ├── restart_tools_server.py  # 重启维护 MCP 服务器；当前缺少项目根 restart_helper.py，main.py 的服务快照写入亦被注释，不能按设计完成自动重启
 │   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（setup_pipe/run_pipe_command/read_pipe_history）
 │
 ├── H5/                          # 前端聊天界面（纯静态，由后端同端口静态托管或本地打开）
 │   ├── README.md                # 前端使用说明
-│   ├── index.html               # 单页应用入口（Ytools）
+│   ├── index.html               # 单页应用入口（Ytools；当前需独立打开）
+│   ├── editor.html              # 文件 Diff 独立编辑器页面
 │   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
 │   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
 │   │                            #   widget_reuse.js（流式保活渲染的控件复用配对决策，纯逻辑）/
@@ -83,10 +86,11 @@ agent_tool_sse/
 │   │                            #   session_utils.js / session_group_utils.js（会话分组纯逻辑：
 │   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
 │   │                            #   名称校验）等工具模块 + app.js（入口）+
-│   │                            #   app/（15 个功能模块：core/sessions/session_groups/stats/workdir/
-│   │                            #   messages/history/compaction/builtin/media/skills/composer/
+│   │                            #   app/（16 个功能模块：core/sessions/session_groups/stats/workdir/
+│   │                            #   messages/history/compaction/builtin/user_profile/media/skills/composer/
 │   │                            #   model_panel/tools/chat；session_groups=侧边栏分组区
-│   │                            #   UI/交互；skills=提示词库可拖拽对话框）
+│   │                            #   UI/交互；skills=提示词库可拖拽对话框；
+│   │                            #   user_profile=访客显示名内联编辑（.env USER_NAME））
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
@@ -98,7 +102,7 @@ agent_tool_sse/
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
 │   ├── sub_agent_v1.md          # 子智能体（sub_agent 内置工具）V1 设计与实现依据文档
-│   ├── chat_momory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
+│   ├── chat_memory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
 │   └── compact.md               # 压缩逻辑说明文档（含压缩失败重试链、失败终止任务策略、拼接优先累计合并）
 │
 ├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
@@ -108,7 +112,7 @@ agent_tool_sse/
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
                                  #   test_context_compaction / test_chat_router / test_sub_agent /
-                                 #   test_session_groups 等）
+                                 #   test_user_profile_router / test_session_groups 等）
 ```
 
 ---
@@ -252,15 +256,14 @@ agent_tool_sse/
 - `set_env_vars`：写回 .env 并保持内存 env_vars 一致（防 hot-reload 覆盖）
 
 ### 8. 系统 MCP 服务器（`mcp_server/sys_tools_server.py`）
-当前注册 3 个工具（read/write/edit/search 文件四件套已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`，list_items 已停用）：
+当前注册 2 个工具（read/write/edit/search 文件四件套与 run_command 已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`，list_items 已停用）：
 
 | 工具 | 业务 |
 |---|---|
-| run_command | 终端命令执行（多 shell：cmd/powershell/pwsh/bash/sh/zsh；超时杀进程树、超长输出截断并落盘完整输出、gbk/utf-8 编码自适应、后台分离模式；cmd 家族健壮性补丁：多行内联代码改写为临时脚本、管道过滤器探测替换/本地兜底、分号与 Unix 命令语法提示） |
 | fetch_url | 抓取网页/HTTP 接口（正文纯文本、按标签/正则抽取、超长截断） |
 | web_search | 网页搜索（解析 Bing 网页版，返回标题/链接/摘要） |
 
-**run_command 的 cmd 家族健壮性补丁**（`mcp_server/sys_tools_server.py`，均为实测复现的真实坑）：
+**run_command 的 cmd 家族健壮性补丁**（迁移后位于 `factory/agent_runtime/builtin_tools.py`，均为实测复现的真实坑）：
 
 | 坑 | 现象 | 修复 |
 |---|---|---|
@@ -272,7 +275,9 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 另注册命名管道终端服务器 `PipeIpcMCP.exe`（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）。
 
-可用 `python test/manual_sys_tools_check.py` 通过真实 MCP 客户端逐工具自检（临时沙箱，自动清理）。
+**迁移说明（2026-09）**：run_command 已迁移为主项目后端内置工具（`factory/agent_runtime/builtin_tools.py` 的 `RUN_COMMAND_NAME` / `execute_run_command`），并入「内置工具」分组随 `__builtin__` 伪服务保存选择；父循环与子智能体均在服务端本地执行（同步阻塞实现经 `asyncio.to_thread` 放到工作线程），语义与原 MCP 版完全对齐（多 shell / 超时杀进程树 / 超长截断落盘 / 编码自适应 / 后台模式 / cmd 家族补丁）。`mcp_server/sys_tools_server.py` 中原注册块与实现函数整体注释保留，回滚时取消注释即可。
+
+可用 `python test/manual_sys_tools_check.py` 通过真实 MCP 客户端逐工具自检（临时沙箱，自动清理）；run_command 与文件工具的验证见 `test/test_builtin_command_tool.py` / `test/test_builtin_file_tools.py`。
 
 ### 9. H5 前端（`H5/`）
 - 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口

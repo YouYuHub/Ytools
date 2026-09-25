@@ -1500,6 +1500,85 @@ class RecentQuestionsRetentionTests(unittest.IsolatedAsyncioTestCase):
             compaction.resolve_model_max_input_tokens = original_chat
             compaction.resolve_context_compaction_model_config = original_model
 
+    async def test_target_does_not_lower_trigger_threshold(self):
+        """60k 目标不能让 0.85 × 500k 的自动压缩在 180k 历史时触发。"""
+        original_chat = compaction.resolve_model_max_input_tokens
+        original_model = compaction.resolve_context_compaction_model_config
+        try:
+            compaction.resolve_model_max_input_tokens = lambda default=8192: 528_000
+            compaction.resolve_context_compaction_model_config = lambda _s: {
+                "maxInputTokens": 500_000, "apiType": "chat-completions"}
+
+            def fake_chat(*, stream=False, **_kwargs):
+                if not stream:
+                    return {"content": "任务仍需继续。"}
+
+                async def frames():
+                    yield 'data: {"content": "任务仍需继续。"}\n\n'
+                    yield 'data: [DONE]\n\n'
+
+                return frames()
+
+            compaction.ChatLLM.chat_completions = staticmethod(fake_chat)
+            settings = compaction.ContextCompactionSettings(
+                trigger_ratio=0.85, summary_budget_ratio=0.15,
+                oversized_reject_factor=1.5, max_oversized_rejections=3,
+                target_tokens=60_000,
+            )
+            request = ChatLLMRequest(
+                session_id="target_trigger_test",
+                messages=[{"role": "user", "content": "新问题"}],
+                max_tokens=512,
+            )
+            round_tokens = compaction.estimate_messages_tokens(
+                compaction.round_entry_to_context_messages(self._make_big_round(1), -1)
+            )
+            below_count = max(1, 180_000 // round_tokens)
+            memory = _MemoryStub([
+                self._make_big_round(index) for index in range(1, below_count + 1)
+            ])
+            self.assertGreater(below_count * round_tokens, 60_000)
+            self.assertLess(below_count * round_tokens, 425_000)
+            events = []
+
+            async def emit(payload):
+                events.append(payload)
+
+            self.assertEqual(
+                await compaction.compact_session_history_if_needed(
+                    memory, request, settings=settings, event_emitter=emit,
+                ),
+                0,
+            )
+            self.assertIsNone(memory.summary)
+            self.assertFalse(events)
+            self.assertEqual(
+                await compaction.compact_session_history_if_needed(
+                    memory, request, settings=settings, budget_tokens=60_000,
+                    trigger_reason="post",
+                ),
+                0,
+            )
+
+            above_count = 450_000 // round_tokens + 1
+            memory.entries = [
+                self._make_big_round(index) for index in range(1, above_count + 1)
+            ]
+            self.assertGreater(
+                await compaction.compact_session_history_if_needed(
+                    memory, request, settings=settings, event_emitter=emit,
+                    trigger_reason="post",
+                ),
+                0,
+            )
+            done = next(event for event in events if event.get("phase") == "done")
+            self.assertGreater(done["before_tokens"], 425_000)
+            self.assertEqual(done["trigger_threshold"], 425_000)
+            self.assertEqual(done["token_limit"], 60_000)
+        finally:
+            compaction.resolve_model_max_input_tokens = original_chat
+            compaction.resolve_context_compaction_model_config = original_model
+
     async def test_target_tokens_skips_when_history_already_below_target(self):
         """历史本身已低于目标时不触发压缩（目标只是上限，不是"必须压"）。"""
         original_chat = compaction.resolve_model_max_input_tokens

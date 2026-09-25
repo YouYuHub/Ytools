@@ -41,6 +41,74 @@ const api_url = localStorage.getItem("ytools-api-base")
     return res.json();
   }
 
+  // XHR 的 upload 事件提供真实的已发送字节数；100% 后等待服务端解析/保存。
+  function uploadRaw(path, file, onProgress, signal) {
+    return new Promise(function (resolve, reject) {
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+      function finish(error, result) {
+        if (settled) return;
+        settled = true;
+        if (signal) signal.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolve(result);
+      }
+      function abort() { xhr.abort(); }
+      xhr.open("POST", BASE + path);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = function (event) {
+        if (onProgress && event.lengthComputable) {
+          onProgress({ phase: "upload", percent: Math.min(100, Math.round(event.loaded / event.total * 100)) });
+        }
+      };
+      xhr.upload.onload = function () {
+        if (onProgress) onProgress({ phase: "processing", percent: 100 });
+      };
+      xhr.onload = function () {
+        let body;
+        try { body = JSON.parse(xhr.responseText); } catch (_) { body = {}; }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          finish(new Error(body.detail || body.message || ("上传失败 " + xhr.status)));
+          return;
+        }
+        if (onProgress) onProgress({ phase: "done", percent: 100 });
+        finish(null, body);
+      };
+      xhr.onerror = function () { finish(new Error("网络连接中断")); };
+      xhr.onabort = function () { const error = new Error("上传已取消"); error.name = "AbortError"; finish(error); };
+      if (signal) {
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) { abort(); return; }
+      }
+      if (onProgress) onProgress({ phase: "upload", percent: 0 });
+      xhr.send(file);
+    });
+  }
+
+  async function uploadRawBatch(path, files, onProgress, signal) {
+    const selected = Array.from(files || []);
+    if (selected.length > 10) throw new Error("最多上传 10 个文件");
+    const combined = { total: selected.length, success: 0, failed: 0, results: [], upload_id: null };
+    for (let index = 0; index < selected.length; index++) {
+      const file = selected[index];
+      const separator = path.includes("?") ? "&" : "?";
+      try {
+        const data = await uploadRaw(path + separator + "filename=" + encodeURIComponent(file.name), file,
+          function (progress) { if (onProgress) onProgress(index, progress, file); }, signal);
+        combined.success += data.success || 0;
+        combined.failed += data.failed || 0;
+        combined.results.push.apply(combined.results, data.results || []);
+        if (data.upload_id) combined.upload_id = data.upload_id;
+      } catch (error) {
+        if (error.name === "AbortError") throw error;
+        combined.failed++;
+        combined.results.push({ filename: file.name, status: "failed", message: error.message });
+        if (onProgress) onProgress(index, { phase: "error", percent: 0 }, file);
+      }
+    }
+    return combined;
+  }
+
   // ---------- 会话历史 ----------
   function listSessions() {
     return request("/chat_history/sessions");
@@ -150,22 +218,11 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @returns {Promise<{state, session_id, filename, imported_rounds, collision, meta, ...}>}
    */
   function uploadChatHistory(sessionId, file, overwrite) {
-    const fd = new FormData();
-    fd.append("file", file);
     const params = new URLSearchParams();
     params.set("session_id", sessionId || "default");
+    params.set("filename", file.name);
     if (overwrite) params.set("overwrite", "true");
-    return fetch(BASE + "/chat_history/upload_chat_file?" + params.toString(), {
-      method: "POST",
-      body: fd,
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().then(function (body) {
-          throw new Error(body.detail || ("上传失败 " + res.status));
-        });
-      }
-      return res.json();
-    });
+    return uploadRaw("/chat_history/upload_chat_file?" + params.toString(), file);
   }
 
   // ---------- 会话分享 / 多会话导入（zip / jsonl 两阶段） ----------
@@ -215,17 +272,7 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @returns {Promise<{type, filename, total, sessions:Array, conflicts:string[]}>}
    */
   function previewImport(file) {
-    const fd = new FormData();
-    fd.append("file", file);
-    return fetch(BASE + "/chat_history/import_preview", { method: "POST", body: fd })
-      .then(function (res) {
-        if (!res.ok) {
-          return res.json().then(function (body) {
-            throw new Error(body.detail || ("预检失败 " + res.status));
-          });
-        }
-        return res.json();
-      });
+    return uploadRaw("/chat_history/import_preview?filename=" + encodeURIComponent(file.name), file);
   }
 
   /**
@@ -236,24 +283,13 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @returns {Promise<{state, imported:Array, skipped:Array, failed:Array}>}
    */
   function submitImport(file, conflictStrategy, decisions) {
-    const fd = new FormData();
-    fd.append("file", file);
     const params = new URLSearchParams();
+    params.set("filename", file.name);
     params.set("conflict_strategy", conflictStrategy || "ask");
     if (decisions && Object.keys(decisions).length) {
       params.set("decisions", JSON.stringify(decisions));
     }
-    return fetch(BASE + "/chat_history/import_package?" + params.toString(), {
-      method: "POST",
-      body: fd,
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().then(function (body) {
-          throw new Error(body.detail || ("导入失败 " + res.status));
-        });
-      }
-      return res.json();
-    });
+    return uploadRaw("/chat_history/import_package?" + params.toString(), file);
   }
 
   // ---------- 工具 ----------
@@ -578,16 +614,8 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   // ---------- 会话文件 ----------
-  function uploadSessionFiles(sessionId, fileList) {
-    const fd = new FormData();
-    Array.from(fileList).forEach(function (f) { fd.append("files", f); });
-    return fetch(BASE + "/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), {
-      method: "POST",
-      body: fd,
-    }).then(function (res) {
-      if (!res.ok) throw new Error("上传失败 " + res.status);
-      return res.json();
-    });
+  function uploadSessionFiles(sessionId, fileList, onProgress) {
+    return uploadRawBatch("/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), fileList, onProgress);
   }
 
   function getSessionFiles(sessionId) {
@@ -642,25 +670,10 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @returns {Promise<{total:number, success:number, failed:number,
    *   results:Array<{filename,status,stored_name?,media_ref?,kind?,mime?,size?,message?}>, upload_id}>}
    */
-  async function uploadSessionMedia(sessionId, files) {
+  async function uploadSessionMedia(sessionId, files, onProgress, signal) {
     const params = new URLSearchParams();
     params.set("session_id", sessionId || "default");
-    const form = new FormData();
-    (files || []).forEach(function (file) {
-      form.append("files", file, file.name);
-    });
-    const res = await fetch(BASE + "/file/upload_session_media?" + params.toString(), {
-      method: "POST",
-      body: form,
-    });
-    if (!res.ok) {
-      let detail = res.status + " " + res.statusText;
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch (_) { /* ignore */ }
-      throw new Error(detail);
-    }
-    return res.json();
+    return uploadRawBatch("/file/upload_session_media?" + params.toString(), files, onProgress, signal);
   }
 
   /** 会话内媒体文件的访问 URL（消息气泡缩略图等用途） */
@@ -812,6 +825,29 @@ const api_url = localStorage.getItem("ytools-api-base")
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name }),
+    });
+  }
+
+  // ---------- 用户资料（全局显示名，账号体系接入前的过渡实现） ----------
+  /**
+   * 读取全局用户资料（当前仅显示名）
+   * @returns {Promise<{state, name, default_name, max_length, persisted, env_name, env_value, env_file}>}
+   *   name：当前生效显示名（.env USER_NAME 未设置/被清空时回退 default_name）
+   */
+  function getUserProfile() {
+    return request("/user/profile");
+  }
+
+  /**
+   * 保存全局显示名（写入项目 .env 的 USER_NAME 键，写盘 + 内存同步，立即生效）
+   * @param {string} name 新显示名；空白串 = 清空，界面回退默认名
+   * @returns {Promise<{state, name, message, persisted, ...}>}
+   */
+  function updateUserProfile(name) {
+    return request("/user/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name == null ? "" : String(name) }),
     });
   }
 
@@ -1011,6 +1047,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     savePrompt,
     renamePrompt,
     deletePrompt,
+    getUserProfile,
+    updateUserProfile,
     listFileChanges,
     fileVersions,
     fileContent,
@@ -1029,4 +1067,3 @@ const api_url = localStorage.getItem("ytools-api-base")
     fileRevertAll,
   };
 })(window);
-

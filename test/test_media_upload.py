@@ -21,7 +21,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from starlette.datastructures import UploadFile
+import httpx
+from fastapi import FastAPI
 
 from config import Message
 from factory.agent_runtime.chat_runtime import (
@@ -57,7 +58,7 @@ def _cleanup_test_session():
         asyncio.run(cleanup_chat_memory_manager(TEST_SESSION))
     except Exception:
         pass
-    fm.cleanup_file_memory_manager(TEST_SESSION)
+    asyncio.run(fm.cleanup_file_memory_manager(TEST_SESSION))
 
 
 class MediaStorageTests(unittest.TestCase):
@@ -199,22 +200,25 @@ class MediaEndpointTests(unittest.TestCase):
         _cleanup_test_session()
 
     @staticmethod
-    def _upload_file(name: str, data: bytes) -> UploadFile:
-        return UploadFile(file=io.BytesIO(data), filename=name)
+    def _post_media(name: str, data: bytes):
+        app = FastAPI()
+        app.include_router(file_router.api_file_router)
+        async def post():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                return await client.post("/file/upload_session_media", params={"session_id": TEST_SESSION, "filename": name},
+                                         content=data, headers={"Content-Type": "application/octet-stream"})
+        return asyncio.run(post())
 
     def test_upload_and_get_session_media(self):
-        response = asyncio.run(file_router.upload_session_media(
-            files=[self._upload_file("图.png", PNG_BYTES), self._upload_file("曲.wav", WAV_BYTES)],
-            session_id=TEST_SESSION,
-        ))
-        body = json.loads(response.body.decode("utf-8"))
-        self.assertEqual(body["success"], 2)
-        self.assertEqual(body["failed"], 0)
-        kinds = sorted(result["kind"] for result in body["results"])
+        responses = [self._post_media("图.png", PNG_BYTES), self._post_media("曲.wav", WAV_BYTES)]
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        bodies = [response.json() for response in responses]
+        self.assertTrue(all(body["success"] == 1 and body["failed"] == 0 for body in bodies))
+        kinds = sorted(body["results"][0]["kind"] for body in bodies)
         self.assertEqual(kinds, ["audio", "image"])
-        self.assertTrue(body["upload_id"])
+        self.assertTrue(bodies[0]["upload_id"])
 
-        stored = body["results"][0]["stored_name"]
+        stored = bodies[0]["results"][0]["stored_name"]
         from starlette.requests import Request
 
         media_response = asyncio.run(file_router.get_session_media(
@@ -224,16 +228,10 @@ class MediaEndpointTests(unittest.TestCase):
         self.assertEqual(media_response.status_code, 200)
         self.assertIn(bytes(media_response.body), (PNG_BYTES, WAV_BYTES))
 
-    def test_upload_rejects_non_media_and_reports_per_file(self):
-        response = asyncio.run(file_router.upload_session_media(
-            files=[self._upload_file("doc.pdf", b"%PDF-1.4"), self._upload_file("ok.png", PNG_BYTES)],
-            session_id=TEST_SESSION,
-        ))
-        body = json.loads(response.body.decode("utf-8"))
-        self.assertEqual(body["success"], 1)
-        self.assertEqual(body["failed"], 1)
-        failed = next(result for result in body["results"] if result["status"] != "success")
-        self.assertIn("不支持的媒体类型", failed["message"])
+    def test_upload_rejects_non_media(self):
+        response = self._post_media("doc.pdf", b"%PDF-1.4")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("不支持的媒体类型", response.json()["detail"])
 
     def test_get_missing_media_404(self):
         from starlette.requests import Request
@@ -501,11 +499,8 @@ class RangeRequestTests(unittest.TestCase):
     def test_get_session_media_206_and_full(self):
         from starlette.requests import Request
 
-        response = asyncio.run(file_router.upload_session_media(
-            files=[MediaEndpointTests._upload_file("音频.wav", WAV_BYTES)],
-            session_id=TEST_SESSION,
-        ))
-        body = json.loads(response.body.decode("utf-8"))
+        response = MediaEndpointTests._post_media("音频.wav", WAV_BYTES)
+        body = response.json()
         stored = body["results"][0]["stored_name"]
 
         def make_request(headers):

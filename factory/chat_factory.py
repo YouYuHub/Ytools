@@ -47,6 +47,7 @@ from factory.agent_runtime.builtin_tools import (
     CHECK_TOOL_EXISTS_NAME,
     EDIT_FILE_NAME,
     READ_FILE_NAME,
+    RUN_COMMAND_NAME,
     SEARCH_FILES_NAME,
     SUB_AGENT_TOOL_NAME,
     TODO_TOOL_NAME,
@@ -66,6 +67,7 @@ from factory.agent_runtime.builtin_tools import (
     roll_recent_media_parts,
     retire_prior_video_parts,
     cap_video_parts_in_batch,
+    try_execute_builtin_command_tool,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -112,6 +114,7 @@ from factory.agent_runtime.tool_executor import (
     normalize_tool_calls,
     prepare_tool_execution,
 )
+from factory.agent_runtime.text_tool_call import TextToolCallBuffer
 from factory.agent_runtime.sub_agent import (
     SubAgentContext,
     load_sub_agent_limits,
@@ -325,7 +328,7 @@ def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, 
             # 指令在下一轮会被本摘要替换——终态必须自带收官指令，否则后续
             # 轮次只剩一列 ✓，模型无从判断计划已结束
             lines = [
-                f"任务规划已全部完成（{done_count}/{len(todos)} 项）："
+                f"plan_complete=true；任务规划已全部完成（{done_count}/{len(todos)} 项）："
                 "请汇总执行结果直接答复用户；如无新的计划，无需再调用本工具。"
             ]
         else:
@@ -543,6 +546,24 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
         raw_todos, prev_items=prev_items)
     if items is None:
         return {"error": error_reason or "todos 参数无效"}, None
+    # 模型偶尔在全部完成后再次提交同一计划，甚至把每项 id 全部换掉。
+    # 内容和状态未变时保留原计划及稳定 id，避免重复写盘与无意义的状态变化。
+    if prev_items and len(items) == len(prev_items) and all(
+        item["content"] == prev.get("content")
+        and item["status"] == prev.get("status")
+        for item, prev in zip(items, prev_items)
+    ):
+        complete = all(item["status"] == "done" for item in prev_items)
+        return {
+            "message": (
+                "任务计划已全部完成且没有变化，请直接汇总结果答复用户，"
+                "无需再次调用 todo_write"
+                if complete else "任务计划没有变化，无需重复提交"
+            ),
+            "plan_complete": complete,
+            "unchanged": True,
+            "todos": prev_items,
+        }, prev_items
     await session_chat_memory.update_session_todo(items)
     done_count = sum(1 for item in items if item["status"] == "done")
     in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
@@ -949,6 +970,7 @@ async def _run_chat_generation(
     edit_file_requested = EDIT_FILE_NAME in (requested_names or [])
     read_file_requested = READ_FILE_NAME in (requested_names or [])
     search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
+    run_command_requested = RUN_COMMAND_NAME in (requested_names or [])
     read_media_requested = READ_MEDIA_NAME in (requested_names or [])
     # 模型不支持视觉时 read_media 一律不注入（即使前端勾选/选择快照里带上）：
     # 工具能力由后端会话生效模型决定，前端仅为展示口径
@@ -970,6 +992,7 @@ async def _run_chat_generation(
         include_edit_file=edit_file_requested,
         include_read_file=read_file_requested,
         include_search_files=search_files_requested,
+        include_run_command=run_command_requested,
         include_read_media=read_media_requested,
         include_sub_agent=sub_agent_requested,
     )
@@ -1483,6 +1506,7 @@ async def _run_chat_generation(
         # 重新发起请求（新轮次/续写重发）后重新计数；连续达到
         # stream_truncated_retries 上限才终止任务（长任务不再被历史累计误杀）
         model_retries = 0
+        text_tool_call_retries = 0
         while session_chat_memory.run_task:
             stream.set_round_start()
             # 每轮检查点：取出注入消息，本轮模型调用即可看到
@@ -1512,6 +1536,7 @@ async def _run_chat_generation(
             stream_error = None  # 追踪上游流式错误（与用户手动停止区分，避免误记为"停止任务"）
             stream_truncated = False  # 本轮流被上游提前关闭（EOF 未收到 finish_reason）
             tool_calls: List[dict] = []
+            text_tool_call_buffer = TextToolCallBuffer()
             usage_accumulator = UsageAccumulator()
             # 将 messages 附加到 tool_request 中（请求侧副本占位化，
             # 运行时 messages 保持模型原始输出）
@@ -1635,7 +1660,11 @@ async def _run_chat_generation(
                     function_call_delta = event.get("function_call")  # 兼容老模型
                     if content:
                         full_response += content
-                        print(f"{content}", end="", flush=True)
+                        visible_content = text_tool_call_buffer.push(content)
+                        if visible_content:
+                            print(f"{visible_content}", end="", flush=True)
+                    else:
+                        visible_content = ""
                     if reasoning_content:
                         full_reasoning += reasoning_content
                         print(f"{reasoning_content}", end="", flush=True)
@@ -1665,6 +1694,11 @@ async def _run_chat_generation(
                         #     print(f"[STREAM] function_call += name:'{fc_name[:30]}', args_len:{len(fc_args)}", flush=True)
                     # 过滤 tool_calls 中的 id 和 type 字段后再输出
                     filtered_event = _filter_tool_calls_fields(event)
+                    if content:
+                        if visible_content:
+                            filtered_event["content"] = visible_content
+                        else:
+                            filtered_event.pop("content", None)
                     await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
             finally:
                 # 显式关闭上游响应流：超时/提前 break 时立即断开连接，
@@ -1673,6 +1707,12 @@ async def _run_chat_generation(
                     await sse_iter.aclose()
                 except Exception:
                     pass
+            held_content, text_tool_call_name = text_tool_call_buffer.finish()
+            if held_content:
+                await _stream_emit(
+                    stream,
+                    f"data: {json.dumps({'content': held_content}, ensure_ascii=False)}\n\n",
+                )
             if usage_accumulator.count > 0:
                 round_usage_total: dict[str, Any] = {}
                 usage_accumulator.merge_to(round_usage_total, _merge_usage_values)
@@ -1726,6 +1766,29 @@ async def _run_chat_generation(
                 # 手动停止：不再写入"停止任务"假消息，直接以 stopped 状态收尾当前轮次
                 await session_chat_memory.stop_current_round()
                 break  # 任务结束，退出循环
+            if text_tool_call_name and not tool_calls:
+                # 文本里的 XML/JSON 只是正文，不是可执行的 tool_calls。不要把它
+                # 当最终答复落盘；给模型一次有界纠错机会，也不要向前端泄露标记。
+                text_tool_call_retries += 1
+                if text_tool_call_retries > 2:
+                    detail = "模型连续输出文本形式的工具调用，无法执行；请重试本次任务。"
+                    await session_chat_memory.add_chat_history({"role": "assistant", "error": detail})
+                    await _stream_emit(stream, _sse_error_payload(detail))
+                    session_chat_memory.run_task = False
+                    break
+                reminder = (
+                    "刚才的回复只有写在正文中的工具调用标记，系统没有执行它。"
+                    "请勿输出 <tool_call> 标签或工具调用 JSON。"
+                    "若任务已经完成，请直接用自然语言答复用户；"
+                    "确需使用工具时，请通过原生 tool_calls 发起调用。"
+                )
+                if text_tool_call_name == TODO_TOOL_NAME:
+                    reminder += "若计划已全部 done，不要再次调用 todo_write。"
+                messages.append({"role": "user", "content": reminder, "_internal": True})
+                await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TEXT_TOOL_CALL_RETRY', 'message': '模型输出了无法执行的文本工具调用，正在要求其改为正常答复。'}}, ensure_ascii=False)}\n\n")
+                continue
+            if not text_tool_call_name or tool_calls:
+                text_tool_call_retries = 0
             known_tool_names = list(round_tool_servers.keys())
             # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
             tool_calls = normalize_tool_calls(tool_calls, known_tool_names)
@@ -2242,8 +2305,23 @@ async def _run_chat_generation(
                         "result": file_tool_result,
                         "error": None,
                     })
-                else:
-                    external_parsed_tools.append((idx, tc, tn, ta))
+                    continue
+                # 内置终端命令工具（run_command）：服务端本地执行；命令为同步
+                # 阻塞调用（可能长达分钟级），经 asyncio.to_thread 放到工作线程
+                # 执行，避免卡死事件循环（与 MCP 工具走线程池的语义一致）
+                if tn == RUN_COMMAND_NAME:
+                    command_result = await asyncio.to_thread(
+                        try_execute_builtin_command_tool, tn, ta)
+                    builtin_results.append({
+                        "index": idx,
+                        "tool_call": tc,
+                        "tool_name": tn,
+                        "tool_args": ta,
+                        "result": command_result,
+                        "error": None,
+                    })
+                    continue
+                external_parsed_tools.append((idx, tc, tn, ta))
             tool_results = []
             # 使用线程池并发执行 MCP 工具。
             # execute_tool_round 是同步阻塞函数（内部 ThreadPoolExecutor +

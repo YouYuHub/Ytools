@@ -52,6 +52,8 @@ window.App = window.App || {};
     modelParamDirty: false,
     // 待发送的多媒体附件（粘贴/选择的图片音频视频）：[{id,file,name,kind,dataUrl}]
     pendingMedia: [],
+    // 正在上传或由服务端解析的文档，仅用于输入框内显示进度
+    pendingDocs: [],
     // 会话内已上传解析的文档（file_memory）：解析文本由后端注入系统提示词，跨消息生效
     sessionDocs: [],
     // 任务计划（模型自我规划）：SSE todo 事件驱动更新
@@ -190,6 +192,7 @@ window.App = window.App || {};
   const fileChips = $("#fileChips");
   const toolChips = $("#toolChips");
   const themeMenu = $("#themeMenu");
+  const profileName = $("#profileName");
   const profileSub = $("#profileSub");
   const scrollBottomBtn = $("#scrollBottomBtn");
   const qnav = $("#qnav");
@@ -579,7 +582,7 @@ window.App = window.App || {};
   toolSearchInput, toolSelected, toolCollapseAll,
   toolRefresh, toolFollowGlobal, fileInput, historyFileInput,
   fileChips, toolChips, themeMenu,
-  profileSub, scrollBottomBtn, qnav,
+  profileName, profileSub, scrollBottomBtn, qnav,
   qnavRail, qnavPanel, toastWrap,
   deleteModal, deleteModalBackdrop, deleteCancel,
   deleteConfirm, importConflictModal, importConflictBackdrop,

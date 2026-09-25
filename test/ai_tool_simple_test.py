@@ -1,91 +1,86 @@
+# coding: utf-8
+"""内置工具定义格式校验（对齐主程序 factory/agent_runtime/builtin_tools.py）。
+
+背景：本文件原为早期 `tool_decorator`（ai_tool 装饰器）实验的演示脚本；该模块
+未进入主程序（工具的 OpenAI function-calling schema 现由内置工具定义与 MCP
+服务提供），且会导致 pytest 收集失败。按「以主程序为准」原则改写为对内置工具
+定义的统一校验：
+
+- 全部 *_DEFINITION 与动态构建的 read_media 定义均为合法 function-calling 格式
+  （type=function、name 非空、description 非空、parameters 为 object、
+  required ⊆ properties、每个属性均带 description）；
+- 工具名唯一（ASK_USER_PLACEHOLDER_DEFINITION 为子智能体占位定义，同名不计重复）；
+- SELECTABLE_BUILTIN_TOOL_NAMES 中的可勾选工具都有对应定义；
+- is_builtin_tool 覆盖全部定义。
 """
-测试 ai_tool 装饰器的简化版本 - 直接存储 OpenAI API 格式
-"""
+import os
 import sys
-from pathlib import Path
+import unittest
 
-# 添加项目根目录到 Python 路径
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tool_decorator import ai_tool, get_tools, clear_tools
-
-
-# 测试 1: 最简单的用法
-# @ai_tool
-def add(a: int, b: int) -> int:
-    """两个数相加"""
-    return a + b
+from factory.agent_runtime import builtin_tools as bt
 
 
-# 测试 2: 自定义工具名称
-# @ai_tool("custom_multiply")
-def multiply(x: int, y: int) -> int:
-    """两个数相乘"""
-    return x * y
+def _collect_tool_definitions() -> dict:
+    """收集模块内全部工具定义：*_DEFINITION 常量 + read_media 动态构建。"""
+    collected = {}
+    for const_name, value in vars(bt).items():
+        if const_name.endswith("_DEFINITION") and isinstance(value, dict) and "function" in value:
+            collected[const_name] = value
+    collected["build_read_media_tool_definition()"] = bt.build_read_media_tool_definition()
+    return collected
 
 
-# 测试 3: 带默认值的参数
-# @ai_tool
-def greet(name: str, greeting: str = "你好") -> str:
-    """向某人打招呼"""
-    return f"{greeting}, {name}!"
+class BuiltinToolDefinitionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.definitions = _collect_tool_definitions()
 
+    def test_definitions_are_openai_function_format(self):
+        self.assertTrue(self.definitions, "未收集到任何工具定义")
+        for const_name, definition in self.definitions.items():
+            with self.subTest(definition=const_name):
+                self.assertEqual(definition.get("type"), "function")
+                function = definition.get("function") or {}
+                name = function.get("name")
+                self.assertIsInstance(name, str)
+                self.assertTrue(name.strip(), f"{const_name} 工具名为空")
+                self.assertTrue(
+                    str(function.get("description") or "").strip(),
+                    f"{const_name} 缺少 description",
+                )
+                parameters = function.get("parameters") or {}
+                self.assertEqual(parameters.get("type"), "object")
+                properties = parameters.get("properties") or {}
+                self.assertIsInstance(properties, dict)
+                for key in parameters.get("required") or []:
+                    self.assertIn(key, properties, msg=f"{const_name}: required 含未声明属性 {key}")
+                for prop_name, prop in properties.items():
+                    self.assertTrue(
+                        str((prop or {}).get("description") or "").strip(),
+                        msg=f"{const_name}.{prop_name} 缺少 description",
+                    )
 
-# 测试 4: 返回列表的函数
-# @ai_tool
-def get_user_list(limit: int = 5) -> list:
-    """获取用户列表"""
-    return [f"用户{i}" for i in range(limit)]
+    def test_tool_names_unique(self):
+        names = [
+            definition["function"]["name"]
+            for const_name, definition in self.definitions.items()
+            if "PLACEHOLDER" not in const_name
+        ]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        self.assertEqual(duplicates, [], msg=f"工具名重复: {duplicates}")
 
+    def test_selectable_names_have_definitions(self):
+        defined = {definition["function"]["name"] for definition in self.definitions.values()}
+        missing = [name for name in bt.SELECTABLE_BUILTIN_TOOL_NAMES if name not in defined]
+        self.assertEqual(missing, [], msg=f"可勾选工具缺少定义: {missing}")
 
-def test_tools():
-    """测试所有工具"""
-    print("=" * 60)
-    print("测试 ai_tool 装饰器 - OpenAI API 格式存储")
-    print("=" * 60)
-    
-    # 获取工具列表
-    print("\n1️⃣ 获取工具列表 (get_tools()):")
-    print("-" * 60)
-    tools_list = get_tools()
-    
-    import json
-    print(json.dumps(tools_list, indent=2, ensure_ascii=False))
-    
-    # 打印工具数量
-    print(f"\n工具总数：{len(tools_list)}")
-    
-    # 验证格式
-    print("\n2️⃣ 验证工具格式:")
-    print("-" * 60)
-    for i, tool in enumerate(tools_list, 1):
-        print(f"工具 {i}:")
-        print(f"  type: {tool.get('type')}")
-        print(f"  function.name: {tool.get('function', {}).get('name')}")
-        print(f"  function.description: {tool.get('function', {}).get('description')}")
-        print(f"  function.parameters: {json.dumps(tool.get('function', {}).get('parameters'), ensure_ascii=False, indent=4)}")
-        print()
-    
-    # 测试原函数调用
-    print("\n3️⃣ 测试原函数调用:")
-    print("-" * 60)
-    print(f"add(5, 3) = {add(5, 3)}")
-    print(f"multiply(4, 6) = {multiply(4, 6)}")
-    print(f"greet('张三') = {greet('张三')}")
-    print(f"greet('李四', 'Hello') = {greet('李四', 'Hello')}")
-    print(f"get_user_list(3) = {get_user_list(3)}")
-    
-    # 清空工具
-    print("\n4️⃣ 测试清空工具:")
-    print("-" * 60)
-    print(f"清空前工具数量：{len(get_tools())}")
-    clear_tools()
-    print(f"清空后工具数量：{len(get_tools())}")
-    
-    print("\n" + "=" * 60)
-    print("✅ 所有测试完成!")
-    print("=" * 60)
+    def test_is_builtin_tool_covers_definitions(self):
+        for const_name, definition in self.definitions.items():
+            name = definition["function"]["name"]
+            self.assertTrue(bt.is_builtin_tool(name), msg=f"is_builtin_tool 未覆盖 {name}（{const_name}）")
 
 
 if __name__ == "__main__":
-    test_tools()
+    unittest.main()

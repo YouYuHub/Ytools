@@ -788,6 +788,7 @@ html:not([data-theme="dark"]) #voiceBtn.is-recording {
 
   .media-remove {
     position: absolute;
+    z-index: 3;
     top: 2px;
     right: 2px;
     width: 18px;
@@ -843,6 +844,67 @@ html:not([data-theme="dark"]) #voiceBtn.is-recording {
     right: 6px;
     transform: translateY(-50%);
   }
+}
+
+// 上传时从顶部顺时针擦除阴影；传完后旋转表示服务端仍在处理。
+.attachment-progress {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: conic-gradient(from 0deg, transparent 0 var(--upload-progress), rgba(0, 0, 0, .68) var(--upload-progress) 100%);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  text-shadow: 0 1px 3px #000;
+}
+
+.attachment-progress-label {
+  padding: 2px 4px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, .6);
+  white-space: nowrap;
+}
+
+.attachment-progress.is-processing {
+  background: rgba(0, 0, 0, .45);
+}
+
+.attachment-progress.is-processing::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border: 3px solid rgba(255, 255, 255, .24);
+  border-top-color: var(--accent, #67a9ff);
+  border-radius: 50%;
+  animation: attachment-processing-spin .8s linear infinite;
+}
+
+@keyframes attachment-processing-spin {
+  to { transform: rotate(360deg); }
+}
+
+.doc-chip-pending {
+  overflow: hidden;
+  padding-right: 10px;
+  min-width: 135px;
+}
+
+.doc-chip-pending .attachment-progress {
+  justify-content: flex-end;
+  padding-right: 8px;
+}
+
+.doc-chip-pending .attachment-progress.is-processing::before {
+  inset: 7px auto 7px 8px;
+  width: 20px;
+}
+
+.doc-chip-symbol {
+  font-size: 16px;
 }
 
 // ---------- 任务计划（模型自我规划，内置 todo_write 工具） ----------

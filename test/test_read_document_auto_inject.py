@@ -4,7 +4,7 @@
 覆盖场景：
 - 会话存在上传文件且本轮携带工具 → 请求 tools 含 read_document，首条 system 含文件清单；
 - 无文件 → 不注入 read_document、无清单；
-- 无工具模式（tool_names 为空）→ 不注入 read_document，但清单仍注入（无读取提示）。
+- 无工具模式（tool_names=[]，显式空列表）→ 不注入 read_document，但清单仍注入（无读取提示）。
 """
 import asyncio
 import shutil
@@ -204,7 +204,9 @@ class ReadDocumentAutoInjectTests(unittest.TestCase):
 
     def test_no_tools_mode_keeps_manifest_without_hint(self):
         self._add_file("文件正文内容" * 30)
-        stream, captured = self._run(None)
+        # 显式空列表 = 无工具模式；传 None 会回退「会话覆盖 → 全局默认」工具选择
+        # （当前全局配置非空，会带入工具），与主程序语义不符（见 chat_factory）
+        stream, captured = self._run([])
         self.assertIn("你好！", "".join(stream.chunks))
         names = self._tool_names(captured)
         self.assertNotIn("read_document", names)

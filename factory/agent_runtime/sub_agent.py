@@ -41,6 +41,7 @@ from memory import file_history as _file_history
 from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
     CHECK_TOOL_EXISTS_NAME,
+    RUN_COMMAND_NAME,
     READ_MEDIA_NAME,
     READ_DOCUMENT_NAME,
     SUB_AGENT_TOOL_NAME,
@@ -54,6 +55,7 @@ from factory.agent_runtime.builtin_tools import (
     roll_recent_media_parts,
     retire_prior_video_parts,
     cap_video_parts_in_batch,
+    try_execute_builtin_command_tool,
     try_execute_builtin_file_tool,
 )
 from factory.agent_runtime.chat_runtime import (
@@ -852,6 +854,14 @@ class SubAgentRunner:
             file_tool_result = try_execute_builtin_file_tool(tn, ta)
             if file_tool_result is not None:
                 builtin_results.append((idx, tc, tn, ta, file_tool_result))
+                continue
+            # 内置终端命令工具（run_command）：服务端本地执行；命令为同步阻塞
+            # 调用（可能长达分钟级），经 asyncio.to_thread 放到工作线程执行，
+            # 避免卡死子任务事件循环（与 MCP 工具走线程池的语义一致）
+            if tn == RUN_COMMAND_NAME:
+                command_result = await asyncio.to_thread(
+                    try_execute_builtin_command_tool, tn, ta)
+                builtin_results.append((idx, tc, tn, ta, command_result))
                 continue
             external_tools.append((idx, tc, tn, ta))
         # tool_start 事件（内置 + 外部统一推送；被拦截的不推送）

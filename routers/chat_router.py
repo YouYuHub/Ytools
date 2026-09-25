@@ -4,9 +4,10 @@ import json
 from typing import Any, Optional, List
 import urllib.parse
 # fastapi 库导入
-from fastapi import APIRouter, Query, HTTPException, UploadFile, File, Request
+from fastapi import APIRouter, Query, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
+from routers.raw_upload import read_upload, require_raw_upload
 
 # 自定义模块导入
 from config import ChatLLMRequest
@@ -34,6 +35,7 @@ from factory.agent_runtime.builtin_tools import (
     EDIT_FILE_NAME,
     READ_FILE_NAME,
     READ_MEDIA_NAME,
+    RUN_COMMAND_NAME,
     SEARCH_FILES_NAME,
     SELECTABLE_BUILTIN_TOOL_NAMES,
     TODO_TOOL_NAME,
@@ -504,7 +506,8 @@ _UPLOAD_CHAT_FILE_MAX_BYTES = 20 * 1024 * 1024
 
 @api_chat_router.post('/chat_history/upload_chat_file')
 async def upload_chat_history_file(
-    file: UploadFile = File(..., description="要导入的 jsonl 聊天历史文件"),
+    request: Request,
+    filename: str = Query(..., description="要导入的 jsonl 文件名"),
     session_id: str = Query(
         "default",
         description="目标会话ID（可直接传文件名，后端会去掉 _chat.jsonl/.jsonl 后缀并规整）",
@@ -524,22 +527,10 @@ async def upload_chat_history_file(
       `<session_id>_<时间戳>_chat.jsonl`，返回的 session_id 为实际写入值；
     - 写入后通过 `_recompute_meta_from_entries` 重新计算 user_questions / usage / record_count / completion_count。
     """
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="请提供有效的 jsonl 文件")
-    filename = (file.filename or "").strip()
+    filename = require_raw_upload(request, filename)
     if not filename.lower().endswith(".jsonl"):
         raise HTTPException(status_code=400, detail="仅支持 .jsonl 格式文件")
-    try:
-        raw_bytes = await file.read()
-    except Exception as read_error:
-        raise HTTPException(status_code=400, detail=f"读取上传文件失败: {read_error}")
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的文件为空")
-    if len(raw_bytes) > _UPLOAD_CHAT_FILE_MAX_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"文件大小超过限制（最大{_UPLOAD_CHAT_FILE_MAX_BYTES // (1024 * 1024)}MB）",
-        )
+    raw_bytes = await read_upload(request, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
     session_id = normalize_session_id(session_id)
     try:
         import_result = ChatMemoryManager.import_jsonl_chat_history(
@@ -571,24 +562,6 @@ async def upload_chat_history_file(
 # 导入文件大小上限：zip 包含媒体原字节，放宽到 512MB；单 jsonl 沿用 20MB
 def _import_file_size_limit(filename: str) -> int:
     return IMPORT_PACKAGE_MAX_BYTES if filename.lower().endswith(".zip") else _UPLOAD_CHAT_FILE_MAX_BYTES
-
-
-def _read_upload_bytes(file: UploadFile, max_bytes: int, label: str) -> bytes:
-    """读取上传文件字节流并校验非空/大小上限。"""
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail=f"请提供有效的{label}")
-    try:
-        raw_bytes = file.file.read() if getattr(file, "file", None) is not None else asyncio.get_event_loop().run_until_complete(file.read())
-    except Exception as read_error:
-        raise HTTPException(status_code=400, detail=f"读取上传文件失败: {read_error}")
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail=f"上传的{label}为空")
-    if len(raw_bytes) > max_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"文件大小超过限制（最大 {max_bytes // (1024 * 1024)}MB）",
-        )
-    return raw_bytes
 
 
 @api_chat_router.get('/chat_history/export_zip')
@@ -678,7 +651,8 @@ class ImportPreviewResponse(BaseModel):
 
 @api_chat_router.post('/chat_history/import_preview')
 async def preview_chat_import(
-    file: UploadFile = File(..., description="要导入的分享包（zip 或 jsonl）"),
+    request: Request,
+    filename: str = Query(..., description="要导入的分享包文件名（zip 或 jsonl）"),
 ):
     """
     导入预检（不落盘）：解析 zip/jsonl 并返回会话清单与本地冲突信息。
@@ -688,17 +662,17 @@ async def preview_chat_import(
     - jsonl：按单会话解析（与 upload_chat_file 同一解析器），exists 标记本地同名会话。
     前端据 conflicts 弹出「覆盖 / 重命名」决策弹窗后调用 import_package 提交。
     """
-    filename = (file.filename or "").strip()
+    filename = require_raw_upload(request, filename)
     lower = filename.lower()
     if lower.endswith(".zip"):
-        raw_bytes = _read_upload_bytes(file, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
+        raw_bytes = await read_upload(request, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
         try:
             preview = list_zip_sessions(raw_bytes)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         sessions = preview.get("sessions") or []
     elif lower.endswith(".jsonl"):
-        raw_bytes = _read_upload_bytes(file, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
+        raw_bytes = await read_upload(request, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
         from memory.chat_memory import _parse_jsonl_payload, _get_chat_history_file, _safe_session_id
 
         try:
@@ -743,7 +717,8 @@ class ImportSubmitRequest(BaseModel):
 
 @api_chat_router.post('/chat_history/import_package')
 async def import_chat_package(
-    file: UploadFile = File(..., description="要导入的分享包（zip 或 jsonl）"),
+    request: Request,
+    filename: str = Query(..., description="要导入的分享包文件名（zip 或 jsonl）"),
     conflict_strategy: str = Query(
         "ask",
         description="全局冲突策略：ask（默认，按 decisions 逐会话决策）/ overwrite / rename / skip",
@@ -762,10 +737,10 @@ async def import_chat_package(
     - jsonl：单会话导入，冲突策略与 zip 相同（overwrite 覆盖 / rename 另存）。
     返回 {state, imported, skipped, failed} 汇总。
     """
-    filename = (file.filename or "").strip()
+    filename = require_raw_upload(request, filename)
     lower = filename.lower()
     if lower.endswith(".zip"):
-        raw_bytes = _read_upload_bytes(file, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
+        raw_bytes = await read_upload(request, IMPORT_PACKAGE_MAX_BYTES, "zip 分享包")
         try:
             decisions_map = json.loads(decisions) if (decisions or "").strip() else {}
         except json.JSONDecodeError as exc:
@@ -782,7 +757,7 @@ async def import_chat_package(
             raise HTTPException(status_code=400, detail=str(exc))
         return JSONResponse(content=result)
     if lower.endswith(".jsonl"):
-        raw_bytes = _read_upload_bytes(file, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
+        raw_bytes = await read_upload(request, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
         base_id = normalize_session_id(filename)
         strategy = (conflict_strategy or "ask").strip().lower()
         decision_map: dict[str, str] = {}
@@ -916,6 +891,7 @@ async def get_chat_context_token_stats(
                             include_edit_file=EDIT_FILE_NAME in selected_names,
                             include_read_file=READ_FILE_NAME in selected_names,
                             include_search_files=SEARCH_FILES_NAME in selected_names,
+                            include_run_command=RUN_COMMAND_NAME in selected_names,
                             include_read_media=READ_MEDIA_NAME in selected_names,
                         )
                         # read_document 自动注入：会话存在上传文件时与真实请求同口径

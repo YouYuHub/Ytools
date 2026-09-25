@@ -30,6 +30,7 @@ from routers.file_router import api_file_router
 from routers.prompt_router import api_prompt_router
 from routers.export_router import api_export_router
 from routers.file_history_router import api_file_history_router
+from routers.user_profile_router import api_user_profile_router
 
 
 # FastAPI 实例化
@@ -95,10 +96,12 @@ app.include_router(api_file_router, tags=["FileUpload"])
 app.include_router(api_prompt_router, tags=["Skills"])
 app.include_router(api_export_router, tags=["Export"])
 app.include_router(api_file_history_router, tags=["FileDiffHistory"])
+app.include_router(api_user_profile_router, tags=["UserProfile"])
 
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------
 def _start_config_hot_reload() -> None:
+    import env_manager as _env_manager
 
     def _reload_mcp_servers(data: dict, meta: dict) -> None:
         # inputs / servers 变化都同步工具选择内存快照（服务集合可能增删）
@@ -127,7 +130,6 @@ def _start_config_hot_reload() -> None:
                 print("[config-watch] MCP 工具重探超过 60s 未完成，已放弃等待（后台线程继续）")
 
     def _reload_models(_data: dict, _meta: dict) -> None:
-        import env_manager as _env_manager
         if _env_manager.reload_models_config():
             selection = _env_manager.get_current_model_selection()
             print(
@@ -136,7 +138,6 @@ def _start_config_hot_reload() -> None:
             )
 
     def _reload_env(_data: dict, _meta: dict) -> None:
-        import env_manager as _env_manager
         if _env_manager.reload_env_vars():
             print("[config-watch] .env 内存已同步（load_var 类配置热生效，如 VIDEO_MAX_READ_SECONDS）")
 

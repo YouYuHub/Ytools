@@ -397,12 +397,12 @@ class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
         summary = await self.manager.get_context_summary()
         self.assertEqual(summary["source_round_count"], 3)
 
-        # 模拟插入完成后收尾压缩（auto 语义、无 force）：预算给到下限附近，
-        # 未覆盖轮次（第 4、5 轮）超预算需要压缩，但压缩源必须从第 4 轮开始
+        # 模拟插入完成后收尾压缩（无 force）：配置阈值低于未覆盖历史，
+        # 第 4、5 轮需要压缩，但压缩源必须从第 4 轮开始
         request = ChatLLMRequest(messages=[{"role": "user", "content": "新任务"}])
         settings = compaction.ContextCompactionSettings(
 
-            trigger_ratio=0.5,
+            trigger_ratio=0.05,
             summary_budget_ratio=0.2,
             oversized_reject_factor=1.5,
             max_oversized_rejections=3,

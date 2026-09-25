@@ -11,10 +11,7 @@
 
 ### 1. 运行方式
 
-前端为纯静态页面，两种方式任选：
-
-- **后端同端口托管**（推荐）：由 FastAPI 直接托管 `H5/` 静态目录，访问 `http://127.0.0.1:48621` 即可；
-- **本地直开**：双击或浏览器打开 `index.html`（需注意跨域，后端已开 CORS）。
+前端为纯静态页面。当前 `main.py` 没有挂载 `H5/`，访问 `http://127.0.0.1:48621/` 只会得到后端 JSON；请先启动后端，再用 Edge 或 Chrome 打开 `index.html`。后端当前允许跨域请求；如更改后端地址，按下节设置 API 地址。
 
 ### 2. 指定后端地址
 
@@ -77,6 +74,7 @@ H5/
 │   │   ├── history.js          # 分享导出/加载 JSONL/文件上传 chips
 │   │   ├── compaction.js       # 手动压缩对话
 │   │   ├── builtin.js          # 内置工具（todo 任务计划卡片/ask_user 提问弹窗/工具模态框内置分组含 read_media；read_media 读取时自动转换视觉 API 拒绝的格式：静图 gif/bmp/ico/tif/tiff→PNG、动图 gif→H.264 MP4（ffmpeg 定位回退 imageio-ffmpeg 包内置二进制，requirements 已含），converted 元信息随结果展示）
+│   │   ├── user_profile.js     # 访客用户显示名：侧边栏名字点击内联编辑（全局存 .env USER_NAME）
 │   │   ├── media.js            # 附件与图片/音视频/文档预览
 │   │   ├── skills.js           # Skills 提示词库：可拖拽对话框（列表/预览/编辑/保存/加载到输入框）
 │   │   ├── composer.js         # 输入区/聊天设置弹窗/功能菜单
@@ -114,7 +112,7 @@ H5/
     └── zoom_utils.test.js         # 缩放档位/步进/归一化（配合 markdown 渲染断言）
 ```
 
-脚本加载顺序（index.html 底部）：`theme.js` → `api.js` → prism 系列 → `markdown.js` → `zoom_utils.js` → `session_list_utils.js` → `session_group_utils.js` → `session_utils.js` → `format_utils.js` → `history_parser.js` → `app/core.js`（共享核心，须最先于其余 app/ 模块）→ `app/sessions.js` → `app/session_groups.js` → `app/stats.js` → `app/workdir.js` → `app/messages.js` → `app/history.js` → `app/compaction.js` → `app/builtin.js` → `app/media.js` → `app/skills.js` → `app/composer.js` → `app/model_panel.js` → `app/tools.js` → `app/chat.js` → `app.js`（入口，最后执行 init）。工具函数模块均为「浏览器挂 window 全局 / Node 下 module.exports」的双端写法，因此可直接被 node:test 测试；app/ 各模块间的跨模块调用统一走 `App.xxx(...)`（运行期解析，仅要求 core 先加载、入口最后加载）。
+脚本加载顺序（index.html 底部）：`theme.js` → `api.js` → prism 系列 → `markdown.js` → `zoom_utils.js` → `session_list_utils.js` → `session_group_utils.js` → `session_utils.js` → `format_utils.js` → `history_parser.js` → `app/core.js`（共享核心，须最先于其余 app/ 模块）→ `app/sessions.js` → `app/session_groups.js` → `app/stats.js` → `app/workdir.js` → `app/messages.js` → `app/history.js` → `app/compaction.js` → `app/builtin.js` → `app/user_profile.js` → `app/media.js` → `app/skills.js` → `app/composer.js` → `app/model_panel.js` → `app/tools.js` → `app/chat.js` → `app.js`（入口，最后执行 init）。工具函数模块均为「浏览器挂 window 全局 / Node 下 module.exports」的双端写法，因此可直接被 node:test 测试；app/ 各模块间的跨模块调用统一走 `App.xxx(...)`（运行期解析，仅要求 core 先加载、入口最后加载）。
 
 ---
 
@@ -135,6 +133,7 @@ H5/
 | MCP 工具执行 | `getMcpToolConfig` / `updateMcpToolConfig` | `/chat_config/mcp_tools` |
 | 文件 | `uploadSessionFiles` / `getSessionFiles` / `deleteSessionFile` | `/file/*` |
 | Skills 提示词 | `listPrompts` / `readPrompt(name)` / `createPrompt(name, content?)` / `savePrompt(name, content)` / `renamePrompt(old, new)` / `deletePrompt(name)` | `/prompts/list`、`/prompts/read`、`/prompts/create`、`/prompts/save`、`/prompts/rename`、`/prompts/delete` |
+| 用户资料 | `getUserProfile()` / `updateUserProfile(name)` | `/user/profile`（GET/POST；全局显示名，存项目 .env 的 `USER_NAME`） |
 | 控制 | `stopChat(sessionId)` | `/stop_chat` |
 | 聊天流 | `chatStream(payload, onEvent, signal)` | `POST /chat_with_tool`（SSE） |
 
@@ -165,7 +164,7 @@ H5/
 
 ## 四、主逻辑（js/app/ 模块 + app.js 入口）
 
-主逻辑按功能拆分为 `js/app/` 下 15 个 IIFE 模块 + 瘦入口 `app.js`（一次性迁移旧配置并执行 init 启动序列）。共享机制：
+主逻辑按功能拆分为 `js/app/` 下 16 个 IIFE 模块 + 瘦入口 `app.js`（一次性迁移旧配置并执行 init 启动序列）。共享机制：
 
 - `app/core.js` 创建 `window.App` 并以 `Object.assign(App, {...})` 导出共享 state、常量、DOM 引用与通用工具；其余模块在头部解构所需核心成员（`const { state, el, toast } = App;`），并以 `App.foo = foo;` 注册自己的导出；
 - **跨模块调用一律写 `App.xxx(...)`**（运行期解析）：加载顺序只要求 core 最先、入口最后，模块之间无顺序耦合；
@@ -206,6 +205,7 @@ localStorage 键：`ytools-session-title-overrides`（会话标题本地覆盖�
 | token 统计（app/stats.js） | 侧边栏累计 token；流结束后以会话文件 meta 校准 |
 | 上下文统计条（app/stats.js） | composer 下方常显「30.1k/100k (30.1%)」（小屏只显百分比）；ratio≥0.8 黄色警告、≥1 红色危险；详细构成放 hover 提示。不做轮询，仅在 usage 到达/压缩完成/切会话/发消息等事件后 120ms 防抖刷新，in-flight 期间新请求排队合并 |
 | 工作路径（app/workdir.js） | 常显工作目录，双击内联编辑调用 `changeChatDir` 实时切换，hover tooltip 显示完整路径 |
+| 访客用户显示名（app/user_profile.js） | 侧边栏底部名字点击即内联编辑（Enter/失焦保存、Esc 取消，值未变不发请求），经 `POST /user/profile` 全局保存到项目 `.env` 的 `USER_NAME` 键（非会话级）；首屏 `GET /user/profile` 拉取一次，读取失败保持 HTML 默认文案；留空恢复默认「访客用户」 |
 | 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接。**重复点击跳过重载**：视图就绪跟踪（`readySessionId` / `loadingSessionId`）+ `session_list_utils.shouldOpenSessionOnClick` 判定——点击已完整显示的当前会话（或加载中的会话）不再重新加载，点击其他会话照常切换；显式 `App.openSession(...)`（删除轮次后重载、流失败对齐、深链启动等）不受影响始终真实重载；加载失败不置就绪，可再次点击重试 |
 | 历史渲染（app/messages.js） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对）、轮次 usage 行、提示/出错横幅、压缩块（含中断态）；历史轮用户气泡 hover 操作行（复制/编辑/删除）：编辑进 GPT 同款编辑面板重发（「重新生成该轮」target_round 原地替换 /「删除该轮及之后」truncate 预演确认），**运行中也允许编辑**——确认发送弹「任务正在进行中」确认框，确认后先 `/stop_chat` 停止生成再删重发；「删除」弹确认框后 `single` 模式删除该轮整轮（后续轮次前移）；任务启动后端推 `round_started` 轮次号，前端就地补挂本轮操作行（最后一轮无需重载即可编辑/删除） |
 | 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——复制=原始 Markdown，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |

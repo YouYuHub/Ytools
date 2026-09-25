@@ -275,7 +275,9 @@
             updateGroupCheckbox(groupCheck, allTools);
           });
 
-          row.innerHTML = '<svg class="icon tool-row-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/></svg><span class="tool-row-info"><span class="tool-row-name"></span><span class="tool-row-description"></span></span>';
+          const iconClass = "icon tool-row-icon" +
+            (App.isBuiltinToolName(tool.name) ? " is-builtin-tool-icon" : "");
+          row.innerHTML = App.toolIconSvg(tool.name, iconClass) + '<span class="tool-row-info"><span class="tool-row-name"></span><span class="tool-row-description"></span></span>';
           row.querySelector(".tool-row-name").textContent = tool.name;
           // read_media 在当前模型不支持视觉时置灰禁用（勾选路径已统一守卫）
           const rowVisionBlocked = visionBlocked && tool.name === "read_media";

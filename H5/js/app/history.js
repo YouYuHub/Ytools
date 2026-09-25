@@ -377,12 +377,24 @@
 
     // 上传属于产生会话内容的动作：此时才分配会话 ID（与发送消息同一时机规则）
     const uploadSessionId = App.ensureSessionId();
+    const pendingDocs = parseable.map(function (file) {
+      return { id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+        sessionId: uploadSessionId, filename: file.name, phase: "upload", percent: 0 };
+    });
+    state.pendingDocs.push.apply(state.pendingDocs, pendingDocs);
+    App.renderComposerAttachments();
     try {
-      const res = await API.uploadSessionFiles(uploadSessionId, parseable);
+      const res = await API.uploadSessionFiles(uploadSessionId, parseable, function (index, progress) {
+        Object.assign(pendingDocs[index], progress);
+        if (state.sessionId === uploadSessionId) App.renderComposerAttachments();
+      });
       toast("上传完成：成功 " + (res.success || 0) + " 个，失败 " + (res.failed || 0) + " 个");
-      loadSessionFiles();
+      await loadSessionFiles();
     } catch (err) {
       toast("上传失败：" + err.message);
+    } finally {
+      state.pendingDocs = state.pendingDocs.filter(function (item) { return pendingDocs.indexOf(item) < 0; });
+      App.renderComposerAttachments();
     }
   });
 

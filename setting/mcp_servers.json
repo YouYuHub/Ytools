@@ -16,7 +16,21 @@
     }
   },
   "inputs": {
+    "__builtin__": [
+      "ask_user",
+      "edit_file",
+      "read_file",
+      "read_media",
+      "search_files",
+      "sub_agent",
+      "todo_write",
+      "write_file"
+    ],
     "PipeIpcMcp": [],
-    "SysServer": []
+    "SysServer": [
+      "fetch_url",
+      "run_command",
+      "web_search"
+    ]
   }
 }

@@ -2,6 +2,8 @@
 
 服务地址: `http://<host>:48621` ｜ 在线文档: `/docs`（Swagger）
 
+> 当前后端没有统一身份认证，默认监听地址为 `0.0.0.0`，且 `/file/get_local_file` 可读取任意绝对路径。请只在受信任的本机环境中使用；本机运行建议在 `.env` 中设置 `DEFAULT_SERVICE_HOST=127.0.0.1`。`main.py` 当前不托管 H5 静态页面。
+
 ## 1. 聊天 ChatLLM
 
 ### POST /chat_with_tool
@@ -12,7 +14,7 @@
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | messages | `Message[]` | 必填 | 对话消息。`Message` = `{role, content?, name?, tool_calls?, tool_call_id?, refusal?, reasoning_content?}`，role ∈ `user/assistant/system/tool` |
-| tool_names | `string[]?` | null | 本轮选择的工具白名单（唯一入口）；不传则无工具模式，传未知工具名会被忽略并告警 |
+| tool_names | `string[]?` | null | 本轮工具白名单；不传时按会话覆盖、全局默认的顺序读取工具选择，显式传 `[]` 为无工具模式；未知工具名会被忽略并告警 |
 | session_id | `string` | "default" | 会话ID，隔离聊天历史与文件记忆 |
 | max_tokens | `int` | 8192 | 最大生成 token |
 | temperature | `float` | 0.7 | 随机性；未显式传时按 `model_selection.chat_model.parameter` 填充 |
@@ -154,7 +156,7 @@
 ### POST /chat_history/upload_chat_file
 接收前端上传的 jsonl 聊天历史文件，按现有格式过滤后保存到 `history_files` 目录。
 
-- **Form**: `file`(必填, jsonl 文件)；**Query**: `session_id`(默认 "default"，可传文件名)、`overwrite`(默认 false)
+- **Body**: 单个 jsonl 文件原始字节，`Content-Type: application/octet-stream`；**Query**: `filename`(必填)、`session_id`(默认 "default")、`overwrite`(默认 false)
 - 过滤规则：
   - 首行若为 `{"_meta": {...}}` 则作为基础元数据（其中 `session_id` 字段会被移除）；
   - 其余行通过 `parse_round_entry` 验证，只保留能正确解析为 `chat_round` 的条目（含非空 `question`、至少一条 `user` 事件、合法 `status`），无法解析的行丢弃并计入 `skipped_lines`；
@@ -184,12 +186,12 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 **导入两阶段**（前端弹窗逐会话选择「覆盖 / 重命名另存 / 跳过」）：
 
-1. `POST /chat_history/import_preview`（Form: `file`，支持 .zip / .jsonl）——**预检不落盘**：
+1. `POST /chat_history/import_preview?filename=<文件名>`（原始字节请求体，`application/octet-stream`；支持 .zip / .jsonl）——**预检不落盘**：
    - 返回 `{type(zip|jsonl), filename, total, sessions[], conflicts[], groups[]}`；
    - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count, group_id, group_name}`；`exists=true` 表示本地已有同名会话（即冲突，列入 `conflicts`）；`group_name` 来自包内分组定义（旧包为空串）；
    - `groups[]` 为随包携带的分组定义 `[{id, name}]`（zip manifest v2；jsonl / 旧版 v1 包为空列表），前端弹窗据此提示「导入后按分组名自动还原归属」；
    - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析（含路径穿越防护）。
-2. `POST /chat_history/import_package?conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（Form: `file`）——**提交导入**：
+2. `POST /chat_history/import_package?filename=<文件名>&conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（原始字节请求体，`application/octet-stream`）——**提交导入**：
    - 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`（ask 且无逐项决策时该会话跳过，绝不静默改名/覆盖）；
    - 无冲突会话直接导入；zip 包同时落盘各会话的 `session_files/<upload_id>/` 数据；
    - 冲突「重命名」：会话 ID 追加时间戳另存，上传数据目录归属同步改名为新会话 ID，并回写首行 `_meta.upload_id`；「覆盖」：清空旧 jsonl 与旧上传目录后写入；
@@ -595,8 +597,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 ## 6. 文件 FileUpload
 
 ### POST /file/upload_session_files
-上传文件并解析文本（≤10 个，单个 ≤10MB），结果写入文件记忆。
-- Form: `files`(必填, 多文件)；Query: `session_id`
+上传单个文件并解析文本（单文件 ≤10MB），结果写入文件记忆；前端选择多个文件时逐个请求（最多 10 个）。
+- Body: 单个文件的原始字节，`Content-Type: application/octet-stream`；Query: `filename`(必填)、`session_id`
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status(success/failed), message?, type?, content_length?}`
 - 上传文件保存为 `history_files/session_files/<session_id>/<文件名>.json`（目录按前端传入的 `session_id` 命名，仅存解析出的文本内容）；
   同时把**原始文件字节**另存到 `history_files/session_files/<session_id>/files/<名>_<随机>.<ext>`（供 `GET /file/get_session_document` 点击预览/下载），
@@ -614,8 +616,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 ### POST /file/upload_session_media
 上传聊天多媒体附件（图片/音频/视频），**原始字节**保存到 `history_files/session_files/<session>/media/`。
-- Form: `files`(必填, 多文件)；Query: `session_id`
-- 限制：≤10 个/次；单文件上限按类别——图片/音频 20MB、**视频 600MB（流式落盘，不整体读入内存）**；扩展名白名单——图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff（ico/tif/tiff 视觉模型不原生接受，上传时由 Pillow 自动转为 PNG 再落盘，需安装 pillow）、音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv
+- Body: 单个文件的原始字节，`Content-Type: application/octet-stream`；Query: `filename`(必填)、`session_id`；前端多文件逐个请求（最多 10 个）。
+- 限制：单文件上限按类别——图片/音频 20MB、**视频及 GIF 600MB（流式落盘，不整体读入内存）**；扩展名白名单——图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff（ico/tif/tiff 视觉模型不原生接受，上传时由 Pillow 自动转为 PNG 再落盘，需安装 pillow）、音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status, stored_name, media_ref, kind(image/audio/video), mime, size}`
 - 聊天消息引用方式：`content` 部件列表中 `{"type":"image_url","image_url":{"url":"media://<stored_name>"}}`（音频为 `{"type":"input_audio","input_audio":{"data":"media://<stored_name>","format":"wav"}}`，视频 `video_url`）。
   后端发送上游前把 `media://` 引用解析为 OpenAI 兼容格式：URL 类部件 → `data:<mime>;base64,<b64>`，`input_audio.data` → 纯 base64；`https://` 与已内联 `data:`/base64 原样透传（url 与 base64 双格式兼容）。
@@ -737,9 +739,11 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - 行为: 删除文件；返回 `{"state": "succeed", "name"}`；不存在 404
 
 ## 8. 根路由
-- `GET /` → `{"message": "欢迎使用大模型智能体工具接口"}`
+- `GET /` → `{"message": "欢迎使用智能体工具项目(Ytools)接口"}`
 
 ## 9. 重启维护工具（RestartMcp，mcp_server/restart_tools_server.py）
+
+> **当前状态：不可按下述设计流程使用。** `main.py` 中写入 `service_state.json` 的调用已被注释，项目根目录也缺少下述 `restart_helper.py`。以下保留为设计说明；启用前需补齐实现并重新验证。当前 `setting/mcp_servers.json` 未注册 RestartMcp。
 
 模型可调用的开发运维 MCP 工具（工具选择中勾选 `RestartMcp` 分组即授权），用于
 「修改代码后自驱动重启服务，并在重启完成后续接同一会话任务」。三个工具均为
@@ -804,3 +808,30 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
   复制 Markdown / 复制图片 / 下载 Excel）、`H5/js/table_canvas.js`
   （复制图片 canvas：列宽两轮收敛 + 行高自适应，长文本逐字换行不再截断）。
   测试: `test/test_table_export.py`（17 用例）、`H5/test_h5/table_export.test.js`。
+
+## 11. 访客用户 UserProfile
+
+账号 / 数据库体系落地前的过渡实现：全局唯一的「显示名」存项目 `.env` 的 `USER_NAME` 键，
+前端侧边栏底部点击名字即可就地编辑（Enter / 失焦保存，Esc 取消）。
+
+> 后续接入数据库管理用户时，只需替换 `routers/user_profile_router.py` 中读写 `USER_NAME`
+> 的两端（`load_var` / `set_env_vars`），对外契约保持不变。
+
+### GET /user/profile
+- 返回: `{"state","name","default_name","max_length","persisted","env_name","env_value","env_file","source"}`
+  - `name`：当前生效显示名；`.env` 未设置 / 被清空 / 存量值非法时回退 `default_name`（默认「访客用户」，常量 `config.DEFAULT_USER_NAME`）
+  - `persisted`：`.env` 是否显式保存过有效显示名（`false` = 正在使用默认值）
+  - `max_length`：显示名长度上限（`config.MAX_USER_NAME_LENGTH`，默认 32）
+
+### POST /user/profile
+- Body: `{"name": "新的显示名"}`
+  - 去首尾空白后保存；**空白串 = 清空该键值**，界面回退默认名（键位保留为空串）
+  - 校验（400）：超长（> `MAX_USER_NAME_LENGTH`）、含换行/制表等控制字符
+- 行为: 经 `env_manager.set_env_vars` 写回项目 `.env`（读入原文件 → 整体重写 + 同步内存
+  `env_vars`，下一次请求立即生效）；`.env` 被外部直接编辑时由配置热重载线程同步。
+- **读回校验**：保存后立即读回比对，若值因 `.env` 语法被改写（`#` 注释截断、已定义
+  `${VAR}` 变量引用展开、引号被 `strip` 去除等）则**回滚为保存前的值并返回 400**，
+  避免出现「保存成功但显示不对」。含未定义 `${VAR}` 的输入不会被展开，属可保存内容。
+- 返回: 同 GET 结构 + `message`（如「显示名已更新为「张三」」/「显示名已恢复默认「访客用户」」）
+- 前端: `H5/js/app/user_profile.js`（内联编辑交互）、`H5/js/api.js`
+  （`getUserProfile` / `updateUserProfile`）。测试: `test/test_user_profile_router.py`（13 用例）。

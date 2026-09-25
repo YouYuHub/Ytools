@@ -86,9 +86,14 @@
   }
 
   .rail-logo {
-    font-size: 17px;
-    font-weight: 700;
     margin-bottom: 10px;
+
+    .rail-logo-image {
+      display: block;
+      width: 28px;
+      height: 28px;
+      object-fit: contain;
+    }
   }
 
   .rail-spacer {
@@ -678,6 +683,24 @@
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+
+        // 显示名内联编辑框（JS 动态插入，见 js/app/user_profile.js）
+        .profile-name-editor {
+          width: 100%;
+          min-width: 0;
+          padding: 1px 6px;
+          border: 1px solid var(--border-strong);
+          border-radius: 6px;
+          outline: none;
+          background: var(--bg-elevated);
+          color: var(--text);
+          font: inherit;
+          font-size: 13px;
+
+          &:focus {
+            border-color: #0b84d8;
+          }
         }
 
         .profile-sub {

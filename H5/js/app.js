@@ -49,6 +49,8 @@
     if (isMobile()) sidebar.classList.add("collapsed");
     loadTools();
     loadWorkDir();
+    // 全局显示名（.env USER_NAME）：首屏拉取一次，点击侧边栏名字可改
+    if (App.loadUserProfile) App.loadUserProfile();
     migrateLegacyBuiltinFlags();
     // 支持 ?session=xxx 直达会话；目标会话不存在时（如默认 default 已删除）直接新建对话
     const target = new URLSearchParams(location.search).get("session") || "default";

@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ytools</title>
+    <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js"></script>
     <link rel="stylesheet" href="style/css/main.css">
@@ -18,7 +19,9 @@
         <aside class="sidebar" id="sidebar">
             <!-- 折叠态：窄图标栏 -->
             <div class="rail">
-                <button class="rail-btn rail-logo" id="railExpand" title="展开侧边栏">Y</button>
+                <button class="rail-btn rail-logo" id="railExpand" title="展开侧边栏" aria-label="展开侧边栏">
+                    <img class="rail-logo-image" src="favicon-squid.svg" alt="" width="28" height="28">
+                </button>
                 <button class="rail-btn" id="railNewChat" title="新对话">
                     <svg class="icon" viewBox="0 0 24 24">
                         <path
@@ -64,8 +67,7 @@
                         </svg>
                         <span>新对话</span>
                     </button>
-                    <button type="button" class="bulk-mode-toggle" id="bulkModeBtn"
-                        title="多选会话，批量分享/删除；再次点击退出多选">
+                    <button type="button" class="bulk-mode-toggle" id="bulkModeBtn" title="多选会话，批量分享/删除；再次点击退出多选">
                         <svg class="icon" viewBox="0 0 24 24">
                             <path d="M9 11l3 3 8-8" />
                             <path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" />
@@ -87,7 +89,8 @@
                     </button>
                     <button type="button" class="bulk-btn danger" id="bulkDeleteBtn" title="删除所选会话">
                         <svg class="icon" viewBox="0 0 24 24">
-                            <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6" />
+                            <path
+                                d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6" />
                         </svg>
                         <span>删除</span>
                     </button>
@@ -174,7 +177,7 @@
                     <button class="profile-card" id="profileCard" title="主题设置">
                         <span class="avatar">Y</span>
                         <span class="profile-info">
-                            <span class="profile-name">访客用户</span>
+                            <span class="profile-name" id="profileName" title="点击修改显示名">访客用户</span>
                             <span class="profile-sub" id="profileSub">跟随系统</span>
                         </span>
                         <span class="profile-plan">主题</span>
@@ -409,7 +412,8 @@
                     <div class="file-chips hidden" id="fileChips"></div>
                     <div class="tool-chips hidden" id="toolChips"></div>
                     <input type="file" id="fileInput" multiple hidden>
-                    <input type="file" id="historyFileInput" accept=".jsonl,.zip,application/json,application/zip" multiple hidden>
+                    <input type="file" id="historyFileInput" accept=".jsonl,.zip,application/json,application/zip"
+                        multiple hidden>
                 </div>
             </div>
         </main>
@@ -779,8 +783,7 @@
                         <option value="max">max</option>
                     </select>
                 </label>
-                <label class="enhance-check enhance-check-inline"
-                    title="通过 extra_body.enable_thinking 传递">
+                <label class="enhance-check enhance-check-inline" title="通过 extra_body.enable_thinking 传递">
                     <input type="checkbox" id="enableThinking">
                     <span>启用 thinking</span>
                 </label>
@@ -878,6 +881,7 @@
     <script src="js/app/history.js"></script>
     <script src="js/app/compaction.js"></script>
     <script src="js/app/builtin.js"></script>
+    <script src="js/app/user_profile.js"></script>
     <script src="js/app/media.js"></script>
     <script src="js/app/skills.js"></script>
     <script src="js/app/composer.js"></script>

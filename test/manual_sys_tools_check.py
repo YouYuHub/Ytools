@@ -7,13 +7,12 @@ sys_tools_server.py 的手动验证脚本：通过项目自身的 MCP 客户端�
     python test/manual_sys_tools_check.py
 
 说明：
-    - 当前 SysServer 注册 3 个工具：run_command / fetch_url / web_search
-      （read/write/edit/search 文件四件套已迁移为主项目后端内置工具，
-       其验证见 test/test_builtin_file_tools.py；list_dir 已停用）；
-    - run_command 用例覆盖：cmd/中文/退出码/超时杀进程/work_dir/超长截断落盘/
-      后台模式，以及 PowerShell 多行+引号（历史回归场景）与 bash（可用时）；
+    - 当前 SysServer 注册 2 个工具：fetch_url / web_search
+      （read/write/edit/search 文件四件套与 run_command 已迁移为主项目后端
+        内置工具，其验证见 test/test_builtin_file_tools.py 与
+        test/test_builtin_command_tool.py；list_dir 已停用）；
     - fetch_url / web_search 依赖外网连通性，失败时仅告警不判定为失败；
-    - 每次工具调用都会新起一个 MCP 服务器子进程，整体耗时约 1-2 分钟。
+    - 每次工具调用都会新起一个 MCP 服务器子进程，整体耗时约 1 分钟内。
 """
 import asyncio
 import os
@@ -27,8 +26,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from util.mcp_client import call_mcp_tool, get_mcp_tools  # noqa: E402
-
-PY = sys.executable
 
 
 def _make_sandbox() -> Path:
@@ -82,90 +79,6 @@ class Checker:
         print(f"❌ {name}: 期望报错但成功返回：{str(result)[:200]}")
 
 
-async def run_command_cases(checker: Checker, sandbox: Path):
-    # ---- 基础：echo / 中文 / 退出码 ----
-    await checker.check(
-        "run_command echo", "run_command", {"command": "echo hello_cmd"},
-        must_contain=["exit=0", "hello_cmd"],
-    )
-    await checker.check(
-        "run_command 中文输出", "run_command",
-        {"command": f'"{PY}" -c "print(\'中文输出ok\')"'},
-        must_contain=["中文输出ok"],
-    )
-    await checker.check(
-        "run_command 非零退出码", "run_command",
-        {"command": "cmd /c exit 3"},
-        must_contain=["exit=3"],
-    )
-    # ---- 超时终止（进程树强制终止）----
-    await checker.check(
-        "run_command 超时终止", "run_command",
-        {"command": "ping -n 30 127.0.0.1", "timeout_seconds": 2},
-        must_contain=["命令超时，进程树已被强制终止"],
-    )
-    # ---- work_dir 指定工作目录 ----
-    await checker.check(
-        "run_command 指定 work_dir", "run_command",
-        {"command": "cd", "work_dir": os.environ.get("SystemRoot", r"C:\Windows")},
-        must_contain=["exit=0", "Windows"],
-    )
-    # ---- PowerShell：多行 + 引号 + 分号（历史回归：内联引号破坏曾必失败）----
-    await checker.check(
-        "run_command PowerShell 多行+引号", "run_command",
-        {"command": "$a = 1\n$b = 2\nWrite-Output \"sum=$($a+$b) | 'q' ok\"",
-         "shell": "powershell"},
-        must_contain=["sum=3 | 'q' ok"],
-    )
-    await checker.check(
-        "run_command PowerShell 中文", "run_command",
-        {"command": "Write-Output '中文PS输出ok'", "shell": "powershell"},
-        must_contain=["中文PS输出ok"],
-    )
-    # ---- bash（WSL/Git Bash；首次启动较慢，失败仅告警）----
-    if shutil.which("bash"):
-        await checker.check(
-            "run_command bash", "run_command",
-            {"command": "echo bash_ok && pwd", "shell": "bash"},
-            must_contain=["bash_ok"], fatal=False,
-        )
-    else:
-        print("⚠️  run_command bash: 系统未安装 bash，跳过")
-        checker.warned += 1
-    # ---- 超长输出：截断 + 完整输出落盘提示 ----
-    await checker.check(
-        "run_command 超长截断+落盘", "run_command",
-        {"command": f'"{PY}" -c "print(\'x\'*30000)"'},
-        must_contain=["过长已截断", "完整输出:", "可用 read_file 读取"],
-    )
-    # ---- 后台模式：启动 + 输出文件轮询 ----
-    bg = await checker.check(
-        "run_command 后台模式", "run_command",
-        {"command": "echo bg_manual_ok", "background": True},
-        must_contain=["后台模式已启动", "输出文件:"],
-    )
-    if bg:
-        out_path = None
-        for line in bg.splitlines():
-            if line.startswith("输出文件:"):
-                out_path = line.split(":", 1)[1].strip().split("（")[0].strip()
-        if out_path:
-            await asyncio.sleep(2.5)
-            try:
-                content = Path(out_path).read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                content = f"<读取失败: {exc}>"
-            if "bg_manual_ok" in content:
-                checker.passed += 1
-                print("✅ run_command 后台输出落盘: bg_manual_ok")
-            else:
-                checker.failed += 1
-                print(f"❌ run_command 后台输出缺失: {content[:120]!r}")
-        else:
-            checker.failed += 1
-            print("❌ run_command 后台模式: 未能解析输出文件路径")
-
-
 async def run_network_cases(checker: Checker):
     await checker.check(
         "fetch_url 纯文本", "fetch_url", {"url": "https://example.com"},
@@ -196,7 +109,7 @@ async def main():
     try:
         tools = await get_mcp_tools("SysServer")
         names = sorted(tool.name for tool in tools)
-        expected = sorted(["run_command", "fetch_url", "web_search"])
+        expected = sorted(["fetch_url", "web_search"])
         if names == expected:
             checker.passed += 1
             print(f"✅ 工具发现: {names}")
@@ -212,8 +125,6 @@ async def main():
             checker.passed += 1
             print("✅ 工具参数 schema 均为 object")
 
-        print("\n---------- 命令执行 ----------")
-        await run_command_cases(checker, sandbox)
         print("\n---------- 网络抓取/搜索（失败仅告警） ----------")
         await run_network_cases(checker)
     finally:

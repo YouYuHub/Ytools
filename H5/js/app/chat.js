@@ -40,11 +40,16 @@
    * 上传媒体附件到 history_files/session_files/<session>/media/，换回 media:// 引用；
    * 后端发送上游前会把引用解析为 data URL / base64（兼容 Chat Completions 格式）
    */
-  async function uploadMediaFiles(streamSessionId, files) {
+  async function uploadMediaFiles(streamSessionId, items, signal) {
     const uploadedMedia = [];
     const uploadRes = await API.uploadSessionMedia(
       streamSessionId,
-      files
+      items.map(function (item) { return item.file; }),
+      function (index, progress) {
+        Object.assign(items[index], progress);
+        if (state.sessionId === streamSessionId) App.renderComposerAttachments();
+      },
+      signal
     );
     (uploadRes.results || []).forEach(function (result) {
       if (result.status === "success") uploadedMedia.push(result);
@@ -632,12 +637,13 @@
     });
     if (needUploadMedia.length) {
       try {
-        const files = needUploadMedia.map(function (m) { return m.file; });
-        const results = await uploadMediaFiles(streamSessionId, files);
+        const results = await uploadMediaFiles(streamSessionId, needUploadMedia, state.abort.signal);
         results.forEach(function (result) { uploadedMedia.push(result); });
       } catch (err) {
         toast("附件上传失败：" + err.message);
         state.streaming = false;
+        state.streamingSession = null;
+        state.abort = null;
         App.refreshComposerButtons();
         // flush 来源的失败消息放回队列头部，避免丢失
         if (!fromInput) {

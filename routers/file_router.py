@@ -1,8 +1,7 @@
 # coding: utf-8
 # fastapi 库导入
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
-from typing import List
 from pathlib import Path
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +25,7 @@ from memory.chat_memory import (
     resolve_session_work_dir,
 )
 from factory.file_factory import extract_text_from_bytes
+from routers.raw_upload import read_upload, require_raw_upload, spool_upload
 
 # 创建 API 路由器实例
 api_file_router = APIRouter(prefix="/file")
@@ -83,62 +83,26 @@ def _parse_single_file(file_info: dict) -> dict:
 
 @api_file_router.post("/upload_session_files")
 async def upload_files(
-    files: List[UploadFile] = File(...),
-    session_id: str = "default"  # 会话ID，用于隔离不同用户的文件历史
+    request: Request,
+    filename: str = Query(...),
+    session_id: str = "default"
 ):
     """
-    上传文件并解析内容，将文件信息记录到 file_memory 中
-    使用线程池并发处理多个文件的解析
+    接收一个 application/octet-stream 文件并解析内容，记录到 file_memory。
     参数:
-        files: 上传的文件列表，支持多个文件，最多10个
+        filename: 原始文件名；多文件由客户端逐个请求
         session_id: 会话ID，用于隔离不同会话的文件历史
     返回:
         JSON格式的结果，包含每个文件的处理状态
     """
-    # 验证文件数量
-    if len(files) > 10:
-        raise HTTPException(status_code=400, detail="最多只能上传10个文件")
-    if not files:
-        raise HTTPException(status_code=400, detail="至少需要上传一个文件")
+    filename = require_raw_upload(request, filename)
     results = []
     success_count = 0
     failed_count = 0
-    # 第一步：读取所有文件内容（异步操作）
-    file_data_list = []
-    for file in files:
-        try:
-            # 验证文件名
-            if not file.filename:
-                results.append({
-                    "filename": "未知文件",
-                    "status": "failed",
-                    "message": "文件名缺失"
-                })
-                failed_count += 1
-                continue
-            # 读取文件内容
-            file_content = await file.read()
-            # 验证文件大小（限制为10MB）
-            max_file_size = 10 * 1024 * 1024  # 10MB
-            if len(file_content) > max_file_size:
-                results.append({
-                    "filename": file.filename,
-                    "status": "failed",
-                    "message": f"文件大小超过限制（最大{max_file_size // (1024*1024)}MB）"
-                })
-                failed_count += 1
-                continue
-            file_data_list.append({
-                "filename": file.filename,
-                "content_bytes": file_content
-            })
-        except Exception as e:
-            results.append({
-                "filename": file.filename if file.filename else "未知文件",
-                "status": "failed",
-                "message": f"读取文件失败: {str(e)}"
-            })
-            failed_count += 1
+    file_data_list = [{
+        "filename": filename,
+        "content_bytes": await read_upload(request, 10 * 1024 * 1024, "文件"),
+    }]
     # 第二步：并发解析文件内容（CPU密集型操作）
     if file_data_list:
         # 提交所有文件到线程池进行并发解析
@@ -201,7 +165,7 @@ async def upload_files(
         upload_id = await _record_session_upload_id(session_id)
     # 返回处理结果
     return JSONResponse(content={
-        "total": len(files),
+        "total": 1,
         "success": success_count,
         "failed": failed_count,
         "results": results,
@@ -211,7 +175,8 @@ async def upload_files(
 
 @api_file_router.post("/upload_session_media")
 async def upload_session_media(
-    files: List[UploadFile] = File(...),
+    request: Request,
+    filename: str = Query(...),
     session_id: str = "default",
 ):
     """
@@ -219,66 +184,45 @@ async def upload_session_media(
     history_files/session_files/<session>/media/，供聊天多模态消息以
     media://<stored_name> 引用（发送上游前由后端解析为 data URL / base64）。
     参数:
-        files: 媒体文件列表，最多 10 个；单文件上限按类别：图片/音频 20MB、视频 600MB
+        filename: 原始文件名；每次请求上传一个文件；单文件上限按类别：图片/音频 20MB、视频 600MB
                （视频流式落盘，不整体读入内存）；扩展名白名单校验
         session_id: 会话ID，用于隔离不同会话的媒体目录
     返回:
         {total, success, failed, results: [{filename, stored_name, media_ref, kind, mime, size}], upload_id}
     """
-    if len(files) > 10:
-        raise HTTPException(status_code=400, detail="最多只能上传10个文件")
-    if not files:
-        raise HTTPException(status_code=400, detail="至少需要上传一个文件")
+    filename = require_raw_upload(request, filename)
     results = []
     success_count = 0
-    for file in files:
-        filename = file.filename or ""
-        try:
-            if not filename:
-                results.append({"filename": "", "status": "failed", "message": "文件名缺失"})
-                continue
-            kind = media_kind(filename)
-            if kind is None:
-                results.append({
-                    "filename": filename,
-                    "status": "failed",
-                    "message": "不支持的媒体类型（仅支持图片 png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff"
-                               "——ico/tif/tiff 会自动转为 png、"
-                               "音频 wav/mp3/m4a/ogg/flac、视频 mp4/webm/mov/mkv）",
-                })
-                continue
-            size_limit = media_size_limit(kind)
-            if kind == "video" or (kind == "image" and filename.lower().endswith(".gif")):
-                # 大文件流式落盘：边拷贝边计数、超限即中止，不整体读入内存；
-                # 动图 gif 归视频档（600MB，发送/读取侧按内容判定同口径）
-                saved = save_session_media_stream(session_id, filename, file.file)
-                results.append({"status": "success", **saved})
-                success_count += 1
-                continue
-            data = await file.read()
-            if len(data) > size_limit:
-                results.append({
-                    "filename": filename,
-                    "status": "failed",
-                    "message": f"文件大小超过限制（{kind} 最大{size_limit // (1024 * 1024)}MB）",
-                })
-                continue
+    kind = media_kind(filename)
+    if kind is None:
+        raise HTTPException(status_code=400, detail="不支持的媒体类型")
+    size_limit = media_size_limit(kind)
+    try:
+        if kind == "video" or (kind == "image" and filename.lower().endswith(".gif")):
+            # 大文件流式落盘，不整体读入内存；动图 gif 按视频档上限处理。
+            if filename.lower().endswith(".gif"):
+                size_limit = media_size_limit("video")
+            stream = await spool_upload(request, size_limit, "媒体文件")
+            try:
+                saved = save_session_media_stream(session_id, filename, stream)
+            finally:
+                stream.close()
+        else:
+            data = await read_upload(request, size_limit, "媒体文件")
             saved = save_session_media(session_id, filename, data)
-            results.append({"status": "success", **saved})
-            success_count += 1
-        except Exception as exc:
-            results.append({
-                "filename": filename,
-                "status": "failed",
-                "message": f"保存失败: {str(exc)}",
-            })
+        results.append({"status": "success", **saved})
+        success_count += 1
+    except HTTPException:
+        raise
+    except Exception as exc:
+        results.append({"filename": filename, "status": "failed", "message": f"保存失败: {exc}"})
     upload_id = None
     if success_count:
         upload_id = await _record_session_upload_id(session_id)
     return JSONResponse(content={
-        "total": len(files),
+        "total": 1,
         "success": success_count,
-        "failed": len(files) - success_count,
+        "failed": 1 - success_count,
         "results": results,
         "upload_id": upload_id,
     })

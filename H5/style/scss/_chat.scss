@@ -191,6 +191,24 @@
       height: 15px;
     }
 
+    .tool-block-tool-icon {
+      width: 18px;
+      height: 18px;
+      color: var(--text-secondary);
+
+      &.is-builtin-tool-icon {
+        color: var(--tool-icon-pink);
+      }
+
+      &.is-failed {
+        color: var(--danger);
+      }
+    }
+
+    .tool-status-icon {
+      color: var(--text-tertiary);
+    }
+
     // 收缩只允许发生在文件路径上：图标/"调用工具"/工具名等刚性占位。
     // 否则 flex 默认按 各项基准宽度×收缩系数 分摊压缩量——路径基准极大，
     // 分摊后其余项仍会被压扁（"调用工具"竖排、工具名截成"ed..."）
@@ -299,6 +317,10 @@
     overflow: auto;
     white-space: pre-wrap;
     word-break: break-all;
+  }
+
+  .tool-io-out .tool-output-stderr {
+    color: var(--danger);
   }
 }
 
@@ -2103,6 +2125,10 @@ html[data-theme="dark"] {
 .md-canvas-block:fullscreen {
   display: flex;
   flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  box-sizing: border-box;
+  align-items: stretch;
   background: #111318;
   padding: 10px;
   overflow: hidden;
@@ -2116,10 +2142,13 @@ html[data-theme="dark"] {
     min-height: 0;
     display: flex;
     flex-direction: row;
+    align-items: stretch;
+    justify-content: flex-start;
     overflow: hidden;
 
     .md-canvas-frame {
-      flex: 1;
+      flex: 1 1 auto;
+      min-width: 0;
       height: auto;
       min-height: 0;
     }

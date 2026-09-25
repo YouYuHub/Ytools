@@ -204,6 +204,26 @@ class TodoApplyTests(unittest.TestCase):
         self.assertTrue(result_all_done["plan_complete"])
         self.assertEqual(items_all_done[1]["status"], "done")
 
+    def test_repeated_completed_plan_keeps_original_ids(self):
+        from factory import chat_factory
+
+        original = [
+            {"id": "a", "content": "调研", "status": "done"},
+            {"id": "b", "content": "交付", "status": "done"},
+        ]
+        asyncio.run(self.manager.update_session_todo(original))
+        result, items = asyncio.run(chat_factory._apply_session_todo(
+            self.manager,
+            {"todos": [
+                {"id": "1", "content": "调研", "status": "done"},
+                {"id": "2", "content": "交付", "status": "done"},
+            ]},
+        ))
+        self.assertTrue(result["unchanged"])
+        self.assertTrue(result["plan_complete"])
+        self.assertEqual(items, original)
+        self.assertEqual(asyncio.run(self.manager.get_session_todo()), original)
+
     def test_replace_todo_context_summary_terminal_state(self):
         # 摘要终态回归：模型最后一次 todo 调用（全部 done）后，历史 todo
         # 调用/结果被替换为摘要——终态摘要必须自带"全部完成+请汇总答复"
@@ -228,6 +248,7 @@ class TodoApplyTests(unittest.TestCase):
         summary = messages[2]["content"]
         self.assertIn("任务规划已全部完成（2/2 项）", summary)
         self.assertIn("汇总执行结果直接答复用户", summary)
+        self.assertIn("plan_complete=true", summary)
         self.assertIn("✓ 汇总结果", summary)
 
     def test_apply_session_todo_missing_id_inherits_prev(self):
