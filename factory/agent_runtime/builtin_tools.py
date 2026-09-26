@@ -1287,11 +1287,20 @@ READ_DOCUMENT_TOOL_DEFINITION = {
 }
 
 
-def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[str, Any]:
+def execute_read_document(
+    tool_args: dict[str, Any],
+    session_id: str,
+    support_doc_types: Any = None,
+) -> dict[str, Any]:
     """执行内置 read_document：按文件名读取上传文件的解析文本（分页）。
 
+    support_doc_types 为当前生效模型的 supportDocTypes 声明（原生文档输入能力）：
+    - 命中声明且原始文件可用 → 结果携带 native 块（原生文档部件），调用方把它
+      注入后续请求（供应商侧视觉解析），同时返回解析文本节选作为兜底/速读；
+    - 未命中/原始文件缺失 → 纯文本分页口径（与历史行为一致），native 省略。
+
     返回 {filename, type, total_chars, start_char, end_char, content, has_more,
-    next_start_char?, message}；失败返回 {"error": ...}（模型可见的错误反馈）。
+    next_start_char?, native?, message}；失败返回 {"error": ...}（模型可见）。
     """
     args = tool_args if isinstance(tool_args, dict) else {}
     filename = str(args.get("filename") or "").strip()
@@ -1318,10 +1327,34 @@ def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[st
             names = []
         hint = f"；当前会话已上传文件：{'、'.join(names)}" if names else "；当前会话没有上传文件"
         return {"error": f"未找到文件「{filename}」{hint}"}
+    # 原生文档分支：当前模型声明支持该类型且原始文件可用时，构建原生文档部件
+    # （调用方注入后续请求；文本节选仍一并返回，供应商拒绝 file 部件时可兜底）
+    native_block: dict[str, Any] | None = None
+    native_note = ""
+    if support_doc_types and file_memory.document_supports_native(
+        str(record.get("filename") or filename), support_doc_types
+    ):
+        loaded_native = file_memory.build_native_document_part(session_id, record)
+        if loaded_native.get("part") is not None:
+            native_block = loaded_native
+            native_note = (
+                "；当前模型支持该文档类型，原始文件已作为原生文档注入后续请求"
+                "（以下为解析文本节选，供快速定位）"
+            )
+        elif loaded_native.get("error"):
+            native_note = f"；原生文档注入不可用：{loaded_native['error']}"
     content = str(record.get("content") or "")
     total = len(content)
     if total == 0:
-        return {
+        empty_hint = "该文件解析文本为空（可能是扫描版 PDF 等无可提取文本）"
+        if record.get("parse_failed"):
+            empty_hint = (
+                "该文件本地文本解析失败"
+                f"（{str(record.get('parse_error') or '解析器不可用/文件不支持')}），"
+                "无文本可读；原始文件仍保留，可尝试按绝对路径用 read_file 读取"
+                "（若为纯文本），或改用支持该文档类型的模型按原生文档读取"
+            )
+        result: dict[str, Any] = {
             "filename": record.get("filename") or filename,
             "type": record.get("type") or "",
             "total_chars": 0,
@@ -1329,8 +1362,11 @@ def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[st
             "end_char": 0,
             "content": "",
             "has_more": False,
-            "message": "该文件解析文本为空（可能是扫描版 PDF 等无可提取文本）",
+            "message": empty_hint + native_note,
         }
+        if native_block is not None:
+            result["native"] = native_block
+        return result
     if start >= total:
         return {
             "error": (
@@ -1340,7 +1376,7 @@ def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[st
         }
     chunk = content[start:start + max_chars]
     end = start + len(chunk)
-    result: dict[str, Any] = {
+    result = {
         "filename": record.get("filename") or filename,
         "type": record.get("type") or "",
         "total_chars": total,
@@ -1349,14 +1385,16 @@ def execute_read_document(tool_args: dict[str, Any], session_id: str) -> dict[st
         "content": chunk,
         "has_more": end < total,
     }
+    if native_block is not None:
+        result["native"] = native_block
     if end < total:
         result["next_start_char"] = end
         result["message"] = (
             f"已返回第 {start}-{end} 字符（共 {total} 字）；"
-            f"如需继续，用 start_char={end} 再次调用"
+            f"如需继续，用 start_char={end} 再次调用" + native_note
         )
     else:
-        result["message"] = f"已返回第 {start}-{end} 字符（全文结束，共 {total} 字）"
+        result["message"] = f"已返回第 {start}-{end} 字符（全文结束，共 {total} 字）" + native_note
     return result
 
 

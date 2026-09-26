@@ -56,6 +56,18 @@ DEFAULT_ONE_TASK_MAX_WORKERS = 3             # 同一轮多个 MCP 工具调用�
 DEFAULT_USER_NAME = "访客用户"
 MAX_USER_NAME_LENGTH = 32                    # 显示名最大字符数（前端输入框同步限制）
 
+# 原生文档（模型 supportDocTypes 声明的文件输入）与文本解析上限：
+# 上传的 PDF/DOCX 等文档在「会话生效模型声明支持该类型」时按轮随请求注入
+# （语义同图片/视频：本任务内每轮发送，出现新用户消息后转文本占位）；以下常量
+# 约束注入规模，避免超大文档撑爆请求体/模型窗口——超预算的文档降级为文本口径
+# （解析文本 + read_document 分页读取）。运行期经 load_var 读取（配置热重载生效）。
+DEFAULT_NATIVE_DOC_MAX_BYTES = 20 * 1024 * 1024        # 单个原生文档注入上限（字节）
+DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES = 40 * 1024 * 1024  # 单轮原生文档注入总量上限（字节）
+DEFAULT_NATIVE_DOC_MAX_ITEMS = 3                       # 单轮原生文档注入数量上限
+# 单个上传文件的解析文本入库上限（字符）：超出截断入库并标记，模型可
+# read_document 分页读取已入库文本，或用 read_file 读取原始文件绝对路径续读
+DEFAULT_FILE_TEXT_MAX_CHARS = 200000
+
 
 class Message(BaseModel):
     role: str = "user"       # 角色，可以是 "user" 或 "assistant" 或 "system" 或 "tool"

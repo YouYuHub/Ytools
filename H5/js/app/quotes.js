@@ -2,7 +2,7 @@
  * 选中文本引用到提问（docs/quote_selection_design.md）
  * - 选区检测：聊天正文中「用户提问正文」或「助手回答正文」内的同一条消息选择
  * - 浮钮「引用到提问」：选区末端附近出现，点击把文本快照加入当前会话草稿
- * - 草稿引用卡片：输入框上方展示（预览/来源/移除），随会话草稿保存与恢复
+ * - 草稿引用入口：输入框上方显示数量按钮，悬停/聚焦展开原文与来源，可跳转/移除
  * - 气泡引用卡片：用户消息气泡内展示（历史回放与实时发送共用）
  *
  * 依赖：app/core.js（state/el/toast 等）、js/quote_utils.js（QuoteUtils 纯逻辑）。
@@ -14,7 +14,7 @@
   const { state, el, toast, chatInner, chatScroll, composer, input } = App;
   const QuoteUtils = window.QuoteUtils;
 
-  // 引用卡片行（输入框上方）：index.html 中位于附件区之前
+  // 引用入口（输入框上方）：index.html 中位于附件区之前
   const composerQuotes = App.$("#composerQuotes");
 
   // ---------- 浮钮 ----------
@@ -182,7 +182,7 @@
   });
   chatScroll.addEventListener("scroll", hideFloatBtn, { passive: true });
 
-  // ---------- 草稿引用（输入框上方卡片） ----------
+  // ---------- 草稿引用（输入框上方紧凑入口 + 原文浮层） ----------
   function renderComposerQuotes() {
     if (!composerQuotes) return;
     const quotes = state.pendingQuotes || [];
@@ -190,8 +190,24 @@
     if (!quotes.length) {
       composerQuotes.classList.add("hidden");
       composer.classList.remove("has-quotes");
+      if (App.syncComposerAttachmentBlocks) App.syncComposerAttachmentBlocks();
       return;
     }
+
+    const tile = el("div", "composer-quotes-tile");
+    const trigger = el("button", "composer-quotes-trigger");
+    trigger.type = "button";
+    trigger.title = "悬停或聚焦查看引用原文";
+    trigger.setAttribute("aria-label", "查看 " + quotes.length + " 条引用原文");
+    trigger.setAttribute("aria-controls", "composerQuotesPopover");
+    trigger.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.4Z"/><path d="M8 10h8M8 14h5"/></svg>';
+    trigger.appendChild(el("span", "composer-quotes-count", String(quotes.length)));
+    tile.appendChild(trigger);
+
+    const popover = el("div", "composer-quotes-popover");
+    popover.id = "composerQuotesPopover";
+    popover.setAttribute("role", "region");
+    popover.setAttribute("aria-label", "已添加的引用原文");
     quotes.forEach(function (quote, index) {
       const card = el("div", "composer-quote");
       const jump = el("button", "composer-quote-jump");
@@ -206,7 +222,7 @@
       const label = QuoteUtils.quoteSourceLabel(quote.source);
       if (label) head.appendChild(el("span", "composer-quote-source", label));
       jump.appendChild(head);
-      jump.appendChild(el("span", "composer-quote-text", QuoteUtils.quotePreview(quote.text, 90)));
+      jump.appendChild(el("span", "composer-quote-text", quote.text));
       const remove = el("button", "composer-quote-remove", "×");
       remove.type = "button";
       remove.title = "移除该引用";
@@ -217,10 +233,13 @@
       });
       card.appendChild(jump);
       card.appendChild(remove);
-      composerQuotes.appendChild(card);
+      popover.appendChild(card);
     });
+    tile.appendChild(popover);
+    composerQuotes.appendChild(tile);
     composerQuotes.classList.remove("hidden");
     composer.classList.add("has-quotes");
+    if (App.syncComposerAttachmentBlocks) App.syncComposerAttachmentBlocks();
   }
 
   function addDraftQuote(entry) {
@@ -262,22 +281,40 @@
     const normalized = QuoteUtils.normalizeQuotes(quotes);
     if (!normalized.length) return null;
     const wrap = el("div", "msg-quote-list");
+    const tile = el("div", "msg-quote-tile");
+    const trigger = el("button", "msg-quote-card");
+    trigger.type = "button";
+    trigger.title = "悬停或聚焦查看引用原文";
+    trigger.setAttribute("aria-label", "查看 " + normalized.length + " 条引用");
+
+    const icon = el("span", "msg-quote-icon");
+    icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.4Z"/><path d="M8 10h8M8 14h5"/></svg>';
+    trigger.appendChild(icon);
+    trigger.appendChild(el("span", "msg-quote-index", String(normalized.length)));
+
+    const popover = el("div", "msg-quote-popover");
+    popover.setAttribute("role", "region");
+    popover.setAttribute("aria-label", "已发送消息中的引用原文");
     normalized.forEach(function (quote, index) {
-      const card = el("button", "msg-quote-card");
-      card.type = "button";
-      card.title = "点击跳转到引用原文";
-      card.setAttribute("aria-label", "跳转到引用 " + (index + 1) + " 的原文");
-      card.addEventListener("click", function () {
+      const jump = el("button", "msg-quote-jump");
+      jump.type = "button";
+      jump.title = "跳转到这条引用的原文";
+      jump.setAttribute("aria-label", "跳转到引用 " + (index + 1) + " 的原文");
+      jump.addEventListener("click", function (event) {
+        event.stopPropagation();
         if (App.jumpToQuoteSource) App.jumpToQuoteSource(quote.source, quote.text);
       });
       const head = el("span", "msg-quote-head");
       head.appendChild(el("span", "msg-quote-badge", "引用 " + (index + 1)));
       const label = QuoteUtils.quoteSourceLabel(quote.source);
       if (label) head.appendChild(el("span", "msg-quote-source", label));
-      card.appendChild(head);
-      card.appendChild(el("span", "msg-quote-text", quote.text));
-      wrap.appendChild(card);
+      jump.appendChild(head);
+      jump.appendChild(el("span", "msg-quote-text", quote.text));
+      popover.appendChild(jump);
     });
+    tile.appendChild(trigger);
+    tile.appendChild(popover);
+    wrap.appendChild(tile);
     return wrap;
   }
 

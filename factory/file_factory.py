@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # PDF - 使用 PyMuPDF (fitz)
 try:
     import fitz  # PyMuPDF
+except ImportError:
+    import pymupdf as fitz  # 新版本推荐；旧代码常用 import fitz
 except Exception:
     fitz = None
 
@@ -33,13 +35,18 @@ except Exception:
 
 
 def _parse_txt(data: bytes, encoding: Optional[str] = 'utf-8') -> str:
-    try:
-        return data.decode(encoding)
-    except Exception:
+    """文本解码：指定编码优先，失败后走统一回退链（utf-8-sig/utf-8/gb18030/big5/latin-1）。
+
+    此前失败直接 latin-1（会把 GBK 中文解成乱码）；改用回退链后
+    GBK/GB2312/Big5 等常见编码的中文文本都能正确还原。
+    """
+    if encoding:
         try:
-            return data.decode('latin-1')
-        except Exception:
-            return data.decode('utf-8', errors='ignore')
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    text, _used = decode_text_bytes(data)
+    return text
 
 
 def _parse_md(data: bytes) -> str:
@@ -360,13 +367,13 @@ def _parse_txt_with_pages(data: bytes, encoding: Optional[str] = 'utf-8') -> Lis
     解析 TXT 文件（TXT 文件没有页码概念，返回 None）
     返回：包含 content 和 page_number 的字典列表
     """
-    try:
-        text = data.decode(encoding)
-    except Exception:
+    if encoding:
         try:
-            text = data.decode('latin-1')
-        except Exception:
-            text = data.decode('utf-8', errors='ignore')
+            text = data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            text, _used = decode_text_bytes(data)
+    else:
+        text, _used = decode_text_bytes(data)
     # TXT 文件没有页码概念，直接返回整个内容，页码设为 None
     return [{"content": text, "page_number": None}]
 
@@ -376,13 +383,7 @@ def _parse_md_with_pages(data: bytes) -> List[Dict]:
     解析 MD 文件（MD 文件没有页码概念，返回 None）
     返回：包含 content 和 page_number 的字典列表
     """
-    try:
-        text = data.decode('utf-8')
-    except Exception:
-        try:
-            text = data.decode('latin-1')
-        except Exception:
-            text = data.decode('utf-8', errors='ignore')
+    text, _used = decode_text_bytes(data)
     # MD 文件没有页码概念，直接返回整个内容，页码设为 None
     return [{"content": text, "page_number": None}]
 
@@ -396,6 +397,97 @@ PARSER_BY_EXT = {
     '.xls': _parse_excel,
     '.xlsx': _parse_excel,
 }
+
+# ---------- 文本类文件：扩展名白名单 + 编码回退解码 + 二进制嗅探 ----------
+# 上传链路的「文本类文件」口径（需求：文本文件直接上传，文本内容即解析结果）：
+# - 已知可解析文档（pdf/docx/doc/csv/xls/xlsx）走各自解析器（PARSER_BY_EXT）；
+# - 常见文本扩展名（代码/配置/日志/字幕/数据等）直接按文本解码，无需专用解析器；
+# - 未知扩展名：先二进制嗅探（前 8KB 含空字节、或控制字符占比过高 → 拒绝），
+#   通过则按文本解码。避免此前「未知类型一律 latin-1 硬解码」把二进制文件
+#   解出满屏乱码文本塞进上下文。
+TEXT_FILE_EXTENSIONS = frozenset({
+    # 文档/笔记/数据
+    '.txt', '.md', '.markdown', '.rst', '.log', '.text', '.me',
+    '.csv', '.tsv', '.json', '.jsonl', '.ndjson', '.yaml', '.yml', '.toml',
+    '.ini', '.cfg', '.conf', '.properties', '.env', '.gitignore', '.gitattributes',
+    '.editorconfig', '.srt', '.vtt', '.ass', '.tex', '.bib',
+    # Web / 前端
+    '.html', '.htm', '.xhtml', '.xml', '.xsl', '.xslt', '.css', '.scss', '.sass',
+    '.less', '.styl', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.vue',
+    '.svelte', '.map', '.svg',
+    # 通用编程语言
+    '.py', '.pyi', '.ipynb', '.java', '.kt', '.kts', '.scala', '.groovy',
+    '.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.cs', '.go', '.rs',
+    '.swift', '.m', '.mm', '.php', '.rb', '.pl', '.pm', '.lua', '.r', '.jl',
+    '.dart', '.ex', '.exs', '.erl', '.hrl', '.hs', '.clj', '.cljs', '.el',
+    '.vim', '.asm', '.s', '.f', '.f90', '.f95', '.for', '.pas', '.d', '.nim',
+    '.zig', '.v', '.sol', '.tcl', '.awk', '.sed',
+    # 脚本 / 配置 / 构建
+    '.sh', '.bash', '.zsh', '.fish', '.ps1', '.psm1', '.bat', '.cmd', '.sql',
+    '.graphql', '.gql', '.proto', '.thrift', '.cmake', '.make', '.mk', '.gradle',
+    '.dockerfile', '.containerfile', '.tf', '.tfvars', '.hcl', '.nix',
+    # 其它纯文本
+    '.diff', '.patch', '.po', '.pot', '.strings', '.pem',
+    '.crt', '.cer', '.key', '.pub', '.asc', '.lic', '.license',
+})
+# 文本解码回退链：BOM 变体 → 常用 Unicode/中文编码 → 单字节兜底
+_TEXT_DECODE_CANDIDATES = ("utf-8-sig", "utf-8", "gb18030", "big5", "latin-1")
+# 二进制嗅探：样本大小与「非文本控制字符」占比阈值
+_BINARY_SNIFF_SAMPLE_BYTES = 8192
+_BINARY_CONTROL_RATIO = 0.10
+
+
+def get_text_extension(filename: str) -> bool:
+    """按扩展名判断是否属于常见文本类文件（不含 pdf/docx 等富文档）。"""
+    _, ext = os.path.splitext(str(filename).lower())
+    return ext in TEXT_FILE_EXTENSIONS
+
+
+def is_probably_binary(data: bytes) -> bool:
+    """二进制嗅探：前 8KB 出现空字节即视为二进制文件（与内置工具同口径）。
+
+    另加控制字符占比判定：除 \\t\\n\\r\\f\\v 外的控制字符占比超过 10% 也视为
+    二进制（覆盖无空字节的压缩/编码数据）。
+    """
+    sample = bytes(data[:_BINARY_SNIFF_SAMPLE_BYTES])
+    if b"\x00" in sample:
+        return True
+    if not sample:
+        return False
+    control = sum(
+        1 for byte in sample
+        if byte < 0x20 and byte not in (0x09, 0x0A, 0x0D, 0x0C, 0x0B)
+    )
+    return control / len(sample) > _BINARY_CONTROL_RATIO
+
+
+def decode_text_bytes(data: bytes) -> tuple[str, str]:
+    """按编码回退链把字节解码为文本，返回 (文本, 实际采用的编码)。
+
+    回退链：utf-8-sig（带 BOM 的 UTF-8）→ utf-8 → gb18030（GBK/GB2312 超集）
+    → big5 → latin-1（单字节兜底，永不失败）。
+    """
+    for candidate in _TEXT_DECODE_CANDIDATES:
+        try:
+            return data.decode(candidate), candidate
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("latin-1", errors="replace"), "latin-1"
+
+
+def parse_text_file_bytes(filename: str, data: bytes) -> str:
+    """把文本类文件字节解析为文本内容（直接使用文本内容作为解析结果）。
+
+    Raises:
+        ValueError: 疑似二进制文件（扩展名未知且内容不像文本）时抛出，
+        由上传链路转为该文件的失败反馈。
+    """
+    known_text = get_text_extension(filename)
+    if is_probably_binary(data) and not known_text:
+        raise ValueError(f"{filename} 疑似二进制文件（非文本内容），无法按文本解析")
+    text, _encoding = decode_text_bytes(data)
+    return text
+
 
 # 带页码解析的映射表
 PAGES_PARSER_BY_EXT = {
@@ -424,8 +516,8 @@ def get_pages_parser_for_filename(filename: str):
 def extract_text_from_bytes(filename: str, data: bytes) -> str:
     parser = get_parser_for_filename(filename)
     if not parser:
-        # fallback: try to decode as text
-        return _parse_txt(data)
+        # 未知扩展名 / 常见文本类：先二进制嗅探，通过则按编码回退链解码
+        return parse_text_file_bytes(filename, data)
     return parser(data)
 
 
@@ -442,8 +534,8 @@ def extract_pages_from_bytes(filename: str, data: bytes) -> List[Dict]:
     """
     parser = get_pages_parser_for_filename(filename)
     if not parser:
-        # fallback: try to decode as text
-        text = _parse_txt(data)
+        # 未知扩展名 / 常见文本类：二进制嗅探 + 编码回退解码
+        text = parse_text_file_bytes(filename, data)
         return [{"content": text, "page_number": None}]
     try:
         return parser(data)

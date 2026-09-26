@@ -809,6 +809,49 @@ def _recompute_meta_from_entries(
     return meta
 
 
+def _relocate_anchored_compaction_rows(
+    entries: list[Any],
+    display_round: int,
+    target_index: int,
+) -> tuple[list[Any], int]:
+    """把锚定到指定轮次的跨轮压缩行搬到 target_index 之前（就地重排）。
+
+    行序契约：任务内独立落盘的跨轮压缩行（带 display_round 锚点）应位于其
+    锚定轮次 chat_round 行之前——历史回放（前端解析器与旧版客户端）据此把
+    压缩块归位到轮次内部的事件位置。正常追加收尾天然满足（压缩行先落盘、
+    轮次行收尾时追加在压缩行之后）；回答插入（ask_user 再答）与编辑重发
+    （原地重跑）这两条"轮次行写在非末尾"的收尾路径会让压缩行滞留在其锚定
+    轮次行之后（旧前端把压缩块兜底显示到会话末尾），这里统一重排为
+    「压缩行 → 轮次行」顺序。
+
+    target_index 为目标轮次行（或即将插入新轮次行的位置）在当前 entries 中
+    的下标；返回 (重排后的 entries 列表, 目标位置的新下标)——新下标指向
+    搬移后的压缩行之后，即轮次行应落的位置。无锚定行时原样返回。
+    """
+    if not isinstance(display_round, int):
+        return entries, target_index
+    anchored: list[Any] = []
+    remaining: list[Any] = []
+    removed_before = 0
+    for index, entry in enumerate(entries):
+        if (
+            isinstance(entry, dict)
+            and entry.get("event") == "context_compaction"
+            and entry.get("display_round") == display_round
+        ):
+            anchored.append(entry)
+            if index < target_index:
+                removed_before += 1
+        else:
+            remaining.append(entry)
+    if not anchored:
+        return entries, target_index
+    new_target = target_index - removed_before
+    # 压缩行按原有相对顺序放到目标位置之前
+    new_entries = remaining[:new_target] + anchored + remaining[new_target:]
+    return new_entries, new_target + len(anchored)
+
+
 def _load_meta_and_entries(
     file_path: Path,
     session_id: str,
@@ -1257,6 +1300,12 @@ class ChatMemoryManager:
                     # 累计摘要保留：替换不改变轮次总数与编号，摘要游标继续有效；
                     # 摘要对被编辑轮次的旧描述按现状保留不失效重压（大会话下
                     # 整段重建摘要成本极高，见 get_context_messages 的钳制说明）
+                    # 锚定到本轮次的跨轮压缩行（重跑期间独立落盘、通常位于文件
+                    # 尾部）重排到替换位置之前，保持「压缩行先于其锚定轮次行」的
+                    # 行序契约（见 _relocate_anchored_compaction_rows）
+                    entries, replace_index = _relocate_anchored_compaction_rows(
+                        entries, target_round, replace_index
+                    )
                     entries[replace_index] = completed_round
                     self._target_round_number = None
                     self._history_cutoff_rounds = None
@@ -1276,6 +1325,13 @@ class ChatMemoryManager:
                     ]
                     if insert_round <= len(round_positions):
                         after_index = round_positions[insert_round - 1] + 1
+                        # 锚定到插入轮次的跨轮压缩行（回答轮执行中独立落盘、
+                        # 通常位于文件尾部）重排到插入点之前（行序契约，同替换
+                        # 分支）：不重排会滞留在插入的轮次行之后，旧前端把压缩
+                        # 块兜底显示到会话末尾
+                        entries, after_index = _relocate_anchored_compaction_rows(
+                            entries, insert_round + 1, after_index
+                        )
                         entries.insert(after_index, completed_round)
                         self._insert_round_number = None
                         self._history_cutoff_rounds = None
@@ -1408,6 +1464,11 @@ class ChatMemoryManager:
                         completed_round["started_at"] = (
                             old_round.get("started_at") or completed_round.get("started_at")
                         )
+                    # 锚定到本轮次的跨轮压缩行重排到替换位置之前（行序契约，
+                    # 见 _relocate_anchored_compaction_rows）
+                    entries, replace_index = _relocate_anchored_compaction_rows(
+                        entries, target_round, replace_index
+                    )
                     entries[replace_index] = completed_round
                     self._target_round_number = None
                     self._history_cutoff_rounds = None
@@ -1423,7 +1484,13 @@ class ChatMemoryManager:
                         if isinstance(entry, dict) and entry.get("event") == "chat_round"
                     ]
                     if insert_round <= len(round_positions):
-                        entries.insert(round_positions[insert_round - 1] + 1, completed_round)
+                        after_index = round_positions[insert_round - 1] + 1
+                        # 锚定到插入轮次的跨轮压缩行重排到插入点之前（行序契约，
+                        # 见 _relocate_anchored_compaction_rows）
+                        entries, after_index = _relocate_anchored_compaction_rows(
+                            entries, insert_round + 1, after_index
+                        )
+                        entries.insert(after_index, completed_round)
                     else:
                         entries.append(completed_round)
                     self._insert_round_number = None

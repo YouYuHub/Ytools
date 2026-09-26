@@ -23,7 +23,7 @@ imageio-ffmpeg
 
 #################### optional start ####################
 # 文档解析
-fitz
+PyMuPDF
 docx
 pandas
 

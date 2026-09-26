@@ -356,23 +356,18 @@
     // 按类型分流，两种附件统一显示在输入框上方附件区：
     // - 媒体（图片/音频/视频）：与剪贴板粘贴同款——先进待发区，随消息上传，
     //   以 media:// 引用进入消息内容部件；
-    // - 可解析文档：立即上传解析（file_memory），解析文本由后端注入系统
-    //   提示词（跨消息生效），不进入消息内容部件。
+    // - 其它文件（文档/文本/未知类型）：立即上传（file_memory），解析文本由
+    //   后端注入系统提示词（跨消息生效），不进入消息内容部件；常见文本类
+    //   直接按文本内容入库，未知类型由后端二进制嗅探决定接受或拒绝。
     const mediaFiles = files.filter(function (f) { return App.mediaKindOf(f.name); });
     const docFiles = files.filter(function (f) { return !App.mediaKindOf(f.name); });
     if (mediaFiles.length) App.addPendingMediaFiles(mediaFiles);
 
-    const unsupported = docFiles.filter(function (f) { return !docKindOf(f.name); });
-    if (unsupported.length) {
-      toast("不支持的文件类型：" + unsupported.map(function (f) { return f.name; }).join("、"));
-    }
-    const oversizeDocs = docFiles.filter(function (f) { return docKindOf(f.name) && f.size > MAX_DOC_FILE_SIZE; });
+    const oversizeDocs = docFiles.filter(function (f) { return f.size > MAX_DOC_FILE_SIZE; });
     if (oversizeDocs.length) {
       toast("已跳过超过 10MB 的文件：" + oversizeDocs.map(function (f) { return f.name; }).join("、"));
     }
-    const parseable = docFiles.filter(function (f) {
-      return docKindOf(f.name) && f.size <= MAX_DOC_FILE_SIZE;
-    });
+    const parseable = docFiles.filter(function (f) { return f.size <= MAX_DOC_FILE_SIZE; });
     if (!parseable.length) return;
 
     // 上传属于产生会话内容的动作：此时才分配会话 ID（与发送消息同一时机规则）
@@ -389,6 +384,11 @@
         if (state.sessionId === uploadSessionId) App.renderComposerAttachments();
       });
       toast("上传完成：成功 " + (res.success || 0) + " 个，失败 " + (res.failed || 0) + " 个");
+      // 失败明细（如二进制文件被拒/解析失败）：逐条提示原因，便于用户判断
+      const failedItems = (res.results || []).filter(function (item) { return item.status !== "success"; });
+      failedItems.slice(0, 3).forEach(function (item) {
+        toast((item.filename || "文件") + "：" + (item.message || "解析失败"));
+      });
       await loadSessionFiles();
     } catch (err) {
       toast("上传失败：" + err.message);

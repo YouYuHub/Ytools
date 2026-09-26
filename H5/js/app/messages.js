@@ -384,6 +384,9 @@
     // 分段尾部未配对的工具块置完成态
     finishUnmatchedTools(pendingTools);
     chatInner.insertBefore(frag, anchorNode || chatInner.firstChild);
+    // 分段回灌时用户消息先在离屏 DocumentFragment 中创建，插入后再测量
+    // 附件网格宽度，确保引用/媒体/文档方块按当前聊天区宽度排成一到两行。
+    if (App.syncMessageAttachmentBlocks) App.syncMessageAttachmentBlocks();
     loadOlderState.start = targetStart;
     // 插入把锚点（及其下方内容）下推：按锚点位移回拨 scrollTop，视口内
     // 阅读位置保持不变；content-visibility 下新内容进入视口附近即真实渲染
@@ -869,10 +872,11 @@
   // 卡片置顶、正文在下；渲染走 textContent，绝不把引用原文交给 innerHTML）
   function buildUserBubble(content, sessionId, docs, quotes) {
     const bubble = el("div", "msg-bubble");
+    const attachmentBlocks = el("div", "msg-user-attachment-blocks");
     // 引用卡片（引用 1/引用 2…）：置于问题正文之前（GPT 同款信息层级）
     if (App.buildQuoteList) {
       const quoteList = App.buildQuoteList(quotes);
-      if (quoteList) bubble.appendChild(quoteList);
+      if (quoteList) attachmentBlocks.appendChild(quoteList);
     }
     const parts = Array.isArray(content) ? content : null;
     let text = String(content == null ? "" : content);
@@ -896,7 +900,7 @@
           if (!url) return;
           const src = App.resolveMediaSrc(url, sessionId);
           if (!src) return;
-          const thumb = el("img", "msg-user-media-thumb", "");
+          const thumb = el("img", "msg-user-media-thumb clickable", "");
           thumb.src = src;
           thumb.alt = "附件图片";
           thumb.title = "点击预览";
@@ -912,7 +916,7 @@
           if (!url) return;
           const src = App.resolveMediaSrc(url, sessionId);
           if (!src) return;
-          const video = el("video", "msg-user-media-thumb", "");
+          const video = el("video", "msg-user-media-thumb clickable", "");
           video.src = src + "#t=0.1";
           video.muted = true;
           video.preload = "metadata";
@@ -928,7 +932,9 @@
         if (type === "input_audio") {
           const mediaRef = part.input_audio && typeof part.input_audio.data === "string" ? part.input_audio.data : "";
           const audioSrc = App.resolveMediaSrc(mediaRef, sessionId);
-          const chip = el("div", "msg-user-media-audio", mediaChipLabel(mediaRef, "🎵 音频"));
+          const chip = el("div", "msg-user-media-audio");
+          chip.appendChild(el("span", "msg-user-media-icon", "🎵"));
+          chip.appendChild(el("span", "msg-user-media-label", "音频"));
           chip.title = "点击收听";
           if (audioSrc) {
             chip.classList.add("clickable");
@@ -943,16 +949,24 @@
       // 随消息发送的会话文档（前端展示块；内容经系统提示词注入，不进 content）
       (docs || []).forEach(function (doc) {
         if (!doc || !doc.filename) return;
-        const chip = el("div", "msg-user-media-doc", "📄 " + doc.filename);
-        chip.title = "点击预览";
+        const filename = String(doc.filename);
+        const extension = (filename.split(".").pop() || "FILE").toUpperCase();
+        const chip = el("div", "msg-user-media-doc clickable");
+        chip.appendChild(el("span", "msg-user-media-icon", "📄"));
+        chip.appendChild(el("span", "msg-user-media-label", extension.slice(0, 5)));
+        chip.title = filename + "（点击预览）";
+        chip.setAttribute("aria-label", "文档：" + filename + "，点击预览");
         chip.classList.add("clickable");
         chip.addEventListener("click", function () {
           App.openMediaPreviewForDocument(doc);
         });
         mediaRow.appendChild(chip);
       });
-      if (mediaRow.childNodes.length) bubble.appendChild(mediaRow);
+      if (mediaRow.childNodes.length) attachmentBlocks.appendChild(mediaRow);
     }
+    if (attachmentBlocks.querySelector(
+      ".msg-quote-tile, .msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-doc"
+    )) bubble.appendChild(attachmentBlocks);
     if (text) bubble.appendChild(el("div", "msg-user-text", text));
     return bubble;
   }
@@ -974,6 +988,10 @@
     // container 缺省追加到会话流末尾；传入正在流式的助手消息节点时，
     // 气泡嵌入其当前内容之后（工具结果位置），保持注入消息的时间顺序
     (container || chatInner).appendChild(msg);
+    const attachmentBlocks = msg.querySelector(".msg-user-attachment-blocks");
+    if (attachmentBlocks && App.fitAttachmentBlockGrid) {
+      App.fitAttachmentBlockGrid(attachmentBlocks);
+    }
     // 流式注入（attachment 指向流节点）时尊重自动贴底暂停：用户上滚阅读
     // 时不被拉回；整段历史回放后由 history.js 的 scrollToBottom 置底复位
     stickToBottom();

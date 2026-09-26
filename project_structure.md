@@ -1,7 +1,7 @@
 # Ytools 智能体工具使用测试 - 项目结构
 
 ## 概述
-基于 **FastAPI** 的智能体工具服务平台，核心业务：大模型对话（SSE 流式、后台任务 + 断线重连）、MCP 工具调用、**多模态文件上传**（图片/音频/视频，media:// 引用解析为 OpenAI 兼容格式）、文件解析、会话记忆与历史压缩、模型/工作目录动态配置；另附 **H5 前端**（聊天界面：SSE 流式、多模态附件、富媒体渲染——SVG 生成控件 / KaTeX 数学公式 / Mermaid 图表 / Canvas 沙箱程序块——与历史会话管理）与交互测试脚本。
+基于 **FastAPI** 的智能体工具服务平台，核心业务：大模型对话（SSE 流式、后台任务 + 断线重连）、MCP 工具调用、**多模态文件上传**（图片/音频/视频，media:// 引用解析为 OpenAI 兼容格式）、文件解析（含**原生文档**：模型 supportDocTypes 声明的 pdf/docx 等按轮随请求注入原始文件；文本类文件二进制嗅探直收）、会话记忆与历史压缩、模型/工作目录动态配置；另附 **H5 前端**（聊天界面：SSE 流式、多模态附件、富媒体渲染——SVG 生成控件 / KaTeX 数学公式 / Mermaid 图表 / Canvas 沙箱程序块——与历史会话管理）与交互测试脚本。
 
 ---
 
@@ -9,8 +9,8 @@
 ```
 agent_tool_sse/
 ├── main.py                      # FastAPI 入口：init_path → 注册8个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 → uvicorn(48621)；当前未托管 H5 静态页面
-├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH
-├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载
+├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH；原生文档注入与文本入库上限常量（DEFAULT_NATIVE_DOC_MAX_BYTES/DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES/DEFAULT_NATIVE_DOC_MAX_ITEMS/DEFAULT_FILE_TEXT_MAX_CHARS）
+├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载；supportDocTypes 归一化为 support_doc_types（get_model_config / list_available_models 输出）
 ├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp，可选 fitz/docx/pandas）
 ├── .env                         # 一些全局配置
 ├── project_structure.md         # 本文档
@@ -30,29 +30,29 @@ agent_tool_sse/
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
 │   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）+ 保真批次策略（force_all 不做尾部保留、单批源吃满 0.9 窗口、压缩比恒定 12:1、批次诊断字段）+ 历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS，夹取到窗口派生上下限：<500k 时 8% 下限、≥500k 时 40k 下限、40% 上限；目标模式下摘要预算收紧为 min(预算, 目标×0.6) 并走"只保留核心内容"的精简提示词）
-│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体、read_document 按需读取上传文件解析文本（有上传文件时自动注入）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
+│   │   ├── builtin_tools.py     # 本地内置工具（check_tool_exists、todo_write 任务计划、ask_user 向用户提问、read_media 读取当前任务媒体、read_document 按需读取上传文件解析文本（有上传文件时自动注入；当前模型声明支持该类型时结果携带 native 块，由调用方原生注入后续请求，否则纯文本分页）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
 │   │   └── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
 │   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理；生成任务逃逸异常与 worker 崩溃均可见化（error SSE 帧 + JSONL 错误说明 + task_done 收尾）
 │   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则+回传长度/工具超时等可变配置实时说明
-│   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝、sub_agent 派发/并发/事件双写（JSONL+SSE）
-│   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）
+│   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝、sub_agent 派发/并发/事件双写（JSONL+SSE）；原生文档接线（任务开始按 supportDocTypes 批量注入、新用户消息到达回收占位、read_document 原生结果收集注入、工具结果剥离 base64）
+│   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）；文本类文件内核：TEXT_FILE_EXTENSIONS 白名单 / is_probably_binary 二进制嗅探 / decode_text_bytes 编码回退链（utf-8-sig→utf-8→gb18030→big5→latin-1）/ parse_text_file_bytes
 │   ├── xlsx_export.py           # 纯标准库 xlsx 生成器（zipfile+XML 手拼 OOXML：表头加粗/数字原生/错误占位样式）
 │   └── md_table_export.py       # md 表格文本解析（与前端同语义：行内代码/转义竖线不切断分列、行内标记清理、链接取 URL）
 │
 ├── memory/                      # 记忆持久化层
-│   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘 + 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
+│   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘（锚点行序维护：回答插入/编辑重发等非追加收尾时把锚定压缩行重排到轮次行之前）+ 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
 │   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）、引用快照前置（<quote_list> 模型视图/压缩源【引用原文】）
 │   ├── quote_format.py          # 选中文本引用：规整/限额校验（5 段/4000 字/12000 字）、XML 转义、<quote_list> 序列化、模型视图前置（前后端同口径）
-│   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（小文件内联/大文件节选+按需读取）与记录查找
+│   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（小文件内联/大文件节选+按需读取）与记录查找；原生文档内核（document_supports_native / build_native_document_part / select_native_document_records / load_native_document_model_part / retire_native_document_parts；预算键 NATIVE_DOC_*）
 │
 ├── routers/                     # API 路由层
 │   ├── chat_router.py           # 聊天主接口（含 quotes 请求校验）+ 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置；压缩失败重试 GET/POST /chat_config/compaction_retry
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
-│   ├── file_router.py           # 文档上传解析（原始字节另存为预览）/媒体上传（视频600MB流式）/Range 读取
+│   ├── file_router.py           # 文档上传解析（文本类扩展名+二进制嗅探、超限截断入库、原生文档标记）/媒体上传（视频600MB流式）/Range 读取
 │   ├── file_history_router.py   # 文件版本链与差异块操作接口（/file_diff/*）
 │   ├── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
 │   └── user_profile_router.py   # 访客用户显示名 GET/POST /user/profile（全局唯一，存项目 .env USER_NAME；账号/数据库体系落地前的过渡实现）
@@ -115,7 +115,7 @@ agent_tool_sse/
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
                                  #   test_context_compaction / test_chat_router / test_sub_agent /
-                                 #   test_quote_selection / test_user_profile_router / test_session_groups 等）
+                                 #   test_quote_selection / test_user_profile_router / test_session_groups / test_native_document_support 等）
 ```
 
 ---
@@ -169,10 +169,19 @@ agent_tool_sse/
 ### 2. 文件上传流程（`routers/file_router.py`）
 ```
 文档：/file/upload_session_files —— 读取文件（异步）→ 校验大小(≤10MB)/数量(≤10)
-  → 线程池并发解析文本 → FileMemoryManager 持久化（JSON，最多10个）
+  → 线程池并发解析文本：富文档走专用解析器（pdf/docx/doc/csv/xls/xlsx）；
+    常见文本类扩展名（TEXT_FILE_EXTENSIONS 约百余项）直接按文本解码；
+    未知扩展名先二进制嗅探（前 8KB 空字节/控制字符占比 >10% 拒绝）再解码
+  → 解析文本超过 FILE_TEXT_MAX_CHARS（默认 20 万字符）截断入库并标记
+    （截断文件在清单/read_document 结果中给出原文绝对路径，供 read_file 续读）
+  → FileMemoryManager 持久化（JSON，最多10个）
   → 原始字节另存 files/ 目录（stored_name，供点击预览/下载）→ 返回逐文件状态
+  → 命中会话生效模型 supportDocTypes 的文档标记 native_doc_supported：
+    按轮以原生文档部件随请求注入（每轮发送；出现新用户消息后转「[文档 名字]」
+    占位；原始文件始终保留，可用 read_document 原生重读或 read_file 续读）；
+    本地解析失败但模型支持该类型时仍接收（parse_failed 入库，纯原生口径）
 媒体：/file/upload_session_media —— 图片/音频/视频原始字节存 media/ 目录
-  （图片/音频 ≤20MB；视频 ≤500MB 流式落盘；ico/tif/tiff 自动转 PNG）
+  （图片/音频 ≤20MB；视频 ≤600MB 流式落盘；ico/tif/tiff 自动转 PNG）
   → 返回 media:// 引用，聊天消息 content 部件引用，发送上游前解析为 base64
   → **大图降采样**：>2MB 图片（GIF 除外）解析时改发 JPEG 缩略图（长边≤1568、
     质量85，缓存 thumbs/<原名>.thumb.jpg，按 mtime+size 指纹失效重建，失败回退原图）；
@@ -180,7 +189,7 @@ agent_tool_sse/
 读取：/file/get_session_media、/file/get_session_document 均支持 HTTP Range（206），
   音频/视频进度条即时拖动跳转；/file/get_session_document 供 PDF/文本预览与下载
 ```
-解析后的文本在下一轮聊天时注入系统提示词供模型使用；媒体以 `media://` 引用保存在历史中（JSONL 不膨胀）。上传目录名（按前端传入的 session_id 命名，可能与会话文件名不一致）会记录到会话 `_meta.upload_id`，删除会话时可连带清理。上传数据目录为 `history_files/session_files/`（由 `upload` 目录改名而来，字段名 upload_id 沿用不变）。
+解析后的文本在下一轮聊天时以**文件清单**注入系统提示词供模型使用；命中会话生效模型 supportDocTypes 的文档同时按轮以原生文档部件注入（供应商侧解析，文本解析并存兜底）。媒体以 `media://` 引用保存在历史中（JSONL 不膨胀）。上传目录名（按前端传入的 session_id 命名，可能与会话文件名不一致）会记录到会话 `_meta.upload_id`，删除会话时可连带清理。上传数据目录为 `history_files/session_files/`（由 `upload` 目录改名而来，字段名 upload_id 沿用不变）。
 
 ### 3. 模型/配置动态切换
 - **切换模型**：`POST /chat_config/models/select`（body: `provider/model/role/parameter`）→ 校验 models.json 存在该组合 → 写入 models.json 顶层 `model_selection.<role>`（四角色：chat/compaction/title/sub_agent）并同步内存，实时生效；不再写 .env。**会话级覆盖**：携带 `session_id` 时写入该会话 `_meta.model_selection.<role>`（仅覆盖该角色，`clear=true` 清除恢复跟随全局），生成/压缩/参数默认值填充按「会话覆盖 → 全局默认」逐角色解析——ambient 任务级上下文（ContextVar）实现，`create_task` 上下文隔离保证多会话互不影响；覆盖模型失效时发 `MODEL_SELECTION_FALLBACK` warning 并回退全局。`sub_agent_model` 未配置时子智能体继承聊天模型
@@ -239,7 +248,7 @@ agent_tool_sse/
   - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；`run_task` 属性按会话控制对话启停
   - 支持按行删除/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
   - **多会话分享/导入**：`export_sessions_to_zip` 打包（各会话 jsonl + `session_files/<upload_id>/` 数据 + manifest.json）；`list_zip_sessions` 预检（不落盘，返回会话清单与本地冲突标记）；`import_sessions_from_zip` 两阶段提交（冲突策略 ask/overwrite/rename/skip，逐会话决策，另存时上传目录归属随新会话 ID 改名并回写 `_meta.upload_id`），路由见 `/chat_history/export_zip|import_preview|import_package`
-- **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）
+- **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）。**原生文档内核**（`memory/file_memory.py`）：`document_supports_native`（扩展名命中 supportDocTypes）/ `build_native_document_part`（原始字节→OpenAI `file` 部件 data URL；单文件上限 NATIVE_DOC_MAX_BYTES）/ `select_native_document_records`（数量/单文件/总量三重预算、新文件优先）/ `load_native_document_model_part`（read_document 原生分支）/ `retire_native_document_parts`（历史部件→「[文档 名字]」文本占位，与视频一次性消费同构）；文本口径占位与清单标注（native 标记、截断提示、abs_path 续读提示）同步支持
   - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）；带引用快照的轮次在用户消息前置 `<quote_list>`（模型视图，JSONL 原始历史不含标签）
 - **引用快照（选中文本引用到提问，`docs/quote_selection_design.md`）**：
   - `quote_format.py`：规整（换行统一/去首尾空白/丢弃 UI 字段）、限额（5 段/单段 4000 字/合计 12000 字，strict=请求校验拒绝、容错=历史读取）、XML 转义与 `<quote_list>` 序列化；同一函数用于当前轮请求、历史轮次上下文与压缩源
@@ -260,6 +269,7 @@ agent_tool_sse/
 - 模型选择三件套：`list_available_models`（扁平列表给前端）/ `get_current_model_selection` / `select_chat_model`（写 models.json + 同步内存）；`model_selection` 未配置 chat_model 时回退 .env 的 CHAT_OWNERSHIP_NANE/CHAT_MODEL_NAME
 - `apply_role_parameter_defaults`：请求体未显式提供的生成参数按选中模型的 parameter 自动填充
 - `set_env_vars`：写回 .env 并保持内存 env_vars 一致（防 hot-reload 覆盖）
+- **supportDocTypes（原生文档能力）**：models.json 各模型可选字段 `supportDocTypes`（如 `[".pdf", ".docx"]`），`_normalize_support_doc_types` 归一化为小写含点扩展名列表（容错非法条目）；`get_model_config` / `list_available_models` 输出顶层 `support_doc_types`，供上传链路（原生标记/解析失败容错接收）与生成链路（按轮注入 / read_document 原生判定）使用
 
 ### 8. 系统 MCP 服务器（`mcp_server/sys_tools_server.py`）
 当前注册 2 个工具（read/write/edit/search 文件四件套与 run_command 已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`，list_items 已停用）：
@@ -287,7 +297,7 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 ### 9. H5 前端（`H5/`）
 - 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口
-- 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染
+- 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染；文档上传类型放宽——`core.js` 的 `DOC_EXTENSIONS` 与后端 `TEXT_FILE_EXTENSIONS` 对齐（约百余项文本/代码/配置扩展名，未知扩展名交后端二进制嗅探），命中当前模型 `supportDocTypes` 的文档按轮原生注入（供应商侧解析，文本解析并存兜底）
 - **语音输入**：Web Speech API（Chrome/Edge）——点麦克风连续听写，识别文本以录音时光标为插入点实时写入输入框（确认结果累积、中间结果实时预览），长静默自动重启会话，再点停止；发送/切会话自动收尾，剪贴板无关、仅依赖浏览器在线语音服务
 - **会话标题跑马灯**：溢出标题 hover 300ms 后向左匀速滚动（约 80px/s）至末尾文本对齐右缘，滚动期间移除右缘渐隐遮罩，移出即复位
 - **富媒体渲染**：模型输出的 ```svg（双视图：代码/图片 + 复制代码/复制图片）、```mermaid（懒加载 Mermaid.js 异步渲染，代码/图片双视图）、```canvas（**运行确认 + iframe 沙箱**：sandbox="allow-scripts" 隔离执行，postMessage 握手下发源码；沙箱包装 rAF/定时器统计待执行回调数——一次性绘制回传 canvas-done 快照，动画/游戏脚本进入"独活"模式保持运行态可交互（点击/键盘直接玩），console 逐行实时回传，截图随时索要当前帧，脚本自然收尾自动补发最终快照；⛶ 全屏作用于整个控件块，画布 object-fit:contain 等比缩放，全屏内按钮可用；```svg|mermaid|canvas 栅栏与媒体伪标签均独占一行不参与两列并排

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 自定义模块导入
 from memory.file_memory import (
+    document_supports_native,
     get_file_memory_manager,
     get_upload_dir_name,
     media_kind,
@@ -22,9 +23,10 @@ from memory.file_memory import (
 from memory.chat_memory import (
     get_chat_memory_manager,
     normalize_session_id,
+    resolve_session_model_selection,
     resolve_session_work_dir,
 )
-from factory.file_factory import extract_text_from_bytes
+from factory.file_factory import extract_text_from_bytes, get_text_extension
 from routers.raw_upload import read_upload, require_raw_upload, spool_upload
 
 # 创建 API 路由器实例
@@ -53,24 +55,35 @@ def _parse_single_file(file_info: dict) -> dict:
     """
     解析单个文件的辅助函数（在线程池中执行）
     Args:
-        file_info: 包含 filename, content_bytes 的字典
+        file_info: 包含 filename, content_bytes 的字典；可选 max_chars 截断上限
     Returns:
-        解析结果字典
+        解析结果字典（text_content 为截断后的入库文本，附带截断标记）
     """
     filename = file_info['filename']
     file_content = file_info['content_bytes']
+    max_chars = int(file_info.get('max_chars') or 0)
     try:
         # 获取文件扩展名和类型
         _, ext = os.path.splitext(filename.lower())
         file_type = ext.lstrip('.') if ext else "unknown"
-        # 解析文件内容
+        # 解析文件内容（已知文档类型走专用解析器；常见文本/未知类型按文本解码，
+        # 二进制内容在解析器内被拒绝并转为该文件的失败反馈）
         text_content = extract_text_from_bytes(filename, file_content)
+        total_chars = len(text_content)
+        truncated = False
+        if max_chars > 0 and total_chars > max_chars:
+            # 解析文本入库上限（防超大文件撑爆模型窗口）：截断入库并标记，
+            # 模型可用 read_document 分页读取，或按原文绝对路径用 read_file 续读
+            text_content = text_content[:max_chars]
+            truncated = True
         return {
             "filename": filename,
             "status": "success",
             "type": file_type,
             "content_length": len(text_content),
-            "text_content": text_content,  # 返回解析后的文本
+            "content_total_chars": total_chars,
+            "content_truncated": truncated,
+            "text_content": text_content,  # 返回解析后的文本（可能已截断）
             "size": len(file_content)
         }
     except Exception as parse_error:
@@ -79,6 +92,47 @@ def _parse_single_file(file_info: dict) -> dict:
             "status": "failed",
             "message": f"文件解析失败: {str(parse_error)}"
         }
+
+
+def _resolve_session_support_doc_types(session_id: str) -> list[str]:
+    """解析会话生效聊天模型的 supportDocTypes 声明（原生文档输入能力）。
+
+    口径与生成链路一致：会话级模型覆盖 → 全局默认（resolve_session_model_selection
+    返回的 effective_selection 即合并结果）；解析失败返回空列表（按不支持处理，
+    上传仍走文本解析口径，行为与历史版本一致）。
+    """
+    try:
+        from env_manager import get_model_config, get_global_model_selection
+
+        effective_selection, _warnings = resolve_session_model_selection(
+            normalize_session_id(session_id)
+        )
+        selection = effective_selection or get_global_model_selection()
+        chat_selection = (selection or {}).get("chat_model") or {}
+        provider = chat_selection.get("ownership_name")
+        model = chat_selection.get("model_name")
+        if not provider or not model:
+            return []
+        chat_config = get_model_config(str(provider), str(model))
+        if not isinstance(chat_config, dict):
+            return []
+        support = chat_config.get("support_doc_types")
+        return [str(item) for item in support] if isinstance(support, list) else []
+    except Exception as exc:
+        print(f"[WARN] 解析会话模型 supportDocTypes 失败（按不支持处理）: {exc}")
+        return []
+
+
+def _file_text_max_chars() -> int:
+    """解析文本入库上限（字符）：动态读取 .env，非法值回退默认。"""
+    from config import DEFAULT_FILE_TEXT_MAX_CHARS
+    from env_manager import load_var
+
+    try:
+        value = int(float(load_var("FILE_TEXT_MAX_CHARS", DEFAULT_FILE_TEXT_MAX_CHARS)))
+    except (TypeError, ValueError):
+        return DEFAULT_FILE_TEXT_MAX_CHARS
+    return max(0, value)
 
 
 @api_file_router.post("/upload_session_files")
@@ -102,7 +156,14 @@ async def upload_files(
     file_data_list = [{
         "filename": filename,
         "content_bytes": await read_upload(request, 10 * 1024 * 1024, "文件"),
+        # 解析文本入库上限：超限截断入库并标记（模型可 read_document 分页 /
+        # read_file 按原文绝对路径续读），防止超大文本撑爆模型窗口
+        "max_chars": _file_text_max_chars(),
     }]
+    # 会话生效模型的原生文档能力（supportDocTypes）：命中类型的文档原始文件
+    # 会在每轮请求中按原生文档注入（供应商侧视觉解析），文本解析仍并存作为
+    # 兜底（供应商拒绝 file 部件时可回退、read_document 也能返回文本）
+    session_support_doc_types = _resolve_session_support_doc_types(session_id)
     # 第二步：并发解析文件内容（CPU密集型操作）
     if file_data_list:
         # 提交所有文件到线程池进行并发解析
@@ -123,19 +184,35 @@ async def upload_files(
                         "filename": parse_result["filename"],
                         "type": parse_result["type"],
                         "content": parse_result["text_content"],  # 只保存文本内容
-                        "size": parse_result["size"]
+                        "size": parse_result["size"],
+                        "content_truncated": bool(parse_result.get("content_truncated")),
+                        "content_total_chars": parse_result.get("content_total_chars"),
                     }
                     # 同时保存原始字节（history_files/session_files/<session>/files/），
                     # 供前端点击预览 PDF/文本/下载原文件；保存失败只告警不影响解析结果
                     stored_name = None
+                    abs_path = None
                     try:
                         doc_saved = save_session_document(
                             session_id, parse_result["filename"], file_data["content_bytes"]
                         )
                         stored_name = doc_saved["stored_name"]
                         file_info["stored_name"] = stored_name
+                        doc_path = resolve_document_path(session_id, stored_name)
+                        if doc_path is not None:
+                            abs_path = str(doc_path).replace("\\", "/")
+                            file_info["abs_path"] = abs_path
                     except Exception as save_error:
                         print(f"[WARN] 保存文档原始字节失败（不影响解析文本）: {save_error}")
+                    # 原生文档标记：当前模型声明支持该类型且原始文件已保存时，
+                    # 该文件将按轮作为原生文档注入（文本解析结果作为兜底口径）
+                    native_supported = bool(
+                        stored_name
+                        and document_supports_native(
+                            parse_result["filename"], session_support_doc_types
+                        )
+                    )
+                    file_info["native_doc_supported"] = native_supported
                     # 添加到 file_memory（使用session_id隔离）
                     add_result = session_file_memory.add_file_memory(file_info, max_items=10)
                     results.append({
@@ -144,7 +221,65 @@ async def upload_files(
                         "message": add_result,
                         "type": parse_result["type"],
                         "content_length": parse_result["content_length"],
+                        "content_truncated": bool(parse_result.get("content_truncated")),
+                        "content_total_chars": parse_result.get("content_total_chars"),
                         "stored_name": stored_name,
+                        "abs_path": abs_path,
+                        "native_doc_supported": native_supported,
+                    })
+                    success_count += 1
+                elif document_supports_native(
+                    str(parse_result.get("filename") or file_data["filename"]),
+                    session_support_doc_types,
+                ):
+                    # 本地解析失败但当前模型原生支持该类型：仍然接收——保存原始
+                    # 文件并入库记录（content 为空 + parse_failed 标记），该文件
+                    # 会按轮作为原生文档发送（供应商侧解析），不因本地解析器缺失
+                    # （如未装 PyMuPDF / python-docx）而阻断上传
+                    filename = str(parse_result.get("filename") or file_data["filename"])
+                    _, ext = os.path.splitext(filename.lower())
+                    stored_name = None
+                    abs_path = None
+                    try:
+                        doc_saved = save_session_document(
+                            session_id, filename, file_data["content_bytes"]
+                        )
+                        stored_name = doc_saved["stored_name"]
+                        doc_path = resolve_document_path(session_id, stored_name)
+                        if doc_path is not None:
+                            abs_path = str(doc_path).replace("\\", "/")
+                    except Exception as save_error:
+                        print(f"[WARN] 保存文档原始字节失败: {save_error}")
+                    if not stored_name:
+                        results.append(parse_result)
+                        failed_count += 1
+                        continue
+                    file_info = {
+                        "filename": filename,
+                        "type": ext.lstrip(".") if ext else "unknown",
+                        "content": "",
+                        "size": len(file_data["content_bytes"]),
+                        "stored_name": stored_name,
+                        "abs_path": abs_path,
+                        "parse_failed": True,
+                        "parse_error": str(parse_result.get("message") or ""),
+                        "native_doc_supported": True,
+                    }
+                    add_result = session_file_memory.add_file_memory(file_info, max_items=10)
+                    results.append({
+                        "filename": filename,
+                        "status": "success",
+                        "message": (
+                            f"{add_result}；本地文本解析失败（"
+                            f"{parse_result.get('message')}），已按原生文档方式提供"
+                            "（模型支持该类型，随请求发送原始文件）"
+                        ),
+                        "type": file_info["type"],
+                        "content_length": 0,
+                        "stored_name": stored_name,
+                        "abs_path": abs_path,
+                        "native_doc_supported": True,
+                        "parse_failed": True,
                     })
                     success_count += 1
                 else:

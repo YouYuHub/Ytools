@@ -9,6 +9,7 @@
   const {
     state, el, toast, $,
     composerAttachments, composer, input, MAX_PENDING_MEDIA,
+    syncComposerAttachmentBlocks,
     MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS, mediaPreviewModal, mediaPreviewBody,
     mediaPreviewTitle
   } = App;
@@ -252,13 +253,26 @@
       composerAttachments.innerHTML = "";
       composerAttachments.classList.add("hidden");
       composer.classList.remove("has-media");
+      if (syncComposerAttachmentBlocks) syncComposerAttachmentBlocks();
       App.refreshComposerButtons();
       return;
     }
     composerAttachments.classList.remove("hidden");
-    // 附件行占满输入行上方（.has-media 走 flex 换行），输入框区域随之变高
+    // 引用、媒体和文档共享同一块区域；该区域整体位于输入行上方
     composer.classList.add("has-media");
     composerAttachments.innerHTML = "";
+
+    function appendDocumentMark(chip, filename) {
+      const icon = el("span", "doc-chip-symbol");
+      icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>';
+      chip.appendChild(icon);
+      const name = String(filename || "");
+      const dot = name.lastIndexOf(".");
+      const extension = dot >= 0 && dot < name.length - 1 ? name.slice(dot + 1, dot + 5).toUpperCase() : "FILE";
+      chip.appendChild(el("span", "doc-chip-ext", extension));
+      chip.title = name || "文件";
+      chip.setAttribute("aria-label", name || "文件");
+    }
     function addProgress(chip, item) {
       if (!item.phase || item.phase === "done") return;
       const percent = Math.max(0, Math.min(100, Number(item.percent) || 0));
@@ -269,10 +283,12 @@
       overlay.setAttribute("aria-label", (item.name || item.filename || "附件") + " " + label);
       overlay.appendChild(el("span", "attachment-progress-label", label));
       chip.appendChild(overlay);
-      chip.title = (item.name || item.filename || "附件") + "：" + label;
+      chip.title = (item.name || item.filename || chip.title || "附件") + "：" + label;
     }
     state.pendingMedia.forEach(function (item) {
       const chip = el("div", "media-chip");
+      chip.title = item.name || "媒体文件";
+      chip.setAttribute("aria-label", item.name || "媒体文件");
       if (item.kind === "image" && item.dataUrl) {
         const thumb = el("img", "media-thumb", "");
         thumb.src = item.dataUrl;
@@ -286,7 +302,7 @@
       } else {
         // 音频/视频无预览帧：显示类别占位，点击在预览框中播放/收听
         const placeholder = el("div", "media-thumb media-thumb-placeholder",
-          item.kind === "audio" ? "🎵 音频" : "🎬 视频");
+          item.kind === "audio" ? "音频" : "视频");
         placeholder.title = "点击预览";
         placeholder.classList.add("clickable");
         placeholder.addEventListener("click", function () {
@@ -312,16 +328,15 @@
     });
     visibleDocs.forEach(function (item) {
       const chip = el("div", "doc-chip doc-chip-pending");
-      chip.appendChild(el("span", "doc-chip-symbol", "▤"));
-      chip.appendChild(el("span", "doc-chip-name", item.filename));
+      appendDocumentMark(chip, item.filename);
       addProgress(chip, item);
       composerAttachments.appendChild(chip);
     });
     state.sessionDocs.forEach(function (doc) {
       const chip = el("div", "doc-chip");
-      chip.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>';
-      chip.appendChild(el("span", "doc-chip-name", doc.filename || "未命名"));
-      chip.title = "已解析文档：内容以清单形式注入对话上下文（大文件可按需读取）；点击预览";
+      appendDocumentMark(chip, doc.filename || "未命名");
+      chip.title = "已解析文档：" + (doc.filename || "未命名")
+        + "；内容以清单形式注入对话上下文（大文件可按需读取）；点击预览";
       chip.classList.add("clickable");
       chip.addEventListener("click", function () {
         openMediaPreviewForDocument(doc);
@@ -342,6 +357,7 @@
       chip.appendChild(del);
       composerAttachments.appendChild(chip);
     });
+    if (syncComposerAttachmentBlocks) syncComposerAttachmentBlocks();
     App.refreshComposerButtons();
   }
 

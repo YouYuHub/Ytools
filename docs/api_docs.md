@@ -261,7 +261,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /chat_config/work_dir | POST | Body `{session_id, work_dir}` | `{state, message, session_id, session_dir, effective_dir, warning, updated_at}`；设置/清除会话独立工作目录（写会话 `_meta.work_dir`）。`work_dir` 非空时校验目录存在（不存在 400）；空串/None 清除覆盖恢复跟随默认。对正在运行的任务不生效，下一轮生成任务开始时生效 |
 | /chat_config/history_compaction | GET | `session_id`（可选） | `{trigger_ratio, summary_budget_ratio, summary_total_budget, target_tokens, target_limits{min, max, window}, effective_summary_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
 | /chat_config/history_compaction | POST | Body 见下方完整策略；Query `session_id`（可选） | `{state, updated, config, memory_state}`；返回的 `config.effective_threshold` 同样支持会话口径 |
-| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present}`；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`，响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示） |
+| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present, support_doc_types}`；`support_doc_types` 为 supportDocTypes 归一化声明（原生文档输入扩展名列表，如 `[".pdf", ".docx"]`，未声明为 `[]`）；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`，响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示） |
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
@@ -369,7 +369,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 **发送前预检**（`ChatLLM._precheck_hard_limit`，流式/非流式全部路径，每次尝试都执行）：
 
-- 估算口径与项目统一 token 估算一致（ASCII//4 + 非 ASCII 逐字），多模态部件（image_url/input_audio）按固定占位（1024 tokens）计费，避免 base64 字符数虚高；
+- 估算口径与项目统一 token 估算一致（ASCII//4 + 非 ASCII 逐字），多模态部件（image_url/input_audio）按固定占位（1024 tokens）计费，避免 base64 字符数虚高（上下文统计侧对原生文档 file 部件同样按占位计费）；
 - `估算输入 + max_tokens ≤ 硬限制` → 通过，正常发送；
 - 输入在限额内但 `+ max_tokens` 超限 → **自动降级 max_tokens**（保留安全余量 512、最低输出预算 1024）并打印 `[WARN]`，请求照常发送；
 - 输入本身超限（降到底也无法发送）→ 直接推送 `error_type=hard_limit`、`retrying=false` 错误帧并结束，**不再进入网络重试**（0.4 秒内失败，替代旧行为约 20 分钟卡死）；
@@ -582,6 +582,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **推送与落盘字段完全一致**（`timestamp` 由落盘方补充），前端加载历史与实时显示共用同一解析逻辑；
 - **先推 SSE 后落盘**：实时显示优先，落盘失败不阻塞推送；
 - 事件行不参与 `usage`/`user_questions`/`chat_round` 统计；
+- **行序契约（锚点行先于其锚定轮次行）**：任务进行中触发的跨轮压缩事件行携带轮内锚点 `display_round`（1-based 轮次号）/ `display_event_index`（压缩发生时该轮已写入的事件数），历史回放据此把压缩块插回触发它的轮次内部的事件位置。契约要求锚定压缩行位于其锚定轮次 `chat_round` 行**之前**——正常追加收尾天然满足（压缩行先独立落盘、轮次行收尾时追加在其后）；「回答插入（ask_user 再答）」与「编辑重发（原地重跑）」两条**非追加**收尾路径由后端写入时把锚定到目标轮次的压缩行重排到轮次行之前（`memory/chat_memory.py` 的 `_relocate_anchored_compaction_rows`，覆盖 add_chat_history 的替换/插入分支与 stop_current_round 的中断收尾）。前端解析器（`H5/js/history_parser.js`）同样不依赖物理顺序：按 `display_round` 预扫描收集锚点行、解析到锚定轮次时按 `display_event_index` 归位合并（兼容旧版后端产生的反序文件，避免压缩块被兜底显示到会话末尾）；锚定轮次不存在（已删除/尚未收尾）时锚点行保留在可见历史末尾兜底展示。
 - 触发门槛：单轮压缩需"全量上下文超 `min(聊天窗口, 压缩模型窗口) × trigger_ratio` **且** 本轮轨迹 > 阈值一半"（防空转，避免历史主导时空转消耗压缩调用）；触发后会先压缩此前可压缩的多轮历史，再处理当前轮轨迹。
 - **任务内预算管理**：长任务进行中，每批工具结果写入后若全量上下文超过统一压缩阈值，会**立即执行跨轮压缩并重建内存历史**——超出动态历史预算的老轮次压成累计摘要（预算 = 阈值 − 系统提示 − 工具定义 − 当前轮轨迹 − 摘要总预算 − 问题索引 − 余量；预算内的最近轮次保留原始对话），随后内存消息重建为"累计摘要 system（含运行时提示） + 全历史最近问题 + 当前任务轮"；当前任务轮的轨迹仍由单轮压缩管理。**若配置了历史压缩目标 `HISTORY_COMPACT_TARGET_TOKENS`，历史预算改为 `min(动态可用空间, 目标)`**，把历史整体压到目标以内以降低后续单次输入成本。
 - 首调用预算检查：请求开始时若"历史+文件记忆+当前请求+工具定义"估算超过当前聊天模型窗口，文件记忆先降级为 3000 字符摘要并推送 `warning`（`CONTEXT_BUDGET_FILE_DOWNGRADED`）；仍超窗（典型场景：切换到更小窗口的模型）进入**历史降级链**：
@@ -609,14 +610,17 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 ### POST /file/upload_session_files
 上传单个文件并解析文本（单文件 ≤10MB），结果写入文件记忆；前端选择多个文件时逐个请求（最多 10 个）。
+**支持类型**：富文档 pdf/docx/doc/csv/xls/xlsx 走专用解析器；常见文本类扩展名（代码/配置/日志/数据等约百余项，`factory/file_factory.TEXT_FILE_EXTENSIONS`）直接按文本解码入库；未知扩展名先二进制嗅探（前 8KB 含空字节或控制字符占比 >10% 判为二进制拒绝，通过则按文本解码）。文本解码回退链 `utf-8-sig → utf-8 → gb18030 → big5 → latin-1`（GBK 等中文编码文件不再乱码）。
 - Body: 单个文件的原始字节，`Content-Type: application/octet-stream`；Query: `filename`(必填)、`session_id`
-- 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status(success/failed), message?, type?, content_length?}`
+- 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status(success/failed), message?, type?, content_length?, content_truncated?, content_total_chars?, stored_name?, abs_path?, native_doc_supported?, parse_failed?}`
+- **文本入库截断**：解析文本超过 `FILE_TEXT_MAX_CHARS`（.env，默认 200000 字符）时截断入库并标记 `content_truncated=true`（`content_total_chars` 为截断前总长）；清单与 `read_document` 返回中给出原文绝对路径 `abs_path`，模型可用内置 `read_file` 按路径续读剩余内容。
+- **原生文档容错**：会话生效模型声明支持该类型（`supportDocTypes`）但本地解析器缺失/解析失败时，上传仍成功——保存原始文件并入库 `parse_failed=true`（`content` 为空），靠原生文档注入提供内容（不因未装 PyMuPDF/python-docx 而阻断上传）。
 - 上传文件保存为 `history_files/session_files/<session_id>/<文件名>.json`（目录按前端传入的 `session_id` 命名，仅存解析出的文本内容）；
   同时把**原始文件字节**另存到 `history_files/session_files/<session_id>/files/<名>_<随机>.<ext>`（供 `GET /file/get_session_document` 点击预览/下载），
   `results[]` 与 file_memory 记录均携带 `stored_name`（保存失败时为 null，不影响解析结果）；
   上传成功后会把该目录名写入对应聊天会话 jsonl 的 `_meta.upload_id`（会话文件不存在时自动创建），
   供 `/chat_history/delete_file` 连带清理；`upload_id` 为实际记录的目录名（记录失败时为 null，不影响上传结果）。
-- **解析内容注入方式（清单 + 按需读取）**：解析文本不再全量拼接进系统提示——由后端构建「文件清单」注入（小文件内联全文 / 大文件节选开头 + `read_document` 读取提示，总预算 16000 字符），模型需要细节时调用内置工具 `read_document` 按字符区间分页读取（详见下文「内置 read_document 工具」）；清单块计入 `token_stats.file_memory_tokens`。
+- **解析内容注入方式（清单 + 按需读取）**：解析文本不再全量拼接进系统提示——由后端构建「文件清单」注入（小文件内联全文 / 大文件节选开头 + `read_document` 读取提示，总预算 16000 字符），模型需要细节时调用内置工具 `read_document` 按字符区间分页读取（详见下文「内置 read_document 工具」）；清单块计入 `token_stats.file_memory_tokens`。命中当前模型 `supportDocTypes` 的文档条目另标注「原生文档」（并按轮注入，见下文「原生文档注入」）；截断入库的文件在清单中给出原文绝对路径，供模型 `read_file` 续读剩余内容。
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
@@ -634,7 +638,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   后端发送上游前把 `media://` 引用解析为 OpenAI 兼容格式：URL 类部件 → `data:<mime>;base64,<b64>`，`input_audio.data` → 纯 base64；`https://` 与已内联 `data:`/base64 原样透传（url 与 base64 双格式兼容）。
   **大图自动降采样**：超过 2MB 的图片（GIF 除外，无论动静）在解析时改发 JPEG 缩略图——长边 ≤1568px、质量 85，缓存到 `<session>/thumbs/<原名>.thumb.jpg`（按原文件 mtime+size 指纹失效重建）；生成失败回退原图。原图仍完整落盘，预览/下载不受影响。前端在**发送前**也做同等压缩（canvas 重采样，压缩无收益保留原文件），双保险进一步降低上传体积与视觉 token 计费。
   **视觉 API 拒绝格式的自动转换（发送上游前，不动落盘原图）**：静图 gif 与 bmp/ico/tif/tiff 统一转 PNG；**动图 gif 转 H.264 MP4**（Pillow `is_animated/n_frames` 判动静动，动图经 ffmpeg fps=10 + minterpolate 补帧 30fps + libx264 编码为 mp4，部件类型随之变为 `video_url`；ffmpeg 定位三级回退：系统 PATH → `imageio-ffmpeg` 包内置静态二进制 → 均缺失时按静图回退链路兜底）；转换缓存到 `<session>/media_transcode/<原名>.conv.<png|mp4>`（同款 mtime+size 指纹失效）。原生格式（png/jpg/jpeg/webp）不变。
-- 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位。
+- 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位，原生文档部件以 `[文档 名字]` 占位（出现新用户消息后自动转换）。
 
 ### GET /file/get_session_media
 读取会话内已上传的媒体文件原始字节（消息气泡缩略图、音视频播放等用途）。
@@ -656,9 +660,20 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **read_document 工具**（会话存在上传文件且本轮携带工具时**后端自动注入**，不开放手选，与 `check_tool_exists` 同类）：模型需要文件其余内容时按文件名调用：
   - `filename`（必填）：上传文件的原始文件名（清单中展示的名字）；
   - `start_char` / `max_chars`：可选，字符区间分页读取（默认 0 / 8000，单次上限 20000）；
-  - 返回 `{filename, type, total_chars, start_char, end_char, content, has_more, next_start_char?}`，`has_more=true` 时用 `next_start_char` 续读；文件不存在时返回可用文件名列表提示；
+  - 返回 `{filename, type, total_chars, start_char, end_char, content, has_more, next_start_char?, native?, message}`，`has_more=true` 时用 `next_start_char` 续读；文件不存在时返回可用文件名列表提示；
+  - **原生文档分支**：当前模型声明支持该文件类型（supportDocTypes）且原始文件可用时，结果额外携带 `native` 块（`{part, filename, stored_name, mime, size, abs_path}`）——调用方把原始文件按原生文档注入后续请求（供应商侧解析），解析文本节选仍一并返回作兜底/速读；未命中或原始文件缺失时省略 `native`，纯文本分页口径与历史行为一致。`native` 块在工具结果返回模型/前端前被剥离为可读说明（base64 不进入工具结果文本）；
 - **首调用超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
 - **token 统计**：`GET /chat_context/token_stats` 新增 `file_memory_tokens` 字段（清单块估算 token），并计入 `request_context_tokens`。
+
+### 原生文档注入（模型 supportDocTypes 声明的文件输入）
+
+会话生效聊天模型在 models.json 声明 `supportDocTypes`（如 `[".pdf", ".docx"]`；`GET /chat_config/models` 的 `support_doc_types` 为归一化结果）时，命中类型的上传文档按轮以**原生文档部件**随请求发送（供应商侧原生解析，与图片/视频同语义）：
+
+- **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端适配层可转换其它协议；当前聊天客户端仅支持 `chat-completions` 协议，其余协议走文本解析口径）；
+- **发送节奏**：本任务内每轮发送；出现新的用户消息后转「[文档 名字]」文本占位（与视频一次性消费同构）——原始文件始终保留在 `history_files/session_files/<session>/files/`，模型可用 `read_document` 原生重读或 `read_file` 读文本；
+- **规模预算**（.env 可配、动态热生效）：单文件 `NATIVE_DOC_MAX_BYTES`（默认 20MB）、单轮总量 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）、单轮数量 `NATIVE_DOC_MAX_ITEMS`（默认 3）；超预算的文档降级为文本口径；
+- **文本解析并存**：上传时无论是否原生支持都照常解析存文本（供应商拒绝 file 部件时可回退、`read_document` 也能返回文本）；本地解析器缺失/失败但模型支持该类型时上传仍成功（`parse_failed` 记录，纯原生口径）；
+- **注入与落盘**：原生文档数据仅进内存请求消息（`_internal` 标记，不落盘 JSONL，避免 base64 膨胀历史）；token 统计按多模态部件固定占位口径计费；父循环与子智能体共用同一内核（`memory/file_memory.py` 原生文档函数族）。
 
 ### 内置 read_media 工具（factory/agent_runtime/builtin_tools.py）
 模型可调用的媒体读取内置工具（「配置工具」→「内置工具」分组勾选 `read_media`），

@@ -31,9 +31,12 @@ from memory.chat_memory import (
     normalize_session_id,
 )
 from memory.file_memory import (
+    build_native_document_part,
     cleanup_file_memory_manager,
     get_file_memory_manager,
     resolve_message_media_refs,
+    retire_native_document_parts,
+    select_native_document_records,
 )
 from memory.chat_history_format import content_part_to_text
 from memory.chat_history_format import RECENT_QUESTIONS_TOKEN_BUDGET
@@ -180,6 +183,15 @@ def _format_tool_result(result: Any) -> str:
             k: v for k, v in result.items()
             if k not in ("_file_diff", "_file_history")
         }
+        # 原生文档块（read_document 返回）：数据本体为 base64，绝不能进入
+        # 模型文本上下文或 JSONL；只保留可读的注入说明
+        native_block = result.pop("native", None)
+        if isinstance(native_block, dict):
+            filename = str(native_block.get("filename") or "")
+            result["native_document"] = (
+                f"{filename} 已作为原生文档注入后续请求" if filename
+                else "原生文档已注入后续请求"
+            )
     if isinstance(result, str):
         return result
     try:
@@ -892,8 +904,17 @@ async def _run_chat_generation(
     chat_config_effective = require_default_chat_config()
     if isinstance(chat_config_effective, dict):
         vision_enabled = bool(chat_config_effective.get("vision", False))
+        # 原生文档输入能力（models.json 模型条目的 supportDocTypes）：命中类型的
+        # 上传文档按轮作为原生文档注入（供应商侧视觉解析），未命中的走文本解析
+        raw_support_doc_types = chat_config_effective.get("support_doc_types")
+        native_doc_types = (
+            [str(item) for item in raw_support_doc_types]
+            if isinstance(raw_support_doc_types, list)
+            else []
+        )
     else:
         vision_enabled = True
+        native_doc_types = []
     if not vision_enabled:
         vision_warning_event = {
             "warning": {
@@ -1328,6 +1349,7 @@ async def _run_chat_generation(
             try:
                 file_manifest_suffix = session_file_memory.get_file_memory_manifest(
                     read_document_available=read_document_requested,
+                    native_doc_types=native_doc_types,
                 )
             except Exception as manifest_error:
                 print(f"[WARN] 文件清单构建失败（跳过文件注入）: {manifest_error}")
@@ -1335,6 +1357,44 @@ async def _run_chat_generation(
             if file_manifest_suffix:
                 active_file_block = file_manifest_suffix
                 messages[0]["content"] += file_manifest_suffix
+        # 原生文档注入（模型 supportDocTypes 声明的文件输入，与图片/视频同语义）：
+        # 命中的上传文档在本任务内**每轮**随请求发送（模型始终能看到文档原文，
+        # 供应商侧按原生视觉解析）；任务中出现新的用户消息（消息引导）时转文本
+        # 占位（retire_native_document_parts），模型可再用 read_document 原生重读；
+        # 原始文件始终保留在会话目录，也可用 read_file 按绝对路径读取文本。
+        # 数据仅在内存消息中（不落盘历史，避免 JSONL 膨胀），规模受
+        # NATIVE_DOC_* 配置约束（超预算的文档自动降级为文本口径）。
+        if native_doc_types and uploaded_file_count > 0:
+            try:
+                native_records, native_skipped = select_native_document_records(
+                    session_file_memory.get_file_memory_all(), native_doc_types
+                )
+                native_parts: list[Any] = []
+                for native_record in native_records:
+                    built = build_native_document_part(session_id, native_record)
+                    if built.get("part") is not None:
+                        native_parts.append(built["part"])
+                    elif built.get("error"):
+                        native_skipped.append(str(built["error"]))
+                if native_parts:
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "以下是你可用的用户上传文档（原生文档，"
+                                    "已随本次请求发送，可直接阅读原文）："
+                                ),
+                            },
+                            *native_parts,
+                        ],
+                        "_internal": True,
+                    })
+                if native_skipped:
+                    print(f"[INFO] 原生文档注入跳过（按文本口径）: {native_skipped[:3]}")
+            except Exception as native_error:
+                print(f"[WARN] 原生文档注入失败（按文本口径继续）: {native_error}")
         # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
         # 终态（全部 done）文案必须「新任务感知」：该后缀每轮新任务都会随系统
         # 提示注入，写"请汇总执行结果/无需再调用"是收官时对上一轮说的话，
@@ -1540,6 +1600,10 @@ async def _run_chat_generation(
             injected_message = pop_injected() if callable(pop_injected) else None
             if not (isinstance(injected_message, dict) and injected_message.get("content")):
                 return False
+            # 新的用户消息到达：此前按轮注入的原生文档数据转文本占位
+            # （「[文档 名字]」，与视频一次性消费同语义）——原始文件仍在会话
+            # 目录，模型可用 read_document 原生重读或 read_file 读文本
+            retire_native_document_parts(messages)
             inject_text = content_part_to_text(injected_message.get("content")).strip()
             messages.append({
                 "role": "user",
@@ -2169,6 +2233,10 @@ async def _run_chat_generation(
             # 读取的坐标含区间，注入时现场按坐标加载 base64 部件
             read_media_injected_refs: set[str] = set()
             read_media_pending_parts: list[tuple[str, Any]] = []
+            # read_document 原生分支待注入部件：当前模型声明支持该文档类型时，
+            # 工具结果携带原生文档部件（base64），在下方统一作为 user 消息注入
+            # 后续请求（仅内存、不落盘；与 read_media 同语义）
+            native_doc_pending_parts: list[Any] = []
             # 同轮并发守卫：供应商单请求最多稳定注入 1 次媒体数据（实证：同一
             # 模型回复并发 2 个 read_media 调用时，多个媒体部件同批注入触发
             # 供应商 400）。本轮解析出的 read_media 调用数 >1 时只执行第 1 个，
@@ -2296,10 +2364,17 @@ async def _run_chat_generation(
                     })
                     continue
                 if tn == READ_DOCUMENT_NAME:
-                    # 读取用户上传文件的解析文本（按字符区间分页）；系统提示词
-                    # 只注入清单，其余内容由模型按需读取（工具在有上传文件时
-                    # 由后端自动注入，见上方 read_document_requested）
-                    read_document_result = execute_read_document(ta, session_id)
+                    # 读取用户上传文件：模型声明支持该类型（supportDocTypes）时
+                    # 优先返回原生文档部件（注入后续请求，供应商侧视觉解析），
+                    # 同时附解析文本节选兜底；未命中则纯文本分页口径。
+                    # 系统提示词只注入清单，其余内容由模型按需读取（工具在有
+                    # 上传文件时由后端自动注入，见上方 read_document_requested）
+                    read_document_result = execute_read_document(
+                        ta, session_id, support_doc_types=native_doc_types
+                    )
+                    native_block = read_document_result.get("native") if isinstance(read_document_result, dict) else None
+                    if isinstance(native_block, dict) and native_block.get("part") is not None:
+                        native_doc_pending_parts.append(native_block["part"])
                     builtin_results.append({
                         "index": idx,
                         "tool_call": tc,
@@ -2614,6 +2689,27 @@ async def _run_chat_generation(
                     }
                     messages.append(media_message)
                     read_media_pending_parts = []
+                # read_document 原生文档注入：模型声明支持该类型时，工具返回的
+                # 原生文档部件在此作为 user 消息追加进 messages（仅内存、不落盘，
+                # 文本口径已有解析文本节选兜底）。注入前先回收上一批原生文档数据
+                # （转文本占位），保证同一文档只保留一份数据、避免多批叠加撑爆窗口
+                if native_doc_pending_parts and not oversized_abort:
+                    retire_native_document_parts(messages)
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "以下是你刚才调用 read_document 读取的文档内容"
+                                    "（原生文档，按文件名顺序排列）："
+                                ),
+                            },
+                            *native_doc_pending_parts,
+                        ],
+                        "_internal": True,
+                    })
+                    native_doc_pending_parts = []
                 # 任务内上下文预算管理：全量上下文达到单轮阈值（窗口×比例）时，
                 # 压缩持久层历史（老轮次→摘要块+最近问题）并重建内存历史部分。
                 # 此前历史只在请求开始/收尾时压缩，长任务中会一路膨胀到窗口上限。

@@ -154,6 +154,127 @@ test("parseHistory: context_compaction 事件行解析为 compaction 记录", fu
   assert.equal(parsed.records[1].usage.compressed_rounds, 2);
 });
 
+test("parseHistory: 手动压缩独立 JSONL 行保留在旧历史与后续轮次之间", function () {
+  const firstRound = JSON.stringify({
+    event: "chat_round",
+    started_at: "2026-08-08 18:00:00",
+    ended_at: "2026-08-08 18:00:10",
+    events: [
+      { timestamp: "2026-08-08 18:00:00", role: "user", content: "旧问题" },
+      { timestamp: "2026-08-08 18:00:05", role: "assistant", content: "旧回答" },
+    ],
+  });
+  const start = {
+    event: "context_compaction", scope: "session", phase: "start",
+    timestamp: "2026-08-08 18:00:11", context_summary: "待压缩旧历史",
+  };
+  const done = {
+    event: "context_compaction", scope: "session", phase: "done",
+    timestamp: "2026-08-08 18:00:12", summary_text: "旧历史摘要",
+  };
+  const nextRound = JSON.stringify({
+    event: "chat_round",
+    started_at: "2026-08-08 18:00:20",
+    ended_at: "2026-08-08 18:00:30",
+    events: [
+      { timestamp: "2026-08-08 18:00:20", role: "user", content: "后续问题" },
+      { timestamp: "2026-08-08 18:00:25", role: "assistant", content: "后续回答" },
+    ],
+  });
+
+  const parsed = historyParser.parseHistory([
+    firstRound, JSON.stringify(start), JSON.stringify(done), nextRound,
+  ].join("\n"));
+  assert.deepEqual(parsed.records.map(function (r) {
+    return r.kind === "compaction" ? r.phase : r.content;
+  }), ["旧问题", "旧回答", "start", "done", "后续问题", "后续回答"]);
+  assert.equal(parsed.records[2].ts, start.timestamp);
+  assert.equal(parsed.records[3].summary_text, "旧历史摘要");
+});
+
+test("parseHistory: 带轮内锚点的跨轮压缩插回准确事件位置", function () {
+  const start = {
+    event: "context_compaction", scope: "session", phase: "start",
+    display_round: 1, display_event_index: 3,
+    timestamp: "2026-08-08 18:00:03", context_summary: "压缩前轨迹",
+  };
+  const done = {
+    event: "context_compaction", scope: "session", phase: "done",
+    display_round: 1, display_event_index: 3,
+    timestamp: "2026-08-08 18:00:04", summary_text: "压缩后摘要",
+  };
+  const round = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "问题" },
+    { timestamp: "2026-08-08 18:00:01", role: "assistant", tool_calls: [{ function: { name: "read_file", arguments: "{}" } }] },
+    { timestamp: "2026-08-08 18:00:02", role: "tool", tool_name: "read_file", result: "文件内容" },
+    { timestamp: "2026-08-08 18:00:05", role: "assistant", content: "继续回答" },
+  ]);
+
+  const parsed = historyParser.parseHistory([
+    JSON.stringify(start), JSON.stringify(done), round,
+  ].join("\n"));
+  assert.deepEqual(parsed.records.map(function (r) {
+    return r.kind === "compaction" ? r.phase : r.kind;
+  }), ["user", "tool", "toolResult", "start", "done", "assistant"]);
+  assert.equal(parsed.records[3].round, 1);
+  assert.equal(parsed.records[3].ts, start.timestamp);
+  assert.equal(parsed.records[4].summary_text, "压缩后摘要");
+});
+
+test("parseHistory: 锚点行位于轮次行之后（旧版后端反序文件）仍归位到轮内位置", function () {
+  // 旧版后端"回答插入/编辑重发"收尾会让锚定的跨轮压缩行滞留在轮次行之后；
+  // 解析器不依赖物理顺序，按 display_round 锚点归位（压缩块不再兜底到会话末尾）
+  const start = {
+    event: "context_compaction", scope: "session", phase: "start",
+    display_round: 1, display_event_index: 3,
+    timestamp: "2026-08-08 18:00:03", context_summary: "压缩前轨迹",
+  };
+  const done = {
+    event: "context_compaction", scope: "session", phase: "done",
+    display_round: 1, display_event_index: 3,
+    timestamp: "2026-08-08 18:00:04", summary_text: "压缩后摘要",
+  };
+  const round = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "问题" },
+    { timestamp: "2026-08-08 18:00:01", role: "assistant", tool_calls: [{ function: { name: "read_file", arguments: "{}" } }] },
+    { timestamp: "2026-08-08 18:00:02", role: "tool", tool_name: "read_file", result: "文件内容" },
+    { timestamp: "2026-08-08 18:00:05", role: "assistant", content: "继续回答" },
+  ]);
+
+  // 反序：轮次行在前，压缩行在其后（模拟旧版后端收尾产物）
+  const parsed = historyParser.parseHistory(
+    [round, JSON.stringify(start), JSON.stringify(done)].join("\n")
+  );
+  assert.deepEqual(parsed.records.map(function (r) {
+    return r.kind === "compaction" ? r.phase : r.kind;
+  }), ["user", "tool", "toolResult", "start", "done", "assistant"]);
+  assert.equal(parsed.records[3].round, 1);
+  assert.equal(parsed.records[4].summary_text, "压缩后摘要");
+});
+
+test("parseHistory: 锚定轮次尚未收尾的锚点行保留在可见历史末尾", function () {
+  // 任务进行中刷新：压缩行已落盘（带锚点），其锚定轮次行还没写（收尾才落盘）
+  const round = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "已完成问题" },
+  ]);
+  const start = {
+    event: "context_compaction", scope: "session", phase: "start",
+    display_round: 2, display_event_index: 0,
+    timestamp: "2026-08-08 18:00:05", context_summary: "压缩前轨迹",
+  };
+  const done = {
+    event: "context_compaction", scope: "session", phase: "done",
+    display_round: 2, display_event_index: 0,
+    timestamp: "2026-08-08 18:00:06", summary_text: "摘要",
+  };
+  const parsed = historyParser.parseHistory(
+    [round, JSON.stringify(start), JSON.stringify(done)].join("\n")
+  );
+  assert.deepEqual(parsed.records.map(function (r) {
+    return r.kind === "compaction" ? r.phase : r.kind;
+  }), ["user", "start", "done"]);
+});
+
 test("parseHistory: chat_round.events 中的单轮压缩按实际顺序展开且合并摘要 usage", function () {
   const round = fakeRound([
     { timestamp: "2026-08-08 18:00:00", role: "user", content: "查文件" },

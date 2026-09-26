@@ -62,6 +62,31 @@ def _normalize_config_name(value: Any) -> str | None:
     return normalized or None
 
 
+def _normalize_support_doc_types(raw: Any) -> list[str]:
+    """把模型条目的 supportDocTypes 归一化为小写扩展名列表（含点、去重保序）。
+
+    - 接受 [".pdf", "docx"] 等形态（缺前导点自动补）；
+    - 非法条目（非字符串/空串/含路径分隔符）丢弃；
+    - None/缺失/非列表 → 空列表（视为该模型不支持原生文档输入）。
+    """
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    normalized: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip().lower()
+        if not text:
+            continue
+        if not text.startswith("."):
+            text = "." + text
+        if text == "." or "/" in text or "\\" in text:
+            continue
+        if text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 def _iter_provider_records(config: Any) -> list[dict[str, Any]]:
     if not isinstance(config, dict):
         return []
@@ -159,6 +184,12 @@ def get_model_config(provider_name: str | None = None, model_name: str | None = 
     resolved_config["selected_model"] = dict(model_item)
     # 视觉能力顶层字段（请求链路能力判断的读取口径）：models.json 缺省视为不支持
     resolved_config["vision"] = bool(model_item.get("vision", False))
+    # 原生文档输入能力（models.json 模型条目的 supportDocTypes）：归一化为小写
+    # 扩展名列表挂顶层；上传链路 / read_document / 每轮请求注入按此判断是否
+    # 把文档原始文件作为 file 部件发给模型（空列表 = 不支持，走文本解析口径）
+    resolved_config["support_doc_types"] = _normalize_support_doc_types(
+        model_item.get("supportDocTypes")
+    )
     resolved_config.setdefault("apiType", "chat-completions")
     return resolved_config
 
@@ -228,6 +259,8 @@ def list_available_models() -> list[dict[str, Any]]:
                 "tool_calling": bool(model.get("toolCalling", False)),
                 "max_input_tokens": model.get("maxInputTokens") or model.get("max_input_tokens"),
                 "max_output_tokens": model.get("maxOutputTokens") or model.get("max_output_tokens"),
+                # 原生文档输入能力（前端可据此提示"该类型将按原生文档发送"）
+                "support_doc_types": _normalize_support_doc_types(model.get("supportDocTypes")),
                 "api_key_present": bool(isinstance(api_key, str) and api_key.strip()),
             })
     return records

@@ -13,6 +13,7 @@
         "url": "http://172.23.144.63:10001/v1",
         "toolCalling": true,
         "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 240000,
         "maxOutputTokens": 24000
       }
@@ -28,6 +29,7 @@
         "url": "https://api.deepseek.com/v1",
         "toolCalling": true,
         "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 1000000,
         "maxOutputTokens": 384000
       },
@@ -36,6 +38,7 @@
         "url": "https://api.deepseek.com/v1",
         "toolCalling": true,
         "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 1000000,
         "maxOutputTokens": 384000
       }
@@ -51,6 +54,7 @@
         "url": "https://open.bigmodel.cn/api/paas/v4/",
         "toolCalling": true,
         "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 1000000,
         "maxOutputTokens": 384000
       },
@@ -74,6 +78,7 @@
         "url": "https://api.apiyi.com/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [".pdf", ".docx"],
         "maxInputTokens": 928000,
         "maxOutputTokens": 24000
       }
@@ -88,7 +93,8 @@
         "id": "glm-5.2",
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
-        "vision": true,
+        "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
       },
@@ -97,6 +103,7 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [".pdf", ".docx"],
         "maxInputTokens": 128000,
         "maxOutputTokens": 26000
       },
@@ -105,6 +112,7 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": null,
         "maxInputTokens": 128000,
         "maxOutputTokens": 26000
       },
@@ -113,6 +121,7 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [".pdf", ".docx"],
         "maxInputTokens": 228000,
         "maxOutputTokens": 26000
       },
@@ -121,6 +130,7 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [".pdf", ".docx"],
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
       }
@@ -136,6 +146,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [ ".pdf", ".docx" ],
         "maxInputTokens": 888888,
         "maxOutputTokens": 16000
       },
@@ -152,6 +163,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [ ".pdf", ".docx" ],
         "maxInputTokens": 888888,
         "maxOutputTokens": 65536
       }
@@ -167,6 +179,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": [ ".pdf", ".docx", ".xlsx", ".pptx" ],
         "maxInputTokens": 898000,
         "maxOutputTokens": 36000
       },
@@ -175,6 +188,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": null,
         "maxInputTokens": 498000,
         "maxOutputTokens": 26000
       },
@@ -183,6 +197,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": false,
+        "supportDocTypes": null,
         "maxInputTokens": 888888,
         "maxOutputTokens": 65536
       },
@@ -191,6 +206,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": null,
         "maxInputTokens": 528000,
         "maxOutputTokens": 226000
       },
@@ -199,6 +215,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": null,
         "maxInputTokens": 500000,
         "maxOutputTokens": 116000
       },
@@ -207,6 +224,7 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
+        "supportDocTypes": null,
         "maxInputTokens": 500000,
         "maxOutputTokens": 106000
       }

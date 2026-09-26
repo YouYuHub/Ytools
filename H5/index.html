@@ -328,10 +328,11 @@
                                 <span class="menu-item-label">Skills 提示词</span>
                             </button>
                         </div>
-                        <!-- 引用卡片区：选中文本「引用到提问」后显示在输入框上方 -->
-                        <div class="composer-quotes hidden" id="composerQuotes"></div>
-                        <!-- 待发送媒体附件预览区：粘贴/选择图片等媒体后显示在输入框上方 -->
-                        <div class="composer-attachments hidden" id="composerAttachments"></div>
+                        <!-- 引用、媒体与文档共用方块区域，按可用宽度自动排布 -->
+                        <div class="composer-attachment-blocks hidden" id="composerAttachmentBlocks">
+                            <div class="composer-quotes hidden" id="composerQuotes"></div>
+                            <div class="composer-attachments hidden" id="composerAttachments"></div>
+                        </div>
                         <!-- 流式期间引导/队列消息暂存指示器：显示待发条目，可移除放回输入框 -->
                         <div class="pending-outbox hidden" id="pendingOutbox"></div>
                         <textarea class="composer-input" id="input" rows="1" placeholder="应该做什么"></textarea>
@@ -880,7 +881,7 @@
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
     <script src="js/app/core.js"></script>
-    <!-- 引用交互（选区浮钮/草稿卡片/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
+    <!-- 引用交互（选区浮钮/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script src="js/app/quotes.js"></script>
     <script src="js/app/sessions.js"></script>
     <script src="js/app/session_groups.js"></script>

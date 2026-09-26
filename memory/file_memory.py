@@ -82,6 +82,8 @@ MEDIA_PART_LABELS = {
     "image_url": "[图片]",
     "input_audio": "[音频]",
     "video_url": "[视频]",
+    # 原生文档部件（模型 supportDocTypes 声明支持时按轮注入；历史回放转占位）
+    "file": "[文档]",
 }
 
 # ---------- 可解析文档的原始字节（用于点击预览/下载） ----------
@@ -242,7 +244,13 @@ def _format_file_size(size: Any) -> str:
     return f"{number / (1024 * 1024):.1f}MB"
 
 
-def _file_record_header(index: int, record: dict[str, Any], *, with_length: bool) -> str:
+def _file_record_header(
+    index: int,
+    record: dict[str, Any],
+    *,
+    with_length: bool,
+    native_doc_types: Any = None,
+) -> str:
     filename = str(record.get("filename") or "未命名")
     file_type = str(record.get("type") or "").strip()
     size_text = _format_file_size(record.get("size"))
@@ -250,6 +258,19 @@ def _file_record_header(index: int, record: dict[str, Any], *, with_length: bool
     if with_length:
         content_len = len(str(record.get("content") or ""))
         meta = f"{meta}，共约 {content_len} 字" if meta else f"共约 {content_len} 字"
+    # 原生文档标注：该类型在当前模型的 supportDocTypes 内时，文档原始文件会
+    # 按轮作为原生文档发送（供应商侧视觉解析），文本口径仅为兜底
+    if record_supports_native(record, native_doc_types):
+        meta = f"{meta}，原生文档已随请求发送" if meta else "原生文档已随请求发送"
+    # 本地解析失败（解析器缺失/损坏文件等）：仅原生文档可用，明确告知模型
+    if record.get("parse_failed"):
+        note = "本地文本解析失败（仅原生文档可用）"
+        meta = f"{meta}，{note}" if meta else note
+    # 解析文本被截断入库：告知模型可用原文绝对路径（read_file）继续读取
+    if record.get("content_truncated"):
+        total = record.get("content_total_chars")
+        note = f"解析文本已截断（原文共约 {total} 字）" if total else "解析文本已截断"
+        meta = f"{meta}，{note}" if meta else note
     return f"【文件 {index}】{filename}" + (f"（{meta}）" if meta else "")
 
 
@@ -260,12 +281,15 @@ def build_file_manifest_text(
     inline_max_chars: int = FILE_MEMORY_INLINE_MAX_CHARS,
     head_excerpt_chars: int = FILE_MEMORY_HEAD_EXCERPT_CHARS,
     total_max_chars: int = FILE_MEMORY_TOTAL_MAX_CHARS,
+    native_doc_types: Any = None,
 ) -> str:
     """构建「文件清单」注入文本（发送口径）。
 
     - 小文件（解析文本 ≤ inline_max_chars）：内联全文；
     - 大文件：给开头 head_excerpt_chars 字节选 + read_document 读取提示；
-    - 总预算 total_max_chars：超出时按「新文件优先」收缩（先截断/省略最旧文件）。
+    - 总预算 total_max_chars：超出时按「新文件优先」收缩（先截断/省略最旧文件）；
+    - native_doc_types：当前模型 supportDocTypes 声明（命中时条目注明
+      「原生文档已随请求发送」）；截断入库的记录注明可读原文绝对路径。
 
     调用方约定记录顺序：最近上传的在前。返回空串表示没有文件。
     """
@@ -281,7 +305,9 @@ def build_file_manifest_text(
         total_len = len(content)
         inline = total_len <= inline_max_chars
         body = content if inline else content[:head_excerpt_chars]
-        header = _file_record_header(index, record, with_length=not inline)
+        header = _file_record_header(
+            index, record, with_length=not inline, native_doc_types=native_doc_types
+        )
         if inline:
             block = f"{header}\n{body}" if body else header
         else:
@@ -290,6 +316,14 @@ def build_file_manifest_text(
                 filename = str(record.get("filename") or "")
                 note += f'；可调用 read_document(filename="{filename}") 读取完整内容'
             block = f"{header}\n{body}\n{note}" if body else f"{header}\n{note}"
+        # 截断入库的记录：提示原文绝对路径（模型可用 read_file 直接读取续读）
+        if record.get("content_truncated"):
+            abs_path = str(record.get("abs_path") or "").strip()
+            if abs_path:
+                block += (
+                    f"\n（解析文本已截断，原始文件保留于 {abs_path}，"
+                    "可用 read_file 按行读取续读原文）"
+                )
         if used + len(block) + 1 > total_max_chars:
             remaining = total_max_chars - used - 1
             if remaining >= 300:
@@ -322,6 +356,7 @@ def build_file_index_text(
     *,
     read_document_available: bool = True,
     total_max_chars: int = FILE_MEMORY_INDEX_MAX_CHARS,
+    native_doc_types: Any = None,
 ) -> str:
     """构建「文件索引」文本（首调用超窗时的最小降级形态：仅文件名/类型/大小）。"""
     if not records:
@@ -332,7 +367,9 @@ def build_file_index_text(
     for index, record in enumerate(records, start=1):
         if not isinstance(record, dict):
             continue
-        line = f"- {_file_record_header(index, record, with_length=False)}"
+        line = "- " + _file_record_header(
+            index, record, with_length=False, native_doc_types=native_doc_types
+        )
         if used + len(line) + 1 > total_max_chars:
             omitted = max(0, len(records) - index + 1)
             break
@@ -535,6 +572,229 @@ def video_max_read_seconds() -> int:
     except (TypeError, ValueError):
         return DEFAULT_VIDEO_MAX_READ_SECONDS
     return max(5, min(3600, value))
+
+
+# ---------- 原生文档（模型 supportDocTypes 声明的文件输入） ----------
+# 上传的 PDF/DOCX 等文档在「会话生效模型声明支持该类型」时按轮随请求注入，
+# 语义与图片/视频一致（用户确认口径）：
+# - 本任务内每轮发送：后续追问仍能看到文档原文（供应商侧按视觉/原生解析）；
+# - 出现新的用户消息后转文本占位（[文档 名字]）——原始文件始终保留在
+#   history_files/session_files/<session>/files/，模型可用 read_document
+#   （声明支持时原生重读）或 read_file（按绝对路径读文本）继续访问；
+# - 规模约束（单文件 / 单轮总量 / 数量）：超预算的文档降级为文本口径，
+#   避免超大文档撑爆请求体与模型窗口。
+# 部件形态对齐 OpenAI Chat Completions 的 file 部件（file_data 为 data URL）；
+# 其它协议（Responses 的 input_file / Anthropic 的 document 等）由服务端
+# 适配层在发送前转换。
+NATIVE_DOC_PART_TYPE = "file"
+NATIVE_DOC_PART_LABEL = "[文档]"
+DEFAULT_NATIVE_DOC_MAX_BYTES = 20 * 1024 * 1024
+DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES = 40 * 1024 * 1024
+DEFAULT_NATIVE_DOC_MAX_ITEMS = 3
+NATIVE_DOC_MAX_BYTES_ENV = "NATIVE_DOC_MAX_BYTES"
+NATIVE_DOC_TOTAL_MAX_BYTES_ENV = "NATIVE_DOC_TOTAL_MAX_BYTES"
+NATIVE_DOC_MAX_ITEMS_ENV = "NATIVE_DOC_MAX_ITEMS"
+
+
+def native_doc_max_bytes() -> int:
+    """单个原生文档注入上限（字节）；动态读 .env，非法值回退默认 20MB。"""
+    from env_manager import load_var
+
+    try:
+        value = int(float(load_var(NATIVE_DOC_MAX_BYTES_ENV, DEFAULT_NATIVE_DOC_MAX_BYTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_NATIVE_DOC_MAX_BYTES
+    return max(0, value)
+
+
+def native_doc_total_max_bytes() -> int:
+    """单轮原生文档注入总量上限（字节）；动态读 .env，非法值回退默认 40MB。"""
+    from env_manager import load_var
+
+    try:
+        value = int(float(load_var(NATIVE_DOC_TOTAL_MAX_BYTES_ENV, DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES
+    return max(0, value)
+
+
+def native_doc_max_items() -> int:
+    """单轮原生文档注入数量上限；动态读 .env，非法值回退默认 3（至少 1）。"""
+    from env_manager import load_var
+
+    try:
+        value = int(float(load_var(NATIVE_DOC_MAX_ITEMS_ENV, DEFAULT_NATIVE_DOC_MAX_ITEMS)))
+    except (TypeError, ValueError):
+        return DEFAULT_NATIVE_DOC_MAX_ITEMS
+    return max(1, value)
+
+
+def document_supports_native(filename: str, support_doc_types: Any) -> bool:
+    """文件扩展名是否命中该模型的 supportDocTypes 声明（原生文档输入）。"""
+    if not support_doc_types:
+        return False
+    suffix = Path(str(filename)).suffix.lower()
+    if not suffix:
+        return False
+    for item in support_doc_types:
+        if not isinstance(item, str):
+            continue
+        candidate = item.strip().lower()
+        if not candidate:
+            continue
+        if not candidate.startswith("."):
+            candidate = "." + candidate
+        if candidate == suffix:
+            return True
+    return False
+
+
+def record_supports_native(record: dict[str, Any], support_doc_types: Any) -> bool:
+    """记录是否可用于原生注入：类型命中声明 + 原始文件已保存（stored_name）。"""
+    if not isinstance(record, dict):
+        return False
+    if not str(record.get("stored_name") or "").strip():
+        return False
+    return document_supports_native(str(record.get("filename") or ""), support_doc_types)
+
+
+def build_native_document_part(session_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    """按文件记录构建原生文档部件（原始文件字节 → data URL）。
+
+    返回 {"part", "filename", "stored_name", "mime", "size", "abs_path"}；
+    原始文件缺失/超上限返回 {"error": 说明}（调用方转为文本口径或错误占位）。
+    """
+    filename = str(record.get("filename") or "未命名")
+    stored_name = str(record.get("stored_name") or "").strip()
+    path = resolve_document_path(session_id, stored_name) if stored_name else None
+    if path is None:
+        return {"error": f"{filename} 的原始文件不存在（无法按原生文档注入）"}
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return {"error": f"{filename} 原始文件读取失败（无法按原生文档注入）"}
+    limit = native_doc_max_bytes()
+    if limit > 0 and size > limit:
+        return {
+            "error": (
+                f"{filename}（{size / (1024 * 1024):.1f}MB）超过原生文档注入上限 "
+                f"{limit // (1024 * 1024)}MB，已按文本口径处理"
+            )
+        }
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return {"error": f"{filename} 原始文件读取失败：{exc}"}
+    mime = media_mime_type(filename) or "application/octet-stream"
+    part = {
+        "type": NATIVE_DOC_PART_TYPE,
+        "file": {
+            "filename": filename,
+            "file_data": _media_data_url(mime, base64.b64encode(data).decode("ascii")),
+        },
+    }
+    return {
+        "part": part,
+        "filename": filename,
+        "stored_name": stored_name,
+        "mime": mime,
+        "size": size,
+        "abs_path": str(path).replace("\\", "/"),
+    }
+
+
+def select_native_document_records(
+    records: list[dict[str, Any]],
+    support_doc_types: Any,
+    *,
+    max_items: int | None = None,
+    max_bytes: int | None = None,
+    total_max_bytes: int | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """挑选可原生注入的文档记录（新文件优先），返回 (选中记录, 跳过说明列表)。
+
+    规则：类型命中 supportDocTypes 且原始文件已保存；单文件超上限、数量超上限、
+    总量超上限的按「新文件优先」跳过（跳过原因供日志/提示使用）。
+    """
+    selected: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    if not support_doc_types:
+        return selected, skipped
+    limit_items = native_doc_max_items() if max_items is None else max_items
+    limit_single = native_doc_max_bytes() if max_bytes is None else max_bytes
+    limit_total = native_doc_total_max_bytes() if total_max_bytes is None else total_max_bytes
+    used = 0
+    for record in records or []:
+        if not record_supports_native(record, support_doc_types):
+            continue
+        filename = str(record.get("filename") or "未命名")
+        try:
+            size = int(record.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if limit_single > 0 and size > limit_single:
+            skipped.append(f"{filename}（超过单文件上限，按文本口径）")
+            continue
+        if len(selected) >= limit_items:
+            skipped.append(f"{filename}（超过单轮数量上限 {limit_items}，按文本口径）")
+            continue
+        if limit_total > 0 and used + size > limit_total:
+            skipped.append(f"{filename}（超过单轮总量上限，按文本口径）")
+            continue
+        selected.append(record)
+        used += size
+    return selected, skipped
+
+
+def load_native_document_model_part(
+    session_id: str,
+    filename: str,
+    support_doc_types: Any,
+) -> dict[str, Any]:
+    """read_document 原生分支：按文件名加载原生文档部件。
+
+    返回 build_native_document_part 的结果；文件名不存在 / 类型不在声明内 /
+    原始文件缺失等返回 {"error": 说明}（调用方回退文本分页口径或转为错误反馈）。
+    """
+    try:
+        record = find_file_memory_record(session_id, filename)
+    except Exception as exc:
+        return {"error": f"读取文件记录失败：{exc}"}
+    if record is None:
+        return {"error": f"未找到文件「{filename}」"}
+    if not document_supports_native(str(record.get("filename") or filename), support_doc_types):
+        return {"error": f"{filename} 不在当前模型支持的原生文档类型内"}
+    return build_native_document_part(session_id, record)
+
+
+def retire_native_document_parts(messages: Any) -> int:
+    """把历史 _internal 消息里的原生文档部件替换为文本占位（就地改写）。
+
+    语义与视频一次性消费同构：出现新用户消息后，此前注入的文档数据不再随
+    请求发送（转「[文档 名字]」占位），需要时模型可重新调用 read_document
+    原生读取；原始文件始终保留在会话目录。返回替换的部件数。
+    """
+    replaced = 0
+    for message in messages or []:
+        if not isinstance(message, dict) or not message.get("_internal"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        new_parts: list[Any] = []
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "") == NATIVE_DOC_PART_TYPE:
+                file_info = part.get("file")
+                name = ""
+                if isinstance(file_info, dict):
+                    name = str(file_info.get("filename") or "").strip()
+                label = f"{NATIVE_DOC_PART_LABEL.strip('[]')} {name}" if name else NATIVE_DOC_PART_LABEL
+                new_parts.append({"type": "text", "text": f"[{label}]"})
+                replaced += 1
+            else:
+                new_parts.append(part)
+        message["content"] = new_parts
+    return replaced
 
 
 def _parse_ffmpeg_time_seconds(text: str) -> float | None:
@@ -1823,6 +2083,12 @@ def _media_reference_label(part: dict[str, Any]) -> str | None:
     label = MEDIA_PART_LABELS.get(part_type)
     if not label:
         return None
+    # 原生文档部件：占位带上原始文件名（模型可据此 read_document 原生重读），
+    # 数据本体（base64）不进入文本口径
+    if part_type == NATIVE_DOC_PART_TYPE:
+        file_info = part.get("file")
+        name = str(file_info.get("filename") or "").strip() if isinstance(file_info, dict) else ""
+        return f"[{label.strip('[]')} {name}]" if name else label
     reference: Any = None
     if part_type == "image_url":
         value = part.get("image_url")
@@ -1985,20 +2251,36 @@ class FileMemoryManager:
         """当前会话文件记忆条数（轻量：只数记录文件，不读取内容）。"""
         return count_session_file_memory(self._session_id)
 
-    def get_file_memory_manifest(self, *, read_document_available: bool = True) -> str:
+    def get_file_memory_manifest(
+        self, *, read_document_available: bool = True, native_doc_types: Any = None
+    ) -> str:
         """构建「文件清单」注入文本（发送口径：小文件内联 / 大文件节选 + 按需读取）。
 
         与旧版 get_file_memory_chat（全量拼接）的区别：受总预算约束、大文件
         只给开头节选，模型需要细节时用 read_document 工具按需读取。
+        native_doc_types 为当前模型 supportDocTypes 声明：命中的条目会注明
+        「原生文档已随请求发送」，避免模型误以为只有节选文本可用。
         """
         with self._lock:
             records = list_session_file_records(self._session_id)
         records.reverse()  # 最近上传的排前面（预算收缩先挤最旧）
         return build_file_manifest_text(
-            records, read_document_available=read_document_available
+            records,
+            read_document_available=read_document_available,
+            native_doc_types=native_doc_types,
         )
 
-    def get_file_memory_index(self, *, read_document_available: bool = True) -> str:
+    def get_file_memory_index(
+        self, *, read_document_available: bool = True, native_doc_types: Any = None
+    ) -> str:
+        with self._lock:
+            records = list_session_file_records(self._session_id)
+        records.reverse()
+        return build_file_index_text(
+            records,
+            read_document_available=read_document_available,
+            native_doc_types=native_doc_types,
+        )
         """构建「文件索引」文本（首调用超窗时的最小降级形态）。"""
         with self._lock:
             records = list_session_file_records(self._session_id)

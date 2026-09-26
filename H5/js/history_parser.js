@@ -226,6 +226,11 @@
   function parseHistory(text) {
     const records = [];
     const pendingRoundCompactions = Object.create(null);
+    // 带 display_round 锚点的压缩行按轮次号预收集（保持文件顺序）。
+    // 锚点行在旧版后端"回答插入/编辑重发"收尾时可能位于其锚定轮次行之后，
+    // 主循环跳过这些行、在解析到锚定轮次时按锚点归位合并——不依赖文件
+    // 物理顺序，避免旧文件的压缩块被兜底显示到会话末尾。
+    const anchoredCompactionLines = Object.create(null);
     let metaUsageTotal = 0;
     let metaUsage = {};
     let roundCounter = 0;
@@ -245,6 +250,14 @@
       if (obj.event === "chat_round" && Array.isArray(obj.events)) {
         candidateRoundNo += 1;
         roundTimeWindows.push({ round: candidateRoundNo, entry: obj });
+      } else if (obj.event === "context_compaction") {
+        const anchorRound = Number(obj.display_round);
+        const anchorIndex = Number(obj.display_event_index);
+        if (Number.isInteger(anchorRound) && anchorRound > 0
+            && Number.isInteger(anchorIndex) && anchorIndex >= 0) {
+          if (!anchoredCompactionLines[anchorRound]) anchoredCompactionLines[anchorRound] = [];
+          anchoredCompactionLines[anchorRound].push(obj);
+        }
       }
     });
 
@@ -292,22 +305,22 @@
       }
       // 压缩过程事件行（与 SSE 实时推送同一份 payload，字段一致）
       if (obj.event === "context_compaction") {
-        let displayRound = Number(obj.display_round);
-        let displayEventIndex = Number(obj.display_event_index);
-        if ((!Number.isInteger(displayRound) || displayRound <= 0
-            || !Number.isInteger(displayEventIndex) || displayEventIndex < 0)) {
-          const inferred = inferLegacyRoundAnchor(obj);
-          if (inferred) {
-            displayRound = inferred.round;
-            displayEventIndex = inferred.eventIndex;
-          }
-        }
+        const displayRound = Number(obj.display_round);
+        const displayEventIndex = Number(obj.display_event_index);
         if (Number.isInteger(displayRound) && displayRound > 0
             && Number.isInteger(displayEventIndex) && displayEventIndex >= 0) {
-          if (!pendingRoundCompactions[displayRound]) pendingRoundCompactions[displayRound] = [];
-          pendingRoundCompactions[displayRound].push({
+          // 带轮内锚点的压缩行已在预扫描阶段按轮次收集（anchoredCompactionLines），
+          // 此处跳过：即使物理位置在锚定轮次行之后（旧版后端"回答插入/编辑重发"
+          // 收尾产生），也会在解析到该轮次时按锚点归位合并，不依赖文件顺序。
+          return;
+        }
+        // 无锚点（旧 JSONL）：按时间窗推断轮次锚点，插回对应轮次
+        const inferred = inferLegacyRoundAnchor(obj);
+        if (inferred) {
+          if (!pendingRoundCompactions[inferred.round]) pendingRoundCompactions[inferred.round] = [];
+          pendingRoundCompactions[inferred.round].push({
             event: obj,
-            eventIndex: displayEventIndex,
+            eventIndex: inferred.eventIndex,
           });
           return;
         }
@@ -322,6 +335,19 @@
       const openBlocks = {}; // agent_id -> agentBlock record（轮内聚合）
       const anchoredCompactions = pendingRoundCompactions[roundNo] || [];
       delete pendingRoundCompactions[roundNo];
+      // 预扫描收集的锚点行（含物理位置在轮次行之后的旧文件）并入归位列表：
+      // 放在时间窗推断行之后（推断行仅服务旧数据兜底，两类通常不同时出现于
+      // 同一轮）；同类内部保持 JSONL 写入顺序，相同锚点不重排。
+      const presetAnchored = anchoredCompactionLines[roundNo];
+      if (presetAnchored) {
+        presetAnchored.forEach(function (anchorObj) {
+          anchoredCompactions.push({
+            event: anchorObj,
+            eventIndex: Number(anchorObj.display_event_index),
+          });
+        });
+        delete anchoredCompactionLines[roundNo];
+      }
       const orderedEvents = [];
       let compactionIndex = 0;
       for (let eventIndex = 0; eventIndex <= obj.events.length; eventIndex += 1) {
@@ -444,6 +470,14 @@
     Object.keys(pendingRoundCompactions).forEach(function (roundKey) {
       pendingRoundCompactions[roundKey].forEach(function (item) {
         appendCompactionRecord(records, item.event);
+      });
+    });
+
+    // 锚定轮次不存在（轮次被删除/尚未收尾）的锚点行：同样保留在可见历史
+    // 末尾，避免刷新后事件消失
+    Object.keys(anchoredCompactionLines).forEach(function (roundKey) {
+      anchoredCompactionLines[roundKey].forEach(function (anchorObj) {
+        appendCompactionRecord(records, anchorObj);
       });
     });
 

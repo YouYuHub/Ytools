@@ -1207,87 +1207,123 @@ html[data-theme="dark"] {
   }
 }
 
-// 用户气泡内的附件图片（多模态消息与其历史回放）：
-// 布局为媒体在上、文字在下，媒体行用 margin-bottom 与下方文字隔开
-.msg-user-media {
-  display: flex;
-  flex-wrap: wrap;
+// 已发送消息中的引用、图片、音视频和文档共用紧凑方块行。
+// 两个子容器使用 display:contents，让所有附件参与同一套等尺寸网格。
+.msg-user-attachment-blocks {
+  --attachment-block-min-size: 20px;
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(var(--attachment-block-columns, 1), var(--attachment-block-size, 52px));
+  grid-auto-rows: var(--attachment-block-size, 52px);
+  align-content: start;
   gap: 6px;
-  margin-bottom: 6px;
-
-  .msg-user-media-thumb {
-    max-width: 180px;
-    max-height: 140px;
-    border-radius: 10px;
-    object-fit: cover;
-    display: block;
-  }
+  width: 100%;
+  margin-bottom: 8px;
+  overflow: visible;
 }
 
-// 用户气泡内的音频/视频徽标（不内联播放，标注附件类型与名称）
+.msg-quote-list,
+.msg-user-media {
+  display: contents;
+}
+
+.msg-user-media-thumb,
 .msg-user-media-audio,
-.msg-user-media-video {
-  display: inline-flex;
-  align-items: center;
-  max-width: 220px;
-  padding: 4px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-// 用户气泡内的文档徽标（file_memory 文档随消息发送时的展示块；
-// 内容经系统提示词注入，不进消息 content 部件）
+.msg-user-media-video,
 .msg-user-media-doc {
-  display: inline-flex;
-  align-items: center;
-  max-width: 240px;
-  padding: 4px 10px;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   border: 1px solid var(--border-strong);
   border-radius: 10px;
-  font-size: 12px;
+  background: var(--bg-code);
   color: var(--text-secondary);
+  overflow: hidden;
+}
+
+.msg-user-media-thumb {
+  display: block;
+  object-fit: cover;
+}
+
+.msg-user-media-audio,
+.msg-user-media-video,
+.msg-user-media-doc {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 3px;
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+}
+
+.msg-user-media-icon {
+  display: block;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.msg-user-media-label {
+  display: block;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-// 用户气泡内的引用卡片（选中文本引用到提问）：置于问题正文之前，
-// 多段引用纵向堆叠；引用原文只用 textContent 绘制（纯文本，不解析 HTML）
-.msg-quote-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 8px;
+// 每条引用是一枚编号方块；悬停/聚焦时浮出完整原文，点击方块仍跳转来源。
+.msg-quote-tile {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+
+  &::before {
+    content: "";
+    position: absolute;
+    z-index: 1;
+    left: 0;
+    right: 0;
+    top: 100%;
+    height: 8px;
+  }
+
+  &:hover,
+  &:focus-within {
+    z-index: 20;
+  }
 }
 
 .msg-quote-card {
-  display: block;
-  width: 100%;
   appearance: none;
-  padding: 6px 10px;
-  border: 0;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  width: 100%;
+  height: 100%;
+  padding: 3px;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--accent);
   border-radius: 10px;
-  border-left: 3px solid var(--accent);
-  background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
-  color: inherit;
+  background: var(--bg-code);
+  color: var(--text-secondary);
   font: inherit;
-  text-align: left;
   cursor: pointer;
-  max-height: 180px;
-  overflow-y: auto;
 
-  @supports not (background: color-mix(in srgb, red 50%, blue)) {
-    background: var(--bg-code);
-  }
-
-  &:hover {
-    background: color-mix(in srgb, var(--bg-active) 82%, transparent);
-    border-left-color: var(--accent);
+  &:hover,
+  &:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   &:focus-visible {
@@ -1296,38 +1332,110 @@ html[data-theme="dark"] {
   }
 }
 
-.msg-quote-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 3px;
-}
-
-.msg-quote-badge {
-  flex-shrink: 0;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--bg-active);
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.msg-quote-source {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-tertiary);
-  font-size: 11px;
-}
-
-.msg-quote-text {
+.msg-quote-icon {
   display: block;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
+  line-height: 0;
+
+  svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+.msg-quote-index {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.msg-quote-popover {
+  display: none;
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 7px);
+  left: 0;
+  width: min(360px, calc(100vw - 40px));
+  max-height: min(300px, 45vh);
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+
+  .msg-quote-jump {
+    appearance: none;
+    display: block;
+    width: 100%;
+    padding: 8px 7px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+      background: var(--bg-active);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    & + .msg-quote-jump {
+      border-top: 1px solid var(--border);
+    }
+  }
+
+  .msg-quote-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 5px;
+  }
+
+  .msg-quote-badge {
+    flex-shrink: 0;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--bg-active);
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+
+  .msg-quote-source {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .msg-quote-text {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+.msg-quote-tile:hover .msg-quote-popover,
+.msg-quote-tile:focus-within .msg-quote-popover {
+  display: block;
+}
+
+@container main-area (max-width: 420px) {
+  .msg-user-attachment-blocks {
+    --attachment-block-min-size: 18px;
+    gap: 4px;
+  }
 }
 
 @keyframes quote-source-flash {

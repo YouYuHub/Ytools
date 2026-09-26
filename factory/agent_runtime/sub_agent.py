@@ -37,6 +37,7 @@ from env_manager import (
 )
 from util.timestamp_utils import now_str
 from memory import file_history as _file_history
+from memory.file_memory import retire_native_document_parts
 
 from factory.agent_runtime.builtin_tools import (
     ASK_USER_TOOL_NAME,
@@ -252,6 +253,15 @@ def _format_result_text(result: Any) -> str:
             k: v for k, v in result.items()
             if k not in ("_file_diff", "_file_history")
         }
+        # 原生文档块（read_document 返回）：数据本体为 base64，绝不能进入
+        # 模型文本上下文或 JSONL；只保留可读的注入说明
+        native_block = result.pop("native", None)
+        if isinstance(native_block, dict):
+            filename = str(native_block.get("filename") or "")
+            result["native_document"] = (
+                f"{filename} 已作为原生文档注入后续请求" if filename
+                else "原生文档已注入后续请求"
+            )
     if isinstance(result, str):
         return result
     try:
@@ -409,6 +419,8 @@ class SubAgentRunner:
         # （键带区间：同视频不同区间是新的读取）；滚动窗口只保留最近 5 个
         self.read_media_pending_parts: list[tuple[str, Any]] = []
         self.read_media_injected_refs: set[str] = set()
+        # read_document 原生分支待注入部件（模型支持该文档类型时）
+        self.native_doc_pending_parts: list[Any] = []
         # 任务文本中的 media:// 引用集合：子任务 read_media 的安全边界数据源
         #（父模型派发任务时把可回读引用写进 task，子模型只能读这些）
         self.task_media_references: set[str] = set(
@@ -543,6 +555,27 @@ class SubAgentRunner:
         except Exception:
             parameter = {}
         return None, parameter
+
+    def _native_doc_types(self) -> list[str]:
+        """子任务生效模型的原生文档能力（supportDocTypes 归一化列表）。
+
+        口径与子任务模型解析一致：sub_agent_model 角色配置有效时取该模型，
+        否则继承父级聊天模型（ambient 会话覆盖已由 asyncio 任务上下文继承）。
+        解析失败返回空列表（read_document 走纯文本分页口径）。
+        """
+        try:
+            model_config, _parameter = self._resolve_request_model_config()
+            if model_config is None:
+                from env_manager import require_default_chat_config
+
+                model_config = require_default_chat_config()
+            if not isinstance(model_config, dict):
+                return []
+            support = model_config.get("support_doc_types")
+            return [str(item) for item in support] if isinstance(support, list) else []
+        except Exception as exc:
+            print(f"[WARN] 子任务 supportDocTypes 解析失败（按不支持处理）: {exc}")
+            return []
 
     def _build_request(self, parameter: dict[str, Any]) -> ChatLLMRequest:
         """构造子任务请求：参数填充优先级 sub_agent_model.parameter > 内置默认。
@@ -839,9 +872,18 @@ class SubAgentRunner:
                 builtin_results.append((idx, tc, tn, ta, read_media_result))
                 continue
             if tn == READ_DOCUMENT_NAME:
-                # 读取用户上传文件的解析文本（与父循环 execute_read_document
-                # 同接口）：按文件名读取会话内已上传文件，支持字符区间分页
-                read_document_result = execute_read_document(ta, ctx.session_id)
+                # 读取用户上传文件：子任务生效模型声明支持该类型（supportDocTypes）
+                # 时优先返回原生文档部件（与父循环 execute_read_document 同接口），
+                # 由 runner 在工具结果统一处理后注入；未命中则纯文本分页口径
+                read_document_result = execute_read_document(
+                    ta, ctx.session_id, support_doc_types=self._native_doc_types(),
+                )
+                native_block = (
+                    read_document_result.get("native")
+                    if isinstance(read_document_result, dict) else None
+                )
+                if isinstance(native_block, dict) and native_block.get("part") is not None:
+                    self.native_doc_pending_parts.append(native_block["part"])
                 builtin_results.append((idx, tc, tn, ta, read_document_result))
                 continue
             builtin_result = execute_builtin_tool(
@@ -1351,6 +1393,26 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 self.read_media_pending_parts = []
+            # read_document 原生文档注入（子任务版）：模型声明支持该类型时，
+            # 工具返回的原生文档部件在此作为 user 消息追加（仅内存、不落盘）。
+            # 注入前回收上一批原生文档数据（转文本占位），避免多批叠加
+            if self.native_doc_pending_parts:
+                retire_native_document_parts(self.messages)
+                self.messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "以下是你刚才调用 read_document 读取的文档内容"
+                                "（原生文档，按文件名顺序排列）："
+                            ),
+                        },
+                        *self.native_doc_pending_parts,
+                    ],
+                    "_internal": True,
+                })
+                self.native_doc_pending_parts = []
             # 循环继续：下一轮模型调用（顶部已检查停止条件）
 
     # ----------------------------- 收尾辅助 -----------------------------

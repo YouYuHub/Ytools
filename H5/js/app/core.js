@@ -103,9 +103,35 @@ window.App = window.App || {};
     audio: ["wav", "mp3", "m4a", "ogg", "flac"],
     video: ["mp4", "webm", "mov", "mkv"],
   };
-  // 与后端 file_factory.PARSER_BY_EXT 一致的可解析文档类型
-  // （解析文本写入 file_memory，由后端注入系统提示词，与二进制媒体走不同通道）
-  const DOC_EXTENSIONS = ["txt", "md", "pdf", "docx", "doc", "csv", "xls", "xlsx"];
+  // 与后端一致的「可上传文档」类型：
+  // - 富文档（pdf/docx/doc/xls/xlsx/csv）走专用解析器；
+  // - 常见文本类（代码/配置/日志/字幕/数据等）直接按文本内容解析入库；
+  // 其余类型（未知扩展名）由后端按二进制嗅探判定：像文本则按文本解析、
+  // 否则拒绝（避免二进制文件被硬解码成乱码文本塞进上下文）。
+  const DOC_EXTENSIONS = [
+    "txt", "md", "pdf", "docx", "doc", "csv", "xls", "xlsx",
+    // 数据 / 配置
+    "markdown", "rst", "log", "text", "me", "tsv", "json", "jsonl", "ndjson",
+    "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env",
+    "gitignore", "gitattributes", "editorconfig", "srt", "vtt", "ass", "tex", "bib",
+    // Web / 前端
+    "html", "htm", "xhtml", "xml", "xsl", "xslt", "css", "scss", "sass",
+    "less", "styl", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "svg",
+    "map",
+    // 通用编程语言
+    "py", "pyi", "ipynb", "java", "kt", "kts", "scala", "groovy",
+    "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "go", "rs",
+    "swift", "m", "mm", "php", "rb", "pl", "pm", "lua", "r", "jl", "dart",
+    "ex", "exs", "erl", "hrl", "hs", "clj", "cljs", "el", "vim",
+    "asm", "s", "f", "f90", "f95", "for", "pas", "d", "nim",
+    "zig", "v", "sol", "tcl", "awk", "sed",
+    // 脚本 / 构建 / 其它纯文本
+    "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", "sql",
+    "graphql", "gql", "proto", "thrift", "cmake", "make", "mk", "gradle",
+    "dockerfile", "containerfile", "tf", "tfvars", "hcl", "nix",
+    "diff", "patch", "po", "pot", "strings", "pem",
+    "crt", "cer", "key", "pub", "asc", "lic", "license",
+  ];
   const MAX_DOC_FILE_SIZE = 10 * 1024 * 1024;
 
   function docKindOf(filename) {
@@ -143,6 +169,8 @@ window.App = window.App || {};
   const stopGroup = $("#stopGroup");
   const stopMenuBtn = $("#stopMenuBtn");
   const queueMenu = $("#queueMenu");
+  const composerAttachmentBlocks = $("#composerAttachmentBlocks");
+  const composerQuotes = $("#composerQuotes");
   const composerAttachments = $("#composerAttachments");
   const pendingOutbox = $("#pendingOutbox");
   const contextTokenTodoSlot = $("#contextTokenTodoSlot");
@@ -302,6 +330,85 @@ window.App = window.App || {};
     if (className) node.className = className;
     if (text != null) node.textContent = text;
     return node;
+  }
+
+  function fitAttachmentBlockGrid(grid) {
+    if (!grid) return;
+    const tiles = grid.querySelectorAll(
+      ".composer-quotes-tile, .media-chip, .doc-chip, .msg-quote-tile, " +
+      ".msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-video, .msg-user-media-doc"
+    );
+    const count = tiles.length;
+    if (!count) return;
+
+    const style = window.getComputedStyle(grid);
+    const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+    const gap = parseFloat(style.columnGap) || 0;
+    const minimumSize = parseFloat(style.getPropertyValue("--attachment-block-min-size")) || 20;
+    // 用户消息气泡按内容收缩。给附件网格一个由数量决定的宽度上限，
+    // 否则纯附件消息会按首个默认网格列收窄，无法在插入后正确测量布局。
+    if (grid.classList.contains("msg-user-attachment-blocks") && chatInner.clientWidth) {
+      const bubble = grid.parentElement;
+      const bubbleStyle = bubble ? window.getComputedStyle(bubble) : null;
+      const bubblePadding = bubbleStyle
+        ? (parseFloat(bubbleStyle.paddingLeft) || 0) + (parseFloat(bubbleStyle.paddingRight) || 0)
+        : 0;
+      const maxGridWidth = Math.max(1, chatInner.clientWidth * 0.9 - bubblePadding);
+      const oneRowWidth = 52 * count + gap * (count - 1);
+      grid.style.width = Math.min(oneRowWidth, maxGridWidth).toFixed(2) + "px";
+    }
+    const availableWidth = grid.clientWidth;
+    if (!availableWidth) return;
+
+    const contentWidth = Math.max(1, availableWidth - padding);
+    const maxColumnsAtMinimum = Math.max(
+      1,
+      Math.floor((contentWidth + gap) / (minimumSize + gap))
+    );
+    // 宽度允许时全部保持一行；否则最多两行，并让每个方块尺寸保持一致。
+    const columns = count <= maxColumnsAtMinimum ? count : Math.ceil(count / 2);
+    const tileSize = Math.max(
+      1,
+      Math.min(52, (contentWidth - gap * (columns - 1)) / columns)
+    );
+    grid.style.setProperty("--attachment-block-columns", String(columns));
+    grid.style.setProperty("--attachment-block-size", tileSize.toFixed(2) + "px");
+  }
+
+  function syncMessageAttachmentBlocks() {
+    if (!chatInner) return;
+    chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(fitAttachmentBlockGrid);
+  }
+
+  function syncAttachmentBlockLayouts() {
+    syncComposerAttachmentBlocks();
+    syncMessageAttachmentBlocks();
+  }
+
+  function syncComposerAttachmentBlocks() {
+    if (!composerAttachmentBlocks) return;
+    const hasQuotes = composerQuotes
+      && !composerQuotes.classList.contains("hidden")
+      && composerQuotes.childElementCount > 0;
+    const hasAttachments = composerAttachments
+      && !composerAttachments.classList.contains("hidden")
+      && composerAttachments.childElementCount > 0;
+    const hasItems = hasQuotes || hasAttachments;
+    composerAttachmentBlocks.classList.toggle("hidden", !hasItems);
+    if (!hasItems) {
+      composerAttachmentBlocks.style.removeProperty("--attachment-block-columns");
+      composerAttachmentBlocks.style.removeProperty("--attachment-block-size");
+      return;
+    }
+    fitAttachmentBlockGrid(composerAttachmentBlocks);
+  }
+
+  if (composerAttachmentBlocks && typeof ResizeObserver !== "undefined") {
+    const composerAttachmentObserver = new ResizeObserver(syncAttachmentBlockLayouts);
+    composerAttachmentObserver.observe(composerAttachmentBlocks);
+    composerAttachmentObserver.observe(chatScroll);
+  } else {
+    window.addEventListener("resize", syncAttachmentBlockLayouts);
   }
 
   function toast(message) {
@@ -654,6 +761,8 @@ window.App = window.App || {};
   composerWrap, contextTokenStatus, contextTokenSummary,
   contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn,
   voiceBtn, stopGroup, stopMenuBtn, queueMenu,
+  composerAttachmentBlocks, syncComposerAttachmentBlocks, syncMessageAttachmentBlocks,
+  fitAttachmentBlockGrid,
   composerAttachments, pendingOutbox, contextTokenTodoSlot,
   composerQuotes,
   todoPanelHost, askModal, askQuestions,
