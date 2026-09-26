@@ -246,7 +246,8 @@
       try {
         obj = JSON.parse(trimmed);
       } catch (_) { return; }
-      parsedLines.push({ index: idx, object: obj });
+      const lineRecord = { index: idx, object: obj, compactionAnchored: false };
+      parsedLines.push(lineRecord);
       if (obj.event === "chat_round" && Array.isArray(obj.events)) {
         candidateRoundNo += 1;
         roundTimeWindows.push({ round: candidateRoundNo, entry: obj });
@@ -257,6 +258,7 @@
             && Number.isInteger(anchorIndex) && anchorIndex >= 0) {
           if (!anchoredCompactionLines[anchorRound]) anchoredCompactionLines[anchorRound] = [];
           anchoredCompactionLines[anchorRound].push(obj);
+          lineRecord.compactionAnchored = true;
         }
       }
     });
@@ -294,6 +296,22 @@
       return null;
     }
 
+    // 先为所有旧式 session 压缩事件推断轮次锚点，再进入记录渲染循环。
+    // 事件行可能因旧版写入时序落在 chat_round 行之后；若边读边推断，目标轮次
+    // 已渲染完，只能在 EOF 兜底追加，导致压缩块出现在会话末尾。
+    parsedLines.forEach(function (lineRecord) {
+      const obj = lineRecord.object;
+      if (obj.event !== "context_compaction" || lineRecord.compactionAnchored) return;
+      const inferred = inferLegacyRoundAnchor(obj);
+      if (!inferred) return;
+      if (!pendingRoundCompactions[inferred.round]) pendingRoundCompactions[inferred.round] = [];
+      pendingRoundCompactions[inferred.round].push({
+        event: obj,
+        eventIndex: inferred.eventIndex,
+      });
+      lineRecord.compactionAnchored = true;
+    });
+
     parsedLines.forEach(function (lineRecord) {
       const idx = lineRecord.index;
       const obj = lineRecord.object;
@@ -305,25 +323,9 @@
       }
       // 压缩过程事件行（与 SSE 实时推送同一份 payload，字段一致）
       if (obj.event === "context_compaction") {
-        const displayRound = Number(obj.display_round);
-        const displayEventIndex = Number(obj.display_event_index);
-        if (Number.isInteger(displayRound) && displayRound > 0
-            && Number.isInteger(displayEventIndex) && displayEventIndex >= 0) {
-          // 带轮内锚点的压缩行已在预扫描阶段按轮次收集（anchoredCompactionLines），
-          // 此处跳过：即使物理位置在锚定轮次行之后（旧版后端"回答插入/编辑重发"
-          // 收尾产生），也会在解析到该轮次时按锚点归位合并，不依赖文件顺序。
-          return;
-        }
-        // 无锚点（旧 JSONL）：按时间窗推断轮次锚点，插回对应轮次
-        const inferred = inferLegacyRoundAnchor(obj);
-        if (inferred) {
-          if (!pendingRoundCompactions[inferred.round]) pendingRoundCompactions[inferred.round] = [];
-          pendingRoundCompactions[inferred.round].push({
-            event: obj,
-            eventIndex: inferred.eventIndex,
-          });
-          return;
-        }
+        // 显式/推断锚点行已在预扫描阶段排入目标轮次；无锚点且不在任何
+        // 轮次时间窗内的空闲手动压缩，继续按 JSONL 物理顺序显示。
+        if (lineRecord.compactionAnchored) return;
         appendCompactionRecord(records, obj);
         return;
       }

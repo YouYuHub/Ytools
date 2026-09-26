@@ -136,6 +136,47 @@ class CompactionEventPersistenceTests(unittest.IsolatedAsyncioTestCase):
             for event in entries[3]["events"]
         ))
 
+    async def test_late_session_compaction_events_infer_anchor_from_completed_round(self):
+        """pending round 不可见时，事件时间落在已完成轮次内也应保存锚点。"""
+        await self._add_round("已完成轮次")
+        with self.manager._write_guard():
+            meta, entries = chat_memory._load_meta_and_entries(
+                self.manager._file_path, self.session_id
+            )
+            round_entry = entries[0]
+            round_entry["started_at"] = "2026-09-01 10:00:00"
+            round_entry["ended_at"] = "2026-09-01 10:00:10"
+            events = round_entry["events"]
+            events[0]["timestamp"] = "2026-09-01 10:00:01"
+            events[1]["timestamp"] = "2026-09-01 10:00:04"
+            events[2]["timestamp"] = "2026-09-01 10:00:09"
+            chat_memory._write_meta_and_entries(self.manager._file_path, meta, entries)
+
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "session", "phase": "start",
+            "role": "assistant", "timestamp": "2026-09-01 10:00:06",
+            "context_summary": "待压缩历史",
+        })
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "session", "phase": "done",
+            "role": "assistant", "timestamp": "2026-09-01 10:00:07",
+            "summary_text": "累计摘要",
+        })
+
+        entries = self._load_entries()
+        self.assertEqual(
+            [entry.get("event") for entry in entries],
+            ["chat_round", "context_compaction", "context_compaction"],
+        )
+        self.assertEqual(
+            (entries[1]["display_round"], entries[1]["display_event_index"]),
+            (1, 2),
+        )
+        self.assertEqual(
+            (entries[2]["display_round"], entries[2]["display_event_index"]),
+            (1, 2),
+        )
+
     async def test_insert_round_relocates_anchored_compaction_rows_before_round(self):
         """回答插入（ask_user 再答）收尾：锚定到插入轮次的跨轮压缩行重排到轮次行之前。
 

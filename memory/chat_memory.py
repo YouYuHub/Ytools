@@ -1936,6 +1936,54 @@ class ChatMemoryManager:
             _write_meta_and_entries(self._file_path, meta, entries)
         return "记录成功"
 
+    def _infer_completed_round_compaction_anchor(
+        self,
+        entries: list[dict[str, Any]],
+        timestamp: Any,
+    ) -> tuple[int, int] | None:
+        """为迟到写入的 session 压缩事件推断已完成轮次锚点。
+
+        正常运行中，任务内压缩写入时 pending round 可提供精确锚点。若事件写入
+        时 pending round 已收尾/不可见，但事件时间仍落在某个已落盘轮次内，补上
+        同一套 display_round/display_event_index，避免历史回放只能把它放到末尾。
+        空闲手动压缩发生在 ended_at 之后，不会命中这个严格时间窗。
+        """
+        compaction_time = self._parse_timestamp_value(timestamp)
+        if compaction_time is None:
+            return None
+
+        round_number = 0
+        matched: tuple[int, int] | None = None
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("event") != "chat_round":
+                continue
+            round_number += 1
+            events = entry.get("events") if isinstance(entry.get("events"), list) else []
+            start = self._parse_timestamp_value(entry.get("started_at"))
+            if start is None and events:
+                start = self._parse_timestamp_value(
+                    events[0].get("timestamp") if isinstance(events[0], dict) else None
+                )
+            end = self._parse_timestamp_value(entry.get("ended_at"))
+            if end is None and events:
+                end = self._parse_timestamp_value(
+                    events[-1].get("timestamp") if isinstance(events[-1], dict) else None
+                )
+            if start is None or end is None or not (start <= compaction_time < end):
+                continue
+
+            event_index = 0
+            for index, event in enumerate(events):
+                event_time = self._parse_timestamp_value(
+                    event.get("timestamp") if isinstance(event, dict) else None
+                )
+                if event_time is not None and event_time <= compaction_time:
+                    event_index = index + 1
+            # 与前端的逆序时间窗查找一致：若编辑/插入历史造成时间窗重叠，
+            # 后出现的 chat_round 优先。
+            matched = (round_number, event_index)
+        return matched
+
     async def add_context_compaction_event(self, payload: dict[str, Any]) -> str:
         """追加压缩过程事件。
 
@@ -1980,6 +2028,22 @@ class ChatMemoryManager:
                         "display_event_index",
                         len(pending_round.get("events", [])),
                     )
+                else:
+                    inferred = self._infer_completed_round_compaction_anchor(
+                        entries, record.get("timestamp")
+                    )
+                    if inferred is not None:
+                        anchor_round = record.get("display_round")
+                        anchor_index = record.get("display_event_index")
+                        if not (
+                            isinstance(anchor_round, int)
+                            and not isinstance(anchor_round, bool)
+                            and anchor_round > 0
+                            and isinstance(anchor_index, int)
+                            and not isinstance(anchor_index, bool)
+                            and anchor_index >= 0
+                        ):
+                            record["display_round"], record["display_event_index"] = inferred
                 entries.append(record)
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)

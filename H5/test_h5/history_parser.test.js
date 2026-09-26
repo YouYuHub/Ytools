@@ -252,6 +252,32 @@ test("parseHistory: 锚点行位于轮次行之后（旧版后端反序文件）
   assert.equal(parsed.records[4].summary_text, "压缩后摘要");
 });
 
+test("parseHistory: 无锚点的迟到压缩行按轮次时间窗回插而非追加到会话末尾", function () {
+  const round = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "任务问题" },
+    { timestamp: "2026-08-08 18:00:10", role: "tool", tool_name: "read_file", result: "内容" },
+    { timestamp: "2026-08-08 18:00:20", role: "assistant", content: "继续处理" },
+  ]);
+  // 模拟旧 JSONL：轮次先整体落盘，session 压缩 start/done 稍后才单独追加；
+  // 事件本身没有 display_round/display_event_index，但时间仍在该轮中。
+  const start = {
+    event: "context_compaction", scope: "session", phase: "start",
+    timestamp: "2026-08-08 18:00:15", context_summary: "压缩前轨迹",
+  };
+  const done = {
+    event: "context_compaction", scope: "session", phase: "done",
+    timestamp: "2026-08-08 18:00:16", summary_text: "压缩摘要",
+  };
+  const parsed = historyParser.parseHistory(
+    [round, JSON.stringify(start), JSON.stringify(done)].join("\n")
+  );
+  assert.deepEqual(parsed.records.map(function (r) {
+    return r.kind === "compaction" ? r.phase : r.content || r.kind;
+  }), ["任务问题", "toolResult", "start", "done", "继续处理"]);
+  assert.equal(parsed.records[2].round, 1);
+  assert.equal(parsed.records[3].round, 1);
+});
+
 test("parseHistory: 锚定轮次尚未收尾的锚点行保留在可见历史末尾", function () {
   // 任务进行中刷新：压缩行已落盘（带锚点），其锚定轮次行还没写（收尾才落盘）
   const round = fakeRound([
