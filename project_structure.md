@@ -43,11 +43,12 @@ agent_tool_sse/
 ├── memory/                      # 记忆持久化层
 │   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘 + 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
-│   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）
+│   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）、引用快照前置（<quote_list> 模型视图/压缩源【引用原文】）
+│   ├── quote_format.py          # 选中文本引用：规整/限额校验（5 段/4000 字/12000 字）、XML 转义、<quote_list> 序列化、模型视图前置（前后端同口径）
 │   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（小文件内联/大文件节选+按需读取）与记录查找
 │
 ├── routers/                     # API 路由层
-│   ├── chat_router.py           # 聊天主接口 + 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
+│   ├── chat_router.py           # 聊天主接口（含 quotes 请求校验）+ 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置；压缩失败重试 GET/POST /chat_config/compaction_retry
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
@@ -85,11 +86,13 @@ agent_tool_sse/
 │   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
 │   │                            #   session_utils.js / session_group_utils.js（会话分组纯逻辑：
 │   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
-│   │                            #   名称校验）等工具模块 + app.js（入口）+
-│   │                            #   app/（16 个功能模块：core/sessions/session_groups/stats/workdir/
+│   │                            #   名称校验）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
+│   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app.js（入口）+
+│   │                            #   app/（17 个功能模块：core/sessions/session_groups/stats/workdir/
 │   │                            #   messages/history/compaction/builtin/user_profile/media/skills/composer/
-│   │                            #   model_panel/tools/chat；session_groups=侧边栏分组区
-│   │                            #   UI/交互；skills=提示词库可拖拽对话框；
+│   │                            #   model_panel/tools/chat/quotes；session_groups=侧边栏分组区
+│   │                            #   UI/交互；skills=提示词库可拖拽对话框；quotes=引用选区浮钮/
+│   │                            #   草稿卡片/气泡卡片；
 │   │                            #   user_profile=访客显示名内联编辑（.env USER_NAME））
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
@@ -97,7 +100,7 @@ agent_tool_sse/
 │   └── test_h5/                 # 前端单元测试（api/format_utils/history_parser/markdown/
 │                                #   session_list_utils/session_group_utils/session_utils/
 │                                #   session_marquee/session_open_guard/session_title_flow/table_export/
-│                                #   zoom_utils/widget_reuse/file_history_sync，node --test）
+│                                #   zoom_utils/widget_reuse/file_history_sync/quote_utils，node --test）
 │
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
@@ -112,7 +115,7 @@ agent_tool_sse/
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
                                  #   test_context_compaction / test_chat_router / test_sub_agent /
-                                 #   test_user_profile_router / test_session_groups 等）
+                                 #   test_quote_selection / test_user_profile_router / test_session_groups 等）
 ```
 
 ---
@@ -237,10 +240,13 @@ agent_tool_sse/
   - 支持按行删除/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
   - **多会话分享/导入**：`export_sessions_to_zip` 打包（各会话 jsonl + `session_files/<upload_id>/` 数据 + manifest.json）；`list_zip_sessions` 预检（不落盘，返回会话清单与本地冲突标记）；`import_sessions_from_zip` 两阶段提交（冲突策略 ask/overwrite/rename/skip，逐会话决策，另存时上传目录归属随新会话 ID 改名并回写 `_meta.upload_id`），路由见 `/chat_history/export_zip|import_preview|import_package`
 - **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）
-  - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）
+  - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）；带引用快照的轮次在用户消息前置 `<quote_list>`（模型视图，JSONL 原始历史不含标签）
+- **引用快照（选中文本引用到提问，`docs/quote_selection_design.md`）**：
+  - `quote_format.py`：规整（换行统一/去首尾空白/丢弃 UI 字段）、限额（5 段/单段 4000 字/合计 12000 字，strict=请求校验拒绝、容错=历史读取）、XML 转义与 `<quote_list>` 序列化；同一函数用于当前轮请求、历史轮次上下文与压缩源
+  - JSONL 用户事件保存原始 `content` + `quotes` 快照；标题/问题索引只取问题正文；上游请求由 `copy_for_request` 兜底剥离 `quotes` 字段
 
 ### 6. 配置模型（`config.py`）
-- `Message`：对话消息（role/content/tool_calls/tool_call_id/reasoning_content/refusal）
+- `Message`：对话消息（role/content/tool_calls/tool_call_id/reasoning_content/refusal/quotes——quotes 为选中文本引用快照，仅本轮最新 user 消息使用）
 - `ChatLLMRequest`：聊天请求全参（超时/采样参数/工具选择/会话隔离字段）；`tools` 为服务端内部字段；支持 use_backend_history/backend_history_rounds
 - `ChatModelSelection`：模型切换请求（provider/model/role/parameter，role ∈ chat_model/compaction_model/title_model/sub_agent_model）
 - `HistoryCompactionConfig`：跨轮保留数、统一压缩触发比例、摘要预算比例（`summary_budget_ratio`）、超大结果拒绝系数与连续拒绝上限
@@ -288,6 +294,7 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 - 公式：KaTeX 0.18.7 本地 vendor（$…$、$$…$$、\(…\)、\[…\] 四种定界符；代码栅栏先遮蔽防误提取；价格文本防误判；无 katex 环境降级原文）
 - 图片视图自适应：SVG 按 viewBox 比例注入 aspect-ratio 内联样式，默认填满控件宽度（仅极竖长 >1.7 屏才按高度收窄），导出图片按实际渲染尺寸超采样 + contain 裁剪
 - 滚动：自动贴底暂停机制（用户上滚阅读时流式 delta 不再强制拉回，滚回底部或点「回到底部」恢复）
+- **选中文本引用到提问**：在用户提问正文/助手回答正文中选中文字后浮钮「引用到提问」→ 引用快照卡片进输入框上方（可多段、可移除、随会话草稿保存/恢复、随引导与队列暂存派发）；发送时作为用户消息同级 `quotes` 字段上送（结构化，不打标签进 content），历史回放/流恢复重建引用卡片，编辑可保留或移除引用，复制输出人可读文本（"引用 1：…\n\n问题：…"）；引用快照随消息落盘，模型视图由后端序列化为 `<quote_list>`（见 `memory/quote_format.py`）
 - 工具函数均有对应单元测试（`H5/test_h5/`，node --test 运行）
 
 ### 10. API 接口总览

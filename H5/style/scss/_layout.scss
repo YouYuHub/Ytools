@@ -40,6 +40,10 @@
   min-width: 0;
   position: relative;
   overflow: hidden;
+  // 主区可能因侧栏拖宽而变窄；内部布局断点应根据剩余宽度判断，
+  // 而不是只看整个浏览器窗口宽度。
+  container-name: main-area;
+  container-type: inline-size;
 
   // 移动端才显示的汉堡按钮（限定在主区内，避免侧边栏误用）
   .only-mobile {
@@ -69,7 +73,7 @@
     flex-direction: column;
     gap: 24px;
 
-    @media (max-width: 768px) {
+    @container main-area (max-width: 768px) {
       padding: 60px 16px var(--chat-bottom-padding, 48px);
     }
   }
@@ -143,7 +147,10 @@
     pointer-events: auto;
   }
 
-  @media (max-width: 768px) {
+}
+
+@container main-area (max-width: 768px) {
+  .main .bottom {
     padding: 0 8px 10px;
   }
 }

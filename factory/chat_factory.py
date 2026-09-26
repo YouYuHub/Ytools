@@ -37,6 +37,11 @@ from memory.file_memory import (
 )
 from memory.chat_history_format import content_part_to_text
 from memory.chat_history_format import RECENT_QUESTIONS_TOKEN_BUDGET
+from memory.quote_format import (
+    content_with_quotes,
+    normalize_quotes,
+    serialize_quotes_for_model,
+)
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
@@ -98,6 +103,7 @@ from factory.agent_runtime.chat_runtime import (
 from factory.agent_runtime.context_compaction import (
     ContextCompactionError,
     _find_current_round_start,
+    _has_tool_trace,
     build_oversized_tool_feedback,
     compact_active_round_context_if_needed,
     compact_session_history_if_needed,
@@ -427,6 +433,7 @@ class _SessionStream:
         self.done = False
         self.question_text = ""   # 本轮初始用户提问（回放时补前端气泡用）
         self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
+        self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.cond = asyncio.Condition()
@@ -624,11 +631,9 @@ async def _compact_task_context_if_needed(
 
     触发：全量上下文估算 > threshold（单轮阈值 = min(聊天,压缩)窗口 × 比例）。
     行为：
-    1. 跨轮压缩持久层历史（force_all：不保留原始轮次；预算 = 阈值 × 0.4）——
-       老轮次压成累计摘要并重建全历史最近问题索引，压缩游标推进；
-    2. 从持久层重建内存消息的历史部分：主 system（persona+运行时文本+文件块）
-       保持在首位，累计摘要 system 与最近问题排在其后；
-    3. 当前任务轮的消息（最后一条用户问题起）原样保留，交由单轮压缩继续管理。
+    1. 按当前完整窗口目标与不可压缩内容动态计算历史预算，压缩超预算的已完成轮次；
+    2. 从持久层重建历史消息，主 system 保持在首位，累计摘要与最近问题排在其后；
+    3. 暂时原样保留当前任务轮，随后由单轮压缩将工具轨迹纳入同一个完整窗口目标。
 
     返回重建后的 messages；未触发返回 None。
     """
@@ -658,16 +663,43 @@ async def _compact_task_context_if_needed(
         threshold - system_tokens - tools_tokens - active_tokens
         - summary_reserve - RECENT_QUESTIONS_TOKEN_BUDGET - safety_reserve,
     )
-    # 设了历史压缩目标时以其为准（目标 < 可用空间才收紧）：目标模式要的是
-    # "历史 ≤ 目标"的稳定低成本，而不是"能塞多少塞多少"
+    # 任务进行中触发压缩时，目标约束完整请求而非只约束历史：为系统/工具定义、
+    # 当前用户问题、本轮工具轨迹摘要和最近问题索引预留空间，剩余预算再分给历史。
+    # 当前轮工具结果稍后会由单轮压缩替换成摘要；用户问题始终原样保留。
     history_target = resolve_history_target_tokens(compaction_settings)
+    target_history_budget = 0
     if history_target > 0:
-        history_budget = min(history_budget, history_target)
+        preserved_user_messages = [
+            message for message in active_messages
+            if isinstance(message, dict) and message.get("role") == "user"
+        ]
+        if _has_tool_trace(active_messages):
+            active_fixed_tokens = estimate_send_context_tokens(preserved_user_messages)
+            active_summary_reserve = resolve_effective_summary_budget(compaction_settings)
+        else:
+            # 没有可摘要的工具轨迹時，本轮内容不可压缩，必须按原文为其留预算。
+            active_fixed_tokens = active_tokens
+            active_summary_reserve = 0
+        target_history_budget = max(
+            2048,
+            history_target - system_tokens - tools_tokens
+            - active_fixed_tokens - active_summary_reserve
+            - RECENT_QUESTIONS_TOKEN_BUDGET - 64,
+        )
+        history_budget = min(history_budget, target_history_budget)
+    task_summary_budget = (
+        resolve_effective_summary_budget(
+            compaction_settings,
+            target_tokens=history_budget,
+        )
+        if target_history_budget > 0 else None
+    )
     print(
         f"[INFO] 任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
         f"动态历史预算 {history_budget}（系统 {system_tokens} + 工具 {tools_tokens} + "
         f"当前轮 {active_tokens} + 摘要预留 {summary_reserve} + 问题索引 "
-        f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}），"
+        f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}；"
+        f"完整窗口目标 {history_target or '未启用'}，目标历史预算 {target_history_budget or '未启用'}），"
         f"预算内轮次保留原始对话，超出部分压缩"
     )
     await compact_session_history_if_needed(
@@ -675,6 +707,7 @@ async def _compact_task_context_if_needed(
         tool_request,
         settings=compaction_settings,
         budget_tokens=history_budget,
+        summary_budget_tokens=task_summary_budget,
         enforce=True,
         # 不再 force_all：预算内的最近轮次保留为原始对话（保真），仅压缩超出
         # 预算的旧轮次；压缩量由实际可用空间（或历史压缩目标）决定。
@@ -1214,11 +1247,25 @@ async def _run_chat_generation(
                 latest_user_text = content_part_to_text(
                     msg.get("content"), include_media_labels=False
                 ).strip()
-                if latest_user_text:
+                # 纯媒体提问（无文本）但带引用快照时同样挂到本轮：
+                # 引用快照仍需落盘、随回放 marker 下发并进入模型视图
+                if latest_user_text or msg.get("quotes"):
                     latest_user_message = msg
                 break
         if latest_user_message:
-            await session_chat_memory.add_chat_history(latest_user_message)
+            # 引用快照（选中文本引用到提问，见 docs/quote_selection_design.md）：
+            # 先按容错口径规整；历史视图（JSONL）保存原始 content + 规范化
+            # quotes（供回放/编辑/复制），模型视图在下面把 <quote_list> 前置
+            # 进该条 user 消息的 content（当前轮请求与压缩源共用同一序列化）。
+            latest_user_quotes = normalize_quotes(
+                latest_user_message.get("quotes"), strict=False
+            )
+            history_message = dict(latest_user_message)
+            if latest_user_quotes:
+                history_message["quotes"] = latest_user_quotes
+            else:
+                history_message.pop("quotes", None)
+            await session_chat_memory.add_chat_history(history_message)
             if not stream.question_text:
                 stream.question_text = latest_user_text
             # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
@@ -1229,6 +1276,18 @@ async def _run_chat_generation(
                 stream.question_parts = _normalize_question_parts(
                     latest_user_message.get("content")
                 )
+            # 回放 marker 携带引用快照：刷新重连后重建引用卡片（与提问部件
+            # 同源，均为落盘/改写前的原始快照）
+            if latest_user_quotes and getattr(stream, "question_quotes", None) is None:
+                stream.question_quotes = latest_user_quotes
+            # 模型视图：<quote_list> 前置到问题正文（多模态消息作为第一个 text
+            # 部件），并从运行时消息移除自定义 quotes 字段——发给上游的请求
+            # 只含标准字段（chat_runtime.copy_for_request 另有兜底剥离）
+            if latest_user_quotes:
+                latest_user_message["content"] = content_with_quotes(
+                    latest_user_message.get("content"), latest_user_quotes
+                )
+                latest_user_message.pop("quotes", None)
         # read_media 的 media:// 引用常规集合（当前任务轮用户消息中出现的引用）；
         # 当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
         # 常规过滤传给 execute_read_media（本地/网络来源不在此列、不受过滤）。
@@ -2559,6 +2618,7 @@ async def _run_chat_generation(
                 # 压缩持久层历史（老轮次→摘要块+最近问题）并重建内存历史部分。
                 # 此前历史只在请求开始/收尾时压缩，长任务中会一路膨胀到窗口上限。
                 try:
+                    task_history_compacted = False
                     rebuilt_messages = await _compact_task_context_if_needed(
                         messages,
                         tool_request,
@@ -2586,6 +2646,7 @@ async def _run_chat_generation(
                     rebuilt_messages = None
                 if rebuilt_messages is not None:
                     messages = rebuilt_messages
+                    task_history_compacted = True
                 try:
                     current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
                     round_compaction = await compact_active_round_context_if_needed(
@@ -2593,6 +2654,8 @@ async def _run_chat_generation(
                         tool_request,
                         compression_index=current_tool_result_count,
                         event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                        # 同一次阈值触发先压历史再压本轮工具轨迹；让两部分共享目标预算。
+                        enforce_target=task_history_compacted,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -2837,13 +2900,17 @@ async def tool_chat_server(
                 # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
                 # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
                 # 纯文本提问归一为单个 text 部件），前端重建气泡/补挂编辑入口用；
-                # round 为本轮最终轮次号（round_started 帧在回放起点之前，消费端
-                # 收不到，必须随标记下发）——前端按轮次精确去重历史提问气泡。
+                # question_quotes 为本轮引用快照（选中文本引用到提问），前端
+                # 重建引用卡片用；round 为本轮最终轮次号（round_started 帧在回放
+                # 起点之前，消费端收不到，必须随标记下发）——前端按轮次精确
+                # 去重历史提问气泡。
                 # worker 模式由 evt 队列的 question_text/question_parts/
-                # live_round_no 事件同步到 stream 对应属性。
+                # question_quotes/live_round_no 事件同步到 stream 对应属性。
                 marker = {"replay": True, "question_text": stream.question_text or ""}
                 if stream.question_parts:
                     marker["question_parts"] = stream.question_parts
+                if stream.question_quotes:
+                    marker["question_quotes"] = stream.question_quotes
                 if stream.live_round_no:
                     marker["round"] = int(stream.live_round_no)
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"

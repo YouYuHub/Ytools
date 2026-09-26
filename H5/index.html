@@ -184,6 +184,9 @@
                     </button>
                 </div>
             </div>
+            <div class="sidebar-resize-handle" id="sidebarResizeHandle" role="separator" tabindex="0"
+                aria-orientation="vertical" aria-label="调整侧边栏宽度" aria-controls="sidebar"
+                aria-valuemin="220" aria-valuemax="840" aria-valuenow="240"></div>
         </aside>
 
         <div class="scrim" id="scrim"></div>
@@ -325,6 +328,8 @@
                                 <span class="menu-item-label">Skills 提示词</span>
                             </button>
                         </div>
+                        <!-- 引用卡片区：选中文本「引用到提问」后显示在输入框上方 -->
+                        <div class="composer-quotes hidden" id="composerQuotes"></div>
                         <!-- 待发送媒体附件预览区：粘贴/选择图片等媒体后显示在输入框上方 -->
                         <div class="composer-attachments hidden" id="composerAttachments"></div>
                         <!-- 流式期间引导/队列消息暂存指示器：显示待发条目，可移除放回输入框 -->
@@ -545,7 +550,7 @@
                         <input id="summaryBudgetRatio" type="number" min="0.01" max="0.5" step="0.05">
                     </label>
                     <label class="chat-setting-field">
-                        <span>压缩目标 tokens<small>把历史压到该值以内，用于降低单次输入成本；0=不设目标，取值受窗口上下限约束</small></span>
+                        <span>压缩目标 tokens<small>任务开始或手动压缩时控制历史预算；任务进行中作为完整请求软目标，后端会为系统提示、工具定义、当前消息和最近 10k 用户问题索引留空间，再分配历史与本轮工具摘要预算。固定内容较多时可能略超；0=不设目标</small></span>
                         <input id="historyTargetTokens" type="number" min="0" max="1000000" step="1000">
                     </label>
                     <p id="historyTargetHint" class="chat-settings-threshold-hint" hidden></p>
@@ -869,10 +874,14 @@
     <script src="js/session_utils.js"></script>
     <script src="js/format_utils.js"></script>
     <script src="js/history_parser.js"></script>
+    <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
+    <script src="js/quote_utils.js"></script>
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
     <script src="js/app/core.js"></script>
+    <!-- 引用交互（选区浮钮/草稿卡片/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
+    <script src="js/app/quotes.js"></script>
     <script src="js/app/sessions.js"></script>
     <script src="js/app/session_groups.js"></script>
     <script src="js/app/stats.js"></script>

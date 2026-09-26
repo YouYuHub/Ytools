@@ -16,6 +16,11 @@ from typing import Any
 from factory.agent_runtime.chat_runtime import estimate_text_tokens, sanitize_tool_call_pairing
 from memory.chat_round_store import merge_usage_dict
 from memory.file_memory import content_part_to_text
+from memory.quote_format import (
+    content_with_quotes,
+    round_entry_user_quotes,
+    serialize_quotes_for_model,
+)
 
 # 摘要块的结构化段落：字段名 -> 渲染/解析用的标准标题。
 # 顺序即渲染顺序；所有字段均为可选，空列表/空字符串渲染时整体省略。
@@ -298,18 +303,35 @@ def _resolve_round_user_content(round_entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _round_user_content_for_model(round_entry: dict[str, Any]) -> str | None:
+    """历史轮次用户问题的模型视图：问题正文（或引用块+正文）。
+
+    该轮用户消息带引用快照时，前置 `<quote_list>…</quote_list>` 组装文本
+    （序列化函数与当前轮请求/压缩源共用 memory.quote_format）；无引用或
+    全部非法时退回纯问题正文。JSONL 原始历史与标题/问题索引不经过本函数。
+    """
+    content = _resolve_round_user_content(round_entry)
+    quotes = round_entry_user_quotes(round_entry)
+    if not quotes:
+        return content
+    block = serialize_quotes_for_model(quotes)
+    if not block:
+        return content
+    return block + ("\n\n" + content if content else "")
+
+
 def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[dict[str, Any]]:
     """默认模式：工具结果不回传，仅把工具调用参数渲染成 assistant 文本行。
 
     用户消息为纯文本口径：多模态消息的媒体部件替换为 [图片] 等占位引用
     （content_part_to_text），不回传图片数据本身；仅当前轮用户消息保留
     原始多部件 content 并在发送上游前解析为 base64。media:// 落盘引用
-    不膨胀历史 JSONL。
+    不膨胀历史 JSONL。带引用快照的轮次在用户消息前置 <quote_list>
+    （模型视图，见 memory.quote_format；JSONL 原始历史不含标签）。
     """
     events = round_entry.get("events")
     if not isinstance(events, list):
         return []
-    round_user_content = _resolve_round_user_content(round_entry)
     compression_content, compress_index = _round_compression_state(round_entry)
     skipped_ids, skipped_objects = _compressed_tool_call_keys(round_entry, compress_index)
     assistant_fragments: list[str] = []
@@ -351,8 +373,9 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
         # 数据已落盘（含崩溃恢复的 interrupted 轮），丢掉它会让"请继续上面的
         # 任务"这类后续提问在模型侧完全失忆。仅剩"停止任务"等无效内容时
         # round_user_content 为空，仍返回空列表。
-        if round_user_content:
-            return [{"role": "user", "content": round_user_content}]
+        round_user_model_content = _round_user_content_for_model(round_entry)
+        if round_user_model_content:
+            return [{"role": "user", "content": round_user_model_content}]
         return []
     merged_assistant_fragments: list[str] = []
     for text in assistant_fragments:
@@ -360,9 +383,11 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
             merged_assistant_fragments.append(text)
     messages: list[dict[str, Any]] = []
     # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用）；轮次无 events
-    # 中的 user 消息时回退 question 字段的纯文本
-    if round_user_content:
-        messages.append({"role": "user", "content": round_user_content})
+    # 中的 user 消息时回退 question 字段的纯文本。带引用快照的轮次前置
+    # <quote_list>（模型视图；JSONL 原始历史不含标签，标题/索引不受影响）
+    round_user_model_content = _round_user_content_for_model(round_entry)
+    if round_user_model_content:
+        messages.append({"role": "user", "content": round_user_model_content})
     messages.append({"role": "assistant", "content": "\n".join(merged_assistant_fragments)})
     return messages
 
@@ -423,12 +448,13 @@ def _round_entry_to_tool_result_context_messages(
     events = round_entry.get("events")
     if not isinstance(events, list):
         return []
-    round_user_content = _resolve_round_user_content(round_entry)
     messages: list[dict[str, Any]] = []
     # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用），历史轮次不回传
-    # 图片数据；仅当前轮用户消息保留原始多部件 content 并在发送前解析
-    if round_user_content:
-        messages.append({"role": "user", "content": round_user_content})
+    # 图片数据；仅当前轮用户消息保留原始多部件 content 并在发送前解析。
+    # 带引用快照的轮次前置 <quote_list>（模型视图；JSONL 原始历史不含标签）
+    round_user_model_content = _round_user_content_for_model(round_entry)
+    if round_user_model_content:
+        messages.append({"role": "user", "content": round_user_model_content})
     compression_content, compress_index = _round_compression_state(round_entry)
     skipped_ids, skipped_objects = _compressed_tool_call_keys(round_entry, compress_index)
     pending_text: list[str] = []
@@ -1137,7 +1163,7 @@ def round_entry_to_minimal_messages(round_entry: dict[str, Any]) -> list[dict[st
     """
     if not isinstance(round_entry, dict):
         return []
-    round_user_content = _resolve_round_user_content(round_entry)
+    round_user_model_content = _round_user_content_for_model(round_entry)
     events = round_entry.get("events")
     answer_fragments: list[str] = []
     if isinstance(events, list):
@@ -1155,16 +1181,16 @@ def round_entry_to_minimal_messages(round_entry: dict[str, Any]) -> list[dict[st
                         answer_fragments.append(normalized)
     if not answer_fragments:
         # 中断/停止且无任何助手文本的轮次：仍保留用户问题，不整轮丢弃
-        if round_user_content:
-            return [{"role": "user", "content": round_user_content}]
+        if round_user_model_content:
+            return [{"role": "user", "content": round_user_model_content}]
         return []
     merged: list[str] = []
     for text in answer_fragments:
         if not merged or merged[-1] != text:
             merged.append(text)
     messages: list[dict[str, Any]] = []
-    if round_user_content:
-        messages.append({"role": "user", "content": round_user_content})
+    if round_user_model_content:
+        messages.append({"role": "user", "content": round_user_model_content})
     messages.append({"role": "assistant", "content": "\n".join(merged)})
     return messages
 
@@ -1208,6 +1234,12 @@ def round_entry_to_compaction_text(round_entry: dict[str, Any]) -> str:
     question = round_entry.get("question")
     if isinstance(question, str) and question.strip():
         lines.append(f"【用户问题】{question.strip()}")
+    # 引用快照（选中文本引用到提问）：压缩模型同样需要看到引用原文，
+    # 否则"针对这段解释…"类问题在摘要里会失去指代对象；序列化函数与
+    # 模型视图共用（memory.quote_format），JSONL 原始历史不含标签
+    quotes_block = serialize_quotes_for_model(round_entry_user_quotes(round_entry))
+    if quotes_block:
+        lines.append(f"【引用原文】\n{quotes_block}")
     compression_content, compress_index = _round_compression_state(round_entry)
     skipped_ids, skipped_objects = _compressed_tool_call_keys(round_entry, compress_index)
     if compression_content:

@@ -65,6 +65,10 @@ class Message(BaseModel):
     tool_call_id: Optional[str] = None  # 工具调用 ID（tool role 时必须）
     refusal: Optional[str] = None  # 拒绝内容
     reasoning_content: Optional[str] = None  # 思考内容
+    # 引用快照（结构化方案，见 docs/quote_selection_design.md）：用户消息携带
+    # 被选中的会话原文，落盘保存、模型视图由 memory.quote_format 序列化为
+    # <quote_list> 前置到问题正文；上游请求不含该自定义字段（请求构造时剥离）
+    quotes: Optional[List[dict]] = None
 
     
 class FunctionDefinition(BaseModel):

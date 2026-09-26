@@ -14,7 +14,7 @@
   position: relative;
 
   // 宽屏（>=1000px）：输入框占父容器可用宽度 85%
-  @media (min-width: 1000px) {
+  @container main-area (min-width: 1000px) {
     width: 85%;
     max-width: none;
   }
@@ -56,7 +56,7 @@
     cursor: help;
 
     // 小屏只显示百分比
-    @media (max-width: 420px) {
+    @container main-area (max-width: 420px) {
       .cts-nums {
         display: none;
       }
@@ -78,7 +78,7 @@
       color: var(--text-secondary);
     }
 
-    @media (max-width: 420px) {
+    @container main-area (max-width: 420px) {
       flex-basis: 42%;
     }
   }
@@ -98,7 +98,7 @@
       color: var(--text-secondary);
     }
 
-    @media (max-width: 768px) {
+    @container main-area (max-width: 768px) {
       display: none;
     }
   }
@@ -175,6 +175,16 @@
     flex-wrap: wrap;
   }
 
+  // 引用快照卡片可见时同样换行（.has-quotes 由 renderComposerQuotes 切换）：
+  // 引用行占满输入框上方一整行，与附件/暂存条互不挤压
+  &.has-quotes {
+    flex-wrap: wrap;
+
+    .composer-quotes {
+      flex-basis: 100%;
+    }
+  }
+
   // 超过 1 行（.grow）：输入框在上占满整行，功能条在其下
   &.grow {
     flex-direction: column;
@@ -189,6 +199,7 @@
     // column 主轴是纵向，附件/暂存行的 flex-basis:100% 会变成“高度100%”，
     // 把输入框挤出容器：grow 态复位为 auto（宽度仍由 width:100% 保证）
     .composer-attachments,
+    .composer-quotes,
     .pending-outbox {
       flex-basis: auto;
     }
@@ -267,7 +278,7 @@
   // 移动端（<=768px）：“+”图标按钮 + “设置”图标 + 语音/发送 round-btn
   // 麦克风等一律收起；参数按钮整合为纯图标“设置”；
   // 单行：[+] [输入框] [设置] [语音/发送]；变高后：[+] 左下，[设置] [语音/发送] 右下
-  @media (max-width: 768px) {
+  @container main-area (max-width: 768px) {
     #micBtn {
       display: none;
     }
@@ -312,7 +323,7 @@
 
   // 窄屏（<=445px）：始终上下两行——文本输入在上、功能按钮在下
   // （不再依赖 .grow 动态切换，布局恒定，输入框占满整行）
-  @media (max-width: 445px) {
+  @container main-area (max-width: 445px) {
     flex-direction: column;
     align-items: stretch;
     gap: 4px;
@@ -644,6 +655,16 @@ html:not([data-theme="dark"]) #voiceBtn.is-recording {
       color: var(--text-secondary);
     }
 
+    // 引用快照数量提示（选中文本引用到提问）：随消息一起暂存/派发
+    .pending-outbox-quotes {
+      flex-shrink: 0;
+      padding: 1px 8px;
+      border-radius: 999px;
+      background: var(--bg-active);
+      color: var(--text-tertiary);
+      font-size: 11px;
+    }
+
     .pending-outbox-send {
       flex-shrink: 0;
       padding: 3px 12px;
@@ -757,6 +778,106 @@ html:not([data-theme="dark"]) #voiceBtn.is-recording {
   gap: 6px;
   width: 100%;
   padding: 6px 8px 2px;
+}
+
+// 引用快照卡片（选中文本「引用到提问」）：输入框上方独立一行，
+// 卡片显示序号/来源/预览与移除按钮；多段引用纵向堆叠，整体限高滚动
+.composer-quotes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px 2px;
+  max-height: 150px;
+  overflow-y: auto;
+
+  .composer-quote {
+    position: relative;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-md, 10px);
+    background: var(--bg-code);
+  }
+
+  .composer-quote-jump {
+    appearance: none;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 34px 6px 10px;
+    border: 0;
+    border-radius: inherit;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+  }
+
+  .composer-quote-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .composer-quote-badge {
+    flex-shrink: 0;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--bg-active);
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+
+  .composer-quote-source {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-tertiary);
+    font-size: 11px;
+  }
+
+  .composer-quote-remove {
+    position: absolute;
+    top: 5px;
+    right: 6px;
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1;
+
+    &:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+  }
+
+  .composer-quote-text {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
 }
 
 .media-chip {

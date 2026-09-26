@@ -96,6 +96,7 @@ class _WorkerStreamAdapter:
         self._evt_queue = evt_queue
         self._question_text = ""
         self._question_parts = None
+        self._question_quotes = None
         self._live_round_no = None
         self.user_stop_requested = False
         self.done = False
@@ -133,6 +134,20 @@ class _WorkerStreamAdapter:
         self._evt_queue.put({
             "type": "question_parts",
             "parts": self._question_parts,
+        })
+
+    # 本轮引用快照（选中文本引用到提问）：经 evt 队列同步到主进程
+    # stream.question_quotes（附接回放 marker 携带，前端重建引用卡片用）
+    @property
+    def question_quotes(self):
+        return self._question_quotes
+
+    @question_quotes.setter
+    def question_quotes(self, value) -> None:
+        self._question_quotes = value if isinstance(value, list) or value is None else None
+        self._evt_queue.put({
+            "type": "question_quotes",
+            "quotes": self._question_quotes,
         })
 
     # 本轮最终轮次号：round_started 推送时由生成循环写入，经 evt 队列同步到
@@ -711,6 +726,12 @@ def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], No
             #（_SessionStream 为普通属性，无 setter 副作用）
             try:
                 stream.question_parts = evt.get("parts")
+            except Exception:
+                pass
+        elif evt_type == "question_quotes":
+            # 本轮引用快照：附接回放 marker 携带（前端重建引用卡片用）
+            try:
+                stream.question_quotes = evt.get("quotes")
             except Exception:
                 pass
         elif evt_type == "live_round_no":

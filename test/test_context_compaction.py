@@ -80,6 +80,48 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
             max_oversized_rejections=max_rejections,
         )
 
+    async def test_oversized_summary_source_is_fully_chunked_before_model_calls(self):
+        """单轮/单轮次源超过模型输入预算时，中段也必须完整送入分段摘要。"""
+        original_require = compaction.require_default_chat_config
+        compaction.require_default_chat_config = lambda: {
+            "selected_provider_name": "Test Provider",
+            "selected_model_id": "test-model",
+            "apiType": "chat-completions",
+            "maxInputTokens": 20_000,
+            "maxOutputTokens": 512,
+        }
+        source = "\n\n".join(
+            f"BLOCK_{index:02d}_MIDDLE_EVIDENCE_" + ("x" * 2_000)
+            for index in range(48)
+        )
+        try:
+            result = await compaction.summarize_context_text(
+                source,
+                ChatLLMRequest(messages=[{"role": "user", "content": "q"}]),
+                scope="跨轮会话历史",
+                settings=self._settings(),
+            )
+        finally:
+            compaction.require_default_chat_config = original_require
+
+        self.assertTrue(result.source_was_chunked)
+        self.assertGreater(result.source_chunk_count, 1)
+        self.assertFalse(result.source_was_truncated)
+        original_parts = [
+            captured["request"].messages[1].content
+            for captured in self.captured_requests[:result.source_chunk_count]
+        ]
+        self.assertEqual("".join(original_parts), source)
+        self.assertTrue(all(f"BLOCK_{index:02d}_MIDDLE_EVIDENCE_" in "".join(original_parts)
+                            for index in range(48)))
+
+    def test_token_chunk_splitter_preserves_all_text(self):
+        source = "\n\n".join(f"段落-{index}-" + ("详细内容" * 120) for index in range(30))
+        chunks = compaction._split_text_to_token_chunks(source, 300)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunks), source)
+        self.assertTrue(all(compaction.estimate_text_tokens(chunk) <= 300 for chunk in chunks))
+
     async def test_summarize_falls_back_to_chat_model_then_raises(self):
         """压缩模型失败 -> 聊天模型重试一次；重试仍失败 -> 抛 ContextCompactionError。"""
         calls = []
@@ -1180,6 +1222,7 @@ class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_result.triggered)
         self.assertEqual(len(first_result.summary_blocks), 1)
         marker = first_result.messages[1]
+        first_call_count = len(self.captured_requests)
 
         second_result = await compaction.compact_active_round_context_if_needed(
             self._round_message("请处理任务", ["第二批结果" * 4000], block_marker=marker),
@@ -1191,12 +1234,16 @@ class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second_result.summary_blocks), 1)
         self.assertEqual(second_result.summary_blocks[0]["index"], 2)
         # 第二次压缩本身只读取新轨迹（不含旧摘要与此前轨迹渲染标记）。
-        second_source = self.captured_requests[1].messages[-1].content
-        self.assertNotIn("段摘要：1", second_source)
-        self.assertNotIn("【此前本轮摘要】", second_source)
+        second_sources = [
+            request.messages[-1].content
+            for request in self.captured_requests[first_call_count:]
+        ]
+        self.assertTrue(any("第二批结果" in source for source in second_sources))
+        self.assertTrue(all("段摘要：1" not in source for source in second_sources))
+        self.assertTrue(all("【此前本轮摘要】" not in source for source in second_sources))
         # 拼接优先：新旧摘要同为标准分段结构时在本地直接合并，预算内不再
-        # 消耗模型调用——整个流程只有两次批压缩调用，无独立合并请求。
-        self.assertEqual(len(self.captured_requests), 2)
+        # 消耗模型调用——虽然长来源可能被拆成多段，但不应额外向模型请求累计合并。
+        self.assertTrue(all("【已有累计摘要】" not in source for source in second_sources))
         # 累计摘要只保留一个块，游标覆盖到最新工具结果
         markers = [
             msg for msg in second_result.messages
@@ -1204,8 +1251,8 @@ class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(markers), 1)
         self.assertEqual(markers[0]["_context_compaction_index"], 2)
-        self.assertIn("段摘要：1", second_result.summary_text)
-        self.assertIn("段摘要：2", second_result.summary_text)
+        self.assertIn(first_result.summary_text, second_result.summary_text)
+        self.assertNotEqual(first_result.summary_text, second_result.summary_text)
         self.assertEqual(second_result.compress_index, 2)
 
     async def test_single_round_cumulative_summary_keeps_old_segments(self):
@@ -1575,6 +1622,8 @@ class RecentQuestionsRetentionTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(done["before_tokens"], 425_000)
             self.assertEqual(done["trigger_threshold"], 425_000)
             self.assertEqual(done["token_limit"], 60_000)
+            self.assertEqual(done["budget_scope"], "history")
+            self.assertEqual(done["target_tokens"], 60_000)
         finally:
             compaction.resolve_model_max_input_tokens = original_chat
             compaction.resolve_context_compaction_model_config = original_model

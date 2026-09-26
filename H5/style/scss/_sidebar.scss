@@ -4,6 +4,7 @@
 // 必须保持顶层扁平，不能嵌套进 .panel-head。
 
 .sidebar {
+  position: relative;
   flex-shrink: 0;
   display: flex;
   background: var(--bg-sidebar);
@@ -20,6 +21,42 @@
     .panel {
       display: none;
     }
+
+    .sidebar-resize-handle {
+      display: none;
+    }
+  }
+
+  .sidebar-resize-handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -5px;
+    z-index: 2;
+    width: 10px;
+    cursor: col-resize;
+    touch-action: none;
+
+    &::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 4px;
+      width: 2px;
+      background: var(--border-strong);
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+
+    &:hover::after,
+    &:focus-visible::after {
+      opacity: 1;
+    }
+
+    &:focus-visible {
+      outline: none;
+    }
   }
 
   // ---------- 移动端 ----------
@@ -30,6 +67,14 @@
     left: 0;
     transform: translateX(0);
     transition: transform 0.25s ease;
+
+    .sidebar-resize-handle {
+      display: none;
+    }
+
+    .panel {
+      width: 240px;
+    }
 
     // 抽屉模式：折叠即整体滑出屏幕，面板保持可见
     &.collapsed {
@@ -53,6 +98,23 @@
     .panel {
       width: 100%;
     }
+  }
+}
+
+body.sidebar-resizing {
+  cursor: col-resize;
+  user-select: none;
+
+  &::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    cursor: col-resize;
+  }
+
+  .sidebar-resize-handle::after {
+    opacity: 1;
   }
 }
 

@@ -1107,9 +1107,9 @@
       const parsed = HistoryParser.parseHistory(text);
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
       // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
-      // marker / round_started 回填），无轮次号时回退提问文本匹配
+      // marker / round_started 回填），无轮次号时回退提问文本 + 引用快照匹配
       const visibleRecords = active
-        ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText, active.round)
+        ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText, active.round, active.quotes)
         : parsed.records;
       App.setSessionUsage(parsed.metaUsage);
       App.refreshContextTokenStats(id);

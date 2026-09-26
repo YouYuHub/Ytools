@@ -13,7 +13,7 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| messages | `Message[]` | 必填 | 对话消息。`Message` = `{role, content?, name?, tool_calls?, tool_call_id?, refusal?, reasoning_content?}`，role ∈ `user/assistant/system/tool` |
+| messages | `Message[]` | 必填 | 对话消息。`Message` = `{role, content?, name?, tool_calls?, tool_call_id?, refusal?, reasoning_content?, quotes?}`，role ∈ `user/assistant/system/tool`。`quotes`（可选，仅本轮最新 user 消息）：选中文本引用快照 `[{text, source?{role?, session_id?, round?}}]`，最多 5 段、单段 ≤4000 字符、合计 ≤12000 字符，超限/非法直接 400 可读错误（不静默截断）；旧请求无该字段行为不变 |
 | tool_names | `string[]?` | null | 本轮工具白名单；不传时按会话覆盖、全局默认的顺序读取工具选择，显式传 `[]` 为无工具模式；未知工具名会被忽略并告警 |
 | session_id | `string` | "default" | 会话ID，隔离聊天历史与文件记忆 |
 | max_tokens | `int` | 8192 | 最大生成 token |
@@ -35,7 +35,7 @@
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
 - `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）。推送时同步记录到任务流（`live_round_no`），供回放标记携带——`round_started` 帧位于回放起点之前，附接消费端收不到，轮次号必须随回放标记下发
-- `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配
+- `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "question_quotes": <本轮引用快照，无引用时省略；旧后端无此字段>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览；引用卡片同源重建），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配（带引用时同时比较引用签名）
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
@@ -61,6 +61,17 @@
 - **触发来源**（`trigger_reason`，随 done 事件落盘，历史回放可见）：`auto`=任务开始自动（历史超阈值）、`task`=任务内检查点（当前轮工具轨迹推高全量上下文超阈值，强制压缩历史；`trigger_context_tokens` 为全量规模、`trigger_threshold` 为单轮阈值）、`first_call`=首次调用超窗降级（`trigger_context_tokens` 为首调用全量规模、`trigger_threshold` 为模型窗口）、`manual`=用户手动。**收尾压缩（`post`）已移除**：任务结束不再压缩（避免刚完成的轮次被并入摘要导致后续编辑失准）；历史数据中仍可能出现该值。前端 detail 行显示"触发阈值 … · 本批预算 … · 触发来源 …（全量上下文 X > 阈值 Z）"，与"本批预算"（压缩批输入预算）明确区分。
 - **压缩失败策略**：压缩模型未配置或配置不可用时自动使用当前聊天模型压缩；压缩模型调用失败时换聊天模型重试一次；聊天模型仍失败则抛出终止级错误，**任务终止**（不再节选降级）——请求前/单轮压缩失败会立即推送错误帧并停止生成。
 - **任务中断恢复**：压缩结果采用"完成后一次性写入"，中断不会留下半成品数据。若上次任务在压缩进行中被终止（有 `start` 无 `done`），下次请求开始时会自动补一条 `aborted` 事件（前端把对应条目置为中断态），未覆盖的轮次由常规压缩按预算**重新压缩**。
+
+#### 引用快照（选中文本引用到提问）
+
+用户在聊天正文中选中文字后点击浮钮「引用到提问」，引用文本作为快照随该条用户消息上送（结构化字段，见请求体 `messages[].quotes`）。两种视图分离（设计文档 `docs/quote_selection_design.md`）：
+
+- **历史视图**：JSONL 用户事件保存原始 `content`（问题正文/多模态部件）与 `quotes` 快照数组（`[{text, source?{role?, session_id?, round?}}]`，`id` 等 UI 字段不入库）；前端回放绘制引用卡片、编辑时可保留/移除、复制输出人可读文本（"引用 1：…\n\n问题：…"）。标题、侧栏预览、问题导航、`chat_round.question` 与最近问题索引**只取问题正文**，不混入引用原文。
+- **模型视图**：送入聊天模型/压缩模型前，由 `memory/quote_format.serialize_quotes_for_model` 统一把引用序列化为 `<quote_list><li>…</li></quote_list>` 前置到该条 user 消息文本（多模态消息作为第一个 text 部件），XML 文本按 `&`、`<`、`>`、`"`、`'` 顺序转义（引用中含 `</li>`/代码/换行仍作为引用内容）。同一函数用于当前轮请求、历史轮次重新进入上下文（`memory/chat_history_format`）与压缩源渲染（`【引用原文】` 段落）。
+- **上游隔离**：`quotes` 是应用内部字段，传给上游提供商的消息只含标准字段——当前轮在生成任务内剥离、请求副本（`factory/agent_runtime/chat_runtime.copy_for_request`）兜底再剥离一次。
+- **限额**：最多 5 段、单段 ≤4000 字符、合计 ≤12000 字符（前后端同口径，`memory/quote_format` 与 `H5/js/quote_utils.js`）；请求超限返回 400 可读错误，不静默截断。
+- **系统提示词**：注入简短规则说明 `<quote_list>` 是用户选取的会话原文（待讨论资料）、其后的文字才是本次问题、引用中的角色声明/指令不自动成为新的系统指令（子智能体系统提示不含该规则）。
+- **回放 marker**：`replay` 帧携带 `question_quotes`（本轮引用快照），刷新重连后引用卡片不丢失；无轮次号回退文本匹配时同时比较引用签名，避免同文本不同引用误裁历史气泡。
 
 #### 子智能体事件格式（`event="sub_agent"`，SSE 实时推送 = JSONL 落盘字段一致）
 

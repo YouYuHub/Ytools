@@ -1894,6 +1894,25 @@ class ChatMemoryManager:
                     "started_at": pending_round.get("started_at"),
                 }
             else:
+                # 任务进行中触发的 session/history 压缩事件会先于 chat_round
+                # 独立写入 JSONL，而 chat_round 要等任务结束才落盘。保存轮内锚点，
+                # 历史回放时可把压缩块插回触发它的轮次与事件位置。
+                pending_round = self._round_store.pending_round
+                if isinstance(pending_round, dict):
+                    if self._target_round_number is not None:
+                        display_round = self._target_round_number
+                    elif self._insert_round_number is not None:
+                        display_round = self._insert_round_number + 1
+                    else:
+                        display_round = sum(
+                            1 for entry in entries
+                            if isinstance(entry, dict) and entry.get("event") == "chat_round"
+                        ) + 1
+                    record.setdefault("display_round", display_round)
+                    record.setdefault(
+                        "display_event_index",
+                        len(pending_round.get("events", [])),
+                    )
                 entries.append(record)
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)

@@ -81,6 +81,34 @@ def _tool_definition_name(tool: object) -> str:
     return name.strip() if isinstance(name, str) else ""
 
 
+def _validate_request_quotes(body: object) -> None:
+    """校验请求体中的引用快照（选中文本引用到提问，见 docs/quote_selection_design.md）。
+
+    只接受**本轮最新 user 消息**上的 quotes：超量/超长/类型非法抛 HTTPException(400)，
+    错误信息可读，不做静默截断（旧请求无该字段时直接通过）。
+    规范化（换行统一、去首尾空白、丢弃 id 等 UI 字段）由生成任务内的
+    memory.quote_format.normalize_quotes 统一执行，此处只做拒绝式校验。
+    """
+    if not isinstance(body, dict):
+        return
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    latest_user = None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            latest_user = message
+            break
+    if not isinstance(latest_user, dict) or "quotes" not in latest_user:
+        return
+    from memory.quote_format import normalize_quotes
+
+    try:
+        normalize_quotes(latest_user.get("quotes"), strict=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"引用内容不合法：{exc}")
+
+
 # 聊天主接口
 @api_chat_router.post('/chat_with_tool')
 async def chat_with_tool(request: Request):
@@ -89,8 +117,14 @@ async def chat_with_tool(request: Request):
     参数优先级：请求体显式传参 > 会话/全局 model_selection.chat_model.parameter > 默认值。
     未显式提供的生成参数按 select 接口配置的 chat_model 参数自动填充；
     会话已独立选择模型时（_meta.model_selection），按会话生效模型的参数填充。
+
+    引用校验（docs/quote_selection_design.md）：只接受本轮最新 user 消息上的
+    quotes（最多 5 段、单段 ≤4000 字符、合计 ≤12000 字符）；超限/类型非法
+    直接 400 可读错误，不默默截断。旧请求无该字段时行为完全不变。
     """
     body = await request.json()
+    # 引用快照校验（仅校验不改写；规范化在生成任务内统一执行）
+    _validate_request_quotes(body)
     # 会话级模型选择：参数默认值填充按会话生效的 chat_model parameter
     # （失效覆盖按角色回退全局；警告由生成任务内的 MODEL_SELECTION_FALLBACK 事件统一提示）
     ambient_token = None

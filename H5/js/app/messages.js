@@ -8,7 +8,7 @@
 (function (App) {
   "use strict";
   const {
-    el, scrollToBottom, stickToBottom, QNAV_MAX_DASHES, chatScroll,
+    el, state, toast, scrollToBottom, stickToBottom, QNAV_MAX_DASHES, chatScroll,
     chatInner, qnav, qnavRail, qnavPanel,
     scrollBottomBtn
   } = App;
@@ -74,7 +74,8 @@
   // 回灌各自持有一套，互不串扰）
   function renderOneRecordInto(container, rec, pendingTools, pendingCompactions) {
     if (rec.kind === "user") {
-      appendUserMessage(rec.content, rec.ts, null, null, container, rec.round);
+      appendUserMessage(rec.content, rec.ts, null, null, container, rec.round, rec.quotes,
+        rec.source_event_index);
       return;
     }
     if (rec.kind === "think") {
@@ -87,6 +88,9 @@
     if (rec.kind === "assistant") {
       appendTimeInto(container, rec.ts);
       const body = el("div", "msg-assistant-body");
+      if (Number.isInteger(rec.source_event_index) && rec.source_event_index >= 0) {
+        body.dataset.sourceEvent = String(rec.source_event_index);
+      }
       body.innerHTML = Markdown.render(rec.content);
       highlightCodeBlocks(body);
       container.appendChild(body);
@@ -167,9 +171,20 @@
         summary_usage: rec.scope === "session" ? rec.usage : null,
         before_tokens: rec.before_tokens,
         after_tokens: rec.after_tokens,
+        target_tokens: rec.target_tokens,
+        budget_scope: rec.budget_scope,
         token_limit: rec.token_limit,
         trigger_reason: rec.trigger_reason,
         trigger_context_tokens: rec.trigger_context_tokens,
+        trigger_threshold: rec.trigger_threshold,
+        batch_source_tokens: rec.batch_source_tokens,
+        source_budget: rec.source_budget,
+        tail_rounds: rec.tail_rounds,
+        output_token_limit: rec.output_token_limit,
+        source_was_truncated: rec.source_was_truncated,
+        source_was_chunked: rec.source_was_chunked,
+        source_chunk_count: rec.source_chunk_count,
+        warnings: rec.warnings,
         compress_index: rec.compress_index,
         block_count: rec.block_count,
         error: rec.error || "",
@@ -255,7 +270,9 @@
       return count;
     };
 
-    doRenderBatch(RENDER_TAIL_RECORDS);
+    // 段头可能为配对工具结果而向前扩展；选出的尾段必须全部渲染，
+    // 否则多出的记录会挤掉末尾的助手回复，刷新后看起来像历史未落盘。
+    doRenderBatch(slice.length);
 
     // 没有等到结果的工具（历史中断）也标记结束
     finishUnmatchedTools(pendingTools);
@@ -626,22 +643,41 @@
         const tokenLimit = safeNumber(latestCompaction.token_limit);
         const triggerContextTokens = safeNumber(latestCompaction.trigger_context_tokens);
         const triggerThreshold = safeNumber(latestCompaction.trigger_threshold);
+        const targetTokens = safeNumber(latestCompaction.target_tokens);
+        const budgetScope = latestCompaction.budget_scope
+          || (scope === "round" ? "full_request" : "history");
+        if (targetTokens !== null && targetTokens > 0) {
+          let targetLabel = "历史压缩目标";
+          if (budgetScope === "full_request") targetLabel = "完整请求目标";
+          else if (budgetScope === "request_history_component") {
+            targetLabel = "完整请求目标（本条仅显示历史部分）";
+          }
+          let targetText = targetLabel + " " + FormatUtils.fmtNum(targetTokens);
+          if (budgetScope !== "request_history_component" && after !== null && after > targetTokens) {
+            targetText += "（受保留内容或摘要预算下限影响，未完全达到）";
+          }
+          detail.push(targetText);
+        }
         if (triggerThreshold !== null && triggerThreshold > 0) {
           // 强制路径：显示真实触发阈值 + 本批预算（两者不同才有意义）
           detail.push("触发阈值 " + FormatUtils.fmtNum(triggerThreshold));
           if (tokenLimit !== null && tokenLimit > 0 && tokenLimit !== triggerThreshold) {
-            detail.push("本批预算 " + FormatUtils.fmtNum(tokenLimit));
+            detail.push((scope === "session" ? "本批历史预算 " : "本轮压缩预算 ") +
+              FormatUtils.fmtNum(tokenLimit));
           }
         } else if (tokenLimit !== null && tokenLimit > 0) {
           const triggered = before !== null && before > tokenLimit;
-          detail.push((triggered ? "触发阈值" : "本批预算") + " " + FormatUtils.fmtNum(tokenLimit));
+          const limitLabel = scope === "session"
+            ? "历史压缩预算"
+            : (triggered ? "触发阈值" : "本轮压缩预算");
+          detail.push(limitLabel + " " + FormatUtils.fmtNum(tokenLimit));
         }
-        // 触发来源（auto=历史超阈值/轮数保护自动、task=任务内检查点、
+        // 触发来源（auto=任务开始检查、task=任务内检查点、
         // first_call=首调用超窗降级、post=任务收尾、manual=手动）：历史回放同样可见
         const triggerReason = latestCompaction.trigger_reason != null
           ? String(latestCompaction.trigger_reason) : "";
         const REASON_LABELS = {
-          auto: "历史超阈值/轮数保护自动",
+          auto: "任务开始历史检查",
           task: "任务内检查点",
           first_call: "首调用超窗降级",
           post: "任务收尾",
@@ -677,10 +713,17 @@
           ? latestCompaction.tail_rounds : latestUsage && latestUsage.tail_rounds);
         const outputTokenLimit = safeNumber(latestCompaction.output_token_limit != null
           ? latestCompaction.output_token_limit : latestUsage && latestUsage.output_token_limit);
+        const sourceChunkCount = safeNumber(latestCompaction.source_chunk_count != null
+          ? latestCompaction.source_chunk_count : latestUsage && latestUsage.source_chunk_count);
+        const sourceWasChunked = latestCompaction.source_was_chunked
+          || (latestUsage && latestUsage.source_was_chunked);
         if (batchSourceTokens !== null && batchSourceTokens > 0) {
           let batchText = "本批压缩源 " + FormatUtils.fmtNum(batchSourceTokens);
           if (sourceBudget !== null && sourceBudget > 0) {
             batchText += " / 预算 " + FormatUtils.fmtNum(sourceBudget);
+          }
+          if (sourceWasChunked && sourceChunkCount !== null && sourceChunkCount > 1) {
+            batchText += " · 完整分段 " + FormatUtils.fmtNum(sourceChunkCount) + " 段";
           }
           if (outputTokenLimit !== null && outputTokenLimit > 0) {
             batchText += " · 摘要上限 " + FormatUtils.fmtNum(outputTokenLimit);
@@ -822,9 +865,15 @@
   // 列表取 text 部件作为正文；image_url 渲染图片缩略图；video_url 渲染视频
   // 首帧（浏览器原生 <video>，#t=0.1 确保首帧绘制）；input_audio 渲染固定
   // 格式音频徽标；docs 为发送时随消息的会话文档快照（file_memory，仅前端
-  // 展示，不进入消息内容部件）
-  function buildUserBubble(content, sessionId, docs) {
+  // 展示，不进入消息内容部件）；quotes 为选中文本引用快照（结构化数据，
+  // 卡片置顶、正文在下；渲染走 textContent，绝不把引用原文交给 innerHTML）
+  function buildUserBubble(content, sessionId, docs, quotes) {
     const bubble = el("div", "msg-bubble");
+    // 引用卡片（引用 1/引用 2…）：置于问题正文之前（GPT 同款信息层级）
+    if (App.buildQuoteList) {
+      const quoteList = App.buildQuoteList(quotes);
+      if (quoteList) bubble.appendChild(quoteList);
+    }
     const parts = Array.isArray(content) ? content : null;
     let text = String(content == null ? "" : content);
     if (parts) {
@@ -908,15 +957,18 @@
     return bubble;
   }
 
-  function appendUserMessage(content, ts, sessionId, docs, container, round) {
+  function appendUserMessage(content, ts, sessionId, docs, container, round, quotes, sourceEventIndex) {
     const msg = el("div", "msg msg-user");
     if (ts) msg.appendChild(el("div", "msg-time", FormatUtils.fmtTime(ts)));
-    msg.appendChild(buildUserBubble(content, sessionId, docs));
+    msg.appendChild(buildUserBubble(content, sessionId, docs, quotes));
     // 历史轮次的用户消息：记录原始内容供编辑态回填，并挂 hover「编辑」入口。
     // round 为 null（实时发送）时编辑入口在收尾重载后随历史回放出现
     if (round != null) {
       msg.dataset.round = String(round);
-      msg._editData = { content: content, round: round };
+      if (Number.isInteger(sourceEventIndex) && sourceEventIndex >= 0) {
+        msg.dataset.sourceEvent = String(sourceEventIndex);
+      }
+      msg._editData = { content: content, round: round, quotes: quotes || [] };
       attachUserEditAction(msg);
     }
     // container 缺省追加到会话流末尾；传入正在流式的助手消息节点时，
@@ -959,8 +1011,12 @@
     copyBtn.innerHTML = EDIT_COPY_ICON + '<span class="msg-user-action-label">复制</span>';
     copyBtn.addEventListener("click", function () {
       const data = msg._editData || {};
-      // content 可能是字符串（纯文本消息）或多部件列表（多模态消息）
-      const text = contentToPlainText(data.content);
+      // content 可能是字符串（纯文本消息）或多部件列表（多模态消息）；
+      // 带引用时输出人可读文本（「引用 1：…\n\n问题：…」），不输出协议标签
+      const plain = contentToPlainText(data.content);
+      const text = (data.quotes && data.quotes.length && window.QuoteUtils)
+        ? QuoteUtils.composeCopyText(data.quotes, plain)
+        : plain;
       if (!text) { App.toast("该消息没有可复制的文本"); return; }
       const done = function () {
         copyBtn.classList.add("copied");
@@ -1114,7 +1170,11 @@
     // 不挂入口：编辑重发会丢失多模态附件，等收尾重载随历史回放补挂
     if (activeStream.userContent == null) return;
     userNode.dataset.round = String(round);
-    userNode._editData = { content: activeStream.userContent, round: round };
+    userNode._editData = {
+      content: activeStream.userContent,
+      round: round,
+      quotes: activeStream.quotes || [],
+    };
     attachUserEditAction(userNode);
     if (activeStream.messageNode) {
       activeStream.messageNode.dataset.round = String(round);
@@ -1131,6 +1191,9 @@
     const data = msg._editData;
     const originalText = contentToPlainText(data.content);
     const mediaItems = extractUserMediaItems(data.content);
+    // 引用快照（选中文本引用到提问）：编辑态可移除、保留，随重发一起上送
+    const originalQuotes = (data.quotes || []).slice();
+    const keptQuotes = originalQuotes.slice();
 
     msg.classList.add("is-editing");
     msg._editRestore = msg.querySelector(".msg-bubble");
@@ -1141,6 +1204,30 @@
     textarea.value = originalText;
     textarea.rows = Math.min(10, Math.max(2, originalText.split("\n").length));
     textarea.placeholder = "编辑消息内容…";
+
+    // 引用芯片（编辑态）：短预览 + 移除按钮；空则整行隐藏
+    const quoteRow = el("div", "msg-edit-quote-row");
+    function renderQuoteRow() {
+      quoteRow.innerHTML = "";
+      keptQuotes.forEach(function (quote, index) {
+        const chip = el("span", "msg-edit-quote-chip");
+        chip.title = quote.text;
+        chip.appendChild(el("span", "msg-edit-quote-badge", "引用 " + (index + 1)));
+        chip.appendChild(el("span", "msg-edit-quote-text",
+          window.QuoteUtils ? QuoteUtils.quotePreview(quote.text, 60) : quote.text));
+        const remove = el("button", "msg-edit-chip-remove", "×");
+        remove.type = "button";
+        remove.title = "移除该引用";
+        remove.addEventListener("click", function () {
+          keptQuotes.splice(index, 1);
+          renderQuoteRow();
+        });
+        chip.appendChild(remove);
+        quoteRow.appendChild(chip);
+      });
+      quoteRow.style.display = keptQuotes.length ? "" : "none";
+    }
+    renderQuoteRow();
 
     // 附件芯片（在输入框上方，GPT 编辑态同款）：可移除，原样复用 media:// 引用
     // 不重新上传；图片/视频显示缩略图，音频显示徽标
@@ -1200,6 +1287,8 @@
     }
     renderMediaRow();
     panel.appendChild(mediaRow);
+    // 引用芯片行在附件行下方（两者都不占 textarea 文本值）
+    panel.appendChild(quoteRow);
     panel.appendChild(textarea);
 
     const foot = el("div", "msg-edit-foot");
@@ -1258,10 +1347,14 @@
       area.appendChild(box);
     }
 
-    // 编辑是否产生过改动（文本或附件集合任一变化即视为已编辑）
+    // 编辑是否产生过改动（文本/附件集合/引用集合任一变化即视为已编辑）
     function isEdited() {
       if (textarea.value !== originalText) return true;
       if (keptMedia.length !== mediaItems.length) return true;
+      if (keptQuotes.length !== originalQuotes.length) return true;
+      if (keptQuotes.some(function (quote, index) {
+        return !originalQuotes[index] || originalQuotes[index].text !== quote.text;
+      })) return true;
       return keptMedia.some(function (item, index) {
         return !mediaItems[index] || mediaItems[index].stored_name !== item.stored_name;
       });
@@ -1300,6 +1393,7 @@
           round: data.round,
           text: text,
           media: keptMedia,
+          quotes: keptQuotes.slice(),
           mode: mode,
         });
         return;
@@ -1311,6 +1405,7 @@
           round: data.round,
           text: text,
           media: keptMedia,
+          quotes: keptQuotes.slice(),
           mode: mode,
         });
       });
@@ -1514,40 +1609,6 @@
     const outLabel = el("span", "tool-io-label", "输出");
     const outPre = el("pre", "tool-io tool-io-out", "");
     let currentToolName = "";
-    let outputText = "";
-
-    function renderToolOutput() {
-      outPre.textContent = "";
-      if (currentToolName !== "run_command" || !outputText) {
-        outPre.textContent = outputText;
-        return;
-      }
-      const marker = /^--- (stdout|stderr) ---[ \t]*$/gm;
-      const sections = [];
-      let match;
-      while ((match = marker.exec(outputText)) !== null) {
-        sections.push({ start: match.index, type: match[1] });
-      }
-      if (!sections.length) {
-        outPre.textContent = outputText;
-        return;
-      }
-      let cursor = 0;
-      sections.forEach(function (section, index) {
-        if (section.start > cursor) {
-          outPre.appendChild(document.createTextNode(outputText.slice(cursor, section.start)));
-        }
-        const end = index + 1 < sections.length ? sections[index + 1].start : outputText.length;
-        const stream = document.createElement("span");
-        stream.className = "tool-output-stream tool-output-" + section.type;
-        stream.textContent = outputText.slice(section.start, end);
-        outPre.appendChild(stream);
-        cursor = end;
-      });
-      if (cursor < outputText.length) {
-        outPre.appendChild(document.createTextNode(outputText.slice(cursor)));
-      }
-    }
 
     function updateToolIdentity(nextName) {
       currentToolName = String(nextName || "tool");
@@ -1568,7 +1629,6 @@
       action.textContent = actionName;
       nameNode.hidden = Boolean(actionName);
       nameNode.textContent = currentToolName;
-      if (outputText) renderToolOutput();
     }
     updateToolIdentity(name);
 
@@ -1660,10 +1720,7 @@
         revealQueue = "";
         inPre.textContent = t || "{}";
       },
-      setOutput: function (t) {
-        outputText = t ? String(t) : "(无输出)";
-        renderToolOutput();
-      },
+      setOutput: function (t) { outPre.textContent = t || "(无输出)"; },
       // 附带展示用 diff 视图（write_file/edit_file 结果）：渲染在输出区上方，
       // 头部显示完整文件路径（可换行、垂直居中）+ "+N绿 / -M红" 双徽标
       setDiff: function (diff) {
@@ -1967,9 +2024,14 @@
    * 字段的旧数据里兜底提取完整文件路径（full_file_name），以及为 read_file /
    * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
   function applyToolResult(block, name, resultText, fileDiff, args) {
-    if (name === "edit_file" || name === "write_file") {
+    if (name === "edit_file" || name === "write_file" || name === "run_command") {
       const toolIcon = block && block.wrap && block.wrap.querySelector(".tool-block-tool-icon");
-      if (toolIcon) toolIcon.classList.toggle("is-failed", isToolFailureResult(resultText));
+      if (toolIcon) {
+        const failed = name === "run_command"
+          ? isCommandFailureResult(resultText)
+          : isToolFailureResult(resultText);
+        toolIcon.classList.toggle("is-failed", failed);
+      }
     }
     let parsed = null;
     if (fileDiff && typeof fileDiff === "object") {
@@ -2018,6 +2080,19 @@
       return false;
     }
     return /^(?:error|failed|failure|错误|失败)(?:\b|[:：\s])/i.test(String(value || "").trim());
+  }
+
+  function isCommandFailureResult(resultText) {
+    const text = typeof resultText === "string"
+      ? resultText
+      : JSON.stringify(resultText == null ? "" : resultText);
+    // run_command 的首行是工具生成的元数据，包含退出码和超时状态；只检查
+    // 这一行，避免 stdout/stderr 正文（例如读取文件中的“stderr”）造成误判。
+    const header = text.split(/\r?\n/, 1)[0];
+    const exitCode = /\bexit=(-?\d+)\b/i.exec(header);
+    if (/命令超时|已超过 timeout=/i.test(header)) return true;
+    if (exitCode) return Number(exitCode[1]) !== 0;
+    return /^(?:\[run_command\]\s*)?(?:error|failed|failure|错误|失败)(?:\b|[:：\s])/i.test(header.trim());
   }
 
   // ---------- 子任务块（sub_agent） ----------
@@ -3670,6 +3745,235 @@
     updateQnavActive();
   }
 
+  // ---------- 从用户引用卡片定位到原文 ----------
+  let highlightedQuoteNode = null;
+  let quoteHighlightTimer = null;
+
+  function quoteMatchText(value) {
+    return String(value == null ? "" : value)
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function quoteRecordRoleMatches(record, role) {
+    return record && (role === "user" ? record.kind === "user"
+      : role === "assistant" ? record.kind === "assistant"
+        : record.kind === "user" || record.kind === "assistant");
+  }
+
+  function quoteRecordText(record) {
+    return quoteMatchText(contentToPlainText(record && record.content));
+  }
+
+  function findQuoteRecordIndex(records, source, quoteText) {
+    if (!Array.isArray(records)) return -1;
+    const role = source && source.role;
+    const round = Number(source && source.round);
+    const eventIndex = Number(source && source.event_index);
+    const wanted = quoteMatchText(quoteText);
+    const candidates = [];
+    records.forEach(function (record, index) {
+      if (quoteRecordRoleMatches(record, role)) candidates.push({ record: record, index: index });
+    });
+    if (!candidates.length) return -1;
+
+    if (Number.isInteger(round) && round > 0 && Number.isInteger(eventIndex) && eventIndex >= 0) {
+      const exact = candidates.find(function (item) {
+        return Number(item.record.round) === round
+          && Number(item.record.source_event_index) === eventIndex;
+      });
+      if (exact && (!wanted || quoteRecordText(exact.record).includes(wanted))) return exact.index;
+    }
+
+    const sameRound = Number.isInteger(round) && round > 0
+      ? candidates.filter(function (item) { return Number(item.record.round) === round; })
+      : [];
+    function findText(items) {
+      if (!wanted) return null;
+      return items.find(function (item) { return quoteRecordText(item.record).includes(wanted); }) || null;
+    }
+    const matching = findText(sameRound) || findText(candidates);
+    return matching ? matching.index : -1;
+  }
+
+  function findRenderedQuoteSource(source, quoteText, allowUnscoped) {
+    const role = source && source.role;
+    const selector = role === "user" ? ".msg-user-text"
+      : role === "assistant" ? ".msg-assistant-body"
+        : ".msg-user-text, .msg-assistant-body";
+    const candidates = Array.from(chatInner.querySelectorAll(selector));
+    if (!candidates.length) return null;
+
+    const round = Number(source && source.round);
+    const eventIndex = Number(source && source.event_index);
+    const wanted = quoteMatchText(quoteText);
+    const sameRound = Number.isInteger(round) && round > 0
+      ? candidates.filter(function (node) {
+        const host = node.closest("[data-round]");
+        return host && Number(host.getAttribute("data-round")) === round;
+      })
+      : [];
+    if (Number.isInteger(round) && round > 0 && !sameRound.length && !allowUnscoped) return null;
+    const scoped = sameRound.length ? sameRound : candidates;
+
+    if (Number.isInteger(eventIndex) && eventIndex >= 0) {
+      const exact = scoped.find(function (node) {
+        const host = node.closest("[data-source-event]");
+        return host && Number(host.getAttribute("data-source-event")) === eventIndex;
+      });
+      if (exact && (!wanted || quoteMatchText(exact.innerText || exact.textContent).includes(wanted))) {
+        return exact;
+      }
+    }
+
+    if (!wanted) return null;
+    const matching = function (items) {
+      return items.find(function (node) {
+        return quoteMatchText(node.innerText || node.textContent).includes(wanted);
+      }) || null;
+    };
+    return matching(scoped) || (allowUnscoped && scoped !== candidates ? matching(candidates) : null);
+  }
+
+  function normalizedTextOffsets(rawText) {
+    let text = "";
+    const starts = [];
+    const ends = [];
+    for (let index = 0; index < rawText.length;) {
+      if (/\s|\u00a0/.test(rawText[index])) {
+        const start = index;
+        while (index < rawText.length && (/\s|\u00a0/.test(rawText[index]))) index += 1;
+        if (text && text[text.length - 1] !== " ") {
+          text += " ";
+          starts.push(start);
+          ends.push(index);
+        }
+        continue;
+      }
+      text += rawText[index];
+      starts.push(index);
+      ends.push(index + 1);
+      index += 1;
+    }
+    if (text.endsWith(" ")) {
+      text = text.slice(0, -1);
+      starts.pop();
+      ends.pop();
+    }
+    return { text: text, starts: starts, ends: ends };
+  }
+
+  // 尽量把滚动锚点落在引用文字起始处；跨 Markdown 内联节点时，
+  // 逐步缩短匹配前缀，仍可定位到引用所在的同一句/段落。
+  function quoteTextAnchorRect(target, quoteText) {
+    const wanted = quoteMatchText(quoteText);
+    if (!wanted || typeof document.createTreeWalker !== "function") return null;
+    const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeValue && node.nodeValue.trim()) {
+        nodes.push({ node: node, mapped: normalizedTextOffsets(node.nodeValue) });
+      }
+    }
+    const minLength = Math.min(8, wanted.length);
+    for (let length = Math.min(32, wanted.length); length >= minLength; length -= 1) {
+      const prefix = wanted.slice(0, length);
+      for (let i = 0; i < nodes.length; i += 1) {
+        const item = nodes[i];
+        const at = item.mapped.text.indexOf(prefix);
+        if (at < 0) continue;
+        const range = document.createRange();
+        range.setStart(item.node, item.mapped.starts[at]);
+        range.setEnd(item.node, item.mapped.ends[at + prefix.length - 1]);
+        const rect = range.getBoundingClientRect();
+        if (rect && (rect.width || rect.height)) return rect;
+      }
+    }
+    return null;
+  }
+
+  function revealQuoteSource(target, quoteText) {
+    if (quoteHighlightTimer != null) window.clearTimeout(quoteHighlightTimer);
+    if (highlightedQuoteNode) highlightedQuoteNode.classList.remove("quote-source-highlight");
+    highlightedQuoteNode = target;
+    target.classList.remove("quote-source-highlight");
+    // 重复点击同一引用时重播一次闪烁动画。
+    void target.offsetWidth;
+    target.classList.add("quote-source-highlight");
+    quoteHighlightTimer = window.setTimeout(function () {
+      if (highlightedQuoteNode) highlightedQuoteNode.classList.remove("quote-source-highlight");
+      highlightedQuoteNode = null;
+      quoteHighlightTimer = null;
+    }, 1900);
+
+    const targetRect = quoteTextAnchorRect(target, quoteText) || target.getBoundingClientRect();
+    const scrollRect = chatScroll.getBoundingClientRect();
+    const top = chatScroll.scrollTop + targetRect.top - scrollRect.top
+      - Math.max(0, (chatScroll.clientHeight - targetRect.height) / 2);
+    chatScroll.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  }
+
+  async function jumpToQuoteSource(source, quoteText) {
+    const locator = source && typeof source === "object" ? source : {};
+    const sourceSession = typeof locator.session_id === "string" ? locator.session_id : "";
+    if (sourceSession && state.sessionId !== sourceSession) {
+      if (typeof App.openSession !== "function") {
+        toast("无法打开引用所属的会话");
+        return;
+      }
+      try {
+        await App.openSession(sourceSession);
+      } catch (_) {
+        toast("无法打开引用所属的会话");
+        return;
+      }
+      if (state.sessionId !== sourceSession) {
+        toast("引用所属的会话未能打开");
+        return;
+      }
+    }
+
+    const records = loadOlderState.records;
+    const recordIndex = findQuoteRecordIndex(records, locator, quoteText);
+    let target = findRenderedQuoteSource(locator, quoteText, false);
+    let renderLocator = locator;
+    if (!target && records && recordIndex >= 0) {
+      const sourceRecord = records[recordIndex];
+      renderLocator = Object.assign({}, locator, { round: sourceRecord.round });
+      if (Number.isInteger(sourceRecord.source_event_index)) {
+        renderLocator.event_index = sourceRecord.source_event_index;
+      } else {
+        delete renderLocator.event_index;
+      }
+      target = findRenderedQuoteSource(renderLocator, quoteText, false);
+    }
+    if (!target && records && recordIndex >= 0) {
+      while (loadOlderState.records === records && recordIndex < loadOlderState.start) {
+        const previousStart = loadOlderState.start;
+        if (loadOlderState.loading) {
+          await new Promise(function (resolve) { window.setTimeout(resolve, 20); });
+        } else {
+          await runOlderBatch();
+        }
+        if (loadOlderState.start === previousStart && !loadOlderState.loading) break;
+        target = findRenderedQuoteSource(renderLocator, quoteText, false);
+        if (target) break;
+      }
+      if (!target && loadOlderState.records === records) {
+        target = findRenderedQuoteSource(renderLocator, quoteText, false);
+      }
+    }
+    if (!target && recordIndex < 0) target = findRenderedQuoteSource(locator, quoteText, true);
+
+    if (!target) {
+      toast("未找到引用原文，可能已被编辑或删除");
+      return;
+    }
+    revealQuoteSource(target, quoteText);
+  }
+
   function jumpToQuestion(i) {
     const target = qnavUsers[i];
     if (!target) return;
@@ -3809,6 +4113,7 @@
   App.applyToolResult = applyToolResult;
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
+  App.jumpToQuoteSource = jumpToQuoteSource;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
   App.renderPreservingWidgets = renderPreservingWidgets;
 })(window.App);

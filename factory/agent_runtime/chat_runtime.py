@@ -620,18 +620,31 @@ def copy_for_request(
     *,
     limit: int | None = None,
 ) -> List[dict[str, Any]]:
-    """构造发往上游的请求副本：思考整形 + 悬空 tool_call 清理。
+    """构造发往上游的请求副本：思考整形 + 悬空 tool_call 清理 + 引用字段剥离。
 
     思考回传整形规则见 _shape_reasoning_for_send（历史思考不回传、仅保留
     最近一条真实思考）；请求副本在返回前统一执行一次「悬空 tool_call 清理」
     （sanitize_tool_call_pairing）：上游对声明/结果配对做严格校验，悬空
     直接 400 空响应体（todo 归并/中断轮次等历史遗留均由此兜底）。
+
+    引用快照（quotes）是应用内部字段：模型视图已把 <quote_list> 前置进
+    content（memory.quote_format），这里兜底剥离 quotes 键——传给上游的
+    消息只含标准字段（正常路径下运行时消息已剥离，此处防御异常调用方）。
     """
     shaped = _shape_reasoning_for_send(messages, limit)
     cleaned, removed = sanitize_tool_call_pairing(shaped)
     if removed:
         print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
-    return cleaned
+    return [_drop_quote_fields(message) for message in cleaned]
+
+
+def _drop_quote_fields(message: Any) -> Any:
+    """剥离内部引用字段：无 quotes 键时原样返回引用（零拷贝快路径）。"""
+    if not isinstance(message, dict) or "quotes" not in message:
+        return message
+    clone = dict(message)
+    clone.pop("quotes", None)
+    return clone
 
 
 def estimate_send_context_tokens(

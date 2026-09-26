@@ -40,6 +40,50 @@ test("parseHistory: user/assistant 记录与 skip done 块", function () {
   assert.equal(parsed.records[1].content, "你好！");
 });
 
+test("parseHistory: 用户消息携带引用快照透传给渲染层", function () {
+  const quotes = [{ text: "被选中的原文", source: { role: "assistant", round: 1 } }];
+  const round = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "问题", quotes: quotes },
+    { timestamp: "2026-08-08 18:00:05", role: "assistant", content: "回答" },
+  ]);
+  const parsed = historyParser.parseHistory(round);
+  assert.deepEqual(parsed.records[0].quotes, quotes);
+  // 无 quotes 字段的旧记录：不产生该键（正常回放）
+  const plainRound = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "问题" },
+  ]);
+  const plain = historyParser.parseHistory(plainRound);
+  assert.equal(plain.records[0].quotes, undefined);
+  // 空数组同样不携带（不显示卡片）
+  const emptyRound = fakeRound([
+    { timestamp: "2026-08-08 18:00:00", role: "user", content: "问题", quotes: [] },
+  ]);
+  assert.equal(historyParser.parseHistory(emptyRound).records[0].quotes, undefined);
+});
+
+test("recordsBeforeActiveRound: 无轮次号时文本 + 引用快照参与匹配", function () {
+  const records = [
+    { kind: "user", content: "同一个问题", round: 1, quotes: [{ text: "旧引用" }] },
+    { kind: "assistant", content: "旧回答", round: 1 },
+    { kind: "user", content: "同一个问题", round: 2, quotes: [{ text: "新引用" }] },
+    { kind: "assistant", content: "新回答", round: 2 },
+  ];
+  // 引用不同：不能把旧同文本提问误判为本轮
+  const sliced = historyParser.recordsBeforeActiveRound(
+    records, "同一个问题", null, [{ text: "新引用" }]
+  );
+  assert.equal(sliced.length, 2);
+  assert.equal(sliced[1].content, "旧回答");
+  // 引用一致时命中第二条
+  const matched = historyParser.recordsBeforeActiveRound(
+    records, "同一个问题", null, [{ text: "旧引用" }]
+  );
+  assert.equal(matched.length, 0);
+  // 无引用（旧调用方）：保持旧行为（命中最后一条同文本）
+  const legacy = historyParser.recordsBeforeActiveRound(records, "同一个问题", null);
+  assert.equal(legacy.length, 2);
+});
+
 test("parseHistory: 跳过“停止任务”用户消息与 error 记录", function () {
   const round = fakeRound([
     { timestamp: "2026-08-08 18:00:00", role: "user", content: "停止任务" },
@@ -169,12 +213,16 @@ test("parseHistory: 压缩 done 的批次诊断字段（P2-1）解析到记录",
       before_tokens: 360000,
       after_tokens: 189000,
       token_limit: 200000,
+      target_tokens: 80000,
+      budget_scope: "full_request",
       trigger_reason: "task",
       batch_source_tokens: 180000,
       source_budget: 450000,
       tail_rounds: 5,
       output_token_limit: 15020,
       source_was_truncated: true,
+      source_was_chunked: true,
+      source_chunk_count: 4,
       warnings: ["batch_source_truncated"],
     },
     { timestamp: "2026-08-08 18:00:02", role: "assistant", content: "继续处理" },
@@ -186,6 +234,10 @@ test("parseHistory: 压缩 done 的批次诊断字段（P2-1）解析到记录",
   assert.equal(rec.tail_rounds, 5);
   assert.equal(rec.output_token_limit, 15020);
   assert.equal(rec.source_was_truncated, true);
+  assert.equal(rec.source_was_chunked, true);
+  assert.equal(rec.source_chunk_count, 4);
+  assert.equal(rec.budget_scope, "full_request");
+  assert.equal(rec.target_tokens, 80000);
   assert.deepEqual(rec.warnings, ["batch_source_truncated"]);
 });
 

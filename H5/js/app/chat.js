@@ -594,8 +594,9 @@
 
   /**
    * 发送一条用户消息并开启新一轮回复。
-   * @param {object} [direct] 直接载荷（引导/队列 flush 调用）：
-   *   { text, media } —— media 为待上传附件快照；缺省时从输入框读取。
+   * @param {object} [direct] 直接载荷（引导/队列 flush/编辑重发调用）：
+   *   { text, media, quotes, targetRound?, insertAfterRound? } —— media 为待上传
+   *   附件快照、quotes 为引用快照；缺省时从输入框读取。
    */
   async function send(direct) {
     // 防御：事件监听器直接传引用时，MouseEvent 等非普通对象不算直接载荷
@@ -603,7 +604,11 @@
     const fromInput = !direct;
     const text = direct ? (direct.text || "") : input.value.trim();
     const pendingMedia = direct ? (direct.media || []).slice() : state.pendingMedia.slice();
-    // 有附件时允许无文本发送
+    // 引用快照（选中文本引用到提问）：与消息一起上送，不作为独立用户消息
+    const pendingQuotes = direct
+      ? (direct.quotes || []).slice()
+      : (state.pendingQuotes || []).slice();
+    // 有附件时允许无文本发送；引用本身不构成提问（仍要求正文或附件）
     if (!text && !pendingMedia.length) return;
     // 仅当“当前会话”正在流式时禁止发送；其他会话在后台流式不影响本会话发送
     if (state.streaming && state.streamingSession === state.sessionId) return;
@@ -645,9 +650,14 @@
         state.streamingSession = null;
         state.abort = null;
         App.refreshComposerButtons();
-        // flush 来源的失败消息放回队列头部，避免丢失
+        // flush 来源的失败消息放回队列头部，避免丢失（引用快照一并保留）
         if (!fromInput) {
-          state.pendingQueue.unshift({ text: text, media: pendingMedia, sessionId: streamSessionId });
+          state.pendingQueue.unshift({
+            text: text,
+            media: pendingMedia,
+            quotes: pendingQuotes,
+            sessionId: streamSessionId,
+          });
           App.renderPendingOutbox();
         }
         return;
@@ -663,14 +673,20 @@
     }
 
     const userContent = buildUserContent(text, uploadedMedia);
+    // 请求用引用快照（去掉本地 UI 字段 id）：无引用时为空数组，不上送该字段
+    const requestQuotes = QuoteUtils.quotesForRequest(pendingQuotes);
 
-    const userNode = App.appendUserMessage(userContent, null, streamSessionId, state.sessionDocs);
+    const userNode = App.appendUserMessage(
+      userContent, null, streamSessionId, state.sessionDocs, null, null, requestQuotes
+    );
     App.upsertLocalSession(streamSessionId, { userText: text || (uploadedMedia.length ? "[图片/附件]" : text) });
     // 问题导航重建已移到下方 DOM 手术（原地重发删旧轮+原位插入）之后：
     // 若在手术前重建，旧第 N 轮节点仍在（旧文本占第 N 位），新气泡又临时
     // 挂在末尾（新文本占第 total+1 位），导航面板会出现新旧两条重复条目
     if (fromInput) {
       App.clearPendingMedia();
+      // 引用随输入框一起清空（快照已进本轮消息，失败重发由气泡上的编辑入口承担）
+      App.clearPendingQuotes();
       input.value = "";
     }
     App.autosize();
@@ -759,7 +775,7 @@
     // 新 userNode 若先带上 data-round=N，会被上面的删除循环误删
     if (liveRound != null) {
       userNode.dataset.round = String(liveRound);
-      userNode._editData = { content: userContent, round: liveRound };
+      userNode._editData = { content: userContent, round: liveRound, quotes: requestQuotes };
       App.attachUserEditAction(userNode);
       msg.dataset.round = String(liveRound);
     }
@@ -786,6 +802,8 @@
       userContent: userContent,
       // 多模态时含 media:// 引用，标题请求透传给后端解析
       questionParts: Array.isArray(userContent) ? userContent : null,
+      // 本轮引用快照（附接回放去重与编辑回填用）
+      quotes: requestQuotes,
       userNode: userNode,
       messageNode: msg,
       completed: false,
@@ -799,6 +817,9 @@
       messages: [{ role: "user", content: userContent }],
       session_id: streamSessionId,
     };
+    // 引用快照（选中文本引用到提问）：与用户消息同级字段，后端落盘并序列化
+    // 为模型视图的 <quote_list>；无引用不携带（旧行为完全一致）
+    if (requestQuotes.length) payload.messages[0].quotes = requestQuotes;
     // 编辑重发「重新生成该轮」：携带 target_round，后端把本轮回复原地替换
     // 历史第 N 轮（上下文截到第 N-1 轮）；ask_user 卡片再答携带 insert_round，
     // 后端把回答轮插入历史第 N 轮之后（上下文截到第 N 轮）；普通发送不带
@@ -982,6 +1003,11 @@
             else if (activeStream.userContent == null && activeStream.userText) {
               activeStream.userContent = activeStream.userText;
             }
+            // 引用快照（选中文本引用到提问）：随 marker 下发，重建/复用气泡
+            // 时绘制引用卡片，并进 _editData 供编辑回填
+            if (Array.isArray(data.question_quotes) && data.question_quotes.length) {
+              activeStream.quotes = QuoteUtils.quotesForRequest(data.question_quotes);
+            }
             if (activeStream.userText || parts) {
               // 历史文件已落盘时可能已经渲染过本轮提问（生成中刷新，提问事件
               // 已随检查点/收尾写入）：优先按轮次精确匹配并复用该节点补挂
@@ -1007,8 +1033,8 @@
               } else {
                 // 提问气泡必须排在回答上方：回答容器 msg 已先入列，把气泡插入到它之前
                 const userNode = parts
-                  ? App.appendUserMessage(parts, null, sessionId)
-                  : App.appendUserMessage(data.question_text, null, sessionId);
+                  ? App.appendUserMessage(parts, null, sessionId, null, null, null, activeStream.quotes)
+                  : App.appendUserMessage(data.question_text, null, sessionId, null, null, null, activeStream.quotes);
                 chatInner.insertBefore(userNode, msg);
                 activeStream.userNode = userNode;
               }
@@ -1211,6 +1237,8 @@
       App.send({
         text: plan.text,
         media: plan.media,
+        // 引用快照：编辑态保留/移除后的最终列表（无则空数组）
+        quotes: plan.quotes || [],
         targetRound: targetRound,
       });
     };

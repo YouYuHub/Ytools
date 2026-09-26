@@ -319,9 +319,6 @@
     word-break: break-all;
   }
 
-  .tool-io-out .tool-output-stderr {
-    color: var(--danger);
-  }
 }
 
 // ---------- 工具结果展示用 diff 视图（write_file / edit_file） ----------
@@ -1091,7 +1088,7 @@ html[data-theme="dark"] {
     }
   }
 
-  @media (max-width: 520px) {
+  @container main-area (max-width: 520px) {
     .codeblock-head {
       height: 32px;
       padding: 0 10px;
@@ -1259,6 +1256,139 @@ html[data-theme="dark"] {
   white-space: nowrap;
 }
 
+// 用户气泡内的引用卡片（选中文本引用到提问）：置于问题正文之前，
+// 多段引用纵向堆叠；引用原文只用 textContent 绘制（纯文本，不解析 HTML）
+.msg-quote-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.msg-quote-card {
+  display: block;
+  width: 100%;
+  appearance: none;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 10px;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  max-height: 180px;
+  overflow-y: auto;
+
+  @supports not (background: color-mix(in srgb, red 50%, blue)) {
+    background: var(--bg-code);
+  }
+
+  &:hover {
+    background: color-mix(in srgb, var(--bg-active) 82%, transparent);
+    border-left-color: var(--accent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.msg-quote-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.msg-quote-badge {
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.msg-quote-source {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.msg-quote-text {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@keyframes quote-source-flash {
+  0%,
+  58% {
+    background-color: var(--bg-active);
+    outline-color: var(--accent);
+  }
+
+  100% {
+    background-color: transparent;
+    outline-color: transparent;
+  }
+}
+
+.msg-user-text.quote-source-highlight,
+.msg-assistant-body.quote-source-highlight {
+  border-radius: 8px;
+  outline: 2px solid transparent;
+  outline-offset: 4px;
+  animation: quote-source-flash 1.8s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-user-text.quote-source-highlight,
+  .msg-assistant-body.quote-source-highlight {
+    animation: none;
+    background-color: var(--bg-active);
+    outline-color: var(--accent);
+  }
+}
+
+// 选区浮钮「引用到提问」：body 级 fixed 定位（视口坐标钳制），
+// 点击后把选区快照加入当前会话草稿；Esc/点击别处/滚动时隐藏
+.quote-float-btn {
+  position: fixed;
+  z-index: 130;
+  transform: translate(-50%, -100%);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+
+  .icon {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
 // ---------- 用户消息编辑态（GPT 网页同款 hover 编辑 + 两种重发范围） ----------
 // 编辑入口：hover 用户气泡时右下角浮现；编辑态隐藏原气泡显示编辑面板。
 // 视觉基调：面板不套边框（延续气泡底色），控件弱化分隔——仅 textarea 与
@@ -1340,6 +1470,43 @@ html[data-theme="dark"] {
     flex-wrap: wrap;
     gap: 8px;
     margin: 0 0 8px;
+  }
+
+  // 引用芯片行（编辑态）：短预览 + 移除，位于附件行下方、输入框上方
+  .msg-edit-quote-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 8px;
+  }
+
+  .msg-edit-quote-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 8px;
+    border-radius: 10px;
+    border-left: 3px solid var(--accent);
+    background: color-mix(in srgb, var(--bg-primary) 65%, transparent);
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .msg-edit-quote-badge {
+    flex-shrink: 0;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--bg-active);
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+
+  .msg-edit-quote-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .msg-edit-chip {
@@ -1856,7 +2023,7 @@ html[data-theme="dark"] {
   }
 
   // 窄屏：外边距与聊天区收窄节奏一致（桌面 16px / 移动端 8px）
-  @media (max-width: 768px) {
+  @container main-area (max-width: 768px) {
     margin: 0 8px 10px;
   }
 

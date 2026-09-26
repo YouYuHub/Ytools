@@ -134,12 +134,15 @@
     }
     const text = input.value.trim();
     const mediaSnapshot = state.pendingMedia.map(function (m) { return Object.assign({}, m); });
+    const quoteSnapshot = (state.pendingQuotes || []).map(function (q) { return Object.assign({}, q); });
     if (!text && !mediaSnapshot.length) return;
-    const message = { text: text, media: mediaSnapshot, sessionId: state.sessionId };
+    const message = { text: text, media: mediaSnapshot, quotes: quoteSnapshot, sessionId: state.sessionId };
     // 从待发区移除但保留快照中的 objUrl（移除放回输入框后预览仍可用）；
     // objUrl 的最终释放在消息成功上传后（send 内）
     state.pendingMedia = [];
+    state.pendingQuotes = [];
     App.renderComposerAttachments();
+    App.renderComposerQuotes();
     input.value = "";
     App.autosize();
     if (mode === "queue") {
@@ -150,9 +153,9 @@
     }
     // 消息引导：纯文本走后端注入接口（下一轮检查点立即生效）；
     // 多次引导按「空行分隔」合并为同一条用户消息，消费后只发送一次；
-    // 带附件或注入不可用时回退本地暂存（流结束后作为一条消息派发）
+    // 带附件/引用或注入不可用时回退本地暂存（流结束后作为一条消息派发）
     let injected = false;
-    if (!mediaSnapshot.length && state.sessionId) {
+    if (!mediaSnapshot.length && !quoteSnapshot.length && state.sessionId) {
       // 已有同会话待注入消息：把新输入拼接进去，消费时作为一条完整消息注入
       const pending = state.injectedPending;
       const hasPending = Boolean(pending && pending.sessionId === state.sessionId && pending.text);
@@ -176,12 +179,14 @@
       } catch (_) { /* 网络异常同样回退暂存 */ }
     }
     if (injected) return;
-    // 本地暂存合并：同会话已有引导未派发时，新输入以空行拼进同一条、附件并入
+    // 本地暂存合并：同会话已有引导未派发时，新输入以空行拼进同一条、附件与
+    // 引用一并并入（引用卡片按添加顺序拼接）
     const prevSteer = (state.steerMessage && state.steerMessage.sessionId === state.sessionId)
       ? state.steerMessage : null;
     state.steerMessage = {
       text: prevSteer && prevSteer.text ? prevSteer.text + "\n\n" + text : text,
       media: (prevSteer && prevSteer.media ? prevSteer.media : []).concat(mediaSnapshot),
+      quotes: (prevSteer && prevSteer.quotes ? prevSteer.quotes : []).concat(quoteSnapshot),
       sessionId: state.sessionId,
     };
     toast(prevSteer
@@ -212,6 +217,10 @@
       item.appendChild(el("span", "pending-outbox-badge", row.label));
       // 收尾空白会进入省略号前的可见文本（看起来内容很长），显示前裁掉
       item.appendChild(el("span", "pending-outbox-text", (row.message.text || "").trim() || "[图片/附件]"));
+      // 引用快照提示（选中文本引用到提问）：随消息一起暂存与派发
+      if (row.message.quotes && row.message.quotes.length) {
+        item.appendChild(el("span", "pending-outbox-quotes", "引用 " + row.message.quotes.length));
+      }
       // 立即发送：当前会话流式中则打断该轮（后端收尾 + 本地中止），以本条消息
       // 立即开启新一轮；无进行中的流时直接派发（与自动 flush 同链路）
       const sendNow = el("button", "pending-outbox-send", "发送");
@@ -256,7 +265,7 @@
             return;
           }
         }
-        await App.send({ text: row.message.text || "", media: row.message.media || [] });
+        await App.send({ text: row.message.text || "", media: row.message.media || [], quotes: row.message.quotes || [] });
       });
       item.appendChild(sendNow);
       const remove = el("button", "pending-outbox-remove", "×");
@@ -333,6 +342,11 @@
     if (restored.media.length) {
       state.pendingMedia = restored.media.concat(state.pendingMedia);
       App.renderComposerAttachments();
+    }
+    // 引用快照随消息一起放回草稿（多段引用按原顺序拼在最前）
+    if (restored.quotes && restored.quotes.length) {
+      state.pendingQuotes = restored.quotes.concat(state.pendingQuotes || []);
+      App.renderComposerQuotes();
     }
     App.autosize();
     renderPendingOutbox();
@@ -940,18 +954,19 @@
 
   // ---------- 每会话独立的输入草稿 ----------
   /**
-   * 保存当前输入到该会话的草稿（文本 + 待发附件快照，附件保留 objUrl 引用）。
+   * 保存当前输入到该会话的草稿（文本 + 待发附件 + 引用快照，附件保留 objUrl 引用）。
    * 切换会话前调用；新对话（sessionId=null）存到 "" 键。
    */
   function saveSessionDraft() {
     const key = state.sessionId || "";
     const text = input.value;
     const media = state.pendingMedia.map(function (m) { return Object.assign({}, m); });
-    if (!text.trim() && !media.length) {
+    const quotes = (state.pendingQuotes || []).map(function (q) { return Object.assign({}, q); });
+    if (!text.trim() && !media.length && !quotes.length) {
       delete state.sessionDrafts[key];
       return;
     }
-    state.sessionDrafts[key] = { text: text, media: media };
+    state.sessionDrafts[key] = { text: text, media: media, quotes: quotes };
   }
 
   /**
@@ -967,11 +982,14 @@
     if (draft) {
       input.value = draft.text || "";
       state.pendingMedia = (draft.media || []).map(function (m) { return Object.assign({}, m); });
+      state.pendingQuotes = (draft.quotes || []).map(function (q) { return Object.assign({}, q); });
     } else {
       input.value = "";
       state.pendingMedia = [];
+      state.pendingQuotes = [];
     }
     App.renderComposerAttachments();
+    App.renderComposerQuotes();
     App.autosize();
   }
 

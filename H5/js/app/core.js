@@ -52,6 +52,10 @@ window.App = window.App || {};
     modelParamDirty: false,
     // 待发送的多媒体附件（粘贴/选择的图片音频视频）：[{id,file,name,kind,dataUrl}]
     pendingMedia: [],
+    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection_design.md）：
+    // [{id, text, source:{role,session_id,round}}]；随会话草稿保存/恢复，
+    // 发送成功后清空（id 仅本地 UI 用，请求上送前由 QuoteUtils 剥离）
+    pendingQuotes: [],
     // 正在上传或由服务端解析的文档，仅用于输入框内显示进度
     pendingDocs: [],
     // 会话内已上传解析的文档（file_memory）：解析文本由后端注入系统提示词，跨消息生效
@@ -491,6 +495,91 @@ window.App = window.App || {};
   importConflictCancel.addEventListener("click", function () { App.closeImportConflict(); });
 
   // ---------- 侧边栏 ----------
+  const sidebarResizeHandle = $("#sidebarResizeHandle");
+  const SIDEBAR_WIDTH_KEY = "ytools-sidebar-width";
+  const SIDEBAR_DEFAULT_WIDTH = 240;
+  const SIDEBAR_MIN_WIDTH = 220;
+  const SIDEBAR_MAX_WIDTH = 840;
+  const SIDEBAR_MAIN_MIN_WIDTH = 360;
+  let sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
+  let sidebarResizePointer = null;
+  let sidebarResizeStartWidth = SIDEBAR_DEFAULT_WIDTH;
+
+  try {
+    const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    if (Number.isFinite(savedWidth) && savedWidth >= SIDEBAR_MIN_WIDTH && savedWidth <= SIDEBAR_MAX_WIDTH) {
+      sidebarPreferredWidth = savedWidth;
+    }
+  } catch (_) { /* 私密模式等无法访问本地存储时使用默认宽度 */ }
+
+  function sidebarWidthLimit() {
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth - SIDEBAR_MAIN_MIN_WIDTH));
+  }
+
+  function clampSidebarWidth(width) {
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(sidebarWidthLimit(), Math.round(width)));
+  }
+
+  function applySidebarWidth() {
+    const width = clampSidebarWidth(sidebarPreferredWidth);
+    document.documentElement.style.setProperty("--sidebar-width", width + "px");
+    sidebarResizeHandle.setAttribute("aria-valuemax", String(sidebarWidthLimit()));
+    sidebarResizeHandle.setAttribute("aria-valuenow", String(width));
+    sidebarResizeHandle.setAttribute("aria-valuetext", width + " 像素");
+  }
+
+  function saveSidebarWidth() {
+    try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarPreferredWidth)); } catch (_) { /* 存储不可用时仍允许本次拖动 */ }
+  }
+
+  function finishSidebarResize(commit) {
+    if (sidebarResizePointer === null) return;
+    if (!commit) sidebarPreferredWidth = sidebarResizeStartWidth;
+    sidebarResizePointer = null;
+    document.body.classList.remove("sidebar-resizing");
+    applySidebarWidth();
+    if (commit) saveSidebarWidth();
+  }
+
+  applySidebarWidth();
+  window.addEventListener("resize", applySidebarWidth);
+  sidebarResizeHandle.addEventListener("pointerdown", function (event) {
+    if (sidebarResizePointer !== null || event.button !== 0 || isMobile() || sidebar.classList.contains("collapsed")) return;
+    event.preventDefault();
+    sidebarResizePointer = event.pointerId;
+    sidebarResizeStartWidth = sidebarPreferredWidth;
+    document.body.classList.add("sidebar-resizing");
+  });
+  window.addEventListener("pointermove", function (event) {
+    if (event.pointerId !== sidebarResizePointer) return;
+    sidebarPreferredWidth = clampSidebarWidth(event.clientX - sidebar.getBoundingClientRect().left - 1);
+    applySidebarWidth();
+  });
+  window.addEventListener("pointerup", function (event) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
+  });
+  window.addEventListener("pointercancel", function (event) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(false);
+  });
+  window.addEventListener("blur", function () { finishSidebarResize(true); });
+  sidebarResizeHandle.addEventListener("keydown", function (event) {
+    let width = clampSidebarWidth(sidebarPreferredWidth);
+    if (event.key === "ArrowLeft") width -= event.shiftKey ? 40 : 16;
+    else if (event.key === "ArrowRight") width += event.shiftKey ? 40 : 16;
+    else if (event.key === "Home") width = SIDEBAR_MIN_WIDTH;
+    else if (event.key === "End") width = sidebarWidthLimit();
+    else return;
+    event.preventDefault();
+    sidebarPreferredWidth = clampSidebarWidth(width);
+    applySidebarWidth();
+    saveSidebarWidth();
+  });
+  sidebarResizeHandle.addEventListener("dblclick", function () {
+    sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
+    applySidebarWidth();
+    saveSidebarWidth();
+  });
+
   function setSidebarCollapsed(collapsed) {
     sidebar.classList.toggle("collapsed", collapsed);
     scrim.classList.toggle("show", isMobile() && !collapsed);
@@ -566,6 +655,7 @@ window.App = window.App || {};
   contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn,
   voiceBtn, stopGroup, stopMenuBtn, queueMenu,
   composerAttachments, pendingOutbox, contextTokenTodoSlot,
+  composerQuotes,
   todoPanelHost, askModal, askQuestions,
   askSubmit, mediaPreviewModal, mediaPreviewBody,
   mediaPreviewTitle, boostBtn, enhancePanel,

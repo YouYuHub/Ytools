@@ -20,6 +20,14 @@
       .join("\n");
   }
 
+  /** 引用快照签名（去重比较用）：仅取各段文本，忽略来源/UI 字段。 */
+  function quotesSignature(quotes) {
+    if (!Array.isArray(quotes) || !quotes.length) return "";
+    return JSON.stringify(quotes.map(function (quote) {
+      return quote && typeof quote.text === "string" ? quote.text : "";
+    }));
+  }
+
   /**
    * 打开会话时，若该会话正有后台流在跑，历史中应剔除当前轮提问，
    * 避免与 restoreActiveStream/attachStreamSession 补建的提问气泡重复。
@@ -30,9 +38,10 @@
    * 尚未落盘（生成中），此时直接返回全部——不能回退文本匹配，否则会误裁
    * 历史中同文本的旧提问（连同其后的整段记录）。无 activeRound（旧后端/
    * 旧调用方）时才回退文本匹配——对部件数组先取 text 部件拼接再比较，
-   * 避免多模态提问因 content 不是字符串而匹配失败（气泡重建后重复渲染）。
+   * 避免多模态提问因 content 不是字符串而匹配失败（气泡重建后重复渲染）；
+   * 传入 activeQuotes 时文本匹配还要求引用快照一致（同文本不同引用不误裁）。
    */
-  function recordsBeforeActiveRound(records, userText, activeRound) {
+  function recordsBeforeActiveRound(records, userText, activeRound, activeQuotes) {
     let activeIndex = -1;
     const round = Number(activeRound);
     if (Number.isFinite(round) && round > 0) {
@@ -43,10 +52,13 @@
     }
     const text = typeof userText === "string" ? userText : "";
     if (!text) return records;
+    const wantedQuotes = quotesSignature(activeQuotes);
     records.forEach(function (record, index) {
-      if (record.kind === "user" && recordContentText(record.content) === text) {
-        activeIndex = index;
-      }
+      if (record.kind !== "user" || recordContentText(record.content) !== text) return;
+      // 引用参与比较：仅当两侧都有引用时要求签名一致（旧记录无 quotes
+      // 字段时不拒绝匹配，保持旧行为）
+      if (wantedQuotes && record.quotes && quotesSignature(record.quotes) !== wantedQuotes) return;
+      activeIndex = index;
     });
     return activeIndex >= 0 ? records.slice(0, activeIndex) : records;
   }
@@ -74,6 +86,9 @@
         ? obj.trigger_context_tokens : null,
       trigger_threshold: obj.trigger_threshold != null
         ? obj.trigger_threshold : null,
+      target_tokens: obj.target_tokens != null
+        ? obj.target_tokens : compactionUsage && compactionUsage.target_tokens,
+      budget_scope: obj.budget_scope != null ? obj.budget_scope : "",
       compress_index: obj.compress_index != null
         ? obj.compress_index : compactionUsage && compactionUsage.compress_index,
       block_count: obj.block_count != null
@@ -92,6 +107,12 @@
       source_was_truncated: obj.source_was_truncated != null
         ? !!obj.source_was_truncated
         : !!(compactionUsage && compactionUsage.source_was_truncated),
+      source_was_chunked: obj.source_was_chunked != null
+        ? !!obj.source_was_chunked
+        : !!(compactionUsage && compactionUsage.source_was_chunked),
+      source_chunk_count: obj.source_chunk_count != null
+        ? obj.source_chunk_count
+        : (compactionUsage && compactionUsage.source_chunk_count),
       warnings: Array.isArray(obj.warnings)
         ? obj.warnings
         : (compactionUsage && Array.isArray(compactionUsage.warnings)
@@ -204,10 +225,15 @@
   // start_round 同口径）：供用户消息编辑/删除定位 JSONL 轮次
   function parseHistory(text) {
     const records = [];
+    const pendingRoundCompactions = Object.create(null);
     let metaUsageTotal = 0;
     let metaUsage = {};
     let roundCounter = 0;
 
+    // 预读轮次时间窗：修复旧 JSONL 中尚无 display_round 锚点的任务内历史压缩事件。
+    const parsedLines = [];
+    const roundTimeWindows = [];
+    let candidateRoundNo = 0;
     text.split("\n").forEach(function (line, idx) {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -215,6 +241,49 @@
       try {
         obj = JSON.parse(trimmed);
       } catch (_) { return; }
+      parsedLines.push({ index: idx, object: obj });
+      if (obj.event === "chat_round" && Array.isArray(obj.events)) {
+        candidateRoundNo += 1;
+        roundTimeWindows.push({ round: candidateRoundNo, entry: obj });
+      }
+    });
+
+    function timestampValue(value) {
+      if (typeof value !== "string" || !value.trim()) return null;
+      const parsed = Date.parse(value.includes("T") ? value : value.replace(" ", "T"));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function inferLegacyRoundAnchor(compaction) {
+      if (compaction.scope !== "session") return null;
+      const compactionTime = timestampValue(compaction.timestamp);
+      if (compactionTime === null) return null;
+      for (let i = roundTimeWindows.length - 1; i >= 0; i -= 1) {
+        const candidate = roundTimeWindows[i];
+        const entry = candidate.entry;
+        const events = Array.isArray(entry.events) ? entry.events : [];
+        const start = timestampValue(entry.started_at)
+          ?? (events.length ? timestampValue(events[0] && events[0].timestamp) : null);
+        const end = timestampValue(entry.ended_at)
+          ?? (events.length ? timestampValue(events[events.length - 1] && events[events.length - 1].timestamp) : null);
+        // 使用严格结束边界，避免任务开始前的独立历史压缩与上一轮 ended_at
+        // 同秒时被误认为发生在上一轮内部。
+        if (start === null || end === null || compactionTime < start || compactionTime >= end) continue;
+
+        // 时间戳精度为秒；遇到同秒事件时放在该秒最后一条之后，尽量贴近压缩触发点。
+        let eventIndex = 0;
+        events.forEach(function (event, index) {
+          const eventTime = timestampValue(event && event.timestamp);
+          if (eventTime !== null && eventTime <= compactionTime) eventIndex = index + 1;
+        });
+        return { round: candidate.round, eventIndex: eventIndex };
+      }
+      return null;
+    }
+
+    parsedLines.forEach(function (lineRecord) {
+      const idx = lineRecord.index;
+      const obj = lineRecord.object;
 
       if (idx === 0 && obj._meta) {
         metaUsage = obj._meta.usage || {};
@@ -223,6 +292,25 @@
       }
       // 压缩过程事件行（与 SSE 实时推送同一份 payload，字段一致）
       if (obj.event === "context_compaction") {
+        let displayRound = Number(obj.display_round);
+        let displayEventIndex = Number(obj.display_event_index);
+        if ((!Number.isInteger(displayRound) || displayRound <= 0
+            || !Number.isInteger(displayEventIndex) || displayEventIndex < 0)) {
+          const inferred = inferLegacyRoundAnchor(obj);
+          if (inferred) {
+            displayRound = inferred.round;
+            displayEventIndex = inferred.eventIndex;
+          }
+        }
+        if (Number.isInteger(displayRound) && displayRound > 0
+            && Number.isInteger(displayEventIndex) && displayEventIndex >= 0) {
+          if (!pendingRoundCompactions[displayRound]) pendingRoundCompactions[displayRound] = [];
+          pendingRoundCompactions[displayRound].push({
+            event: obj,
+            eventIndex: displayEventIndex,
+          });
+          return;
+        }
         appendCompactionRecord(records, obj);
         return;
       }
@@ -232,7 +320,36 @@
       const roundNo = roundCounter;
       const roundStart = records.length; // 本行产生的 records 起点（子块统一补轮次号用）
       const openBlocks = {}; // agent_id -> agentBlock record（轮内聚合）
-      obj.events.forEach(function (evt) {
+      const anchoredCompactions = pendingRoundCompactions[roundNo] || [];
+      delete pendingRoundCompactions[roundNo];
+      const orderedEvents = [];
+      let compactionIndex = 0;
+      for (let eventIndex = 0; eventIndex <= obj.events.length; eventIndex += 1) {
+        // 把任务中独立落盘的历史压缩事件合并回 pending chat_round.events。
+        // 锚点表示压缩发生时已经写入的轮内事件数量；相同锚点保持 JSONL 写入顺序。
+        while (compactionIndex < anchoredCompactions.length
+            && anchoredCompactions[compactionIndex].eventIndex <= eventIndex) {
+          orderedEvents.push({
+            event: anchoredCompactions[compactionIndex].event,
+            eventIndex: eventIndex,
+          });
+          compactionIndex += 1;
+        }
+        if (eventIndex < obj.events.length) {
+          orderedEvents.push({ event: obj.events[eventIndex], eventIndex: eventIndex });
+        }
+      }
+      // 防御异常/旧记录中的越界锚点，不能因此丢掉压缩记录。
+      while (compactionIndex < anchoredCompactions.length) {
+        orderedEvents.push({
+          event: anchoredCompactions[compactionIndex].event,
+          eventIndex: obj.events.length,
+        });
+        compactionIndex += 1;
+      }
+      orderedEvents.forEach(function (orderedEvent) {
+        const evt = orderedEvent.event;
+        const eventIndex = orderedEvent.eventIndex;
         if (!evt || typeof evt !== "object") return;
         const ts = evt.timestamp || "";
 
@@ -242,14 +359,21 @@
           return;
         }
 
-        // 单轮压缩事件嵌入 chat_round.events，按其在 events 中的位置渲染。
-        if (evt.event === "context_compaction" && evt.scope === "round") {
+        // 轮内压缩事件及带锚点并回来的任务内历史压缩事件，按轮内位置渲染。
+        if (evt.event === "context_compaction") {
           appendCompactionRecord(records, evt);
           return;
         }
 
         if (evt.role === "user" && evt.content && evt.content !== "停止任务") {
-          records.push({ kind: "user", content: evt.content, ts: ts, round: roundNo });
+          const userRec = {
+            kind: "user", content: evt.content, ts: ts, round: roundNo,
+            source_event_index: eventIndex,
+          };
+          // 引用快照（选中文本引用到提问）：透传给渲染层绘制引用卡片；
+          // 旧记录无该字段时正常回放（不显示卡片）
+          if (Array.isArray(evt.quotes) && evt.quotes.length) userRec.quotes = evt.quotes;
+          records.push(userRec);
           return;
         }
         // 父级 sub_agent 工具结果：轨迹已在 agentBlock 中，跳过普通渲染
@@ -291,7 +415,10 @@
           records.push({ kind: "think", content: evt.reasoning_content, ts: ts, round: roundNo });
         }
         if (typeof evt.content === "string" && evt.content.trim() && !evt.done) {
-          records.push({ kind: "assistant", content: evt.content, ts: ts, round: roundNo });
+          records.push({
+            kind: "assistant", content: evt.content, ts: ts, round: roundNo,
+            source_event_index: eventIndex,
+          });
         }
         if (Array.isArray(evt.tool_calls)) {
           evt.tool_calls.forEach(function (call) {
@@ -310,6 +437,14 @@
       for (let r = roundStart; r < records.length; r += 1) {
         if (records[r].round == null) records[r].round = roundNo;
       }
+    });
+
+    // 正在进行/中断的轮次可能尚未写成 chat_round。保留其独立压缩事件，
+    // 放在目前可见历史末尾，避免刷新后事件消失。
+    Object.keys(pendingRoundCompactions).forEach(function (roundKey) {
+      pendingRoundCompactions[roundKey].forEach(function (item) {
+        appendCompactionRecord(records, item.event);
+      });
     });
 
     return { records: records, metaUsageTotal: metaUsageTotal, metaUsage: metaUsage };
