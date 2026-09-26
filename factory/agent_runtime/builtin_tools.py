@@ -2116,7 +2116,8 @@ def execute_read_media(
 # ------------------- run_command：终端命令执行（多 shell） -------------------
 # 由 mcp_server/sys_tools_server.py 的 run_command 迁移而来（服务端本地执行，
 # 语义完全对齐：多 shell 解析、超时杀进程树、超长输出截断并落盘、gbk/utf-8
-# 编码自适应、后台分离模式、cmd 家族健壮性补丁——多行内联代码改写为临时脚本 /
+# 编码自适应、后台分离模式、cmd 家族健壮性补丁——内联代码（多行或含 %）改写
+# 为临时脚本 /
 # 管道过滤器探测替换或本地兜底 / 分号与 Unix 命令语法提示）。
 # 迁移差异：
 # - 本实现为同步阻塞函数：execute_run_command 由调用方经 asyncio.to_thread
@@ -2192,6 +2193,24 @@ def _decode_command_bytes_used(data: bytes, encoding: str = "", candidates: tupl
                 return data.decode(name), name
             except (UnicodeDecodeError, LookupError):
                 break
+    # Windows 的同一次命令可能同时输出 Python/Node 的 UTF-8 与 cmd/原生程序的
+    # 本地代码页。按整段选择一个编码会把另一段变成乱码，甚至在宽松兜底中产生 �。
+    # 逐行先试 UTF-8 严格解码，再回退到系统代码页；纯 ASCII 行任意候选等价。
+    if len(data.splitlines(keepends=True)) > 1:
+        decoded_lines = []
+        used = set()
+        for line in data.splitlines(keepends=True):
+            if line.isascii():
+                decoded_lines.append(line.decode("ascii"))
+                continue
+            line_candidates = ("utf-8",) + tuple(c for c in candidates if c != "utf-8")
+            decoded, codec = _decode_command_bytes_used(line, candidates=line_candidates)
+            decoded_lines.append(decoded)
+            used.add(codec)
+        if len(used) > 1:
+            return "".join(decoded_lines), "mixed"
+        if used:
+            return "".join(decoded_lines), used.pop()
     best_text, best_encoding, best_score = None, None, None
     for candidate in candidates:
         try:
@@ -2539,7 +2558,12 @@ _BG_NAME_SEQ = itertools.count(1)
 #    （exit=0），表现为"命令成功但没执行"；另有用 Unix 命令名（ls/cat/...）
 #    在 cmd 下必然失败的情况。
 #
-# 补丁策略：① 多行内联代码改写为临时脚本执行；② 管道过滤器探测 + 替换/本地兜底；
+# 4) 单行内联代码中的 `%`：cmd 批处理层会把孤立 `%` 直接吞掉（实测
+#    `python -c "print('100%')"` 输出 `100`），或把 `%VAR%` 展开成环境变量值，
+#    代码在到达子进程前就被破坏（`print('%d' % x)` 会 SyntaxError）。
+#
+# 补丁策略：① 内联代码（多行，或含 `%` 的单行）改写为临时脚本执行；
+# ② 管道过滤器探测 + 替换/本地兜底；
 # ③ 失败或可疑时附语法提示（不改变命令本身）。
 
 # 管道过滤器探测结果缓存：key=(工具名, 参数, exe路径) -> 是否可用
@@ -2561,8 +2585,13 @@ _SIMPLE_FILTER_RE = re.compile(
 # 内联代码执行入口：python -c / node -e / node --eval
 _INLINE_CODE_RE = re.compile(
     r"(?P<interp>(?:^|[\s&|(])(?:python|python3|py|node)(?:\.exe)?)"
+    r"(?:\s+(?:-X\s+[^\s\"']+|-u|-B|-I|-E|-s|-S|-O|-OO))*"
     r"\s+(?P<flag>-c|-e|--eval)\s+(?P<quote>[\"'])",
     re.IGNORECASE)
+_INLINE_CODE_INTENT_RE = re.compile(
+    r"\b(?:python|python3|py|node)(?:\.exe)?\b[^\r\n]*\s(?:-c|-e|--eval)\s*[\"']",
+    re.IGNORECASE,
+)
 # cmd 下常见的 Unix 命令 → Windows 等价物（仅用于失败后的提示）
 _UNIX_COMMAND_EQUIVALENTS = {
     "ls": "dir", "cat": "type", "rm": "del", "cp": "copy", "mv": "move",
@@ -2772,76 +2801,183 @@ def _guard_cmd_pipeline(command: str):
     )
 
 
-def _find_inline_code(command: str):
-    """定位多行内联代码执行（python -c / node -e）。
+def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
+    """定位内联代码执行（python -c / node -e）。
 
-    返回 dict（含解释器、入口 flag 及其在命令中的位置、代码文本）或 None。
-    仅当代码跨行（含换行）时才返回——单行命令交给 shell 原生处理。
-    改写时需要把"入口 flag + 引号内代码"整体替换为"脚本路径"，
-    因此这里同时给出 flag 的起止下标。
+    返回 dict（含解释器、入口 flag 及其在命令中的位置、代码文本、multi_line 与
+    quote 标记）或 None。默认 min_lines=2：仅当代码跨行（含换行）时返回——单行
+    命令交给 shell 原生处理（含 `%` 的单行由 _locate_inline_code_segment 的
+    退化扫描定位并改写为临时脚本）。min_lines=1 时单行代码也返回。
+    start 用于从指定下标继续查找（同一命令存在多处内联代码时，跳过不合门槛的
+    匹配继续向后找）。
+    定位失败（引号未配对/尾部语法复杂/代码区吞并后续引号段）时跳过该匹配并
+    继续向后找，全部不可用才返回 None，由调用方决定拒绝或跳过。
     """
-    match = _INLINE_CODE_RE.search(command)
-    if not match:
-        return None
-    interp_token = match.group("interp")
-    interp = interp_token.strip().lstrip("&|(").strip()
-    quote = match.group("quote")
-    open_index = match.end() - 1
-    # 闭引号：从末尾往前找，要求"后面只剩 shell 尾部语法"（重定向/管道/&&/参数）。
-    # 判据（实测踩坑后放宽）：remainder 为空、或以空白开头且不含引号、不含 ";"。
-    # 例：` 2>&1 | tail -2`（多行代码 + 管道）此前被过严的字符类规则漏判，
-    # 导致不改写 → cmd 拆行 → 管道失效且输出混乱。
-    close_index = None
-    for index in range(len(command) - 1, open_index, -1):
-        if command[index] != quote:
+    search_from = start
+    while True:
+        match = _INLINE_CODE_RE.search(command, search_from)
+        if not match:
+            return None
+        interp_token = match.group("interp")
+        interp = interp_token.strip().lstrip("&|(").strip()
+        quote = match.group("quote")
+        open_index = match.end() - 1
+        # 闭引号：从末尾往前找，要求"后面只剩 shell 尾部语法"（重定向/管道/&&/参数）。
+        # 判据（实测踩坑后放宽）：remainder 为空、或以空白开头且不含引号、不含 ";"。
+        # 例：` 2>&1 | tail -2`（多行代码 + 管道）此前被过严的字符类规则漏判，
+        # 导致不改写 → cmd 拆行 → 管道失效且输出混乱。
+        close_index = None
+        for index in range(len(command) - 1, open_index, -1):
+            if command[index] != quote:
+                continue
+            remainder = command[index + 1:]
+            if remainder == "" or (
+                re.match(r"^\s[^\"']*$", remainder)
+                and ";" not in remainder
+                and "\n" not in remainder
+            ):
+                close_index = index
+                break
+        if close_index is None:
+            # 该匹配（含尾部语法）无法安全定位：跳过，继续向后找可能存在的其他段
+            search_from = match.end()
             continue
-        remainder = command[index + 1:]
-        if remainder == "" or (
-            re.match(r"^\s[^\"']*$", remainder)
-            and ";" not in remainder
-            and "\n" not in remainder
+        code = command[open_index + 1: close_index]
+        # 代码区含未转义的同类引号：说明闭引号定位吞并了后续引号段（如
+        # `python -c "A" && echo "B"` 从末尾往前会错选最后一对引号），
+        # 该匹配跳过继续向后找（`\"` 这类转义引号不算）。
+        if re.search(r"(?<!\\)" + re.escape(quote), code):
+            search_from = match.end()
+            continue
+        if len(code) > _INLINE_SCRIPT_MAX_CHARS:
+            search_from = match.end()
+            continue
+        multi_line = "\n" in code
+        if not multi_line and min_lines > 1:
+            # 单行匹配不满足门槛：继续向后找（同一命令可能有多处内联代码）
+            search_from = match.end()
+            continue
+        return {
+            "interp": interp,
+            "flag": match.group("flag"),
+            "flag_start": match.start("flag"),
+            "flag_end": match.end("flag"),
+            "open_index": open_index,
+            "close_index": close_index,
+            "quote": quote,
+            "code": code,
+            "multi_line": multi_line,
+        }
+
+
+def _has_multiline_inline_intent(command: str) -> bool:
+    """判断命令中是否存在【跨行】的内联代码写法（引号在换行之后才闭合）。
+
+    用于"无法安全定位时是否拒绝执行"的判定：只有跨行代码才会被 cmd 拆行执行；
+    单行内联代码（哪怕整条命令还有其它 shell 行）不受拆行影响——含 `%` 的单行
+    代码由 _locate_inline_code_segment 定位并改写为临时脚本，不应误杀。
+    """
+    for match in _INLINE_CODE_INTENT_RE.finditer(command):
+        quote = command[match.end() - 1]
+        rest = command[match.end():]
+        close = rest.find(quote)
+        if close == -1 or "\n" in rest[:close]:
+            return True
+    return False
+
+
+def _inline_code_needs_script(code: str, multi_line: bool) -> bool:
+    """该段内联代码是否需要改写为临时脚本。
+
+    需要：多行（cmd 按行解释 .cmd，必被拆行）或含 `%`（cmd 批处理层会吞掉
+    孤立 `%`、把 `%VAR%` 展开成环境变量值，代码在到达子进程前就被破坏）。
+    不需要：单行且不含 `%`——交给 shell 原生处理（保持既有行为与低开销）。
+    """
+    return multi_line or ("%" in code)
+
+
+def _locate_inline_code_segment(command: str, start: int = 0):
+    """定位下一段"需要脚本化"的内联代码，返回定位 dict 或 None。
+
+    两级策略：
+    1. `_find_inline_code`（从末尾往前找闭引号 + 引号吞并守卫）——多行代码
+       通常能精确定位；
+    2. 退化扫描"最近引号区间"逐段切分——覆盖 `python -c "A" && python -c "B"`
+       这类多段串联（从末尾往前找会吞并后续引号段而定位失败），以及开头
+       `python -X utf8 -c` 等前置选项形态（正则已支持）。
+    只接受"单行含 `%`"或"多行"的段；其余段跳过继续向后找。
+    """
+    found = _find_inline_code(command, min_lines=1, start=start)
+    if found is not None and _inline_code_needs_script(found["code"], found["multi_line"]):
+        return found
+    search_from = start
+    while True:
+        match = _INLINE_CODE_RE.search(command, search_from)
+        if not match:
+            return None
+        quote = match.group("quote")
+        open_index = match.end() - 1
+        close_index = command.find(quote, open_index + 1)
+        if close_index == -1:
+            return None
+        # 尾部语法校验（与主定位同规则）：闭引号后只允许空白 + 重定向/管道/链式，
+        # 否则该段无法确认边界，跳过继续向后找（如 `python -c "…" ; echo done`）
+        remainder = command[close_index + 1:]
+        if not (
+            remainder == ""
+            or (
+                re.match(r"^\s[^\"']*$", remainder)
+                and ";" not in remainder
+                and "\n" not in remainder
+            )
         ):
-            close_index = index
-            break
-    if close_index is None:
-        return None
-    code = command[open_index + 1: close_index]
-    if "\n" not in code:
-        return None
-    if len(code) > _INLINE_SCRIPT_MAX_CHARS:
-        return None
-    return {
-        "interp": interp,
-        "flag": match.group("flag"),
-        "flag_start": match.start("flag"),
-        "flag_end": match.end("flag"),
-        "open_index": open_index,
-        "close_index": close_index,
-        "code": code,
-    }
+            search_from = close_index + 1
+            continue
+        code = command[open_index + 1: close_index]
+        if len(code) <= _INLINE_SCRIPT_MAX_CHARS and _inline_code_needs_script(
+            code, "\n" in code
+        ):
+            return {
+                "interp": match.group("interp").strip().lstrip("&|(").strip(),
+                "flag": match.group("flag"),
+                "flag_start": match.start("flag"),
+                "flag_end": match.end("flag"),
+                "open_index": open_index,
+                "close_index": close_index,
+                "quote": quote,
+                "code": code,
+                "multi_line": "\n" in code,
+            }
+        search_from = close_index + 1
 
 
-def _rewrite_multiline_inline_code(command: str, shell_kind: str):
-    """把多行内联代码改写为临时脚本执行（cmd 家族）。
+def _rewrite_inline_code_to_script(command: str, shell_kind: str):
+    """把 cmd 无法安全直接执行的内联代码改写为临时脚本（cmd 家族）。
 
-    cmd 按行解释 .cmd 文件，多行内联代码必然被拆行执行；改写为
-    `<解释器> "<临时脚本>"` 后语义与 `-c` 一致（退出码透传），且支持中文与引号。
+    cmd 会破坏两类内联代码，因此两类都改写为 `<解释器> "<临时脚本>"`：
+    - 多行：命令写入 .run.cmd 后按行解释，后续行被当独立命令执行
+      （实测 `i was unexpected at this time.`）；
+    - 含 `%` 的单行：批处理层先做 `%` 展开，孤立 `%` 被吞、`%VAR%` 被替换成
+      环境变量值（实测 `python -c "print('100%')"` 输出 `100`；`print('%d' % 5)`
+      直接 SyntaxError）。脚本文件内容不经 cmd 批处理解析，两种链路
+      （隐藏中转链 / Popen 直连）下语义都稳定，且退出码透传。
     注意必须连入口 flag（`-c`/`-e`）一起替换掉：`python -c "<路径>"` 会把路径
     当代码字符串执行（实测 SyntaxError），而 `python "<路径>"` 才是执行脚本。
+    无法安全定位且存在跨行代码意图时抛 ValueError（拒绝执行）。
     返回 (新命令, 提示列表)。
     """
-    if shell_kind != "cmd" or "\n" not in command:
+    if shell_kind != "cmd":
         return command, []
-    found = _find_inline_code(command)
-    if not found:
-        # 有多行内联代码痕迹但无法安全改写（尾部语法复杂/含分号等）：给出明确提示，
-        # 避免"首行被当命令执行 + 后续行报错"的混乱结果被误读为成功
-        if _INLINE_CODE_RE.search(command):
-            return command, [
-                "检测到多行内联代码但尾部语法复杂，未自动改写；cmd 按行解释 .cmd 文件，"
-                "多行 `-c` 代码会被拆行执行（可能部分执行并伴随报错）。"
-                "建议把代码写入脚本文件（write_file）后执行，或改用 shell=bash/pwsh"
-            ]
+    found = _locate_inline_code_segment(command)
+    if found is None:
+        # 不能安全改写且确有【跨行】内联代码时必须拒绝执行：否则 cmd 可能已运行
+        # 首行，随后把代码正文当成一串独立命令，模型也无法从退出码判断哪些行
+        # 真的执行了。单行内联代码（哪怕整条命令还有其它 shell 行）不受拆行
+        # 影响，不误杀"多行 shell 命令 + 单行内联代码"的普通写法。
+        if _has_multiline_inline_intent(command):
+            raise ValueError(
+                "cmd 下的多行内联代码无法安全改写，命令未执行；请用 write_file 写入"
+                "脚本后运行，或改用适合该语法的 shell")
         return command, []
     interp = found["interp"]
     interp_name = Path(interp).stem.lower()
@@ -2854,17 +2990,32 @@ def _rewrite_multiline_inline_code(command: str, shell_kind: str):
         script_path = _BG_LOG_DIR / f"inline_{stamp}_{seq:04d}_{os.getpid()}.{extension}"
         script_path.write_text(code if code.endswith("\n") else code + "\n", encoding="utf-8")
     except OSError as exc:
-        return command, [f"多行内联代码改写失败（{exc}）；cmd 按行解释 .cmd，多行 `-c` 代码会失败，"
-                         "建议改用 write_file 写脚本后执行"]
+        raise ValueError(
+            f"内联代码改写失败（{exc}），命令未执行；"
+            "请用 write_file 写脚本后运行"
+        ) from exc
     # 用"解释器 + 脚本路径"替换"解释器 + 入口 flag + 引号内代码"
+    # 无空格的路径直接传给 cmd：中转链的 call/重定向解析层对额外引号
+    # 会二次保留，使 Python 把引号当成文件名的一部分。
+    script_arg = f'"{script_path}"' if any(ch.isspace() for ch in str(script_path)) else str(script_path)
     new_command = (
-        f'{command[:found["flag_start"]]}"{script_path}"'
+        f'{command[:found["flag_start"]]}{script_arg}'
         f'{command[found["close_index"] + 1:]}'
     )
-    return new_command, [
-        f"检测到多行内联代码（{interp} {found['flag']}）：cmd 按行解释 .cmd 文件会把后续行当命令执行，"
-        f"已自动改写为临时脚本 {_display_path(script_path)} 后执行（语义等价，退出码透传）"
-    ]
+    if found["multi_line"]:
+        note = (
+            f"检测到多行内联代码（{interp} {found['flag']}）：cmd 按行解释 .cmd 文件"
+            f"会把后续行当命令执行，已自动改写为临时脚本 {_display_path(script_path)} "
+            "后执行（语义等价，退出码透传）"
+        )
+    else:
+        note = (
+            f"检测到单行内联代码中的 `%`（{interp} {found['flag']}）：cmd 批处理层会"
+            "吞掉孤立 `%` 或把 `%VAR%` 展开成环境变量值（实测 `print('100%')` 输出丢 `%`），"
+            f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+            "（代码原样交给解释器：如需百分号直接写单个 `%`，无需 cmd 的 `%%` 转义）"
+        )
+    return new_command, [note]
 
 
 def _first_token(segment: str) -> str:
@@ -3107,11 +3258,11 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         'f.Close\r\n'
     )
     try:
-        launcher_path.write_text(launcher_text, encoding="mbcs")
-        vbs_path.write_text(vbs_text, encoding="mbcs")
+        launcher_path.write_bytes(launcher_text.encode("mbcs"))
+        vbs_path.write_bytes(vbs_text.encode("mbcs"))
     except (OSError, LookupError):
-        launcher_path.write_text(launcher_text, encoding="utf-8", errors="replace")
-        vbs_path.write_text(vbs_text, encoding="utf-8", errors="replace")
+        launcher_path.write_bytes(launcher_text.encode("utf-8", errors="replace"))
+        vbs_path.write_bytes(vbs_text.encode("utf-8", errors="replace"))
     if runner_path is not None:
         _write_runner_script(runner_path, shell_kind, command)
     # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
@@ -3137,9 +3288,9 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> No
         # 已在上游改写为临时脚本，此处只做兜底归一化）
         text = "@echo off\r\n" + normalized.replace("\n", "\r\n") + "\r\n"
         try:
-            runner_path.write_text(text, encoding="mbcs")
+            runner_path.write_bytes(text.encode("mbcs"))
         except (OSError, LookupError):
-            runner_path.write_text(text, encoding="utf-8", errors="replace")
+            runner_path.write_bytes(text.encode("utf-8", errors="replace"))
         return
     text = normalized + "\n"
     if shell_kind in ("powershell", "pwsh"):
@@ -3357,10 +3508,27 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
     # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
     _prune_old_bg_files()
     shell_exe, shell_kind, shell_prefix = _resolve_shell(shell, is_nt)
+    if shell_kind == "cmd" and re.search(
+        r"\b(?:python|python3|py|node)(?:\.exe)?\s+-\s*<<", command,
+        re.IGNORECASE,
+    ):
+        raise ValueError(
+            "cmd 不支持 `python - <<标记` 这类 heredoc，命令未执行；"
+            "请用 write_file 写脚本后运行，或选择 shell=bash"
+        )
     # ===== cmd 家族健壮性补丁（详见文件头补丁说明）=====
-    # ① 多行内联代码（python -c / node -e）改写为临时脚本：cmd 按行解释 .cmd，
-    #    多行 `-c` 代码必然被拆行执行（实测 `i was unexpected at this time.`）
-    command, guard_notes = _rewrite_multiline_inline_code(command, shell_kind)
+    # ① 内联代码（多行，或含 `%` 的单行）改写为临时脚本：
+    #    多行会被 cmd 拆行执行（实测 `i was unexpected at this time.`）；
+    #    单行含 `%` 会被批处理层吞掉/展开（实测 `print('100%')` 输出 `100`）
+    guard_notes = []
+    for _ in range(10):
+        rewritten, notes = _rewrite_inline_code_to_script(command, shell_kind)
+        guard_notes.extend(notes)
+        if rewritten == command:
+            break
+        command = rewritten
+    else:
+        raise ValueError("同一命令中的内联代码改写次数过多，命令未执行；请写入脚本后运行")
     # ② 管道过滤器兜底：PATH 里可能命中"非管道过滤器"实现（实测宝塔 tail.exe），
     #    在管道中提前退出且不转发输出 → 整条管道静默无输出；此处探测并替换/本地兜底
     local_filter = None
@@ -3384,6 +3552,11 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
         return _append_command_notes(result_text, guard_notes)
     exit_code, stdout_text, stderr_text, timed_out, elapsed, relay_info = _run_command_foreground(
         command, shell_exe, shell_kind, shell_prefix, cwd, timeout, is_nt)
+    if "\ufffd" in stdout_text or "\ufffd" in stderr_text:
+        guard_notes.append(
+            "输出包含替换字符 �；可能是子进程读取源文件时已替换原始字节，"
+            "也可能是输出编码无法可靠识别。请核对原文件编码或原始字节，勿据此判断文本原貌"
+        )
     # 本地 tail/head 兜底：在读取完整输出后按行取头/尾（不改变退出码）
     if local_filter is not None:
         stdout_text = _apply_local_line_filter(stdout_text, local_filter[0], local_filter[1])
@@ -3441,7 +3614,8 @@ RUN_COMMAND_TOOL_DEFINITION = {
             "                     多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持\n"
             "                     （用 work_dir 或链式命令）。cmd 家族用 `&&`/`&` 串联（不支持 `;`，\n"
             "                     写了会被当普通字符原样输出）；PowerShell 5.1 用 `;` 串联。\n"
-            "                     多行内联代码（python -c）与 `| tail/head -N` 会自动适配，无需特殊写法\n"
+            "                     内联代码（python -c / node -e，多行或含 `%`）自动转脚本；\n"
+            "                     cmd 不支持 `<<` heredoc；`| tail/head -N` 可自动适配\n"
             "    shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/\n"
             "                     pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）\n"
             "    work_dir:        工作目录，默认当前目录（会话工作目录）；目录不存在时报错\n"

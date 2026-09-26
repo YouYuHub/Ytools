@@ -7,6 +7,7 @@
 
 说明：
     - 覆盖：注入 / echo / 中文 / 退出码 / 多行内联代码改写（原迁移动机场景）/
+      单行内联代码含 % 改写（cmd 吞 % 场景）/
       超时杀进程树 / work_dir / 超长输出截断并落盘 / PowerShell 多行+引号 /
       后台模式与输出落盘 / asyncio.to_thread 接线 / 分发器错误结构化；
     - run_command 已由 mcp_server/sys_tools_server.py 迁移为内置工具
@@ -79,6 +80,19 @@ def main():
             multi = 'python -c "\nimport sys\nprint(\'multi-line\', sys.version_info[0])\n"'
             result = bt.execute_run_command({"command": multi})
             check("多行内联代码改写", result, "multi-line", "已自动改写为临时脚本")
+
+            # ---- 单行内联代码含 %（cmd 批处理层吞 % 的坑） ----
+            # 实测修复前：`print('100%')` 输出 `100`；`print('%d' % 5)` 直接 SyntaxError
+            result = bt.execute_run_command({"command": 'python -c "print(\'100%\')"'})
+            check("单行含 % 改写（字面百分号）", result, "exit=0", "100%", "已自动改写为临时脚本")
+            result = bt.execute_run_command({"command": 'python -c "print(\'百分比 %d\' % 5)"'})
+            check("单行含 % 改写（% 格式化）", result, "exit=0", "百分比 5")
+            result = bt.execute_run_command(
+                {"command": 'python -c "print(\'a%\')" && python -c "print(\'b%\')"'})
+            check("双命令串联（各含 %）", result, "exit=0", "a%", "b%")
+            result = bt.execute_run_command({"command": 'python -c "print(\'plain-ok\')"'})
+            check("单行无 %（不改写，原样执行）", result, "exit=0", "plain-ok")
+            check("单行无 % 无改写说明", str("已自动改写为临时脚本" not in result), "True")
 
             # ---- 超时杀进程树 ----
             check("超时终止", bt.execute_run_command(
