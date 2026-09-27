@@ -249,52 +249,44 @@ def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
 
 
 # 思考过程（reasoning_content）回传长度：0=不回传，负数=全部回传，正数=保留末尾 N 字符
-def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
-    """单行概要描述每条消息（角色+内容形态），供模型调用前的调试打印。
+_DEBUG_REASONING_PREVIEW_CHARS = 100
 
-    媒体部件只显示 media:// 引用名或 data: 前缀，绝不输出 base64 数据：
-    旧实现直接 str(messages) 整包打印，带图轮次每次模型调用都会向控制台
-    刷出 MB 级 base64，且同一张图在任务循环的多次调用中反复出现，
-    容易被误判为"历史重复携带图片"。
-    """
+
+def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
+    """打印消息概要，并单独显示每条消息最多 100 字符的思考摘要。"""
+
+    def sanitize(value: Any, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {item_key: sanitize(item, str(item_key)) for item_key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item, key) for item in value]
+        if isinstance(value, str):
+            if key == "url" and value.startswith("data:"):
+                return value.split(",", 1)[0] + ",<base64省略>"
+            if key in ("data", "file_data"):
+                return "<base64省略>"
+        return value
+
+    if not isinstance(messages, (list, tuple)):
+        return "[]"
     lines: list[str] = []
     for index, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            lines.append(f"[{index}]<非dict:{type(msg).__name__}>")
-            continue
-        role = msg.get("role") or "?"
-        content = msg.get("content")
-        if isinstance(content, list):
-            parts: list[str] = []
-            for part in content:
-                if not isinstance(part, dict):
-                    parts.append(f"<{type(part).__name__}>")
-                    continue
-                part_type = str(part.get("type") or "?")
-                if part_type == "text":
-                    text = str(part.get("text") or "")
-                    parts.append(f"text({len(text)}字)")
-                elif part_type == "image_url":
-                    url = str((part.get("image_url") or {}).get("url") or "")
-                    if url.startswith("data:"):
-                        url = url.split(",", 1)[0] + ",<base64省略>"
-                    parts.append(f"image({url[:80]})")
-                elif part_type == "input_audio":
-                    parts.append("audio(<base64省略>)")
-                else:
-                    parts.append(part_type)
-            content_desc = "[" + ", ".join(parts) + "]"
-        else:
-            text = "" if content is None else str(content)
-            extra = ""
-            if msg.get("tool_calls"):
-                extra += f"+{len(msg['tool_calls'])}个工具调用"
-            if msg.get("tool_call_id"):
-                extra += f" tool_call_id={msg['tool_call_id']}"
-            preview = text[:60].replace("\n", "\\n")
-            content_desc = f"{len(text)}字'{preview}'{extra}"
-        lines.append(f"[{index}]{role}:{content_desc}")
-    return "; ".join(lines)
+        reasoning = msg.get("reasoning_content") if isinstance(msg, dict) else None
+        summary_msg = dict(msg) if isinstance(msg, dict) else msg
+        if isinstance(summary_msg, dict):
+            summary_msg.pop("reasoning_content", None)
+        line = f"[{index}]{sanitize(summary_msg)!s}"
+        if len(line) > 100:
+            line = line[:99] + "…"
+        if isinstance(reasoning, str) and reasoning:
+            preview = reasoning[:_DEBUG_REASONING_PREVIEW_CHARS]
+            if len(reasoning) > _DEBUG_REASONING_PREVIEW_CHARS:
+                preview += "…"
+            line += f" reasoning_content[{len(reasoning)}]={preview!r}"
+        lines.append(line)
+    if not lines:
+        return "[]"
+    return "[\n\t" + ";\n\t".join(lines) + "\n]"
 
 
 def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
@@ -1050,12 +1042,11 @@ async def _run_chat_generation(
         include_read_media=read_media_requested,
         include_sub_agent=sub_agent_requested,
     )
-    # read_document 自动注入：会话存在上传文件且本轮携带工具时注入。
-    # 文件内容以「清单+按需读取」方式注入（小文件内联/大文件节选开头，
-    # 见 memory.file_memory.get_file_memory_manifest）；模型需要文件其余
-    # 内容时用 read_document 分页读取。不开放手选（与 check_tool_exists 同类）。
+    # read_document 是文档读取能力，与当前会话是否已有上传记录、模型是否支持
+    # 原生文档输入无关；只要本轮启用了工具就注入，支持通过显式本地路径读取文档。
+    # 已上传文件仍以「清单+按需读取」方式注入。不开放手选（与 check_tool_exists 同类）。
     read_document_requested = False
-    if uploaded_file_count > 0 and round_tools:
+    if round_tools:
         round_tools, round_tool_servers = inject_builtin_tools(
             round_tools, round_tool_servers, include_read_document=True,
         )
@@ -1647,6 +1638,7 @@ async def _run_chat_generation(
             # 裁剪；找不到真实思考或 limit==0 时用 "..." 占位。历史 assistant
             # （含旧工具轮）一律剥离 reasoning_content，严格上游的字段校验
             # 仍满足（见 _copy_for_request）。
+            # print(f"[DEBUG] messages: {str(messages)}")
             # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
             # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
             print(f"[DEBUG] 模型调用消息概要：{_messages_debug_summary(messages)}")
@@ -1687,6 +1679,7 @@ async def _run_chat_generation(
                 stream_truncated_retries = None
             # 手动迭代 async generator（而非 async for）：需要对工具调用阶段
             # 施加"事件间隔"超时；超时/提前退出时显式 aclose 立即断开上游连接
+            # print(f"[DEBUG] tool_request: {tool_request}")
             sse_iter = ChatLLM.chat_completions(
                 request = tool_request, # 传递完整的 ChatLLMRequest 对象（已包含 messages）
                 stream = True,
@@ -1956,13 +1949,16 @@ async def _run_chat_generation(
                         session_chat_memory.run_task = False
                         break
                     model_retries += 1
-                    print(f"[WARN] 上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
+                    print(f"[WARNING] 上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
                     # 已生成的部分内容进入 messages（模型续写时可见上下文），
                     # 不落盘——避免 JSONL 留下"腰斩的回答"，最终完整回答统一落盘
+                    partial_message = {"role": "assistant"}
                     if full_response:
-                        messages.append({"role": "assistant", "content": full_response})
-                    elif full_reasoning:
-                        messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                        partial_message["content"] = full_response
+                    if full_reasoning:
+                        partial_message["reasoning_content"] = full_reasoning
+                    if len(partial_message) > 1:
+                        messages.append(partial_message)
                     messages.append({
                         "role": "user",
                         "content": (
@@ -1976,13 +1972,14 @@ async def _run_chat_generation(
                 # 如果 finish_reason 是 "length"，说明模型输出因 max_tokens 不足被截断
                 # 需要提示模型继续完成回答，而不是按"未调用工具"的逻辑处理
                 if finish_reason == "length":
-                    print(f"[WARN] 模型输出被截断(finish_reason=length)，提示模型继续完成回答")
-                    assistant_message = {}
+                    print(f"[WARNING] 模型输出被截断(finish_reason=length)，提示模型继续完成回答")
+                    assistant_message = {"role": "assistant"}
                     if full_response:
-                        assistant_message = {"role": "assistant", "content": full_response}
-                    elif full_reasoning:
-                        assistant_message = {"role": "assistant", "content": f"...{full_reasoning[-100:]}"}
-                    messages.append(assistant_message)
+                        assistant_message["content"] = full_response
+                    if full_reasoning:
+                        assistant_message["reasoning_content"] = full_reasoning
+                    if len(assistant_message) > 1:
+                        messages.append(assistant_message)
                     messages.append({"role": "user", "content": "你的回答因为长度限制被截断了，请继续。", "_internal": True})
                     continue  # 让模型继续，不进入"未调用工具"的逻辑
                 assistant_message = {"role": "assistant", "content": full_response} if full_response else None
@@ -2006,7 +2003,7 @@ async def _run_chat_generation(
                         print("[INFO] 注入消息接管任务收尾：继续下一轮模型调用")
                         continue
                 except Exception as inject_error:
-                    print(f"[WARN] 处理注入消息失败（按任务结束处理）: {inject_error}")
+                    print(f"[WARNING] 处理注入消息失败（按任务结束处理）: {inject_error}")
                 session_chat_memory.run_task = False
                 print("\n[INFO] 本轮对话未返回工具调用，任务结束")
                 break
@@ -2014,8 +2011,6 @@ async def _run_chat_generation(
             assistant_message = {"role": "assistant"}
             if full_response:
                 assistant_message["content"] = full_response
-            elif full_reasoning:
-                assistant_message["content"] = f"...{full_reasoning[-100:]}"
             # 带 tool_calls 的 assistant 消息：思考过程落盘模型原始全文
             # （本轮有思考就存本轮的；没有就不写字段，也不拿历史旧思考
             # 冒充本轮落盘）。裁剪/占位符只是"回传"语义——严格上游要求
@@ -2058,7 +2053,7 @@ async def _run_chat_generation(
                     f"{int(tool_call_stream_timeout)} 秒无任何响应（上游接口疑似卡死），"
                     "本次调用已被中止，参数可能不完整，请重新发起工具调用。"
                 )
-                print(f"[WARN] 工具调用流式阶段超时：放弃 {len(formatted_tool_calls)} 个调用，反馈模型继续")
+                print(f"[WARNING] 工具调用流式阶段超时：放弃 {len(formatted_tool_calls)} 个调用，反馈模型继续")
                 if formatted_tool_calls:
                     assistant_message["tool_calls"] = formatted_tool_calls
                     messages.append(assistant_message)
@@ -2095,7 +2090,7 @@ async def _run_chat_generation(
                     "刚才的工具调用格式损坏（未能解析出函数名），本次调用已放弃。"
                     "请重新发起工具调用，或直接回答用户。"
                 )
-                print("[WARN] 工具调用全部损坏（无函数名），提示模型重试")
+                print("[WARNING] 工具调用全部损坏（无函数名），提示模型重试")
                 messages.append({"role": "user", "content": broken_notice, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_BROKEN', 'message': broken_notice}}, ensure_ascii=False)}\n\n")
                 continue
@@ -2500,7 +2495,7 @@ async def _run_chat_generation(
                         f"data: {json.dumps({'event': 'todo', 'todos': todos}, ensure_ascii=False)}\n\n",
                     )
                 except Exception as todo_emit_error:
-                    print(f"[WARN] todo 事件推送失败: {todo_emit_error}")
+                    print(f"[WARNING] todo 事件推送失败: {todo_emit_error}")
             if tool_results:
                 print(f"[INFO] 有 {len(tool_results)} 个工具执行完成", flush=True)
                 # 按索引排序结果
@@ -2534,7 +2529,7 @@ async def _run_chat_generation(
                             tool_name, estimated_tokens, oversized_result_threshold, result_text=ret
                         )
                         print(
-                            f"[WARN] 工具 {tool_name} 返回结果过大"
+                            f"[WARNING] 工具 {tool_name} 返回结果过大"
                             f"（估算 {estimated_tokens} tokens > 拒绝阈值 {oversized_result_threshold}），"
                             f"连续 {consecutive_oversized_count}/{max_oversized_rejections} 次，"
                             "已告知模型重新考虑工具使用"
@@ -2625,7 +2620,7 @@ async def _run_chat_generation(
                         latest_todos = await session_chat_memory.get_session_todo()
                         _replace_todo_context(messages, latest_todos)
                     except Exception as todo_compact_error:
-                        print(f"[WARN] todo 上下文归并失败：{todo_compact_error}")
+                        print(f"[WARNING] todo 上下文归并失败：{todo_compact_error}")
                 if ask_user_pending and not oversized_abort:
                     # 推送提问事件：前端渲染问题/选项/自由输入卡片；
                     # 回答作为下一条用户消息发送，与本轮任务解耦
@@ -2636,7 +2631,7 @@ async def _run_chat_generation(
                             f"data: {json.dumps(ask_event, ensure_ascii=False)}\n\n",
                         )
                     except Exception as ask_emit_error:
-                        print(f"[WARN] ask_user 事件推送失败: {ask_emit_error}")
+                        print(f"[WARNING] ask_user 事件推送失败: {ask_emit_error}")
                     # 本轮任务到此暂停：占位工具结果已落盘、消息契约完整，
                     # 置 run_task=False 后循环正常退出（done 标记 + 收尾压缩）
                     session_chat_memory.run_task = False
@@ -2738,7 +2733,7 @@ async def _run_chat_generation(
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
-                    print(f"[WARN] 任务内历史压缩跳过：{exc}")
+                    print(f"[WARNING] 任务内历史压缩跳过：{exc}")
                     rebuilt_messages = None
                 if rebuilt_messages is not None:
                     messages = rebuilt_messages
@@ -2764,7 +2759,7 @@ async def _run_chat_generation(
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
-                    print(f"[WARN] 单轮工具上下文压缩跳过：{exc}")
+                    print(f"[WARNING] 单轮工具上下文压缩跳过：{exc}")
                     round_compaction = None
                 if round_compaction is not None and round_compaction.triggered:
                     messages = round_compaction.messages

@@ -25,6 +25,7 @@
   const SEARCH_FILES_TOOL_NAME = "search_files";
   const RUN_COMMAND_TOOL_NAME = "run_command";
   const READ_MEDIA_TOOL_NAME = "read_media";
+  const READ_DOCUMENT_TOOL_NAME = "read_document";
   const SUB_AGENT_TOOL_NAME = "sub_agent";
   const BUILTIN_SERVER_KEY = "__builtin__";
   const BUILTIN_TOOLS = [
@@ -77,6 +78,7 @@
     search_files: '<path d="M4 4h11l4 4v3M15 4v4h4M4 4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M6 11h7M6 15h4"/><circle cx="17" cy="17" r="3.5"/><path d="m19.6 19.6 2 2"/>',
     run_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
     read_media: '<rect x="7" y="3" width="14" height="15" rx="2" transform="rotate(8 14 10.5)"/><rect x="3" y="6" width="14" height="15" rx="2"/><circle cx="7.5" cy="10.5" r="1.3"/><path d="m4 18 4-4 3 3 2-2 3 3"/>',
+    read_document: '<path d="M6 3.5h8l4 4v12A1.5 1.5 0 0 1 16.5 21h-11A1.5 1.5 0 0 1 4 19.5v-14A2 2 0 0 1 6 3.5Z"/><path d="M14 3.5V8h4M8 11h8M8 14.5h8M8 18h5"/>',
   };
   const TOOL_DISPLAY_NAMES = {
     todo_write: "改写计划",
@@ -88,6 +90,7 @@
     search_files: "查找文件",
     run_command: "运行命令",
     read_media: "读取媒体",
+    read_document: "读取文档",
   };
   const DEFAULT_TOOL_ICON_PATH = '<path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/>';
 
@@ -106,7 +109,8 @@
   }
 
   function isBuiltinToolName(name) {
-    return BUILTIN_TOOLS.some(function (tool) { return tool.name === name; });
+    return name === READ_DOCUMENT_TOOL_NAME ||
+      BUILTIN_TOOLS.some(function (tool) { return tool.name === name; });
   }
 
   function renderTodoWidget() {

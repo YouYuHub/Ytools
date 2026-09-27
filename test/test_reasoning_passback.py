@@ -35,6 +35,21 @@ def _assistant(content="", reasoning=None, tool_calls=None):
     return message
 
 
+class MessagesDebugSummaryTests(unittest.TestCase):
+    def test_reasoning_preview_is_shown_separately_from_message_limit(self):
+        reasoning = "思" * 120
+        summary = cf._messages_debug_summary([
+            {"role": "assistant", "content": "回复内容", "reasoning_content": reasoning},
+        ])
+        expected_preview = repr("思" * 100 + "…")
+        self.assertIn(f"reasoning_content[120]={expected_preview}", summary)
+
+    def test_messages_without_reasoning_keep_compact_summary(self):
+        summary = cf._messages_debug_summary([{"role": "user", "content": "问题"}])
+        self.assertIn("'content': '问题'", summary)
+        self.assertNotIn("reasoning_content", summary)
+
+
 class RetainLatestReasoningTests(unittest.TestCase):
     """_retain_latest_reasoning 的保留/占位/剥离行为。"""
 

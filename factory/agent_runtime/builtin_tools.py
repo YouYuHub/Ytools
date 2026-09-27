@@ -325,10 +325,17 @@ def execute_builtin_tool(
         if close:
             message += f"；名称最接近的已有工具：{'、'.join(close)}（注意大小写与下划线）"
     elif disabled:
-        message = (
-            f"{query_name} 在后端已注册但未被当前轮次任务启用（用户禁用了该工具），"
-            "本轮无法使用；请改用其他方式完成，或提示用户在工具选择中重新勾选该工具"
-        )
+        if query_name == READ_DOCUMENT_NAME:
+            message = (
+                "read_document 是后端按条件自动注入的文档读取工具，不开放手选；"
+                "当前轮次未注入，通常是因为本轮处于无工具模式。"
+                "supportDocTypes 只控制原生文档注入，不控制该工具的文本读取能力"
+            )
+        else:
+            message = (
+                f"{query_name} 在后端已注册但未被当前轮次任务启用（用户禁用了该工具），"
+                "本轮无法使用；请改用其他方式完成，或提示用户在工具选择中重新勾选该工具"
+            )
     else:
         message = f"{query_name} 当前轮次任务中可用"
     if not exists:
@@ -1232,16 +1239,79 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ------------------- read_document：读取上传文件的解析文本（按需/分页） -------------------
-# 用户上传文档（pdf/docx/doc/xls/xlsx/csv/md/txt）解析出的文本由系统提示词以
-# 「文件清单」形式注入：小文件内联全文、大文件仅开头节选（见
-# memory.file_memory.build_file_manifest_text）。需要文件其余内容时模型调用
-# 本工具，按字符区间分页读取完整解析文本。
-# 由 chat_factory 在「会话存在上传文件且本轮携带工具」时自动注入（不开放手选，
-# 与 check_tool_exists 同类）；只读工具，无内容安全边界（文件由用户自己上传）。
+# ------------------- read_document：读取文档解析文本（按需/分页） -------------------
+# 支持会话上传文件，以及用户明确传入的本地文档路径；当前轮启用工具时自动注入。
 
 _READ_DOCUMENT_DEFAULT_MAX_CHARS = 8000
 _READ_DOCUMENT_MAX_CHARS = 20000
+_READ_DOCUMENT_LOCAL_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _load_local_document(filename: str) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
+    """读取显式指定的本地文档并复用上传链路解析器。"""
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        path = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, None, f"本地文档路径不存在或不可访问：{filename}"
+    if not path.is_file():
+        return None, None, f"本地文档路径不是文件：{filename}"
+    try:
+        size = path.stat().st_size
+        if size > _READ_DOCUMENT_LOCAL_MAX_BYTES:
+            return None, None, (
+                f"本地文档超过读取上限 {_READ_DOCUMENT_LOCAL_MAX_BYTES // (1024 * 1024)}MB："
+                f"{path.name}（{size / (1024 * 1024):.1f}MB）"
+            )
+        data = path.read_bytes()
+    except OSError as exc:
+        return None, None, f"读取本地文档失败：{exc}"
+
+    from factory import file_factory
+
+    if (
+        file_factory.get_parser_for_filename(path.name) is None
+        and not file_factory.get_text_extension(path.name)
+    ):
+        return None, None, (
+            f"不支持读取该文件类型：{path.suffix or '无扩展名'}；"
+            "请使用 PDF/Word/Excel/CSV/Markdown/文本文件"
+        )
+    parse_error = ""
+    try:
+        content = file_factory.extract_text_from_bytes(path.name, data)
+    except Exception as exc:
+        content = ""
+        parse_error = str(exc)
+
+    try:
+        from config import DEFAULT_FILE_TEXT_MAX_CHARS
+        from env_manager import load_var
+
+        max_chars = int(float(load_var("FILE_TEXT_MAX_CHARS", DEFAULT_FILE_TEXT_MAX_CHARS)))
+        max_chars = max(0, max_chars)
+    except (TypeError, ValueError):
+        from config import DEFAULT_FILE_TEXT_MAX_CHARS
+
+        max_chars = DEFAULT_FILE_TEXT_MAX_CHARS
+    total_chars = len(content)
+    truncated = max_chars > 0 and total_chars > max_chars
+    if truncated:
+        content = content[:max_chars]
+    record = {
+        "filename": str(path),
+        "display_filename": path.name,
+        "type": path.suffix.lower().lstrip("."),
+        "content": content,
+        "parse_failed": bool(parse_error),
+        "parse_error": parse_error,
+        "content_truncated": truncated,
+        "content_total_chars": total_chars,
+        "size": size,
+    }
+    return record, data, None
 
 
 def _read_document_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
@@ -1257,9 +1327,10 @@ READ_DOCUMENT_TOOL_DEFINITION = {
     "function": {
       "name": READ_DOCUMENT_NAME,
       "description": (
-          "读取用户上传文件（PDF/Word/Excel/CSV/MD/TXT 等已解析文档）的完整内容。"
-          "系统提示词中会列出上传文件清单：小文件已内联全文，大文件仅显示开头节选；"
-          "需要文件其余内容时用本工具读取。支持按字符区间分页（start_char/max_chars），"
+          "读取当前会话上传文件，或按明确提供的本地绝对/相对路径读取文档"
+          "（PDF/Word/Excel/CSV/MD/TXT 等）。小文件可能已在文件清单中内联，"
+          "大文件只显示开头节选；需要其余内容时用本工具读取。支持按字符区间分页"
+          "（start_char/max_chars），本地路径文件最大 10MB，"
           "返回带 total_chars 与 has_more，据此继续读取后续区间。"
       ),
       "parameters": {
@@ -1267,7 +1338,7 @@ READ_DOCUMENT_TOOL_DEFINITION = {
         "properties": {
           "filename": {
             "type": "string",
-            "description": "上传文件的原始文件名（见系统提示词文件清单中的文件名）",
+            "description": "会话文件清单中的原始文件名，或当前工作目录下的相对/绝对文档路径",
           },
           "start_char": {
             "type": "integer",
@@ -1292,7 +1363,7 @@ def execute_read_document(
     session_id: str,
     support_doc_types: Any = None,
 ) -> dict[str, Any]:
-    """执行内置 read_document：按文件名读取上传文件的解析文本（分页）。
+    """执行内置 read_document：按会话文件名或本地路径读取解析文本（分页）。
 
     support_doc_types 为当前生效模型的 supportDocTypes 声明（原生文档输入能力）：
     - 命中声明且原始文件可用 → 结果携带 native 块（原生文档部件），调用方把它
@@ -1305,7 +1376,7 @@ def execute_read_document(
     args = tool_args if isinstance(tool_args, dict) else {}
     filename = str(args.get("filename") or "").strip()
     if not filename:
-        return {"error": "filename 不能为空（文件名见系统提示词中的上传文件清单）"}
+        return {"error": "filename 不能为空（传入会话文件名或明确的本地文档路径）"}
     start = _read_document_int(args.get("start_char"), 0, minimum=0, maximum=10**9)
     max_chars = _read_document_int(
         args.get("max_chars"),
@@ -1313,28 +1384,37 @@ def execute_read_document(
         minimum=1,
         maximum=_READ_DOCUMENT_MAX_CHARS,
     )
+    local_data: bytes | None = None
     try:
         record = file_memory.find_file_memory_record(session_id, filename)
     except Exception as exc:
         return {"error": f"读取文件记录失败：{exc}"}
     if record is None:
-        try:
-            names = [
-                str(item.get("filename") or "未命名")
-                for item in file_memory.list_session_file_records(session_id)
-            ]
-        except Exception:
-            names = []
-        hint = f"；当前会话已上传文件：{'、'.join(names)}" if names else "；当前会话没有上传文件"
-        return {"error": f"未找到文件「{filename}」{hint}"}
+        record, local_data, local_error = _load_local_document(filename)
+        if record is None:
+            try:
+                names = [
+                    str(item.get("filename") or "未命名")
+                    for item in file_memory.list_session_file_records(session_id)
+                ]
+            except Exception:
+                names = []
+            hint = f"；当前会话已上传文件：{'、'.join(names)}" if names else "；当前会话没有上传文件"
+            return {"error": f"{local_error}；{hint}"}
     # 原生文档分支：当前模型声明支持该类型且原始文件可用时，构建原生文档部件
     # （调用方注入后续请求；文本节选仍一并返回，供应商拒绝 file 部件时可兜底）
     native_block: dict[str, Any] | None = None
     native_note = ""
+    display_filename = str(record.get("display_filename") or record.get("filename") or filename)
     if support_doc_types and file_memory.document_supports_native(
-        str(record.get("filename") or filename), support_doc_types
+        display_filename, support_doc_types
     ):
-        loaded_native = file_memory.build_native_document_part(session_id, record)
+        if local_data is not None:
+            loaded_native = file_memory.build_native_document_part_from_bytes(
+                display_filename, local_data
+            )
+        else:
+            loaded_native = file_memory.build_native_document_part(session_id, record)
         if loaded_native.get("part") is not None:
             native_block = loaded_native
             native_note = (
@@ -1395,6 +1475,13 @@ def execute_read_document(
         )
     else:
         result["message"] = f"已返回第 {start}-{end} 字符（全文结束，共 {total} 字）" + native_note
+    if record.get("content_truncated"):
+        result["content_truncated"] = True
+        result["content_total_chars"] = record.get("content_total_chars")
+        result["message"] += (
+            f"；文本解析结果达到入库上限，完整解析文本共约 "
+            f"{record.get('content_total_chars')} 字"
+        )
     return result
 
 

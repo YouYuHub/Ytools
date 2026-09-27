@@ -5,7 +5,7 @@
   },
   "Wsl Completions": {
     "vendor": "wsl",
-    "apiKey": "not-needed",
+    "apiKey": "",
     "apiType": "chat-completions",
     "models": {
       "Qwen3.5 2B": {
@@ -21,7 +21,7 @@
   },
   "DeepSeek Completions": {
     "vendor": "deepseek",
-    "apiKey": "sk-deepseek-api-key",
+    "apiKey": "",
     "apiType": "chat-completions",
     "models": {
       "Deepseek Flash": {
@@ -46,7 +46,7 @@
   },
   "ZaiOrg Completions": {
     "vendor": "zai-org",
-    "apiKey": "sk-zaiOrg-api-key",
+    "apiKey": "",
     "apiType": "chat-completions",
     "models": {
       "GLM 5.3": {
@@ -70,7 +70,7 @@
   },
   "ApiYi Claude": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-apiyi-api-key",
+    "apiKey": "",
     "apiType": "messages",
     "models": {
       "Claude Opus 4.8": {
@@ -78,7 +78,10 @@
         "url": "https://api.apiyi.com/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [".pdf", ".docx"],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 928000,
         "maxOutputTokens": 24000
       }
@@ -86,24 +89,27 @@
   },
   "Qwen Completions": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-ws-qwen-api-key",
+    "apiKey": "",
     "apiType": "chat-completions",
     "models": {
-      "GLM 5.2": {
-        "id": "glm-5.2",
+      "Qwen3.7 Flash": {
+        "id": "qwen3.7-flash-2026-07-15",
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
-        "vision": false,
+        "vision": true,
         "supportDocTypes": null,
         "maxInputTokens": 428000,
-        "maxOutputTokens": 26000
+        "maxOutputTokens": 126000
       },
       "Qwen3.8 Flash": {
         "id": "qwen3.8-flash",
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [".pdf", ".docx"],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 128000,
         "maxOutputTokens": 26000
       },
@@ -121,7 +127,10 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [".pdf", ".docx"],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 228000,
         "maxOutputTokens": 26000
       },
@@ -130,7 +139,10 @@
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [".pdf", ".docx"],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 428000,
         "maxOutputTokens": 26000
       }
@@ -138,7 +150,7 @@
   },
   "OpenCode Message": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-opencode-message-api-key",
+    "apiKey": "",
     "apiType": "messages",
     "models": {
       "Qwen3.7 Max": {
@@ -146,7 +158,10 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [ ".pdf", ".docx" ],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 888888,
         "maxOutputTokens": 16000
       },
@@ -163,7 +178,10 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [ ".pdf", ".docx" ],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx"
+        ],
         "maxInputTokens": 888888,
         "maxOutputTokens": 65536
       }
@@ -171,7 +189,7 @@
   },
   "OpenCode Completions": {
     "vendor": "custom_endpoint",
-    "apiKey": "sk-opencode-api-key",
+    "apiKey": "",
     "apiType": "chat-completions",
     "models": {
       "GPT-5.6 Luna": {
@@ -179,7 +197,12 @@
         "url": "https://opencode.ai/zen/go/v1",
         "toolCalling": true,
         "vision": true,
-        "supportDocTypes": [ ".pdf", ".docx", ".xlsx", ".pptx" ],
+        "supportDocTypes": [
+          ".pdf",
+          ".docx",
+          ".xlsx",
+          ".pptx"
+        ],
         "maxInputTokens": 898000,
         "maxOutputTokens": 36000
       },
@@ -232,14 +255,14 @@
   },
   "model_selection": {
     "chat_model": {
-      "ownership_name": "OpenCode Completions",
-      "model_name": "Omen Alpha",
+      "ownership_name": "Qwen Completions",
+      "model_name": "Qwen3.7 Flash",
       "parameter": {
         "chat_completions": {
           "temperature": 0.8,
           "top_p": 0.8,
           "presence_penalty": 0.5,
-          "reasoning_effort": "max",
+          "reasoning_effort": "low",
           "extra_body": {
             "enable_thinking": true
           },
@@ -260,7 +283,7 @@
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "your-session-id"
+          "value": " lolicon1314"
         }
       ]
     },
@@ -283,7 +306,7 @@
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "your-session-id"
+          "value": "lolicon1314"
         }
       ]
     },
@@ -306,7 +329,7 @@
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "your-session-id"
+          "value": "lolicon1314"
         }
       ]
     },
@@ -329,7 +352,7 @@
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "your-session-id"
+          "value": "lolicon1314"
         }
       ]
     }

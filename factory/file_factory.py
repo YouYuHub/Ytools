@@ -13,10 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # PDF - 使用 PyMuPDF (fitz)
 try:
     import fitz  # PyMuPDF
-except ImportError:
-    import pymupdf as fitz  # 新版本推荐；旧代码常用 import fitz
 except Exception:
-    fitz = None
+    try:
+        import pymupdf as fitz  # 新版本推荐；旧代码常用 import fitz
+    except Exception:
+        fitz = None
 
 # DOCX
 try:

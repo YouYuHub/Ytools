@@ -249,6 +249,7 @@ def _file_record_header(
     record: dict[str, Any],
     *,
     with_length: bool,
+    read_document_available: bool = True,
     native_doc_types: Any = None,
 ) -> str:
     filename = str(record.get("filename") or "未命名")
@@ -258,15 +259,19 @@ def _file_record_header(
     if with_length:
         content_len = len(str(record.get("content") or ""))
         meta = f"{meta}，共约 {content_len} 字" if meta else f"共约 {content_len} 字"
-    # 原生文档标注：该类型在当前模型的 supportDocTypes 内时，文档原始文件会
-    # 按轮作为原生文档发送（供应商侧视觉解析），文本口径仅为兜底
+    capabilities: list[str] = []
+    if read_document_available and not record.get("parse_failed"):
+        capabilities.append("read_document 文本分页可读")
     if record_supports_native(record, native_doc_types):
-        meta = f"{meta}，原生文档已随请求发送" if meta else "原生文档已随请求发送"
+        capabilities.append("模型声明支持原生文档输入（受大小/数量预算限制）")
+    if capabilities:
+        capability_text = "；".join(capabilities)
+        meta = f"{meta}，{capability_text}" if meta else capability_text
     # 本地解析失败（解析器缺失/损坏文件等）：仅原生文档可用，明确告知模型
     if record.get("parse_failed"):
         note = "本地文本解析失败（仅原生文档可用）"
         meta = f"{meta}，{note}" if meta else note
-    # 解析文本被截断入库：告知模型可用原文绝对路径（read_file）继续读取
+    # 解析文本被截断入库：告知模型可对保留的原始文件路径重新解析
     if record.get("content_truncated"):
         total = record.get("content_total_chars")
         note = f"解析文本已截断（原文共约 {total} 字）" if total else "解析文本已截断"
@@ -288,8 +293,8 @@ def build_file_manifest_text(
     - 小文件（解析文本 ≤ inline_max_chars）：内联全文；
     - 大文件：给开头 head_excerpt_chars 字节选 + read_document 读取提示；
     - 总预算 total_max_chars：超出时按「新文件优先」收缩（先截断/省略最旧文件）；
-    - native_doc_types：当前模型 supportDocTypes 声明（命中时条目注明
-      「原生文档已随请求发送」）；截断入库的记录注明可读原文绝对路径。
+    - native_doc_types：当前模型 supportDocTypes 声明（命中时条目标注原生文档能力）；
+      截断入库的记录注明可用 read_document 重新读取原文路径。
 
     调用方约定记录顺序：最近上传的在前。返回空串表示没有文件。
     """
@@ -306,7 +311,9 @@ def build_file_manifest_text(
         inline = total_len <= inline_max_chars
         body = content if inline else content[:head_excerpt_chars]
         header = _file_record_header(
-            index, record, with_length=not inline, native_doc_types=native_doc_types
+            index, record, with_length=not inline,
+            read_document_available=read_document_available,
+            native_doc_types=native_doc_types,
         )
         if inline:
             block = f"{header}\n{body}" if body else header
@@ -322,7 +329,7 @@ def build_file_manifest_text(
             if abs_path:
                 block += (
                     f"\n（解析文本已截断，原始文件保留于 {abs_path}，"
-                    "可用 read_file 按行读取续读原文）"
+                    "可用 read_document(filename=路径) 重新读取原文）"
                 )
         if used + len(block) + 1 > total_max_chars:
             remaining = total_max_chars - used - 1
@@ -340,6 +347,8 @@ def build_file_manifest_text(
     intro = f"\n用户上传了 {len(records)} 个文件，解析内容如下"
     if read_document_available:
         intro += "（小文件已内联全文，大文件为开头节选，可用 read_document 读取完整内容）"
+    if native_doc_types:
+        intro += "；supportDocTypes 表示模型声明的原生输入类型，不决定 read_document 工具是否可用"
     intro += "：\n"
     text = intro + "\n".join(parts)
     if omitted > 0:
@@ -368,7 +377,9 @@ def build_file_index_text(
         if not isinstance(record, dict):
             continue
         line = "- " + _file_record_header(
-            index, record, with_length=False, native_doc_types=native_doc_types
+            index, record, with_length=False,
+            read_document_available=read_document_available,
+            native_doc_types=native_doc_types,
         )
         if used + len(line) + 1 > total_max_chars:
             omitted = max(0, len(records) - index + 1)
@@ -685,6 +696,26 @@ def build_native_document_part(session_id: str, record: dict[str, Any]) -> dict[
         data = path.read_bytes()
     except OSError as exc:
         return {"error": f"{filename} 原始文件读取失败：{exc}"}
+    result = build_native_document_part_from_bytes(filename, data, stored_name=stored_name)
+    if result.get("part") is not None:
+        result["abs_path"] = str(path).replace("\\", "/")
+    return result
+
+
+def build_native_document_part_from_bytes(
+    filename: str, data: bytes, *, stored_name: str = ""
+) -> dict[str, Any]:
+    """从显式提供的文件字节构建原生文档部件，并应用单文件大小上限。"""
+    filename = Path(str(filename or "未命名")).name
+    size = len(data)
+    limit = native_doc_max_bytes()
+    if limit > 0 and size > limit:
+        return {
+            "error": (
+                f"{filename}（{size / (1024 * 1024):.1f}MB）超过原生文档注入上限 "
+                f"{limit // (1024 * 1024)}MB，已按文本口径处理"
+            )
+        }
     mime = media_mime_type(filename) or "application/octet-stream"
     part = {
         "type": NATIVE_DOC_PART_TYPE,
@@ -699,7 +730,6 @@ def build_native_document_part(session_id: str, record: dict[str, Any]) -> dict[
         "stored_name": stored_name,
         "mime": mime,
         "size": size,
-        "abs_path": str(path).replace("\\", "/"),
     }
 
 

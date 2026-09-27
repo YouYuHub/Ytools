@@ -123,3 +123,7 @@ if __name__ == "__main__":
 后端测试位于 `test/`。安装 `pytest` 后，可在项目根目录运行 `python -m pytest test -q`；部分 `manual_*.py` 是需要外部服务或人工操作的脚本，不属于普通单元测试。前端测试位于 `H5/test_h5/`，在 `H5/` 目录执行 `npm test`。样式修改应编辑 `H5/style/scss/`，再按 [H5 文档](H5/README.md#4-scss-构建与测试)编译。
 
 专题文档：[上下文压缩](docs/compact.md) · [文件 Diff](docs/file_diff.md) · [子智能体](docs/sub_agent_v1.md)。
+
+## 本地凭据配置
+
+克隆后将 `.env.example` 复制为 `.env`，并将 `setting/models.example.json` 复制为 `setting/models.json`，再在本机填写自己的凭据。真实配置文件已加入 Git 忽略规则，不应提交到仓库。

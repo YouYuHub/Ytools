@@ -11,13 +11,14 @@ history_files/yt-2026-09-13_22.03.42_062_chat.jsonl 两轮均在流开始约
 - chat_llm.py：EOF 且未收到 finish_reason 时在合成 [DONE] 前补发
   stream_truncated 标记帧；
 - chat_factory.py / sub_agent.py：拦截标记帧走"截断续写重试"——已生成的
-  部分内容进 messages（不落盘）+ 内部消息提示模型继续；重试超限先落盘
+  正文与思考分别放入对应字段进 messages（不落盘）+ 内部消息提示模型继续；重试超限先落盘
   部分内容再写带统计的错误记录，任务不再静默假成功。
 
 测试 mock 直接模拟 ChatLLM 的完整行为（含 stream_truncated 标记帧），
 验证工厂层与子智能体的拦截/重试/超限收尾逻辑。
 """
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -28,6 +29,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import factory.chat_factory as cf
 from config import ChatLLMRequest
+
+
+def _snapshot_request_messages(request):
+    """将 Pydantic 消息模型转成独立 dict，避免 mock 快照被后续修改污染。"""
+    messages = getattr(request, "messages", None) or []
+    snapshot = []
+    for message in messages:
+        if isinstance(message, dict):
+            snapshot.append(copy.deepcopy(message))
+        elif callable(getattr(message, "model_dump", None)):
+            snapshot.append(message.model_dump(exclude_none=True))
+        else:
+            snapshot.append(copy.deepcopy(vars(message)))
+    return snapshot
 from memory.chat_memory import (
     ChatMemoryManager,
     cleanup_chat_memory_manager,
@@ -47,8 +62,9 @@ class TruncatingLLM:
         if TruncatingLLM.last_messages is None:
             TruncatingLLM.last_messages = {}
         TruncatingLLM.last_messages[TruncatingLLM.calls] = (
-            list(request.messages) if request is not None and request.messages else []
+            _snapshot_request_messages(request)
         )
+        messages_value = getattr(request, "messages", None)
         if TruncatingLLM.calls <= TruncatingLLM.fail_calls:
             # 模拟 ChatLLM 对上游 EOF 的处理：部分思考增量 →
             # stream_truncated 标记帧 → 合成 [DONE]（无 finish_reason）
@@ -89,7 +105,7 @@ class TextToolCallLLM:
     @staticmethod
     async def chat_completions(request=None, stream=False, stop_checker=None, **kw):
         TextToolCallLLM.calls += 1
-        TextToolCallLLM.last_messages = list(request.messages or [])
+        TextToolCallLLM.last_messages = _snapshot_request_messages(request)
         if TextToolCallLLM.calls == 1 or TextToolCallLLM.always_markup:
             chunks = [
                 "@@<tool_",
@@ -220,8 +236,14 @@ class StreamTruncationRecoveryTests(TruncationTestBase):
             self.assertIn("恢复后的完整回答", text)
             second = TruncatingLLM.last_messages.get(2) or []
             flattened = json.dumps(second, ensure_ascii=False, default=str)
-            # 部分思考以占位形式进入续写上下文（与 finish_reason=length 同语义）
-            self.assertIn("...部分生成的思考内容", flattened)
+            # 部分思考保留在 reasoning_content；不能混入正文 content。
+            self.assertTrue(any(
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("reasoning_content")
+                for message in second
+            ))
+            self.assertNotIn("...部分生成的思考内容", flattened)
             self.assertIn("连接中断被截断", flattened)
         finally:
             await cleanup_chat_memory_manager(sid)
@@ -332,7 +354,7 @@ class IntermittentLLM:
         if IntermittentLLM.last_messages is None:
             IntermittentLLM.last_messages = {}
         IntermittentLLM.last_messages[n] = (
-            list(request.messages) if request is not None and request.messages else []
+            _snapshot_request_messages(request)
         )
         if n in (1, 3, 4):
             # 模拟上游 EOF + stream_truncated 标记帧（部分思考增量）

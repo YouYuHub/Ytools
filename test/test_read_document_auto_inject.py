@@ -194,11 +194,11 @@ class ReadDocumentAutoInjectTests(unittest.TestCase):
         self.assertIn("说明.txt", system_text)
         self.assertIn("文件正文内容", system_text)
 
-    def test_no_files_no_read_document(self):
+    def test_read_document_injected_without_uploaded_files(self):
         stream, captured = self._run(["read_file"])
         self.assertIn("你好！", "".join(stream.chunks))
         names = self._tool_names(captured)
-        self.assertNotIn("read_document", names)
+        self.assertIn("read_document", names)
         system_text = self._message_content(captured["messages"][0])
         self.assertNotIn("用户上传了", system_text)
 

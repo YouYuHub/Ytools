@@ -170,6 +170,52 @@ class ReadDocumentExecutionTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record["content"], "PDF 内容")
 
+    def test_reads_explicit_local_text_path(self):
+        path = Path(self._tmp) / "本地文档.txt"
+        path.write_text("本地内容" * 5, encoding="utf-8")
+        result = execute_read_document(
+            {"filename": str(path), "start_char": 4, "max_chars": 8}, self.sid
+        )
+        self.assertEqual(result["content"], "本地内容" * 2)
+        self.assertEqual(result["filename"], str(path.resolve()))
+        self.assertTrue(result["has_more"])
+
+    def test_local_native_document_for_supported_type(self):
+        from factory import file_factory
+        from unittest.mock import patch
+
+        path = Path(self._tmp) / "local.pdf"
+        path.write_bytes(b"pdf bytes")
+        with patch.object(file_factory, "extract_text_from_bytes", return_value="PDF 文本"):
+            result = execute_read_document(
+                {"filename": str(path)}, self.sid, support_doc_types=[".pdf"]
+            )
+        self.assertEqual(result["content"], "PDF 文本")
+        self.assertEqual(result["native"]["filename"], "local.pdf")
+        self.assertEqual(result["native"]["part"]["type"], "file")
+
+    def test_local_native_document_survives_missing_text_parser(self):
+        from factory import file_factory
+        from unittest.mock import patch
+
+        path = Path(self._tmp) / "local.pdf"
+        path.write_bytes(b"pdf bytes")
+        with patch.object(
+            file_factory, "extract_text_from_bytes", side_effect=RuntimeError("PyMuPDF unavailable")
+        ):
+            result = execute_read_document(
+                {"filename": str(path)}, self.sid, support_doc_types=[".pdf"]
+            )
+        self.assertEqual(result["total_chars"], 0)
+        self.assertEqual(result["native"]["filename"], "local.pdf")
+        self.assertIn("PyMuPDF unavailable", result["message"])
+
+    def test_local_unsupported_extension_is_rejected(self):
+        path = Path(self._tmp) / "payload.bin"
+        path.write_bytes(b"data")
+        result = execute_read_document({"filename": str(path)}, self.sid)
+        self.assertIn("不支持读取该文件类型", result["error"])
+
     def test_count_and_find_record(self):
         self._add_file("alpha.txt", "aaa")
         self._add_file("beta.csv", "bbb", ftype="csv")
@@ -211,6 +257,18 @@ class ReadDocumentInjectionTests(unittest.TestCase):
         )
         self.assertTrue(result["exists"])
         self.assertFalse(result["disabled"])
+
+    def test_check_tool_exists_explains_read_document_condition(self):
+        result = execute_builtin_tool(
+            "check_tool_exists",
+            {"tool_name": "read_document"},
+            set(),
+            {},
+            enabled_tool_names=set(),
+        )
+        self.assertTrue(result["disabled"])
+        self.assertIn("按条件自动注入", result["message"])
+        self.assertNotIn("用户禁用了", result["message"])
 
     def test_read_document_definition_shape(self):
         definition = builtin_tools.READ_DOCUMENT_TOOL_DEFINITION

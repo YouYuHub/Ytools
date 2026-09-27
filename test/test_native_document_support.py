@@ -246,9 +246,9 @@ class NativeDocumentHelperTests(unittest.TestCase):
         text = file_memory.build_file_manifest_text(
             [record], native_doc_types=[".pdf"], read_document_available=True
         )
-        self.assertIn("原生文档已随请求发送", text)
+        self.assertIn("模型声明支持原生文档输入", text)
         self.assertIn("解析文本已截断", text)
-        self.assertIn("read_file", text)
+        self.assertIn("read_document(filename=路径)", text)
 
     def test_part_label_uses_filename(self):
         label = file_memory._media_reference_label({

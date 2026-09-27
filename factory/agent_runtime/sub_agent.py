@@ -1037,10 +1037,13 @@ class SubAgentRunner:
                         f"[WARN] 子任务模型调用失败，断点续跑重试 "
                         f"#{self._stream_error_retries_used}（上限 {se_label}）"
                     )
+                    partial_message = {"role": "assistant"}
                     if call["full_response"]:
-                        self.messages.append({"role": "assistant", "content": call["full_response"]})
-                    elif call["full_reasoning"]:
-                        self.messages.append({"role": "assistant", "content": f"...{call['full_reasoning'][-100:]}"})
+                        partial_message["content"] = call["full_response"]
+                    if call["full_reasoning"]:
+                        partial_message["reasoning_content"] = call["full_reasoning"]
+                    if len(partial_message) > 1:
+                        self.messages.append(partial_message)
                     self.messages.append({
                         "role": "user",
                         "content": (
@@ -1096,8 +1099,6 @@ class SubAgentRunner:
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if full_response:
                 assistant_message["content"] = full_response
-            elif full_reasoning:
-                assistant_message["content"] = f"...{full_reasoning[-100:]}"
             if full_reasoning:
                 assistant_message["reasoning_content"] = full_reasoning
             formatted_tool_calls = []
@@ -1121,10 +1122,13 @@ class SubAgentRunner:
                 # 此前该场景与正常收尾不可区分——空正文被包装为"思考摘要"静默
                 # 结束（done），真实回答丢失
                 if call["stream_truncated"]:
+                    partial_message = {"role": "assistant"}
                     if full_response:
-                        self.messages.append({"role": "assistant", "content": full_response})
-                    elif full_reasoning:
-                        self.messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                        partial_message["content"] = full_response
+                    if full_reasoning:
+                        partial_message["reasoning_content"] = full_reasoning
+                    if len(partial_message) > 1:
+                        self.messages.append(partial_message)
                     self.messages.append({
                         "role": "user",
                         "content": (
@@ -1137,8 +1141,13 @@ class SubAgentRunner:
                     continue
                 if call["finish_reason"] == "length":
                     # 截断续写：落盘已生成内容 + 内部"请继续"消息（同父循环语义）
+                    partial_message = {"role": "assistant"}
                     if full_response:
-                        self.messages.append({"role": "assistant", "content": full_response})
+                        partial_message["content"] = full_response
+                    if full_reasoning:
+                        partial_message["reasoning_content"] = full_reasoning
+                    if len(partial_message) > 1:
+                        self.messages.append(partial_message)
                     self.messages.append({
                         "role": "user",
                         "content": "你的回答因为长度限制被截断了，请继续完成。",
@@ -1176,10 +1185,13 @@ class SubAgentRunner:
                         f"[WARN] 子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
                         f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）"
                     )
+                    partial_message = {"role": "assistant"}
                     if full_response:
-                        self.messages.append({"role": "assistant", "content": full_response})
-                    elif full_reasoning:
-                        self.messages.append({"role": "assistant", "content": f"...{full_reasoning[-100:]}"})
+                        partial_message["content"] = full_response
+                    if full_reasoning:
+                        partial_message["reasoning_content"] = full_reasoning
+                    if len(partial_message) > 1:
+                        self.messages.append(partial_message)
                     self.messages.append({
                         "role": "user",
                         "content": (
@@ -1216,7 +1228,6 @@ class SubAgentRunner:
                         if full_reasoning:
                             self.messages.append({
                                 "role": "assistant",
-                                "content": f"...{full_reasoning[-100:]}",
                                 "reasoning_content": full_reasoning,
                             })
                         self.messages.append({
