@@ -82,7 +82,7 @@ MEDIA_PART_LABELS = {
     "image_url": "[图片]",
     "input_audio": "[音频]",
     "video_url": "[视频]",
-    # 原生文档部件（模型 supportDocTypes 声明支持时按轮注入；历史回放转占位）
+    # 原生文档部件（read_document 按 supportDocTypes 按需单次注入；完整响应后转占位）
     "file": "[文档]",
 }
 
@@ -262,14 +262,18 @@ def _file_record_header(
     capabilities: list[str] = []
     if read_document_available and not record.get("parse_failed"):
         capabilities.append("read_document 文本分页可读")
-    if record_supports_native(record, native_doc_types):
+    if read_document_available and record_supports_native(record, native_doc_types):
         capabilities.append("模型声明支持原生文档输入（受大小/数量预算限制）")
     if capabilities:
         capability_text = "；".join(capabilities)
         meta = f"{meta}，{capability_text}" if meta else capability_text
     # 本地解析失败（解析器缺失/损坏文件等）：仅原生文档可用，明确告知模型
     if record.get("parse_failed"):
-        note = "本地文本解析失败（仅原生文档可用）"
+        note = (
+            "本地文本解析失败（仅原生文档可用）"
+            if read_document_available and record_supports_native(record, native_doc_types)
+            else "本地文本解析失败；如需尝试读取原文，请在工具配置中启用 read_document"
+        )
         meta = f"{meta}，{note}" if meta else note
     # 解析文本被截断入库：告知模型可对保留的原始文件路径重新解析
     if record.get("content_truncated"):
@@ -300,6 +304,11 @@ def build_file_manifest_text(
     """
     if not records:
         return ""
+    native_keys = {
+        (str(record.get("filename") or ""), str(record.get("stored_name") or ""))
+        for record in records
+        if isinstance(record, dict) and record_supports_native(record, native_doc_types)
+    }
     parts: list[str] = []
     used = 0
     omitted = 0
@@ -315,7 +324,17 @@ def build_file_manifest_text(
             read_document_available=read_document_available,
             native_doc_types=native_doc_types,
         )
-        if inline:
+        is_native_candidate = (
+            str(record.get("filename") or ""),
+            str(record.get("stored_name") or ""),
+        ) in native_keys
+        if is_native_candidate and read_document_available:
+            block = (
+                f"{header}\n"
+                "原生文档按需读取；需要查看原文或页面时调用 "
+                "read_document(mode=\"native\")。未发送解析文本。"
+            )
+        elif inline:
             block = f"{header}\n{body}" if body else header
         else:
             note = f"（内容较长，已节选开头 {len(body)} 字）"
@@ -329,7 +348,11 @@ def build_file_manifest_text(
             if abs_path:
                 block += (
                     f"\n（解析文本已截断，原始文件保留于 {abs_path}，"
-                    "可用 read_document(filename=路径) 重新读取原文）"
+                    + (
+                        "可用 read_document(filename=路径) 重新读取原文）"
+                        if read_document_available
+                        else "启用 read_document 后可尝试重新读取原文）"
+                    )
                 )
         if used + len(block) + 1 > total_max_chars:
             remaining = total_max_chars - used - 1
@@ -344,9 +367,9 @@ def build_file_manifest_text(
         used += len(block) + 1
     if not parts:
         return ""
-    intro = f"\n用户上传了 {len(records)} 个文件，解析内容如下"
+    intro = f"\n用户上传了 {len(records)} 个文件，文件清单如下"
     if read_document_available:
-        intro += "（小文件已内联全文，大文件为开头节选，可用 read_document 读取完整内容）"
+        intro += "（普通文本小文件内联全文，大文件为开头节选；原生候选只列索引；可用 read_document 读取）"
     if native_doc_types:
         intro += "；supportDocTypes 表示模型声明的原生输入类型，不决定 read_document 工具是否可用"
     intro += "：\n"
@@ -586,14 +609,11 @@ def video_max_read_seconds() -> int:
 
 
 # ---------- 原生文档（模型 supportDocTypes 声明的文件输入） ----------
-# 上传的 PDF/DOCX 等文档在「会话生效模型声明支持该类型」时按轮随请求注入，
-# 语义与图片/视频一致（用户确认口径）：
-# - 本任务内每轮发送：后续追问仍能看到文档原文（供应商侧按视觉/原生解析）；
-# - 出现新的用户消息后转文本占位（[文档 名字]）——原始文件始终保留在
-#   history_files/session_files/<session>/files/，模型可用 read_document
-#   （声明支持时原生重读）或 read_file（按绝对路径读文本）继续访问；
-# - 规模约束（单文件 / 单轮总量 / 数量）：超预算的文档降级为文本口径，
-#   避免超大文档撑爆请求体与模型窗口。
+# read_document 按目标扩展名和模型 supportDocTypes 选择原生/文本模式，与
+# vision 图片能力分开判断。原生部件只随下一次模型请求发送一次；完整响应后
+# 转成 [文档 文件名] 占位，仍需原文时须再次调用工具。原始文件保存在
+# history_files/session_files/<session>/files/ 下，解析文本供显式文本模式及回退。
+# 规模约束为单文件、同次请求总量和文件数，避免请求体过大。
 # 部件形态对齐 OpenAI Chat Completions 的 file 部件（file_data 为 data URL）；
 # 其它协议（Responses 的 input_file / Anthropic 的 document 等）由服务端
 # 适配层在发送前转换。
@@ -638,6 +658,22 @@ def native_doc_max_items() -> int:
     except (TypeError, ValueError):
         return DEFAULT_NATIVE_DOC_MAX_ITEMS
     return max(1, value)
+
+
+def native_doc_batch_limit_error(
+    current_count: int, current_bytes: int, next_size: int
+) -> str | None:
+    """判断即将注入的文档是否会超过同一模型请求的批次预算。"""
+    count_limit = native_doc_max_items()
+    if current_count >= count_limit:
+        return f"同一次模型请求最多发送 {count_limit} 个原生文档"
+    total_limit = native_doc_total_max_bytes()
+    if total_limit > 0 and current_bytes + max(0, int(next_size)) > total_limit:
+        return (
+            "同一次模型请求的原生文档总量将超过 "
+            f"{total_limit // (1024 * 1024)}MB 限制"
+        )
+    return None
 
 
 def document_supports_native(filename: str, support_doc_types: Any) -> bool:
@@ -731,6 +767,70 @@ def build_native_document_part_from_bytes(
         "mime": mime,
         "size": size,
     }
+
+
+def build_native_pdf_page_part_from_bytes(
+    filename: str,
+    data: bytes,
+    page_start: int,
+    page_count: int,
+    *,
+    stored_name: str = "",
+) -> dict[str, Any]:
+    """从 PDF 原始字节中提取指定物理页面，返回有效的原生子 PDF 部件。
+
+    页码从 1 开始。不能直接截断 PDF 字节；必须生成结构完整的页面子集。
+    """
+    safe_name = Path(str(filename or "document.pdf")).name
+    if Path(safe_name).suffix.lower() != ".pdf":
+        return {"error": "原生页面选段目前只支持 PDF；其他格式请使用文本 offset/limit"}
+    try:
+        first_page = int(page_start)
+        count = int(page_count)
+    except (TypeError, ValueError):
+        return {"error": "page_start 和 page_count 必须是整数"}
+    if first_page < 1 or count < 1:
+        return {"error": "page_start 从 1 开始，page_count 必须大于 0"}
+    if count > 20:
+        return {"error": "单次 PDF 页面选段最多 20 页，请缩小 page_count"}
+    original_limit = native_doc_max_bytes()
+    if original_limit > 0 and len(data) > original_limit:
+        return {
+            "error": (
+                f"{safe_name} 原文件大小 {len(data)} 字节，超过原生文档读取上限 "
+                f"{original_limit} 字节；请改用文本 offset/limit 或缩小读取范围"
+            )
+        }
+    try:
+        from factory.file_factory import fitz
+
+        if fitz is None:
+            return {"error": "PDF 页面选段需要 PyMuPDF；请改用文本 offset/limit"}
+        source = fitz.open(stream=data, filetype="pdf")
+        total_pages = len(source)
+        if first_page > total_pages:
+            source.close()
+            return {"error": f"page_start={first_page} 超出 PDF 总页数 {total_pages}"}
+        last_page = min(total_pages, first_page + count - 1)
+        selected = fitz.open()
+        selected.insert_pdf(source, from_page=first_page - 1, to_page=last_page - 1)
+        subset_bytes = selected.tobytes(garbage=4, deflate=True)
+        selected.close()
+        source.close()
+    except Exception as exc:
+        return {"error": f"PDF 页面提取失败：{exc}"}
+    subset_name = f"{Path(safe_name).stem}_pages_{first_page}-{last_page}.pdf"
+    result = build_native_document_part_from_bytes(
+        subset_name, subset_bytes, stored_name=stored_name
+    )
+    if result.get("part") is not None:
+        result.update({
+            "source_filename": safe_name,
+            "page_start": first_page,
+            "page_end": last_page,
+            "total_pages": total_pages,
+        })
+    return result
 
 
 def select_native_document_records(
@@ -2319,17 +2419,6 @@ class FileMemoryManager:
             records, read_document_available=read_document_available
         )
 
-    def clear_file_memory(self) -> str:
-        """
-        清空当前会话的所有文件上传历史
-        Returns:
-            操作结果字符串
-        """
-        with self._lock:
-            for file_path in _list_session_files(self._session_id):
-                file_path.unlink(missing_ok=True)
-        return "清空成功"
-
     def delete_file_memory(self, filename: str) -> int:
         """
         删除当前会话中指定文件名的历史文件记录
@@ -2430,15 +2519,8 @@ if __name__ == "__main__":
     text_summary = manager_text.get_file_memory_text(max_total_chars=100)
     print(f"文本摘要（限制100字符）:\n{text_summary}")
 
-    # 测试4：清理功能
-    print("\n【测试4】清理功能测试")
-    print(f"清理前 Session 1: {len(manager_1.get_file_memory_all())} 个文件")
-    manager_1.clear_file_memory()
-    print(f"清理后 Session 1: {len(manager_1.get_file_memory_all())} 个文件")
-    print(f"Session 2 未受影响: {len(manager_2.get_file_memory_all())} 个文件")
-
-    # 测试5：并发安全测试
-    print("\n【测试5】并发安全测试")
+    # 测试4：并发安全测试
+    print("\n【测试4】并发安全测试")
     import time
 
     errors = []
@@ -2481,6 +2563,8 @@ if __name__ == "__main__":
     # 清理测试数据
     for i in range(5):
         cleanup_file_memory_manager(f"concurrent_session_{i}")
+    manager_1.delete_file_memory("test1.pdf")
+    manager_1.delete_file_memory("test2.docx")
     cleanup_file_memory_manager("session_1")
     cleanup_file_memory_manager("session_2")
     cleanup_file_memory_manager("session_limit")

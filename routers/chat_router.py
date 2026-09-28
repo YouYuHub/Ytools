@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 from typing import Any, Optional, List
 import urllib.parse
@@ -35,6 +34,7 @@ from factory.agent_runtime.builtin_tools import (
     EDIT_FILE_NAME,
     READ_FILE_NAME,
     READ_MEDIA_NAME,
+    READ_DOCUMENT_NAME,
     RUN_COMMAND_NAME,
     SEARCH_FILES_NAME,
     SELECTABLE_BUILTIN_TOOL_NAMES,
@@ -63,9 +63,8 @@ from memory.chat_memory import (
 )
 from memory.file_memory import (
     cleanup_file_memory_manager,
-    count_session_file_memory,
 )
-from routers.chat_config_router import get_chat_work_dir_config
+from routers.chat_config_router import get_chat_work_dir_config  # noqa: F401 — 兼容历史导入路径
 
 # 创建 API 路由器实例
 api_chat_router = APIRouter()
@@ -82,7 +81,7 @@ def _tool_definition_name(tool: object) -> str:
 
 
 def _validate_request_quotes(body: object) -> None:
-    """校验请求体中的引用快照（选中文本引用到提问，见 docs/quote_selection_design.md）。
+    """校验请求体中的引用快照（选中文本引用到提问，见 docs/quote_selection.md）。
 
     只接受**本轮最新 user 消息**上的 quotes：超量/超长/类型非法抛 HTTPException(400)，
     错误信息可读，不做静默截断（旧请求无该字段时直接通过）。
@@ -118,7 +117,7 @@ async def chat_with_tool(request: Request):
     未显式提供的生成参数按 select 接口配置的 chat_model 参数自动填充；
     会话已独立选择模型时（_meta.model_selection），按会话生效模型的参数填充。
 
-    引用校验（docs/quote_selection_design.md）：只接受本轮最新 user 消息上的
+    引用校验（docs/quote_selection.md）：只接受本轮最新 user 消息上的
     quotes（最多 5 段、单段 ≤4000 字符、合计 ≤12000 字符）；超限/类型非法
     直接 400 可读错误，不默默截断。旧请求无该字段时行为完全不变。
     """
@@ -321,32 +320,6 @@ async def delete_chat_history(session_id: str = "default"):
     # 清理缓存的管理器实例，避免下次操作时重建已删除的目录/文件
     await cleanup_file_memory_manager(session_id)
     await cleanup_chat_memory_manager(session_id)
-    return JSONResponse(content=result)
-
-
-@api_chat_router.delete("/chat_history/delete_lines")
-async def delete_chat_history_lines(
-    startline: int = Query(..., description="要删除的起始行号(1-based)", ge=1),
-    endline: int = Query(..., description="要删除的结束行号(1-based,包含)", ge=1),
-    session_id: str = "default"
-):
-    """
-    删除指定会话的聊天历史文件中的指定行范围
-    参数:
-        startline: 要删除的起始行号(从1开始)
-        endline: 要删除的结束行号(从1开始,包含该行)
-        session_id: 会话ID
-    返回:
-        操作结果
-    """
-    if startline > endline:
-        raise HTTPException(status_code=400, detail=f"起始行号({startline})不能大于结束行号({endline})")
-    try:
-        result = ChatMemoryManager.delete_chat_session_file_line(
-            normalize_session_id(session_id), startline, endline
-        )
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(content=result)
 
 
@@ -594,10 +567,6 @@ async def upload_chat_history_file(
 
 # ---------- 会话分享 / 多会话导入（zip / jsonl，两阶段冲突确认） ----------
 # 导入文件大小上限：zip 包含媒体原字节，放宽到 512MB；单 jsonl 沿用 20MB
-def _import_file_size_limit(filename: str) -> int:
-    return IMPORT_PACKAGE_MAX_BYTES if filename.lower().endswith(".zip") else _UPLOAD_CHAT_FILE_MAX_BYTES
-
-
 @api_chat_router.get('/chat_history/export_zip')
 async def export_chat_sessions_zip(
     session_ids: str = Query(
@@ -676,13 +645,6 @@ def _export_single_session_payload_for_share(session_id: str) -> dict[str, Any] 
     return {"filename": payload["filename"], "text": payload["text"]}
 
 
-class ImportPreviewResponse(BaseModel):
-    type: str  # zip / jsonl
-    sessions: List[dict[str, Any]]
-    conflicts: List[str]  # 与本地已有会话同名的 session_id 列表
-    groups: List[dict[str, Any]] = []  # 随包携带的分组定义（zip v2；jsonl/旧包为空）
-
-
 @api_chat_router.post('/chat_history/import_preview')
 async def preview_chat_import(
     request: Request,
@@ -741,12 +703,6 @@ async def preview_chat_import(
         # 随包携带的分组定义（zip manifest v2；jsonl / 旧包为空列表）
         "groups": (preview.get("groups") or []) if lower.endswith(".zip") else [],
     })
-
-
-class ImportSubmitRequest(BaseModel):
-    """导入提交：随包附带的逐会话冲突决策。"""
-    conflict_strategy: str = "ask"
-    decisions: dict[str, str] = {}
 
 
 @api_chat_router.post('/chat_history/import_package')
@@ -896,7 +852,12 @@ async def get_chat_context_token_stats(
             effective_max_rounds = max_rounds if max_rounds is not None else 0
             context_tools = None
             if include_tools:
-                available_tools = list(tool_registry.ALL_TOOLS)
+                (
+                    available_tools,
+                    available_tool_servers,
+                    _available_tool_original_names,
+                    available_tool_name_index,
+                ) = tool_registry.get_tool_registry_snapshot()
                 if tool_names is None:
                     context_tools = available_tools
                 else:
@@ -905,15 +866,19 @@ async def get_chat_context_token_stats(
                         for name in tool_names
                         if isinstance(name, str) and name.strip()
                     }
+                    canonical_names, _ambiguous_names = tool_registry.canonicalize_requested_names(
+                        list(selected_names),
+                        available_tool_servers,
+                        available_tool_name_index,
+                    )
+                    selected_names = set(canonical_names)
                     context_tools = [
                         tool
                         for tool in available_tools
                         if _tool_definition_name(tool) in selected_names
                     ]
-                    # 聊天任务有外部工具时，运行时还会注入 check_tool_exists；
-                    # 内置工具（todo_write / ask_user / write_file / edit_file /
-                    # read_file / search_files / read_media）按前端勾选显式注入；
-                    # read_document 在「会话存在上传文件且携带工具」时由后端自动注入。
+                    # 内置工具（todo_write / ask_user / 文件工具 / read_media /
+                    # read_document 等）按前端勾选显式注入。
                     # 这里保持 token 统计与真实请求的工具 schema 口径一致。
                     if context_tools or selected_names & set(SELECTABLE_BUILTIN_TOOL_NAMES):
                         context_tools, _ = inject_builtin_tools(
@@ -927,15 +892,8 @@ async def get_chat_context_token_stats(
                             include_search_files=SEARCH_FILES_NAME in selected_names,
                             include_run_command=RUN_COMMAND_NAME in selected_names,
                             include_read_media=READ_MEDIA_NAME in selected_names,
+                            include_read_document=READ_DOCUMENT_NAME in selected_names,
                         )
-                        # read_document 自动注入：会话存在上传文件时与真实请求同口径
-                        # （真实请求还要求本轮携带工具；此处用于展示口径）
-                        if count_session_file_memory(normalized_session_id) > 0:
-                            context_tools, _ = inject_builtin_tools(
-                                context_tools,
-                                {},
-                                include_read_document=True,
-                            )
             # read_media 指引条件开关：与真实请求同口径（显式传名才提示）。
             # 视觉过滤由 build_sys_prompt 内部按 ambient 会话模型统一判定。
             read_media_selected = False

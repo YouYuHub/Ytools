@@ -123,7 +123,7 @@
       return;
     }
     if (rec.kind === "usage") {
-      container.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage)));
+      container.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage, rec.model)));
       return;
     }
     if (rec.kind === "agentBlock") {

@@ -52,7 +52,7 @@ window.App = window.App || {};
     modelParamDirty: false,
     // 待发送的多媒体附件（粘贴/选择的图片音频视频）：[{id,file,name,kind,dataUrl}]
     pendingMedia: [],
-    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection_design.md）：
+    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection.md）：
     // [{id, text, source:{role,session_id,round}}]；随会话草稿保存/恢复，
     // 发送成功后清空（id 仅本地 UI 用，请求上送前由 QuoteUtils 剥离）
     pendingQuotes: [],

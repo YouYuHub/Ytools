@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """聊天引用（选中文本引用到提问）的规整、校验与模型视图序列化。
 
-设计文档：docs/quote_selection_design.md（结构化方案）。
+设计文档：docs/quote_selection.md（结构化方案）。
 
 两种视图分离：
 - **历史视图**：JSONL 用户事件保存原始 content 与 `quotes` 数组快照，

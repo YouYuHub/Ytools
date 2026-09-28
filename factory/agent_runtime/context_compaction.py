@@ -44,6 +44,7 @@ from memory.chat_history_format import (
     split_context_window,
 )
 from memory.chat_round_store import merge_usage_dict as _merge_usage_dict
+from memory.file_memory import content_part_to_text
 # 相对导入
 from .chat_runtime import (
     estimate_messages_tokens,
@@ -187,19 +188,6 @@ def _parse_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _parse_non_negative_int(value: Any, default: int) -> int:
-    """解析 >=0 的整数；负数非法回退默认值。
-
-    与 _parse_positive_int 的区别：0 是合法值（keep_rounds 的"无限窗口"
-    语义，见 config.HistoryCompactionConfig），不能回落为默认值。
-    """
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= 0 else default
 
 
 def _parse_trigger_ratio(value: Any, default: float) -> float:
@@ -1914,7 +1902,14 @@ def _round_messages_to_compaction_text(
         if not isinstance(message, dict):
             continue
         role = message.get("role")
-        content = _to_text(message.get("content"))
+        raw_content = message.get("content")
+        # 原生文件/媒体部件只以可回读占位进入压缩文本，不能 JSON 序列化
+        # 多模态列表，否则 file_data/base64 会被当作普通文本发给压缩模型。
+        content = (
+            content_part_to_text(raw_content)
+            if isinstance(raw_content, list)
+            else _to_text(raw_content)
+        )
         if role == "user" and content:
             lines.append(f"【用户】{content}")
         elif role == "assistant":

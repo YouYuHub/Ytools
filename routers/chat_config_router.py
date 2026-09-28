@@ -1,7 +1,6 @@
 # coding: utf-8
 from typing import Any, Optional
 from pathlib import Path
-import json
 import sys
 from dataclasses import replace
 # 添加项目根目录到 Python 路径
@@ -12,18 +11,14 @@ from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 from config import (
     DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS,
-    DEFAULT_HISTORY_TRIGGER_RATIO,
-    DEFAULT_MAX_OVERSIZED_REJECTIONS,
     DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
     DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS,
-    DEFAULT_OVERSIZED_REJECT_FACTOR,
     DEFAULT_ONE_TASK_MAX_WORKERS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
     DEFAULT_SUB_AGENT_MAX_CONCURRENT,
     DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
     DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
-    DEFAULT_SUMMARY_BUDGET_RATIO,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     set_current_dir,
     get_current_dir,

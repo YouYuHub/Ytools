@@ -246,46 +246,6 @@ def _undo_one_hunk(baseline_text: str, current_text: str, hunk: dict[str, int]) 
     return "\n".join(out) + ("\n" if current_text.endswith("\n") else "")
 
 
-def _extract_hunk_payload(diff_text: str) -> list[dict[str, Any]]:
-    """解析 unified diff：每个 hunk 附带 old/new 行序列（供 hunk_keep 重建全文）。
-
-    old_lines = 该 hunk 的 ctx + del 行（基线视角）；new_lines = ctx + add 行
-    （目标状态）。del-only hunk 的 new_lines 为空列表。
-    """
-    hunks: list[dict[str, Any]] = []
-    cur: dict[str, Any] | None = None
-    for line in diff_text.split("\n"):
-        match = _HUNK_HEAD_RE.match(line)
-        if match:
-            old_start = int(match.group(1))
-            new_start = int(match.group(3))
-            cur = {
-                "index": len(hunks),
-                "old_start": old_start,
-                "old_count": int(match.group(2)) if match.group(2) is not None else 1,
-                "new_start": new_start,
-                "new_count": int(match.group(4)) if match.group(4) is not None else 1,
-                "old_lines": [],
-                "new_lines": [],
-            }
-            hunks.append(cur)
-            continue
-        if line.startswith("--- a/") or line.startswith("+++ b/"):
-            continue
-        if cur is None:
-            continue
-        if line.startswith("+"):
-            cur["new_lines"].append(line[1:])
-        elif line.startswith("-"):
-            cur["old_lines"].append(line[1:])
-        else:
-            # 上下文行（difflib lineterm="" 输出带一个前导空格）须剥掉首字符
-            text = line[1:] if line.startswith(" ") else line
-            cur["old_lines"].append(text)
-            cur["new_lines"].append(text)
-    return hunks
-
-
 # ---------------- meta 读写 ----------------
 
 def _load_meta(session_id: str, key: str) -> dict[str, Any] | None:
@@ -1253,13 +1213,3 @@ def cleanup_file_histories(
                 _atomic_write_json(root / "index.json", index)
             removed.append({"key": key, "path": item.get("path", "")})
         return {"removed_count": len(removed), "removed": removed}
-
-
-def stats_summary(session_id: str) -> dict[str, Any]:
-    """供会话顶栏徽标使用的轻量统计（文件数 / 总增删行）。"""
-    files = list_files(session_id)
-    return {
-        "total": len(files),
-        "added": sum(int(item.get("added", 0)) for item in files),
-        "removed": sum(int(item.get("removed", 0)) for item in files),
-    }

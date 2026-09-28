@@ -115,7 +115,7 @@ def test_edit_file_result_contains_diff(tmp_path):
     assert result["_file_diff"]["lines_removed"] == 1
     assert "-value = 1" in result["_file_diff"]["diff"]
     assert "+value = 2" in result["_file_diff"]["diff"]
-    assert result["content_hash"] == _content_hash("value = 2\n")
+    assert result["content_hash"] == _content_hash(target.read_bytes().decode("utf-8"))
     assert "diff +1 -1 行" in result["message"]
 
 

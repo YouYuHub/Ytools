@@ -12,6 +12,7 @@
     toolCollapseAll, toolRefresh, toolTip, hideToolTip,
     toolFollowGlobal
   } = App;
+  let pendingSelectionInputs = null;
 
   // ---------- 工具选择 ----------
   function normalizeTool(rawTool) {
@@ -20,9 +21,12 @@
     }
     const functionInfo = rawTool && typeof rawTool.function === "object" ? rawTool.function : {};
     const name = functionInfo.name || rawTool.name || "";
+    const originalName = String(rawTool.original_name || rawTool.originalName || name);
+    const description = String(functionInfo.description || rawTool.description || "暂无工具描述");
     return {
       name: name,
-      description: String(functionInfo.description || rawTool.description || "暂无工具描述"),
+      originalName: originalName,
+      description: description + (name !== originalName ? "\n模型调用名：" + name : ""),
       serverId: String(rawTool.server_id || rawTool.serverId || rawTool.server || ""),
     };
   }
@@ -38,21 +42,70 @@
     return Array.from(new Set(values.filter(Boolean)));
   }
 
+  function remapToolSet(names, previousTools, nextTools) {
+    const remapped = new Set();
+    names.forEach(function (name) {
+      if (App.isBuiltinToolName(name)) {
+        remapped.add(name);
+        return;
+      }
+      const exact = nextTools.find(function (tool) { return tool.name === name; });
+      if (exact) {
+        remapped.add(exact.name);
+        return;
+      }
+      const previous = previousTools.find(function (tool) { return tool.name === name; });
+      if (!previous) return;
+      const matches = nextTools.filter(function (tool) {
+        return tool.serverId === previous.serverId
+          && tool.originalName === previous.originalName;
+      });
+      if (matches.length === 1) remapped.add(matches[0].name);
+    });
+    return remapped;
+  }
+
   // forceRefresh 为 true 时要求后端绕过缓存强制重探（"刷新"按钮）；
   // 页面初始化等常规调用默认走后端缓存
+  async function refreshChatModelConfig() {
+    if (typeof App.refreshChatModelLabel !== "function") return false;
+    // 传入当前会话 ID 会强制重新请求 role_info；只刷新 MCP 工具列表
+    // 不会同步 models.json 中的 vision 等模型能力。
+    try {
+      return await App.refreshChatModelLabel(state.sessionId || undefined, true);
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function loadTools(forceRefresh) {
     let success = true;
+    const previousTools = state.tools.slice();
+    // 和工具探测并行刷新当前会话的模型能力；无论工具接口成功与否，
+    // 都等能力结果返回后再渲染弹窗，避免使用旧 vision 状态。
+    const modelConfigRefresh = forceRefresh
+      ? refreshChatModelConfig()
+      : Promise.resolve(null);
     try {
       const data = await API.listTools(forceRefresh);
       state.tools = (data.tools || []).map(normalizeTool).filter(function (tool) { return tool.name; });
       state.servers = Array.isArray(data.servers) ? data.servers.map(String) : [];
       state.failedServers = Array.isArray(data.failed_servers) ? data.failed_servers.map(String) : [];
+      if (pendingSelectionInputs) {
+        const pending = pendingSelectionInputs;
+        pendingSelectionInputs = null;
+        applyToolSelectionInputs(pending);
+      } else {
+        state.selectedTools = remapToolSet(state.selectedTools, previousTools, state.tools);
+        state.draftTools = remapToolSet(state.draftTools, previousTools, state.tools);
+      }
     } catch (_) {
       success = false;
       state.tools = [];
       state.servers = [];
       state.failedServers = [];
     }
+    const modelConfigRefreshed = await modelConfigRefresh;
     if (success) {
       const availableNames = new Set(state.tools.map(function (tool) { return tool.name; }));
       state.selectedTools = new Set(Array.from(state.selectedTools).filter(function (name) {
@@ -63,7 +116,7 @@
       }));
     }
     if (!toolModal.classList.contains("hidden")) renderToolGroups();
-    return success;
+    return { success: success, modelConfigRefreshed: modelConfigRefreshed };
   }
 
   function groupTools() {
@@ -71,9 +124,7 @@
     // 内置工具作为伪服务分组始终参与渲染（不依赖 MCP 服务列表）
     groups.set(App.BUILTIN_SERVER_KEY, App.BUILTIN_TOOLS);
     state.tools.forEach(function (tool) {
-      // 与内置工具同名的 MCP 工具不再重复展示（如 SysServer 的
-      // read_file/write_file/edit_file/search_files 已转为内置可选）：
-      // 后端按名称解析时内置版优先，勾选任一条目效果一致，这里只去重视图
+      // 兼容旧版后端仍返回原名的 MCP 工具；新版后端已为内置同名工具生成别名。
       if (App.isBuiltinToolName(tool.name)) return;
       const key = tool.serverId || "__unassigned__";
       if (!groups.has(key)) groups.set(key, []);
@@ -148,11 +199,28 @@
         const list = inputs[server];
         if (Array.isArray(list)) {
           list.forEach(function (name) {
-            if (typeof name === "string" && name) names.push(name);
+            if (typeof name !== "string" || !name) return;
+            if (server === App.BUILTIN_SERVER_KEY || !state.tools.length) {
+              names.push(name);
+              return;
+            }
+            const exact = state.tools.find(function (tool) {
+              return tool.name === name && tool.serverId === server;
+            });
+            if (exact) {
+              names.push(exact.name);
+              return;
+            }
+            // 旧选择按服务保存原始 MCP 名称；迁移到当前唯一模型名。
+            const legacyMatches = state.tools.filter(function (tool) {
+              return tool.serverId === server && tool.originalName === name;
+            });
+            if (legacyMatches.length === 1) names.push(legacyMatches[0].name);
           });
         }
       });
     }
+    if (!state.tools.length) pendingSelectionInputs = inputs;
     state.selectedTools = new Set(names);
     // 工具列表已加载时先过滤掉当前不可用的工具（内置工具始终可用，不参与过滤）
     if (state.tools.length) {
@@ -229,7 +297,9 @@
     order.forEach(function (serverId) {
       const allTools = groups.get(serverId) || [];
       const visibleTools = allTools.filter(function (tool) {
-        return !query || tool.name.toLowerCase().includes(query) || tool.description.toLowerCase().includes(query);
+        return !query || tool.name.toLowerCase().includes(query)
+          || tool.originalName.toLowerCase().includes(query)
+          || tool.description.toLowerCase().includes(query);
       });
       if (query && !visibleTools.length) return;
 
@@ -278,7 +348,10 @@
           const iconClass = "icon tool-row-icon" +
             (App.isBuiltinToolName(tool.name) ? " is-builtin-tool-icon" : "");
           row.innerHTML = App.toolIconSvg(tool.name, iconClass) + '<span class="tool-row-info"><span class="tool-row-name"></span><span class="tool-row-description"></span></span>';
-          row.querySelector(".tool-row-name").textContent = tool.name;
+          row.querySelector(".tool-row-name").textContent = tool.originalName;
+          row.querySelector(".tool-row-name").title = tool.name !== tool.originalName
+            ? "模型调用名：" + tool.name
+            : tool.name;
           // read_media 在当前模型不支持视觉时置灰禁用（勾选路径已统一守卫）
           const rowVisionBlocked = visionBlocked && tool.name === "read_media";
           if (rowVisionBlocked) {
@@ -317,7 +390,10 @@
     updateToolSelected();
   }
 
-  function openToolModal() {
+  async function openToolModal() {
+    // 打开弹窗时重新读取当前会话模型能力，避免一直沿用页面启动时缓存的
+    // vision 值；等能力刷新完成后再渲染，防止旧 false 把 read_media 从草稿移除。
+    await refreshChatModelConfig();
     state.draftTools = new Set(state.selectedTools);
     toolSearchInput.value = "";
     toolModal.classList.remove("hidden");
@@ -369,10 +445,14 @@
     if (toolRefresh.disabled) return;
     toolRefresh.disabled = true;
     toolRefresh.classList.add("is-loading");
-    const success = await loadTools(true);
+    const result = await loadTools(true);
     toolRefresh.disabled = false;
     toolRefresh.classList.remove("is-loading");
-    toast(success ? "工具列表已更新，共 " + state.tools.length + " 项" : "工具列表更新失败");
+    toast(!result.success
+      ? "工具列表更新失败"
+      : result.modelConfigRefreshed
+        ? "工具列表和模型能力已更新，共 " + state.tools.length + " 项"
+        : "工具列表已更新，但模型能力刷新失败");
   });
   $("#toolCollapseAll").addEventListener("click", function () {
     const groups = Array.from(toolGroups.querySelectorAll(".tool-group"));

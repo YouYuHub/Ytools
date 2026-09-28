@@ -17,14 +17,15 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+from collections import OrderedDict
 from pathlib import Path
+from threading import Lock
 from typing import Any, Optional
 
 
 from memory import file_memory
 
 
-CHECK_TOOL_EXISTS_NAME = "check_tool_exists"
 TODO_TOOL_NAME = "todo_write"
 ASK_USER_TOOL_NAME = "ask_user"
 WRITE_FILE_NAME = "write_file"
@@ -38,34 +39,15 @@ RUN_COMMAND_NAME = "run_command"
 # 内置工具在工具选择（_meta.tool_selection / mcp_servers.json inputs）中的伪服务键：
 # 前端把它作为“内置工具”分组渲染在工具模态框首位，保存/加载与 MCP 工具走同一链路
 BUILTIN_TOOL_SERVER_KEY = "__builtin__"
-# 工具选择中允许出现的内置工具名（check_tool_exists 由后端按外部工具自动注入、
-# read_document 由后端按会话上传文件自动注入，均不开放手选）
+# 用户可在工具选择中显式启用 read_document。
 SELECTABLE_BUILTIN_TOOL_NAMES = (
     TODO_TOOL_NAME, ASK_USER_TOOL_NAME, WRITE_FILE_NAME, EDIT_FILE_NAME,
-    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME, SUB_AGENT_TOOL_NAME,
-    RUN_COMMAND_NAME,
+    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME, READ_DOCUMENT_NAME,
+    SUB_AGENT_TOOL_NAME, RUN_COMMAND_NAME,
 )
 # 前端回答 ask_user 提问时的消息前缀（前端 app.js 中同名拼接，需保持一致）；
 # 后端据此识别"覆盖式重新回答"：截断最新提问轮之后的旧回答轮
 ASK_ANSWER_PREFIX = "【回答模型提问】"
-CHECK_TOOL_EXISTS_DEFINITION = {
-    "type": "function",
-    "function": {
-      "name": CHECK_TOOL_EXISTS_NAME,
-      "description": "检查指定工具在当前轮次任务中是否可用（含后端是否存在、是否被用户禁用两种状态），建议某个工具使用失败时才进行检查",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "tool_name": {
-            "type": "string",
-            "description": "要检查的工具名称",
-          }
-        },
-        "required": ["tool_name"],
-      },
-    },
-}
-
 def inject_builtin_tools(
     selected_tools: list[dict[str, Any]],
     selected_tool_servers: dict[str, str],
@@ -80,15 +62,11 @@ def inject_builtin_tools(
     include_read_document: bool = False,
     include_sub_agent: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """注入本地内置工具：check_tool_exists（选了外部工具时）、todo_write、
-    ask_user、write_file、edit_file、read_file、search_files、run_command、
-    read_media、read_document（会话存在上传文件且本轮携带工具时由 chat_factory
-    自动注入）与 sub_agent（用户在工具选择中勾选时）。"""
+    """注入用户选择的本地内置工具：todo_write、ask_user、
+    write_file、edit_file、read_file、search_files、run_command、
+    read_media、read_document 与 sub_agent（用户在工具选择中勾选时）。"""
     tools = list(selected_tools)
     servers = dict(selected_tool_servers)
-    if selected_tools and CHECK_TOOL_EXISTS_NAME not in servers:
-        tools.append(CHECK_TOOL_EXISTS_DEFINITION)
-        servers[CHECK_TOOL_EXISTS_NAME] = BUILTIN_TOOL_SERVER_KEY
     # todo_write 独立于外部工具：用户显式勾选即注入（即使没有选择任何 MCP 工具）
     if include_todo and TODO_TOOL_NAME not in servers:
         tools.append(TODO_TOOL_DEFINITION)
@@ -125,7 +103,7 @@ def inject_builtin_tools(
 
 def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in (
-        CHECK_TOOL_EXISTS_NAME, TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
+        TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
         WRITE_FILE_NAME, EDIT_FILE_NAME, READ_FILE_NAME, SEARCH_FILES_NAME,
         READ_MEDIA_NAME, READ_DOCUMENT_NAME, SUB_AGENT_TOOL_NAME,
         RUN_COMMAND_NAME,
@@ -219,8 +197,10 @@ def normalize_todo_items(
             f"todo 数量超过上限：收到 {len(raw)} 项，最多 {_TODO_MAX_ITEMS} 项，"
             "请合并同类步骤或拆分任务"
         )
-    # 上一版计划索引 (content, status) -> id，供缺失 id 的条目继承
+    # 状态变化时也要继承同一步骤的 id；先匹配内容与状态，再匹配内容。
     prev_by_key: dict[tuple[str, str], str] = {}
+    prev_by_content: dict[str, list[str]] = {}
+    prev_ids: set[str] = set()
     for prev in prev_items or []:
         if not isinstance(prev, dict):
             continue
@@ -229,6 +209,8 @@ def normalize_todo_items(
         prev_status = str(prev.get("status") or "pending").strip()
         if prev_id and prev_content:
             prev_by_key[(prev_content, prev_status)] = prev_id
+            prev_by_content.setdefault(prev_content, []).append(prev_id)
+            prev_ids.add(prev_id)
     items: list[dict[str, str]] = []
     notices: list[str] = []
     used_ids: set[str] = set()
@@ -254,13 +236,18 @@ def normalize_todo_items(
         if raw_id:
             if raw_id in used_ids:
                 id_duplicated += 1
-                raw_id = _next_todo_id(used_ids)
+                raw_id = _next_todo_id(used_ids | prev_ids)
         else:
             inherited = prev_by_key.get((content, status))
+            if not inherited or inherited in used_ids:
+                inherited = next(
+                    (item_id for item_id in prev_by_content.get(content, [])
+                     if item_id not in used_ids), None
+                )
             if inherited and inherited not in used_ids:
                 raw_id = inherited
             else:
-                raw_id = _next_todo_id(used_ids)
+                raw_id = _next_todo_id(used_ids | prev_ids)
             id_missing += 1
         used_ids.add(raw_id)
         if status == "in_progress" and any(i["status"] == "in_progress" for i in items):
@@ -281,81 +268,6 @@ def normalize_todo_items(
         )
     return items, notices, None
 
-
-def execute_builtin_tool(
-    tool_name: str,
-    tool_args: dict[str, Any],
-    available_tool_names: set[str] | list[str],
-    available_tool_servers: dict[str, str],
-    enabled_tool_names: set[str] | list[str] | None = None,
-) -> dict[str, Any] | None:
-    """执行内置工具；非内置名称返回 ``None`` 交由 MCP 执行器处理。
-
-    available_* 为后端实时注册表全集（工具是否存在），enabled_* 为当前轮
-    用户启用的工具集合（是否可用）。被禁用 ≠ 不存在：exists 仍为 True，
-    但补充 disabled 状态与提示文案，避免模型误以为被禁用工具可再次调用。
-    """
-    if tool_name != CHECK_TOOL_EXISTS_NAME:
-        return None
-    query_name = ""
-    if isinstance(tool_args, dict):
-        query_name = str(tool_args.get("tool_name", "")).strip()
-    # 内置工具不进 MCP 注册表（调用方传入的 available_tool_names 只含 MCP 工具），
-    # 但它们真实存在、可在工具选择中勾选：这里并入内置工具全集一起识别，
-    # 避免查询 ask_user / todo_write / read_file 等时误报"不存在"。
-    all_known_names = (
-        {str(n).strip() for n in available_tool_names if str(n).strip()}
-        | set(SELECTABLE_BUILTIN_TOOL_NAMES)
-        | {CHECK_TOOL_EXISTS_NAME, READ_DOCUMENT_NAME}
-    )
-    exists = bool(query_name in all_known_names) if query_name else False
-    # 当前轮启用集合缺省回退全集（旧调用方未传时行为不变）
-    enabled_names = (
-        {str(n).strip() for n in enabled_tool_names if str(n).strip()}
-        if enabled_tool_names is not None
-        else None
-    )
-    disabled = exists and enabled_names is not None and query_name not in enabled_names
-    if not exists:
-        message = f"后端实时工具列表中不存在名为 {query_name} 的工具"
-        # 模型常因大小写/下划线写错工具名：给出最接近候选帮助一次纠正
-        close = difflib.get_close_matches(
-            query_name, sorted(all_known_names), n=3, cutoff=0.6
-        )
-        if close:
-            message += f"；名称最接近的已有工具：{'、'.join(close)}（注意大小写与下划线）"
-    elif disabled:
-        if query_name == READ_DOCUMENT_NAME:
-            message = (
-                "read_document 是后端按条件自动注入的文档读取工具，不开放手选；"
-                "当前轮次未注入，通常是因为本轮处于无工具模式。"
-                "supportDocTypes 只控制原生文档注入，不控制该工具的文本读取能力"
-            )
-        else:
-            message = (
-                f"{query_name} 在后端已注册但未被当前轮次任务启用（用户禁用了该工具），"
-                "本轮无法使用；请改用其他方式完成，或提示用户在工具选择中重新勾选该工具"
-            )
-    else:
-        message = f"{query_name} 当前轮次任务中可用"
-    if not exists:
-        server_value = ""
-    elif query_name in available_tool_servers:
-        server_value = available_tool_servers[query_name]
-    elif (
-        query_name in SELECTABLE_BUILTIN_TOOL_NAMES
-        or query_name in (CHECK_TOOL_EXISTS_NAME, READ_DOCUMENT_NAME)
-    ):
-        server_value = BUILTIN_TOOL_SERVER_KEY
-    else:
-        server_value = ""
-    return {
-        "tool_name": query_name,
-        "exists": exists,
-        "disabled": disabled,
-        "server": server_value,
-        "message": message,
-    }
 
 
 # --------------------------- ask_user：向用户提问 ---------------------------
@@ -378,6 +290,8 @@ ASK_USER_TOOL_DEFINITION = {
                 "questions": {
                     "type": "array",
                     "description": "问题列表（1-5 个）",
+                    "minItems": 1,
+                    "maxItems": 5,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -388,6 +302,7 @@ ASK_USER_TOOL_DEFINITION = {
                             "options": {
                                 "type": "array",
                                 "description": "候选选项列表（可选，2-6 项，每项 ≤100 字符；用户也可以不选选项而自由输入）",
+                                "maxItems": 6,
                                 "items": {"type": "string"},
                             },
                             "multiple": {
@@ -462,9 +377,10 @@ SUB_AGENT_TOOL_DEFINITION = {
     "function": {
         "name": SUB_AGENT_TOOL_NAME,
         "description": (
-            "派发子任务给一个子智能体（sub agent）执行，并在同一回复中并发派发多个相互独立的子任务。"
-            "子智能体拥有独立的上下文与与你相同的一套工具（MCP 工具、内置文件读写/搜索等），"
+            "派发一个独立子任务；同一回复中的多个 sub_agent 子任务会并发执行。"
+            "子智能体有独立上下文，可用父任务已启用的工具（不含 sub_agent、ask_user）；"
             "会独立完成该子任务并只把最终回复返回给你——它的思考过程、工具轨迹不会进入你的上下文。"
+            "若同一回复还调用了 MCP 工具，MCP 工具先执行完，随后才开始子任务。"
             "适用场景：可并行的独立调研/检索/批量处理子任务；需要大量中间工具调用而你只关心结论的部分。"
             "不适用：单次工具调用就能完成的事（直接调用该工具）；需要用户交互的决策（用 ask_user）。"
             "关键契约：1. task 必须自包含——子智能体看不到对话历史、上传文件内容与你掌握的任何上下文，"
@@ -479,6 +395,7 @@ SUB_AGENT_TOOL_DEFINITION = {
             "properties": {
                 "task": {
                     "type": "string",
+                    "maxLength": _SUB_AGENT_TASK_MAX_CHARS,
                     "description": (
                         "子任务目标（必填，自包含）。必须包含：目标与验收标准、涉及文件/目录的绝对路径、"
                         "已有事实与结论、执行约束、期望回复的内容结构"
@@ -508,31 +425,6 @@ SUB_AGENT_TOOL_DEFINITION = {
     },
 }
 
-# 子智能体侧的 ask_user 占位定义：同名同参 schema，但执行时返回明确错误
-# （子任务没有用户通道，避免子模型反复尝试向用户提问）。
-ASK_USER_PLACEHOLDER_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": ASK_USER_TOOL_NAME,
-        "description": (
-            "不可用：你是被父智能体调度的子智能体，没有与用户交互的通道，无法通过本工具提问。"
-            "遇到必须由用户决定的事项时，请在最终回复中明确说明阻塞点与所需信息，交给父智能体处理。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "description": "无效参数（占位定义，仅用于拦截）",
-                    "items": {"type": "object"},
-                },
-            },
-            "required": ["questions"],
-        },
-    },
-}
-
-
 def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
     """校验 sub_agent 的 task 参数；返回 (规整后的 task, 错误原因)。
 
@@ -560,30 +452,16 @@ def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
     return task_text, None
 
 
-def execute_ask_user_placeholder(tool_args: dict[str, Any]) -> dict[str, Any]:
-    """子智能体侧 ask_user 占位执行：永远返回不可用说明（不阻塞、不提问）。"""
-    questions = normalize_ask_questions(
-        tool_args.get("questions") if isinstance(tool_args, dict) else None)
-    return {
-        "status": "unavailable_in_sub_agent",
-        "message": (
-            "子智能体无法向用户提问（没有用户交互通道）。"
-            "请基于已有信息继续决策；确实需要用户输入的事项，请在最终回复中"
-            "列出阻塞点与所需信息，由父智能体决定是否向用户转达。"
-        ),
-        "questions": questions or [],
-    }
-
 
 # ------------------- write_file / edit_file：内置文件编辑工具 -------------------
 # 与 MCP sys_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录，
 # worker 进程已 os.chdir），但结果为结构化 dict：除人类可读 message 外携带
 # path/action/changed_bytes 等机器可读字段；edit/写改类结果另带 _file_diff
 # 顶级键（unified diff + 行数统计，仅前端展示与 JSONL 落盘，不进模型上下文）
-# 与 content_hash（read_file 亦可获取，为阶段 2 文件版本校验预留）。
+# 与 content_hash（read_file 亦可获取，edit_file 可用 expected_hash 校验）。
 
 _WRITE_EDIT_MAX_CHARS = 2 * 1024 * 1024   # 单次写入/替换内容上限（防超大参数）
-_READ_CHUNK = 8 * 1024 * 1024             # 文件读取上限：超过按二进制拒绝前先截断
+_EDIT_FILE_MAX_BYTES = 64 * 1024 * 1024  # 超大文件明确拒绝，不能截取前缀后覆盖原文件
 
 WRITE_FILE_TOOL_DEFINITION = {
     "type": "function",
@@ -603,7 +481,7 @@ WRITE_FILE_TOOL_DEFINITION = {
             "type": "object",
             "properties": {
                 "full_file_name": {"type": "string", "description": "文件路径"},
-                "content": {"type": "string", "description": "要写入的完整内容（覆盖模式会清空原内容）"},
+                "content": {"type": "string", "description": "要写入的完整内容（覆盖模式会清空原内容）", "maxLength": _WRITE_EDIT_MAX_CHARS},
                 "encoding": {"type": "string", "description": "文件编码，默认 utf-8", "default": "utf-8"},
                 "append": {"type": "boolean", "description": "true=在文件末尾追加；false（默认）=整文件覆盖", "default": False},
             },
@@ -623,7 +501,8 @@ EDIT_FILE_TOOL_DEFINITION = {
             "    old_string:     要被替换的原文，必须与文件内容完全一致（建议从 read_file 的输出复制）\n"
             "    new_string:     替换后的新内容；传空串表示删除 old_string\n"
             "    replace_all:    old_string 出现多次时是否全部替换；默认 false（多处匹配会报错并提示加长上下文）\n"
-            "    encoding:       指定文件编码（如 gbk）；留空自动尝试 utf-8 → gbk，并按读到的编码写回\n"
+                "    encoding:       指定文件编码（如 gbk）；留空自动尝试 utf-8 → gbk，并按读到的编码写回\n"
+                "    expected_hash:  可选，read_file 返回的 content_hash；文件已变化时拒绝写入\n"
             "返回：\n"
             "    替换结果说明（替换处数/换行风格/编码）；old_string 为 0 处或多处歧义时报错\n"
         ),
@@ -631,10 +510,11 @@ EDIT_FILE_TOOL_DEFINITION = {
             "type": "object",
             "properties": {
                 "full_file_name": {"type": "string", "description": "文件路径"},
-                "old_string": {"type": "string", "description": "要被替换的原文，必须与文件内容完全一致"},
-                "new_string": {"type": "string", "description": "替换后的新内容；传空串表示删除 old_string"},
+                "old_string": {"type": "string", "description": "要被替换的原文，必须与文件内容完全一致", "maxLength": _WRITE_EDIT_MAX_CHARS},
+                "new_string": {"type": "string", "description": "替换后的新内容；传空串表示删除 old_string", "maxLength": _WRITE_EDIT_MAX_CHARS},
                 "replace_all": {"type": "boolean", "description": "出现多次时是否全部替换；默认 false", "default": False},
                 "encoding": {"type": "string", "description": "指定文件编码（如 gbk）；留空自动尝试 utf-8 → gbk", "default": ""},
+                "expected_hash": {"type": "string", "description": "可选：read_file 返回的全文 content_hash，内容变化时拒绝编辑"},
             },
             "required": ["full_file_name", "old_string", "new_string"],
         },
@@ -749,8 +629,35 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
 
 
 def _content_hash(text: str) -> str:
-    """内容指纹（阶段 2 文件版本校验预留）：解码后全文的 sha256 前 16 位。"""
+    """内容指纹：解码后全文的 sha256 前 16 位。"""
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _decode_for_edit(data: bytes, encoding: str) -> tuple[str, str]:
+    """编辑必须完整、无损解码；猜测失败时拒绝修改原文件。"""
+    candidates = (encoding,) if encoding else ("utf-8", "gbk")
+    for candidate in candidates:
+        try:
+            return data.decode(candidate, errors="strict"), candidate
+        except (UnicodeError, LookupError):
+            continue
+    raise ValueError("文件编码无法无损识别；请指定正确的 encoding，原文件未修改")
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str) -> None:
+    """在目标目录完整写入临时文件，再替换目标文件。"""
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists():
+            shutil.copymode(path, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
@@ -765,26 +672,38 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"content 超过 {_WRITE_EDIT_MAX_CHARS // (1024 * 1024)}MB 上限")
     encoding = str(tool_args.get("encoding") or "utf-8").strip() or "utf-8"
     append = bool(tool_args.get("append"))
-    path = Path(full_file_name).expanduser()
+    path = Path(full_file_name).expanduser().resolve()
     dir_path = path.parent if str(path.parent).strip() else Path(".")
     if not dir_path.exists():
         dir_path.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
     size_before = path.stat().st_size if existed else 0
     # 旧内容仅用于 diff 生成（成功失败均不中断写入主流程）
-    old_text = ""
-    if existed:
-        old_data = path.read_bytes()[:_READ_CHUNK]
+    old_text: str | None = ""
+    if existed and size_before <= _FILE_DIFF_MAX_TEXT_CHARS:
+        old_data = path.read_bytes()
         if not _is_probably_binary(old_data):
             old_text, _ = _decode_bytes_used(old_data, "")
-    mode = "a" if append else "w"
-    with open(path, mode, encoding=encoding, newline="") as file:
-        file.write(content)
+        else:
+            old_text = None
+    elif existed:
+        old_text = None
+    if append:
+        with open(path, "a", encoding=encoding, newline="") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+    else:
+        _atomic_write_text(path, content, encoding)
     action = "追加" if append else "写入"
     # 追加模式的新文本 = 旧内容 + 新内容（diff 才能正确反映最终文件变化）
-    new_text_for_diff = old_text + content if append else content
-    file_diff = _build_file_diff(old_text, new_text_for_diff, path)
-    hash_note = f"，内容指纹 {_content_hash(content)}" if content else ""
+    new_text_for_diff = (old_text + content) if append and old_text is not None else content
+    file_diff = _build_file_diff(old_text, new_text_for_diff, path) if old_text is not None else {
+        "diff": "", "lines_added": 0, "lines_removed": 0,
+        "diff_truncated": False, "diff_skipped": "file_too_large",
+    }
+    final_hash = _content_hash(new_text_for_diff) if (not append or old_text is not None) else None
+    hash_note = f"，内容指纹 {final_hash}" if final_hash else ""
     return {
         "message": (
             f"[write_file] 已{action} {len(content)} 字符 → {_display_path(path.resolve())}"
@@ -799,7 +718,7 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "size_after": path.stat().st_size,
         "chars_written": len(content),
         "encoding": encoding,
-        "content_hash": _content_hash(content),
+        "content_hash": final_hash,
         "_file_diff": file_diff,
         # V2 版本链入链数据：{path, display_path, old_text, new_text}
         # （消费点 chat_factory / sub_agent 摘取后调 record_change，再统一剥离）
@@ -810,8 +729,10 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "old_text": old_text if file_diff.get("diff_skipped") != "file_too_large" else None,
             # 追加模式的最终全文 = 旧内容 + 新写入内容
             "new_text": (
-                (old_text + content) if append else content
-            ) if len(old_text + content) <= _FILE_DIFF_MAX_TEXT_CHARS else None,
+                new_text_for_diff
+                if (not append or old_text is not None) and len(new_text_for_diff) <= _FILE_DIFF_MAX_TEXT_CHARS
+                else None
+            ),
         },
     }
 
@@ -830,18 +751,27 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("old_string 不能为空；如需清空文件请使用 write_file 写入空内容")
     if not isinstance(new_string, str):
         raise ValueError("new_string 必须为字符串（可为空串表示删除）")
+    if max(len(old_string), len(new_string)) > _WRITE_EDIT_MAX_CHARS:
+        raise ValueError("old_string/new_string 超过 2 MiB 上限")
     replace_all = bool(args.get("replace_all"))
     encoding = str(args.get("encoding") or "").strip()
     full_file_name = str(args.get("full_file_name") or "").strip()
     if not full_file_name:
         raise ValueError("full_file_name 不能为空")
-    path = Path(full_file_name).expanduser()
+    path = Path(full_file_name).expanduser().resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"{path} 不存在或不是文件")
-    data = path.read_bytes()[:_READ_CHUNK]
+    size = path.stat().st_size
+    if size > _EDIT_FILE_MAX_BYTES:
+        raise ValueError(f"文件超过 {_EDIT_FILE_MAX_BYTES // (1024 * 1024)} MiB 编辑上限，原文件未修改")
+    data = path.read_bytes()
     if _is_probably_binary(data):
         raise ValueError(f"{path} 疑似二进制文件，不支持文本编辑")
-    original, used_encoding = _decode_bytes_used(data, encoding)
+    original, used_encoding = _decode_for_edit(data, encoding)
+    expected_hash = str(args.get("expected_hash") or "").strip()
+    current_hash = _content_hash(original)
+    if expected_hash and expected_hash != current_hash:
+        raise ValueError("FILE_MODIFIED_EXTERNALLY：文件内容与 expected_hash 不一致，原文件未修改；请重新 read_file")
     eol = "\r\n" if "\r\n" in original else "\n"
     # 匹配在换行归一化文本上进行，写回时还原原文件的换行风格
     text = original.replace("\r\n", "\n").replace("\r", "\n")
@@ -866,8 +796,8 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         )
     updated = text.replace(old_norm, new_norm) if replace_all else text.replace(old_norm, new_norm, 1)
     file_diff = _build_file_diff(text, updated, path)
-    with open(path, "w", encoding=used_encoding, newline="") as file:
-        file.write(updated.replace("\n", eol))
+    written_text = updated.replace("\n", eol)
+    _atomic_write_text(path, written_text, used_encoding)
     replaced = count if replace_all else 1
     style = "CRLF" if eol == "\r\n" else "LF"
     matched_lines = len(old_norm.split("\n"))
@@ -880,7 +810,7 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "message": (
             f"[edit_file] 已在 {_display_path(path)} 中替换 {replaced} 处"
             f"（换行风格 {style}，编码 {used_encoding}{diff_note}），"
-            f"内容指纹 {_content_hash(updated)}"
+            f"内容指纹 {_content_hash(written_text)}"
         ),
         "path": _display_path(path),
         "action": "replace",
@@ -889,7 +819,7 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "eol_style": style,
         "encoding": used_encoding,
         "matched_lines": matched_lines,
-        "content_hash": _content_hash(updated),
+        "content_hash": _content_hash(written_text),
         "_file_diff": file_diff,
         # V2 版本链入链数据（text/updated 均为换行归一化后的全文）
         _FILE_HISTORY_PAYLOAD_KEY: {
@@ -938,6 +868,8 @@ _SEARCH_DEFAULT_FILE_MB = 2.0
 # 注意：内置工具走 dict 参数分发，schema 的 default 不会被框架自动应用，
 # 缺省值必须在这里显式兜底，否则会退化成 0（只扫当前目录一层）。
 _SEARCH_DEFAULT_MAX_DEPTH = 6
+_SEARCH_DEFAULT_MAX_SCANNED_FILES = 3000
+_SEARCH_DEFAULT_MAX_SCAN_SECONDS = 10.0
 # 跨文件搜索/遍历时默认跳过的目录名（含各语言依赖与构建产物目录）
 _SKIP_DIR_NAMES = {
     ".git", ".idea", ".vscode", "__pycache__", "node_modules",
@@ -958,7 +890,7 @@ READ_FILE_TOOL_DEFINITION = {
             "    show_line_numbers: 是否带 \"行号| 内容\" 前缀显示，默认 true；行号可用于后续 edit_file 定位\n"
             "    char_offset:       单行超长时的字符偏移（按返回的 char_offset 提示续读）；普通文件忽略该参数\n"
             "返回：\n"
-            "    文件内容；末尾附 [read_file] 摘要（总行数/本次范围/编码），未读完会提示分段读取。\n"
+            "    content 为本次正文，message 为范围/编码摘要；未读完会提示分段读取。\n"
             "    单次最多返回 2000 行；二进制文件拒绝读取；\n"
             "    单行超过 6 万字符（如压缩大 JSON）时自动转为字符分块模式，按提示的 char_offset 续读\n"
         ),
@@ -992,7 +924,9 @@ SEARCH_FILES_TOOL_DEFINITION = {
             "    context_lines: 每处匹配附带上下文行数（0-5），默认 0\n"
             "    max_results:   最多返回的匹配区块数（1-200），默认 50\n"
             "    max_depth:     递归深度，0=仅当前目录；默认 6\n"
-            "    max_file_mb:   单文件大小上限 MB（默认 2；设 0 表示不限制，可搜索大 JSON/日志）\n"
+             "    max_file_mb:   单文件大小上限 MB（默认 2；设 0 表示不限制，可搜索大 JSON/日志）\n"
+             "    max_scanned_files: 最多检查的文件数，默认 3000\n"
+             "    max_scan_seconds: 最长扫描秒数，默认 10\n"
             "返回：\n"
             "    \"文件路径:行号\" 区块列表，> 前缀标记命中行；头部附扫描/命中统计。\n"
             "    自动跳过二进制文件、隐藏目录及 node_modules/__pycache__/.git 等目录；\n"
@@ -1010,6 +944,8 @@ SEARCH_FILES_TOOL_DEFINITION = {
                 "max_results": {"type": "integer", "description": "最多返回的匹配区块数（1-200），默认 50", "default": 50},
                 "max_depth": {"type": "integer", "description": "递归深度，0=仅当前目录；默认 6", "default": 6},
                 "max_file_mb": {"type": "number", "description": "单文件大小上限 MB（默认 2；0=不限制）", "default": 2},
+                "max_scanned_files": {"type": "integer", "description": "最多检查的文件数（默认 3000）", "default": 3000},
+                "max_scan_seconds": {"type": "number", "description": "最长扫描秒数（默认 10）", "default": 10},
             },
             "required": ["pattern"],
         },
@@ -1064,6 +1000,14 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     text, used_encoding = _decode_bytes_used(data, str(args.get("encoding") or ""))
     lines = text.splitlines()
     total = len(lines)
+    if total == 0:
+        return {
+            "message": f"[read_file] {_display_path(path)} | 空文件 | 编码 {used_encoding}",
+            "content": "", "path": _display_path(path), "encoding": used_encoding,
+            "mode": "lines", "total_lines": 0, "range_start": 0,
+            "range_end": 0, "truncated": False, "has_more": False,
+            "content_hash": _content_hash(text),
+        }
     start = max(1, int(args.get("start_line") or 1))
     raw_end = int(args.get("end_line") or 0)
     end = total if raw_end <= 0 else min(raw_end, total)
@@ -1077,7 +1021,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         selected = selected[:_READ_FILE_MAX_LINES]
         limited = True
     # 单行超长（如压缩过的大 JSON/日志）时按字符分块返回，避免头尾截断丢失中间内容
-    if len(selected) == 1 and len(selected[0]) > _READ_FILE_MAX_CHARS:
+    if len(selected) == 1 and len(selected[0]) >= _READ_FILE_MAX_CHARS - 32:
         line_text = selected[0]
         offset = max(0, int(args.get("char_offset") or 0))
         chunk = line_text[offset:offset + _READ_FILE_MAX_CHARS]
@@ -1111,10 +1055,12 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         body = f"{body[:head]}\n...[文件内容过长已截断，中间约 {len(body) - head - tail} 字符已省略]...\n{body[-tail:]}"
     last_line = start + len(selected) - 1
     footer = f"[read_file] {_display_path(path)} | 共 {total} 行 | 本次第 {start}-{last_line} 行 | 编码 {used_encoding}"
-    if last_line < total or limited or char_limited:
-        footer += " | 未读完，可调整 start_line/end_line 继续读取"
-    return {
-        "message": body + ("\n" + footer if body else footer),
+    if char_limited:
+        footer += " | 本次区间字符过多，请缩小 start_line/end_line 后重读"
+    elif last_line < total or limited:
+        footer += f" | 未读完，请从 start_line={last_line + 1} 继续读取"
+    result = {
+        "message": footer,
         "content": body,
         "path": _display_path(path),
         "encoding": used_encoding,
@@ -1123,11 +1069,16 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "range_start": start,
         "range_end": last_line,
         "truncated": bool(limited or char_limited),
-        "has_more": last_line < total,
+        "has_more": last_line < total or char_limited,
         # 全文（非本次区间）的内容指纹：模型可在 edit_file 时以 expected_hash
-        # 引用（阶段 2 版本校验），用于检测读后文件被外部修改的竞态
+        # 引用，用于检测读后文件被外部修改的竞态
         "content_hash": _content_hash(text),
     }
+    if last_line < total:
+        result["next_start_line"] = last_line + 1
+    if char_limited:
+        result["retry_end_line"] = start + max(1, len(selected) // 2) - 1
+    return result
 
 
 def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int) -> list:
@@ -1185,6 +1136,15 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     files_scanned = 0
     files_matched = 0
     skipped_large = 0
+    scan_truncated = False
+    started_at = time.monotonic()
+    try:
+        max_scanned_files = max(1, min(int(args.get("max_scanned_files") or _SEARCH_DEFAULT_MAX_SCANNED_FILES), 20000))
+        max_scan_seconds = max(0.1, min(float(args.get("max_scan_seconds") or _SEARCH_DEFAULT_MAX_SCAN_SECONDS), 120.0))
+    except (TypeError, ValueError):
+        max_scanned_files = _SEARCH_DEFAULT_MAX_SCANNED_FILES
+        max_scan_seconds = _SEARCH_DEFAULT_MAX_SCAN_SECONDS
+    files_checked = 0
     try:
         raw_depth = args.get("max_depth")
         max_depth = int(raw_depth) if raw_depth is not None else _SEARCH_DEFAULT_MAX_DEPTH
@@ -1195,6 +1155,10 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
             continue
         if name_filter and not fnmatch.fnmatch(path.name, name_filter):
             continue
+        if files_checked >= max_scanned_files or time.monotonic() - started_at >= max_scan_seconds:
+            scan_truncated = True
+            break
+        files_checked += 1
         try:
             file_size = path.stat().st_size
             if size_limit and file_size > size_limit * 1024 * 1024:
@@ -1221,6 +1185,8 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
               f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
     if skipped_large:
         header += f" | 跳过 {skipped_large} 个超过 {size_limit:g}MB 的文件（可用 max_file_mb 调整）"
+    if scan_truncated:
+        header += " | 扫描达到文件数或时间上限，命中统计仅覆盖已扫描部分；请缩小目录或调整扫描上限"
     if not blocks:
         message = header + "\n（无匹配结果）"
     else:
@@ -1233,21 +1199,47 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         "path": _display_path(root),
         "pattern": regex.pattern,
         "files_scanned": files_scanned,
+        "files_checked": files_checked,
         "files_matched": files_matched,
         "total_matches": total_matches,
-        "truncated": len(blocks) >= limit,
+        "truncated": len(blocks) >= limit or scan_truncated,
+        "scan_truncated": scan_truncated,
     }
 
 
 # ------------------- read_document：读取文档解析文本（按需/分页） -------------------
-# 支持会话上传文件，以及用户明确传入的本地文档路径；当前轮启用工具时自动注入。
+# 支持会话上传文件，以及用户明确传入的本地文档路径；用户显式启用后才注入。
 
-_READ_DOCUMENT_DEFAULT_MAX_CHARS = 8000
+_READ_DOCUMENT_DEFAULT_MAX_CHARS = 10000
 _READ_DOCUMENT_MAX_CHARS = 20000
 _READ_DOCUMENT_LOCAL_MAX_BYTES = 10 * 1024 * 1024
+_DOCUMENT_TEXT_CACHE_MAX_CHARS = 4 * 1024 * 1024
+_document_text_cache: OrderedDict[tuple[str, int, int], str] = OrderedDict()
+_document_text_cache_lock = Lock()
 
 
-def _load_local_document(filename: str) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
+def _extract_document_text(path: Path, filename: str, data: bytes) -> str:
+    """缓存较小的解析文本；文件修改后由 mtime 与大小自动换键。"""
+    from factory import file_factory
+
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _document_text_cache_lock:
+        cached = _document_text_cache.get(key)
+        if cached is not None:
+            _document_text_cache.move_to_end(key)
+            return cached
+    content = file_factory.extract_text_from_bytes(filename, data)
+    if len(content) <= _DOCUMENT_TEXT_CACHE_MAX_CHARS:
+        with _document_text_cache_lock:
+            _document_text_cache[key] = content
+            _document_text_cache.move_to_end(key)
+            while len(_document_text_cache) > 4 or sum(map(len, _document_text_cache.values())) > _DOCUMENT_TEXT_CACHE_MAX_CHARS:
+                _document_text_cache.popitem(last=False)
+    return content
+
+
+def _load_local_document(filename: str, *, parse_text: bool = True) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
     """读取显式指定的本地文档并复用上传链路解析器。"""
     path = Path(filename).expanduser()
     if not path.is_absolute():
@@ -1280,11 +1272,12 @@ def _load_local_document(filename: str) -> tuple[dict[str, Any] | None, bytes | 
             "请使用 PDF/Word/Excel/CSV/Markdown/文本文件"
         )
     parse_error = ""
-    try:
-        content = file_factory.extract_text_from_bytes(path.name, data)
-    except Exception as exc:
-        content = ""
-        parse_error = str(exc)
+    content = ""
+    if parse_text:
+        try:
+            content = _extract_document_text(path, path.name, data)
+        except Exception as exc:
+            parse_error = str(exc)
 
     try:
         from config import DEFAULT_FILE_TEXT_MAX_CHARS
@@ -1328,10 +1321,11 @@ READ_DOCUMENT_TOOL_DEFINITION = {
       "name": READ_DOCUMENT_NAME,
       "description": (
           "读取当前会话上传文件，或按明确提供的本地绝对/相对路径读取文档"
-          "（PDF/Word/Excel/CSV/MD/TXT 等）。小文件可能已在文件清单中内联，"
-          "大文件只显示开头节选；需要其余内容时用本工具读取。支持按字符区间分页"
-          "（start_char/max_chars），本地路径文件最大 10MB，"
-          "返回带 total_chars 与 has_more，据此继续读取后续区间。"
+          "（PDF/Word/Excel/CSV/MD/TXT 等）。mode=auto 按目标扩展名和模型 supportDocTypes 选择读取方式，"
+          "不以通用 vision 能力分流；"
+          "mode=text 使用 offset/limit 按字符读取（默认 10000，最大 20000）；"
+          "原生 PDF 可用 page_start/page_count 读取 1 起始的页面范围（最多 20 页）。"
+          "原生文件只在下一次模型请求中发送一次；之后需再次调用本工具查看原文。"
       ),
       "parameters": {
         "type": "object",
@@ -1340,16 +1334,29 @@ READ_DOCUMENT_TOOL_DEFINITION = {
             "type": "string",
             "description": "会话文件清单中的原始文件名，或当前工作目录下的相对/绝对文档路径",
           },
-          "start_char": {
-            "type": "integer",
-            "description": "起始字符位置（从 0 开始，默认 0）",
+          "mode": {
+            "type": "string",
+            "enum": ["auto", "text", "native"],
+            "description": "auto 按模型能力选择；text 返回解析文本；native 只发送原始文档",
           },
-          "max_chars": {
+          "offset": {
+            "type": "integer",
+            "description": "解析文本起始字符位置（从 0 开始）；指定后 auto 使用文本模式",
+          },
+          "limit": {
             "type": "integer",
             "description": (
                 f"本次读取的最大字符数（默认 {_READ_DOCUMENT_DEFAULT_MAX_CHARS}，"
                 f"最大 {_READ_DOCUMENT_MAX_CHARS}）"
             ),
+          },
+          "page_start": {
+            "type": "integer",
+            "description": "原生 PDF 起始页码（从 1 开始）；与 page_count 同时指定",
+          },
+          "page_count": {
+            "type": "integer",
+            "description": "原生 PDF 读取页数（1–20）；与 page_start 同时指定",
           },
         },
         "required": ["filename"],
@@ -1363,34 +1370,62 @@ def execute_read_document(
     session_id: str,
     support_doc_types: Any = None,
 ) -> dict[str, Any]:
-    """执行内置 read_document：按会话文件名或本地路径读取解析文本（分页）。
+    """读取解析文本区间，或按需构建一次性原生文档部件。
 
-    support_doc_types 为当前生效模型的 supportDocTypes 声明（原生文档输入能力）：
-    - 命中声明且原始文件可用 → 结果携带 native 块（原生文档部件），调用方把它
-      注入后续请求（供应商侧视觉解析），同时返回解析文本节选作为兜底/速读；
-    - 未命中/原始文件缺失 → 纯文本分页口径（与历史行为一致），native 省略。
-
-    返回 {filename, type, total_chars, start_char, end_char, content, has_more,
-    next_start_char?, native?, message}；失败返回 {"error": ...}（模型可见）。
+    原生能力由 supportDocTypes 与文件扩展名决定，和 vision 标志分开判断。
+    原生结果不带解析文本；调用方须把 native.part 作为独立消息发送，且不得落盘。
     """
     args = tool_args if isinstance(tool_args, dict) else {}
     filename = str(args.get("filename") or "").strip()
     if not filename:
         return {"error": "filename 不能为空（传入会话文件名或明确的本地文档路径）"}
-    start = _read_document_int(args.get("start_char"), 0, minimum=0, maximum=10**9)
-    max_chars = _read_document_int(
-        args.get("max_chars"),
+
+    mode = str(args.get("mode") or "auto").strip().lower()
+    if mode not in {"auto", "text", "native"}:
+        return {"error": "mode 只支持 auto、text 或 native"}
+    has_text_range = any(
+        key in args for key in ("offset", "limit", "start_char", "max_chars")
+    )
+    has_page_start = "page_start" in args
+    has_page_count = "page_count" in args
+    if has_page_start != has_page_count:
+        return {"error": "page_start 和 page_count 必须同时指定"}
+    has_page_range = has_page_start and has_page_count
+    if has_text_range and has_page_range:
+        return {"error": "字符 offset/limit 与 PDF page_start/page_count 不能同时使用"}
+    if mode == "native" and has_text_range:
+        return {"error": "mode=native 不接受字符区间；请移除 offset/limit 或使用 mode=text"}
+    if mode == "text" and has_page_range:
+        return {"error": "mode=text 使用 offset/limit；PDF 页面范围请使用 mode=auto 或 native"}
+
+    offset = _read_document_int(
+        args.get("offset", args.get("start_char", 0)),
+        0, minimum=0, maximum=10**9,
+    )
+    limit = _read_document_int(
+        args.get("limit", args.get("max_chars", _READ_DOCUMENT_DEFAULT_MAX_CHARS)),
         _READ_DOCUMENT_DEFAULT_MAX_CHARS,
         minimum=1,
         maximum=_READ_DOCUMENT_MAX_CHARS,
     )
+
     local_data: bytes | None = None
+    local_parsing_deferred = False
     try:
         record = file_memory.find_file_memory_record(session_id, filename)
     except Exception as exc:
         return {"error": f"读取文件记录失败：{exc}"}
     if record is None:
-        record, local_data, local_error = _load_local_document(filename)
+        local_parsing_deferred = bool(
+            mode == "native" or (
+                mode == "auto" and not has_text_range
+                and support_doc_types
+                and file_memory.document_supports_native(Path(filename).name, support_doc_types)
+            )
+        )
+        record, local_data, local_error = _load_local_document(
+            filename, parse_text=not local_parsing_deferred
+        )
         if record is None:
             try:
                 names = [
@@ -1401,29 +1436,120 @@ def execute_read_document(
                 names = []
             hint = f"；当前会话已上传文件：{'、'.join(names)}" if names else "；当前会话没有上传文件"
             return {"error": f"{local_error}；{hint}"}
-    # 原生文档分支：当前模型声明支持该类型且原始文件可用时，构建原生文档部件
-    # （调用方注入后续请求；文本节选仍一并返回，供应商拒绝 file 部件时可兜底）
-    native_block: dict[str, Any] | None = None
-    native_note = ""
-    display_filename = str(record.get("display_filename") or record.get("filename") or filename)
-    if support_doc_types and file_memory.document_supports_native(
-        display_filename, support_doc_types
-    ):
+
+    display_filename = str(
+        record.get("display_filename") or record.get("filename") or filename
+    )
+    stored_name = str(record.get("stored_name") or "").strip()
+    file_ref = stored_name or str(record.get("filename") or filename)
+    native_supported = bool(
+        support_doc_types
+        and file_memory.document_supports_native(display_filename, support_doc_types)
+    )
+
+    def load_original_bytes() -> bytes | None:
         if local_data is not None:
-            loaded_native = file_memory.build_native_document_part_from_bytes(
-                display_filename, local_data
-            )
+            return local_data
+        if not stored_name:
+            return None
+        path = file_memory.resolve_document_path(session_id, stored_name)
+        if path is None:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    wants_native = mode == "native" or (
+        mode == "auto" and not has_text_range and (native_supported or has_page_range)
+    )
+    if wants_native:
+        if not native_supported:
+            if mode == "native":
+                return {
+                    "error": (
+                        f"当前模型未声明支持 {Path(display_filename).suffix or '该'} "
+                        "原生文档输入，请使用 mode=text"
+                    )
+                }
+            if has_page_range:
+                return {
+                    "error": (
+                        "PDF 页面选段要求当前模型声明支持 PDF 原生输入；"
+                        "否则请使用 offset/limit 文本选段"
+                    )
+                }
         else:
-            loaded_native = file_memory.build_native_document_part(session_id, record)
-        if loaded_native.get("part") is not None:
-            native_block = loaded_native
-            native_note = (
-                "；当前模型支持该文档类型，原始文件已作为原生文档注入后续请求"
-                "（以下为解析文本节选，供快速定位）"
-            )
-        elif loaded_native.get("error"):
-            native_note = f"；原生文档注入不可用：{loaded_native['error']}"
+            if has_page_range:
+                if Path(display_filename).suffix.lower() != ".pdf":
+                    return {"error": "原生页面选段目前只支持 PDF；其他格式请使用 offset/limit"}
+                raw = load_original_bytes()
+                if raw is None:
+                    return {"error": f"{display_filename} 的原始文件不可用，无法读取指定页面"}
+                native_block = file_memory.build_native_pdf_page_part_from_bytes(
+                    display_filename,
+                    raw,
+                    args.get("page_start"),
+                    args.get("page_count"),
+                    stored_name=stored_name,
+                )
+            elif local_data is not None:
+                native_block = file_memory.build_native_document_part_from_bytes(
+                    display_filename, local_data, stored_name=stored_name
+                )
+            else:
+                native_block = file_memory.build_native_document_part(session_id, record)
+
+            if native_block.get("part") is not None:
+                result: dict[str, Any] = {
+                    "filename": record.get("filename") or filename,
+                    "type": record.get("type") or "",
+                    "mode": "native",
+                    "file_ref": file_ref,
+                    "message": (
+                        "原生文档将在下一次模型请求中发送一次；"
+                        "之后如需查看原文，请再次调用 read_document。"
+                    ),
+                    "native": {**native_block, "file_ref": file_ref},
+                }
+                if has_page_range:
+                    result.update({
+                        "page_start": native_block.get("page_start"),
+                        "page_end": native_block.get("page_end"),
+                        "total_pages": native_block.get("total_pages"),
+                    })
+                return result
+            if mode == "native":
+                return {"error": native_block.get("error") or "原生文档不可用"}
+            native_fallback_note = str(native_block.get("error") or "原生文档不可用")
+    else:
+        native_fallback_note = ""
+
+    # 原生读取失败后才解析本地文件；截断入库的记录按需重解析。
+    if local_parsing_deferred and local_data is not None:
+        local_path = Path(str(record.get("filename") or filename))
+        try:
+            record["content"] = _extract_document_text(local_path, local_path.name, local_data)
+        except Exception as exc:
+            record["parse_failed"] = True
+            record["parse_error"] = str(exc)
     content = str(record.get("content") or "")
+    source_truncated = bool(record.get("content_truncated"))
+    if source_truncated:
+        raw = load_original_bytes()
+        if raw is not None:
+            try:
+                source_path = (
+                    Path(str(record.get("filename") or filename)) if local_data is not None
+                    else file_memory.resolve_document_path(session_id, stored_name)
+                )
+                if source_path is None:
+                    raise FileNotFoundError("原始文档路径不可用")
+                content = _extract_document_text(source_path, display_filename, raw)
+                source_truncated = False
+            except Exception:
+                pass
+
     total = len(content)
     if total == 0:
         empty_hint = "该文件解析文本为空（可能是扫描版 PDF 等无可提取文本）"
@@ -1431,57 +1557,69 @@ def execute_read_document(
             empty_hint = (
                 "该文件本地文本解析失败"
                 f"（{str(record.get('parse_error') or '解析器不可用/文件不支持')}），"
-                "无文本可读；原始文件仍保留，可尝试按绝对路径用 read_file 读取"
-                "（若为纯文本），或改用支持该文档类型的模型按原生文档读取"
+                "无文本可读；若模型支持该类型，可使用 mode=native 读取原始文档"
             )
-        result: dict[str, Any] = {
+        message = empty_hint
+        if source_truncated:
+            message += "；解析文本在入库时已截断，原始文件不可用，无法继续重解析"
+        if native_fallback_note:
+            message += f"；原生文档不可用：{native_fallback_note}"
+        return {
             "filename": record.get("filename") or filename,
             "type": record.get("type") or "",
+            "mode": "text",
             "total_chars": 0,
+            "offset": 0,
+            "limit": limit,
             "start_char": 0,
             "end_char": 0,
             "content": "",
             "has_more": False,
-            "message": empty_hint + native_note,
+            "source_truncated": source_truncated,
+            "message": message,
         }
-        if native_block is not None:
-            result["native"] = native_block
-        return result
-    if start >= total:
+
+    if offset >= total:
         return {
             "error": (
-                f"start_char={start} 已超出文件总长度 {total}；"
-                "请用 start_char=0 重新开始或检查文件名是否正确"
+                f"offset={offset} 已超出当前可读取文本长度 {total}；"
+                "请检查偏移量或重新从 offset=0 读取"
             )
         }
-    chunk = content[start:start + max_chars]
-    end = start + len(chunk)
+
+    chunk = content[offset:offset + limit]
+    end = offset + len(chunk)
+    has_more = end < total
+    message = (
+        f"已返回字符区间 [{offset}, {end})（共 {total} 字）；"
+        f"如需继续，用 offset={end} 再次调用"
+        if has_more
+        else f"已返回字符区间 [{offset}, {end})（当前可读取文本结束，共 {total} 字）"
+    )
+    if source_truncated:
+        message += "；原始文件不可用，解析文本在入库时已截断"
+    if native_fallback_note:
+        message += f"；原生文档不可用，已回退到解析文本：{native_fallback_note}"
     result = {
         "filename": record.get("filename") or filename,
         "type": record.get("type") or "",
+        "mode": "text",
         "total_chars": total,
-        "start_char": start,
+        "offset": offset,
+        "limit": limit,
+        "start_char": offset,
         "end_char": end,
         "content": chunk,
-        "has_more": end < total,
+        "has_more": has_more,
+        "source_truncated": source_truncated,
+        "message": message,
     }
-    if native_block is not None:
-        result["native"] = native_block
-    if end < total:
+    if has_more:
+        result["next_offset"] = end
         result["next_start_char"] = end
-        result["message"] = (
-            f"已返回第 {start}-{end} 字符（共 {total} 字）；"
-            f"如需继续，用 start_char={end} 再次调用" + native_note
-        )
-    else:
-        result["message"] = f"已返回第 {start}-{end} 字符（全文结束，共 {total} 字）" + native_note
-    if record.get("content_truncated"):
+    if source_truncated:
         result["content_truncated"] = True
         result["content_total_chars"] = record.get("content_total_chars")
-        result["message"] += (
-            f"；文本解析结果达到入库上限，完整解析文本共约 "
-            f"{record.get('content_total_chars')} 字"
-        )
     return result
 
 
@@ -1521,51 +1659,14 @@ def build_read_media_tool_definition() -> dict[str, Any]:
         "function": {
             "name": READ_MEDIA_NAME,
             "description": (
-                "读取媒体文件（本地/网络/用户上传统一入口），把数据回传给你（多模态部件）"
-                "以便观察内容，最多 5 个。\n"
-                "参数：\n"
-                "    references: 媒体来源列表，支持三类引用（可混用）：\n"
-                "                1) media:// 引用（用户消息附件中已展示的引用，如 "
-                "media://xxx_abc12345.png，不要臆造）；\n"
-                "                2) 本地文件路径（绝对路径如 C:/data/x.png，或相对当前"
-                "工作目录的路径；支持 png/jpg/gif/webp/bmp 等图片与常见音频视频格式）；\n"
-                "                3) http(s) 网络直链（公开可访问的图片/音频/视频文件）；\n"
-                "                单个字符串视为单个引用\n"
-                "    quality:    图片清晰度 50-100（越大越清晰/占用越大，默认 85）；"
-                "仅对超过 2MB 的大图生效（小图按原样回传）\n"
-                "    start_time: 视频区间读取开始秒数（可选，精确到帧，毫秒精度）\n"
-                "    end_time:   视频区间读取结束秒数（可选，精确到帧；省略时读取 "
-                f"start_time 起 {max_seconds} 秒——该上限可"
-                "由项目 .env 的 VIDEO_MAX_READ_SECONDS 配置）\n"
-                "返回：\n"
-                "    文本说明（读取了哪些媒体、来源类型、是否转换/降采样/超限跳过）；"
-                "数据本身以 user 消息多模态部件注入后续请求，不在本文本内\n"
-                "注意：\n"
-                "    并发限制：同一条模型回复只允许 1 个 read_media 调用——同一回复"
-                "并发调用本工具 2 个及以上时，仅首个会执行，其余返回错误占位且不注入"
-                "媒体数据（多个媒体部件并发注入会使供应商请求报错）。要读多个来源时"
-                "把它们合并进一次调用的 references 列表；必须先后依赖结果时改为分多轮调用；\n"
-                "    视频/动图 gif 走区间读取（不再全量注入）：单次最多 "
-                f"{max_seconds} 秒（.env 可配），"
-                "请求区间超上限自动截断为 [start, "
-                "start+上限] 并在返回中标记 truncated；先传 start_time == end_time "
-                "（如 0/0）可只探测元数据（时长/帧率/分辨率，不回传视频数据）；"
-                "返回元信息含视频时长/帧率/分辨率与实际读取区间，据此规划下一段 "
-                "[上一段 end, end+上限] 续读；\n"
-                "    视频数据一次性消费：供应商单请求仅接受 1 个视频——读取新片段"
-                "时此前已注入的视频数据会被回收（工具结果中的参数与读取状态文本"
-                "仍保留）；需要回看画面就对同一引用与相同区间重新调用本工具"
-                "（切片有缓存，成本很低）；一次调用读多个视频时只有第一个片段"
-                "带画面数据，其余按序补读；\n"
-                "    视觉 API 拒绝的图片格式会自动转换后再注入：静图 gif 与 "
-                "bmp/ico/tif/tiff 转 PNG、动图 gif 转 H.264 MP4（ffmpeg 定位"
-                "回退 imageio-ffmpeg 包内置二进制，均缺失时动图回退首帧 PNG）；"
-                "原生格式（png/jpg/jpeg/webp）直接按原样注入；\n"
-                "    大小上限按内容判定：静图类 30MB、动图 gif 与视频 600MB、"
-                "音频 20MB；超过上限的媒体直接拒绝（错误信息注明原因），"
-                "不会注入原始大文件；\n"
-                "    视频/音频仅回传元信息与部分模型的有限支持，读取结果以图片为主；\n"
-                "    已读取过的引用无需重复读取（同一轮上下文已注入）"
+                "按需读取 media:// 引用、本地路径或 http(s) 直链的图片、音频、视频。"
+                "每次最多 5 个来源，同一条回复只调用一次（重复调用仅首个会执行）；"
+                "多个来源合并到 references 列表。"
+                "媒体数据作为下一次请求的多模态部件发送，工具结果只含读取状态。"
+                f"视频/动图每次最多读取 {max_seconds} 秒；start_time=end_time 可只探测元数据，"
+                "继续读取时使用上一段的结束时间。单请求仅保留一个视频片段，"
+                "此前视频画面会回收；如需回看，重新读取相同引用和区间。"
+                "超限或不支持的格式会返回原因；图片格式必要时自动转换。"
             ),
             "parameters": {
                 "type": "object",
@@ -1577,9 +1678,12 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                             "http(s) 网络直链，可混用"
                         ),
                         "items": {"type": "string"},
+                        "maxItems": READ_MEDIA_MAX_ITEMS,
                     },
                     "quality": {
                         "type": "integer",
+                        "minimum": _READ_MEDIA_QUALITY_MIN,
+                        "maximum": _READ_MEDIA_QUALITY_MAX,
                         "description": (
                             "图片清晰度 50-100（默认 85；仅对超过 2MB 的大图降采样生效，"
                             "小图/动图按原样回传）"
@@ -1727,6 +1831,28 @@ def retire_prior_video_parts(messages: Any) -> int:
     return retired
 
 
+def collect_injected_media_keys(messages: Any) -> set[str]:
+    """只把当前消息中仍携带的图片/音频计入去重；视频回收后允许重读。"""
+    keys: set[str] = set()
+    if not isinstance(messages, list):
+        return keys
+    for message in messages:
+        if not isinstance(message, dict) or not message.get("_internal"):
+            continue
+        parts = message.get("content")
+        media_keys = message.get("_media_injected_keys")
+        if not isinstance(parts, list) or not isinstance(media_keys, list):
+            continue
+        for key, part in zip(media_keys, parts[1:]):
+            if (
+                isinstance(key, str) and key
+                and isinstance(part, dict)
+                and part.get("type") in {"image_url", "input_audio"}
+            ):
+                keys.add(key)
+    return keys
+
+
 def cap_video_parts_in_batch(
     parts: list[dict[str, Any]],
     reference_hint: str | None = None,
@@ -1768,25 +1894,6 @@ def cap_video_parts_in_batch(
             continue
         capped.append(part)
     return capped
-
-
-def roll_recent_media_parts(
-    pairs: list[tuple[str, Any]],
-    evicted: set[str] | None = None,
-) -> list[tuple[str, Any]]:
-    """任务内累计媒体部件的滚动窗口：只保留最近 READ_MEDIA_MAX_ITEMS 个。
-
-    - pairs：[(reference, media_part), ...]，按注入时间排列；
-    - evicted：可选输出集合，被挤出窗口的引用会写入其中（调用方应把它们从
-      already_injected 里移除，这样模型再次读取同一引用时能重新注入）。
-
-    返回裁剪后的列表（末尾 READ_MEDIA_MAX_ITEMS 个）。
-    """
-    limit = max(1, READ_MEDIA_MAX_ITEMS)
-    trimmed = pairs[-limit:] if len(pairs) > limit else list(pairs)
-    if evicted is not None and len(pairs) > limit:
-        evicted.update(reference for reference, _ in pairs[:-limit])
-    return trimmed
 
 
 def _load_network_media_bytes(source: str) -> bytes | None:
@@ -3695,25 +3802,11 @@ RUN_COMMAND_TOOL_DEFINITION = {
     "function": {
         "name": RUN_COMMAND_NAME,
         "description": (
-            "执行终端命令并返回退出码与输出（多 shell：cmd/powershell/pwsh/bash/sh/zsh）\n"
-            "参数：\n"
-            "    command:         命令原文，由目标 shell 解释（管道、重定向、链式命令、多行均可；\n"
-            "                     多行按顺序逐行执行）。每次调用都是新 shell，cd 不跨调用保持\n"
-            "                     （用 work_dir 或链式命令）。cmd 家族用 `&&`/`&` 串联（不支持 `;`，\n"
-            "                     写了会被当普通字符原样输出）；PowerShell 5.1 用 `;` 串联。\n"
-            "                     内联代码（python -c / node -e，多行或含 `%`）自动转脚本；\n"
-            "                     cmd 不支持 `<<` heredoc；`| tail/head -N` 可自动适配\n"
-            "    shell:           默认 auto（Windows→cmd，非 Windows→bash/sh）；可选 cmd/powershell/\n"
-            "                     pwsh/bash/sh/zsh（bash/sh/zsh 在 Windows 上需 Git Bash/WSL）\n"
-            "    work_dir:        工作目录，默认当前目录（会话工作目录）；目录不存在时报错\n"
-            "    timeout_seconds: 默认 120，可能受限于系统配置\n"
-            "    background:      true=后台分离模式：立即返回 pid 与输出/结束标记文件路径（适合长任务）；\n"
-            "                     默认 false 前台等待\n"
-            "返回：\n"
-            "    头部（shell/工作目录/退出码/耗时）+ stdout/stderr 分段；超长截断保留头尾，\n"
-            "    完整输出落盘并附文件路径。后台模式读输出文件轮询，结束标记出现即已结束（内容为退出码）。\n"
-            "    命令被自动改写/兜底或疑似语法误用时，末尾附 `[run_command] …` 说明行。\n"
-            "    文件读写/搜索请优先使用专用工具；本工具适用于安装依赖、运行脚本、git、进程管理等。"
+            "执行命令并返回 shell、工作目录、退出码和 stdout/stderr。"
+            "每次调用使用新 shell；用 work_dir 指定目录。Windows 默认 cmd，"
+            "cmd 用 && 串联命令，PowerShell 用分号。前台默认超时 120 秒；"
+            "background=true 立即返回进程及输出文件路径，读取结束标记可知退出码。"
+            "超长输出会截断展示并保存完整文件。读写和搜索文件优先使用专用工具。"
         ),
         "parameters": {
             "type": "object",
@@ -3727,6 +3820,7 @@ RUN_COMMAND_TOOL_DEFINITION = {
                 },
                 "shell": {
                     "type": "string",
+                    "enum": ["auto", "cmd", "powershell", "pwsh", "bash", "sh", "zsh"],
                     "description": (
                         "目标 shell：auto=默认（Windows→cmd，非 Windows→bash/sh）；"
                         "可选 cmd/powershell/pwsh/bash/sh/zsh"
@@ -3740,6 +3834,8 @@ RUN_COMMAND_TOOL_DEFINITION = {
                 },
                 "timeout_seconds": {
                     "type": "number",
+                    "minimum": 1,
+                    "maximum": 1800,
                     "description": "超时秒数（默认 120，最大 1800）",
                     "default": 120.0,
                 },

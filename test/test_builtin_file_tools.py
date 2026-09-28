@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -76,6 +77,7 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertEqual(p.read_text(encoding="utf-8"), "hello-world")
         self.assertEqual(result["action"], "append")
         self.assertFalse(result["created"])
+        self.assertEqual(result["content_hash"], bt._content_hash("hello-world"))
 
     def test_write_file_rejects_bad_args(self):
         with self.assertRaises(ValueError):
@@ -147,6 +149,10 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         raw = Path(path).read_bytes()
         self.assertIn(b"LINE1\r\nline2", raw)
+        self.assertEqual(
+            bt.execute_read_file({"full_file_name": path})["content_hash"],
+            bt._content_hash("LINE1\r\nline2\r\n"),
+        )
 
     def test_edit_file_gbk_roundtrip(self):
         path = self._make_file("gbk.txt", "中文内容\n", encoding="gbk")
@@ -157,6 +163,31 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         self.assertEqual(result["encoding"], "gbk")
         self.assertEqual(Path(path).read_text(encoding="gbk"), "改好的中文\n")
+
+    def test_edit_file_preserves_content_beyond_old_eight_mib_boundary(self):
+        path = self._make_file("large.txt", "TARGET\n" + "x" * (8 * 1024 * 1024) + "TAIL")
+        bt.execute_edit_file({"full_file_name": path, "old_string": "TARGET", "new_string": "CHANGED"})
+        data = Path(path).read_text(encoding="utf-8")
+        self.assertTrue(data.startswith("CHANGED\n"))
+        self.assertTrue(data.endswith("TAIL"))
+
+    def test_edit_file_wrong_encoding_and_stale_hash_leave_original_untouched(self):
+        path = self._make_file("encoded.txt", "中文 TARGET\n", encoding="gbk")
+        original = Path(path).read_bytes()
+        with self.assertRaisesRegex(ValueError, "无法无损识别"):
+            bt.execute_edit_file({"full_file_name": path, "old_string": "TARGET", "new_string": "DONE", "encoding": "utf-8"})
+        self.assertEqual(Path(path).read_bytes(), original)
+        with self.assertRaisesRegex(ValueError, "FILE_MODIFIED_EXTERNALLY"):
+            bt.execute_edit_file({"full_file_name": path, "old_string": "TARGET", "new_string": "DONE", "expected_hash": "stale"})
+        self.assertEqual(Path(path).read_bytes(), original)
+
+    def test_edit_file_replace_failure_keeps_original(self):
+        path = self._make_file("atomic.txt", "TARGET\n")
+        with patch.object(bt.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                bt.execute_edit_file({"full_file_name": path, "old_string": "TARGET", "new_string": "DONE"})
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "TARGET\n")
+        self.assertEqual(list(Path(self._tmp).glob(".atomic.txt.*.tmp")), [])
 
     def test_edit_file_delete_via_empty_new_string(self):
         path = self._make_file("del.txt", "keep A\nremove me\nkeep B\n")
@@ -194,6 +225,18 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertFalse(result["has_more"])
         self.assertIn("1| alpha", result["content"])
         self.assertIn("[read_file]", result["message"])
+        self.assertNotIn("alpha", result["message"])
+
+    def test_read_file_empty_and_truncated_range_metadata(self):
+        empty = self._make_file("empty.txt", "")
+        result = bt.execute_read_file({"full_file_name": empty})
+        self.assertEqual(result["content"], "")
+        self.assertEqual(result["total_lines"], 0)
+        long_path = self._make_file("many.txt", ("x" * 1000 + "\n") * 100)
+        limited = bt.execute_read_file({"full_file_name": long_path})
+        self.assertTrue(limited["truncated"])
+        self.assertTrue(limited["has_more"])
+        self.assertLess(limited["retry_end_line"], limited["range_end"])
 
     def test_read_file_range_and_no_line_numbers(self):
         path = self._make_file("range.txt", "l1\nl2\nl3\nl4\n")
@@ -286,6 +329,14 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         self.assertTrue(result["truncated"])
         self.assertEqual(result["total_matches"], 5)
+
+    def test_search_files_scan_limit_reports_partial_counts(self):
+        self._make_file("a.txt", "hit\n")
+        self._make_file("b.txt", "hit\n")
+        result = bt.execute_search_files({"pattern": "hit", "max_scanned_files": 1})
+        self.assertTrue(result["scan_truncated"])
+        self.assertEqual(result["files_checked"], 1)
+        self.assertEqual(result["total_matches"], 1)
 
     def test_builtin_names_and_injection_for_new_tools(self):
         tools, servers = bt.inject_builtin_tools(

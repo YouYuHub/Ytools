@@ -1469,7 +1469,7 @@ html[data-theme="dark"] {
 }
 
 // 选区浮钮「引用到提问」：body 级 fixed 定位（视口坐标钳制），
-// 点击后把选区快照加入当前会话草稿；Esc/点击别处/滚动时隐藏
+// 点击后把选区快照加入当前会话草稿；滚动时跟随选区重定位，Esc/点击别处时隐藏
 .quote-float-btn {
   position: fixed;
   z-index: 130;

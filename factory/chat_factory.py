@@ -7,7 +7,7 @@ import time
 # import uuid
 from collections import deque
 # import inspect
-from typing import Any, Dict, List, AsyncGenerator
+from typing import Any, List, AsyncGenerator
 
 # 自定义模块导入
 from env_manager import (
@@ -22,7 +22,6 @@ from config import (
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUB_AGENT_ENABLED,
     DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS,
-    DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_current_dir,
 )
 from memory.chat_memory import (
@@ -31,28 +30,23 @@ from memory.chat_memory import (
     normalize_session_id,
 )
 from memory.file_memory import (
-    build_native_document_part,
     cleanup_file_memory_manager,
     get_file_memory_manager,
+    native_doc_batch_limit_error,
     resolve_message_media_refs,
     retire_native_document_parts,
-    select_native_document_records,
 )
 from memory.chat_history_format import content_part_to_text
 from memory.chat_history_format import RECENT_QUESTIONS_TOKEN_BUDGET
 from memory.quote_format import (
     content_with_quotes,
     normalize_quotes,
-    serialize_quotes_for_model,
 )
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
-    ASK_USER_PLACEHOLDER_DEFINITION,
-    BUILTIN_TOOL_SERVER_KEY,
-    CHECK_TOOL_EXISTS_NAME,
     EDIT_FILE_NAME,
     READ_FILE_NAME,
     RUN_COMMAND_NAME,
@@ -62,8 +56,8 @@ from factory.agent_runtime.builtin_tools import (
     WRITE_FILE_NAME,
     READ_MEDIA_NAME,
     READ_DOCUMENT_NAME,
+    collect_injected_media_keys,
     collect_media_references,
-    execute_builtin_tool,
     inject_builtin_tools,
     is_builtin_tool,
     normalize_ask_questions,
@@ -72,7 +66,6 @@ from factory.agent_runtime.builtin_tools import (
     execute_read_media,
     execute_read_document,
     load_any_media_model_part,
-    roll_recent_media_parts,
     retire_prior_video_parts,
     cap_video_parts_in_batch,
     try_execute_builtin_command_tool,
@@ -80,10 +73,10 @@ from factory.agent_runtime.builtin_tools import (
 )
 from factory.agent_runtime.chat_runtime import (
     parse_bool_like,
-    parse_int_like,
     parse_return_length,
     frontend_provides_full_history,
     build_request_messages,
+    # log_upstream_assistant_messages,  # noqa: F401 — 临时核对 API 消息时启用
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_request_context_tokens,
@@ -97,10 +90,7 @@ from factory.agent_runtime.chat_runtime import (
     filter_tool_calls_fields as _filter_tool_calls_fields,  # noqa: F401
     merge_function_call_delta as _merge_function_call_delta,  # noqa: F401
     merge_tool_call_delta as _merge_tool_call_delta,  # noqa: F401
-    REASONING_PLACEHOLDER as _REASONING_PLACEHOLDER,  # noqa: F401
-    latest_reasoning_content as _latest_reasoning_content,  # noqa: F401
     reasoning_content_for_tool_call as _reasoning_content_for_tool_call,  # noqa: F401
-    retain_latest_reasoning,
     copy_for_request,
 )
 from factory.agent_runtime.context_compaction import (
@@ -116,7 +106,6 @@ from factory.agent_runtime.context_compaction import (
     resolve_history_target_tokens,
     resolve_oversized_result_token_threshold,
     resolve_context_compaction_threshold,
-    resolve_summary_total_budget,
 )
 from factory.agent_runtime.tool_executor import (
     execute_tool_round,
@@ -148,8 +137,7 @@ _SESSION_STREAM_MAX_BUFFER = 20000  # 有界环形缓冲：防止长时间无消
 # 这些 loader 曾随共享纯函数一起迁入 agent_runtime.chat_runtime，但父循环
 # 走 chat_factory.load_var 的路径（测试/运行时可直接 patch 本命名空间），
 # 因此这里保留本地实现；chat_runtime 侧同签名函数供子任务等独立调用方使用。
-# 思考回传整形函数（_retain_latest_reasoning / _copy_for_request）改为
-# 显式传 limit 的包装，保证 cf.* 打桩对下游行为生效。
+# 请求副本的思考回传整形显式传入 limit，保证 cf.* 打桩对下游行为生效。
 def _load_reasoning_return_max_length(default: int = DEFAULT_REASONING_RETURN_MAX_LENGTH) -> int:
     return parse_return_length(
         load_var("REASONING_RETURN_MAX_LENGTH", default), default
@@ -168,10 +156,6 @@ def _load_tool_call_stream_timeout(
     return value if value > 0 else 0.0
 
 
-def _retain_latest_reasoning(messages: List[dict]) -> None:
-    retain_latest_reasoning(messages, limit=_load_reasoning_return_max_length())
-
-
 def _copy_for_request(messages: List[dict]) -> List[dict]:
     return copy_for_request(messages, limit=_load_reasoning_return_max_length())
 
@@ -184,14 +168,23 @@ def _format_tool_result(result: Any) -> str:
             if k not in ("_file_diff", "_file_history")
         }
         # 原生文档块（read_document 返回）：数据本体为 base64，绝不能进入
-        # 模型文本上下文或 JSONL；只保留可读的注入说明
+        # 模型文本上下文或 JSONL；只保留可追溯文件引用和一次性发送说明
         native_block = result.pop("native", None)
         if isinstance(native_block, dict):
-            filename = str(native_block.get("filename") or "")
-            result["native_document"] = (
-                f"{filename} 已作为原生文档注入后续请求" if filename
-                else "原生文档已注入后续请求"
-            )
+            native_document = {
+                "filename": str(native_block.get("source_filename") or native_block.get("filename") or ""),
+                "file_ref": str(
+                    result.get("file_ref")
+                    or native_block.get("file_ref")
+                    or native_block.get("stored_name")
+                    or ""
+                ),
+                "delivery": "下一次模型请求发送一次；之后需要原文时重新调用 read_document",
+            }
+            for key in ("page_start", "page_end", "total_pages"):
+                if native_block.get(key) is not None:
+                    native_document[key] = native_block[key]
+            result["native_document"] = native_document
     if isinstance(result, str):
         return result
     try:
@@ -355,11 +348,7 @@ def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, 
 # 工具规则 + 回传长度/工具超时等可变配置说明）。此处 re-export 保持既有
 # 导入路径（routers/chat_router 等）不变；build_runtime_system_text 每次构造
 # 都实时读取 load_var，用户改配置后下一轮对话即生效。
-from factory.system_prompt import (  # noqa: F401
-    build_media_tag_prompt,
-    build_runtime_system_text,
-    build_sys_prompt,
-)
+from factory.system_prompt import build_runtime_system_text  # noqa: F401
 
 
 async def load_all_tools() -> None:
@@ -439,6 +428,7 @@ class _SessionStream:
         self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
         self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
+        self.live_round_model: dict | None = None  # 本轮生效聊天模型（round_model 推送时记录，回放 marker 携带）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.cond = asyncio.Condition()
         # 运行中注入的用户消息队列（消息引导，inline 模式）：inject 接口写入，
@@ -778,20 +768,18 @@ def _build_sub_agent_contexts(
     *,
     round_tools: list[dict[str, Any]],
     round_tool_servers: dict[str, str],
-    configured_tool_names: set[str],
-    configured_tool_servers: dict[str, str],
     session_id: str,
     session_chat_memory,
     stream,
     stop_checker,
+    round_tool_original_names: dict[str, str] | None = None,
     parent_vision_enabled: bool | None = None,
     parent_round_number: int = 0,
 ) -> list["SubAgentContext"]:
     """把父循环收集的 sub_agent 调用转成 SubAgentContext 列表（docs/sub_agent_v1.md §6.1）。
 
     工具快照在派发时刻固化：
-    - 剔除 sub_agent（V1 禁止嵌套）与 check_tool_exists（子任务工具已知）；
-    - ask_user 替换为占位定义（子任务无用户通道，占位执行返回明确错误）；
+    - 剔除 sub_agent（V1 禁止嵌套）与 ask_user（子任务无用户通道）；
     - read_media：父级本轮未启用，或模型不支持视觉（parent_vision_enabled
       为 False）时一律不注入——schema 不进子任务请求，子模型就无从知道并
       调用该工具（支持时正常注入，子任务执行链已接内置处理）。
@@ -807,29 +795,20 @@ def _build_sub_agent_contexts(
     read_media_blocked = not sub_vision_enabled
     for agent_index, (tool_index, tc, task_text, initial_todo) in enumerate(sub_agent_calls):
         tool_call_id = tc.get("id", "") if isinstance(tc, dict) else ""
-        # 子工具白名单 = 父级本轮工具快照 − sub_agent − check_tool_exists；
-        # ask_user 真实定义替换为占位定义（同名同参，执行返回不可用说明）
+        # 子工具白名单 = 父级本轮工具快照 − sub_agent − ask_user。
         child_tools: list[dict[str, Any]] = []
         child_servers: dict[str, str] = {}
-        ask_user_replaced = False
+        child_original_names: dict[str, str] = {}
         for tool_def in round_tools:
             tool_name = _tool_name_from_definition(tool_def)
-            if not tool_name or tool_name == SUB_AGENT_TOOL_NAME or tool_name == CHECK_TOOL_EXISTS_NAME:
+            if not tool_name or tool_name in (SUB_AGENT_TOOL_NAME, ASK_USER_TOOL_NAME):
                 continue
             if tool_name == READ_MEDIA_NAME and read_media_blocked:
-                continue
-            if tool_name == ASK_USER_TOOL_NAME:
-                child_tools.append(dict(ASK_USER_PLACEHOLDER_DEFINITION))
-                child_servers[ASK_USER_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
-                ask_user_replaced = True
                 continue
             child_tools.append(tool_def)
             if tool_name in round_tool_servers:
                 child_servers[tool_name] = round_tool_servers[tool_name]
-        if not ask_user_replaced:
-            # 父级本轮没有 ask_user：仍注入占位定义，避免子模型幻觉出提问工具
-            child_tools.append(dict(ASK_USER_PLACEHOLDER_DEFINITION))
-            child_servers[ASK_USER_TOOL_NAME] = BUILTIN_TOOL_SERVER_KEY
+                child_original_names[tool_name] = (round_tool_original_names or {}).get(tool_name, tool_name)
         contexts.append(SubAgentContext(
             agent_id=new_agent_id(used_agent_ids),
             parent_agent_id="main",
@@ -841,8 +820,7 @@ def _build_sub_agent_contexts(
             initial_todo=initial_todo,
             tools=child_tools,
             tool_servers=child_servers,
-            configured_tool_names=configured_tool_names,
-            configured_tool_servers=configured_tool_servers,
+            tool_original_names=child_original_names,
             max_rounds=limits["max_rounds"],
             timeout_seconds=limits["timeout_seconds"],
             reply_max_chars=limits["reply_max_chars"],
@@ -894,10 +872,20 @@ async def _run_chat_generation(
     # 配置缺失（mock 场景/异常回退）时保守视为支持，行为与历史版本一致，
     # 不发能力警告、不拦截工具。
     chat_config_effective = require_default_chat_config()
+    round_model = {}
     if isinstance(chat_config_effective, dict):
+        round_model = {
+            key: str(chat_config_effective[source]).strip()
+            for key, source in (
+                ("provider", "selected_provider_name"),
+                ("name", "selected_model_name"),
+                ("id", "selected_model_id"),
+            )
+            if chat_config_effective.get(source)
+        }
         vision_enabled = bool(chat_config_effective.get("vision", False))
-        # 原生文档输入能力（models.json 模型条目的 supportDocTypes）：命中类型的
-        # 上传文档按轮作为原生文档注入（供应商侧视觉解析），未命中的走文本解析
+        # 原生文档输入能力（models.json 模型条目的 supportDocTypes）：由
+        # read_document 按目标文件扩展名选择原生或文本口径，与 vision 分开判断
         raw_support_doc_types = chat_config_effective.get("support_doc_types")
         native_doc_types = (
             [str(item) for item in raw_support_doc_types]
@@ -919,14 +907,17 @@ async def _run_chat_generation(
         )
     await load_all_tools()
     # 计算本轮允许使用的工具：后端实时工具为唯一真相；前端仅允许传 tool_names
-    configured_tools = list(tool_registry.ALL_TOOLS)
-    configured_tool_servers = dict(tool_registry.TOOL_MCP_SERVERS)
+    (
+        configured_tools,
+        configured_tool_servers,
+        configured_tool_original_names,
+        configured_tool_name_index,
+    ) = tool_registry.get_tool_registry_snapshot()
     configured_tool_by_name = {
         _tool_name_from_definition(tool_def): tool_def
         for tool_def in configured_tools
         if _tool_name_from_definition(tool_def)
     }
-    configured_tool_names = set(configured_tool_by_name)
     requested_tool_names = getattr(tool_request, "tool_names", None)
     # 请求未携带 tool_names（None，区别于显式空列表）时回退会话工具选择：
     # _meta.tool_selection 覆盖 → mcp_servers.json 的 inputs 全局默认；
@@ -945,19 +936,28 @@ async def _run_chat_generation(
                 stream, f"data: {json.dumps(fallback_warning_event, ensure_ascii=False)}\n\n"
             )
         if effective_selection:
-            fallback_names = [
-                str(name).strip()
-                for tool_names in effective_selection.values()
-                for name in (tool_names if isinstance(tool_names, list) else [])
-                if isinstance(name, str) and str(name).strip()
-            ]
+            fallback_names = tool_registry.resolve_tool_selection(
+                effective_selection,
+                configured_tool_servers,
+                configured_tool_original_names,
+            )
             if fallback_names:
                 requested_tool_names = fallback_names
                 tool_request.tool_names = fallback_names
     # 先初始化：未携带 tool_names（无工具模式）时下游引用（todo_requested 等）也要可用
     requested_names: list[str] = []
     if isinstance(requested_tool_names, list):
-        requested_names = [str(name).strip() for name in requested_tool_names if str(name).strip()]
+        requested_names, ambiguous_names = tool_registry.canonicalize_requested_names(
+            requested_tool_names,
+            configured_tool_servers,
+            configured_tool_name_index,
+        )
+        tool_request.tool_names = requested_names
+        if ambiguous_names:
+            await _stream_emit(
+                stream,
+                f"data: {json.dumps({'warning': {'code': 'AMBIGUOUS_TOOL_NAME', 'message': '旧客户端传入了重名 MCP 工具的原始名称，无法判断所属服务，已忽略；请刷新工具列表后重新选择', 'ignored_tools': ambiguous_names}}, ensure_ascii=False)}\n\n",
+            )
         if not requested_names:
             warning_event = {
                 "warning": {
@@ -968,9 +968,11 @@ async def _run_chat_generation(
             await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
             round_tools = []
             round_tool_servers = {}
+            round_tool_original_names = {}
         else:
             selected_tools: list[dict] = []
             selected_servers: dict[str, str] = {}
+            selected_original_names: dict[str, str] = {}
             ignored_names: list[str] = []
             seen_names = set()
             for tool_name in requested_names:
@@ -986,6 +988,7 @@ async def _run_chat_generation(
                 selected_tools.append(real_tool)
                 if tool_name in configured_tool_servers:
                     selected_servers[tool_name] = configured_tool_servers[tool_name]
+                    selected_original_names[tool_name] = configured_tool_original_names.get(tool_name, tool_name)
             if ignored_names:
                 warning_event = {
                     "warning": {
@@ -997,6 +1000,7 @@ async def _run_chat_generation(
                 await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
             round_tools = selected_tools
             round_tool_servers = selected_servers
+            round_tool_original_names = selected_original_names
     else:
         warning_event = {
             "warning": {
@@ -1007,9 +1011,9 @@ async def _run_chat_generation(
         await _stream_emit(stream, f"data: {json.dumps(warning_event, ensure_ascii=False)}\n\n")
         round_tools = []
         round_tool_servers = {}
-    # 当且仅当前端有工具选择时，注入本地工具；无工具时不向上游发送 tools 字段。
-    # todo_write / ask_user / write_file / edit_file / read_file / search_files /
-    # sub_agent 例外：用户在工具选择中勾选（内置工具分组）即注入，即使未选择任何 MCP 工具。
+        round_tool_original_names = {}
+    # 用户在工具选择中勾选的内置工具即注入，即使未选择任何 MCP 工具；
+    # 未选择的内置工具不会因为其他工具启用而自动暴露。
     todo_requested = TODO_TOOL_NAME in (requested_names or [])
     ask_requested = ASK_USER_TOOL_NAME in (requested_names or [])
     write_file_requested = WRITE_FILE_NAME in (requested_names or [])
@@ -1018,6 +1022,7 @@ async def _run_chat_generation(
     search_files_requested = SEARCH_FILES_NAME in (requested_names or [])
     run_command_requested = RUN_COMMAND_NAME in (requested_names or [])
     read_media_requested = READ_MEDIA_NAME in (requested_names or [])
+    read_document_requested = READ_DOCUMENT_NAME in (requested_names or [])
     # 模型不支持视觉时 read_media 一律不注入（即使前端勾选/选择快照里带上）：
     # 工具能力由后端会话生效模型决定，前端仅为展示口径
     read_media_requested = read_media_requested and vision_enabled
@@ -1025,7 +1030,7 @@ async def _run_chat_generation(
         SUB_AGENT_TOOL_NAME in (requested_names or [])
         and load_var("SUB_AGENT_ENABLED", DEFAULT_SUB_AGENT_ENABLED)
     )
-    # 会话是否已有上传文件（决定 read_document 自动注入与文件清单口径）
+    # 会话上传文件用于构建文件清单；read_document 是否可用由用户工具选择决定。
     session_file_memory = await get_file_memory_manager(session_id)
     try:
         uploaded_file_count = session_file_memory.count_file_memory()
@@ -1040,17 +1045,9 @@ async def _run_chat_generation(
         include_search_files=search_files_requested,
         include_run_command=run_command_requested,
         include_read_media=read_media_requested,
+        include_read_document=read_document_requested,
         include_sub_agent=sub_agent_requested,
     )
-    # read_document 是文档读取能力，与当前会话是否已有上传记录、模型是否支持
-    # 原生文档输入无关；只要本轮启用了工具就注入，支持通过显式本地路径读取文档。
-    # 已上传文件仍以「清单+按需读取」方式注入。不开放手选（与 check_tool_exists 同类）。
-    read_document_requested = False
-    if round_tools:
-        round_tools, round_tool_servers = inject_builtin_tools(
-            round_tools, round_tool_servers, include_read_document=True,
-        )
-        read_document_requested = True
     tool_request.tools = round_tools or None
     messages: List[dict] = []
     for message in tool_request.messages or []:
@@ -1265,7 +1262,7 @@ async def _run_chat_generation(
                     latest_user_message = msg
                 break
         if latest_user_message:
-            # 引用快照（选中文本引用到提问，见 docs/quote_selection_design.md）：
+            # 引用快照（选中文本引用到提问，见 docs/quote_selection.md）：
             # 先按容错口径规整；历史视图（JSONL）保存原始 content + 规范化
             # quotes（供回放/编辑/复制），模型视图在下面把 <quote_list> 前置
             # 进该条 user 消息的 content（当前轮请求与压缩源共用同一序列化）。
@@ -1278,6 +1275,21 @@ async def _run_chat_generation(
             else:
                 history_message.pop("quotes", None)
             await session_chat_memory.add_chat_history(history_message)
+            if round_model:
+                # 本轮生效聊天模型（provider/name/id）：唯一下发通道。
+                # round_started 帧不再携带 model——该帧只在普通发送路径推送，
+                # 编辑重发(target_round)/回答插入(insert_round) 会缺模型名；
+                # 而本帧在三条路径下均于提问落盘后推送，前端统一按此更新显示。
+                # 同步写入 stream：round_model 帧在回放起点之前，附接消费端
+                # 收不到，必须随回放 marker 携带（与 live_round_no 同一思路）。
+                # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+                if hasattr(stream, "live_round_model"):
+                    stream.live_round_model = dict(round_model)
+                await session_chat_memory.set_current_round_model(round_model)
+                await _stream_emit(
+                    stream,
+                    f"data: {json.dumps({'round_model': round_model}, ensure_ascii=False)}\n\n",
+                )
             if not stream.question_text:
                 stream.question_text = latest_user_text
             # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
@@ -1329,8 +1341,8 @@ async def _run_chat_generation(
                 )
         except Exception as media_error:
             print(f"[WARN] 媒体引用解析失败（按原始引用发送）: {media_error}")
-        # 这里做文件处理：注入「文件清单」（方案二：小文件内联全文 / 大文件
-        # 节选开头 + read_document 按需读取提示），替换旧版全量拼接。清单受
+        # 这里做文件处理：注入「文件清单」（普通文本文件小文件内联全文 / 大文件
+        # 节选开头 +（启用时）read_document 按需读取提示；启用原生读取时原生候选只显示索引），替换旧版全量拼接。清单受
         # 总预算约束（memory.file_memory.FILE_MEMORY_TOTAL_MAX_CHARS），不再
         # 随文件体积无限膨胀；需要文件其余内容时模型调用 read_document 分页读取。
         file_manifest_suffix = ""
@@ -1348,44 +1360,8 @@ async def _run_chat_generation(
             if file_manifest_suffix:
                 active_file_block = file_manifest_suffix
                 messages[0]["content"] += file_manifest_suffix
-        # 原生文档注入（模型 supportDocTypes 声明的文件输入，与图片/视频同语义）：
-        # 命中的上传文档在本任务内**每轮**随请求发送（模型始终能看到文档原文，
-        # 供应商侧按原生视觉解析）；任务中出现新的用户消息（消息引导）时转文本
-        # 占位（retire_native_document_parts），模型可再用 read_document 原生重读；
-        # 原始文件始终保留在会话目录，也可用 read_file 按绝对路径读取文本。
-        # 数据仅在内存消息中（不落盘历史，避免 JSONL 膨胀），规模受
-        # NATIVE_DOC_* 配置约束（超预算的文档自动降级为文本口径）。
-        if native_doc_types and uploaded_file_count > 0:
-            try:
-                native_records, native_skipped = select_native_document_records(
-                    session_file_memory.get_file_memory_all(), native_doc_types
-                )
-                native_parts: list[Any] = []
-                for native_record in native_records:
-                    built = build_native_document_part(session_id, native_record)
-                    if built.get("part") is not None:
-                        native_parts.append(built["part"])
-                    elif built.get("error"):
-                        native_skipped.append(str(built["error"]))
-                if native_parts:
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "以下是你可用的用户上传文档（原生文档，"
-                                    "已随本次请求发送，可直接阅读原文）："
-                                ),
-                            },
-                            *native_parts,
-                        ],
-                        "_internal": True,
-                    })
-                if native_skipped:
-                    print(f"[INFO] 原生文档注入跳过（按文本口径）: {native_skipped[:3]}")
-            except Exception as native_error:
-                print(f"[WARN] 原生文档注入失败（按文本口径继续）: {native_error}")
+        # 不在首轮或每轮自动发送原生文档。清单只提供文件索引；模型确需原文时
+        # 调用 read_document(mode="native")，对应文件只在紧接着的一次请求中发送。
         # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
         # 终态（全部 done）文案必须「新任务感知」：该后缀每轮新任务都会随系统
         # 提示注入，写"请汇总执行结果/无需再调用"是收官时对上一轮说的话，
@@ -1591,9 +1567,9 @@ async def _run_chat_generation(
             injected_message = pop_injected() if callable(pop_injected) else None
             if not (isinstance(injected_message, dict) and injected_message.get("content")):
                 return False
-            # 新的用户消息到达：此前按轮注入的原生文档数据转文本占位
-            # （「[文档 名字]」，与视频一次性消费同语义）——原始文件仍在会话
-            # 目录，模型可用 read_document 原生重读或 read_file 读文本
+            # 新的用户消息到达：此前注入的原生文档数据转文本占位
+            # （「[文档 名字]」）——原始文件仍在会话目录，模型可再次调用
+            # read_document 原生读取或用 read_file 读文本
             retire_native_document_parts(messages)
             inject_text = content_part_to_text(injected_message.get("content")).strip()
             messages.append({
@@ -1628,16 +1604,9 @@ async def _run_chat_generation(
                 await _consume_injected_message()
             except Exception as inject_error:
                 print(f"[WARN] 处理注入消息失败（跳过）: {inject_error}")
-            # 占位化只作用于"发往上游的请求副本"，不再原地改 messages：
-            # messages 里的 reasoning_content 必须保持模型原始输出——
-            # 每一轮（含旧工具轮）的真实思考都完整保留并随 add_chat_history
-            # 原样落盘，历史回放/审计永远能看到全部思考过程；
-            # 原地占位化会把"数据源"也污染掉，落盘跟着失真成 "..."。
-            # 请求侧语义：副本中最多只保留一条真实思考——最近一次 API 调用
-            # 输出的那条（本轮没有时向前回溯最近一次真实思考），按回传长度
-            # 裁剪；找不到真实思考或 limit==0 时用 "..." 占位。历史 assistant
-            # （含旧工具轮）一律剥离 reasoning_content，严格上游的字段校验
-            # 仍满足（见 _copy_for_request）。
+            # 思考回传整形只作用于请求副本：运行时 messages 保留每轮模型原始
+            # 输出，并按原值落盘。请求副本最多保留最新 assistant 的思考；
+            # 最新工具调用本轮缺失时回退最近一次真实思考，旧 assistant 字段剥离。
             # print(f"[DEBUG] messages: {str(messages)}")
             # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
             # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
@@ -1653,9 +1622,13 @@ async def _run_chat_generation(
             tool_calls: List[dict] = []
             text_tool_call_buffer = TextToolCallBuffer()
             usage_accumulator = UsageAccumulator()
-            # 将 messages 附加到 tool_request 中（请求侧副本占位化，
-            # 运行时 messages 保持模型原始输出）
+            # 将整形后的请求副本附加到 tool_request；运行时 messages 保持原样。
             tool_request.messages = build_request_messages(_copy_for_request(messages))
+            # 临时核对上游实际 assistant 消息时启用：
+            # log_upstream_assistant_messages(
+            #     ChatLLM._serialize_messages(tool_request.messages),
+            #     source="main",
+            # )
             # 工具调用流式阶段无输出超时（0=不限制）：部分服务商在 SSE 输出
             # tool_calls 期间会无限卡住（连接不断、永无后续事件），HTTP 读
             # 超时（默认 1800s）既兜不住也不该终止任务。首个 tool_calls
@@ -1921,6 +1894,15 @@ async def _run_chat_generation(
                 messages.append({"role": "user", "content": timeout_notice, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_STREAM_TIMEOUT', 'message': timeout_notice}}, ensure_ascii=False)}\n\n")
                 continue
+            # 原生文档是按需的一次性输入：收到完整模型响应后立即把此前注入的
+            # 文件部件改为文件引用占位，后续请求需再次调用 read_document 才发送。
+            # 截断、length 续写和工具流超时都保留原部件，供重试请求继续读取。
+            if (
+                not stream_truncated
+                and finish_reason != "length"
+                and not tool_phase_timeout_hit
+            ):
+                retire_native_document_parts(messages)
             # 检查 tool_calls 是否为空
             if not tool_calls:
                 # 上游提前断开（EOF 且未收到 finish_reason）：与 token 截断同语义。
@@ -2011,13 +1993,8 @@ async def _run_chat_generation(
             assistant_message = {"role": "assistant"}
             if full_response:
                 assistant_message["content"] = full_response
-            # 带 tool_calls 的 assistant 消息：思考过程落盘模型原始全文
-            # （本轮有思考就存本轮的；没有就不写字段，也不拿历史旧思考
-            # 冒充本轮落盘）。裁剪/占位符只是"回传"语义——严格上游要求
-            # 工具调用链每条 assistant 必须带 reasoning_content——该契约
-            # 完全由请求副本（_copy_for_request）在发请求前补齐：本轮思考
-            # → 回退上下文最近真实思考 → "..." 占位，长度按
-            # REASONING_RETURN_MAX_LENGTH 裁剪（0=只回占位符）。
+            # 带 tool_calls 的 assistant 消息只记录本轮模型实际输出的思考；
+            # 历史思考回退、长度裁剪与最新轮占位由请求副本负责，不污染落盘。
             if full_reasoning:
                 assistant_message["reasoning_content"] = full_reasoning
             formatted_tool_calls = []
@@ -2223,15 +2200,14 @@ async def _run_chat_generation(
             todo_updated = False
             ask_user_pending = False
             ask_user_questions: list[dict[str, Any]] = []
-            # read_media 已注入的引用与待注入坐标（本轮任务内累计，防止重复读取）；
-            # 坐标为 (reference, quality, start_time, end_time) 四元组——视频区间
-            # 读取的坐标含区间，注入时现场按坐标加载 base64 部件
-            read_media_injected_refs: set[str] = set()
-            read_media_pending_parts: list[tuple[str, Any]] = []
-            # read_document 原生分支待注入部件：当前模型声明支持该文档类型时，
-            # 工具结果携带原生文档部件（base64），在下方统一作为 user 消息注入
-            # 后续请求（仅内存、不落盘；与 read_media 同语义）
+            # 根据当前消息里仍保留的图片/音频部件去重；已回收的视频区间允许重读。
+            # 待注入坐标含引用、质量、视频区间和去重键，注入时现场加载部件。
+            read_media_injected_refs = collect_injected_media_keys(messages)
+            read_media_pending_parts: list[tuple[str, Any, Any, Any, str]] = []
+            # read_document 原生分支待注入部件：按目标文件的 supportDocTypes
+            # 声明选择；工具结果中的 base64 在下方仅加入下一次模型请求（内存）
             native_doc_pending_parts: list[Any] = []
+            native_doc_pending_bytes = 0
             # 同轮并发守卫：供应商单请求最多稳定注入 1 次媒体数据（实证：同一
             # 模型回复并发 2 个 read_media 调用时，多个媒体部件同批注入触发
             # 供应商 400）。本轮解析出的 read_media 调用数 >1 时只执行第 1 个，
@@ -2336,19 +2312,13 @@ async def _run_chat_generation(
                                 item["reference"],
                                 item.get("quality"),
                                 item.get("start_time"),
-                                item.get("end_time"),
+                            item.get("end_time"),
+                            item["injected_key"],
                             )
                             for item in loaded_meta
                             if item.get("reference")
                         ])
-                        # 任务内累计滚动窗口：只保留最近 5 个部件；
-                        # 被挤出的引用从已注入集合移除，再次读取可重新注入
-                        evicted_refs: set[str] = set()
-                        read_media_pending_parts = roll_recent_media_parts(
-                            read_media_pending_parts,
-                            evicted=evicted_refs,
-                        )
-                        read_media_injected_refs.difference_update(evicted_refs)
+                        # 同一回复只执行一次 read_media，单次至多 5 个来源。
                     builtin_results.append({
                         "index": idx,
                         "tool_call": tc,
@@ -2359,17 +2329,41 @@ async def _run_chat_generation(
                     })
                     continue
                 if tn == READ_DOCUMENT_NAME:
-                    # 读取用户上传文件：模型声明支持该类型（supportDocTypes）时
-                    # 优先返回原生文档部件（注入后续请求，供应商侧视觉解析），
-                    # 同时附解析文本节选兜底；未命中则纯文本分页口径。
-                    # 系统提示词只注入清单，其余内容由模型按需读取（工具在有
-                    # 上传文件时由后端自动注入，见上方 read_document_requested）
+                    # 按单个文件的 supportDocTypes 决定 auto 模式：命中且原始文件
+                    # 可用时只发原生文档；否则返回解析文本。vision 标志不参与此
+                    # 分流。模型显式选择 native/text 或区间参数可覆盖 auto。
                     read_document_result = execute_read_document(
                         ta, session_id, support_doc_types=native_doc_types
                     )
                     native_block = read_document_result.get("native") if isinstance(read_document_result, dict) else None
                     if isinstance(native_block, dict) and native_block.get("part") is not None:
-                        native_doc_pending_parts.append(native_block["part"])
+                        try:
+                            native_size = int(native_block.get("size") or 0)
+                        except (TypeError, ValueError):
+                            native_size = 0
+                        budget_error = native_doc_batch_limit_error(
+                            len(native_doc_pending_parts),
+                            native_doc_pending_bytes,
+                            native_size,
+                        )
+                        request_mode = str(ta.get("mode") or "auto").strip().lower()
+                        is_page_range = "page_start" in ta or "page_count" in ta
+                        if budget_error:
+                            if request_mode == "native" or is_page_range:
+                                read_document_result = {"error": budget_error}
+                            else:
+                                text_args = {**ta, "mode": "text"}
+                                read_document_result = execute_read_document(
+                                    text_args, session_id, support_doc_types=native_doc_types
+                                )
+                                if isinstance(read_document_result, dict) and not read_document_result.get("error"):
+                                    read_document_result["message"] = (
+                                        str(read_document_result.get("message") or "")
+                                        + f"；因原生文档批次预算限制，已回退解析文本：{budget_error}"
+                                    )
+                        else:
+                            native_doc_pending_parts.append(native_block["part"])
+                            native_doc_pending_bytes += native_size
                     builtin_results.append({
                         "index": idx,
                         "tool_call": tc,
@@ -2404,23 +2398,6 @@ async def _run_chat_generation(
                         elif todo_error:
                             print(f"[WARN] sub_agent 预置 todo 无效，忽略：{todo_error}")
                     sub_agent_calls.append((idx, tc, task_text, initial_todo))
-                    continue
-                builtin_result = execute_builtin_tool(
-                    tn,
-                    ta,
-                    configured_tool_names,
-                    configured_tool_servers,
-                    enabled_tool_names=set(round_tool_servers),
-                )
-                if builtin_result is not None:
-                    builtin_results.append({
-                        "index": idx,
-                        "tool_call": tc,
-                        "tool_name": tn,
-                        "tool_args": ta,
-                        "result": builtin_result,
-                        "error": None,
-                    })
                     continue
                 # 内置文件编辑工具（write_file/edit_file）：服务端本地执行，
                 # 结构化结果（path/replacements 等）为后续文件 diff 预留
@@ -2466,6 +2443,7 @@ async def _run_chat_generation(
                     parsed_tools=external_parsed_tools,
                     tool_mcp_servers=round_tool_servers,
                     max_workers=max_workers,
+                    tool_original_names=round_tool_original_names,
                 ))
             # sub_agent 子任务并发执行：与上面 MCP 线程池调用串行开始（to_thread
             # 已让出事件循环），但子任务之间 gather 并发；信号量限流在
@@ -2475,8 +2453,7 @@ async def _run_chat_generation(
                     sub_agent_calls,
                     round_tools=round_tools,
                     round_tool_servers=round_tool_servers,
-                    configured_tool_names=configured_tool_names,
-                    configured_tool_servers=configured_tool_servers,
+                    round_tool_original_names=round_tool_original_names,
                     session_id=session_id,
                     session_chat_memory=session_chat_memory,
                     stream=stream,
@@ -2647,7 +2624,7 @@ async def _run_chat_generation(
                     # token）——占位文本替代数据，工具结果文本不受影响
                     retire_prior_video_parts(messages)
                     media_parts = []
-                    for reference, quality, start_time, end_time in read_media_pending_parts:
+                    for reference, quality, start_time, end_time, _key in read_media_pending_parts:
                         info = load_any_media_model_part(
                             session_id, reference, quality=quality,
                             start_time=start_time, end_time=end_time,
@@ -2668,6 +2645,10 @@ async def _run_chat_generation(
                     # 单请求视频配额≤1：同批并行读多个视频时仅第一个带画面
                     # 数据，其余转为占位（工具结果已含各自读取元信息，可按序补读）
                     media_parts = cap_video_parts_in_batch(media_parts)
+                    retained_keys = [
+                        key if isinstance(part, dict) and part.get("type") in {"image_url", "input_audio"} else None
+                        for (_ref, _quality, _start, _end, key), part in zip(read_media_pending_parts, media_parts)
+                    ]
                     media_message: dict[str, Any] = {
                         "role": "user",
                         "content": [
@@ -2681,13 +2662,13 @@ async def _run_chat_generation(
                             *media_parts,
                         ],
                         "_internal": True,
+                        "_media_injected_keys": retained_keys,
                     }
                     messages.append(media_message)
                     read_media_pending_parts = []
-                # read_document 原生文档注入：模型声明支持该类型时，工具返回的
-                # 原生文档部件在此作为 user 消息追加进 messages（仅内存、不落盘，
-                # 文本口径已有解析文本节选兜底）。注入前先回收上一批原生文档数据
-                # （转文本占位），保证同一文档只保留一份数据、避免多批叠加撑爆窗口
+                # read_document 原生文档注入：工具结果中的原生部件作为 user 消息
+                # 仅加入下一次请求（不落盘）。注入前回收旧部件为文件占位，避免
+                # 多轮累积；原生工具结果不附加解析文本，文本模式由工具单独返回。
                 if native_doc_pending_parts and not oversized_abort:
                     retire_native_document_parts(messages)
                     messages.append({
@@ -2992,11 +2973,13 @@ async def tool_chat_server(
                 # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
                 # 纯文本提问归一为单个 text 部件），前端重建气泡/补挂编辑入口用；
                 # question_quotes 为本轮引用快照（选中文本引用到提问），前端
-                # 重建引用卡片用；round 为本轮最终轮次号（round_started 帧在回放
-                # 起点之前，消费端收不到，必须随标记下发）——前端按轮次精确
-                # 去重历史提问气泡。
+                # 重建引用卡片用；round 为本轮最终轮次号、model 为本轮生效
+                # 聊天模型（round_started / round_model 帧均在回放起点之前，
+                # 消费端收不到，必须随标记下发）——前端按轮次精确去重历史提问
+                # 气泡、按 model 显示本轮消耗行模型名。
                 # worker 模式由 evt 队列的 question_text/question_parts/
-                # question_quotes/live_round_no 事件同步到 stream 对应属性。
+                # question_quotes/live_round_no/live_round_model 事件同步到
+                # stream 对应属性。
                 marker = {"replay": True, "question_text": stream.question_text or ""}
                 if stream.question_parts:
                     marker["question_parts"] = stream.question_parts
@@ -3004,6 +2987,10 @@ async def tool_chat_server(
                     marker["question_quotes"] = stream.question_quotes
                 if stream.live_round_no:
                     marker["round"] = int(stream.live_round_no)
+                # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+                live_round_model = getattr(stream, "live_round_model", None)
+                if live_round_model:
+                    marker["model"] = live_round_model
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
         while True:
             while seen < stream.seq:

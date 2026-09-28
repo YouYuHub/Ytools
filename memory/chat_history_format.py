@@ -17,7 +17,6 @@ from factory.agent_runtime.chat_runtime import estimate_text_tokens, sanitize_to
 from memory.chat_round_store import merge_usage_dict
 from memory.file_memory import content_part_to_text
 from memory.quote_format import (
-    content_with_quotes,
     round_entry_user_quotes,
     serialize_quotes_for_model,
 )

@@ -1,6 +1,8 @@
 """MCP 工具发现、schema 过滤和运行时注册表。"""
 import asyncio
+import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -12,6 +14,10 @@ from util.mcp_client import get_mcp_tools
 
 ALL_TOOLS: List[Dict[str, Any]] = []
 TOOL_MCP_SERVERS: Dict[str, str] = {}
+# Model-visible name -> original MCP name. TOOL_MCP_SERVERS and this map together
+# identify a tool by (server_id, original_name), even when servers reuse names.
+TOOL_ORIGINAL_NAMES: Dict[str, str] = {}
+TOOL_NAME_INDEX: Dict[str, List[str]] = {}
 
 # 工具注册表全局交换锁：工具发现既可能跑在事件循环线程（生成任务 / /tools/list），
 # 也可能跑在配置热重载线程（mcp_servers.json 的 servers 变更时），
@@ -29,6 +35,117 @@ _TOOLS_CACHE_MONO: float = 0.0
 _TOOLS_CACHE_LOCK = threading.Lock()
 
 _DEFAULT_TOOLS_CACHE_TTL_SECONDS = 60.0
+
+
+def get_tool_registry_snapshot() -> tuple[list[dict], dict[str, str], dict[str, str], dict[str, list[str]]]:
+    """Read tools and their identity maps from the same atomic registry version."""
+    with _REGISTRY_SWAP_LOCK:
+        return (
+            list(ALL_TOOLS),
+            dict(TOOL_MCP_SERVERS),
+            dict(TOOL_ORIGINAL_NAMES),
+            {name: list(aliases) for name, aliases in TOOL_NAME_INDEX.items()},
+        )
+
+
+def _qualified_tool_name(server_id: str, original_name: str, reserved: set[str], used: set[str]) -> str:
+    """Build a stable, provider-safe model name for an ambiguous MCP tool."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", original_name).strip("_-") or "tool"
+    identity = f"{server_id}\0{original_name}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    base = f"mcp_{digest}_{slug[:45]}"[:64]
+    candidate = base
+    suffix = 2
+    while candidate in reserved or candidate in used:
+        tail = f"_{suffix}"
+        candidate = f"{base[:64 - len(tail)]}{tail}"
+        suffix += 1
+    return candidate
+
+
+def resolve_tool_selection(
+    selection: Any,
+    tool_servers: dict[str, str] | None = None,
+    original_names: dict[str, str] | None = None,
+) -> list[str]:
+    """Resolve persisted {server_id: [names]} selections to current model names.
+
+    New snapshots store model-visible names. Legacy snapshots store raw MCP names;
+    the server key lets us migrate duplicate names without guessing.
+    """
+    if not isinstance(selection, dict):
+        return []
+    if tool_servers is None or original_names is None:
+        _tools, snapshot_servers, snapshot_originals, _index = get_tool_registry_snapshot()
+        tool_servers = snapshot_servers
+        original_names = snapshot_originals
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for server_id, names in selection.items():
+        server_key = str(server_id)
+        if not isinstance(names, list):
+            continue
+        for value in names:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            name = value.strip()
+            if server_key == "__builtin__":
+                canonical = name
+            elif (
+                name in tool_servers
+                and tool_servers.get(name) == server_key
+            ):
+                canonical = name
+            else:
+                matches = [
+                    visible_name
+                    for visible_name, source_server in tool_servers.items()
+                    if source_server == server_key
+                    and original_names.get(visible_name) == name
+                ]
+                canonical = matches[0] if len(matches) == 1 else name
+            if canonical not in seen:
+                seen.add(canonical)
+                resolved.append(canonical)
+    return resolved
+
+
+def canonicalize_requested_names(
+    names: Any,
+    tool_servers: dict[str, str] | None = None,
+    name_index: dict[str, list[str]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Canonicalize current and legacy flat tool_names; ambiguous raw names fail closed."""
+    if not isinstance(names, list):
+        return [], []
+    if tool_servers is None or name_index is None:
+        _tools, snapshot_servers, _originals, snapshot_index = get_tool_registry_snapshot()
+        tool_servers = snapshot_servers
+        name_index = snapshot_index
+    canonical_names: list[str] = []
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    try:
+        from factory.agent_runtime.builtin_tools import is_builtin_tool
+    except Exception:
+        is_builtin_tool = lambda _name: False
+    for value in names:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        name = value.strip()
+        if is_builtin_tool(name) or name in tool_servers or name not in name_index:
+            canonical = name
+        else:
+            matches = [visible_name for visible_name in name_index[name] if visible_name in tool_servers]
+            if len(matches) == 1:
+                canonical = matches[0]
+            else:
+                unresolved.append(name)
+                continue
+        if canonical not in seen:
+            seen.add(canonical)
+            canonical_names.append(canonical)
+    return canonical_names, unresolved
 
 
 def tools_cache_ttl_seconds() -> float:
@@ -190,12 +307,14 @@ def load_all_tools(current_dir: str) -> None:
 
 
 async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
-    global ALL_TOOLS, TOOL_MCP_SERVERS
+    global ALL_TOOLS, TOOL_MCP_SERVERS, TOOL_ORIGINAL_NAMES, TOOL_NAME_INDEX
     server_ids = _read_server_ids(current_dir)
     if not server_ids:
         with _REGISTRY_SWAP_LOCK:
             ALL_TOOLS = []
             TOOL_MCP_SERVERS = {}
+            TOOL_ORIGINAL_NAMES = {}
+            TOOL_NAME_INDEX = {}
         payload = {
             "tools": [],
             "total": 0,
@@ -240,6 +359,10 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     filtered_tools: list[dict[str, Any]] = []
     tool_mcp_servers: dict[str, str] = {}
+    tool_original_names: dict[str, str] = {}
+    tool_name_index: dict[str, list[str]] = {}
+    discovered: list[tuple[str, str, dict]] = []
+    seen_identities: set[tuple[str, str]] = set()
     failed_servers: list[str] = []
     server_metrics: list[dict[str, Any]] = []
     for server_id, server_tools, server_error, server_elapsed in results:
@@ -263,6 +386,12 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             tool_name = getattr(tool, "name", None)
             if not isinstance(tool_name, str) or not tool_name.strip():
                 continue
+            tool_name = tool_name.strip()
+            identity = (server_id, tool_name)
+            if identity in seen_identities:
+                print(f"⚠️ MCP 服务 [{server_id}] 重复注册工具 [{tool_name}]，忽略重复项")
+                continue
+            seen_identities.add(identity)
             tool_definition = {
                 "type": "function",
                 "function": {
@@ -271,14 +400,43 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
                     "parameters": getattr(tool, "parameters", {}) or {},
                 },
             }
-            filtered_tool = _filter_tool_for_api(tool_definition)
-            filtered_tools.append(filtered_tool)
-            # 保留结构化 server_id，交给 mcp_client 解析 command/args 的参数边界。
-            tool_mcp_servers[tool_name] = server_id
+            discovered.append((server_id, tool_name, tool_definition))
+
+    # Raw names remain unchanged when they are globally unique and do not collide
+    # with a builtin/control tool. Otherwise expose stable qualified names.
+    raw_name_counts: dict[str, int] = {}
+    for _server_id, original_name, _definition in discovered:
+        raw_name_counts[original_name] = raw_name_counts.get(original_name, 0) + 1
+    try:
+        from factory.agent_runtime.builtin_tools import SELECTABLE_BUILTIN_TOOL_NAMES
+        reserved_names = set(SELECTABLE_BUILTIN_TOOL_NAMES) | {"over_task"}
+    except Exception:
+        reserved_names = {"over_task"}
+    all_raw_names = set(raw_name_counts)
+    used_names: set[str] = set()
+    for server_id, original_name, tool_definition in discovered:
+        needs_qualified_name = (
+            raw_name_counts[original_name] > 1
+            or original_name in reserved_names
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", original_name) is None
+        )
+        visible_name = (
+            _qualified_tool_name(server_id, original_name, reserved_names | all_raw_names, used_names)
+            if needs_qualified_name else original_name
+        )
+        used_names.add(visible_name)
+        filtered_tool = _filter_tool_for_api(tool_definition)
+        filtered_tool["function"]["name"] = visible_name
+        filtered_tools.append(filtered_tool)
+        tool_mcp_servers[visible_name] = server_id
+        tool_original_names[visible_name] = original_name
+        tool_name_index.setdefault(original_name, []).append(visible_name)
     # 原子交换注册表全局变量：读方（生成任务/工具列表接口）要么看到旧、要么看到新
     with _REGISTRY_SWAP_LOCK:
         ALL_TOOLS = filtered_tools
         TOOL_MCP_SERVERS = tool_mcp_servers
+        TOOL_ORIGINAL_NAMES = tool_original_names
+        TOOL_NAME_INDEX = tool_name_index
     api_tools = []
     for tool in filtered_tools:
         tool_with_server = dict(tool)
@@ -288,6 +446,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             else ""
         )
         tool_with_server["server_id"] = tool_mcp_servers.get(func_name, "")
+        tool_with_server["original_name"] = tool_original_names.get(func_name, func_name)
         api_tools.append(tool_with_server)
     print(f"✅ 已加载 {len(filtered_tools)} 个工具（{len(server_metrics)} 个 MCP 服务器）")
     for metric in server_metrics:

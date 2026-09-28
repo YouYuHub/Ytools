@@ -13,28 +13,40 @@
 
   // ---------- 当前会话聊天模型名（状态条中部占位） ----------
   // 反映服务端生效的聊天模型选择：会话切换/新建会话/模型面板加载保存后调用。
-  // 无缓存或显式传入会话（切换会话）时拉取一次 /chat_config/models?role=chat_model，
-  // 之后复用缓存；会话独立选择与全局默认已由后端合并进 role_info.selection。
+  // 无缓存或显式传入会话（切换会话）时拉取 /chat_config/models?role=chat_model，
+  // 之后复用缓存；forceRefresh 用于工具配置弹窗主动同步 models.json 的能力改动。
+  // 会话独立选择与全局默认已由后端合并进 role_info.selection。
   // requestSeq 防竞态：快速连续切换会话时丢弃过期响应，避免旧会话的模型名
   // 后到覆盖新会话的显示（与下方 context token 刷新的序号保护同一思路）。
   let chatModelLabelRequestSeq = 0;
-  async function refreshChatModelLabel(sessionId) {
-    if (!contextTokenModel) return;
+  async function refreshChatModelLabel(sessionId, forceRefresh) {
+    if (!contextTokenModel) return false;
     const target = sessionId ? SessionUtils.sanitizeSessionId(sessionId) : state.sessionId;
     const requestSeq = ++chatModelLabelRequestSeq;
-    // 无缓存 / 显式切换会话 / 新建会话（target 为空=取全局默认）时强制拉取，
+    // forceRefresh / 无缓存 / 显式切换会话 / 新建会话（target 为空=取全局默认）时强制拉取，
     // 避免沿用上一会话的独立选择缓存
-    if (!state.modelConfigs || !state.modelConfigs.chat_model || sessionId || !target) {
+    let refreshed = false;
+    if (forceRefresh || !state.modelConfigs || !state.modelConfigs.chat_model || sessionId || !target) {
       try {
-        const data = await API.getModels("chat_model", target || undefined);
-        if (requestSeq !== chatModelLabelRequestSeq) return; // 过期响应：不写缓存不渲染
+        const data = await API.getModels("chat_model", target || undefined, Boolean(forceRefresh));
+        if (requestSeq !== chatModelLabelRequestSeq) return false; // 过期响应：不写缓存不渲染
         if (data) {
           state.modelConfigs = state.modelConfigs || {};
           state.modelConfigs.chat_model = data;
+          refreshed = true;
         }
       } catch (_) { /* 拉取失败保留现有显示 */ }
     }
-    if (requestSeq !== chatModelLabelRequestSeq) return; // 渲染前再校验，只用最新一次调用的结果
+    if (requestSeq !== chatModelLabelRequestSeq) return false; // 渲染前再校验，只用最新一次调用的结果
+    renderChatModelLabel();
+    return refreshed;
+  }
+
+  // 状态条模型名 + 视觉能力的渲染：唯一数据源为 state.modelConfigs.chat_model。
+  // 与缓存写入解耦成两个函数，任何更新缓存的调用方都能通过下面的单一入口
+  // 保证「写缓存 → 渲染」顺序，不再依赖"先更新缓存再调用刷新"的隐式约定。
+  function renderChatModelLabel() {
+    if (!contextTokenModel) return;
     const cfg = state.modelConfigs && state.modelConfigs.chat_model;
     const sel = cfg && cfg.role_info && cfg.role_info.selection;
     const name = sel ? (sel.model || sel.model_name || "") : "";
@@ -47,7 +59,28 @@
       ? (cfg.role_info.vision !== false)
       : true;
   }
+
+  /**
+   * 更新聊天模型配置缓存的单一入口：写缓存 + 立即重绘状态条（原子）。
+   * 模型面板保存/清除会话覆盖、切换模型校准等任何拿到 chat_model 配置的
+   * 地方都应经此更新，避免出现"缓存已换新、状态条仍是旧模型名"的窗口。
+   * 传空值（null/undefined）视为无有效配置：不写缓存、仅按现有缓存重绘。
+   */
+  function setChatModelConfig(data) {
+    if (data) {
+      state.modelConfigs = state.modelConfigs || {};
+      state.modelConfigs.chat_model = data;
+      // 本次写入即当前权威配置：让在途的旧请求（若有）失效，避免其响应
+      // 把这里刚写入的配置覆盖回旧值（与 refreshChatModelLabel 的序号保护配套）
+      chatModelLabelRequestSeq++;
+    }
+    renderChatModelLabel();
+    return Boolean(data);
+  }
+
   App.refreshChatModelLabel = refreshChatModelLabel;
+  App.renderChatModelLabel = renderChatModelLabel;
+  App.setChatModelConfig = setChatModelConfig;
 
   // 当前会话生效聊天模型是否支持视觉（models.json vision 字段，后端合并会话
   // 覆盖后的权威值）；数据未拉到时保守按支持处理，避免误禁功能

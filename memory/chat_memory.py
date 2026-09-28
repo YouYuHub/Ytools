@@ -9,7 +9,6 @@ import shutil
 import threading
 import time
 import copy
-import tempfile
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -33,7 +32,6 @@ from memory.chat_round_store import (
 from util.file_lock import cross_process_lock
 from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str
 from config import (
-    DEFAULT_CONTEXT_HISTORY_ROUNDS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
     get_global_tool_inputs,
@@ -615,13 +613,10 @@ from memory.chat_history_format import (
     clamp_context_summary_to_rounds as _clamp_summary_to_rounds,
     render_context_summary as _render_context_summary,
     render_recent_questions_message as _render_recent_questions_message,
-    extract_recent_questions as _extract_recent_questions,
-    extract_recent_question_items as _extract_recent_question_items,
     split_context_window as _split_context_window,
     RECENT_QUESTIONS_TOKEN_BUDGET,
     round_entry_to_context_messages as _round_entry_to_context_messages,
     round_entry_compression_usage as _round_entry_compression_usage,
-    format_tool_call_history_line as _format_tool_call_history_line,
     _round_question as _extract_round_question,
 )
 from env_manager import load_var as _load_var
@@ -631,7 +626,6 @@ from env_manager import get_global_model_selection as _get_global_model_selectio
 from env_manager import MODEL_SELECTION_ROLES as _MODEL_SELECTION_ROLES
 from factory.agent_runtime.chat_runtime import (
     estimate_messages_tokens as _estimate_messages_tokens,
-    estimate_request_context_tokens as _estimate_request_context_tokens,
     estimate_text_tokens as _estimate_text_tokens,
     estimate_tool_definition_tokens as _estimate_tool_definition_tokens,
     parse_return_length as _parse_return_length,
@@ -1869,6 +1863,14 @@ class ChatMemoryManager:
         with self._lock:
             return self._round_store.add_usage(usage_total, completion_count)
 
+    async def set_current_round_model(self, model: dict[str, str]) -> bool:
+        """把本任务启动时选定的聊天模型写入当前轮及其检查点。"""
+        with self._write_guard():
+            if not self._round_store.set_model(model):
+                return False
+            self._write_pending_checkpoint(self._round_store.snapshot_pending_round())
+            return True
+
     async def get_current_round_tool_result_count(self) -> int:
         """返回当前任务已经记录的工具结果数量，作为单轮压缩游标。"""
         with self._lock:
@@ -2640,16 +2642,21 @@ class ChatMemoryManager:
         messages_tokens += reasoning_tokens
         tool_definition_tokens = _estimate_tool_definition_tokens(tools)
         # 文件清单块（方案二：小文件内联 / 大文件节选 + 按需读取）：真实请求会把
-        # 「文件清单」追加进首条 system 消息，统计口径需与真实请求一致；无文件时
-        # 为 0。（read_document 自动注入条件近似：会话有文件即视为可用，仅影响
-        # 清单尾部提示文案的少量字数，对总量可忽略。）
+        # 「文件清单」追加进首条 system 消息。read_document 仅在本轮工具 schema
+        # 中存在时才可用，因此按传入 tools 判断清单提示和真实请求保持一致。
         file_memory_tokens = 0
         try:
+            read_document_available = any(
+                isinstance(tool, dict)
+                and isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") == "read_document"
+                for tool in (tools or [])
+            )
             file_records = file_memory.list_session_file_records(self.session_id)
             if file_records:
                 file_records.reverse()  # 与清单构建同序：最近上传在前
                 file_block_text = file_memory.build_file_manifest_text(
-                    file_records, read_document_available=True
+                    file_records, read_document_available=read_document_available
                 )
                 if file_block_text:
                     file_memory_tokens = _estimate_text_tokens(file_block_text)
@@ -3016,61 +3023,6 @@ class ChatMemoryManager:
         return {
             "state": "succeed",
             "describe": "已删除：" + "、".join(deleted_parts),
-        }
-
-    @staticmethod
-    def delete_chat_session_file_line(session_id: str, startline: int, endline: int) -> dict[str, Any]:
-        """
-        删除指定 session_id 的 jsonl 文件指定行范围
-        :param session_id: 会话 ID
-        :param startline: 要删除的起始行号(从1开始)
-        :param endline: 要删除的结束行号(包含,从1开始)
-        :return: 操作结果字典
-        """
-        # 验证参数
-        if startline is None or endline is None:
-            raise ValueError("startline 和 endline 参数不能为空")
-        try:
-            startline = int(startline)
-            endline = int(endline)
-        except (TypeError, ValueError):
-            raise TypeError("startline 和 endline 必须是整数")
-        if startline < 1 or endline < 1:
-            raise ValueError("行号必须是大于等于 1 的整数")
-        if startline > endline:
-            raise ValueError(f"起始行号({startline})不能大于结束行号({endline})")
-        manager = ChatMemoryManager(session_id)
-        with manager._write_guard():
-            meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
-            total_lines = len(entries)
-            if total_lines == 0:
-                return {
-                    "state": "failed",
-                    "describe": "当前会话历史文件为空，无可删除行"
-                }
-            # 这里的行号以“业务记录行”计数（不包含第一行 _meta）
-            valid_start = max(1, startline)
-            valid_end = min(endline, total_lines)
-            if valid_start > valid_end:
-                return {
-                    "state": "failed",
-                    "describe": f"指定的行号范围超出文件范围,当前总行数为 {total_lines}"
-                }
-            remaining_entries = [
-                entry for index, entry in enumerate(entries, start=1)
-                if index < valid_start or index > valid_end
-            ]
-            deleted_count = valid_end - valid_start + 1
-            # 删除会改变轮次顺序/数量，旧摘要游标不再可靠；下次聊天前由统一
-            # 跨轮压缩流程从剩余原始轮次重建累计摘要和问题索引。
-            meta["context_summary"] = None
-            meta = _recompute_meta_from_entries(manager.session_id, meta, remaining_entries)
-            _write_meta_and_entries(manager._file_path, meta, remaining_entries)
-        return {
-            "state": "succeed",
-            "describe": f"已删除第 {valid_start} 到 {valid_end} 行,共 {deleted_count} 行。原始记录数 {total_lines},剩余记录数 {len(remaining_entries)}",
-            "meta_after": meta,
-            "usage_after": meta.get("usage", {})
         }
 
     @staticmethod

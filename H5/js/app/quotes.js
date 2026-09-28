@@ -1,5 +1,5 @@
 /**
- * 选中文本引用到提问（docs/quote_selection_design.md）
+ * 选中文本引用到提问（docs/quote_selection.md）
  * - 选区检测：聊天正文中「用户提问正文」或「助手回答正文」内的同一条消息选择
  * - 浮钮「引用到提问」：选区末端附近出现，点击把文本快照加入当前会话草稿
  * - 草稿引用入口：输入框上方显示数量按钮，悬停/聚焦展开原文与来源，可跳转/移除
@@ -21,6 +21,7 @@
   let floatBtn = null;
   let floatVisible = false;
   let pendingCapture = null; // mousedown 时保留的选区快照（浏览器点击后可能清选区）
+  let selectionRefreshFrame = 0;
 
   function ensureFloatBtn() {
     if (floatBtn) return floatBtn;
@@ -57,6 +58,9 @@
       top = rect.bottom + 8 + height;
     }
     left = Math.max(8 + width / 2, Math.min(left, window.innerWidth - 8 - width / 2));
+    const minTop = Math.min(height + 4, Math.max(4, window.innerHeight - 4));
+    const maxTop = Math.max(minTop, window.innerHeight - 4);
+    top = Math.max(minTop, Math.min(top, maxTop));
     btn.style.left = left + "px";
     btn.style.top = top + "px";
   }
@@ -161,6 +165,16 @@
     showFloatBtn(snapshot.rect);
   }
 
+  // 滚动时选区本身可能仍存在；按新的视口坐标重定位浮钮。
+  // 用 requestAnimationFrame 合并高频 scroll 事件，避免重复测量布局。
+  function scheduleSelectionRefresh() {
+    if (selectionRefreshFrame) return;
+    selectionRefreshFrame = window.requestAnimationFrame(function () {
+      selectionRefreshFrame = 0;
+      handleSelectionChange();
+    });
+  }
+
   document.addEventListener("mouseup", function (e) {
     if (floatBtn && (e.target === floatBtn || floatBtn.contains(e.target))) return;
     // 延迟到浏览器完成选区更新后判定
@@ -180,7 +194,10 @@
   document.addEventListener("keydown", function (e) {
     if (e.key === "Escape") hideFloatBtn();
   });
-  chatScroll.addEventListener("scroll", hideFloatBtn, { passive: true });
+  chatScroll.addEventListener("scroll", scheduleSelectionRefresh, { passive: true });
+  // 兼容页面滚动和聊天区内嵌滚动容器滚动；上面的 RAF 会合并重复事件。
+  document.addEventListener("scroll", scheduleSelectionRefresh, true);
+  window.addEventListener("scroll", scheduleSelectionRefresh, { passive: true });
 
   // ---------- 草稿引用（输入框上方紧凑入口 + 原文浮层） ----------
   function renderComposerQuotes() {

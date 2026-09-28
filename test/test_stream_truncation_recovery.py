@@ -64,7 +64,6 @@ class TruncatingLLM:
         TruncatingLLM.last_messages[TruncatingLLM.calls] = (
             _snapshot_request_messages(request)
         )
-        messages_value = getattr(request, "messages", None)
         if TruncatingLLM.calls <= TruncatingLLM.fail_calls:
             # 模拟 ChatLLM 对上游 EOF 的处理：部分思考增量 →
             # stream_truncated 标记帧 → 合成 [DONE]（无 finish_reason）
@@ -309,8 +308,6 @@ class SubAgentTruncationRecoveryTests(unittest.TestCase):
             initial_todo=None,
             tools=[],
             tool_servers={},
-            configured_tool_names=set(),
-            configured_tool_servers={},
             max_rounds=5,
             timeout_seconds=0,
             reply_max_chars=1000,

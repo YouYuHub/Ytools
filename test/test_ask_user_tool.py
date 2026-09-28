@@ -31,14 +31,13 @@ class AskUserToolDefinitionTests(unittest.TestCase):
     def test_is_builtin_tool_covers_ask_user(self):
         self.assertTrue(builtin_tools.is_builtin_tool("ask_user"))
         self.assertTrue(builtin_tools.is_builtin_tool("todo_write"))
-        self.assertTrue(builtin_tools.is_builtin_tool("check_tool_exists"))
+        self.assertFalse(builtin_tools.is_builtin_tool("check_tool_exists"))
         self.assertFalse(builtin_tools.is_builtin_tool("list_dir"))
 
     def test_inject_ask_user_only_when_enabled(self):
         tools, servers = builtin_tools.inject_builtin_tools([], {}, include_ask_user=True)
         names = {t["function"]["name"] for t in tools}
         self.assertIn("ask_user", names)
-        self.assertNotIn("check_tool_exists", names)  # 未选外部工具时不注入
         self.assertEqual(servers["ask_user"], "__builtin__")
 
         tools2, _ = builtin_tools.inject_builtin_tools([], {}, include_ask_user=False)

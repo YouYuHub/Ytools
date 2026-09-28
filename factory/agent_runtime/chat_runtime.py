@@ -9,7 +9,7 @@
 """
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 try:
     import env_manager
@@ -179,6 +179,24 @@ def build_request_messages(messages: List[dict]) -> list[Message]:
         if isinstance(msg, dict) else msg
         for msg in messages
     ]
+
+
+def log_upstream_assistant_messages(
+    serialized_messages: List[dict[str, Any]],
+    *,
+    source: str,
+) -> None:
+    """打印实际上游请求中 assistant 消息的序列化内容，便于核对思考回传字段。"""
+    assistant_messages = [
+        {"index": index, "message": message}
+        for index, message in enumerate(serialized_messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    print(
+        f"[DEBUG] 上游 API 实际发送的 assistant messages（{source}；index 为完整 messages 下标）: "
+        f"{json.dumps(assistant_messages, ensure_ascii=False, default=str)}",
+        flush=True,
+    )
 
 
 class UsageAccumulator:
@@ -390,27 +408,15 @@ def load_tool_call_stream_timeout(
     return value if value > 0 else 0.0
 
 
-def latest_reasoning_content(messages: List[dict[str, Any]]) -> str:
-    """取上下文中最近一条非空 assistant 思考（工具轮回传兜底用；跳过占位符）。"""
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != REASONING_PLACEHOLDER:
-            return reasoning
-    return ""
-
-
 def reasoning_content_for_tool_call(source: str, limit: int) -> str:
     """按回传长度策略生成工具轮 assistant 消息的 reasoning_content。
 
-    思考模式下的工具调用链要求每条 assistant（tool_calls）消息都回传
-    reasoning_content（严格上游缺失即 400），因此这里永远不返回空值：
+    最新工具调用的 assistant 消息需要有 reasoning_content 时，生成回传值：
     - limit < 0：全量回传；
     - limit > 0：只保留末尾 N 字符；
-    - limit == 0：只回传占位符（"不回传"语义退化为最小占位，仅满足上游
-      字段校验，避免请求被严格上游拒绝）；
-    来源缺失（模型本轮未输出思考）时同样回退占位符。
+    - limit == 0：只回传占位符（"不回传"语义退化为最小占位，用于满足
+      对最新工具调用消息的字段要求）；
+    来源缺失（本轮未输出思考且历史无可回退内容）时同样回退占位符。
     """
     if limit == 0:
         return REASONING_PLACEHOLDER
@@ -418,50 +424,6 @@ def reasoning_content_for_tool_call(source: str, limit: int) -> str:
     if not text.strip():
         return REASONING_PLACEHOLDER
     return text if limit < 0 else text[-limit:]
-
-
-def retain_latest_reasoning(messages: List[dict[str, Any]], *, limit: int | None = None) -> None:
-    """只保留最近一条 assistant 真实思考，避免思考过程跨轮累积。
-
-    严格上游（GLM / DeepSeek 等）要求工具调用链中每条 assistant（tool_calls）
-    消息都回传 reasoning_content，缺失即 400；因此旧工具轮不再直接剥离字段，
-    而是替换为 "..." 占位符（字段必须存在，占位可通过校验）。最近一条保持
-    真实思考；意外缺失时回退历史最近思考，再兜底占位符。
-
-    limit 缺省时按 REASONING_RETURN_MAX_LENGTH 配置读取；父循环
-    （chat_factory）会显式传入其命名空间解析出的 limit（测试可打桩）。
-    """
-    assistant_indexes = [
-        index for index, message in enumerate(messages)
-        if isinstance(message, dict) and message.get("role") == "assistant"
-    ]
-    if not assistant_indexes:
-        return
-    latest_index = assistant_indexes[-1]
-    # 先收集兜底思考：旧轮随后会被覆盖为占位符，之后再也取不到真实值
-    fallback = ""
-    for index in reversed(assistant_indexes[:-1]):
-        reasoning = messages[index].get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip() and reasoning.strip() != REASONING_PLACEHOLDER:
-            fallback = reasoning
-            break
-    if limit is None:
-        limit = load_reasoning_return_max_length()
-    for index in assistant_indexes:
-        message = messages[index]
-        if index == latest_index:
-            if not message.get("tool_calls"):
-                continue  # 非工具轮不强制回传思考
-            current = message.get("reasoning_content")
-            if isinstance(current, str) and current.strip():
-                continue  # 最近一条已有思考，保持原样
-            message["reasoning_content"] = reasoning_content_for_tool_call(fallback, limit)
-            continue
-        if message.get("tool_calls"):
-            # 旧工具轮：字段必须存在；值用占位符避免真实思考跨轮累积
-            message["reasoning_content"] = REASONING_PLACEHOLDER
-        else:
-            message.pop("reasoning_content", None)
 
 
 def sanitize_tool_call_pairing(messages: List[dict[str, Any]]) -> tuple[List[dict[str, Any]], int]:
@@ -534,17 +496,16 @@ def _shape_reasoning_for_send(
     """按“发送口径”整形思考回传（copy_for_request 与发送口径估算共用核心）。
 
     运行时 messages 始终保持模型原始输出（每轮思考均为原始全文），落盘
-    （record_message 深拷贝）也以真实值为源——历史工具轮的思考全部完整
-    保留，绝不替换为 "..."。本函数只在副本上做回传侧语义：请求里最多只
-    保留一条真实思考（最近一次 API 调用输出的那条），其余一律占位/剥离，
-    既满足严格上游（GLM/DeepSeek）“reasoning_content 必须存在”的校验，
-    又避免真实思考跨轮累积发给上游：
+    （record_message 深拷贝）也以真实值为源。本函数只在副本上做回传整形：
+    请求中最多保留最新 assistant 消息的 reasoning_content；最新工具调用本轮
+    没有思考时可向前回退。更早 assistant 消息的 reasoning_content 一律剥离，
+    避免真实思考跨轮累积发给上游：
     - 旧工具轮 / 旧非工具 assistant：剥离 reasoning_content（历史思考
       一律不回传，只保留运行时/落盘里的原始值）；
     - 最新工具轮：只回传最近一次 API 调用输出的思考，按
       REASONING_RETURN_MAX_LENGTH 裁剪；本轮没有输出思考时向前回溯，
       取上下文中最近一次真实思考按同一规则回传；完全找不到真实思考或
-      limit==0 时回传占位符（字段仅为通过上游校验而存在）；
+      limit==0 时回传占位符（仅用于最新工具调用消息）；
     - 最新非工具轮：思考非必须，已有则按长度裁剪，limit==0 直接剥离。
 
     只对“需要修改”的 assistant 消息创建新 dict（浅拷贝顶层键），其余消息
@@ -599,7 +560,7 @@ def _shape_reasoning_for_send(
             current = message.get("reasoning_content")
             # 只回传一条思考：优先本轮（最近一次 API 调用）输出的思考；
             # 本轮没有时向前回溯最近一次真实思考（不产生第二条真实思考）；
-            # 都没有或 limit==0 时回传占位符（字段存在即可通过严格上游校验）
+            # 都没有或 limit==0 时回传占位符（仅用于最新工具调用消息）
             source = current if isinstance(current, str) and current.strip() else fallback
             reasoning = reasoning_content_for_tool_call(source, limit)
             if isinstance(current, str) and reasoning == current:

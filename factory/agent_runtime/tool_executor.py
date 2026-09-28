@@ -150,19 +150,25 @@ def _load_tool_call_timeout() -> float:
     return value
 
 
-def _invoke_tool_function(name: str, arguments: dict, tool_mcp_servers: Dict[str, str]) -> Any:
+def _invoke_tool_function(
+    name: str,
+    arguments: dict,
+    tool_mcp_servers: Dict[str, str],
+    tool_original_names: Dict[str, str] | None = None,
+) -> Any:
     if name not in tool_mcp_servers:
         raise ValueError(f"工具 {name} 未在MCP服务器中注册，无法调用")
     mcp_server_file = tool_mcp_servers[name]
+    original_name = (tool_original_names or {}).get(name, name)
     pipe_tools = {"setup_pipe", "run_pipe_command", "read_pipe_history"}
-    max_retry = 3 if name in pipe_tools else 1
+    max_retry = 3 if original_name in pipe_tools else 1
     last_error = None
     call_timeout = _load_tool_call_timeout()
     for attempt in range(1, max_retry + 1):
         loop = asyncio.new_event_loop()
         try:
             call_coro = call_mcp_tool(
-                function_name=name,
+                function_name=original_name,
                 arguments=arguments,
                 mcp_service=mcp_server_file)
             if call_timeout > 0:
@@ -199,12 +205,15 @@ def execute_tool_round(
     parsed_tools: list[tuple[int, dict, str, dict]],
     tool_mcp_servers: Dict[str, str],
     max_workers: int,
+    tool_original_names: Dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     tool_results: list[dict[str, Any]] = []
 
     def execute_tool(index, tool_call, tool_name, tool_args) -> tuple:
         try:
-            result = _invoke_tool_function(tool_name, tool_args, tool_mcp_servers)
+            result = _invoke_tool_function(
+                tool_name, tool_args, tool_mcp_servers, tool_original_names
+            )
             ret = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             return index, tool_call, tool_name, tool_args, ret, None
         except Exception as exc:

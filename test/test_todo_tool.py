@@ -47,14 +47,21 @@ class TodoToolDefinitionTests(unittest.TestCase):
 
     def test_is_builtin_tool_covers_todo(self):
         self.assertTrue(builtin_tools.is_builtin_tool("todo_write"))
-        self.assertTrue(builtin_tools.is_builtin_tool("check_tool_exists"))
+        self.assertFalse(builtin_tools.is_builtin_tool("check_tool_exists"))
         self.assertFalse(builtin_tools.is_builtin_tool("list_dir_item"))
+
+    def test_missing_id_keeps_step_identity_when_status_changes(self):
+        previous = [{"id": "step-7", "content": "检查结果", "status": "in_progress"}]
+        items, _, error = builtin_tools.normalize_todo_items(
+            [{"content": "检查结果", "status": "done"}], prev_items=previous
+        )
+        self.assertIsNone(error)
+        self.assertEqual(items[0]["id"], "step-7")
 
     def test_inject_todo_only_when_enabled(self):
         tools, servers = builtin_tools.inject_builtin_tools([], {}, include_todo=True)
         names = {t["function"]["name"] for t in tools}
         self.assertIn("todo_write", names)
-        self.assertNotIn("check_tool_exists", names)  # 未选外部工具时不注入
         self.assertEqual(servers["todo_write"], "__builtin__")
 
         tools2, servers2 = builtin_tools.inject_builtin_tools([], {}, include_todo=False)

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from memory.chat_memory import ChatMemoryManager, normalize_session_id
-from memory.chat_round_store import parse_round_entry
+from memory.chat_round_store import ChatRoundStore, parse_round_entry
 
 
 # 完整轮次：与 history_files/web-msd5kqad_chat.jsonl 中的格式一致
@@ -37,6 +37,16 @@ def _build_jsonl(meta: dict | None, rounds: list[dict], extra_garbage: list[str]
 
 
 class ParseRoundEntryTests(unittest.TestCase):
+    def test_round_model_survives_completion_and_import(self):
+        store = ChatRoundStore("model-test")
+        store.record_message({"role": "user", "content": "问题"})
+        model = {"provider": "供应商", "name": "模型 A", "id": "model-a"}
+        self.assertTrue(store.set_model(model))
+        model["name"] = "切换后的模型"
+        completed = store.finalize_round("done")
+        self.assertEqual(completed["model"]["name"], "模型 A")
+        self.assertEqual(parse_round_entry(completed)["model"], completed["model"])
+
     def test_valid_round_passes(self):
         parsed = parse_round_entry(_VALID_ROUND)
         self.assertIsNotNone(parsed)
@@ -316,23 +326,6 @@ class ImportJsonlChatHistoryTests(unittest.TestCase):
             overwrite=True,
         )
         meta_after, _ = self._read_session("mismatched-summary")
-        self.assertIsNone(meta_after["context_summary"])
-
-    def test_deleting_history_invalidates_summary_cursor(self):
-        manager = ChatMemoryManager("delete-summary")
-
-        async def prepare():
-            await manager.add_chat_history({"role": "user", "content": "问题"})
-            await manager.add_chat_history({"role": "assistant", "content": "回答"})
-            await manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
-            await manager.update_context_summary({
-                "summary": "旧摘要",
-                "source_round_count": 1,
-            })
-
-        asyncio.run(prepare())
-        ChatMemoryManager.delete_chat_session_file_line("delete-summary", 1, 1)
-        meta_after, _ = self._read_session("delete-summary")
         self.assertIsNone(meta_after["context_summary"])
 
     def test_unicode_session_id_round_trips_to_real_file(self):

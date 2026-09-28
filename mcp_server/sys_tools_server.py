@@ -23,7 +23,6 @@ import difflib
 import fnmatch
 import gzip
 import itertools
-import json
 import os
 import re
 import shutil

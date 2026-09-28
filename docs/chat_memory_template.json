@@ -1,5 +1,5 @@
 {
-  "_说明": "history_files/<session_id>_chat.jsonl 的落盘格式模板（每行一个 JSON 对象，UTF-8）。第 1 行固定为 {\"_meta\": {...}}；第 2 行起为 chat_round 轮次条目与 session 级 context_compaction 事件行。'...' 表示长字符串占位。媒体文件二进制保存在 history_files/session_files/<upload_id>/media/ 下，消息里仅存 media://<stored_name> 引用；上传的可解析文档原始字节在 history_files/session_files/<upload_id>/files/ 下（目录原名 history_files/upload/，upload 改名为 session_files，upload_id 字段名沿用不变）。任务进行中另有检查点侧车 <session_id>_chat.jsonl.pending（内容为单个 chat_round 快照），轮次收尾后删除；任务计划侧车 <session_id>_chat.jsonl.todo（todo_write 真源，跨轮存活），删除会话时一并清理。",
+  "_说明": "history_files/<session_id>_chat.jsonl 的落盘格式模板（每行一个 JSON 对象，UTF-8）。第 1 行固定为 {\"_meta\": {...}}；第 2 行起为 chat_round 轮次条目与 session 级 context_compaction 事件行。'...' 表示长字符串占位。选中文本引用快照以可选的 quotes 字段保存在 chat_round.events 中对应的 user 事件；模型请求中的 <quote_list> 是运行时视图，不写入 JSONL。媒体文件二进制保存在 history_files/session_files/<upload_id>/media/ 下，消息里仅存 media://<stored_name> 引用；上传的可解析文档原始字节在 history_files/session_files/<upload_id>/files/ 下（目录原名 history_files/upload/，upload 改名为 session_files，upload_id 字段名沿用不变）。任务进行中另有检查点侧车 <session_id>_chat.jsonl.pending（内容为单个 chat_round 快照），轮次收尾后删除；任务计划侧车 <session_id>_chat.jsonl.todo（todo_write 真源，跨轮存活），删除会话时一并清理。",
   "第1行_meta": {
     "_meta": {
       "title": "...",
@@ -80,11 +80,28 @@
     "event": "chat_round",
     "question": "...",
     "started_at": "YYYY-MM-DD HH:MM:SS",
+    "model": { "provider": "供应商名", "name": "模型配置名", "id": "实际请求 API 的模型 id" },
     "events": [
       {
         "timestamp": "YYYY-MM-DD HH:MM:SS",
         "role": "user",
         "content": "..."
+      },
+      {
+        "timestamp": "YYYY-MM-DD HH:MM:SS",
+        "role": "user",
+        "content": "针对这段解释，第二点有什么例外？",
+        "quotes": [
+          {
+            "text": "被选中的原文",
+            "source": {
+              "role": "assistant",
+              "session_id": "...",
+              "round": 12,
+              "event_index": 3
+            }
+          }
+        ]
       },
       {
         "timestamp": "YYYY-MM-DD HH:MM:SS",
@@ -313,8 +330,10 @@
     "ended_at": "YYYY-MM-DD HH:MM:SS"
   },
   "_chat_round字段备注": {
+    "model": "本轮任务启动时确定的聊天模型快照：provider 为供应商名，name 为 models.json 中模型配置名，id 为请求 API 使用的模型 id；用户在任务进行中切换模型不会改写该轮。旧轮次可没有此字段；前端在本轮 tokens 行显示 provider/name。",
     "question": "本轮原始用户问题（多模态消息取纯文本部件，不含媒体占位符；'停止任务'不作为问题）",
     "events": "时间顺序事件流；role=user 的第一条非'停止任务'消息即问题；assistant 的 done/error 为收尾标记；role=tool 的数量是单轮压缩游标的计数基准（sub_agent 事件不带 role，不参与该计数）",
+    "quotes(user事件)": "可选的选中文本引用快照，保存在对应 role=user 事件上（不是 chat_round 顶层或 _meta）；数组项为 {text, source?}，source 可含 role / session_id / round / event_index，前端临时 id 不落盘。JSONL 保留原始 content 与规范化 quotes；发送模型前才把引用序列化为 <quote_list> 并从请求消息移除 quotes。旧轮次没有该字段时表示无引用。",
     "content(media://)": "消息落盘时媒体保持 media:// 引用不膨胀；仅发送上游前解析为 data URL / base64",
     "file_diff(tool)": "内置 write_file/edit_file（及 sub_agent 内部同名工具）的前端展示 diff：unified diff 文本 + 行数统计 {diff, lines_added, lines_removed, diff_truncated, diff_skipped}，与 result 并列落盘；不进入模型上下文（模型只见 message 中的 +N -M 摘要）；报错路径与超大结果(oversized)路径不带本字段；结构详见 docs/file_diff.md §3.1",
     "network_retry": "assistant 网络重试失败的过程性记录（error/error_detail/step/retry/max_attempts）：只追加到当前轮、不触发收尾；重试成功后轮次正常进行，最终失败才由 assistant.error 收尾",

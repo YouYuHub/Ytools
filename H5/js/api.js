@@ -312,12 +312,16 @@ const api_url = localStorage.getItem("ytools-api-base")
    * （role_info 附加 is_overridden，响应含 session_selection/effective_selection/warning）
    * @param {string} [role] chat_model / compaction_model / title_model，默认 chat_model
    * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [forceRefresh=false] 强制绕过浏览器缓存，重新读取模型配置
    */
-  function getModels(role, sessionId) {
+  function getModels(role, sessionId, forceRefresh) {
     const params = new URLSearchParams();
     if (role) params.set("role", role);
     if (sessionId) params.set("session_id", sessionId);
-    return request("/chat_config/models" + (params.toString() ? "?" + params.toString() : ""));
+    return request(
+      "/chat_config/models" + (params.toString() ? "?" + params.toString() : ""),
+      forceRefresh ? { cache: "no-store" } : undefined
+    );
   }
 
   /**

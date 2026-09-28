@@ -131,7 +131,10 @@
   function refreshMaxTokensAfterSwitch(key) {
     const role = state.activeModelRole;
     API.getModels(role, state.sessionId || undefined).then(function (data) {
-      state.modelConfigs[role] = data;
+      // 经单一入口写缓存：chat_model 角色顺带原子刷新状态条模型名，
+      // 不再依赖"先赋值 state.modelConfigs 再手动调用刷新"的顺序约定
+      if (role === "chat_model") App.setChatModelConfig(data);
+      else state.modelConfigs[role] = data;
     }, function () { /* 拉取失败沿用缓存模型信息 */ }).then(function () {
       // 等待期间用户可能已切角色/换模型/关面板，过期结果不回填
       if (enhancePanel.classList.contains("hidden")) return;
@@ -314,7 +317,10 @@
         res.data && res.data.role_info && res.data.role_info.is_overridden
       );
     });
-    App.refreshChatModelLabel();
+    // 三个角色的缓存已由本流程整体写入：直接按缓存重绘状态条模型名。
+    // 这里不再调用 refreshChatModelLabel()（无参调用会隐含"缓存必须先被写好"
+    // 的时序约定，语义上等价于纯渲染，显式调用渲染函数更不容易被后续误用）。
+    App.renderChatModelLabel();
     return results.some(function (res) { return res.error; });
   }
 
@@ -479,9 +485,10 @@
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
       const data = await API.getModels(state.activeModelRole, state.sessionId || undefined);
-      if (data) state.modelConfigs[state.activeModelRole] = data;
+      // 写缓存 + 状态条模型名原子更新（单一入口，chat_model 角色才影响状态条）
+      if (state.activeModelRole === "chat_model") App.setChatModelConfig(data);
+      else if (data) state.modelConfigs[state.activeModelRole] = data;
       state.modelPanelDrafts = {};   // 保存成功：服务端状态已变化，草稿基线作废
-      App.refreshChatModelLabel();
       // 仅模型更换才影响 token 估算口径（窗口取自模型定义，参数不影响）：
       // 切换聊天模型后立即刷新统计标签；压缩/标题模型不影响统计，无需刷新
       if (modelChanged && state.activeModelRole === "chat_model") {
@@ -503,10 +510,11 @@
       toast(res.message || "已恢复跟随全局默认模型");
       state.modelOverridden[state.activeModelRole] = false;
       const data = await API.getModels(state.activeModelRole, state.sessionId);
-      if (data) state.modelConfigs[state.activeModelRole] = data;
+      // 写缓存 + 状态条模型名原子更新（单一入口，chat_model 角色才影响状态条）
+      if (state.activeModelRole === "chat_model") App.setChatModelConfig(data);
+      else if (data) state.modelConfigs[state.activeModelRole] = data;
       state.modelLoadFailed = false;
       if (state.modelPanelDrafts) delete state.modelPanelDrafts[state.activeModelRole];
-      App.refreshChatModelLabel();
       initModelPanel();
       if (state.activeModelRole === "chat_model") {
         App.refreshContextTokenStats(state.sessionId);

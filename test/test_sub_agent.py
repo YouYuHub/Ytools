@@ -89,11 +89,6 @@ class SubAgentToolDefinitionTests(unittest.TestCase):
         self.assertIsNone(task)
         self.assertIn("超长", err)
 
-    def test_ask_user_placeholder_result(self):
-        result = builtin_tools.execute_ask_user_placeholder({"questions": [{"question": "?"}]})
-        self.assertEqual(result["status"], "unavailable_in_sub_agent")
-        self.assertIn("无法向用户提问", result["message"])
-
 
 # ---------------------------------------------------------------------------
 # chat_round_store：事件校验 + 记录
@@ -320,8 +315,6 @@ def _make_context(**overrides) -> "object":
         initial_todo=[{"id": "1", "content": "写文件", "status": "pending"}],
         tools=[{"type": "function", "function": {"name": "write_file", "parameters": {}}}],
         tool_servers={"write_file": "__builtin__"},
-        configured_tool_names=set(),
-        configured_tool_servers={},
         max_rounds=5,
         timeout_seconds=0,
         reply_max_chars=1000,
@@ -390,10 +383,12 @@ class SubAgentRunnerTests(unittest.TestCase):
         # tool_result 带 tool_call_id（并发区分）
         tool_result_payload = next(p for ph, p in emitted if ph == "tool_result")
         self.assertEqual(tool_result_payload["tool_call_id"], "call_c1")
-        # 首轮模型请求必须已带上父级下发的任务文本（回归防护）
+        # 首轮请求先注入专属系统提示，再把父级任务作为 user 消息提供。
         first_request = fake_state["requests"][0]
-        self.assertEqual(first_request.messages[0].role, "user")
-        self.assertEqual(first_request.messages[0].content, "写测试文件")
+        self.assertEqual(first_request.messages[0].role, "system")
+        self.assertIn("你是一个子智能体", first_request.messages[0].content)
+        self.assertEqual(first_request.messages[1].role, "user")
+        self.assertEqual(first_request.messages[1].content, "写测试文件")
 
     def test_parent_context_isolation(self):
         from chat.chat_llm import ChatLLM
@@ -405,13 +400,14 @@ class SubAgentRunnerTests(unittest.TestCase):
         runner = SubAgentRunner(ctx)
         asyncio.run(runner.run())
         roles = [m.get("role") for m in runner.messages]
-        # 首条消息必须是父级下发的任务文本（不带 _internal）：子任务独立
-        # 上下文的唯一信息来源，缺失会导致模型收不到任务、空转收尾
-        self.assertEqual(roles[0], "user")
-        self.assertNotIn("_internal", runner.messages[0])
-        self.assertEqual(runner.messages[0].get("content"), "写测试文件")
+        # system 提示提供角色与工具边界；首条 user 消息仍是父级任务文本。
+        self.assertEqual(roles[0], "system")
+        self.assertIn("只能调用当前请求 tools 字段中列出的工具", runner.messages[0]["content"])
+        self.assertEqual(roles[1], "user")
+        self.assertNotIn("_internal", runner.messages[1])
+        self.assertEqual(runner.messages[1].get("content"), "写测试文件")
         # 其余 user 消息只能是内部提示（超时重试/截断续写等）
-        for message in runner.messages[1:]:
+        for message in runner.messages[2:]:
             if message.get("role") == "user":
                 self.assertTrue(message.get("_internal"), message)
         self.assertEqual(roles.count("assistant"), 2)
@@ -493,8 +489,6 @@ class SubAgentRunnerTests(unittest.TestCase):
                 initial_todo=None,
                 tools=[],
                 tool_servers={},
-                configured_tool_names=set(),
-                configured_tool_servers={},
                 max_rounds=3,
                 timeout_seconds=10,
                 reply_max_chars=500,
@@ -553,8 +547,6 @@ def _make_retry_context(initial_todo=None, max_rounds=8):
             {"type": "function", "function": {"name": "todo_write", "parameters": {}}},
         ],
         tool_servers={"todo_write": "__builtin__"},
-        configured_tool_names=set(),
-        configured_tool_servers={},
         max_rounds=max_rounds,
         timeout_seconds=0,
         reply_max_chars=1000,
@@ -748,7 +740,7 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
             initial_todo=[{"id": "1", "content": "写文件", "status": "pending"}]
         )
         runner = SubAgentRunner(ctx)
-        hint = runner.messages[1]
+        hint = runner.messages[2]
         self.assertEqual(hint.get("role"), "user")
         self.assertTrue(hint.get("_internal"))
         self.assertIn("【预置计划】", str(hint.get("content")))
@@ -756,17 +748,18 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertIn("[待办]", str(hint.get("content")))
         # 请求构造剥离下划线内部键（_internal 不进上游 payload）
         request = runner._build_request({})
-        self.assertEqual(request.messages[1].content, hint.get("content"))
-        self.assertFalse(hasattr(request.messages[1], "_internal"))
+        self.assertEqual(request.messages[2].content, hint.get("content"))
+        self.assertFalse(hasattr(request.messages[2], "_internal"))
 
     def test_preset_todo_hint_absent_without_initial_todo(self):
-        """无预置计划时不注入提示消息（上下文保持单条任务文本）。"""
+        """无预置计划时仅有 system 提示与单条任务消息。"""
         from factory.agent_runtime.sub_agent import SubAgentRunner
 
         ctx, _emitted = _make_retry_context(initial_todo=None)
         runner = SubAgentRunner(ctx)
-        self.assertEqual(len(runner.messages), 1)
-        self.assertEqual(runner.messages[0].get("content"), "交付保障测试任务")
+        self.assertEqual(len(runner.messages), 2)
+        self.assertEqual(runner.messages[0].get("role"), "system")
+        self.assertEqual(runner.messages[1].get("content"), "交付保障测试任务")
 
     def test_stream_error_resumes_and_completes(self):
         """流错误断点续跑：出错轮注入内部消息继续，下一轮正常完成。"""
@@ -825,12 +818,7 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
 
 class SharedFunctionExtractionTests(unittest.TestCase):
     def test_chat_factory_reexports_runtime_functions(self):
-        """共享纯函数迁入 chat_runtime；思考回传/loader 在父循环命名空间保留本地实现。
-
-        _retain_latest_reasoning / _copy_for_request 在 chat_factory 中是
-        「显式传 limit 的包装」（limit 来自 cf 命名空间 loader，测试可打桩），
-        chat_runtime 侧函数保持 limit 可选参数供子任务等独立调用方使用。
-        """
+        """共享纯函数迁入 chat_runtime；请求副本包装与配置 loader 保留在父循环。"""
         from factory import chat_factory
         from factory.agent_runtime import chat_runtime
 
@@ -839,41 +827,11 @@ class SharedFunctionExtractionTests(unittest.TestCase):
             chat_factory._merge_tool_call_delta, chat_runtime.merge_tool_call_delta)
         self.assertIs(
             chat_factory._filter_tool_calls_fields, chat_runtime.filter_tool_calls_fields)
-        self.assertIs(
-            chat_factory._REASONING_PLACEHOLDER, chat_runtime.REASONING_PLACEHOLDER)
         # loader 与回传包装：父循环命名空间本地实现（可打桩）
         self.assertTrue(callable(chat_factory._load_reasoning_return_max_length))
         self.assertTrue(callable(chat_factory._load_tool_call_stream_timeout))
-        # 共享实现仍在 chat_runtime（子任务 Runner 直接使用）
+        # 共享请求整形仍在 chat_runtime（子任务 Runner 直接使用）
         self.assertTrue(callable(chat_runtime.copy_for_request))
-        self.assertTrue(callable(chat_runtime.retain_latest_reasoning))
-
-    def test_parent_wrapper_passes_limit_into_runtime(self):
-        """父循环包装显式传 limit：patch cf loader 时下游行为随之变化。"""
-        import inspect
-        from factory import chat_factory
-
-        messages = [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "tool_calls": [
-                {"id": "c1", "type": "function",
-                 "function": {"name": "f", "arguments": "{}"}},
-            ]},
-        ]
-        from unittest import mock
-
-        messages = [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "tool_calls": [
-                {"id": "c1", "type": "function",
-                 "function": {"name": "f", "arguments": "{}"}},
-            ]},
-        ]
-        with mock.patch.object(chat_factory, "_load_reasoning_return_max_length", return_value=0):
-            chat_factory._retain_latest_reasoning(messages)
-            self.assertEqual(messages[1]["reasoning_content"], "...")
-        copied = chat_factory._copy_for_request(messages)
-        self.assertTrue(inspect.isfunction(chat_factory._copy_for_request))
 
     def test_copy_for_request_placeholder_for_missing_reasoning(self):
         from factory.agent_runtime.chat_runtime import copy_for_request

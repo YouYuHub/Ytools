@@ -459,7 +459,7 @@
       });
 
       if (obj.usage_total && obj.usage_total.total_tokens) {
-        records.push({ kind: "usage", usage: obj.usage_total, round: roundNo });
+        records.push({ kind: "usage", usage: obj.usage_total, model: obj.model, round: roundNo });
       }
       // 轮内子块（sub_agent 聚合块等由辅助函数 push 的记录）统一补轮次号
       for (let r = roundStart; r < records.length; r += 1) {

@@ -9,7 +9,7 @@
 - 全部 *_DEFINITION 与动态构建的 read_media 定义均为合法 function-calling 格式
   （type=function、name 非空、description 非空、parameters 为 object、
   required ⊆ properties、每个属性均带 description）；
-- 工具名唯一（ASK_USER_PLACEHOLDER_DEFINITION 为子智能体占位定义，同名不计重复）；
+- 工具名唯一；
 - SELECTABLE_BUILTIN_TOOL_NAMES 中的可勾选工具都有对应定义；
 - is_builtin_tool 覆盖全部定义。
 """

@@ -1,13 +1,7 @@
-"""reasoning_content 回传修复的单元测试。
+"""reasoning_content 请求整形与历史落盘隔离的单元测试。
 
-覆盖：
-- _retain_latest_reasoning：旧工具轮占位符化、最新轮保留真实思考、
-  最新轮缺失时回退上下文最近真实思考、非工具轮剥离思考、无 assistant 消息容错
-- _reasoning_content_for_tool_call：limit 语义（负数全量/正数末尾截断/0 占位）
-  与空来源占位
-- _latest_reasoning_content：跳过占位符取最近真实思考
-- 落盘解耦：chat_round_store.record_message 深拷贝运行时 dict，
-  占位化/裁剪只影响模型请求，JSONL 落盘永远是模型原始输出
+覆盖：请求副本剥离历史思考、最新工具轮回退/裁剪/占位，以及
+chat_round_store 对运行时消息和检查点的深拷贝隔离。
 """
 import os
 import sys
@@ -17,22 +11,6 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from factory import chat_factory as cf
-
-
-def _assistant(content="", reasoning=None, tool_calls=None):
-    message = {"role": "assistant", "content": content}
-    if reasoning is not None:
-        message["reasoning_content"] = reasoning
-    if tool_calls:
-        message["tool_calls"] = [
-            {
-                "id": f"call_{index}",
-                "type": "function",
-                "function": {"name": f"tool_{index}", "arguments": "{}"},
-            }
-            for index in range(1, tool_calls + 1)
-        ]
-    return message
 
 
 class MessagesDebugSummaryTests(unittest.TestCase):
@@ -48,73 +26,6 @@ class MessagesDebugSummaryTests(unittest.TestCase):
         summary = cf._messages_debug_summary([{"role": "user", "content": "问题"}])
         self.assertIn("'content': '问题'", summary)
         self.assertNotIn("reasoning_content", summary)
-
-
-class RetainLatestReasoningTests(unittest.TestCase):
-    """_retain_latest_reasoning 的保留/占位/剥离行为。"""
-
-    def test_old_tool_rounds_become_placeholder_latest_keeps_reasoning(self):
-        messages = [
-            {"role": "user", "content": "hi"},
-            _assistant("先查一下", reasoning="第一轮思考", tool_calls=1),
-            {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
-            _assistant("再查一次", reasoning="第二轮思考", tool_calls=1),
-            {"role": "tool", "tool_call_id": "call_2", "content": "结果2"},
-        ]
-        cf._retain_latest_reasoning(messages)
-        self.assertEqual(messages[1]["reasoning_content"], "...")
-        # 最新一条（最后 assistant）保留真实思考
-        self.assertEqual(messages[3]["reasoning_content"], "第二轮思考")
-
-    def test_latest_missing_reasoning_falls_back_to_context_latest(self):
-        messages = [
-            {"role": "user", "content": "hi"},
-            _assistant(reasoning="更早的真实思考", tool_calls=1),
-            {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
-            _assistant(tool_calls=1),  # 最新一条缺思考（如流式中断未产出）
-            {"role": "tool", "tool_call_id": "call_2", "content": "结果"},
-        ]
-        cf._retain_latest_reasoning(messages)
-        self.assertEqual(messages[1]["reasoning_content"], "...")
-        self.assertEqual(messages[3]["reasoning_content"], "更早的真实思考")
-
-    def test_latest_missing_without_history_uses_placeholder(self):
-        messages = [
-            {"role": "user", "content": "hi"},
-            _assistant(tool_calls=1),
-        ]
-        cf._retain_latest_reasoning(messages)
-        self.assertEqual(messages[1]["reasoning_content"], "...")
-
-    def test_non_tool_assistant_reasoning_removed(self):
-        messages = [
-            {"role": "user", "content": "hi"},
-            _assistant("普通回答", reasoning="最终回答的思考"),
-            _assistant(tool_calls=1),
-            {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
-        ]
-        cf._retain_latest_reasoning(messages)
-        # 旧的非工具 assistant：思考字段彻底移除（不产生占位噪声）
-        self.assertNotIn("reasoning_content", messages[1])
-        # 最新一条是工具轮且缺思考：回退上下文最近真实思考（含非工具轮的）
-        self.assertEqual(messages[2]["reasoning_content"], "最终回答的思考")
-
-    def test_limit_zero_uses_placeholder_even_for_latest(self):
-        messages = [
-            {"role": "user", "content": "hi"},
-            _assistant(reasoning="第一轮", tool_calls=1),
-            {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
-            _assistant(tool_calls=1),  # 最新缺思考
-        ]
-        with patch.object(cf, "_load_reasoning_return_max_length", return_value=0):
-            cf._retain_latest_reasoning(messages)
-        self.assertEqual(messages[1]["reasoning_content"], "...")
-        self.assertEqual(messages[3]["reasoning_content"], "...")
-
-    def test_no_assistant_messages_is_noop(self):
-        messages = [{"role": "user", "content": "hi"}]
-        cf._retain_latest_reasoning(messages)
-        self.assertEqual(messages, [{"role": "user", "content": "hi"}])
 
 
 class ReasoningForToolCallTests(unittest.TestCase):
@@ -138,40 +49,13 @@ class ReasoningForToolCallTests(unittest.TestCase):
             self.assertEqual(cf._reasoning_content_for_tool_call(source, -1), "...")
 
     def test_placeholder_never_empty(self):
-        # 字段必须存在：即使来源缺失，也不允许返回空串/None
+        # 最新工具调用的回传字段即使来源缺失，也不返回空串/None
         result = cf._reasoning_content_for_tool_call("", 100)
         self.assertTrue(result and result.strip())
 
 
-class LatestReasoningContentTests(unittest.TestCase):
-    """_latest_reasoning_content 跳过占位符取最近真实思考。"""
-
-    def test_returns_latest_real_reasoning(self):
-        messages = [
-            _assistant(reasoning="旧思考", tool_calls=1),
-            _assistant(reasoning="新思考", tool_calls=1),
-        ]
-        self.assertEqual(cf._latest_reasoning_content(messages), "新思考")
-
-    def test_skips_placeholders(self):
-        messages = [
-            _assistant(reasoning="真实思考", tool_calls=1),
-            _assistant(reasoning="...", tool_calls=1),
-        ]
-        self.assertEqual(cf._latest_reasoning_content(messages), "真实思考")
-
-    def test_missing_returns_empty(self):
-        self.assertEqual(cf._latest_reasoning_content([]), "")
-        self.assertEqual(cf._latest_reasoning_content([{"role": "user", "content": "x"}]), "")
-
-
 class PersistedHistoryNotPollutedTests(unittest.TestCase):
-    """落盘数据与运行时 messages 解耦：占位化只影响模型请求，不污染历史。
-
-    回归背景：旧实现里 record_message 直接把运行时 dict 引用挂进
-    pending_round.events，下一轮 _retain_latest_reasoning 原地把旧工具轮的
-    reasoning_content 改成 "..."，轮次收尾序列化时落盘的思考过程失真。
-    """
+    """落盘检查点与运行时消息互相隔离，后续修改不污染已记录的数据。"""
 
     def _record(self, reasoning="真实思考"):
         return {
@@ -191,8 +75,8 @@ class PersistedHistoryNotPollutedTests(unittest.TestCase):
         store = ChatRoundStore(session_id="ut-persist")
         record = self._record()
         store.record_message(record)
-        # 模拟下一轮运行时占位化（原地修改同一个 dict）
-        record["reasoning_content"] = cf._REASONING_PLACEHOLDER
+        # 模拟记录后的运行时修改
+        record["reasoning_content"] = "修改后的思考"
         events = store.pending_round["events"]
         self.assertEqual(events[0]["reasoning_content"], "真实思考")
 
@@ -202,7 +86,7 @@ class PersistedHistoryNotPollutedTests(unittest.TestCase):
         store = ChatRoundStore(session_id="ut-persist")
         record = self._record()
         store.record_message(record)
-        record["reasoning_content"] = cf._REASONING_PLACEHOLDER
+        record["reasoning_content"] = "修改后的思考"
         completed = store.finalize_round("done")
         self.assertEqual(completed["events"][0]["reasoning_content"], "真实思考")
 
@@ -213,7 +97,7 @@ class PersistedHistoryNotPollutedTests(unittest.TestCase):
         record = self._record()
         store.record_message(record)
         checkpoint = store.snapshot_pending_round()
-        record["reasoning_content"] = cf._REASONING_PLACEHOLDER
+        record["reasoning_content"] = "修改后的思考"
         self.assertEqual(checkpoint["events"][0]["reasoning_content"], "真实思考")
 
     def test_deep_copy_preserves_nested_structures(self):
@@ -227,25 +111,9 @@ class PersistedHistoryNotPollutedTests(unittest.TestCase):
         events = store.pending_round["events"]
         self.assertEqual(events[0]["extra"]["nested"]["list"], [1, 2])
 
-    def test_end_to_end_placeholder_only_in_runtime_not_in_round(self):
-        # 端到端模拟：入轮次 → 运行时占位化 → 收尾，轮内数据保持真实思考
-        from memory.chat_round_store import ChatRoundStore
-
-        store = ChatRoundStore(session_id="ut-persist")
-        record = self._record(reasoning="第一轮真实思考")
-        store.record_message(record)
-        messages = [
-            record,
-            self._record(reasoning="第二轮真实思考"),
-        ]
-        cf._retain_latest_reasoning(messages)  # 旧轮（record）被 in-place 占位
-        completed = store.finalize_round("done")
-        self.assertEqual(record["reasoning_content"], "...")
-        self.assertEqual(completed["events"][0]["reasoning_content"], "第一轮真实思考")
-
 
 class CopyForRequestTests(unittest.TestCase):
-    """_copy_for_request：占位化只作用于请求副本，运行时 messages 保持真实。"""
+    """_copy_for_request：思考整形只作用于请求副本，运行时 messages 保持真实。"""
 
     def _messages(self):
         return [
@@ -273,7 +141,7 @@ class CopyForRequestTests(unittest.TestCase):
     def test_original_messages_untouched(self):
         messages = self._messages()
         copied = cf._copy_for_request(messages)
-        # 运行时 messages 不被原地修改（占位化只发生在副本上）：
+        # 运行时 messages 不被原地修改（字段剥离只发生在副本上）：
         # 有思考的保留原值，无思考的也不会凭空出现占位
         self.assertEqual(messages[1]["reasoning_content"], "第一轮真实思考")
         self.assertNotIn("reasoning_content", messages[3])
@@ -303,8 +171,8 @@ class CopyForRequestTests(unittest.TestCase):
 
     def test_latest_tool_round_without_reasoning_falls_back_to_previous_thinking(self):
         # 最新工具轮未输出思考时，副本向前回溯最近一次真实思考回传；
-        # 历史工具轮的思考不回传（字段剥离），请求里永远只有一条真实思考；
-        # 运行时 messages 不被占位化污染，历史思考保持真实
+        # 历史工具轮的思考不回传（字段剥离），请求里只保留最新一条真实思考；
+        # 运行时 messages 不受请求整形影响，历史思考保持真实
         messages = [
             {"role": "user", "content": "hi"},
             self._assistant_msg("第一轮", reasoning="第一轮真实思考"),

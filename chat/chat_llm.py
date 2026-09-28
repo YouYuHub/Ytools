@@ -11,7 +11,6 @@ import urllib.parse
 import socket
 import ssl
 # import uuid
-from dataclasses import dataclass #, field
 from typing import(
     List,
     Dict,
@@ -158,24 +157,6 @@ def _build_custom_header_lines(chat_config: dict[str, Any]) -> str:
             continue
         lines += f"{name}: {value}\r\n"
     return lines
-
-
-@dataclass
-class StreamChunk:
-    """流式响应的数据块"""
-    content: Optional[str] = None  # 正常回复内容
-    reasoning_content: Optional[str] = None  # 推理过程内容
-    tool_calls: Optional[List[Dict[str, Any]]] = None  # 工具调用列表
-    usage: Optional[Dict[str, Any]] = None  # token 使用统计
-    
-    def __bool__(self):
-        """判断是否有有效内容"""
-        return any((
-            self.content is not None and self.content != "",
-            self.reasoning_content is not None and self.reasoning_content != "",
-            self.tool_calls is not None and len(self.tool_calls) > 0,
-            self.usage is not None,
-        ))
 
 
 class ChatLLM:

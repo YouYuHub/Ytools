@@ -1,7 +1,4 @@
 import asyncio
-import json
-import os
-import sys
 import threading
 
 from fastapi import FastAPI

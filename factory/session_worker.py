@@ -27,7 +27,6 @@ import os
 import queue
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -98,6 +97,7 @@ class _WorkerStreamAdapter:
         self._question_parts = None
         self._question_quotes = None
         self._live_round_no = None
+        self._live_round_model = None
         self.user_stop_requested = False
         self.done = False
         self._finish_sent = False
@@ -166,6 +166,25 @@ class _WorkerStreamAdapter:
             normalized = None
         self._live_round_no = normalized
         self._evt_queue.put({"type": "live_round_no", "round": normalized})
+
+    # 本轮生效聊天模型（provider/name/id）：round_model 推送时由生成循环写入，
+    # 经 evt 队列同步到主进程 stream.live_round_model（附接回放 marker 携带
+    # model 字段用，与 live_round_no 同一思路）
+    @property
+    def live_round_model(self):
+        return self._live_round_model
+
+    @live_round_model.setter
+    def live_round_model(self, value) -> None:
+        normalized = None
+        if isinstance(value, dict):
+            normalized = {
+                key: str(value[key]).strip()
+                for key in ("provider", "name", "id")
+                if isinstance(value.get(key), str) and value[key].strip()
+            } or None
+        self._live_round_model = normalized
+        self._evt_queue.put({"type": "live_round_model", "model": normalized})
 
     def emit(self, chunk: str) -> None:
         if isinstance(chunk, str) and chunk:
@@ -738,6 +757,12 @@ def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], No
             # 本轮最终轮次号：附接回放 marker 携带 round 字段用
             try:
                 stream.live_round_no = evt.get("round")
+            except Exception:
+                pass
+        elif evt_type == "live_round_model":
+            # 本轮生效聊天模型：附接回放 marker 携带 model 字段用
+            try:
+                stream.live_round_model = evt.get("model")
             except Exception:
                 pass
         elif evt_type == "task_done":

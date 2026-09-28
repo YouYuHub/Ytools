@@ -1,7 +1,7 @@
 # from __future__ import annotations
 # 标准库
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 # from datetime import datetime
 from typing import Any
 # 自定义模块
@@ -94,6 +94,13 @@ class ChatRoundStore:
             "status": "running",
         }
 
+    def set_model(self, model: dict[str, str]) -> bool:
+        """记录任务启动时确定的聊天模型，不随会话后续切换改变。"""
+        if self.pending_round is None or not model.get("name"):
+            return False
+        self.pending_round["model"] = dict(model)
+        return True
+
     def record_message(self, record: dict[str, Any]) -> dict[str, Any] | None:
         role = record.get("role")
         if self.pending_round is None:
@@ -111,10 +118,8 @@ class ChatRoundStore:
             self.pending_round = self.new_round(question=initial_question)
 
         # 深拷贝后再入轮次：持久层持有的事件必须与运行时 messages 的对象引用
-        # 解耦。上游（chat_factory）会把 messages 里的 assistant dict 原地修改
-        # （旧工具轮 reasoning_content 占位化、裁剪、剥离等）——若直接存引用，
-        # 轮次收尾时序列化的是"被运行时改过"的数据，落盘思考过程会失真成
-        # "..."。这里以写入时刻的内容为准，落盘永远是模型原始输出。
+        # 解耦，后续运行时更新不能反向改写已记录的轮次快照。这里以写入时刻
+        # 的内容为准，确保收尾和检查点序列化稳定。
         record = json.loads(json.dumps(record, ensure_ascii=False))
 
         self.pending_round["events"].append(record)
@@ -443,6 +448,13 @@ def parse_round_entry(entry: Any) -> dict[str, Any] | None:
         "status": status,
         "ended_at": ended_at,
     }
+
+    model = entry.get("model")
+    if isinstance(model, dict) and isinstance(model.get("name"), str) and model["name"].strip():
+        normalized_round["model"] = {
+            key: model[key].strip() for key in ("provider", "name", "id")
+            if isinstance(model.get(key), str) and model[key].strip()
+        }
 
     compress_content = entry.get("compress_content")
     try:

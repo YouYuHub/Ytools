@@ -29,7 +29,7 @@ DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
 DEFAULT_HISTORY_COMPACT_TARGET_TOKENS = 0
 DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模型上下文的系数
 DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务
-DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程（reasoning_content）最大回传长度；0 表示不回传，负数表示全部回传，正数表示保留末尾 N 字符
+DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程最大回传长度；0 不回传真实内容（最新工具调用可能发送 "..." 占位），负数全量，正数保留末尾 N 字符
 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
 DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制
 DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS = 300  # 工具调用流式阶段（模型 SSE 输出 tool_calls 期间）无输出超时秒数；超时按工具调用失败反馈模型并继续任务；0 或负数表示不限制
@@ -62,8 +62,8 @@ MAX_USER_NAME_LENGTH = 32                    # 显示名最大字符数（前端
 # 约束注入规模，避免超大文档撑爆请求体/模型窗口——超预算的文档降级为文本口径
 # （解析文本 + read_document 分页读取）。运行期经 load_var 读取（配置热重载生效）。
 DEFAULT_NATIVE_DOC_MAX_BYTES = 20 * 1024 * 1024        # 单个原生文档注入上限（字节）
-DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES = 40 * 1024 * 1024  # 单轮原生文档注入总量上限（字节）
-DEFAULT_NATIVE_DOC_MAX_ITEMS = 3                       # 单轮原生文档注入数量上限
+DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES = 40 * 1024 * 1024  # 同一次模型请求原生文档总量上限（字节）
+DEFAULT_NATIVE_DOC_MAX_ITEMS = 3                       # 同一次模型请求原生文档数量上限
 # 单个上传文件的解析文本入库上限（字符）：超出截断入库并标记，模型可
 # read_document 分页读取已入库文本，或用 read_file 读取原始文件绝对路径续读
 DEFAULT_FILE_TEXT_MAX_CHARS = 200000
@@ -77,7 +77,7 @@ class Message(BaseModel):
     tool_call_id: Optional[str] = None  # 工具调用 ID（tool role 时必须）
     refusal: Optional[str] = None  # 拒绝内容
     reasoning_content: Optional[str] = None  # 思考内容
-    # 引用快照（结构化方案，见 docs/quote_selection_design.md）：用户消息携带
+    # 引用快照（结构化方案，见 docs/quote_selection.md）：用户消息携带
     # 被选中的会话原文，落盘保存、模型视图由 memory.quote_format 序列化为
     # <quote_list> 前置到问题正文；上游请求不含该自定义字段（请求构造时剥离）
     quotes: Optional[List[dict]] = None

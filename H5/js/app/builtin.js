@@ -65,6 +65,10 @@
       name: READ_MEDIA_TOOL_NAME,
       description: "读取媒体（内置）：模型读取当前任务消息中的图片/视频（≤5 个）并以视觉形式观察",
     },
+    {
+      name: READ_DOCUMENT_TOOL_NAME,
+      description: "读取文档（内置）：按字符区间读取解析文本，或按当前模型的 supportDocTypes 发送原生文档；需在此处启用后模型才可调用",
+    },
   ];
 
   // 每个内置工具用一枚易辨认的线性图标；同一映射也供工具调用卡片使用。

@@ -68,8 +68,6 @@ def _make_context(task="子任务", tools=None, tool_servers=None, **overrides):
         initial_todo=None,
         tools=tools if tools is not None else [],
         tool_servers=tool_servers if tool_servers is not None else {},
-        configured_tool_names=set(),
-        configured_tool_servers={},
         max_rounds=3,
         timeout_seconds=0,
         reply_max_chars=2000,
@@ -283,7 +281,7 @@ class SubAgentReadMediaVisionTrueTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["injected_references"], [ref])
         # 坐标已进入待注入队列
-        self.assertEqual(runner.read_media_pending_parts, [(ref, None, None, None)])
+        self.assertEqual(runner.read_media_pending_parts, [(ref, None, None, None, ref)])
 
     def test_reference_outside_task_rejected(self):
         read_media_def = json.loads(json.dumps(bt.build_read_media_tool_definition()))

@@ -16,8 +16,8 @@
 | 3 | 结果结构 | 新建 `EditResult` dataclass | 🔧 变通：不建 dataclass，直接在现有结构化 result dict 上加字段 | 全链路是 dict 直传（有 `_sub_agent` 先例），加字段零序列化成本 |
 | 4 | 前端数据形态 | 后端发结构化 diff 行数组 `{type, old_line, new_line, content}` | ❌ 改用 **unified diff 文本 + 前端轻解析** | 本项目一份工具结果文本同时走「模型上下文 / SSE / JSONL」三条链路，结构化数组体积 3~5 倍会明显吃 token 与历史文件体积；unified diff 是标准格式，前端逐行看首字符即可解析 |
 | 5 | diff 进模型上下文 | diff 原样进 result 给模型核对 | ❌ **不进模型上下文**：模型只看 message 中「+N -M 行」统计摘要，diff 全文经 `_file_diff` 顶级键剥离、仅推前端与落盘 | 模型刚提交过 old/new，diff 主要是给用户看的；省 token 且历史文件不膨胀 |
-| 6 | 原子写入 | tmp + fsync + os.replace | ⏭️ 暂不做（阶段 2） | 现有 `open(..., newline="")` 写回路径稳定，diff 本体优先落地 |
-| 7 | 文件版本校验 | read 返回 content_hash + edit 传 expected_hash | 🔧 折中：本次只加 `content_hash` 字段（铺垫），`expected_hash` 校验放阶段 2 | 成本极低；校验涉及报错语义设计，单独迭代 |
+| 6 | 原子写入 | tmp + fsync + os.replace | ✅ 覆盖写和 edit_file 已实现；追加保留追加写语义 | 同目录临时文件写完后替换目标 |
+| 7 | 文件版本校验 | read 返回 content_hash + edit 传 expected_hash | ✅ 已实现 | 指纹不一致返回 `FILE_MODIFIED_EXTERNALLY`，原文件不写入 |
 | 8 | history 版本快照 / Batch Edit / preview 审阅 | 均建议实现 | ⏭️ 全部放阶段 2 | GPT 自己也建议第一版收敛 |
 
 ---
@@ -27,7 +27,7 @@
 ### 1.1 V1 已实现
 - 内置 `edit_file`：写回前生成 unified diff（归一化旧文本 vs 更新后文本），结果携带 `_file_diff` 顶级键；message 追加「diff +N -M 行」与「内容指纹 xxxx」；
 - 内置 `write_file`：写回前读旧内容（跳过二进制），覆盖 / 追加 / 新建三路径生成 diff；新建文件 diff 呈纯 `+` hunk；追加模式 diff 的 new_text = 旧内容 + 新内容；
-- `read_file` 返回 `content_hash`（全文指纹，为阶段 2 版本校验铺垫）；
+- `read_file` 返回 `content_hash`（全文指纹，可传给 `edit_file.expected_hash`）；
 - diff **不进模型上下文**（主循环与子任务循环统一剥离），仅随 SSE 事件与 JSONL 落盘分发；
 - 前端工具块输出区渲染彩色 diff 视图（实时 + 历史回放 + 子任务块三挂点）；
 - MCP sys_tools_server 版同名工具不受影响（返回纯文本，无 diff，前端自动回退）。
@@ -117,7 +117,7 @@ graph TD
   - `edit_file`：替换后全文的指纹；
   - `write_file`：写入内容的指纹（空内容省略）；
 - message 同步附带「内容指纹 xxxx」便于用户/模型肉眼比对；
-- 阶段 2 用法：模型把 read_file 拿到的 hash 作为 `edit_file.expected_hash` 传入，执行时与当前文件 `content_hash` 比对，不一致报 `FILE_MODIFIED_EXTERNALLY`。
+- 当前用法：模型把 `read_file.content_hash` 作为 `edit_file.expected_hash` 传入；执行时与当前文件的全文指纹比对，不一致报 `FILE_MODIFIED_EXTERNALLY`，原文件保持不变。
 
 ---
 

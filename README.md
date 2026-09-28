@@ -52,6 +52,8 @@ python main.py
 - `ownership_name` 为供应商顶层键名，`model_name` 为 `models` 内的模型键名；`id` 为请求 API 时实际发送的模型 id（缺省时使用键名）。
 - `model_selection` 支持四个角色：`chat_model`（聊天）、`compaction_model`（上下文压缩）、`title_model`（会话标题）、`sub_agent_model`（子智能体）；其中 `compaction_model` 与 `sub_agent_model` 仅支持 chat-completions 协议。
 - 角色的 `parameter`（生成参数）按协议分桶存放（`chat_completions` / `messages` / `responses`），`headers` 为自定义请求头；两者均可省略，也可以直接在前端「参数」面板中修改（写入同一份配置）。
+- 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；在「配置工具」→「内置工具」中启用 `read_document` 后，工具会按目标文件扩展名选择原生或解析文本。文本支持 `offset` / `limit`，原生 PDF 支持页区间；原生文件只在工具调用后的下一次模型请求中发送一次。
+- 内置文件工具按需勾选：`read_file` 返回正文、范围和全文指纹；`edit_file` 可携带 `expected_hash` 防止覆盖读后已变化的文件，编码无法无损解码或文件超过 64 MiB 时拒绝编辑；`search_files` 默认最多检查 3000 个文件或扫描 10 秒。`read_media` 对仍在上下文的图片避免重复注入，已回收的视频区间可以重新读取。
 - 修改保存后自动热重载生效，无需重启服务。
 
 ## 开发 MCP 工具（setting/mcp_servers.json）
@@ -96,7 +98,7 @@ if __name__ == "__main__":
     server.run(transport="stdio")
 ```
 
-- `inputs` 列出要启用的工具（`服务名: [工具名]`），只有启用的工具才会提供给模型；也可以在前端「配置工具」弹窗中勾选，保存后写回此键。
+- `inputs` 列出要启用的工具（`服务名: [工具名]`），只有启用的工具才会提供给模型；也可以在前端「配置工具」弹窗中勾选，保存后写回此键。跨服务重名或与内置工具/`over_task` 冲突的 MCP 工具会获得稳定的模型调用名；配置按服务身份读取旧的原始名称，并在保存时逐步迁移为新名称。
 - `servers` 修改后会自动重新探测工具（配置热重载，默认 5 秒轮询）；每次工具调用都会重新启动服务子进程，改完脚本后下次调用即生效。
 
 ## 工作路径与模型参数（会话独立机制）

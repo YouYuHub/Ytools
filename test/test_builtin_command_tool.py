@@ -3,7 +3,7 @@
 
 覆盖：
 - 工具定义与注入（include_run_command）
-- 名称注册（is_builtin_tool / SELECTABLE_BUILTIN_TOOL_NAMES / check_tool_exists）
+- 名称注册（is_builtin_tool / SELECTABLE_BUILTIN_TOOL_NAMES）
 - execute_run_command / try_execute_builtin_command_tool 基本执行（echo / 退出码 / 参数校验）
 - cmd 家族补丁辅助：内联代码定位（多行 / 含 % 的单行）、临时脚本改写、简单管道过滤器解析、本地 tail/head 兜底
 说明：真实命令执行依赖系统 shell（Windows 为 cmd）；非 Windows 环境自动跳过。
@@ -47,13 +47,6 @@ class BuiltinCommandToolTests(unittest.TestCase):
         self.assertEqual(params["required"], ["command"])
         for key in ("shell", "work_dir", "timeout_seconds", "background"):
             self.assertIn(key, params["properties"])
-
-    def test_check_tool_exists_recognizes_run_command(self):
-        result = bt.execute_builtin_tool(
-            "check_tool_exists", {"tool_name": "run_command"}, set(), {}
-        )
-        self.assertTrue(result["exists"])
-        self.assertEqual(result["server"], "__builtin__")
 
     # ---------- 执行入口 ----------
 

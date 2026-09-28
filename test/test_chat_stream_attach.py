@@ -35,7 +35,17 @@ def patch_env():
     cf.load_all_tools = lambda: asyncio.sleep(0)
     cf.tool_registry.ALL_TOOLS = []
     cf.tool_registry.TOOL_MCP_SERVERS = {}
-    cf.require_default_chat_config = lambda: None
+    # 上下文窗口：测试环境不读 models.json（默认 8192），而真实 MCP 工具定义
+    # 本身就占数千 token，会触发超窗降级链使任务提前终止——本测试只关注
+    # 后台续跑/附接回放行为，这里显式给出充足窗口
+    cf.resolve_model_max_input_tokens = lambda default=8192: 1000000
+    # 会话生效聊天模型（回放 marker.model 的数据源）
+    cf.require_default_chat_config = lambda: {
+        "selected_provider_name": "测试供应商",
+        "selected_model_name": "测试模型",
+        "selected_model_id": "test-model-id",
+        "vision": True,
+    }
     cf.compact_session_history_if_needed = lambda *a, **k: asyncio.sleep(0)
 
 
@@ -98,6 +108,10 @@ async def main():
     # 纯文本提问归一为单个 text 部件（前端多部件气泡重建/编辑入口数据源）
     assert marker.get("question_parts") == [{"type": "text", "text": "再来一轮"}], \
         f"回放标记应携带提问原始部件（实际 {marker.get('question_parts')}）"
+    # 本轮生效聊天模型（round_model 帧在回放起点之前，附接消费端收不到，
+    # 前端 usage 行模型名依赖 marker.model 回填）
+    assert marker.get("model") == {"provider": "测试供应商", "name": "测试模型", "id": "test-model-id"}, \
+        f"回放标记应携带本轮生效模型（实际 {marker.get('model')}）"
     joined_text = "".join(attached)
     assert "块" in joined_text, "应有回放/后续内容块"
     assert any("[DONE]" in c for c in attached), "附接流应收到 [DONE]"

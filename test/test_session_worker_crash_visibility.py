@@ -160,6 +160,26 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
         adapter.question_parts = "not-a-list"
         self.assertEqual(evt_queue.get_nowait(), {"type": "question_parts", "parts": None})
 
+    def test_adapter_live_round_model_enqueues_normalized_event(self):
+        import queue
+
+        evt_queue = queue.Queue()
+        adapter = session_worker._WorkerStreamAdapter("adapter-model-test", evt_queue)
+        model = {"provider": "供应商", "name": "模型 A", "id": "model-a"}
+        adapter.live_round_model = model
+        self.assertEqual(evt_queue.get_nowait(), {"type": "live_round_model", "model": model})
+        # 非 dict / 空 name 归一为 None（前端按旧后端路径省略模型名）
+        adapter.live_round_model = "not-a-dict"
+        self.assertEqual(evt_queue.get_nowait(), {"type": "live_round_model", "model": None})
+        adapter.live_round_model = {"name": "  "}
+        self.assertEqual(evt_queue.get_nowait(), {"type": "live_round_model", "model": None})
+        # 只保留 provider/name/id 三个非空字符串字段
+        adapter.live_round_model = {"name": "模型 A", "extra": "忽略", "id": ""}
+        self.assertEqual(
+            evt_queue.get_nowait(),
+            {"type": "live_round_model", "model": {"name": "模型 A"}},
+        )
+
     def test_handler_dispatches_round_and_parts_to_stream(self):
         proxy = session_worker.SessionWorkerProxy("evt-dispatch-test")
 
@@ -168,6 +188,7 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
                 self.question_text = ""
                 self.question_parts = None
                 self.live_round_no = None
+                self.live_round_model = None
                 self.round_started = False
 
             def emit(self, chunk):
@@ -180,10 +201,12 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
         proxy.bind_stream(stream)
         handler = session_worker._make_worker_event_handler(proxy)
         handler({"type": "live_round_no", "round": 7})
+        handler({"type": "live_round_model", "model": {"provider": "供应商", "name": "模型 A"}})
         handler({"type": "question_parts", "parts": [{"type": "text", "text": "看图"}]})
         handler({"type": "question_text", "text": "看图"})
         handler({"type": "round_start"})
         self.assertEqual(stream.live_round_no, 7)
+        self.assertEqual(stream.live_round_model, {"provider": "供应商", "name": "模型 A"})
         self.assertEqual(stream.question_parts, [{"type": "text", "text": "看图"}])
         self.assertEqual(stream.question_text, "看图")
         self.assertTrue(stream.round_started)

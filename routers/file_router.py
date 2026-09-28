@@ -26,7 +26,7 @@ from memory.chat_memory import (
     resolve_session_model_selection,
     resolve_session_work_dir,
 )
-from factory.file_factory import extract_text_from_bytes, get_text_extension
+from factory.file_factory import extract_text_from_bytes
 from routers.raw_upload import read_upload, require_raw_upload, spool_upload
 
 # 创建 API 路由器实例
@@ -160,9 +160,9 @@ async def upload_files(
         # read_file 按原文绝对路径续读），防止超大文本撑爆模型窗口
         "max_chars": _file_text_max_chars(),
     }]
-    # 会话生效模型的原生文档能力（supportDocTypes）：命中类型的文档原始文件
-    # 会在每轮请求中按原生文档注入（供应商侧视觉解析），文本解析仍并存作为
-    # 兜底（供应商拒绝 file 部件时可回退、read_document 也能返回文本）
+    # 会话生效模型的原生文档能力（supportDocTypes）仅用于标记可按需读取的
+    # 文件类型；生成时由 read_document 按目标扩展名决定原生/文本路径。
+    # 文本解析仍入库供文本模式与自动回退使用。
     session_support_doc_types = _resolve_session_support_doc_types(session_id)
     # 第二步：并发解析文件内容（CPU密集型操作）
     if file_data_list:
@@ -205,7 +205,7 @@ async def upload_files(
                     except Exception as save_error:
                         print(f"[WARN] 保存文档原始字节失败（不影响解析文本）: {save_error}")
                     # 原生文档标记：当前模型声明支持该类型且原始文件已保存时，
-                    # 该文件将按轮作为原生文档注入（文本解析结果作为兜底口径）
+                    # read_document 可按需走原生输入；文本解析结果仍可单独读取
                     native_supported = bool(
                         stored_name
                         and document_supports_native(
@@ -233,8 +233,8 @@ async def upload_files(
                     session_support_doc_types,
                 ):
                     # 本地解析失败但当前模型原生支持该类型：仍然接收——保存原始
-                    # 文件并入库记录（content 为空 + parse_failed 标记），该文件
-                    # 会按轮作为原生文档发送（供应商侧解析），不因本地解析器缺失
+                    # 文件并入库记录（content 为空 + parse_failed 标记），模型
+                    # 调用 read_document 时可按需原生发送，不因本地解析器缺失
                     # （如未装 PyMuPDF / python-docx）而阻断上传
                     filename = str(parse_result.get("filename") or file_data["filename"])
                     _, ext = os.path.splitext(filename.lower())
@@ -306,7 +306,6 @@ async def upload_files(
         "results": results,
         "upload_id": upload_id,
     })
-
 
 @api_file_router.post("/upload_session_media")
 async def upload_session_media(
@@ -564,23 +563,3 @@ async def delete_file_history(
         "message": f"已删除 {deleted_count} 个文件记录" if deleted_count > 0 else "未找到匹配的文件",
         "deleted_count": deleted_count
     })
-
-
-@api_file_router.delete("/clear_session_file_memorys")
-async def clear_file_history(
-    session_id: str = "default"
-):
-    """
-    清空指定会话的所有文件上传历史
-    参数:
-        session_id: 会话ID
-    返回:
-        操作结果
-    """
-    # 获取当前会话的记忆管理器
-    session_file_memory = await get_file_memory_manager(session_id)
-    result = session_file_memory.clear_file_memory()
-    return JSONResponse(content={
-        "message": result
-    })
-

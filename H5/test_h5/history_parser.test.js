@@ -40,6 +40,15 @@ test("parseHistory: user/assistant 记录与 skip done 块", function () {
   assert.equal(parsed.records[1].content, "你好！");
 });
 
+test("parseHistory: 用量记录携带该轮落盘的模型快照", function () {
+  const round = JSON.parse(fakeRound([
+    { role: "user", content: "问题" },
+  ], { total_tokens: 3 }));
+  round.model = { provider: "服务商", name: "旧模型", id: "model-id" };
+  const usage = historyParser.parseHistory(JSON.stringify(round)).records.find(function (r) { return r.kind === "usage"; });
+  assert.deepEqual(usage.model, round.model);
+});
+
 test("parseHistory: 用户消息携带引用快照透传给渲染层", function () {
   const quotes = [{ text: "被选中的原文", source: { role: "assistant", round: 1 } }];
   const round = fakeRound([

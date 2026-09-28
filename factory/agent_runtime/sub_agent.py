@@ -23,7 +23,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict
 
 from chat.chat_llm import ChatLLM
 from config import ChatLLMRequest
@@ -37,23 +37,22 @@ from env_manager import (
 )
 from util.timestamp_utils import now_str
 from memory import file_history as _file_history
-from memory.file_memory import retire_native_document_parts
+from memory.file_memory import (
+    native_doc_batch_limit_error,
+    retire_native_document_parts,
+)
 
 from factory.agent_runtime.builtin_tools import (
-    ASK_USER_TOOL_NAME,
-    CHECK_TOOL_EXISTS_NAME,
     RUN_COMMAND_NAME,
     READ_MEDIA_NAME,
     READ_DOCUMENT_NAME,
     SUB_AGENT_TOOL_NAME,
     TODO_TOOL_NAME,
-    execute_ask_user_placeholder,
-    execute_builtin_tool,
+    collect_injected_media_keys,
     execute_read_media,
     execute_read_document,
     load_any_media_model_part,
     normalize_todo_items,
-    roll_recent_media_parts,
     retire_prior_video_parts,
     cap_video_parts_in_batch,
     try_execute_builtin_command_tool,
@@ -63,7 +62,7 @@ from factory.agent_runtime.chat_runtime import (
     UsageAccumulator,
     build_request_messages,
     copy_for_request,
-    estimate_request_context_tokens,
+    # log_upstream_assistant_messages,  # 临时核对 API 消息时启用
     estimate_send_context_tokens,
     estimate_text_tokens,
     load_tool_call_stream_timeout,
@@ -79,6 +78,7 @@ from factory.agent_runtime.context_compaction import (
     make_oversized_result_preview,
     resolve_oversized_result_token_threshold,
 )
+from factory.system_prompt import build_sub_agent_system_text
 from factory.agent_runtime.tool_executor import (
     execute_tool_round,
     normalize_tool_calls,
@@ -100,11 +100,9 @@ class SubAgentContext:
     # 任务
     task: str
     initial_todo: list[dict[str, Any]] | None
-    # 工具（父级本轮快照，已剔除 sub_agent；ask_user 替换为占位定义）
+    # 工具（父级本轮快照，已剔除 sub_agent 与 ask_user）
     tools: list[dict[str, Any]]
     tool_servers: Dict[str, str]
-    configured_tool_names: set[str]
-    configured_tool_servers: Dict[str, str]
     # 限制
     max_rounds: int
     timeout_seconds: float
@@ -119,6 +117,8 @@ class SubAgentContext:
     parent_round_number: int = 0
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
+    # 模型可见名称到 MCP 原始工具名的映射，供子任务调用时还原协议名称。
+    tool_original_names: Dict[str, str] = field(default_factory=dict)
 
     def stop_requested(self) -> bool:
         """本子任务是否被要求停止（父级停止 或 取消令牌置位）。"""
@@ -254,14 +254,23 @@ def _format_result_text(result: Any) -> str:
             if k not in ("_file_diff", "_file_history")
         }
         # 原生文档块（read_document 返回）：数据本体为 base64，绝不能进入
-        # 模型文本上下文或 JSONL；只保留可读的注入说明
+        # 模型文本上下文或 JSONL；只保留可追溯文件引用和一次性发送说明
         native_block = result.pop("native", None)
         if isinstance(native_block, dict):
-            filename = str(native_block.get("filename") or "")
-            result["native_document"] = (
-                f"{filename} 已作为原生文档注入后续请求" if filename
-                else "原生文档已注入后续请求"
-            )
+            native_document = {
+                "filename": str(native_block.get("source_filename") or native_block.get("filename") or ""),
+                "file_ref": str(
+                    result.get("file_ref")
+                    or native_block.get("file_ref")
+                    or native_block.get("stored_name")
+                    or ""
+                ),
+                "delivery": "下一次模型请求发送一次；之后需要原文时重新调用 read_document",
+            }
+            for key in ("page_start", "page_end", "total_pages"):
+                if native_block.get(key) is not None:
+                    native_document[key] = native_block[key]
+            result["native_document"] = native_document
     if isinstance(result, str):
         return result
     try:
@@ -371,10 +380,11 @@ class SubAgentRunner:
 
     def __init__(self, context: SubAgentContext):
         self.context = context
-        # 任务文本必须注入为首轮 user 消息：子任务上下文完全独立、无系统
-        # 提示词兜底，不注入则首轮请求 messages 为空，模型只会闲聊收尾，
-        # 且"未执行任何任务"会被误标为 done（回归防护）。
+        # 子智能体必须有自己的系统提示词：明确角色、工具边界和交付格式。
+        # 派发任务作为 user 消息传入，避免把任务文本提升为系统指令；两者
+        # 都进入上下文预算预检与实际上游请求。
         self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": build_sub_agent_system_text()},
             {"role": "user", "content": context.task},
         ]
         self.todo: list[dict[str, Any]] = list(context.initial_todo or [])
@@ -417,10 +427,11 @@ class SubAgentRunner:
         # 工具结果统一处理后现场加载 base64 部件注入为 user 消息（仅内存，
         # 不落盘）；视频区间读取的坐标含区间；injected_refs 防重复读取
         # （键带区间：同视频不同区间是新的读取）；滚动窗口只保留最近 5 个
-        self.read_media_pending_parts: list[tuple[str, Any]] = []
+        self.read_media_pending_parts: list[tuple[str, Any, Any, Any, str]] = []
         self.read_media_injected_refs: set[str] = set()
         # read_document 原生分支待注入部件（模型支持该文档类型时）
         self.native_doc_pending_parts: list[Any] = []
+        self.native_doc_pending_bytes = 0
         # 任务文本中的 media:// 引用集合：子任务 read_media 的安全边界数据源
         #（父模型派发任务时把可回读引用写进 task，子模型只能读这些）
         self.task_media_references: set[str] = set(
@@ -492,8 +503,7 @@ class SubAgentRunner:
             todo=self.todo or None,
             tools=[
                 name for name in self.context.tool_servers
-                if name != CHECK_TOOL_EXISTS_NAME
-                and not (self._vision_enabled is False and name == READ_MEDIA_NAME)
+                if not (self._vision_enabled is False and name == READ_MEDIA_NAME)
             ],
             rounds_limit=self.context.max_rounds,
             timeout_seconds=self.context.timeout_seconds,
@@ -592,6 +602,11 @@ class SubAgentRunner:
             tools=self._visible_tool_definitions() or None,
             session_id=self.context.session_id,
         )
+        # 临时核对子智能体上游实际 assistant 消息时启用：
+        # log_upstream_assistant_messages(
+        #     ChatLLM._serialize_messages(request.messages),
+        #     source=f"sub_agent:{self.context.agent_id}",
+        # )
         if "temperature" in parameter:
             try:
                 request.temperature = float(parameter["temperature"])
@@ -729,6 +744,7 @@ class SubAgentRunner:
         （index/tool_call/tool_name/tool_args/result/error）。
         """
         ctx = self.context
+        self.read_media_injected_refs = collect_injected_media_keys(self.messages)
         known_tool_names = list(ctx.tool_servers.keys())
         normalized = normalize_tool_calls(tool_calls, known_tool_names)
         plan = prepare_tool_execution(normalized, known_tool_names)
@@ -804,9 +820,6 @@ class SubAgentRunner:
                         todo_result["warnings"] = notices
                 builtin_results.append((idx, tc, tn, ta, todo_result))
                 continue
-            if tn == ASK_USER_TOOL_NAME:
-                builtin_results.append((idx, tc, tn, ta, execute_ask_user_placeholder(ta)))
-                continue
             if tn == SUB_AGENT_TOOL_NAME:
                 builtin_results.append((idx, tc, tn, ta, {
                     "error": "子智能体不支持再派发子任务（V1 禁止嵌套），请自行完成或分步执行",
@@ -859,22 +872,20 @@ class SubAgentRunner:
                             item.get("quality"),
                             item.get("start_time"),
                             item.get("end_time"),
+                            item["injected_key"],
                         )
                         for item in (read_media_result.get("loaded") or [])
                         if item.get("reference")
                     ])
-                    evicted_refs: set[str] = set()
-                    self.read_media_pending_parts = roll_recent_media_parts(
-                        self.read_media_pending_parts,
-                        evicted=evicted_refs,
-                    )
-                    self.read_media_injected_refs.difference_update(evicted_refs)
+                    if len(self.read_media_pending_parts) > 5:
+                        evicted = self.read_media_pending_parts[:-5]
+                        self.read_media_pending_parts = self.read_media_pending_parts[-5:]
+                        self.read_media_injected_refs.difference_update(item[4] for item in evicted)
                 builtin_results.append((idx, tc, tn, ta, read_media_result))
                 continue
             if tn == READ_DOCUMENT_NAME:
-                # 读取用户上传文件：子任务生效模型声明支持该类型（supportDocTypes）
-                # 时优先返回原生文档部件（与父循环 execute_read_document 同接口），
-                # 由 runner 在工具结果统一处理后注入；未命中则纯文本分页口径
+                # 按子任务模型对此文件扩展名的 supportDocTypes 决定 auto 模式；
+                # 不依据 vision 标志。原生输入只进入下一次请求一次。
                 read_document_result = execute_read_document(
                     ta, ctx.session_id, support_doc_types=self._native_doc_types(),
                 )
@@ -883,15 +894,35 @@ class SubAgentRunner:
                     if isinstance(read_document_result, dict) else None
                 )
                 if isinstance(native_block, dict) and native_block.get("part") is not None:
-                    self.native_doc_pending_parts.append(native_block["part"])
+                    try:
+                        native_size = int(native_block.get("size") or 0)
+                    except (TypeError, ValueError):
+                        native_size = 0
+                    budget_error = native_doc_batch_limit_error(
+                        len(self.native_doc_pending_parts),
+                        self.native_doc_pending_bytes,
+                        native_size,
+                    )
+                    request_mode = str(ta.get("mode") or "auto").strip().lower()
+                    is_page_range = "page_start" in ta or "page_count" in ta
+                    if budget_error:
+                        if request_mode == "native" or is_page_range:
+                            read_document_result = {"error": budget_error}
+                        else:
+                            text_args = {**ta, "mode": "text"}
+                            read_document_result = execute_read_document(
+                                text_args, ctx.session_id,
+                                support_doc_types=self._native_doc_types(),
+                            )
+                            if isinstance(read_document_result, dict) and not read_document_result.get("error"):
+                                read_document_result["message"] = (
+                                    str(read_document_result.get("message") or "")
+                                    + f"；因原生文档批次预算限制，已回退解析文本：{budget_error}"
+                                )
+                    else:
+                        self.native_doc_pending_parts.append(native_block["part"])
+                        self.native_doc_pending_bytes += native_size
                 builtin_results.append((idx, tc, tn, ta, read_document_result))
-                continue
-            builtin_result = execute_builtin_tool(
-                tn, ta, ctx.configured_tool_names, ctx.configured_tool_servers,
-                enabled_tool_names=set(ctx.tool_servers),
-            )
-            if builtin_result is not None:
-                builtin_results.append((idx, tc, tn, ta, builtin_result))
                 continue
             file_tool_result = try_execute_builtin_file_tool(tn, ta)
             if file_tool_result is not None:
@@ -927,6 +958,7 @@ class SubAgentRunner:
                 parsed_tools=external_tools,
                 tool_mcp_servers=ctx.tool_servers,
                 max_workers=max_workers,
+                tool_original_names=ctx.tool_original_names,
             )
             results.extend(mcp_results)
         results.sort(key=lambda item: item["index"])
@@ -974,7 +1006,7 @@ class SubAgentRunner:
             self._vision_enabled if isinstance(self._vision_enabled, bool) else None
         )
         visible_tools = self._visible_tool_definitions()
-        # 预检查：task + 工具定义 vs 模型窗口（超窗 → error 收尾，不走父级降级链）
+        # 预检查：系统提示 + task + 工具定义 vs 模型窗口（超窗 → error 收尾，不走父级降级链）
         # 按"模型实际可见工具"估算（vision=false 时 read_media 已被剔除）
         model_config, _parameter = self._resolve_request_model_config()
         window = (
@@ -1085,6 +1117,14 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 continue
+            # 原生文档按需发送一次：模型完整响应后把旧部件替换为占位；截断、
+            # length 续写或工具流超时保留原部件，避免重试时丢失模型输入。
+            if (
+                not call["stream_truncated"]
+                and call["finish_reason"] != "length"
+                and not call["tool_phase_timeout_hit"]
+            ):
+                retire_native_document_parts(self.messages)
             # 归一化工具调用（流式拼接异常修复）：与执行侧共用同一份列表，
             # 保证下面 assistant 声明的 id 与 _execute_tool_round 产出的结果
             # 一一配对——上游对声明/结果严格校验，任何"结果无声明"的孤儿或
@@ -1371,7 +1411,7 @@ class SubAgentRunner:
                 # 同批多视频仅第一个带画面数据（供应商单请求仅 1 个视频）
                 retire_prior_video_parts(self.messages)
                 media_parts = []
-                for reference, quality, start_time, end_time in self.read_media_pending_parts:
+                for reference, quality, start_time, end_time, _key in self.read_media_pending_parts:
                     info = load_any_media_model_part(
                         ctx.session_id, reference, quality=quality,
                         start_time=start_time, end_time=end_time,
@@ -1389,6 +1429,10 @@ class SubAgentRunner:
                             "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
                         })
                 media_parts = cap_video_parts_in_batch(media_parts)
+                retained_keys = [
+                    key if isinstance(part, dict) and part.get("type") in {"image_url", "input_audio"} else None
+                    for (_ref, _quality, _start, _end, key), part in zip(self.read_media_pending_parts, media_parts)
+                ]
                 self.messages.append({
                     "role": "user",
                     "content": [
@@ -1402,11 +1446,11 @@ class SubAgentRunner:
                         *media_parts,
                     ],
                     "_internal": True,
+                    "_media_injected_keys": retained_keys,
                 })
                 self.read_media_pending_parts = []
-            # read_document 原生文档注入（子任务版）：模型声明支持该类型时，
-            # 工具返回的原生文档部件在此作为 user 消息追加（仅内存、不落盘）。
-            # 注入前回收上一批原生文档数据（转文本占位），避免多批叠加
+            # read_document 原生文档注入（子任务版）：部件只作为下一次请求的
+            # user 消息内容（仅内存、不落盘）；完整响应后已转为文本占位。
             if self.native_doc_pending_parts:
                 retire_native_document_parts(self.messages)
                 self.messages.append({
@@ -1424,6 +1468,7 @@ class SubAgentRunner:
                     "_internal": True,
                 })
                 self.native_doc_pending_parts = []
+                self.native_doc_pending_bytes = 0
             # 循环继续：下一轮模型调用（顶部已检查停止条件）
 
     # ----------------------------- 收尾辅助 -----------------------------

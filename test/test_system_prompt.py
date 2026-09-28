@@ -47,6 +47,22 @@ class RuntimeSystemTextTests(unittest.TestCase):
         self.assertIn("<C:/tmp/b>", b)
 
 
+class SubAgentSystemTextTests(unittest.TestCase):
+    """子智能体系统提示复用运行规则，同时使用独立角色约束。"""
+
+    def test_sub_agent_prompt_has_role_rules_and_omits_parent_media_state(self):
+        prompt = sp.build_sub_agent_system_text("C:/tmp/sub-agent")
+
+        self.assertIn("当前工作路径为<C:/tmp/sub-agent>", prompt)
+        self.assertIn("你是一个子智能体", prompt)
+        self.assertIn("只能调用当前请求 tools 字段中列出的工具", prompt)
+        self.assertIn("父智能体可直接引用的结论报告", prompt)
+        self.assertNotIn("## 媒体展示（伪标签）", prompt)
+        self.assertNotIn("当前模型不支持视觉", prompt)
+        self.assertNotIn("read_media", prompt)
+        self.assertNotIn("重要内容需要实时告诉用户", prompt)
+
+
 class ToolCallTimeoutNoteTests(unittest.TestCase):
     """MCP 工具超时的可变配置说明。"""
 
@@ -94,6 +110,7 @@ class ConditionalNoteTests(unittest.TestCase):
         prompt = sp.build_sys_prompt()
         self.assertIn("工具返回 [] 表示空值而不是失败", prompt)
         self.assertIn("思考过程只保留最近一次", prompt)
+        self.assertIn("重要内容需要实时告诉用户", prompt)
 
 
 class ReadMediaNoteTests(unittest.TestCase):

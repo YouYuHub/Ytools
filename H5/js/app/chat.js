@@ -119,6 +119,7 @@
     const usageByCompletion = new Map();
     const usageWithoutId = new Map();
     let roundUsageAcc = null;
+    let roundModel = activeStream.model || null;
     // 标题生成（前端驱动）：流内累计思考/正文 delta，达 TITLE_PREVIEW_CHARS
     // 时由 maybeTriggerTitle 发起一次标题请求（聊天主链路不再感知标题任务）
     let titleReasoning = "";
@@ -179,8 +180,20 @@
       }
       roundUsageAcc = rebuildRoundUsage();
       activeStream.usage = roundUsageAcc;
-      ensureUsageLine().textContent = FormatUtils.usageText(roundUsageAcc);
+      ensureUsageLine().textContent = FormatUtils.usageText(roundUsageAcc, roundModel);
       msg.appendChild(usageLine);
+      return true;
+    }
+
+    // 更新本轮展示模型（usage 行「模型 provider/name」文案的数据源）：
+    // 同步写入管线内部与 activeStream（切走再切回会话时复用），并在 usage
+    // 行已渲染时立即重绘。唯一下发通道为 round_model 帧（round_started 帧
+    // 不再携带 model）；附接回放走 marker.model → 同一入口。
+    function setRoundModel(model) {
+      if (!model || typeof model.name !== "string" || !model.name.trim()) return false;
+      roundModel = model;
+      activeStream.model = model;
+      if (roundUsageAcc) ensureUsageLine().textContent = FormatUtils.usageText(roundUsageAcc, roundModel);
       return true;
     }
 
@@ -218,6 +231,10 @@
     function handle(evt) {
       if (evt.type === "done") return;
       const data = evt.data || {};
+
+      // 本轮生效聊天模型：唯一下发通道为 round_model 帧（三条发送路径均推送；
+      // round_started 帧只带轮次号，不再冗余携带 model）
+      if (data.round_model) setRoundModel(data.round_model);
 
       // 轮次开始：后端任务启动后推送本轮最终轮次号（普通发送），前端就地
       // 补挂本轮提问气泡的编辑/复制/删除入口（此前收尾不重载就没有入口）；
@@ -566,6 +583,8 @@
 
     return {
       handle: handle,
+      // 附接回放 marker.model → 本轮展示模型（与 round_model 帧同一入口）
+      setRoundModel: setRoundModel,
       finish: function () {
         // 流结束时仍未收到消费信号：清除待注入提示（避免停止/异常时残留）
         App.clearInjectedPending(sessionId);
@@ -1008,6 +1027,9 @@
             if (Array.isArray(data.question_quotes) && data.question_quotes.length) {
               activeStream.quotes = QuoteUtils.quotesForRequest(data.question_quotes);
             }
+            // 本轮生效聊天模型（round_model 帧在回放起点之前，消费端收不到，
+            // 随 marker 下发）：usage 行模型名文案的数据源
+            if (data.model) pipe.setRoundModel(data.model);
             if (activeStream.userText || parts) {
               // 历史文件已落盘时可能已经渲染过本轮提问（生成中刷新，提问事件
               // 已随检查点/收尾写入）：优先按轮次精确匹配并复用该节点补挂

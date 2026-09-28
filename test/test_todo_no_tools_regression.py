@@ -27,6 +27,7 @@ class _FakeStream:
         # 与 _SessionStream 鸭子类型对齐：回放补气泡/轮次标记相关属性
         self.question_parts = None
         self.live_round_no = None
+        self.live_round_model = None
         self.round_start_seq = 0
 
     def emit(self, chunk):
@@ -56,6 +57,10 @@ class _MemoryStub:
         if isinstance(record, dict) and record.get("done") == "[DONE]":
             self.records.append("round_finalized_done")
         return "记录成功"
+
+    async def set_current_round_model(self, model):
+        # 每轮生效聊天模型落盘（round_model 帧的同源写入）：最小桩仅接收
+        return True
 
     async def get_session_todo(self):
         return []
@@ -185,16 +190,6 @@ class NoToolNamesRegressionTests(unittest.TestCase):
         stream = asyncio.run(_run_case([]))
         joined = "".join(stream.chunks)
         self.assertIn("你好！", joined)
-
-    def test_retain_latest_reasoning_removes_previous_rounds(self):
-        messages = [
-            {"role": "assistant", "content": "旧回答", "reasoning_content": "旧思考"},
-            {"role": "tool", "content": "结果"},
-            {"role": "assistant", "content": "当前工具调用", "reasoning_content": "当前思考"},
-        ]
-        chat_factory._retain_latest_reasoning(messages)
-        self.assertNotIn("reasoning_content", messages[0])
-        self.assertEqual(messages[2]["reasoning_content"], "当前思考")
 
     def test_replace_todo_context_keeps_one_compact_status(self):
         messages = [

@@ -6,7 +6,8 @@
 - file_memory：原生文档记录筛选（数量/单文件/总量上限）、部件构建（data URL）、
   占位回收（retire_native_document_parts）、清单标注（原生文档/截断提示）；
 - file_router：上传落盘（stored_name/abs_path/截断标记/native_doc_supported）；
-- builtin_tools：execute_read_document 原生分支（命中返回 native 块，未命中纯文本）；
+- builtin_tools：execute_read_document 按 supportDocTypes 分流、offset/limit、PDF 页段与原生结果不重复返回解析文本；
+- 原生文档批次预算与压缩文本剥离 base64；
 - 前端契约：DOC_EXTENSIONS 与后端 TEXT_FILE_EXTENSIONS 覆盖一致。
 
 运行：python -m pytest test/test_native_document_support.py -v
@@ -53,6 +54,12 @@ class SupportDocTypesNormalizationTests(unittest.TestCase):
                         "url": "https://example.test/v1",
                         "supportDocTypes": None,
                     },
+                    "DocWithoutVision": {
+                        "id": "doc-without-vision",
+                        "url": "https://example.test/v1",
+                        "vision": False,
+                        "supportDocTypes": [".pdf"],
+                    },
                 },
             },
         }), encoding="utf-8")
@@ -69,6 +76,9 @@ class SupportDocTypesNormalizationTests(unittest.TestCase):
         cfg = get_model_config("Prov", "NativeDoc")
         self.assertEqual(cfg["support_doc_types"], [".pdf", ".docx"])
         self.assertEqual(get_model_config("Prov", "NoDoc")["support_doc_types"], [])
+        no_vision_cfg = get_model_config("Prov", "DocWithoutVision")
+        self.assertFalse(no_vision_cfg["vision"])
+        self.assertEqual(no_vision_cfg["support_doc_types"], [".pdf"])
 
     def test_listed_in_available_models(self):
         from env_manager import list_available_models
@@ -226,6 +236,93 @@ class NativeDocumentHelperTests(unittest.TestCase):
         self.assertEqual([item["filename"] for item in selected], ["a.pdf"])
         self.assertTrue(any("总量上限" in note for note in skipped), skipped)
 
+    def test_manifest_does_not_inline_any_native_candidate_past_batch_budget(self):
+        records = [
+            self._add_record(f"doc-{index}.pdf", b"pdf")
+            for index in range(1, 5)
+        ]
+        for index, record in enumerate(records, start=1):
+            record["content"] = f"解析正文-{index}"
+        with mock.patch.object(file_memory, "native_doc_max_items", return_value=1), \
+             mock.patch.object(file_memory, "native_doc_total_max_bytes", return_value=1):
+            manifest = file_memory.build_file_manifest_text(
+                records, native_doc_types=[".pdf"]
+            )
+        for index in range(1, 5):
+            self.assertIn(f"doc-{index}.pdf", manifest)
+            self.assertNotIn(f"解析正文-{index}", manifest)
+        self.assertEqual(manifest.count("未发送解析文本"), 4)
+
+    def test_manifest_falls_back_to_parsed_text_when_read_document_is_disabled(self):
+        record = self._add_record("manual.pdf", b"%PDF")
+        manifest = file_memory.build_file_manifest_text(
+            [record], native_doc_types=[".pdf"], read_document_available=False
+        )
+        self.assertIn("解析文本" * 10, manifest)
+        self.assertNotIn("原生文档按需读取", manifest)
+        self.assertNotIn("模型声明支持原生文档输入", manifest)
+        self.assertNotIn("read_document(mode=", manifest)
+
+    def test_native_request_batch_limits(self):
+        with mock.patch.object(file_memory, "native_doc_max_items", return_value=2), \
+             mock.patch.object(file_memory, "native_doc_total_max_bytes", return_value=100):
+            self.assertIsNone(file_memory.native_doc_batch_limit_error(1, 50, 50))
+            self.assertIn("最多发送 2 个", file_memory.native_doc_batch_limit_error(2, 50, 1))
+            self.assertIn("总量", file_memory.native_doc_batch_limit_error(1, 90, 11))
+
+    def test_compaction_text_replaces_native_data_with_filename_placeholder(self):
+        from factory.agent_runtime.context_compaction import _round_messages_to_compaction_text
+
+        secret_payload = "SECRET_BASE64_PAYLOAD"
+        text = _round_messages_to_compaction_text([], [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请阅读文档"},
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "manual.pdf",
+                        "file_data": f"data:application/pdf;base64,{secret_payload}",
+                    },
+                },
+            ],
+            "_internal": True,
+        }])
+        self.assertIn("[文档 manual.pdf]", text)
+        self.assertNotIn(secret_payload, text)
+        self.assertNotIn("file_data", text)
+
+    @unittest.skipIf(file_factory.fitz is None, "PyMuPDF 未安装")
+    def test_native_pdf_page_range_builds_valid_subset(self):
+        fitz = file_factory.fitz
+        source = fitz.open()
+        for index in range(1, 4):
+            page = source.new_page()
+            page.insert_text((72, 72), f"Page {index}")
+        source_bytes = source.tobytes()
+        source.close()
+
+        built = file_memory.build_native_pdf_page_part_from_bytes(
+            "manual.pdf", source_bytes, 2, 1, stored_name="manual.pdf"
+        )
+        self.assertNotIn("error", built)
+        self.assertEqual((built["page_start"], built["page_end"]), (2, 2))
+        encoded = built["part"]["file"]["file_data"].split(",", 1)[1]
+        subset = fitz.open(stream=base64.b64decode(encoded), filetype="pdf")
+        try:
+            self.assertEqual(len(subset), 1)
+            self.assertIn("Page 2", subset[0].get_text())
+        finally:
+            subset.close()
+
+    def test_native_pdf_page_range_reports_missing_optional_parser(self):
+        with mock.patch.object(file_factory, "fitz", None):
+            result = file_memory.build_native_pdf_page_part_from_bytes(
+                "manual.pdf", b"pdf bytes", 1, 1
+            )
+        self.assertIn("error", result)
+        self.assertIn("需要 PyMuPDF", result["error"])
+
     def test_retire_native_parts_replaces_with_text(self):
         record = self._add_record("手册.pdf", b"%PDF-1.4")
         built = file_memory.build_native_document_part(self._session, record)
@@ -293,15 +390,37 @@ class ReadDocumentNativeBranchTests(unittest.TestCase):
         init_path(ROOT)
         self._tmp_dir.cleanup()
 
-    def test_native_branch_when_supported(self):
+    def test_auto_native_branch_returns_no_duplicate_parse_text(self):
         result = builtin_tools.execute_read_document(
-            {"filename": "说明.pdf", "max_chars": 10},
+            {"filename": "说明.pdf"},
             self._session,
             support_doc_types=[".pdf"],
         )
         self.assertIn("native", result)
         self.assertEqual(result["native"]["part"]["type"], "file")
         self.assertIn("原生文档", result["message"])
+        self.assertNotIn("content", result)
+        self.assertEqual(result["mode"], "native")
+
+    def test_offset_limit_forces_text_even_when_native_is_supported(self):
+        result = builtin_tools.execute_read_document(
+            {"filename": "说明.pdf", "offset": 2, "limit": 10},
+            self._session,
+            support_doc_types=[".pdf"],
+        )
+        self.assertNotIn("native", result)
+        self.assertEqual(result["mode"], "text")
+        self.assertEqual(result["offset"], 2)
+        self.assertEqual(result["content"], ("第一段" * 100)[2:12])
+        self.assertEqual(result["next_offset"], 12)
+
+    def test_legacy_max_chars_alias_selects_text_mode(self):
+        result = builtin_tools.execute_read_document(
+            {"filename": "说明.pdf", "max_chars": 10},
+            self._session,
+            support_doc_types=[".pdf"],
+        )
+        self.assertNotIn("native", result)
         self.assertEqual(len(result["content"]), 10)
 
     def test_text_branch_when_not_supported(self):
@@ -320,6 +439,15 @@ class ReadDocumentNativeBranchTests(unittest.TestCase):
             support_doc_types=[".docx"],
         )
         self.assertNotIn("native", result)
+
+    def test_explicit_native_rejects_unsupported_type(self):
+        result = builtin_tools.execute_read_document(
+            {"filename": "说明.pdf", "mode": "native"},
+            self._session,
+            support_doc_types=[".docx"],
+        )
+        self.assertIn("error", result)
+        self.assertIn("未声明支持", result["error"])
 
     def test_native_block_stripped_from_model_text(self):
         result = builtin_tools.execute_read_document(

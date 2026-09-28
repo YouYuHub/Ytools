@@ -39,11 +39,15 @@
     };
   }
 
-  function usageText(usage) {
+  function usageText(usage, model) {
     const p = usage.prompt_tokens || 0;
     const c = usage.completion_tokens || 0;
     const t = usage.total_tokens || p + c;
-    return "本轮消耗 " + fmtNum(t) + " tokens（输入 " + fmtNum(p) + " · 输出 " + fmtNum(c) + "）";
+    const modelName = model && typeof model.name === "string" ? model.name.trim() : "";
+    const provider = model && typeof model.provider === "string" ? model.provider.trim() : "";
+    const label = modelName ? (provider ? provider + "/" + modelName : modelName) : "";
+    return "本轮消耗 " + fmtNum(t) + " tokens（输入 " + fmtNum(p) + " · 输出 " + fmtNum(c) + "）"
+      + (label ? " · 模型 " + label : "");
   }
 
   function compactionUsageText(usage) {

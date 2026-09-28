@@ -14,7 +14,7 @@
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | messages | `Message[]` | 必填 | 对话消息。`Message` = `{role, content?, name?, tool_calls?, tool_call_id?, refusal?, reasoning_content?, quotes?}`，role ∈ `user/assistant/system/tool`。`quotes`（可选，仅本轮最新 user 消息）：选中文本引用快照 `[{text, source?{role?, session_id?, round?}}]`，最多 5 段、单段 ≤4000 字符、合计 ≤12000 字符，超限/非法直接 400 可读错误（不静默截断）；旧请求无该字段行为不变 |
-| tool_names | `string[]?` | null | 本轮工具白名单；不传时按会话覆盖、全局默认的顺序读取工具选择，显式传 `[]` 为无工具模式；未知工具名会被忽略并告警 |
+| tool_names | `string[]?` | null | 本轮工具白名单，MCP 项使用 `/tools/list` 返回的模型可见 `function.name`；不传时按会话覆盖、全局默认的顺序读取工具选择，显式传 `[]` 为无工具模式；未知或无法消歧的旧名称会被忽略并告警 |
 | session_id | `string` | "default" | 会话ID，隔离聊天历史与文件记忆 |
 | max_tokens | `int` | 8192 | 最大生成 token |
 | temperature | `float` | 0.7 | 随机性；未显式传时按 `model_selection.chat_model.parameter` 填充 |
@@ -34,8 +34,9 @@
 - `tool_calls`：工具调用增量（按 index 合并）
 - `tool_start`：工具开始执行事件，`{"tool_start": {"function_name", "arguments", "tool_call_id"}}`。模型参数生成完毕、即将调用时推送（内置与 MCP 工具统一覆盖；被拦截的未授权工具不推送）。前端据此把对应工具块置为"执行中"状态，填补"参数生成完毕→结果返回"之间的静默期。`tool_call_id`（additive，旧前端忽略）为该次调用的父级 tool_call id；对 `sub_agent` 派发，前端据此在子任务事件到达前预建子任务块
 - `tool_return`：工具执行结果 `{function_name, arguments, result}`；`sub_agent` 结果额外携带聚合字段 `sub_agent: {agent_id, status, rounds, usage_total}`（前端不渲染为普通工具气泡，而是在子任务块尾部显示"最终回复已返回父智能体"引用条）
-- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）。推送时同步记录到任务流（`live_round_no`），供回放标记携带——`round_started` 帧位于回放起点之前，附接消费端收不到，轮次号必须随回放标记下发
-- `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "question_quotes": <本轮引用快照，无引用时省略；旧后端无此字段>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览；引用卡片同源重建），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配（带引用时同时比较引用签名）
+- `round_started`：任务启动后立即推送本轮最终轮次号 `{"round_started": {"round": N}}`（**仅普通发送**；编辑重发/回答插入分别改推 `target_round`/`insert_round` 帧，不重复推送；覆盖式回答截断可能改变轮次，事件统一推迟到截断后发送；失败路径不推送——前端走失败重载兜底；仅实时推送不落盘；**只带轮次号，不带 model**）。前端据此给本轮提问气泡就地补挂编辑/复制/删除操作行：上一轮任务正常完成后**无需重载会话**即可编辑/删除"最后一轮"（旧实现收尾不重载导致本轮没有操作入口，需切走会话再切回）。推送时同步记录到任务流（`live_round_no`），供回放标记携带——`round_started` 帧位于回放起点之前，附接消费端收不到，轮次号必须随回放标记下发
+- `round_model`：本轮生效聊天模型 `{"round_model": {"provider": <供应商名>, "name": <models.json 模型配置名>, "id": <实际请求 API 的模型 id>}}`（与轮次 JSONL 的 `chat_round.model` 字段同源，字段缺失项省略；任务启动时确定，用户在任务进行中切换模型不改写本轮）。**唯一下发通道**：普通发送/编辑重发/回答插入三条路径均在提问落盘后推送一次——`round_started` 帧只在普通发送路径推送（编辑重发/回答插入没有该帧），模型名放那里会丢，故统一由本帧承载；前端据此在本轮 usage 行显示「模型 provider/name」。推送时同步记录到任务流（`live_round_model`），供回放标记携带（本帧位于回放起点之前，附接消费端收不到）
+- `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "question_quotes": <本轮引用快照，无引用时省略；旧后端无此字段>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>, "model": <本轮生效聊天模型，同 round_model；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览；引用卡片同源重建），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配（带引用时同时比较引用签名）；`model` 回填本轮 usage 行模型名
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
 - `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
@@ -64,7 +65,7 @@
 
 #### 引用快照（选中文本引用到提问）
 
-用户在聊天正文中选中文字后点击浮钮「引用到提问」，引用文本作为快照随该条用户消息上送（结构化字段，见请求体 `messages[].quotes`）。两种视图分离（设计文档 `docs/quote_selection_design.md`）：
+用户在聊天正文中选中文字后点击浮钮「引用到提问」，引用文本作为快照随该条用户消息上送（结构化字段，见请求体 `messages[].quotes`）。两种视图分离（设计文档 `docs/quote_selection.md`）：
 
 - **历史视图**：JSONL 用户事件保存原始 `content`（问题正文/多模态部件）与 `quotes` 快照数组（`[{text, source?{role?, session_id?, round?}}]`，`id` 等 UI 字段不入库）；前端回放绘制引用卡片、编辑时可保留/移除、复制输出人可读文本（"引用 1：…\n\n问题：…"）。标题、侧栏预览、问题导航、`chat_round.question` 与最近问题索引**只取问题正文**，不混入引用原文。
 - **模型视图**：送入聊天模型/压缩模型前，由 `memory/quote_format.serialize_quotes_for_model` 统一把引用序列化为 `<quote_list><li>…</li></quote_list>` 前置到该条 user 消息文本（多模态消息作为第一个 text 部件），XML 文本按 `&`、`<`、`>`、`"`、`'` 顺序转义（引用中含 `</li>`/代码/换行仍作为引用内容）。同一函数用于当前轮请求、历史轮次重新进入上下文（`memory/chat_history_format`）与压缩源渲染（`【引用原文】` 段落）。
@@ -75,7 +76,7 @@
 
 #### 子智能体事件格式（`event="sub_agent"`，SSE 实时推送 = JSONL 落盘字段一致）
 
-内置工具 `sub_agent`（「内置工具」分组勾选，V1 不支持嵌套派发）让父智能体一次并发派发多个独立上下文的子任务：子任务有专属系统提示词、复用父级本轮工具（剔除 `sub_agent`/`check_tool_exists`，`ask_user` 替换为占位定义），全轨迹按 `agent_id` 聚合写入当前 `chat_round.events`（无 `role` 字段，不参与父级压缩游标计数），父模型只能看到子任务最终回复（`role=tool` 文本）。完整设计见 `docs/sub_agent_v1.md`。事件阶段：
+内置工具 `sub_agent`（「内置工具」分组勾选，V1 不支持嵌套派发）让父智能体一次并发派发多个独立上下文的子任务：子任务有专属系统提示词、复用父级本轮已启用工具（剔除 `sub_agent` 和 `ask_user`），全轨迹按 `agent_id` 聚合写入当前 `chat_round.events`（无 `role` 字段，不参与父级压缩游标计数），父模型只能看到子任务最终回复（`role=tool` 文本）。同一回复里还调用 MCP 工具时，MCP 工具先完成，随后启动子任务。完整设计见 `docs/sub_agent_v1.md`。事件阶段：
 
 | 阶段 | payload 关键字段 |
 |---|---|
@@ -124,7 +125,6 @@
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
-| /chat_history/delete_lines | DELETE | startline(必填,≥1), endline(必填,≥1,包含), session_id | `{state, describe, meta_after, usage_after}`；行号**不含** `_meta` 首行；startline>endline 报 400 |
 | /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs}` | 见下方「按轮次号删除（用户消息编辑重发）」；生成任务运行中报 409 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
 | /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；**manifest v2 随包携带分组定义**（groups），单会话无附件且无分组时仍回 jsonl 明文；详见下方「会话分享 / 导入」 |
@@ -232,9 +232,9 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 - `context_token_limit`：当前聊天模型最大输入窗口（model.json `maxInputTokens`）
 - `messages_tokens`：历史消息（含跨轮摘要 system 消息）估算 token；**发送口径**——按真实请求规则计入当前轮（pending）最后一条非空思考（历史轮次思考不回传、不计入），与压缩触发/预算检查口径一致
 - `reasoning_tokens`：`messages_tokens` 中属于“随请求回传的最新思考”的估算 token（发送口径补偿项；无思考时为 0）
-- `tool_definition_tokens`：MCP 工具定义估算 token（仅 `include_tools=true` 时计入；会话存在上传文件时自动注入的 `read_document` schema 一并计入）
-- `tool_names`：前端当前选择的工具名称；与 `include_tools=true` 一起传入时只统计这些工具定义，并包含运行时注入的 `check_tool_exists` schema
-- `file_memory_tokens`：会话**文件清单块**估算 token（小文件内联/大文件节选 + 按需读取提示，随首条 system 消息注入；无上传文件时为 0）
+- `tool_definition_tokens`：工具定义估算 token（仅 `include_tools=true` 时计入；只统计当前选择的工具，显式启用时包含 `read_document` schema）
+- `tool_names`：前端当前选择的模型可见工具名称；与 `include_tools=true` 一起传入时只统计这些工具定义
+- `file_memory_tokens`：会话**文件清单块**估算 token（小文件内联/大文件节选；仅启用 `read_document` 时包含读取提示及原生文档索引形态，随首条 system 消息注入；无上传文件时为 0）
 - `request_context_tokens`：`messages_tokens + system_prompt_tokens + tool_definition_tokens + file_memory_tokens`
 - `estimated_budget_ratio`：`request_context_tokens / context_token_limit`（四舍五入到 4 位小数）
 - `rounds`：`{total(总轮数), summarized(已被跨轮摘要覆盖), retained(当前 pending 任务轮数), max_rounds}`
@@ -300,7 +300,9 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 - **全局默认**：`setting/mcp_servers.json` 顶层 `inputs` 键（不携带 `session_id` 的 `POST /chat_config/tool_selection` 修改），作为**新建会话前**选择工具时的默认值（前端在新对话中保存工具选择即写入此处）；
 - **会话级覆盖**：会话历史 JSONL 首行 `_meta.tool_selection`（携带 `session_id` 的 `POST /chat_config/tool_selection` 修改，空 `inputs` 清除覆盖），结构与 `inputs` 一致（`{服务名: [工具名]}`），仅在用户显式设置时落盘（惰性）。
-- **内置工具**（`todo_write` / `ask_user` / `write_file` / `edit_file` / `read_file` / `search_files` / `read_media`，后续可扩展 subAgent 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。`read_document`（读取上传文件解析文本）**不在勾选列表**：由后端在「会话存在上传文件且本轮携带工具」时自动注入（与 `check_tool_exists` 同类），文件内容按「清单 + 按需读取」方式进入上下文（见「文件 FileUpload」章节）。
+- **内置工具**（包括 `todo_write` / `ask_user` / 文件工具 / `read_media` / `read_document` / `sub_agent` 等）并入同一链路：前端在「配置工具」模态框首位的「内置工具」分组勾选，保存为伪服务键 `__builtin__`（如 `{"__builtin__": ["ask_user", "read_document"]}`）；生成时后端把该键下的名称与 MCP 工具名一并作为 `requested_names`，按名称识别注入（`inject_builtin_tools`），会话级/全局默认语义与 MCP 工具完全一致。`read_document` 仅在用户选中时对模型可见；未选中时不会因其他工具启用而自动注入。
+
+`check_tool_exists` 已从内置工具定义和执行链移除。模型只能调用本轮请求中提供的工具；若仍发起未知或未启用工具调用，执行侧返回“不在本轮可用工具列表中”的配对工具结果。子智能体不暴露 `ask_user` 定义，意外调用同样由白名单拦截。
 
 生成请求 `tool_names` 字段的语义保持「前端传入优先」；仅当请求**完全未携带** `tool_names`（`null`，区别于显式空列表 `[]`）时，后端回退为该会话的生效工具选择（`_meta.tool_selection` → 全局 `inputs`），并向前端推送 `warning` 事件（`code=TOOL_SELECTION_FALLBACK`，全局配置读取失败时触发）。显式传 `[]` 仍表示无工具模式。清空会话历史时 `_meta.tool_selection` 与 `_meta.work_dir` 一样予以保留。
 
@@ -346,9 +348,9 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 }
 ```
 
-- `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 -1）：思考过程（`reasoning_content`）的回传裁剪长度。**回传规则**：每次请求最多只回传一条真实思考——最近一次 API 调用输出的那条（本轮没有输出时向前回溯最近一次真实思考），负数全量、正数保留末尾 N 字符；配置为 `0` 或回溯不到真实思考时回传 `"..."` 占位符（带 `tool_calls` 的最新 assistant 消息字段必须存在，GLM / DeepSeek 等严格上游缺失即 400）。**落盘与回传解耦**：运行时上下文与 JSONL 历史永远保存每轮思考的原始全文，历史 assistant（含旧工具轮）的思考在请求副本中直接剥离、不回传上游，也不落 `"..."` 假数据。
+- `reasoning_max_length`（对应 env `REASONING_RETURN_MAX_LENGTH`，默认 -1）：思考过程（`reasoning_content`）的回传裁剪长度。历史 assistant（含旧工具轮）的 `reasoning_content` 在请求副本中直接剥离，不用 `"..."` 替代。最新 assistant 最多回传一条思考：最新工具调用优先使用本轮思考，本轮没有时向前回溯最近一条真实思考；负数全量，正数保留末尾 N 字符。若最新工具调用没有思考可回退，或配置为 `0`，仅该条消息回传 `"..."` 占位符，以兼容要求最新工具调用字段存在的上游。最新非工具 assistant 不做历史回退：按长度配置处理本轮思考，配置为 `0` 时省略字段。**落盘与回传解耦**：运行时上下文与 JSONL 历史仍保存每轮思考的原始全文。
 - `tool_result_max_length`（对应 env `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH`，默认 0）：后端历史轮次重建上下文时，单个工具结果回传前 N 字符；回传格式符合 Chat Completions 规范（`assistant.tool_calls` → `tool.tool_call_id`）。
-- 两个值共用语义：`0` = 不回传，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。（思考过程因上游强校验，`0` 实际回传占位符，见上）
+- 两个值共用长度语义：`0` = 不回传真实内容，负数 = 全部回传，正数 = 按 N 截断（思考过程保留末尾，工具结果保留开头）。对最新工具调用消息，思考配置为 `0` 时仍会发送最小占位符 `"..."`；历史轮次不发送占位符。
 - 该配置同时作用于父循环与子智能体（`sub_agent`）：子任务请求副本经过同一份思考回传整形（共享 `copy_for_request`，可显式传 limit），子任务工具超长结果同样走 `tool_result` 超长反馈路径。
 
 ### tool_call 声明/结果配对契约（悬空清理）
@@ -446,7 +448,8 @@ SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关�
 - **SSE 事件**：`tool_return` 消息附带 `file_diff` 字段（与 result 并列），前端工具块输出区渲染彩色 diff 视图；
 - **JSONL 落盘**：tool 历史记录附带 `file_diff` 字段，刷新/重开会话历史回放同样渲染；
 - **边界降级**：新旧文本任一超过 256KB 时跳过逐行 diff（`diff_skipped: "file_too_large"`）；diff 文本超过 20000 字符时截断（`diff_truncated: true`）；内容无变化时 `diff_skipped: "unchanged"`；
-- **content_hash**：`write_file`/`edit_file`/`read_file` 结果均含 `content_hash`（解码后全文 sha256 前 16 位），为后续「文件版本校验」（edit 时校验 expected_hash，检测读后文件被外部修改）预留；
+- **content_hash**：`read_file` 返回解码后全文的 sha256 前 16 位。`edit_file` 可传 `expected_hash`，与当前内容不一致时返回 `FILE_MODIFIED_EXTERNALLY`，文件不写入；成功后的指纹按实际写入文本计算。`write_file` 覆盖模式返回最终指纹；追加大文件且无法可靠取得旧全文时返回 `null`，避免把本次追加内容的指纹误报为最终文件指纹。覆盖和编辑采用同目录临时文件、`fsync`、`os.replace`；追加保留追加写语义；
+- **读取与搜索限额**：`read_file` 的 `content` 保存本次正文，`message` 仅保存摘要，避免向模型重复发送。空文件正常返回 `total_lines=0`；按字符上限截断多行结果时返回 `truncated=true`、`has_more=true` 和 `retry_end_line`，提示缩小范围重读。`search_files` 默认最多检查 3000 个文件或扫描 10 秒，达到上限返回 `scan_truncated=true`，此时命中统计只覆盖已扫描部分；可通过 `max_scanned_files` / `max_scan_seconds` 调整；
 - **子任务块**：sub_agent 内部调用的文件工具同样在 tool_result 子事件中携带 `file_diff`，渲染行为一致。
 
 MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结果，不带 `file_diff`，前端自动回退普通文本渲染，无需处理。
@@ -543,6 +546,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 ```
 
 - 键为 `servers` 中配置的服务名（或内置工具伪服务 `__builtin__`），值为该服务下选中的工具名数组；全局 POST 为全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具），其余未知服务名报 400。
+- 无冲突工具的名称保持 MCP 原名；有冲突的工具保存模型可见合格名。旧配置中的原始名会按所属服务解析为对应工具，不会在多个同名服务间猜测。前端显示 MCP 原名，悬浮提示显示模型调用名。
 - 后端同时维护内存快照（`_MCP_TOOL_INPUTS_MEMORY`）并写回磁盘；GET 每次以磁盘为准并同步内存，手工编辑文件后刷新页面即可生效（配置热重载线程也会自动同步，见上文）。
 - 会话级覆盖保存在会话历史 JSONL 首行 `_meta.tool_selection`，结构与 `inputs` 一致；空选择/清除后恢复跟随全局默认，清空会话历史时保留。
 
@@ -595,7 +599,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
-| /tools/list | GET | refresh(可选, 默认 false) | `{tools[], total, servers[], failed_servers[], discovery, server_metrics[], mode}`；`tools[]` 每项附加 `server_id`（所属 MCP 服务器键名），便于前端按归属管理；探测按 `mcp_servers.json` 并发进行，单服务超时/失败不阻塞（记录于 failed_servers） |
+| /tools/list | GET | refresh(可选, 默认 false) | `{tools[], total, servers[], failed_servers[], discovery, server_metrics[], mode}`；每项附加 `server_id` 与 `original_name`；跨服务重名、与内置工具同名、与 `over_task` 冲突或不符合模型工具名格式的 MCP 工具使用稳定的合格名作为 `function.name`，`original_name` 保留服务端名称。调用时后端按模型名恢复 `(server_id, original_name)`；单服务超时/失败不阻塞（记录于 failed_servers） |
 
 ### 工具列表缓存与预热
 
@@ -613,21 +617,20 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 **支持类型**：富文档 pdf/docx/doc/csv/xls/xlsx 走专用解析器；常见文本类扩展名（代码/配置/日志/数据等约百余项，`factory/file_factory.TEXT_FILE_EXTENSIONS`）直接按文本解码入库；未知扩展名先二进制嗅探（前 8KB 含空字节或控制字符占比 >10% 判为二进制拒绝，通过则按文本解码）。文本解码回退链 `utf-8-sig → utf-8 → gb18030 → big5 → latin-1`（GBK 等中文编码文件不再乱码）。
 - Body: 单个文件的原始字节，`Content-Type: application/octet-stream`；Query: `filename`(必填)、`session_id`
 - 返回: `{total, success, failed, results[], upload_id}`；`results[]` 每项 `{filename, status(success/failed), message?, type?, content_length?, content_truncated?, content_total_chars?, stored_name?, abs_path?, native_doc_supported?, parse_failed?}`
-- **文本入库截断**：解析文本超过 `FILE_TEXT_MAX_CHARS`（.env，默认 200000 字符）时截断入库并标记 `content_truncated=true`（`content_total_chars` 为截断前总长）；清单与 `read_document` 返回中给出原文绝对路径 `abs_path`，模型可用内置 `read_file` 按路径续读剩余内容。
-- **原生文档容错**：会话生效模型声明支持该类型（`supportDocTypes`）但本地解析器缺失/解析失败时，上传仍成功——保存原始文件并入库 `parse_failed=true`（`content` 为空），靠原生文档注入提供内容（不因未装 PyMuPDF/python-docx 而阻断上传）。
+- **文本入库截断**：解析文本超过 `FILE_TEXT_MAX_CHARS`（.env，默认 200000 字符）时截断入库并标记 `content_truncated=true`（`content_total_chars` 为截断前总长）；文件清单给出原文绝对路径 `abs_path`，模型可用内置 `read_file` 按路径续读剩余内容。
+- **原生文档容错**：会话生效模型声明支持该类型（`supportDocTypes`）但本地解析器缺失/解析失败时，上传仍成功——保存原始文件并入库 `parse_failed=true`（`content` 为空），用户启用 `read_document` 后，模型可调用 `read_document(mode="native")` 按需读取原文（不因未装 PyMuPDF/python-docx 而阻断上传）。
 - 上传文件保存为 `history_files/session_files/<session_id>/<文件名>.json`（目录按前端传入的 `session_id` 命名，仅存解析出的文本内容）；
   同时把**原始文件字节**另存到 `history_files/session_files/<session_id>/files/<名>_<随机>.<ext>`（供 `GET /file/get_session_document` 点击预览/下载），
   `results[]` 与 file_memory 记录均携带 `stored_name`（保存失败时为 null，不影响解析结果）；
   上传成功后会把该目录名写入对应聊天会话 jsonl 的 `_meta.upload_id`（会话文件不存在时自动创建），
   供 `/chat_history/delete_file` 连带清理；`upload_id` 为实际记录的目录名（记录失败时为 null，不影响上传结果）。
-- **解析内容注入方式（清单 + 按需读取）**：解析文本不再全量拼接进系统提示——由后端构建「文件清单」注入（小文件内联全文 / 大文件节选开头 + `read_document` 读取提示，总预算 16000 字符），模型需要细节时调用内置工具 `read_document` 按字符区间分页读取（详见下文「内置 read_document 工具」）；清单块计入 `token_stats.file_memory_tokens`。命中当前模型 `supportDocTypes` 的文档条目另标注「原生文档」（并按轮注入，见下文「原生文档注入」）；截断入库的文件在清单中给出原文绝对路径，供模型 `read_file` 续读剩余内容。
+- **解析内容注入方式（清单 + 按需读取）**：解析文本不再全量拼接进系统提示——由后端构建「文件清单」注入（普通文本口径的小文件内联全文 / 大文件节选开头，总预算 16000 字符）。启用 `read_document` 时清单附读取提示，且当前模型 `supportDocTypes` 命中的原生文档只显示文件索引，不重复内联解析全文；未启用时，原生候选按解析文本清单展示。模型需要更多内容时，在已启用工具的前提下调用 `read_document`，按原生文件或字符区间读取（详见下文「内置 read_document 工具」）；清单块计入 `token_stats.file_memory_tokens`。截断入库的文件在清单中给出原文绝对路径，供模型 `read_file` 续读剩余内容。
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
 | /file/get_session_file_memory | GET | number(1-10,默认10), session_id | `{total, files[]}`，`files[]` = `{timestamp, filename, type, content, size}` |
 | /file/get_session_file_text | GET | number(默认10), max_total_chars(默认3000), session_id | `{summary, length}`（纯文本摘要，供 LLM 上下文） |
 | /file/delete_session_file_memory | DELETE | filename(必填), session_id | `{message, deleted_count}` |
-| /file/clear_session_file_memorys | DELETE | session_id | `{message}` |
 
 ### POST /file/upload_session_media
 上传聊天多媒体附件（图片/音频/视频），**原始字节**保存到 `history_files/session_files/<session>/media/`。
@@ -638,7 +641,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   后端发送上游前把 `media://` 引用解析为 OpenAI 兼容格式：URL 类部件 → `data:<mime>;base64,<b64>`，`input_audio.data` → 纯 base64；`https://` 与已内联 `data:`/base64 原样透传（url 与 base64 双格式兼容）。
   **大图自动降采样**：超过 2MB 的图片（GIF 除外，无论动静）在解析时改发 JPEG 缩略图——长边 ≤1568px、质量 85，缓存到 `<session>/thumbs/<原名>.thumb.jpg`（按原文件 mtime+size 指纹失效重建）；生成失败回退原图。原图仍完整落盘，预览/下载不受影响。前端在**发送前**也做同等压缩（canvas 重采样，压缩无收益保留原文件），双保险进一步降低上传体积与视觉 token 计费。
   **视觉 API 拒绝格式的自动转换（发送上游前，不动落盘原图）**：静图 gif 与 bmp/ico/tif/tiff 统一转 PNG；**动图 gif 转 H.264 MP4**（Pillow `is_animated/n_frames` 判动静动，动图经 ffmpeg fps=10 + minterpolate 补帧 30fps + libx264 编码为 mp4，部件类型随之变为 `video_url`；ffmpeg 定位三级回退：系统 PATH → `imageio-ffmpeg` 包内置静态二进制 → 均缺失时按静图回退链路兜底）；转换缓存到 `<session>/media_transcode/<原名>.conv.<png|mp4>`（同款 mtime+size 指纹失效）。原生格式（png/jpg/jpeg/webp）不变。
-- 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位，原生文档部件以 `[文档 名字]` 占位（出现新用户消息后自动转换）。
+- 历史落盘与回放只保留 `media://` 引用（JSONL 不膨胀），历史轮次不重复注入媒体数据；文本口径提取 text 部件，媒体部件以 `[图片]/[音频]/[视频]` 占位，原生文档部件在完整模型响应后转为 `[文档 名字]` 占位。
 
 ### GET /file/get_session_media
 读取会话内已上传的媒体文件原始字节（消息气泡缩略图、音视频播放等用途）。
@@ -654,26 +657,30 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - 返回: 文件字节流（Content-Type 按扩展名推断）；不存在 404
 
 ### 内置 read_document 工具（factory/agent_runtime/builtin_tools.py）
-用户上传文档（pdf/docx/doc/csv/xls/xlsx/md/txt 等）的解析文本按**「文件清单 + 按需读取」**方式进入模型上下文（替换旧版全量拼接）：
+用户上传文档（pdf/docx/doc/csv/xls/xlsx/md/txt 等）按**「文件清单 + 按需读取」**方式进入模型上下文（替换旧版全量拼接）：
 
-- **文件清单**（`memory/file_memory.build_file_manifest_text`，随首条 system 消息注入）：小文件（解析文本 ≤4000 字符）内联全文；大文件仅给开头 2000 字符节选 + `read_document` 读取提示；清单总预算 16000 字符，超出按「新文件优先」收缩（先截断/省略最旧文件并注明）；
-- **read_document 工具**（会话存在上传文件且本轮携带工具时**后端自动注入**，不开放手选，与 `check_tool_exists` 同类）：模型需要文件其余内容时按文件名调用：
-  - `filename`（必填）：上传文件的原始文件名（清单中展示的名字）；
-  - `start_char` / `max_chars`：可选，字符区间分页读取（默认 0 / 8000，单次上限 20000）；
-  - 返回 `{filename, type, total_chars, start_char, end_char, content, has_more, next_start_char?, native?, message}`，`has_more=true` 时用 `next_start_char` 续读；文件不存在时返回可用文件名列表提示；
-  - **原生文档分支**：当前模型声明支持该文件类型（supportDocTypes）且原始文件可用时，结果额外携带 `native` 块（`{part, filename, stored_name, mime, size, abs_path}`）——调用方把原始文件按原生文档注入后续请求（供应商侧解析），解析文本节选仍一并返回作兜底/速读；未命中或原始文件缺失时省略 `native`，纯文本分页口径与历史行为一致。`native` 块在工具结果返回模型/前端前被剥离为可读说明（base64 不进入工具结果文本）；
-- **首调用超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
+- **文件清单**（`memory.file_memory.build_file_manifest_text`，随首条 system 消息注入）：普通文本口径的小文件（解析文本 ≤4000 字符）内联全文；大文件给开头节选。选中 `read_document` 时，清单会附读取提示；当前模型 `supportDocTypes` 命中的原生文档只显示文件索引和读取提示，不预先内联解析全文或上传原始文件，避免重复发送。未选中时不显示读取提示，原生候选回退为解析文本清单（小文件内联、大文件节选）；清单总预算 16000 字符，超出按「新文件优先」收缩；
+- **read_document 工具**（用户在「配置工具」→「内置工具」中显式勾选后才注入）：
+  - `filename`（必填）：上传文件的原始文件名，或明确提供的本地文档路径；
+  - `mode`：`auto`（默认）、`text` 或 `native`。`auto` 按当前生效模型对**目标文件扩展名**的 `supportDocTypes` 声明选择：命中且原始文件可用时仅走原生文件输入；未命中时走解析文本。此分流不使用通用 `vision` 标志；图片视觉能力不等于文档原生能力；
+  - `offset` / `limit`：解析文本字符区间，`offset` 从 0 开始，默认 `offset=0`、`limit=10000`，单次 `limit` 上限 20000。`has_more=true` 时使用返回的 `next_offset` 继续；旧参数 `start_char` / `max_chars` 仍兼容。提供字符区间时 `auto` 自动使用文本模式；
+  - `page_start` / `page_count`：原生 PDF 按物理页读取，页码从 1 开始，每次最多 20 页。服务端生成结构完整的页面子 PDF，再作为原生文档部件发送；只有当前模型声明支持 PDF 原生输入时可用。其他格式可用解析文本的 `offset` / `limit`；
+  - 文本结果返回 `{filename, type, mode, total_chars, offset, limit, content, has_more, next_offset?, message}`。原生结果不附加解析文本，只返回文件引用和发送说明；工具返回前会剥离 base64 部件；
+  - 原生模式不可用或文件超过单文件大小限制时，`mode=auto` 回退解析文本并说明原因；显式 `mode=native` 返回错误，不静默切换。显式 `mode=text` 始终读取解析文本；
+  - 对本地路径，原生分支不预先执行文本解析；回退文本时才解析。文本分段读取复用按文件修改时间和大小键控的有界解析缓存，避免每个片段重复解析；
+- **超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
 - **token 统计**：`GET /chat_context/token_stats` 新增 `file_memory_tokens` 字段（清单块估算 token），并计入 `request_context_tokens`。
 
-### 原生文档注入（模型 supportDocTypes 声明的文件输入）
+### 原生文档输入（模型 supportDocTypes 声明的文件类型）
 
-会话生效聊天模型在 models.json 声明 `supportDocTypes`（如 `[".pdf", ".docx"]`；`GET /chat_config/models` 的 `support_doc_types` 为归一化结果）时，命中类型的上传文档按轮以**原生文档部件**随请求发送（供应商侧原生解析，与图片/视频同语义）：
+只有当用户启用了 `read_document`、模型实际调用它，且目标文件扩展名命中 models.json 的 `supportDocTypes`（`GET /chat_config/models` 返回归一化字段 `support_doc_types`）时，才按需发送原生文档。`read_document` 未启用时不会进入工具 schema；它和 `vision` 图片/视频能力是相互独立的能力声明：
 
-- **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端适配层可转换其它协议；当前聊天客户端仅支持 `chat-completions` 协议，其余协议走文本解析口径）；
-- **发送节奏**：本任务内每轮发送；出现新的用户消息后转「[文档 名字]」文本占位（与视频一次性消费同构）——原始文件始终保留在 `history_files/session_files/<session>/files/`，模型可用 `read_document` 原生重读或 `read_file` 读文本；
-- **规模预算**（.env 可配、动态热生效）：单文件 `NATIVE_DOC_MAX_BYTES`（默认 20MB）、单轮总量 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）、单轮数量 `NATIVE_DOC_MAX_ITEMS`（默认 3）；超预算的文档降级为文本口径；
-- **文本解析并存**：上传时无论是否原生支持都照常解析存文本（供应商拒绝 file 部件时可回退、`read_document` 也能返回文本）；本地解析器缺失/失败但模型支持该类型时上传仍成功（`parse_failed` 记录，纯原生口径）；
-- **注入与落盘**：原生文档数据仅进内存请求消息（`_internal` 标记，不落盘 JSONL，避免 base64 膨胀历史）；token 统计按多模态部件固定占位口径计费；父循环与子智能体共用同一内核（`memory/file_memory.py` 原生文档函数族）。
+- **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端适配层可转换其它协议；当前聊天客户端仅支持 `chat-completions` 协议）；
+- **发送节奏**：原生文件只随紧接着的一次模型请求发送。收到完整响应后，内存消息中的原生部件转为 `[文档 文件名]` 占位；仍需原文时模型再次调用 `read_document`。不会在首轮或后续每轮自动重复上传所有支持类型的文件。截断续写或工具调用流超时时暂时保留部件，供重试使用；
+- **分段与大小**：完整原生读取受 `NATIVE_DOC_MAX_BYTES` 单文件限制（默认 20MB）。原生 PDF 可用 `page_start` / `page_count` 选择最多 20 页并发送有效子 PDF；非 PDF 文档可用 `mode=text` 和 `offset` / `limit` 分段读取解析文本。PDF 页段目前仍要求源文件没有超过原生单文件大小限制；
+- **批次预算**（.env 可配、动态热生效）：同一次模型请求最多 `NATIVE_DOC_MAX_ITEMS` 个文件（默认 3），原生文件总量最多 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）。`mode=auto` 超预算时回退到文本模式；显式 native 或 PDF 页选段超预算时返回错误，模型可在下一次请求中单独读取；
+- **解析与回退**：上传时照常保存解析文本，供非原生模型、显式 `mode=text` 和自动回退使用。原生读取结果不附加解析文本，避免解析文本与原文件重复进入上下文；本地解析器缺失或解析失败但模型声明支持该类型时，上传仍成功，可通过原生读取查看；
+- **落盘**：原始文件字节保存在会话文件目录，供按需读取；原生 base64 部件只存在于内存请求消息中。`read_document` 工具结果、JSONL 及子智能体事件只保存文件引用、文件名、页码范围和一次性发送说明，不保存原生 base64。父循环与子智能体共用读取和清理逻辑（`memory/file_memory.py` 原生文档函数族）。
 
 ### 内置 read_media 工具（factory/agent_runtime/builtin_tools.py）
 模型可调用的媒体读取内置工具（「配置工具」→「内置工具」分组勾选 `read_media`），
@@ -682,10 +689,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - `references`：媒体来源数组（可混用）：
   1) `media://` 会话引用（用户上传或 read_media 自行注册的来源）；
   2) 本地文件路径（绝对路径或相对会话工作目录的路径，worker 进程已 os.chdir）；
-  3) http(s) 网络直链（下载后按魔数嗅探校准扩展名，30 秒超时、跟随重定向）；
-  本地/网络来源首次读取会自动注册进会话媒体库（`register_media_source`，
-  与用户上传同规则：类型校验、大小上限、ICO/TIFF 自动转 PNG），重复读取走
-  会话链路（无需重复下载/读盘）；重复读取自动去重；
+  3) http(s) 网络直链（通常把 URL 传给上游供应商拉取；需要格式转换时临时下载）。
+  本地路径直接读取原文件，不自动复制入会话媒体库；
 - `quality`：可选，50-100（默认 85）——仅对超过 2MB 的大图降采样生效
   （长边 1568、JPEG 质量按该参数；小图/GIF 按转换后口径回传）；
 - `start_time` / `end_time`：可选，视频与动图 gif 的**区间读取**秒数
@@ -704,7 +709,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   - 动图 gif 先转码 mp4 再按区间切片（同一转码缓存复用）；切片缓存
     `<原名>.clip_<start>_<end>.mp4` 按源文件指纹失效；**网络直链视频不支持
     区间读取**（URL 直传由供应商拉取）；同引用不同区间视为新的读取
-    （去重键 `reference#start-end`），相同区间重复读取仍去重；
+    （去重键 `reference#start-end`）；已回收的视频区间允许重新读取；
 - **格式自动转换**（与聊天附件注入同口径）：视觉 API 拒绝的图片格式在
   构建部件前自动转换——静图 gif 与 bmp/ico/tif/tiff → PNG（Pillow）、
   **动图 gif → H.264 MP4**（流式字节扫描判动静动 + ffmpeg 转码「先缩放后
@@ -729,9 +734,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   （`image_url`/`video_url`/`input_audio`），在工具结果处理完成后追加进
   后续模型请求上下文（仅内存、不落盘历史），token 统计按多模态部件固定
   占位计费；加载失败时以占位文本告知模型；
-- **单次调用最多 5 个**（超出的引用标记 `limit_5_per_round` 跳过）；任务内多次
-  读取累计时按**滚动窗口只保留最近 5 个部件**，被挤出的引用解除「已注入」标记，
-  模型再次读取同一引用可重新注入。
+- **单次调用最多 5 个**（超出的引用标记 `limit_5_per_round` 跳过）；父任务同一条模型回复仅执行首次 `read_media` 调用。当前消息中仍保留的图片/音频部件按引用与区间去重；视频部件会在读取新片段时回收，随后可再次读取相同区间。子任务也使用相同的现存部件判定；只有待注入批次超过 5 个时才保留最近 5 个。
 
 ## 7. Skills 提示词库 Prompts
 

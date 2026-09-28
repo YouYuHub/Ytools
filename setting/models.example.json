@@ -28,7 +28,7 @@
         "id": "deepseek-flash",
         "url": "https://api.deepseek.com/v1",
         "toolCalling": true,
-        "vision": false,
+        "vision": true,
         "supportDocTypes": null,
         "maxInputTokens": 1000000,
         "maxOutputTokens": 384000

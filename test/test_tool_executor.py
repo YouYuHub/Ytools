@@ -77,6 +77,26 @@ class ToolExecutorTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 _invoke_tool_function("slow_tool", {}, {"slow_tool": "server"})
 
+    def test_invoke_tool_function_restores_original_mcp_name(self):
+        calls = []
+
+        async def fake_call(**kwargs):
+            calls.append(kwargs)
+            return "ok"
+
+        with patch("factory.agent_runtime.tool_executor.load_var", return_value="0"), \
+                patch("factory.agent_runtime.tool_executor.call_mcp_tool", fake_call):
+            result = _invoke_tool_function(
+                "mcp_123456789abc_find_item",
+                {"query": "x"},
+                {"mcp_123456789abc_find_item": "catalog_server"},
+                {"mcp_123456789abc_find_item": "find_item"},
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0]["function_name"], "find_item")
+        self.assertEqual(calls[0]["mcp_service"], "catalog_server")
+
     def test_mcp_client_direct_call_honors_timeout(self):
         async def slow_call(*_args, **_kwargs):
             await asyncio.sleep(0.05)

@@ -43,6 +43,8 @@ test("usageText: 生成本轮 token 文案", function () {
   assert.equal(formatUtils.usageText({ prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 }),
     "本轮消耗 1,500 tokens（输入 1,000 · 输出 500）");
   assert.equal(formatUtils.usageText({}), "本轮消耗 0 tokens（输入 0 · 输出 0）");
+  assert.equal(formatUtils.usageText({ total_tokens: 2 }, { provider: "服务商", name: "模型 A" }),
+    "本轮消耗 2 tokens（输入 0 · 输出 0） · 模型 服务商/模型 A");
 });
 
 test("compactionUsageText: 压缩 usage 文案", function () {

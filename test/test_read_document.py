@@ -4,7 +4,7 @@
 覆盖：
 - 文件清单/索引构建（小文件内联、大文件节选 + read_document 提示、总预算收缩）；
 - execute_read_document 执行（分页、越界、未找到、中文文件名）；
-- read_document 工具注入与识别（inject_builtin_tools / is_builtin_tool / check_tool_exists）；
+- read_document 工具注入与识别（inject_builtin_tools / is_builtin_tool）；
 - token_stats 计入文件清单块（file_memory_tokens 字段与 request_context_tokens 口径）。
 """
 import asyncio
@@ -29,7 +29,6 @@ from memory.file_memory import (
 )
 from factory.agent_runtime import builtin_tools
 from factory.agent_runtime.builtin_tools import (
-    execute_builtin_tool,
     execute_read_document,
     inject_builtin_tools,
     is_builtin_tool,
@@ -190,11 +189,13 @@ class ReadDocumentExecutionTests(unittest.TestCase):
             result = execute_read_document(
                 {"filename": str(path)}, self.sid, support_doc_types=[".pdf"]
             )
-        self.assertEqual(result["content"], "PDF 文本")
+        self.assertEqual(result["mode"], "native")
+        self.assertNotIn("content", result)
         self.assertEqual(result["native"]["filename"], "local.pdf")
         self.assertEqual(result["native"]["part"]["type"], "file")
+        self.assertEqual(result["file_ref"], str(path.resolve()))
 
-    def test_local_native_document_survives_missing_text_parser(self):
+    def test_local_native_document_survives_text_parser_failure(self):
         from factory import file_factory
         from unittest.mock import patch
 
@@ -202,13 +203,27 @@ class ReadDocumentExecutionTests(unittest.TestCase):
         path.write_bytes(b"pdf bytes")
         with patch.object(
             file_factory, "extract_text_from_bytes", side_effect=RuntimeError("PyMuPDF unavailable")
-        ):
+        ) as parser:
             result = execute_read_document(
                 {"filename": str(path)}, self.sid, support_doc_types=[".pdf"]
             )
-        self.assertEqual(result["total_chars"], 0)
+        self.assertEqual(result["mode"], "native")
+        self.assertNotIn("content", result)
         self.assertEqual(result["native"]["filename"], "local.pdf")
-        self.assertIn("PyMuPDF unavailable", result["message"])
+        parser.assert_not_called()  # 原生读取无需提前解析文本
+
+    def test_local_text_parser_reused_until_file_changes(self):
+        from factory import file_factory
+        from unittest.mock import patch
+
+        path = Path(self._tmp) / "cached.txt"
+        path.write_text("abcdefgh", encoding="utf-8")
+        with patch.object(file_factory, "extract_text_from_bytes", return_value="abcdefgh") as parser:
+            first = execute_read_document({"filename": str(path), "mode": "text", "limit": 3}, self.sid)
+            second = execute_read_document({"filename": str(path), "mode": "text", "offset": 3}, self.sid)
+        self.assertEqual(first["content"], "abc")
+        self.assertEqual(second["content"], "defgh")
+        self.assertEqual(parser.call_count, 1)
 
     def test_local_unsupported_extension_is_rejected(self):
         path = Path(self._tmp) / "payload.bin"
@@ -226,9 +241,10 @@ class ReadDocumentExecutionTests(unittest.TestCase):
 
 
 class ReadDocumentInjectionTests(unittest.TestCase):
-    """工具注入/识别/check_tool_exists 联动。"""
+    """工具注入与识别。"""
 
     def test_inject_adds_definition(self):
+        self.assertIn("read_document", builtin_tools.SELECTABLE_BUILTIN_TOOL_NAMES)
         tools, servers = inject_builtin_tools([], {}, include_read_document=True)
         names = [t.get("function", {}).get("name") for t in tools]
         self.assertIn("read_document", names)
@@ -247,36 +263,16 @@ class ReadDocumentInjectionTests(unittest.TestCase):
     def test_is_builtin_tool(self):
         self.assertTrue(is_builtin_tool("read_document"))
 
-    def test_check_tool_exists_knows_read_document(self):
-        result = execute_builtin_tool(
-            "check_tool_exists",
-            {"tool_name": "read_document"},
-            set(),
-            {},
-            enabled_tool_names={"read_document"},
-        )
-        self.assertTrue(result["exists"])
-        self.assertFalse(result["disabled"])
-
-    def test_check_tool_exists_explains_read_document_condition(self):
-        result = execute_builtin_tool(
-            "check_tool_exists",
-            {"tool_name": "read_document"},
-            set(),
-            {},
-            enabled_tool_names=set(),
-        )
-        self.assertTrue(result["disabled"])
-        self.assertIn("按条件自动注入", result["message"])
-        self.assertNotIn("用户禁用了", result["message"])
-
     def test_read_document_definition_shape(self):
         definition = builtin_tools.READ_DOCUMENT_TOOL_DEFINITION
         function = definition["function"]
         self.assertEqual(function["name"] == "read_document", True)
         self.assertIn("filename", function["parameters"]["properties"])
-        self.assertIn("start_char", function["parameters"]["properties"])
-        self.assertIn("max_chars", function["parameters"]["properties"])
+        self.assertIn("mode", function["parameters"]["properties"])
+        self.assertIn("offset", function["parameters"]["properties"])
+        self.assertIn("limit", function["parameters"]["properties"])
+        self.assertIn("page_start", function["parameters"]["properties"])
+        self.assertIn("page_count", function["parameters"]["properties"])
 
 
 class FileMemoryStatsTests(unittest.IsolatedAsyncioTestCase):
@@ -326,6 +322,21 @@ class FileMemoryStatsTests(unittest.IsolatedAsyncioTestCase):
             + stats["tool_definition_tokens"]
             + stats["file_memory_tokens"],
         )
+
+    async def test_manifest_stats_follow_read_document_selection(self):
+        file_manager = await get_file_memory_manager(self.sid)
+        file_manager.add_file_memory({
+            "filename": "large.txt",
+            "type": "txt",
+            "content": "A" * 5000,
+            "size": 5000,
+        })
+        manager = self._chat_memory.ChatMemoryManager(self.sid)
+        disabled = await manager.get_context_token_stats()
+        enabled = await manager.get_context_token_stats(
+            tools=[builtin_tools.READ_DOCUMENT_TOOL_DEFINITION]
+        )
+        self.assertGreater(enabled["file_memory_tokens"], disabled["file_memory_tokens"])
 
     async def test_stats_zero_without_files(self):
         manager = self._chat_memory.ChatMemoryManager(self.sid)

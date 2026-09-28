@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""端到端（无真实网络）：read_document 自动注入 + 文件清单注入。
+"""端到端（无真实网络）：read_document 显式选择注入 + 文件清单注入。
 
 覆盖场景：
-- 会话存在上传文件且本轮携带工具 → 请求 tools 含 read_document，首条 system 含文件清单；
-- 无文件 → 不注入 read_document、无清单；
+- 显式选择 read_document → 请求 tools 含 read_document，即使没有上传文件；
+- 只选择其他工具 → 不自动注入 read_document，文件清单仍可见；
 - 无工具模式（tool_names=[]，显式空列表）→ 不注入 read_document，但清单仍注入（无读取提示）。
 """
 import asyncio
@@ -60,6 +60,10 @@ class _MemoryStub:
         if isinstance(record, dict) and record.get("done") == "[DONE]":
             self.records.append("round_finalized_done")
         return "记录成功"
+
+    async def set_current_round_model(self, model):
+        # 每轮生效聊天模型落盘（round_model 帧的同源写入）：最小桩仅接收
+        return True
 
     async def get_session_todo(self):
         return []
@@ -182,23 +186,33 @@ class ReadDocumentAutoInjectTests(unittest.TestCase):
             return str(message.get("content") or "")
         return str(getattr(message, "content", "") or "")
 
-    def test_auto_injects_read_document_with_files(self):
+    def test_read_document_is_injected_when_selected_with_files(self):
         self._add_file("文件正文内容" * 30)
-        stream, captured = self._run(["read_file"])
+        stream, captured = self._run(["read_document"])
         self.assertIn("你好！", "".join(stream.chunks))
         names = self._tool_names(captured)
         self.assertIn("read_document", names)
-        self.assertIn("read_file", names)
+        self.assertNotIn("read_file", names)
         system_text = self._message_content(captured["messages"][0])
         self.assertIn("用户上传了 1 个文件", system_text)
         self.assertIn("说明.txt", system_text)
         self.assertIn("文件正文内容", system_text)
 
-    def test_read_document_injected_without_uploaded_files(self):
+    def test_other_tool_does_not_implicitly_inject_read_document(self):
+        self._add_file("文件正文内容" * 30)
         stream, captured = self._run(["read_file"])
         self.assertIn("你好！", "".join(stream.chunks))
         names = self._tool_names(captured)
-        self.assertIn("read_document", names)
+        self.assertIn("read_file", names)
+        self.assertNotIn("read_document", names)
+        system_text = self._message_content(captured["messages"][0])
+        self.assertIn("用户上传了 1 个文件", system_text)
+        self.assertNotIn("read_document", system_text)
+
+    def test_selected_without_uploaded_files(self):
+        stream, captured = self._run(["read_document"])
+        self.assertIn("你好！", "".join(stream.chunks))
+        self.assertIn("read_document", self._tool_names(captured))
         system_text = self._message_content(captured["messages"][0])
         self.assertNotIn("用户上传了", system_text)
 

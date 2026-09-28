@@ -306,8 +306,6 @@ class SubAgentOverTaskPairingTests(unittest.TestCase):
             initial_todo=None,
             tools=[],
             tool_servers={},
-            configured_tool_names=set(),
-            configured_tool_servers={},
             max_rounds=3,
             timeout_seconds=0,
             reply_max_chars=2000,

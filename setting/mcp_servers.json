@@ -19,8 +19,10 @@
     "__builtin__": [
       "ask_user",
       "edit_file",
+      "read_document",
       "read_file",
       "read_media",
+      "run_command",
       "search_files",
       "sub_agent",
       "todo_write",
@@ -29,7 +31,6 @@
     "PipeIpcMcp": [],
     "SysServer": [
       "fetch_url",
-      "run_command",
       "web_search"
     ]
   }

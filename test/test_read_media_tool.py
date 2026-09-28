@@ -5,7 +5,7 @@
 - normalize_read_media_args 参数规整（media:// 剥离、去重、quality 校验）
 - execute_read_media：当前任务范围安全边界、单轮 ≤5 上限、重复读取去重、
   加载失败/越界跳过、loaded 元信息（不携带 base64 数据本体）、quality 透传
-- roll_recent_media_parts：任务内累计滚动窗口（多次读取只保留最近 5 个坐标）
+- collect_injected_media_keys：已注入图片去重、已回收视频可重读
 - load_session_media_model_part：小图原图、大图降采样 + quality 参数、
   GIF 跳过降采样、非法引用返回 None、音频/视频部件形态
 - collect_media_references：安全边界数据源收集（必须先于 resolve 的顺序约束）
@@ -265,34 +265,20 @@ class ExecuteReadMediaTests(unittest.TestCase):
         self.assertIn("error", result)
 
 
-class RollRecentMediaPartsTests(unittest.TestCase):
-    """任务内累计滚动窗口：多次读取只保留最近 5 个部件坐标。"""
-
-    def test_under_limit_keeps_all(self):
-        pairs = [(f"media://a{i}.png", i) for i in range(5)]
-        evicted: set[str] = set()
-        trimmed = bt.roll_recent_media_parts(pairs, evicted=evicted)
-        self.assertEqual(trimmed, pairs)
-        self.assertEqual(evicted, set())
-
-    def test_over_limit_keeps_recent_five_and_reports_evicted(self):
-        pairs = [(f"media://a{i}.png", i) for i in range(8)]
-        evicted: set[str] = set()
-        trimmed = bt.roll_recent_media_parts(pairs, evicted=evicted)
-        self.assertEqual([ref for ref, _ in trimmed], [f"media://a{i}.png" for i in range(3, 8)])
-        self.assertEqual(evicted, {f"media://a{i}.png" for i in range(3)})
-
-    def test_evicted_refs_can_be_re_injected(self):
-        # 模拟 chat_factory 接线：被挤出的引用从 injected 集合移除后可再次读取
-        injected = {f"media://a{i}.png" for i in range(8)}
-        pairs = [(f"media://a{i}.png", i) for i in range(8)]
-        evicted: set[str] = set()
-        bt.roll_recent_media_parts(pairs, evicted=evicted)
-        injected.difference_update(evicted)
-        self.assertEqual(
-            injected,
-            {f"media://a{i}.png" for i in range(3, 8)},
-        )
+class InjectedMediaStateTests(unittest.TestCase):
+    def test_images_stay_deduplicated_and_retired_video_can_be_read_again(self):
+        messages = [{
+            "role": "user", "_internal": True,
+            "_media_injected_keys": ["media://image.png", "media://clip.mp4#0.000-5.000"],
+            "content": [
+                {"type": "text", "text": "media"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}},
+                {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,b"}},
+            ],
+        }]
+        self.assertEqual(bt.collect_injected_media_keys(messages), {"media://image.png"})
+        bt.retire_prior_video_parts(messages)
+        self.assertEqual(bt.collect_injected_media_keys(messages), {"media://image.png"})
 
 
 class LoadMediaModelPartTests(unittest.TestCase):
@@ -616,7 +602,7 @@ class ConcurrencyGuardAndCorruptImageTests(unittest.TestCase):
     def test_tool_description_mentions_concurrency_limit(self):
         definition = bt.build_read_media_tool_definition()
         description = definition["function"]["description"]
-        self.assertIn("并发限制", description)
+        self.assertIn("同一条回复只调用一次", description)
         self.assertIn("仅首个会执行", description)
         self.assertIn("references 列表", description)
 

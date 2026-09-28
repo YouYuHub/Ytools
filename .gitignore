@@ -10,6 +10,5 @@ tmp_*.py
 _tmp_*.txt
 _sec*.txt
 pytest_out.log
-.env
 setting/models.json
 history_files/
