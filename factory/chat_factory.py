@@ -128,6 +128,11 @@ from factory.session_worker import (
     sweep_dead_worker_proxies,
 )
 
+from util.logger import debug_stream_print, get_logger
+
+logger = get_logger("factory.chat_factory")
+
+
 
 
 # 记录当前后台运行的会话生成任务（session_id -> _SessionStream）
@@ -225,7 +230,7 @@ async def _record_file_history(
             encoding=str(payload.get("encoding") or "utf-8"),
         )
     except Exception as record_error:
-        print(f"[WARNING] 文件版本链记录失败（不影响对话）: {record_error}")
+        logger.warning(f"文件版本链记录失败（不影响对话）: {record_error}")
 
 
 def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
@@ -364,8 +369,8 @@ async def load_all_tools() -> None:
     if ttl > 0 and tool_registry.get_cached_tools_payload(ttl) is not None:
         return
     await tool_registry.refresh_tools_from_mcp(get_current_dir())
-    print(f"✅ 已加载 {len(tool_registry.ALL_TOOLS)} 个工具，构建 {len(tool_registry.TOOL_MCP_SERVERS)} 个MCP映射")
-print("[INFO] 工具将按需实时刷新（来源: setting/mcp_servers.json）")
+    logger.info(f"✅ 已加载 {len(tool_registry.ALL_TOOLS)} 个工具，构建 {len(tool_registry.TOOL_MCP_SERVERS)} 个MCP映射")
+logger.info("工具将按需实时刷新（来源: setting/mcp_servers.json）")
 
 
 # _parse_sse_event / _filter_tool_calls_fields / _merge_function_call_delta /
@@ -530,7 +535,7 @@ async def _emit_compaction_event(
         if callable(add_event):
             await add_event(payload)
     except Exception as exc:
-        print(f"[WARNING] 压缩事件落盘失败：{exc}")
+        logger.warning(f"压缩事件落盘失败：{exc}")
 
 
 async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict[str, Any], list[dict[str, str]] | None]:
@@ -692,14 +697,12 @@ async def _compact_task_context_if_needed(
         )
         if target_history_budget > 0 else None
     )
-    print(
-        f"[INFO] 任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
+    logger.info(f"任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
         f"动态历史预算 {history_budget}（系统 {system_tokens} + 工具 {tools_tokens} + "
         f"当前轮 {active_tokens} + 摘要预留 {summary_reserve} + 问题索引 "
         f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}；"
         f"完整窗口目标 {history_target or '未启用'}，目标历史预算 {target_history_budget or '未启用'}），"
-        f"预算内轮次保留原始对话，超出部分压缩"
-    )
+        f"预算内轮次保留原始对话，超出部分压缩")
     await compact_session_history_if_needed(
         session_chat_memory,
         tool_request,
@@ -742,7 +745,7 @@ async def _compact_task_context_if_needed(
     rebuilt.extend(history_messages)
     rebuilt.extend(active_messages)
     after_tokens = estimate_send_context_tokens(rebuilt, tool_request.tools)
-    print(f"[INFO] 任务内历史重建完成：{context_now} -> {after_tokens} tokens")
+    logger.info(f"任务内历史重建完成：{context_now} -> {after_tokens} tokens")
     return rebuilt
 
 
@@ -757,14 +760,14 @@ async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, 
     try:
         await session_chat_memory.add_sub_agent_event(payload)
     except Exception as persist_error:
-        print(f"[WARNING] sub_agent 事件落盘失败（phase={payload.get('phase')}）: {persist_error}")
+        logger.warning(f"sub_agent 事件落盘失败（phase={payload.get('phase')}）: {persist_error}")
     try:
         await _stream_emit(
             stream,
             f"data: {json.dumps({'event': 'sub_agent', **payload}, ensure_ascii=False)}\n\n",
         )
     except Exception as sse_error:
-        print(f"[WARNING] sub_agent 事件推送失败（phase={payload.get('phase')}）: {sse_error}")
+        logger.warning(f"sub_agent 事件推送失败（phase={payload.get('phase')}）: {sse_error}")
 
 
 def _build_sub_agent_contexts(
@@ -1103,7 +1106,7 @@ async def _run_chat_generation(
     try:
         current_round_number = await session_chat_memory.get_current_round_number()
     except Exception as round_error:
-        print(f"[WARNING] 获取轮次号失败（版本链按 round=0 记录）: {round_error}")
+        logger.warning(f"获取轮次号失败（版本链按 round=0 记录）: {round_error}")
         current_round_number = 0
     # 新生成任务必须显式置回运行态：上一个被中断的任务可能在 finally 里置 False，
     # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
@@ -1135,9 +1138,9 @@ async def _run_chat_generation(
             if latest_answer_text.startswith(ASK_ANSWER_PREFIX):
                 removed_rounds = await session_chat_memory.truncate_rounds_for_reanswer()
                 if removed_rounds:
-                    print(f"[INFO] 覆盖式重新回答：已截断提问后的 {removed_rounds} 个旧轮次")
+                    logger.info(f"覆盖式重新回答：已截断提问后的 {removed_rounds} 个旧轮次")
         except Exception as trunc_error:
-            print(f"[WARNING] 覆盖式回答截断失败（按追加处理）: {trunc_error}")
+            logger.warning(f"覆盖式回答截断失败（按追加处理）: {trunc_error}")
         # 普通发送：覆盖式截断可能已改变轮次计数，此刻计算并推送
         # round_started（本轮的最终轮次号），前端据此给本轮提问气泡
         # 就地补挂编辑/删除入口
@@ -1153,7 +1156,7 @@ async def _run_chat_generation(
                     f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n",
                 )
             except Exception as round_emit_error:
-                print(f"[WARNING] round_started 事件发送失败（前端走重载兜底）: {round_emit_error}")
+                logger.warning(f"round_started 事件发送失败（前端走重载兜底）: {round_emit_error}")
         use_backend_history = parse_bool_like(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
@@ -1173,7 +1176,7 @@ async def _run_chat_generation(
             else:
                 messages = messages[current_start:]
                 incoming_messages = list(messages)
-            print("[INFO] 检测到前端完整历史，已丢弃历史部分并改用后端累计摘要")
+            logger.info("检测到前端完整历史，已丢弃历史部分并改用后端累计摘要")
         # 检查是否存在系统提示词，添加一些提示。
         # runtime_sys_text 为任务级运行时附加文本（工作路径+系统提示），
         # 任务内历史重建（压缩后）与降级链重建候选消息时复用同一份文本。
@@ -1201,12 +1204,10 @@ async def _run_chat_generation(
                 # 此处把孤儿 start 标记为 aborted（前端失效对应条目）。
                 for orphan in await session_chat_memory.find_orphan_compaction_events():
                     await session_chat_memory.mark_compaction_aborted(orphan)
-                    print(
-                        f"[INFO] 检测到未完成的压缩（scope={orphan.get('scope')}，"
-                        f"开始于 {orphan.get('timestamp')}），本次将重新压缩"
-                    )
+                    logger.info(f"检测到未完成的压缩（scope={orphan.get('scope')}，"
+                        f"开始于 {orphan.get('timestamp')}），本次将重新压缩")
             except Exception as exc:
-                print(f"[WARNING] 压缩中断状态检查失败：{exc}")
+                logger.warning(f"压缩中断状态检查失败：{exc}")
             try:
                 # 原地重跑（target_round）/回答插入（insert_round）跳过前置
                 # 压缩：压缩会以当前盘上历史（旧版第 N 轮仍在）为源更新摘要
@@ -1224,13 +1225,13 @@ async def _run_chat_generation(
             except ContextCompactionError as exc:
                 # 压缩模型与聊天模型均失败：终止任务，不回退到原始历史。
                 detail = f"上下文压缩失败，任务已终止：{exc}"
-                print(f"[ERROR] {detail}")
+                logger.error(f"{detail}")
                 session_chat_memory.run_task = False
                 await _stream_emit(stream, _sse_error_payload(detail))
                 return
             except Exception as exc:
                 detail = f"上下文历史压缩失败，任务已终止：{exc}"
-                print(f"[ERROR] {detail}")
+                logger.error(f"{detail}")
                 session_chat_memory.run_task = False
                 await _stream_emit(stream, _sse_error_payload(detail))
                 return
@@ -1240,7 +1241,7 @@ async def _run_chat_generation(
             if backend_messages:
                 # 主 system 保持在首位：累计摘要/最近问题/历史轮次排在其后
                 messages = [messages[0]] + backend_messages + messages[1:]
-                print(f"[INFO] 已拼接累计摘要和最近问题（消息 {len(backend_messages)} 条）")
+                logger.info(f"已拼接累计摘要和最近问题（消息 {len(backend_messages)} 条）")
         latest_user_message = None
         latest_user_text = ""
         for msg in reversed(incoming_messages):
@@ -1315,7 +1316,7 @@ async def _run_chat_generation(
             current_task_media_references = collect_media_references(messages)
         except Exception as media_collect_error:
             current_task_media_references = []
-            print(f"[WARNING] 当前任务媒体引用收集失败（read_media 将不可用）: {media_collect_error}")
+            logger.warning(f"当前任务媒体引用收集失败（read_media 将不可用）: {media_collect_error}")
         # 多媒体引用解析：仅解析当前轮消息 content 列表里的 media:// 引用为
         # 上游可用的 data URL / base64（image_url.url；input_audio.data 为纯
         # base64）。历史轮次用户消息为纯文本口径（媒体部件为 [图片 media://…]
@@ -1329,12 +1330,10 @@ async def _run_chat_generation(
                 session_id, messages, vision_enabled=vision_enabled
             )
             if unresolved_media:
-                print(
-                    f"[WARNING] {len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
-                    f"已原样保留: {unresolved_media[:3]}"
-                )
+                logger.warning(f"{len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
+                    f"已原样保留: {unresolved_media[:3]}")
         except Exception as media_error:
-            print(f"[WARNING] 媒体引用解析失败（按原始引用发送）: {media_error}")
+            logger.warning(f"媒体引用解析失败（按原始引用发送）: {media_error}")
         # 这里做文件处理：注入「文件清单」（普通文本文件小文件内联全文 / 大文件
         # 节选开头 +（启用时）read_document 按需读取提示；启用原生读取时原生候选只显示索引），替换旧版全量拼接。清单受
         # 总预算约束（memory.file_memory.FILE_MEMORY_TOTAL_MAX_CHARS），不再
@@ -1349,7 +1348,7 @@ async def _run_chat_generation(
                     native_doc_types=native_doc_types,
                 )
             except Exception as manifest_error:
-                print(f"[WARNING] 文件清单构建失败（跳过文件注入）: {manifest_error}")
+                logger.warning(f"文件清单构建失败（跳过文件注入）: {manifest_error}")
                 file_manifest_suffix = ""
             if file_manifest_suffix:
                 active_file_block = file_manifest_suffix
@@ -1397,9 +1396,7 @@ async def _run_chat_generation(
             first_call_tokens = estimate_send_context_tokens(messages, tool_request.tools)
             model_window = resolve_model_max_input_tokens(default=8192)
             if first_call_tokens > model_window:
-                print(
-                    f"[WARNING] 首次模型调用上下文 {first_call_tokens} tokens 超过模型窗口 {model_window}"
-                )
+                logger.warning(f"首次模型调用上下文 {first_call_tokens} tokens 超过模型窗口 {model_window}")
                 if file_manifest_suffix:
                     # 文件清单已按预算构建（小文件内联/大文件节选）；仍超窗时
                     # 进一步降级为「文件索引」（仅文件名/类型/大小 + 读取提示）。
@@ -1412,9 +1409,7 @@ async def _run_chat_generation(
                         messages[0]["content"] += downgraded_text
                     downgraded_tokens = estimate_send_context_tokens(messages, tool_request.tools)
                     active_file_block = downgraded_text if downgraded_text else ""
-                    print(
-                        f"[WARNING] 文件清单已降级为文件索引：{first_call_tokens} -> {downgraded_tokens} tokens"
-                    )
+                    logger.warning(f"文件清单已降级为文件索引：{first_call_tokens} -> {downgraded_tokens} tokens")
                     warning_event = {
                         "warning": {
                             "code": "CONTEXT_BUDGET_FILE_DOWNGRADED",
@@ -1463,13 +1458,13 @@ async def _run_chat_generation(
                     except ContextCompactionError as exc:
                         # 压缩模型与聊天模型均失败：终止任务，不再走后续降级
                         detail = f"上下文压缩失败（聊天模型重试仍不可用），任务已终止：{exc}"
-                        print(f"[ERROR] {detail}")
+                        logger.error(f"{detail}")
                         session_chat_memory.run_task = False
                         await _stream_emit(stream, _sse_error_payload(detail))
                         return
                     except Exception as exc:
                         detail = f"强制历史压缩失败，任务已终止：{exc}"
-                        print(f"[ERROR] {detail}")
+                        logger.error(f"{detail}")
                         session_chat_memory.run_task = False
                         await _stream_emit(stream, _sse_error_payload(detail))
                         return
@@ -1508,7 +1503,7 @@ async def _run_chat_generation(
                         if estimate_send_context_tokens(candidate, tool_request.tools) <= model_window:
                             degraded_messages = candidate
                             if question_budget != question_budgets[0]:
-                                print("[INFO] 摘要上下文已按窗口收紧最近问题索引")
+                                logger.info("摘要上下文已按窗口收紧最近问题索引")
                             break
                     if degraded_messages is not None:
                         messages = degraded_messages
@@ -1516,11 +1511,9 @@ async def _run_chat_generation(
                         history_tokens = max(
                             0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens
                         )
-                        print(
-                            f"[INFO] 首次模型调用上下文已按新模型窗口降级："
+                        logger.info(f"首次模型调用上下文已按新模型窗口降级："
                             f"{first_call_tokens} tokens（摘要-only，最近问题预算已收紧，"
-                            f"后端历史约 {history_tokens} tokens）"
-                        )
+                            f"后端历史约 {history_tokens} tokens）")
                     else:
                         # 全部降级后仍超限，才报压缩错误
                         detail = (
@@ -1532,11 +1525,11 @@ async def _run_chat_generation(
                             "已尝试强制压缩历史并收紧最近问题索引仍无法放入窗口，"
                             "请清理上传文件或开启新会话后重试。"
                         )
-                        print(f"[ERROR] {detail}")
+                        logger.error(f"{detail}")
                         await _stream_emit(stream, _sse_error_payload(detail))
                         return
         except Exception as exc:
-            print(f"[WARNING] 首次调用预算检查跳过：{exc}")
+            logger.warning(f"首次调用预算检查跳过：{exc}")
         # 超大工具结果拒绝策略（仅任务内解析一次）：
         # 阈值 = min(聊天窗口, 压缩窗口) × 系数，连续超长达到上限后终止任务
         compaction_settings = load_context_compaction_settings()
@@ -1579,7 +1572,7 @@ async def _run_chat_generation(
                 stream,
                 f"data: {json.dumps({'event': 'message_injected', 'text': inject_text}, ensure_ascii=False)}\n\n",
             )
-            print(f"[INFO] 已注入运行中用户消息（消息引导）: {inject_text[:80]}")
+            logger.info(f"已注入运行中用户消息（消息引导）: {inject_text[:80]}")
             return True
 
         # run_task = True
@@ -1597,14 +1590,14 @@ async def _run_chat_generation(
             try:
                 await _consume_injected_message()
             except Exception as inject_error:
-                print(f"[WARNING] 处理注入消息失败（跳过）: {inject_error}")
+                logger.warning(f"处理注入消息失败（跳过）: {inject_error}")
             # 思考回传整形只作用于请求副本：运行时 messages 保留每轮模型原始
             # 输出，并按原值落盘。请求副本最多保留最新 assistant 的思考；
             # 最新工具调用本轮缺失时回退最近一次真实思考，旧 assistant 字段剥离。
             # print(f"[DEBUG] messages: {str(messages)}")
             # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
             # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
-            print(f"[DEBUG] 模型调用消息概要：{_messages_debug_summary(messages)}")
+            logger.debug(f"模型调用消息概要：{_messages_debug_summary(messages)}")
             # 大上下文下整包转储会向控制台刷 MB 级文本并拖慢循环，只打印概要
             # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
             full_response = ""
@@ -1745,12 +1738,12 @@ async def _run_chat_generation(
                         full_response += content
                         visible_content = text_tool_call_buffer.push(content)
                         if visible_content:
-                            print(f"{visible_content}", end="", flush=True)
+                            debug_stream_print(visible_content)
                     else:
                         visible_content = ""
                     if reasoning_content:
                         full_reasoning += reasoning_content
-                        print(f"{reasoning_content}", end="", flush=True)
+                        debug_stream_print(reasoning_content)
                     # 优先处理 tool_calls，如果为空再处理 function_call（兼容老模型）
                     if tool_calls_delta:
                         _merge_tool_call_delta(tool_calls, tool_calls_delta)
@@ -1770,7 +1763,7 @@ async def _run_chat_generation(
                         _merge_function_call_delta(tool_calls, function_call_delta)
                         if tool_call_stream_timeout > 0:
                             tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
-                        print(f"[DEBUG] function_call_delta: {function_call_delta}")
+                        logger.debug(f"function_call_delta: {function_call_delta}")
                         # fc_name = function_call_delta.get("name") or ""
                         # fc_args = function_call_delta.get("arguments") or ""
                         # if fc_name or fc_args:
@@ -1817,7 +1810,7 @@ async def _run_chat_generation(
             # 而不是伪装成"用户停止任务"。中间重试过程不落盘（仅前端提示），
             # 这里是唯一落盘点：附带完整重试统计，追溯信息不丢。
             if stream_error is not None:
-                print(f"\n[ERROR] 模型流式响应出错: {stream_error}")
+                logger.error(f"模型流式响应出错: {stream_error}")
                 # 记录 ai 已生成的内容
                 if full_reasoning:
                     await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
@@ -1840,7 +1833,7 @@ async def _run_chat_generation(
                 break  # 任务因错误结束，退出循环
             # 模型回复过程中用户手动停止任务
             if not session_chat_memory.run_task:
-                print("停止任务")
+                logger.info("停止任务")
                 # 记录 ai 生成的内容
                 if full_reasoning:
                     await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
@@ -1884,7 +1877,7 @@ async def _run_chat_generation(
                     f"{int(tool_call_stream_timeout)} 秒无输出而失败（接口卡死，"
                     "参数可能不完整），本次调用已放弃。请重新发起工具调用或继续回答。"
                 )
-                print(f"[WARNING] 工具调用流式阶段超时（未收到完整调用），提示模型重试")
+                logger.warning(f"工具调用流式阶段超时（未收到完整调用），提示模型重试")
                 messages.append({"role": "user", "content": timeout_notice, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_STREAM_TIMEOUT', 'message': timeout_notice}}, ensure_ascii=False)}\n\n")
                 continue
@@ -1906,7 +1899,7 @@ async def _run_chat_generation(
                     if stream_truncated_retries > 0 and stream_truncated_retries is not None and model_retries >= stream_truncated_retries:
                         # 重试超限：落盘已生成的思考/正文 + 带重试统计的错误记录，
                         # 结束任务（错误不静默，用户可看到失败原因并重发）
-                        print(f"[WARNING] 上游连接提前断开，单次请求内连续重试 {model_retries} 次仍截断，结束任务")
+                        logger.warning(f"上游连接提前断开，单次请求内连续重试 {model_retries} 次仍截断，结束任务")
                         if full_reasoning:
                             await session_chat_memory.add_chat_history({"role": "assistant", "reasoning_content": full_reasoning})
                         if full_response:
@@ -1925,7 +1918,7 @@ async def _run_chat_generation(
                         session_chat_memory.run_task = False
                         break
                     model_retries += 1
-                    print(f"[WARNING] 上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
+                    logger.warning(f"上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
                     # 已生成的部分内容进入 messages（模型续写时可见上下文），
                     # 不落盘——避免 JSONL 留下"腰斩的回答"，最终完整回答统一落盘
                     partial_message = {"role": "assistant"}
@@ -1948,7 +1941,7 @@ async def _run_chat_generation(
                 # 如果 finish_reason 是 "length"，说明模型输出因 max_tokens 不足被截断
                 # 需要提示模型继续完成回答，而不是按"未调用工具"的逻辑处理
                 if finish_reason == "length":
-                    print(f"[WARNING] 模型输出被截断(finish_reason=length)，提示模型继续完成回答")
+                    logger.warning(f"模型输出被截断(finish_reason=length)，提示模型继续完成回答")
                     assistant_message = {"role": "assistant"}
                     if full_response:
                         assistant_message["content"] = full_response
@@ -1976,12 +1969,12 @@ async def _run_chat_generation(
                 # 请求发起前生效，避免注入消息要等任务全部完成后才发起）
                 try:
                     if await _consume_injected_message():
-                        print("[INFO] 注入消息接管任务收尾：继续下一轮模型调用")
+                        logger.info("注入消息接管任务收尾：继续下一轮模型调用")
                         continue
                 except Exception as inject_error:
-                    print(f"[WARNING] 处理注入消息失败（按任务结束处理）: {inject_error}")
+                    logger.warning(f"处理注入消息失败（按任务结束处理）: {inject_error}")
                 session_chat_memory.run_task = False
-                print("\n[INFO] 本轮对话未返回工具调用，任务结束")
+                logger.info("本轮对话未返回工具调用，任务结束")
                 break
             # 构建包含 tool_calls 的 assistant 消息（符合 OpenAI API 规范）
             assistant_message = {"role": "assistant"}
@@ -2024,7 +2017,7 @@ async def _run_chat_generation(
                     f"{int(tool_call_stream_timeout)} 秒无任何响应（上游接口疑似卡死），"
                     "本次调用已被中止，参数可能不完整，请重新发起工具调用。"
                 )
-                print(f"[WARNING] 工具调用流式阶段超时：放弃 {len(formatted_tool_calls)} 个调用，反馈模型继续")
+                logger.warning(f"工具调用流式阶段超时：放弃 {len(formatted_tool_calls)} 个调用，反馈模型继续")
                 if formatted_tool_calls:
                     assistant_message["tool_calls"] = formatted_tool_calls
                     messages.append(assistant_message)
@@ -2061,7 +2054,7 @@ async def _run_chat_generation(
                     "刚才的工具调用格式损坏（未能解析出函数名），本次调用已放弃。"
                     "请重新发起工具调用，或直接回答用户。"
                 )
-                print("[WARNING] 工具调用全部损坏（无函数名），提示模型重试")
+                logger.warning("工具调用全部损坏（无函数名），提示模型重试")
                 messages.append({"role": "user", "content": broken_notice, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TOOL_CALL_BROKEN', 'message': broken_notice}}, ensure_ascii=False)}\n\n")
                 continue
@@ -2087,7 +2080,7 @@ async def _run_chat_generation(
             plan = prepare_tool_execution(tool_calls, known_tool_names)
             parsed_tools = plan.parsed_tools
             if plan.has_parse_error:
-                print("[WARNING] 检测到工具参数解析错误，可能导致工具执行失败")
+                logger.warning("检测到工具参数解析错误，可能导致工具执行失败")
             # over_task 结束信号的配对结果：声明（assistant_message）已在上方
             # 落盘，无论本轮是否还有其他工具调用，都必须生成配对 tool 结果——
             # 否则历史里留下"声明无结果"的悬空 tool_call，下一轮回放发上游时
@@ -2113,7 +2106,7 @@ async def _run_chat_generation(
             blocked_tools = [item for item in parsed_tools if item[2] not in round_tool_servers]
             parsed_tools = [item for item in parsed_tools if item[2] in round_tool_servers]
             if blocked_tools:
-                print(f"[WARNING] 检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
+                logger.warning(f"检测到 {len(blocked_tools)} 个未授权工具调用，已拦截")
                 for _, blocked_tool_call, blocked_tool_name, blocked_tool_args in blocked_tools:
                     blocked_tool_call_id = blocked_tool_call.get("id", "") if isinstance(blocked_tool_call, dict) else ""
                     blocked_ret = (
@@ -2160,9 +2153,9 @@ async def _run_chat_generation(
             # 如果没有任何有效工具可执行，退出
             if not parsed_tools:
                 # over_task 结束信号：配对结果已在上方统一生成；此处直接退出
-                print("[WARNING] 没有可执行的有效工具，退出循环")
+                logger.warning("没有可执行的有效工具，退出循环")
                 break
-            print(f"\n[INFO] 准备执行 {len(parsed_tools)} 个工具")
+            logger.info(f"准备执行 {len(parsed_tools)} 个工具")
             # 工具开始执行事件：参数已完整、即将调用。前端据此把对应工具块
             # 置为"执行中"，等待结果期间有可感知状态。内置工具（write_file/
             # edit_file/read_file/search_files/todo_write 等）与外部 MCP 工具
@@ -2186,7 +2179,7 @@ async def _run_chat_generation(
                         f"data: {json.dumps(start_event, ensure_ascii=False)}\n\n",
                     )
             except Exception as start_emit_error:
-                print(f"[WARNING] tool_start 事件推送失败: {start_emit_error}")
+                logger.warning(f"tool_start 事件推送失败: {start_emit_error}")
             # 内置工具与 MCP 工具分开执行
             builtin_results = []
             external_parsed_tools = []
@@ -2393,7 +2386,7 @@ async def _run_chat_generation(
                         if todo_error is None and items is not None:
                             initial_todo = items
                         elif todo_error:
-                            print(f"[WARNING] sub_agent 预置 todo 无效，忽略：{todo_error}")
+                            logger.warning(f"sub_agent 预置 todo 无效，忽略：{todo_error}")
                     sub_agent_calls.append((idx, tc, task_text, initial_todo))
                     continue
                 # 内置文件编辑工具（write_file/edit_file）：服务端本地执行，
@@ -2469,9 +2462,9 @@ async def _run_chat_generation(
                         f"data: {json.dumps({'event': 'todo', 'todos': todos}, ensure_ascii=False)}\n\n",
                     )
                 except Exception as todo_emit_error:
-                    print(f"[WARNING] todo 事件推送失败: {todo_emit_error}")
+                    logger.warning(f"todo 事件推送失败: {todo_emit_error}")
             if tool_results:
-                print(f"[INFO] 有 {len(tool_results)} 个工具执行完成", flush=True)
+                logger.info(f"有 {len(tool_results)} 个工具执行完成")
                 # 按索引排序结果
                 tool_results.sort(key=lambda x: x['index'])
                 oversized_abort = False
@@ -2502,12 +2495,10 @@ async def _run_chat_generation(
                         oversized_feedback = build_oversized_tool_feedback(
                             tool_name, estimated_tokens, oversized_result_threshold, result_text=ret
                         )
-                        print(
-                            f"[WARNING] 工具 {tool_name} 返回结果过大"
+                        logger.warning(f"工具 {tool_name} 返回结果过大"
                             f"（估算 {estimated_tokens} tokens > 拒绝阈值 {oversized_result_threshold}），"
                             f"连续 {consecutive_oversized_count}/{max_oversized_rejections} 次，"
-                            "已告知模型重新考虑工具使用"
-                        )
+                            "已告知模型重新考虑工具使用")
                         if consecutive_oversized_count >= max_oversized_rejections:
                             # 达到连续拒绝上限：终止任务
                             await session_chat_memory.add_chat_history(
@@ -2594,7 +2585,7 @@ async def _run_chat_generation(
                         latest_todos = await session_chat_memory.get_session_todo()
                         _replace_todo_context(messages, latest_todos)
                     except Exception as todo_compact_error:
-                        print(f"[WARNING] todo 上下文归并失败：{todo_compact_error}")
+                        logger.warning(f"todo 上下文归并失败：{todo_compact_error}")
                 if ask_user_pending and not oversized_abort:
                     # 推送提问事件：前端渲染问题/选项/自由输入卡片；
                     # 回答作为下一条用户消息发送，与本轮任务解耦
@@ -2605,7 +2596,7 @@ async def _run_chat_generation(
                             f"data: {json.dumps(ask_event, ensure_ascii=False)}\n\n",
                         )
                     except Exception as ask_emit_error:
-                        print(f"[WARNING] ask_user 事件推送失败: {ask_emit_error}")
+                        logger.warning(f"ask_user 事件推送失败: {ask_emit_error}")
                     # 本轮任务到此暂停：占位工具结果已落盘、消息契约完整，
                     # 置 run_task=False 后循环正常退出（done 标记 + 收尾压缩）
                     session_chat_memory.run_task = False
@@ -2706,12 +2697,12 @@ async def _run_chat_generation(
                     # 继续生成只会让上下文持续膨胀、下一批极易超窗（原始问题场景），
                     # 因此与任务前/首调用压缩同策略——终止当前任务。
                     detail = f"任务内历史压缩失败（重试降级链已耗尽），任务已终止：{exc}"
-                    print(f"[ERROR] {detail}")
+                    logger.error(f"{detail}")
                     session_chat_memory.run_task = False
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
-                    print(f"[WARNING] 任务内历史压缩跳过：{exc}")
+                    logger.warning(f"任务内历史压缩跳过：{exc}")
                     rebuilt_messages = None
                 if rebuilt_messages is not None:
                     messages = rebuilt_messages
@@ -2732,12 +2723,12 @@ async def _run_chat_generation(
                     # 严格"失败则停止"：单轮压缩重试降级链耗尽后本轮工具轨迹无法
                     # 收缩，下一批工具结果大概率超窗，终止当前任务而不是原样继续。
                     detail = f"单轮工具轨迹压缩失败（重试降级链已耗尽），任务已终止：{exc}"
-                    print(f"[ERROR] {detail}")
+                    logger.error(f"{detail}")
                     session_chat_memory.run_task = False
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
-                    print(f"[WARNING] 单轮工具上下文压缩跳过：{exc}")
+                    logger.warning(f"单轮工具上下文压缩跳过：{exc}")
                     round_compaction = None
                 if round_compaction is not None and round_compaction.triggered:
                     messages = round_compaction.messages
@@ -2868,7 +2859,7 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest)
         )
         await session_chat_memory.ensure_session_config_snapshot()
     except Exception as snapshot_error:
-        print(f"[WARNING] 会话配置快照失败（不影响本轮对话）: {snapshot_error}")
+        logger.warning(f"会话配置快照失败（不影响本轮对话）: {snapshot_error}")
     if proxy is not None:
         proxy.bind_stream(stream)
         started = proxy.start_generation(tool_request.model_dump())
@@ -2955,7 +2946,7 @@ async def tool_chat_server(
                 except asyncio.CancelledError:
                     pass
                 except Exception as old_error:
-                    print(f"[WARNING] 旧生成任务退出异常（已忽略）: {old_error}")
+                    logger.warning(f"旧生成任务退出异常（已忽略）: {old_error}")
         stream = _set_session_stream(session_id)
         if not await _start_session_generation(proxy, stream, tool_request):
             return
@@ -3126,4 +3117,4 @@ async def stop_chat_task(session_id):
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            print(f"[WARNING] 停止会话任务时忽略后台异常: {exc}")
+            logger.warning(f"停止会话任务时忽略后台异常: {exc}")

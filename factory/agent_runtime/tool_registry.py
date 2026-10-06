@@ -11,6 +11,11 @@ from typing import Any, Dict, List
 from env_manager import load_var
 from util.mcp_client import get_mcp_tools
 
+from util.logger import get_logger
+
+logger = get_logger("factory.agent_runtime.tool_registry")
+
+
 
 ALL_TOOLS: List[Dict[str, Any]] = []
 TOOL_MCP_SERVERS: Dict[str, str] = {}
@@ -389,7 +394,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             tool_name = tool_name.strip()
             identity = (server_id, tool_name)
             if identity in seen_identities:
-                print(f"⚠️ MCP 服务 [{server_id}] 重复注册工具 [{tool_name}]，忽略重复项")
+                logger.warning(f"⚠️ MCP 服务 [{server_id}] 重复注册工具 [{tool_name}]，忽略重复项")
                 continue
             seen_identities.add(identity)
             tool_definition = {
@@ -448,13 +453,11 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
         tool_with_server["server_id"] = tool_mcp_servers.get(func_name, "")
         tool_with_server["original_name"] = tool_original_names.get(func_name, func_name)
         api_tools.append(tool_with_server)
-    print(f"✅ 已加载 {len(filtered_tools)} 个工具（{len(server_metrics)} 个 MCP 服务器）")
+    logger.info(f"✅ 已加载 {len(filtered_tools)} 个工具（{len(server_metrics)} 个 MCP 服务器）")
     for metric in server_metrics:
         if not metric["ok"]:
-            print(
-                f"   ⚠️ 服务器 [{metric['server_id']}] 加载失败"
-                f"（{metric['elapsed_ms']}ms）：{metric['error']}"
-            )
+            logger.warning(f"   ⚠️ 服务器 [{metric['server_id']}] 加载失败"
+                f"（{metric['elapsed_ms']}ms）：{metric['error']}")
     payload = {
         "tools": api_tools,
         "total": len(filtered_tools),

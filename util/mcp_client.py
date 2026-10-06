@@ -11,6 +11,11 @@ import shlex
 import time
 # import platform
 from pathlib import Path
+
+from util.logger import get_logger
+
+logger = get_logger("util.mcp_client")
+
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -311,7 +316,7 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
                 await _upgrade_modern_protocol(session)
                 # 列出可用工具
                 tools_result = await session.list_tools()
-                print(f"✅ 成功获取 {len(tools_result.tools)} 个工具")
+                logger.info(f"✅ 成功获取 {len(tools_result.tools)} 个工具")
                 # 转换为 FunctionDefinition 对象
                 tools = []
                 for tool in tools_result.tools:
@@ -325,7 +330,7 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
                 return tools
     except Exception as e:
         detail = _format_mcp_error(e)
-        print(f"⚠️ MCP 服务器 [{mcp_server}] 连接失败：{detail}")
+        logger.warning(f"⚠️ MCP 服务器 [{mcp_server}] 连接失败：{detail}")
         # Python 不能 raise 字符串；保留真实异常链，避免工具发现失败时
         # 二次变成“exceptions must derive from BaseException”而丢失根因。
         raise RuntimeError(f"MCP 服务器 [{mcp_server}] 连接失败: {detail}") from e

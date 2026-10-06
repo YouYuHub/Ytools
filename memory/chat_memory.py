@@ -40,6 +40,11 @@ from config import (
     resolve_work_dir,
 )
 
+from util.logger import get_logger
+
+logger = get_logger("memory.chat_memory")
+
+
 HISTORY_ROOT = Path(__file__).resolve().parents[1] / "history_files"
 HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -652,7 +657,7 @@ def mark_title_attempted(session_id: str) -> dict[str, Any] | None:
         _write_meta_and_entries(file_path, meta, entries)
         return meta
     except Exception as exc:
-        print(f"[WARNING] 标题尝试标记写入失败（不影响聊天任务）: {exc}")
+        logger.warning(f"标题尝试标记写入失败（不影响聊天任务）: {exc}")
         return None
 
 
@@ -1406,10 +1411,8 @@ class ChatMemoryManager:
                     if target_round <= len(round_positions):
                         replace_index = round_positions[target_round - 1]
                     else:
-                        print(
-                            f"[WARNING] target_round={target_round} 超出当前轮次数 "
-                            f"{len(round_positions)}，降级为追加写入"
-                        )
+                        logger.warning(f"target_round={target_round} 超出当前轮次数 "
+                            f"{len(round_positions)}，降级为追加写入")
                 if replace_index is not None:
                     old_round = entries[replace_index]
                     replaced_round = old_round
@@ -1458,10 +1461,8 @@ class ChatMemoryManager:
                         self._history_cutoff_rounds = None
                         self._backup_history_file()
                     else:
-                        print(
-                            f"[WARNING] insert_round={insert_round} 超出当前轮次数 "
-                            f"{len(round_positions)}，降级为追加写入"
-                        )
+                        logger.warning(f"insert_round={insert_round} 超出当前轮次数 "
+                            f"{len(round_positions)}，降级为追加写入")
                         entries.append(completed_round)
                         _adjust_context_summary_for_insert(meta, len(round_positions))
                         self._insert_round_number = None
@@ -1546,7 +1547,7 @@ class ChatMemoryManager:
             except OSError as err:
                 last_error = err
                 time.sleep(delay)
-        print(f"[WARNING] 会话 {self.session_id} 轮次检查点写入失败（保留旧检查点，本轮继续）：{last_error}")
+        logger.warning(f"会话 {self.session_id} 轮次检查点写入失败（保留旧检查点，本轮继续）：{last_error}")
 
     def _clear_pending_checkpoint(self) -> None:
         try:
@@ -1828,10 +1829,8 @@ class ChatMemoryManager:
             return
         result = self._execute_deleted_files_cleanup(self.session_id, planned)
         if result.get("failed"):
-            print(
-                f"[WARNING] 替换轮次后清理未引用媒体失败："
-                f"{'; '.join(result['failed'])}"
-            )
+            logger.warning(f"替换轮次后清理未引用媒体失败："
+                f"{'; '.join(result['failed'])}")
 
     async def delete_rounds(
         self,
@@ -2010,7 +2009,7 @@ class ChatMemoryManager:
                 # 历史根目录只保留 *.jsonl 正文件）
                 shutil.copy2(self._file_path, self._sidecar_path(".bak"))
         except OSError as backup_error:
-            print(f"[WARNING] 历史文件备份失败（继续执行删除）: {backup_error}")
+            logger.warning(f"历史文件备份失败（继续执行删除）: {backup_error}")
 
     async def update_current_round_usage(
         self,
@@ -2313,7 +2312,7 @@ class ChatMemoryManager:
             except OSError as write_error:
                 # 压缩 usage 统计写盘被文件占用时降级：只影响统计数字完整性，
                 # 不影响摘要内容与任务运行（见 update_context_summary 同源注释）
-                print(f"[WARNING] 历史压缩 usage 写盘失败（文件被占用，本次跳过）: {write_error}")
+                logger.warning(f"历史压缩 usage 写盘失败（文件被占用，本次跳过）: {write_error}")
                 return "usage 写盘繁忙，已跳过"
         return "记录成功"
 
@@ -2543,9 +2542,7 @@ class ChatMemoryManager:
             try:
                 _write_meta_and_entries(self._file_path, meta, entries)
             except OSError as write_error:
-                print(
-                    f"[ERROR] 累计摘要写盘失败（不再静默跳过，交由调用方处理）: {write_error}"
-                )
+                logger.error(f"累计摘要写盘失败（不再静默跳过，交由调用方处理）: {write_error}")
                 raise RuntimeError(f"累计摘要写盘失败：{write_error}") from write_error
         return "记录成功"
 
@@ -2851,7 +2848,7 @@ class ChatMemoryManager:
                 if file_block_text:
                     file_memory_tokens = _estimate_text_tokens(file_block_text)
         except Exception as file_stats_error:
-            print(f"[WARNING] 文件清单统计失败（按 0 计入）: {file_stats_error}")
+            logger.warning(f"文件清单统计失败（按 0 计入）: {file_stats_error}")
         # 运行时系统提示词（工作路径+系统提示）：真实请求追加在首条 system 消息，
         # 单独统计并计入请求上下文总额，避免低估
         system_prompt_tokens = (
@@ -3101,7 +3098,7 @@ class ChatMemoryManager:
                     if resolved is not None:
                         meta["work_dir"] = str(resolved)
             except Exception as work_error:
-                print(f"[WARNING] 会话配置快照（work_dir）失败，已跳过该项: {work_error}")
+                logger.warning(f"会话配置快照（work_dir）失败，已跳过该项: {work_error}")
             # 全局默认工具选择
             try:
                 inputs, _servers, tool_error = get_global_tool_inputs()
@@ -3110,7 +3107,7 @@ class ChatMemoryManager:
                     if normalized_inputs and meta.get("tool_selection") is None:
                         meta["tool_selection"] = normalized_inputs
             except Exception as tool_error:
-                print(f"[WARNING] 会话配置快照（tool_selection）失败，已跳过该项: {tool_error}")
+                logger.warning(f"会话配置快照（tool_selection）失败，已跳过该项: {tool_error}")
             # 全局默认模型选择（全部角色）
             try:
                 global_selection = _get_global_model_selection()
@@ -3121,7 +3118,7 @@ class ChatMemoryManager:
                 if valid_selection and not isinstance(meta.get("model_selection"), dict):
                     meta["model_selection"] = valid_selection
             except Exception as model_error:
-                print(f"[WARNING] 会话配置快照（model_selection）失败，已跳过该项: {model_error}")
+                logger.warning(f"会话配置快照（model_selection）失败，已跳过该项: {model_error}")
             meta["config_snapshot_at"] = now_str()
             meta["updated_at"] = now_str()
             _write_meta_and_entries(self._file_path, meta, entries)

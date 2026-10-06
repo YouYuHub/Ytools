@@ -45,6 +45,11 @@ from env_manager import (
 )
 from util.timestamp_utils import now_str
 
+from util.logger import get_logger
+
+logger = get_logger("factory.agent_runtime.title_generator")
+
+
 # 首轮模型输出预览采集长度（字符）：思考/正文均计入，任一达到即停止采集
 TITLE_SOURCE_PREVIEW_CHARS = 100
 
@@ -150,10 +155,10 @@ def build_title_content(
             session_id, question_parts, vision_enabled=vision_enabled
         )
     except Exception as exc:
-        print(f"[WARNING] 标题请求媒体解析失败（回退纯文本标题）: {exc}")
+        logger.warning(f"标题请求媒体解析失败（回退纯文本标题）: {exc}")
         return plain_text
     if unresolved:
-        print(f"[WARNING] 标题请求 {len(unresolved)} 个媒体引用解析失败（按文本占位发送）")
+        logger.warning(f"标题请求 {len(unresolved)} 个媒体引用解析失败（按文本占位发送）")
     parts: list[dict[str, Any]] = [{"type": "text", "text": plain_text}]
     for part in resolved:
         if isinstance(part, dict):
@@ -269,7 +274,7 @@ async def maybe_generate_session_title(
 
     if retitle_each_message:
         # 每条消息重新标题：每轮收尾都生成（本轮失败也继续，不留 attempted 障碍）
-        print("[INFO] 会话开启每条消息重新标题，本轮收尾将重新生成标题")
+        logger.info("会话开启每条消息重新标题，本轮收尾将重新生成标题")
     else:
         # 标记检查：已生成过（或用户已手动重命名）→ 不再覆盖；
         # 已尝试过但未成功（attempts 非空）→ 同样不再自动重试（防止上游
@@ -284,7 +289,7 @@ async def maybe_generate_session_title(
     config, reason = resolve_title_model_config()
     if config is None:
         # 未配置/配置无效：静默保持旧机制标题（仅日志，不打扰用户）
-        print(f"[INFO] 会话标题保持旧机制（{reason}）")
+        logger.info(f"会话标题保持旧机制（{reason}）")
         return None
 
     # 标题模型支持视觉（models.json 该模型 vision=true）且首问含媒体部件时，
@@ -316,13 +321,13 @@ async def maybe_generate_session_title(
         # 失败原因完整保留（含上游 403/区域限制等响应体）：所选标题模型在
         # 其网关侧可能不可用（如 OpenCode 网关按工作区对部分模型做区域门控，
         # 同 provider 下聊天模型可用不代表标题角色可用），提示用户更换
-        print(f"[WARNING] 标题模型调用失败（保持旧机制标题，可尝试更换标题模型）: {exc}")
+        logger.warning(f"标题模型调用失败（保持旧机制标题，可尝试更换标题模型）: {exc}")
         return None
     title = ""
     if isinstance(result, dict):
         title = _clean_title_text(result.get("content") or result.get("reasoning_content"))
     if not title:
-        print("[WARNING] 标题模型返回空内容（保持旧机制标题）")
+        logger.warning("标题模型返回空内容（保持旧机制标题）")
         return None
     return title
 
@@ -380,7 +385,7 @@ async def _generate_and_apply_title(
         model_name = str(config.get("selected_model_id") or config.get("selected_model_name") or "")
     meta = await apply_title_to_session(session_id, title, model_name)
     if meta is not None:
-        print(f"[INFO] 会话 [{session_id}] 标题已由标题模型更新：{title}")
+        logger.info(f"会话 [{session_id}] 标题已由标题模型更新：{title}")
 
 
 def _log_title_task_error(task: "asyncio.Task") -> None:
@@ -389,7 +394,7 @@ def _log_title_task_error(task: "asyncio.Task") -> None:
         return
     exc = task.exception()
     if exc is not None:
-        print(f"[WARNING] 会话标题任务异常终止（保持旧机制标题）: {exc}")
+        logger.warning(f"会话标题任务异常终止（保持旧机制标题）: {exc}")
 
 
 # 前端触发生成时的同会话防抖窗口（秒）：一轮任务只会触发一次请求，
@@ -480,7 +485,7 @@ async def generate_title_for_frontend(
             "state": "succeed", "title": str(existing_title),
             "replaced": False, "skipped": True, "reason": "标题写盘失败",
         }
-    print(f"[INFO] 会话 [{session_id}] 标题已由标题模型更新（前端触发）：{title}")
+    logger.info(f"会话 [{session_id}] 标题已由标题模型更新（前端触发）：{title}")
     return {"state": "succeed", "title": title, "replaced": True, "skipped": False}
 
 
@@ -526,4 +531,4 @@ def schedule_title_generation(
         )
         task.add_done_callback(_log_title_task_error)
     except Exception as exc:
-        print(f"[WARNING] 会话标题任务启动失败（保持旧机制标题）: {exc}")
+        logger.warning(f"会话标题任务启动失败（保持旧机制标题）: {exc}")

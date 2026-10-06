@@ -23,6 +23,11 @@ from typing import(
 import asyncio
 from contextlib import suppress
 
+from util.logger import get_logger
+
+logger = get_logger("chat.chat_llm")
+
+
 
 
 # 自己的模块
@@ -246,7 +251,7 @@ class ChatLLM:
             raise ChatModelConfigurationError("指定的聊天模型配置必须是字典")
         api_url = chat_config.get("url")
         model_name = chat_config.get("selected_model_id") or chat_config.get("selected_model_name")
-        print(f"[INFO] model: {model_name}")
+        logger.debug(f"model: {model_name}")
         api_type = str(chat_config.get("apiType") or "chat-completions").strip().casefold()
         if not isinstance(api_url, str) or not api_url.strip():
             raise ChatModelConfigurationError("已选择的模型缺少 url 配置")
@@ -363,11 +368,9 @@ class ChatLLM:
         headroom = hard_limit - estimated_input - _HARD_LIMIT_SAFETY_MARGIN_TOKENS
         if headroom >= _HARD_LIMIT_MIN_MAX_TOKENS:
             payload["max_tokens"] = headroom
-            print(
-                f"[WARNING] 请求规模预检：估算输入 {estimated_input} + max_tokens "
+            logger.warning(f"请求规模预检：估算输入 {estimated_input} + max_tokens "
                 f"{max_tokens_value} 超过供应商硬限制 {hard_limit}，"
-                f"已自动降 max_tokens 至 {headroom}"
-            )
+                f"已自动降 max_tokens 至 {headroom}")
             return None
         return (
             f"请求规模超过供应商硬限制：估算输入 {estimated_input} tokens + "
@@ -608,7 +611,7 @@ class ChatLLM:
                 # 配置原值），若仅首次预检，降级结果会在重试时丢失导致再次超限
                 hard_limit_error = ChatLLM._precheck_hard_limit(payload)
                 if hard_limit_error is not None:
-                    print(f"[ERROR] {hard_limit_error}")
+                    logger.error(f"{hard_limit_error}")
                     yield f"data: {json.dumps({'error': hard_limit_error, 'error_type': 'hard_limit', 'step': 'precheck', 'retry': 0, 'max_attempts': None, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -678,12 +681,12 @@ class ChatLLM:
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                            print(f"[ERROR] API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            logger.error(f"API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                             yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
                         yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step}): {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                        print(f"[WARNING] API 返回 {status_str}，进入重试 #{retry_count}"
+                        logger.warning(f"API 返回 {status_str}，进入重试 #{retry_count}"
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
@@ -770,12 +773,12 @@ class ChatLLM:
                             f"（步骤:{last_step}）"
                         )
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                            print(f"[ERROR] API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            logger.error(f"API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                             yield f"data: {json.dumps({'error': f'{empty_error}，已重试 {retry_max_attempts} 次仍为空', 'error_type': 'empty_response', 'step': last_step, 'error_detail': empty_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
                         yield f"data: {json.dumps({'error': f'{empty_error}', 'error_type': 'empty_response', 'step': last_step, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                        print(f"[WARNING] API 200 空响应，进入重试 #{retry_count}"
+                        logger.warning(f"API 200 空响应，进入重试 #{retry_count}"
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     if not saw_done and not saw_finish_reason:
@@ -797,23 +800,23 @@ class ChatLLM:
             except (socket.timeout, OSError) as e:
                 retry_count += 1
                 if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                    print(f"[ERROR] API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    logger.error(f"API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                     yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                print(f"[WARNING] API 请求失败，进入重试 #{retry_count}"
+                logger.warning(f"API 请求失败，进入重试 #{retry_count}"
                       + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
             except Exception as e:
                 retry_count += 1
                 if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                    print(f"[ERROR] API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    logger.error(f"API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                     yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                print(f"[WARNING] API 请求异常，进入重试 #{retry_count}"
+                logger.warning(f"API 请求异常，进入重试 #{retry_count}"
                       + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
 
@@ -872,7 +875,7 @@ class ChatLLM:
                 # 配置原值），若仅首次预检，降级结果会在重试时丢失导致再次超限
                 hard_limit_error = ChatLLM._precheck_hard_limit(payload)
                 if hard_limit_error is not None:
-                    print(f"[ERROR] {hard_limit_error}")
+                    logger.error(f"{hard_limit_error}")
                     yield f"data: {json.dumps({'error': hard_limit_error, 'error_type': 'hard_limit', 'step': 'precheck', 'retry': 0, 'max_attempts': None, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -947,12 +950,12 @@ class ChatLLM:
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                            print(f"[ERROR] API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            logger.error(f"API 返回 {status_str}，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                             yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
                         yield f"data: {json.dumps({'error': f'HTTP错误(步骤:{last_step}): {http_error}', 'error_type': 'http', 'step': last_step, 'error_detail': http_error, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                        print(f"[WARNING] API 返回 {status_str}，进入重试 #{retry_count}"
+                        logger.warning(f"API 返回 {status_str}，进入重试 #{retry_count}"
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     last_step = "read_sse_stream"
@@ -1035,12 +1038,12 @@ class ChatLLM:
                             f"（步骤:{last_step}）"
                         )
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                            print(f"[ERROR] API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                            logger.error(f"API 200 空响应，连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                             yield f"data: {json.dumps({'error': f'{empty_error}，已重试 {retry_max_attempts} 次仍为空', 'error_type': 'empty_response', 'step': last_step, 'error_detail': empty_error, 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
                         yield f"data: {json.dumps({'error': f'{empty_error}', 'error_type': 'empty_response', 'step': last_step, 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                        print(f"[WARNING] API 200 空响应，进入重试 #{retry_count}"
+                        logger.warning(f"API 200 空响应，进入重试 #{retry_count}"
                               + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                         continue  # finally 先关闭当前连接，随后重连重发同一 payload
                     if not saw_done and not saw_finish_reason:
@@ -1065,12 +1068,12 @@ class ChatLLM:
                 if retry_max_attempts > 0 and retry_count > retry_max_attempts:
                     # 连续失败达到配置上限：发终止性错误帧（retrying=False），
                     # 上游据此结束任务并落盘最终失败记录
-                    print(f"[ERROR] API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    logger.error(f"API 请求连续失败 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                     yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 yield f"data: {json.dumps({'error': f'连接失败(步骤:{last_step}): {str(e)}', 'error_type': 'connect', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                print(f"[WARNING] API 请求失败，进入重试 #{retry_count}"
+                logger.warning(f"API 请求失败，进入重试 #{retry_count}"
                       + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
             except asyncio.CancelledError:
@@ -1079,12 +1082,12 @@ class ChatLLM:
             except Exception as e:
                 retry_count += 1
                 if retry_max_attempts > 0 and retry_count > retry_max_attempts:
-                    print(f"[ERROR] API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
+                    logger.error(f"API 请求连续异常 {retry_count - 1} 次后达到重试上限 {retry_max_attempts}，停止重试")
                     yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step})，已重试 {retry_max_attempts} 次仍失败: {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts, 'retrying': False}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 yield f"data: {json.dumps({'error': f'请求异常(步骤:{last_step}): {str(e)}', 'error_type': 'request', 'step': last_step, 'error_detail': str(e), 'retry': retry_count, 'max_attempts': retry_max_attempts or None, 'retrying': True}, ensure_ascii=False)}\n\n"
-                print(f"[WARNING] API 请求异常，进入重试 #{retry_count}"
+                logger.warning(f"API 请求异常，进入重试 #{retry_count}"
                       + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到用户手动停止）"))
                 continue
 
@@ -1150,7 +1153,7 @@ class ChatLLM:
             # 每次尝试都预检（语义见流式版注释）
             hard_limit_error = ChatLLM._precheck_hard_limit(payload)
             if hard_limit_error is not None:
-                print(f"[ERROR] {hard_limit_error}")
+                logger.error(f"{hard_limit_error}")
                 raise RuntimeError(hard_limit_error)
             body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             last_step = "connect"
@@ -1241,10 +1244,8 @@ class ChatLLM:
                         raise RuntimeError(
                             f"API 200 空响应（步骤:{last_step}），已重试 {retry_max_attempts} 次仍为空: {empty_error}"
                         )
-                    print(
-                        f"[WARNING] API 200 空响应，进入重试 #{retry_count}"
-                        + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到手动停止）")
-                    )
+                    logger.warning(f"API 200 空响应，进入重试 #{retry_count}"
+                        + (f"（上限 {retry_max_attempts}）" if retry_max_attempts > 0 else "（直到手动停止）"))
                     continue  # finally 先关闭当前连接，随后重连重发同一 payload
                 finish_reason = choices[0].get("finish_reason")
                 usage = response_json.get("usage")

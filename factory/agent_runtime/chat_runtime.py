@@ -11,6 +11,11 @@ import json
 import uuid
 from typing import Any, Dict, List
 
+from util.logger import get_logger
+
+logger = get_logger("factory.agent_runtime.chat_runtime")
+
+
 try:
     import env_manager
 except ImportError:
@@ -192,11 +197,8 @@ def log_upstream_assistant_messages(
         for index, message in enumerate(serialized_messages)
         if isinstance(message, dict) and message.get("role") == "assistant"
     ]
-    print(
-        f"[DEBUG] 上游 API 实际发送的 assistant messages（{source}；index 为完整 messages 下标）: "
-        f"{json.dumps(assistant_messages, ensure_ascii=False, default=str)}",
-        flush=True,
-    )
+    logger.debug(f"上游 API 实际发送的 assistant messages（{source}；index 为完整 messages 下标）: "
+        f"{json.dumps(assistant_messages, ensure_ascii=False, default=str)}")
 
 
 class UsageAccumulator:
@@ -595,7 +597,7 @@ def copy_for_request(
     shaped = _shape_reasoning_for_send(messages, limit)
     cleaned, removed = sanitize_tool_call_pairing(shaped)
     if removed:
-        print(f"[WARNING] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
+        logger.warning(f"请求前清理 {removed} 个悬空 tool_call（无配对结果）")
     return [_drop_quote_fields(message) for message in cleaned]
 
 

@@ -29,6 +29,11 @@ from memory.chat_memory import (
 from factory.file_factory import extract_text_from_bytes
 from routers.raw_upload import read_upload, require_raw_upload, spool_upload
 
+from util.logger import get_logger
+
+logger = get_logger("routers.file_router")
+
+
 # 创建 API 路由器实例
 api_file_router = APIRouter(prefix="/file")
 
@@ -47,7 +52,7 @@ async def _record_session_upload_id(session_id: str) -> str | None:
         await chat_manager.update_session_upload_id(upload_id)
         return upload_id
     except Exception as record_error:
-        print(f"[WARNING] 记录 upload_id 失败: {record_error}")
+        logger.warning(f"记录 upload_id 失败: {record_error}")
         return None
 
 
@@ -119,7 +124,7 @@ def _resolve_session_support_doc_types(session_id: str) -> list[str]:
         support = chat_config.get("support_doc_types")
         return [str(item) for item in support] if isinstance(support, list) else []
     except Exception as exc:
-        print(f"[WARNING] 解析会话模型 supportDocTypes 失败（按不支持处理）: {exc}")
+        logger.warning(f"解析会话模型 supportDocTypes 失败（按不支持处理）: {exc}")
         return []
 
 
@@ -203,7 +208,7 @@ async def upload_files(
                             abs_path = str(doc_path).replace("\\", "/")
                             file_info["abs_path"] = abs_path
                     except Exception as save_error:
-                        print(f"[WARNING] 保存文档原始字节失败（不影响解析文本）: {save_error}")
+                        logger.warning(f"保存文档原始字节失败（不影响解析文本）: {save_error}")
                     # 原生文档标记：当前模型声明支持该类型且原始文件已保存时，
                     # read_document 可按需走原生输入；文本解析结果仍可单独读取
                     native_supported = bool(
@@ -249,7 +254,7 @@ async def upload_files(
                         if doc_path is not None:
                             abs_path = str(doc_path).replace("\\", "/")
                     except Exception as save_error:
-                        print(f"[WARNING] 保存文档原始字节失败: {save_error}")
+                        logger.warning(f"保存文档原始字节失败: {save_error}")
                     if not stored_name:
                         results.append(parse_result)
                         failed_count += 1

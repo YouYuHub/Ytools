@@ -67,6 +67,11 @@ from memory.file_memory import (
 )
 from routers.chat_config_router import get_chat_work_dir_config  # noqa: F401 — 兼容历史导入路径
 
+from util.logger import get_logger
+
+logger = get_logger("routers.chat_router")
+
+
 # 创建 API 路由器实例
 api_chat_router = APIRouter()
 
@@ -1106,7 +1111,7 @@ async def _manual_compaction_event_stream(
             try:
                 await add_event(payload)
             except Exception as exc:
-                print(f"[WARNING] 手动压缩事件落盘失败：{exc}")
+                logger.warning(f"手动压缩事件落盘失败：{exc}")
         await queue.put(payload)
 
     async def run() -> None:
@@ -1160,7 +1165,7 @@ async def _manual_compaction_event_stream(
                         "error": None,
                     }))
             except Exception as shield_exc:
-                print(f"[WARNING] 手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
+                logger.warning(f"手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
             raise
         except Exception as exc:
             result["error"] = str(exc)

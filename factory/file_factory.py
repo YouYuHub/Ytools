@@ -11,6 +11,11 @@ from util.text_encoding import decode_text, unicode_bom
 from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from util.logger import get_logger
+
+logger = get_logger("factory.file_factory")
+
+
 # PDF - 使用 PyMuPDF (fitz)
 try:
     import fitz  # PyMuPDF
@@ -113,7 +118,7 @@ def _parse_pdf_with_pages(data: bytes) -> List[Dict]:
         # 如果所有页面都为空，返回空内容
         return pages if pages else [{"content": "", "page_number": None}]
     except Exception as e:
-        print(f"PDF 分页解析失败：{e}，回退到单文本模式")
+        logger.warning(f"PDF 分页解析失败：{e}，回退到单文本模式")
         try:
             text = _parse_pdf(data)
             return [{"content": text, "page_number": None}]
@@ -154,7 +159,7 @@ def _parse_docx(data: bytes) -> str:
                             texts.append(cleaned_text.strip())
                 except Exception as e:
                     # 跳过有问题的段落
-                    print(f"警告：跳过段落解析错误 - {e}")
+                    logger.warning(f"警告：跳过段落解析错误 - {e}")
                     continue
             # 合并所有文本
             return "\n\n".join(texts) if texts else ""
@@ -194,14 +199,14 @@ def _parse_docx_with_pages(data: bytes) -> List[Dict]:
                         if cleaned_text.strip():
                             texts.append(cleaned_text.strip())
                 except Exception as e:
-                    print(f"警告：跳过段落解析错误 - {e}")
+                    logger.warning(f"警告：跳过段落解析错误 - {e}")
                     continue
             # 合并所有文本
             content = "\n\n".join(texts) if texts else ""
             # DOCX 文件没有页码概念，返回 None
             return [{"content": content, "page_number": None}]
     except Exception as e:
-        print(f"DOCX 分页解析失败：{e}，回退到简单模式")
+        logger.warning(f"DOCX 分页解析失败：{e}，回退到简单模式")
         try:
             content = _parse_docx(data)
             return [{"content": content, "page_number": None}]
@@ -515,7 +520,7 @@ def extract_pages_from_bytes(filename: str, data: bytes) -> List[Dict]:
     try:
         return parser(data)
     except Exception as e:
-        print(f"文件解析失败：{filename}, 错误：{e}")
+        logger.warning(f"文件解析失败：{filename}, 错误：{e}")
         # 尝试回退到简单文本解析
         try:
             text = _parse_txt(data)

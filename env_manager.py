@@ -24,6 +24,11 @@ from typing import Any
 from pathlib import Path
 from threading import Lock
 
+from util.logger import get_logger
+
+logger = get_logger("env_manager")
+
+
 env_file = None
 env_vars = {}
 setting_file = None
@@ -1147,7 +1152,7 @@ def reload_models_config() -> bool:
     try:
         new_models, new_selection, new_setting_vars = _load_models_setting(Path(setting_file))
     except Exception as exc:
-        print(f"[config-watch] models.json 重新加载失败，保留内存配置: {exc}")
+        logger.warning(f"[config-watch] models.json 重新加载失败，保留内存配置: {exc}")
         return False
     _apply_models_setting(new_models, new_selection, new_setting_vars)
     return True
@@ -1182,9 +1187,15 @@ def reload_env_vars(coding: str = "utf-8") -> bool:
         for var_name, raw_value in raw_vars.items():
             resolved_env_vars[var_name] = _resolve_variable_references(raw_value, raw_vars)
     except (OSError, UnicodeDecodeError) as exc:
-        print(f"[config-watch] .env 重新加载失败，保留内存配置: {exc}")
+        logger.warning(f"[config-watch] .env 重新加载失败，保留内存配置: {exc}")
         return False
     env_vars = resolved_env_vars
+    # 日志等级热生效：外部修改 .env 的 LOG_LEVEL 后无需重启即按新等级输出
+    try:
+        from util.logger import setup_logging
+        setup_logging(force=True)
+    except Exception:
+        pass
     return True
 
 

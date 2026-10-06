@@ -30,6 +30,11 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from util.logger import get_logger
+
+logger = get_logger("factory.session_worker")
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # worker 空闲自退出秒数：进程随用随建，避免长期驻留；>0 生效
@@ -59,6 +64,9 @@ def worker_main(session_id: str, cmd_conn, evt_conn) -> None:
     try:
         from env_manager import init_path
         init_path(PROJECT_ROOT)
+        # spawn 子进程重建运行环境后，按 .env 的 LOG_LEVEL 重新校准日志系统
+        from util.logger import setup_logging
+        setup_logging(force=True)
     except Exception as exc:
         _safe_send(evt_conn, {"type": "worker_error", "error": f"worker 初始化失败: {exc}"})
         return
@@ -265,14 +273,14 @@ async def _worker_generate(
     try:
         init_path(CONFIG_PROJECT_ROOT)
     except Exception as exc:
-        print(f"[WARNING] worker 刷新环境配置失败（沿用启动时配置）: {exc}")
+        logger.warning(f"worker 刷新环境配置失败（沿用启动时配置）: {exc}")
     # Windows spawn creates a fresh process, so the watcher-owned in-memory
     # catalog is not inherited from the FastAPI process. Restore its snapshot
     # after init_path, which only reloads static config from disk.
     try:
         _apply_runtime_ollama_model_snapshots(runtime_ollama_models)
     except Exception as exc:
-        print(f"[WARNING] worker 恢复运行时 Ollama 模型列表失败: {exc}")
+        logger.warning(f"worker 恢复运行时 Ollama 模型列表失败: {exc}")
 
     # 会话工作目录解析：_meta.work_dir 覆盖 → DEFAULT_CHAT_WORK_DIR 兜底；
     # 目录失效时发 warning 并回退，不终止任务
@@ -284,7 +292,7 @@ async def _worker_generate(
     if effective_dir:
         try:
             os.chdir(effective_dir)
-            print(f"[INFO] 会话 [{session_id}] 生成任务工作目录: {effective_dir}")
+            logger.info(f"会话 [{session_id}] 生成任务工作目录: {effective_dir}")
         except OSError as exc:
             adapter.emit_event({
                 "warning": {
@@ -312,7 +320,7 @@ async def _interrupt_worker_task(session_id: str, current_task: "asyncio.Task | 
     except asyncio.CancelledError:
         pass
     except Exception as exc:
-        print(f"[WARNING] worker 旧生成任务退出异常（已忽略）: {exc}")
+        logger.warning(f"worker 旧生成任务退出异常（已忽略）: {exc}")
 
 
 async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
@@ -357,7 +365,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                 timeout = None if task_active else idle_timeout
                 cmd = await asyncio.wait_for(cmd_queue.get(), timeout=timeout)
             except asyncio.TimeoutError:
-                print(f"[INFO] 会话 [{session_id}] worker 空闲退出")
+                logger.info(f"会话 [{session_id}] worker 空闲退出")
                 break
             if cmd.get("__eof__"):
                 break
@@ -443,9 +451,9 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         await _interrupt_worker_task(session_id, current_task, user_stop=False)
                     break
                 else:
-                    print(f"[WARNING] worker 收到未知命令: {ctype!r}")
+                    logger.warning(f"worker 收到未知命令: {ctype!r}")
             except Exception as exc:
-                print(f"[WARNING] worker 处理命令 {ctype!r} 失败: {exc}")
+                logger.warning(f"worker 处理命令 {ctype!r} 失败: {exc}")
     finally:
         evt_queue.put(None)  # 让 evt 写线程退出
 
@@ -593,12 +601,12 @@ class SessionWorkerProxy:
                 manager = await get_chat_memory_manager(session_id)
                 await manager.add_chat_history({"role": "assistant", "error": message})
             except Exception as exc:
-                print(f"[WARNING] 会话 [{session_id}] worker 崩溃错误说明落盘失败: {exc}")
+                logger.warning(f"会话 [{session_id}] worker 崩溃错误说明落盘失败: {exc}")
 
         try:
             asyncio.run_coroutine_threadsafe(_record(), loop)
         except RuntimeError as exc:
-            print(f"[WARNING] 会话 [{session_id}] worker 崩溃错误说明调度失败: {exc}")
+            logger.warning(f"会话 [{session_id}] worker 崩溃错误说明调度失败: {exc}")
 
     def _dispatch(self, evt: dict) -> None:
         if not isinstance(evt, dict):
@@ -614,7 +622,7 @@ class SessionWorkerProxy:
             try:
                 handler(evt)
             except Exception as exc:
-                print(f"[WARNING] 会话 [{self.session_id}] worker 事件处理失败: {exc}")
+                logger.warning(f"会话 [{self.session_id}] worker 事件处理失败: {exc}")
 
     # ---- 状态查询 ----
     def is_alive(self) -> bool:
@@ -653,7 +661,7 @@ class SessionWorkerProxy:
             from env_manager import get_ollama_runtime_model_snapshots
             runtime_ollama_models = get_ollama_runtime_model_snapshots()
         except Exception as exc:
-            print(f"[WARNING] 读取运行时 Ollama 模型快照失败: {exc}")
+            logger.warning(f"读取运行时 Ollama 模型快照失败: {exc}")
             runtime_ollama_models = []
         return self._send({
             "type": "generate",
@@ -701,7 +709,7 @@ class SessionWorkerProxy:
 
     def terminate(self, reason: str = "") -> None:
         """强制终止（等待优雅退出超时后的兜底，JSONL 原子写保证不损坏）。"""
-        print(f"[WARNING] 强制终止会话 [{self.session_id}] worker 进程: {reason}")
+        logger.warning(f"强制终止会话 [{self.session_id}] worker 进程: {reason}")
         with self._state_lock:
             self._terminate_locked()
 
@@ -730,7 +738,7 @@ def drop_worker_proxy(session_id: str, shutdown: bool = True) -> None:
         try:
             proxy.shutdown()
         except Exception as exc:
-            print(f"[WARNING] 关停会话 [{session_id}] worker 失败: {exc}")
+            logger.warning(f"关停会话 [{session_id}] worker 失败: {exc}")
 
 
 def sweep_dead_worker_proxies() -> None:

@@ -18,6 +18,11 @@ from env_manager import (
     set_ollama_runtime_models,
 )
 
+from util.logger import get_logger
+
+logger = get_logger("util.ollama_model_watcher")
+
+
 POLL_INTERVAL_ENV_NAME = "OLLAMA_MODEL_POLL_INTERVAL_SECONDS"
 DISCOVERY_TIMEOUT_ENV_NAME = "OLLAMA_MODEL_DISCOVERY_TIMEOUT_SECONDS"
 DEFAULT_POLL_INTERVAL_SECONDS = 30.0
@@ -153,10 +158,8 @@ class OllamaModelWatcher:
                         should_log = self._last_error.get(key) != error_kind
                         self._last_error[key] = error_kind
                     if should_log:
-                        print(
-                            f"[ollama-discovery] {name} 模型发现失败（{error_kind}），"
-                            "保留上次成功的模型列表"
-                        )
+                        logger.warning(f"[ollama-discovery] {name} 模型发现失败（{error_kind}），"
+                            "保留上次成功的模型列表")
                     actions[name] = "failed"
                     continue
                 with self._state_lock:
@@ -268,7 +271,7 @@ class OllamaModelWatcher:
             }
 
         if changed or snapshot_changed:
-            print(f"[ollama-discovery] {provider_name} 模型列表已更新（{len(ordered_records)} 个）")
+            logger.info(f"[ollama-discovery] {provider_name} 模型列表已更新（{len(ordered_records)} 个）")
         return changed or snapshot_changed
 
     def start(self) -> threading.Thread | None:
@@ -288,9 +291,9 @@ class OllamaModelWatcher:
             )
             self._thread.start()
             if interval <= 0:
-                print(f"[ollama-discovery] 自动模型发现已暂停（{POLL_INTERVAL_ENV_NAME}<=0）")
+                logger.info(f"[ollama-discovery] 自动模型发现已暂停（{POLL_INTERVAL_ENV_NAME}<=0）")
             else:
-                print(f"[ollama-discovery] 自动模型发现线程已启动（间隔 {interval:g}s）")
+                logger.info(f"[ollama-discovery] 自动模型发现线程已启动（间隔 {interval:g}s）")
             return self._thread
 
     def _run(self) -> None:
@@ -308,7 +311,7 @@ class OllamaModelWatcher:
             try:
                 self.poll_once()
             except Exception as exc:  # 轮询线程异常后继续运行
-                print(f"[ollama-discovery] 轮询异常（{type(exc).__name__}），将在下轮重试")
+                logger.warning(f"[ollama-discovery] 轮询异常（{type(exc).__name__}），将在下轮重试")
             interval = _positive_float_env(
                 POLL_INTERVAL_ENV_NAME,
                 DEFAULT_POLL_INTERVAL_SECONDS,

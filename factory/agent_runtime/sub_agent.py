@@ -88,6 +88,11 @@ from factory.agent_runtime.tool_executor import (
     prepare_tool_execution,
 )
 
+from util.logger import get_logger
+
+logger = get_logger("factory.agent_runtime.sub_agent")
+
+
 
 @dataclass
 class SubAgentContext:
@@ -480,10 +485,8 @@ class SubAgentRunner:
         try:
             await self.context.emit_event(payload)
         except Exception as exc:  # 事件发射失败不拖垮子任务
-            print(
-                f"[WARNING] sub_agent 事件发射失败"
-                f"（agent_id={self.context.agent_id}, phase={phase}）: {exc}"
-            )
+            logger.warning(f"sub_agent 事件发射失败"
+                f"（agent_id={self.context.agent_id}, phase={phase}）: {exc}")
 
     def _record_file_history(self, raw_result: dict[str, Any]) -> None:
         """V2 版本链：子任务内文件工具变更入链（同父级消费点语义，失败静默）。"""
@@ -502,7 +505,7 @@ class SubAgentRunner:
                 encoding=str(payload.get("encoding") or "utf-8"),
             )
         except Exception as record_error:
-            print(f"[WARNING] 子任务文件版本链记录失败（不影响子任务）: {record_error}")
+            logger.warning(f"子任务文件版本链记录失败（不影响子任务）: {record_error}")
 
     async def _emit_start(self, *, queued: bool = False) -> None:
         if self.start_emitted:
@@ -567,10 +570,8 @@ class SubAgentRunner:
                 return inject_custom_headers_into_config(
                     chat_config, get_role_headers("sub_agent_model")
                 ), parameter
-            print(
-                f"[WARNING] 子智能体模型配置无效或协议不支持"
-                f"（{provider} / {model}），子任务回退父级聊天模型"
-            )
+            logger.warning(f"子智能体模型配置无效或协议不支持"
+                f"（{provider} / {model}），子任务回退父级聊天模型")
         # 未配置：继承父级聊天模型的生成参数（模型本身由 ambient 覆盖链解析）
         try:
             parameter = get_role_parameter("chat_model") or {}
@@ -596,7 +597,7 @@ class SubAgentRunner:
             support = model_config.get("support_doc_types")
             return [str(item) for item in support] if isinstance(support, list) else []
         except Exception as exc:
-            print(f"[WARNING] 子任务 supportDocTypes 解析失败（按不支持处理）: {exc}")
+            logger.warning(f"子任务 supportDocTypes 解析失败（按不支持处理）: {exc}")
             return []
 
     def _build_request(self, parameter: dict[str, Any]) -> ChatLLMRequest:
@@ -1098,10 +1099,8 @@ class SubAgentRunner:
                 if se_limit <= 0 or self._stream_error_retries_used < se_limit:
                     self._stream_error_retries_used += 1
                     se_label = str(se_limit) if se_limit > 0 else "∞"
-                    print(
-                        f"[WARNING] 子任务模型调用失败，断点续跑重试 "
-                        f"#{self._stream_error_retries_used}（上限 {se_label}）"
-                    )
+                    logger.warning(f"子任务模型调用失败，断点续跑重试 "
+                        f"#{self._stream_error_retries_used}（上限 {se_label}）")
                     partial_message = {"role": "assistant"}
                     if call["full_response"]:
                         partial_message["content"] = call["full_response"]
@@ -1254,10 +1253,8 @@ class SubAgentRunner:
                 ):
                     self._todo_remind_used += 1
                     tr_label = str(tr_limit) if tr_limit > 0 else "∞"
-                    print(
-                        f"[WARNING] 子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
-                        f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）"
-                    )
+                    logger.warning(f"子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
+                        f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）")
                     partial_message = {"role": "assistant"}
                     if full_response:
                         partial_message["content"] = full_response
@@ -1294,10 +1291,8 @@ class SubAgentRunner:
                     if fr_limit <= 0 or self._final_reply_retries_used < fr_limit:
                         self._final_reply_retries_used += 1
                         fr_label = str(fr_limit) if fr_limit > 0 else "∞"
-                        print(
-                            f"[WARNING] 子任务最终回复为空，空收尾重试 "
-                            f"#{self._final_reply_retries_used}（上限 {fr_label}）"
-                        )
+                        logger.warning(f"子任务最终回复为空，空收尾重试 "
+                            f"#{self._final_reply_retries_used}（上限 {fr_label}）")
                         if full_reasoning:
                             self.messages.append({
                                 "role": "assistant",
@@ -1672,10 +1667,8 @@ async def run_sub_agent_batch(
                         await runner._emit_start()
                     await runner._emit_done("stopped", runner._final_reply, None)
                 result = runner._make_result()
-            print(
-                f"[INFO] 子任务完成（agent_id={result.agent_id}, status={result.status}, "
-                f"rounds={result.rounds}）"
-            )
+            logger.info(f"子任务完成（agent_id={result.agent_id}, status={result.status}, "
+                f"rounds={result.rounds}）")
             return {
                 "index": context.parent_tool_index,
                 "tool_call": tool_call,
@@ -1691,7 +1684,7 @@ async def run_sub_agent_batch(
                 },
             }
         except Exception as exc:  # 子任务异常不外溢（CancelledError 为 BaseException，不在其中）
-            print(f"[WARNING] 子任务异常（agent_id={context.agent_id}）: {exc}")
+            logger.warning(f"子任务异常（agent_id={context.agent_id}）: {exc}")
             return {
                 "index": context.parent_tool_index,
                 "tool_call": tool_call,

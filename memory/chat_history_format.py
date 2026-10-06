@@ -21,6 +21,11 @@ from memory.quote_format import (
     serialize_quotes_for_model,
 )
 
+from util.logger import get_logger
+
+logger = get_logger("memory.chat_history_format")
+
+
 # 摘要块的结构化段落：字段名 -> 渲染/解析用的标准标题。
 # 顺序即渲染顺序；所有字段均为可选，空列表/空字符串渲染时整体省略。
 SUMMARY_SECTION_FIELDS: list[tuple[str, str]] = [
@@ -561,7 +566,7 @@ def _round_entry_to_tool_result_context_messages(
     # 见 chat_runtime.sanitize_tool_call_pairing）
     cleaned, removed = sanitize_tool_call_pairing(messages)
     if removed:
-        print(f"[WARNING] 历史轮次构建清理 {removed} 个悬空 tool_call（无配对结果）")
+        logger.warning(f"历史轮次构建清理 {removed} 个悬空 tool_call（无配对结果）")
     return cleaned
 
 

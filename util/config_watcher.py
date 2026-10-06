@@ -29,6 +29,11 @@ from typing import Any, Callable
 
 from env_manager import load_var
 
+from util.logger import get_logger
+
+logger = get_logger("util.config_watcher")
+
+
 # 每个被监视文件的内存状态：内容 hash + 快路径（size/mtime_ns，未变化时跳过读取）
 # {"hash": str|None, "size": int|None, "mtime_ns": int|None}
 _watch_state: dict[str, dict[str, Any]] = {}
@@ -141,7 +146,7 @@ def _check_target(target: str, path: Path) -> str:
     try:
         payload = _read_watch_config(path)
     except (OSError, ValueError) as exc:
-        print(f"[config-watch] 读取 {path} 失败，保留内存配置: {exc}")
+        logger.warning(f"[config-watch] 读取 {path} 失败，保留内存配置: {exc}")
         return "failed"
     payload_hash = _file_hash(payload)
     with _state_lock:
@@ -161,7 +166,7 @@ def _check_target(target: str, path: Path) -> str:
                 raise ValueError("顶层结构必须是 JSON 对象")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         # 解析失败：不更新 hash（下一轮文件修好后自动重试），内存配置保持现状
-        print(f"[config-watch] {path} 解析失败，保留内存配置: {exc}")
+        logger.warning(f"[config-watch] {path} 解析失败，保留内存配置: {exc}")
         return "failed"
     meta: dict[str, Any] = {"path": str(path)}
     if target == "mcp_servers":
@@ -180,17 +185,15 @@ def _check_target(target: str, path: Path) -> str:
             callback(data, meta)
             dispatched.append(name)
         except Exception as exc:
-            print(f"[config-watch] {target} 重载回调 [{name}] 执行失败: {exc}")
+            logger.warning(f"[config-watch] {target} 重载回调 [{name}] 执行失败: {exc}")
     with _state_lock:
         state = _watch_state.setdefault(target, {"hash": None, "size": None, "mtime_ns": None})
         state["hash"] = payload_hash
         state["size"] = stat.st_size
         state["mtime_ns"] = stat.st_mtime_ns
-    print(
-        f"[config-watch] {path} 已重新加载（回调: {'、'.join(dispatched) or '无'}"
+    logger.info(f"[config-watch] {path} 已重新加载（回调: {'、'.join(dispatched) or '无'}"
         + (f"，servers 变更={meta['servers_changed']}" if target == "mcp_servers" else "")
-        + "）"
-    )
+        + "）")
     return "reloaded"
 
 
@@ -199,7 +202,7 @@ def _watcher_loop(watch_targets: dict[str, Path], interval: float) -> None:
         try:
             poll_once(watch_targets)
         except Exception as exc:  # 轮询线程绝不能静默死亡
-            print(f"[config-watch] 轮询异常（已忽略，继续下一轮）: {exc}")
+            logger.warning(f"[config-watch] 轮询异常（已忽略，继续下一轮）: {exc}")
 
 
 def prime_watch_state(watch_targets: dict[str, Path] | None = None) -> None:
@@ -235,10 +238,8 @@ def start_config_watcher(watch_targets: dict[str, Path] | None = None) -> thread
         interval = _watch_interval_seconds()
         resolved_targets = _resolve_watch_targets(watch_targets)
         if interval <= 0:
-            print(
-                f"[config-watch] 配置热重载已禁用（{WATCH_INTERVAL_ENV_NAME}<=0）："
-                + "、".join(str(path) for path in resolved_targets.values())
-            )
+            logger.info(f"[config-watch] 配置热重载已禁用（{WATCH_INTERVAL_ENV_NAME}<=0）："
+                + "、".join(str(path) for path in resolved_targets.values()))
             _watcher_started = True
             return None
         prime_watch_state(resolved_targets)
@@ -251,10 +252,8 @@ def start_config_watcher(watch_targets: dict[str, Path] | None = None) -> thread
         )
         _watcher_thread.start()
         _watcher_started = True
-        print(
-            f"[config-watch] 配置热重载线程已启动（间隔 {interval:g}s）："
-            + "、".join(str(path) for path in resolved_targets.values())
-        )
+        logger.info(f"[config-watch] 配置热重载线程已启动（间隔 {interval:g}s）："
+            + "、".join(str(path) for path in resolved_targets.values()))
         return _watcher_thread
 
 

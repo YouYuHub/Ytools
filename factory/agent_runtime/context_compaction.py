@@ -56,6 +56,11 @@ from .chat_runtime import (
     resolve_model_max_input_tokens,
 )
 
+from util.logger import get_logger
+
+logger = get_logger("factory.agent_runtime.context_compaction")
+
+
 
 # 上下文压缩阈值 = min(聊天窗口, 压缩窗口) × trigger_ratio
 # 单段摘要输出上限 = min(模型 maxOutputTokens, 单段上限, 摘要预算)
@@ -436,9 +441,7 @@ def resolve_context_compaction_model_config(
             # 压缩角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
             config = inject_custom_headers_into_config(candidate, get_role_headers("compaction_model"))
         else:
-            print(
-                f"[WARNING] 压缩模型不可用（{provider} / {model}），回退为当前聊天模型执行压缩"
-            )
+            logger.warning(f"压缩模型不可用（{provider} / {model}），回退为当前聊天模型执行压缩")
     if config is None:
         # 回退聊天模型：require_default_chat_config 已注入聊天角色头
         config = require_default_chat_config()
@@ -821,10 +824,8 @@ async def summarize_context_text(
         chunk_budget = max(128, int(safe_source_budget * 0.8))
         source_chunks = _split_text_to_token_chunks(normalized_source, chunk_budget)
         if len(source_chunks) > 1:
-            print(
-                f"[INFO] 压缩源 {source_tokens} tokens 超过单次输入预算 "
-                f"{safe_source_budget}，完整切分为 {len(source_chunks)} 段后分级汇总"
-            )
+            logger.info(f"压缩源 {source_tokens} tokens 超过单次输入预算 "
+                f"{safe_source_budget}，完整切分为 {len(source_chunks)} 段后分级汇总")
             partial_results: list[SummaryBuildResult] = []
             for index, source_chunk in enumerate(source_chunks, start=1):
                 chunk_tokens = estimate_text_tokens(source_chunk)
@@ -961,7 +962,7 @@ async def summarize_context_text(
                 try:
                     await delta_emitter(delta_payload)
                 except Exception as exc:
-                    print(f"[WARNING] 压缩增量事件推送失败：{exc}")
+                    logger.warning(f"压缩增量事件推送失败：{exc}")
             if isinstance(frame.get("usage"), dict):
                 usage = frame["usage"]
         text = "".join(content_parts).strip()
@@ -1015,11 +1016,9 @@ async def summarize_context_text(
                         f"上下文压缩失败（已尝试 {attempt_index} 次仍失败），"
                         f"任务终止：{first_error}"
                     ) from first_error
-                print(
-                    f"[WARNING] 压缩模型第 {attempt_index} 次调用失败"
+                logger.warning(f"压缩模型第 {attempt_index} 次调用失败"
                     f"（{first_error}），{_COMPACTION_RETRY_INTERVAL_SECONDS:g} 秒后"
-                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）"
-                )
+                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）")
                 await asyncio.sleep(_COMPACTION_RETRY_INTERVAL_SECONDS)
                 continue
             retry_limit = _summary_output_token_limit(
@@ -1048,11 +1047,9 @@ async def summarize_context_text(
                         f"上下文压缩失败（已尝试 {attempt_index} 条完整降级链仍失败），"
                         f"任务终止：{retry_error}（首次错误：{first_error}）"
                     ) from retry_error
-                print(
-                    f"[WARNING] 压缩降级链第 {attempt_index} 次尝试失败"
+                logger.warning(f"压缩降级链第 {attempt_index} 次尝试失败"
                     f"（{retry_error}），{_COMPACTION_RETRY_INTERVAL_SECONDS:g} 秒后"
-                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）"
-                )
+                    f"重试（第 {attempt_index + 1} 次，上限 {retry_limit_label}）")
                 await asyncio.sleep(_COMPACTION_RETRY_INTERVAL_SECONDS)
 
     return SummaryBuildResult(
@@ -1252,7 +1249,7 @@ async def _build_cumulative_summary(
     try:
         merged_text = _concat_summary_text(previous_summary, new_summary.text)
     except Exception as exc:
-        print(f"[WARNING] 摘要拼接合并失败，回退为模型合并：{exc}")
+        logger.warning(f"摘要拼接合并失败，回退为模型合并：{exc}")
         merged_text = None
     # 目标模式下摘要预算收紧（见 resolve_effective_summary_budget）：累计摘要
     # 必须落在这个更小的额度内，否则压缩后历史仍接近目标上限
@@ -1422,7 +1419,7 @@ async def compact_session_history_if_needed(
     stored_source_count = _summary_source_round_count(summary_state)
     if stored_source_count > len(round_entries):
         # 摘要游标不能指向不存在的轮次；丢弃旧摘要并从完整原始历史重建。
-        print("[WARNING] 历史摘要游标超过当前轮次数，已重置累计摘要")
+        logger.warning("历史摘要游标超过当前轮次数，已重置累计摘要")
         summary_state = None
         stored_source_count = 0
     summarized_count = min(stored_source_count, len(round_entries))
@@ -1457,7 +1454,7 @@ async def compact_session_history_if_needed(
             # 问题索引同步失败不影响压缩结果（摘要正文与游标已落盘）：
             # update_context_summary 对写盘失败改为抛出后，这里降级为告警，
             # 避免索引同步失败把整个压缩流程拖垮
-            print(f"[WARNING] 最近问题索引同步失败（不影响压缩结果）: {exc}")
+            logger.warning(f"最近问题索引同步失败（不影响压缩结果）: {exc}")
 
     if not raw_rounds:
         legacy_blocks = summary_state.get("blocks") if isinstance(summary_state, dict) else None
@@ -1479,13 +1476,13 @@ async def compact_session_history_if_needed(
                 except Exception as exc:
                     # 旧版多块摘要迁移失败不影响任务：迁移属优化路径，
                     # 原摘要结构仍可渲染，下次压缩再重试迁移
-                    print(f"[WARNING] 累计摘要迁移落盘失败（保留旧结构）: {exc}")
+                    logger.warning(f"累计摘要迁移落盘失败（保留旧结构）: {exc}")
                 update_history_usage = getattr(session_chat_memory, "add_history_compression_usage", None)
                 if collapsed_usage and callable(update_history_usage):
                     try:
                         await update_history_usage(collapsed_usage)
                     except Exception as exc:
-                        print(f"[WARNING] 累计摘要迁移 usage 落盘失败：{exc}")
+                        logger.warning(f"累计摘要迁移 usage 落盘失败：{exc}")
         await sync_recent_questions()
         return 0
     source_budget = _resolve_compaction_source_budget(tool_request, settings)
@@ -1625,7 +1622,7 @@ async def compact_session_history_if_needed(
                     ),
                 })
             except Exception as exc:
-                print(f"[WARNING] 跨轮压缩开始事件推送失败：{exc}")
+                logger.warning(f"跨轮压缩开始事件推送失败：{exc}")
         # 压缩调用链路自带可配置重试（summarize_context_text 内部整链循环）；
         # 耗尽抛 ContextCompactionError——失败不落盘任何摘要（update_context_summary
         # 只在成功路径执行），在此补发 aborted 闭合 start 事件。
@@ -1657,12 +1654,10 @@ async def compact_session_history_if_needed(
                         "error": str(last_error)[:500],
                     })
                 except Exception as emit_exc:
-                    print(f"[WARNING] 跨轮压缩中止事件推送失败：{emit_exc}")
+                    logger.warning(f"跨轮压缩中止事件推送失败：{emit_exc}")
             if compacted_rounds > 0:
-                print(
-                    f"[INFO] 本批跨轮压缩失败，此前已成功压缩 {compacted_rounds} 轮"
-                    "（游标与累计摘要已落盘，重试将从剩余轮次继续）"
-                )
+                logger.info(f"本批跨轮压缩失败，此前已成功压缩 {compacted_rounds} 轮"
+                    "（游标与累计摘要已落盘，重试将从剩余轮次继续）")
                 # 把进度附加进异常文案：手动压缩等调用方能把"部分成功"
                 # 传达给用户，避免"摘要已生成却整体报错"的困惑。
                 last_error.args = (
@@ -1705,7 +1700,7 @@ async def compact_session_history_if_needed(
                         "error": str(exc)[:500],
                     })
                 except Exception as emit_exc:
-                    print(f"[WARNING] 跨轮压缩中止事件推送失败：{emit_exc}")
+                    logger.warning(f"跨轮压缩中止事件推送失败：{emit_exc}")
             if compacted_rounds > 0:
                 exc.args = (
                     f"{exc}（此前已成功压缩 {compacted_rounds} 轮并写入累计摘要，"
@@ -1718,7 +1713,7 @@ async def compact_session_history_if_needed(
                 try:
                     await update_history_usage(cumulative_usage)
                 except Exception as exc:
-                    print(f"[WARNING] 跨轮压缩 usage 落盘失败：{exc}")
+                    logger.warning(f"跨轮压缩 usage 落盘失败：{exc}")
         # 本批压缩后的历史估算（新累计摘要 + 剩余未压缩轮次）：done 事件携带
         # 前后对比（口径 = 触发判断的历史部分，不含系统提示/当前轮/工具定义）
         after_summary_message = render_context_summary(summary_state)
@@ -1757,10 +1752,8 @@ async def compact_session_history_if_needed(
                     # 单批源超过压缩模型输入预算：头尾保留、中段丢弃。属于保真
                     # 风险（该批中段细节未进入摘要），显式提示便于前端与排查。
                     batch_diagnostics["warnings"] = ["batch_source_truncated"]
-                    print(
-                        f"[WARNING] 本批压缩源 {chunk_source_tokens} tokens 超过输入预算 "
-                        f"{source_budget}，已头尾截断（中段内容未进入摘要）"
-                    )
+                    logger.warning(f"本批压缩源 {chunk_source_tokens} tokens 超过输入预算 "
+                        f"{source_budget}，已头尾截断（中段内容未进入摘要）")
                 await event_emitter({
                     "event": "context_compaction",
                     "scope": "session",
@@ -1798,7 +1791,7 @@ async def compact_session_history_if_needed(
                     **batch_diagnostics,
                 })
             except Exception as exc:
-                print(f"[WARNING] 跨轮压缩完成事件推送失败：{exc}")
+                logger.warning(f"跨轮压缩完成事件推送失败：{exc}")
         raw_rounds = raw_rounds[summarize_count:]
         compacted_rounds += summarize_count
         # 游标推进后按新游标重算保真问题索引（只覆盖已压缩轮次，
@@ -1807,11 +1800,9 @@ async def compact_session_history_if_needed(
             round_entries, _summary_source_round_count(summary_state)
         )
         recent_questions = [question for _number, question in recent_question_items]
-        print(
-            f"[INFO] 已压缩 {len(chunk_rounds)} 个旧会话轮次"
+        logger.info(f"已压缩 {len(chunk_rounds)} 个旧会话轮次"
             f"（累计 {summary_state['source_round_count']}，累计摘要 1 块，"
-            f"降级={summary_result.used_fallback}）"
-        )
+            f"降级={summary_result.used_fallback}）")
     await sync_recent_questions()
     return compacted_rounds
 
@@ -1973,7 +1964,7 @@ async def compact_active_round_context_if_needed(
         )
     round_start = _find_current_round_start(original_messages)
     if round_start is None:
-        print("[WARNING] 当前请求没有 user 消息，跳过单轮上下文压缩")
+        logger.warning("当前请求没有 user 消息，跳过单轮上下文压缩")
         return RoundContextCompactionResult(
             messages=original_messages,
             triggered=False,
@@ -1993,10 +1984,8 @@ async def compact_active_round_context_if_needed(
     # 此类场景留给跨轮压缩（按轮数 > keep_rounds 触发）与首调用预算检查处理。
     active_tokens = estimate_send_context_tokens(active_messages)
     if active_tokens <= max(256, token_limit // 2) and not target_reduction_needed:
-        print(
-            f"[INFO] 单轮上下文压缩跳过：本轮轨迹 {active_tokens} tokens 未达阈值一半"
-            f"（{token_limit}），超窗主要来自历史上下文"
-        )
+        logger.info(f"单轮上下文压缩跳过：本轮轨迹 {active_tokens} tokens 未达阈值一半"
+            f"（{token_limit}），超窗主要来自历史上下文")
         return RoundContextCompactionResult(
             messages=original_messages,
             triggered=False,
@@ -2089,7 +2078,7 @@ async def compact_active_round_context_if_needed(
                 ),
             })
         except Exception as exc:
-            print(f"[WARNING] 单轮压缩开始事件推送失败：{exc}")
+            logger.warning(f"单轮压缩开始事件推送失败：{exc}")
     summary_result = await summarize_context_text(
         compaction_source,
         tool_request,
@@ -2139,11 +2128,9 @@ async def compact_active_round_context_if_needed(
     after_tokens = estimate_send_context_tokens(compacted_messages, tool_request.tools)
     merged_usage.update(cumulative_usage)
     summary_text = cumulative_text
-    print(
-        f"[INFO] 单轮工具上下文已压缩：{before_tokens} -> {after_tokens} tokens"
+    logger.info(f"单轮工具上下文已压缩：{before_tokens} -> {after_tokens} tokens"
         f"（阈值 {token_limit}，目标 {target_tokens or '未启用'}，摘要预算 {summary_budget}，"
-        f"累计块 1，降级={summary_result.used_fallback}）"
-    )
+        f"累计块 1，降级={summary_result.used_fallback}）")
     if event_emitter is not None:
         try:
             usage_payload: dict[str, Any] = {}
@@ -2187,7 +2174,7 @@ async def compact_active_round_context_if_needed(
                 "compress_usage": usage_payload,
             })
         except Exception as exc:
-            print(f"[WARNING] 单轮压缩完成事件推送失败：{exc}")
+            logger.warning(f"单轮压缩完成事件推送失败：{exc}")
     return RoundContextCompactionResult(
         messages=compacted_messages,
         triggered=True,

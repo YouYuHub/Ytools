@@ -14,7 +14,14 @@ from config import (
 from util import config_watcher, ollama_model_watcher
 from factory.agent_runtime import tool_registry
 from env_manager import init_path
+
+from util.logger import get_logger, setup_logging
+
+logger = get_logger("main")
+
 init_path(PROJECT_ROOT)
+# 启动日志系统：init_path 之后才能读到 .env 的 LOG_LEVEL（后端启动日志等级配置项）
+setup_logging(force=True)
 apply_persisted_work_dir()
 # 初始化 env 路径后才能正确加载到变量
 from config import DEFAULT_SERVICE_HOST, DEFAULT_SERVICE_PORT
@@ -105,13 +112,13 @@ def _start_config_hot_reload() -> None:
         try:
             sync_tool_selection_memory(data)
         except Exception as exc:
-            print(f"[config-watch] 同步工具选择内存失败: {exc}")
+            logger.warning(f"[config-watch] 同步工具选择内存失败: {exc}")
 
         def _rediscover() -> None:
             try:
                 asyncio.run(tool_registry.refresh_tools_from_mcp(get_current_dir()))
             except Exception as exc:
-                print(f"[config-watch] mcp_servers.json 变更后重新发现工具失败: {exc}")
+                logger.warning(f"[config-watch] mcp_servers.json 变更后重新发现工具失败: {exc}")
 
         # 仅 servers 键变化才重新探测 MCP 工具（inputs 保存不应触发昂贵的工具发现）。
         # 工具发现要拉起 MCP 子进程，极端情况下可能卡住（如子进程握手挂起），
@@ -124,19 +131,17 @@ def _start_config_hot_reload() -> None:
             rediscover_thread.start()
             rediscover_thread.join(timeout=60.0)
             if rediscover_thread.is_alive():
-                print("[config-watch] MCP 工具重探超过 60s 未完成，已放弃等待（后台线程继续）")
+                logger.warning("[config-watch] MCP 工具重探超过 60s 未完成，已放弃等待（后台线程继续）")
 
     def _reload_models(_data: dict, _meta: dict) -> None:
         if _env_manager.reload_models_config():
             selection = _env_manager.get_current_model_selection()
-            print(
-                f"[config-watch] models.json 内存已同步："
-                f"chat_model={selection.get('provider')}/{selection.get('model')}"
-            )
+            logger.info(f"[config-watch] models.json 内存已同步："
+                f"chat_model={selection.get('provider')}/{selection.get('model')}")
 
     def _reload_env(_data: dict, _meta: dict) -> None:
         if _env_manager.reload_env_vars():
-            print("[config-watch] .env 内存已同步（load_var 类配置热生效，如 VIDEO_MAX_READ_SECONDS）")
+            logger.info("[config-watch] .env 内存已同步（load_var 类配置热生效，如 VIDEO_MAX_READ_SECONDS）")
 
     config_watcher.register_reload_callback("mcp_servers", "tool_selection_memory", _reload_mcp_servers)
     config_watcher.register_reload_callback("models", "models_config", _reload_models)
@@ -159,7 +164,7 @@ def _prewarm_tool_registry() -> None:
         try:
             asyncio.run(refresh_tools_from_mcp(get_current_dir()))
         except Exception as exc:
-            print(f"[prewarm] MCP 工具预热失败（首个请求会现场重探）: {exc}")
+            logger.warning(f"[prewarm] MCP 工具预热失败（首个请求会现场重探）: {exc}")
 
     # 预热要拉起 MCP 子进程，可能耗时数秒，放后台线程避免阻塞服务启动；
     # 失败不致命——缓存缺失时 /tools/list 与发送路径会现场重探
