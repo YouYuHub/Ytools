@@ -8,10 +8,10 @@
 ## 一、目录结构（仅业务代码）
 ```
 agent_tool_sse/
-├── main.py                      # FastAPI 入口：init_path → 注册8个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 → uvicorn(48621)；当前未托管 H5 静态页面
+├── main.py                      # FastAPI 入口：init_path → 注册8个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 + Ollama 本地模型发现线程 + MCP 工具注册表预热线程 → uvicorn(48621)；当前未托管 H5 静态页面
 ├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH；原生文档注入与文本入库上限常量（DEFAULT_NATIVE_DOC_MAX_BYTES/DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES/DEFAULT_NATIVE_DOC_MAX_ITEMS/DEFAULT_FILE_TEXT_MAX_CHARS）
 ├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载；supportDocTypes 归一化为 support_doc_types（get_model_config / list_available_models 输出）
-├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp，可选 fitz/docx/pandas）
+├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp/pillow/imageio-ffmpeg，可选 PyMuPDF/docx/pandas；已知问题：docx 应为 python-docx）
 ├── .env                         # 一些全局配置
 ├── project_structure.md         # 本文档
 ├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
@@ -20,7 +20,8 @@ agent_tool_sse/
 ├── setting/
 │   ├── models.json              # 模型目录：provider→models（含 apiKey/url/能力），variables/runtime 全局变量，
 │   │                            #   顶层 model_selection（chat_model/compaction_model/title_model/sub_agent_model 角色选择）
-│   └── model_config.json        # MCP 服务器注册表：server_id → command/args
+│   ├── mcp_servers.json         # MCP 服务器注册表：server_id → command/args + 顶层 inputs（工具选择默认，含 __builtin__ 内置工具）
+│   └── models.example.json      # models.json 示例模板（真实 models.json 不入库）
 │
 ├── chat/
 │   └── chat_llm.py              # ChatLLM：纯标准库 HTTP/1.1 + SSE 流式客户端（同步/异步/非流式）
@@ -30,11 +31,13 @@ agent_tool_sse/
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
 │   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）+ 保真批次策略（force_all 不做尾部保留、单批源吃满 0.9 窗口、压缩比恒定 12:1、批次诊断字段）+ 历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS，夹取到窗口派生上下限：<500k 时 8% 下限、≥500k 时 40k 下限、40% 上限；目标模式下摘要预算收紧为 min(预算, 目标×0.6) 并走"只保留核心内容"的精简提示词）
-│   │   ├── builtin_tools.py     # 本地内置工具（todo_write 任务计划、ask_user 向用户提问、文件读写检索、read_media 读取当前任务媒体、read_document 按需读取文档（offset/limit 文本区间、原生 PDF 页区间；按 supportDocTypes 逐文件选择原生或文本）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__）
+│   │   ├── builtin_tools.py     # 本地内置工具（todo_write 任务计划、ask_user 向用户提问、文件读写检索、run_command 多 shell 命令执行、read_media 读取当前任务媒体、read_document 按需读取文档（offset/limit 文本区间、原生 PDF 页区间；按 supportDocTypes 逐文件选择原生或文本）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__；可选内置工具共 10 个，check_tool_exists 已移除）
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
-│   │   └── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
+│   │   ├── title_generator.py   # 会话标题自动生成（title_model 角色：累计 100 字符触发、2s 防抖、提示词要求 ≤30 字、后端硬截断 40 字）
+│   │   ├── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
+│   │   └── text_tool_call.py    # 文本形态 <tool_call> 包络解析（模型以普通文本输出工具调用时的兜底提取）
 │   ├── session_worker.py        # 每会话独立 worker 进程：任务开始 os.chdir(会话目录)、命令/事件 IPC、主进程代理；生成任务逃逸异常与 worker 崩溃均可见化（error SSE 帧 + JSONL 错误说明 + task_done 收尾）
-│   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则+回传长度/工具超时等可变配置实时说明
+│   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则（含文件工具选择优先级）+回传长度/工具超时等可变配置实时说明
 │   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝、sub_agent 派发/并发/事件双写（JSONL+SSE）；原生文档接线（read_document 按需注入一次、完整响应后回收占位、工具结果剥离 base64）
 │   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）；文本类文件内核：TEXT_FILE_EXTENSIONS 白名单 / is_probably_binary 二进制嗅探 / decode_text_bytes 编码回退链（utf-8-sig→utf-8→gb18030→big5→latin-1）/ parse_text_file_bytes
 │   ├── xlsx_export.py           # 纯标准库 xlsx 生成器（zipfile+XML 手拼 OOXML：表头加粗/数字原生/错误占位样式）
@@ -45,11 +48,13 @@ agent_tool_sse/
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
 │   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）、引用快照前置（<quote_list> 模型视图/压缩源【引用原文】）
 │   ├── quote_format.py          # 选中文本引用：规整/限额校验（5 段/4000 字/12000 字）、XML 转义、<quote_list> 序列化、模型视图前置（前后端同口径）
+│   ├── file_history.py          # 文件版本链 V2：Baseline/Version/Diff/Undo（record_change 入链、rollback/hunk_undo/hunk_keep、file_diffs/ 存储；详见 docs/file_diff.md）
 │   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（普通文本内联/大文件节选+按需读取）与记录查找；原生文档内核（supportDocTypes 分流、PDF 页段、请求预算、原生部件一次性回收；预算键 NATIVE_DOC_*）
 │
 ├── routers/                     # API 路由层
-│   ├── chat_router.py           # 聊天主接口（含 quotes 请求校验）+ 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
-│   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度配置；压缩失败重试 GET/POST /chat_config/compaction_retry
+│   ├── chat_router.py           # 聊天主接口（含 quotes 请求校验、运行中消息注入 /inject_message 与撤回 /cancel_inject_message）+ 会话状态 + 历史文件/元数据/标题/导入/删除 + 上下文统计/手动压缩
+│   ├── raw_upload.py            # application/octet-stream 原始请求体读取（媒体/文件上传共用：filename 查询参数、大小上限）
+│   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度/网络重试/工具并发/视频读取上限/子智能体重试等配置；压缩失败重试 GET/POST /chat_config/compaction_retry；POST /chat_config/generate_title 会话标题自动生成
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
 │   ├── file_router.py           # 文档上传解析（文本类扩展名+二进制嗅探、超限截断入库、原生文档标记）/媒体上传（视频600MB流式）/Range 读取
@@ -64,13 +69,14 @@ agent_tool_sse/
 ├── util/
 │   ├── timestamp_utils.py       # 全仓统一时间戳格式
 │   ├── file_lock.py             # 跨进程文件锁（msvcrt/flock）：会话 JSONL 多进程写入互斥
-│   ├── config_watcher.py        # 配置文件热重载轮询线程（mcp_servers.json / models.json，hash 比对 + 重载回调）
-│   └── mcp_client.py            # MCP 客户端：构建启动参数、连接会话、调用工具
+│   ├── config_watcher.py        # 配置文件热重载轮询线程（mcp_servers.json / models.json / 项目 .env，hash 比对 + 重载回调）
+│   ├── mcp_client.py            # MCP 客户端：构建启动参数、连接会话、调用工具
+│   └── ollama_model_watcher.py  # Ollama 本地模型周期发现（30s 轮询/3s 超时，供模型选择列表）
 │
 ├── mcp_server/
- │   ├── sys_tools_server.py            # 系统 MCP 服务器（文件读写/正则搜索/命令执行/网页抓取与搜索）
+│   ├── sys_tools_server.py      # 系统 MCP 服务器（仅网页抓取与搜索；文件四件套/run_command 注册块已注释保留，已迁移为后端内置工具）
 │   ├── restart_tools_server.py  # 重启维护 MCP 服务器；当前缺少项目根 restart_helper.py，main.py 的服务快照写入亦被注释，不能按设计完成自动重启
-│   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（setup_pipe/run_pipe_command/read_pipe_history）
+│   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）
 │
 ├── H5/                          # 前端聊天界面（纯静态，由后端同端口静态托管或本地打开）
 │   ├── README.md                # 前端使用说明
@@ -88,23 +94,27 @@ agent_tool_sse/
 │   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
 │   │                            #   名称校验）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
 │   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app.js（入口）+
-│   │                            #   app/（17 个功能模块：core/sessions/session_groups/stats/workdir/
+│   │                            #   app/（19 个功能模块：core/sessions/session_groups/stats/workdir/
 │   │                            #   messages/history/compaction/builtin/user_profile/media/skills/composer/
-│   │                            #   model_panel/tools/chat/quotes；session_groups=侧边栏分组区
+│   │                            #   model_panel/tools/chat/quotes/filehistory/editor；session_groups=侧边栏分组区
 │   │                            #   UI/交互；skills=提示词库可拖拽对话框；quotes=引用选区浮钮/
-│   │                            #   草稿卡片/气泡卡片；
+│   │                            #   草稿卡片/气泡卡片；filehistory=文件版本链徽标与统计面板；
+│   │                            #   editor=文件 diff 编辑器页逻辑（editor.html）；
 │   │                            #   user_profile=访客显示名内联编辑（.env USER_NAME））
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
-│   └── test_h5/                 # 前端单元测试（api/format_utils/history_parser/markdown/
-│                                #   session_list_utils/session_group_utils/session_utils/
-│                                #   session_marquee/session_open_guard/session_title_flow/table_export/
-│                                #   zoom_utils/widget_reuse/file_history_sync/quote_utils，node --test）
+│   └── test_h5/                 # 前端单元测试（format_utils/history_parser/markdown/quote_utils/
+│                                #   session_group_utils/session_list_utils/session_marquee/
+│                                #   session_open_guard/session_title_flow/session_utils/
+│                                #   stats_model_label/table_export/widget_reuse/zoom_utils/
+│                                #   file_history_sync，共 15 个，node --test）
 │
 ├── docs/
 │   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
-│   ├── sub_agent_v1.md          # 子智能体（sub_agent 内置工具）V1 设计与实现依据文档
+│   ├── sub_agent_v1.md          # 子智能体（sub_agent 内置工具）V1 实现说明文档
+│   ├── quote_selection.md       # 选中文本引用功能实现说明
+│   ├── file_diff.md             # 文件变更 Diff 与历史版本链说明
 │   ├── chat_memory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
 │   └── compact.md               # 压缩逻辑说明文档（含压缩失败重试链、失败终止任务策略、拼接优先累计合并）
 │
@@ -138,10 +148,11 @@ agent_tool_sse/
    │     - 未选择工具 → 无工具模式继续
    │     - 工具选择「内置工具」分组勾选的项按需注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 <session>_chat.jsonl.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索；相对路径基于会话工作目录；edit_file 支持 expected_hash 校验，覆盖写与编辑使用临时文件替换；search_files 有扫描上限）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单次 ≤5；数据以 user 多模态部件注入后续请求、仅内存不落盘）、read_document（需在工具配置中勾选；未选中时不注入工具、清单展示解析文本；选中后支持 offset/limit 文本读取，以及按 supportDocTypes 原生读取）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
    ├─ ④ 上下文构建：
-   │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS，默认跟随 HISTORY_COMPACT_KEEP_ROUNDS，前端提供完整历史则跳过）
+   │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS 为兼容参数；
+   │       历史轮数窗口已废弃，默认 0=不限轮数，摘要-only 模式不限制已完成历史回传；前端提供完整历史则跳过）
    │     - 注入系统提示词（含当前工作路径、思考过程回传长度说明）+ 会话已上传文件解析内容
    │     - 首调用预算检查：历史+文件+当前请求+工具定义超模型窗口时，
-   │       文件记忆先降级为 3000 字符摘要（warning: CONTEXT_BUDGET_FILE_DOWNGRADED），
+   │       文件记忆先降级为约 1500 字符的文件索引（仅文件名/类型/大小，warning: CONTEXT_BUDGET_FILE_DOWNGRADED），
    │       仍超窗则推送 error 终止
    ├─ ⑤ 流式请求循环（while session_chat_memory.run_task，按会话隔离停止）：
    │     ├─ ChatLLM 流式请求（stop_checker 支持手动停止）
@@ -195,9 +206,9 @@ agent_tool_sse/
 ### 3. 模型/配置动态切换
 - **切换模型**：`POST /chat_config/models/select`（body: `provider/model/role/parameter`）→ 校验 models.json 存在该组合 → 写入 models.json 顶层 `model_selection.<role>`（四角色：chat/compaction/title/sub_agent）并同步内存，实时生效；不再写 .env。**会话级覆盖**：携带 `session_id` 时写入该会话 `_meta.model_selection.<role>`（仅覆盖该角色，`clear=true` 清除恢复跟随全局），生成/压缩/参数默认值填充按「会话覆盖 → 全局默认」逐角色解析——ambient 任务级上下文（ContextVar）实现，`create_task` 上下文隔离保证多会话互不影响；覆盖模型失效时发 `MODEL_SELECTION_FALLBACK` warning 并回退全局。`sub_agent_model` 未配置时子智能体继承聊天模型
 - **切换工作目录**：两层目录——`POST /change_chat_dir` 设置全局默认（DEFAULT_CHAT_WORK_DIR，新会话初始目录；前端在**新对话**中双击路径修改的就是该默认值）；`POST /chat_config/work_dir` 设置会话独立目录（写会话 `_meta.work_dir`）。生成任务默认在每会话独立 worker 进程中执行，任务开始时按「会话覆盖 → 全局默认 → 进程 cwd」解析并 `os.chdir`，相对路径与 MCP 子进程随会话隔离（`CHAT_WORKER_MODE=inline` 回退主进程旧语义）
-- **工具选择**：两层选择——全局默认存于 mcp_servers.json 顶层 `inputs` 键（不携带 session_id 的 `POST /chat_config/tool_selection`，新对话中保存即为默认）；会话级覆盖存于会话 `_meta.tool_selection`（携带 session_id 时写入，空 inputs 清除恢复跟随全局）。请求未携带 `tool_names`（null）时生成流程按「会话覆盖 → 全局默认」解析为本轮工具；显式 `[]` 仍为无工具模式。**内置工具（todo_write/ask_user）并入同一链路**：前端在工具模态框首位「内置工具」分组勾选，保存为伪服务键 `__builtin__`，生成时按名称识别注入，会话级/全局默认语义与 MCP 工具一致
-- **配置热重载**：`util/config_watcher.py` 全局守护线程按 `CONFIG_HOT_RELOAD_INTERVAL_SECONDS`（默认 5s，<=0 禁用）轮询 setting/mcp_servers.json 与 setting/models.json，与内存 sha256 hash 比对；变化且解析成功才重载（解析失败保留内存现状并打印 `[config-watch]` 日志）。mcp_servers 仅 `servers` 键变化才重新探测 MCP 工具；models.json 变更重载 models_config/model_selection/setting_vars（不触碰 .env）
-- **历史压缩参数**：`POST /chat_config/history_compaction` → 跨轮保留数/触发比例/每次压缩轮数/单轮压缩比例（ratio）与摘要预算比例/超大拒绝系数与上限；单轮阈值由聊天与压缩模型窗口及比例共同决定；压缩模型由 models/select（role=compaction_model）统一管理
+- **工具选择**：两层选择——全局默认存于 mcp_servers.json 顶层 `inputs` 键（不携带 session_id 的 `POST /chat_config/tool_selection`，新对话中保存即为默认）；会话级覆盖存于会话 `_meta.tool_selection`（携带 session_id 时写入；**空 inputs = 显式无工具模式**（落盘空选择哨兵，不回退全局），`clear=true` 清除覆盖恢复跟随全局）。请求未携带 `tool_names`（null）时生成流程按「会话覆盖 → 全局默认」解析为本轮工具；显式 `[]` 仍为无工具模式。**内置工具（todo_write/ask_user）并入同一链路**：前端在工具模态框首位「内置工具」分组勾选，保存为伪服务键 `__builtin__`，生成时按名称识别注入，会话级/全局默认语义与 MCP 工具一致
+- **配置热重载**：`util/config_watcher.py` 全局守护线程按 `CONFIG_HOT_RELOAD_INTERVAL_SECONDS`（默认 5s，<=0 禁用）轮询 setting/mcp_servers.json、setting/models.json 与项目 `.env`，与内存 sha256 hash 比对；变化且解析成功才重载（解析失败保留内存现状并打印 `[config-watch]` 日志）。mcp_servers 仅 `servers` 键变化才重新探测 MCP 工具；models.json 变更重载 models_config/model_selection/setting_vars；.env 变更重载运行时环境变量（main.py 注册 env 回调）
+- **历史压缩参数**：`POST /chat_config/history_compaction` → 触发比例（trigger_ratio）/摘要预算比例（summary_budget_ratio）/历史压缩目标（target_tokens）/超大拒绝系数（oversized_reject_factor）与连续拒绝上限（max_oversized_rejections），另有思考与工具结果回传长度（reasoning_max_length/tool_result_max_length）；keep_rounds（跨轮保留数）已废弃，提交会被忽略；单轮阈值由聊天与压缩模型窗口及比例共同决定；压缩模型由 models/select（role=compaction_model）统一管理
 - **回传长度**：`POST /chat_config/context_return` → 思考过程（reasoning_content）与历史工具结果的最大回传长度（0=不回传真实思考、负数=全部、正数=截断；最新工具调用在 0 或无思考可回退时可能带 `...` 占位，历史轮思考字段直接省略），写回 .env 即时生效
 - **MCP 工具超时**：`GET/POST /chat_config/mcp_tools` → 配置单次 MCP 工具调用（连接/初始化/执行全过程）的超时秒数，写入 `MCP_TOOL_CALL_TIMEOUT_SECONDS`；正数超时后返回工具错误，0 表示不限制。工具执行在工作线程中，停止接口会取消后台生成任务并等待收尾
 
@@ -214,11 +225,11 @@ agent_tool_sse/
 - 统一输出 SSE 事件：content / reasoning_content / tool_calls / usage / finish_reason
 
 ### 2. 工具聊天工厂（`factory/chat_factory.py`）
-- **后台任务 + SSE 重连**：生成循环运行在独立 `asyncio.Task`，事件写入有界环形缓冲（4000 条）；重连请求从当前轮起点回放（`replay` + `question_text`），已完成任务不回放（内容在 JSONL）；带新用户消息的请求平滑打断旧任务重启；`/chat_stream/status` 暴露运行状态
+- **后台任务 + SSE 重连**：生成循环运行在独立 `asyncio.Task`，事件写入有界环形缓冲（20000 条）；重连请求从当前轮起点回放（`replay` + `question_text`），已完成任务不回放（内容在 JSONL）；带新用户消息的请求平滑打断旧任务重启；`/chat_stream/status` 暴露运行状态
 - **工具授权模型**：`tool_request.tools` 是服务端内部字段（exclude），由前端 `tool_names` + 后端实时工具生成，未授权工具调用会被拦截并返回 `blocked: true` 事件
 - **SSE 事件归一化**：流式 `tool_calls` 按 index 增量合并，兼容老模型 `function_call`；透传前过滤 id/type 字段
 - **usage 汇总**：`UsageAccumulator` 按 completion_id + 指纹去重，合并后挂到当前 chat_round
-- **首调用预算检查**：请求发起前估算「消息 + 工具定义」token，超当前模型窗口时优先把文件记忆降级为 3000 字符摘要（发 warning 事件），仍超窗则发 error 并终止，避免上游 400/静默截断
+- **首调用预算检查**：请求发起前估算「消息 + 工具定义」token，超当前模型窗口时优先把文件记忆降级为约 1500 字符的文件索引（仅文件名/类型/大小，发 warning 事件），仍超窗则发 error 并终止，避免上游 400/静默截断
 - **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入。`todo_write` 模型自我规划（落盘侧车 `<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；系统提示终态注入收官提醒）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）。未知或未启用的工具调用由执行侧拒绝并返回配对工具结果。
    - **上下文压缩**：由 `agent_runtime/context_compaction.py` 统一负责。压缩模型调用支持**流式接口**：传入 `event_emitter` 时以 `stream=True` 请求，模型思考/正文增量经 `phase="delta"` 事件（`reasoning_content`/`content` 与聊天 SSE 同名字段）实时推 SSE，delta 帧不落盘；done 事件携带 `summary_text` 最终累计摘要全文并随同一 payload 落盘 JSONL，前端刷新后可在压缩块回放摘要。跨轮历史与单轮工具轨迹达到「`min(聊天窗口,压缩窗口)×ratio`」时，使用压缩模型输出普通文本摘要，并归并为一个累计摘要块；已完成原始轮次只存储在 JSONL，不再回传给模型，全部历史原始用户问题保留最近 ≤10k tokens（`context_summary.recent_questions`），渲染为独立 system 消息；单次超大工具结果也会在下一次模型调用前触发；原始结果仍写入 JSONL 与 SSE。
 - **超大结果拒绝**：单次工具结果估算 token 超过 `min(聊天窗口,压缩窗口)×系数`（默认 1.5）时，结果不进入模型上下文，改写"输出过长，请重新考虑工具"反馈并让模型重新规划；JSONL 只落头尾节选预览（`result_preview`）。连续超长拒绝达到上限（默认 3）时终止任务并写入说明。
@@ -247,7 +258,7 @@ agent_tool_sse/
   - 单轮工具上下文压缩状态随轮次保存为可选 `compress_blocks`（累计摘要块带覆盖游标）/`compress_content`/`compress_index`；活动期间写入 `_meta._active_round_compaction` 检查点，历史重建时跳过游标之前已摘要的工具轨迹
   - 压缩 usage 分桶累计：单轮 `compress_usage`、跨轮 `_history_compress_usage`；压缩过程事件（start/done）以 `event="context_compaction"` 独立行落盘，与 SSE 推送同结构
   - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；`run_task` 属性按会话控制对话启停
-  - 支持按行删除/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
+  - 支持按轮次删除（`delete_rounds`，运行中会话 409 + .bak 备份）/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
   - **多会话分享/导入**：`export_sessions_to_zip` 打包（各会话 jsonl + `session_files/<upload_id>/` 数据 + manifest.json）；`list_zip_sessions` 预检（不落盘，返回会话清单与本地冲突标记）；`import_sessions_from_zip` 两阶段提交（冲突策略 ask/overwrite/rename/skip，逐会话决策，另存时上传目录归属随新会话 ID 改名并回写 `_meta.upload_id`），路由见 `/chat_history/export_zip|import_preview|import_package`
 - **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）。**原生文档内核**（`memory/file_memory.py`）：按 supportDocTypes 逐文件分流 / 原始字节→OpenAI `file` 部件 data URL / 原生 PDF 页段 / 单文件及同请求批次预算 / `retire_native_document_parts`（完整模型响应后把历史部件替换为「[文档 名字]」占位）；清单对原生候选只显示索引，避免重复注入解析全文
   - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）；带引用快照的轮次在用户消息前置 `<quote_list>`（模型视图，JSONL 原始历史不含标签）
@@ -311,3 +322,16 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 ### 10. API 接口总览
 > 完整出入参数说明见 `docs/api_docs.md`，在线文档见 `/docs`
+
+---
+
+## 四、已知问题（代码缺陷与平台限制，2026-09 文档核对时确认，代码未修复仅如实记录）
+
+> 2026-09-29 复核：原第 1 条（read_file 读取侧无大小上限）已随 64 MiB 读取上限（超限直接拒绝，读取改用限量读取）修复，原第 2 条（requirements.txt `docx` 包名有误）已改用 `python-docx`，两条均修复并移出本表。
+
+| # | 位置 | 问题 |
+|---|---|---|
+| 1 | `env_manager.py` `_decrypt_dpapi_secret` | `enc:dpapi:` 凭据仅在 Windows 可解密；非 Windows 加载时按原样返回密文（跨平台部署不可用） |
+| 2 | `mcp_server/sys_tools_server.py` | 文件四件套与 run_command 的大量旧实现以注释保留（已迁移为内置工具），仅 fetch_url/web_search 为活跃代码；`_truncate_text` 等少量辅助函数仍被活跃路径共用 |
+| 3 | `mcp_server/restart_tools_server.py` | 孤儿模块：未在 setting/mcp_servers.json 注册，main.py 的服务快照写入被注释，根目录无 restart_helper.py，内部固定 `cmd /c` 无 POSIX 分支——不要依赖其完成自动重启 |
+| 4 | `setting/mcp_servers.json` | SysServer 以 `"command": "python"` 启动；Windows 可用，Linux 上通常需 `python3`（跨平台部署注意） |

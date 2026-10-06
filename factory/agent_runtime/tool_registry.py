@@ -408,8 +408,8 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
     for _server_id, original_name, _definition in discovered:
         raw_name_counts[original_name] = raw_name_counts.get(original_name, 0) + 1
     try:
-        from factory.agent_runtime.builtin_tools import SELECTABLE_BUILTIN_TOOL_NAMES
-        reserved_names = set(SELECTABLE_BUILTIN_TOOL_NAMES) | {"over_task"}
+        from factory.agent_runtime.builtin_tools import SELECTABLE_BUILTIN_TOOL_NAMES, COMMAND_TOOL_NAMES
+        reserved_names = set(SELECTABLE_BUILTIN_TOOL_NAMES) | COMMAND_TOOL_NAMES | {"over_task"}
     except Exception:
         reserved_names = {"over_task"}
     all_raw_names = set(raw_name_counts)

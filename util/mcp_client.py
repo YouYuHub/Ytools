@@ -387,41 +387,20 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
                     raise ValueError(
                         f"工具 '{function_name}' 不存在。可用工具: {', '.join(available_tools)}"
                     )
-                try:
-                    pipe_tools = {"setup_pipe", "run_pipe_command", "read_pipe_history"}
-                    max_pipe_retries = 3 if function_name in pipe_tools else 1
-                    last_error: Optional[Exception] = None
-                    for attempt in range(1, max_pipe_retries + 1):
-                        # 调用工具
-                        result = await session.call_tool(function_name, arguments or {})
-                        # 解析结果
-                        # 注意：即使 result.content 为空，也可能是合法的返回值（如空列表 []）
-                        # 2.0 协议优先，auto 兼容 1.x（isError）
-                        if _sdk_attr(result, "is_error", "isError", False):
-                            error_text = result.content[0].text if result.content else "未知错误"
-                            is_pipe_connect_error = "Failed to connect to named-pipe server" in error_text
-                            if is_pipe_connect_error and attempt < max_pipe_retries:
-                                wait_seconds = 0.3 * attempt
-                                print(f"[WARN] {function_name} 第{attempt}次调用命名管道连接失败，{wait_seconds:.1f}s 后重试")
-                                await asyncio.sleep(wait_seconds)
-                                continue
-                            last_error = ValueError(f"MCP 工具执行失败: {error_text}")
-                            break
-                        if result.content and len(result.content) > 0:
-                            texts = []
-                            for content_item in result.content:
-                                if hasattr(content_item, 'text') and content_item.text:
-                                    texts.append(content_item.text)
-                            return "\n".join(texts) if texts else ""
-                        else:
-                            # 没有 content 但也没有错误，可能是空列表等合法返回值
-                            # 返回空列表表示成功但无内容
-                            return []
-                    if last_error is not None:
-                        raise last_error
-                except Exception as call_error:
-                    # 重新抛出工具调用错误
-                    raise call_error
+                result = await session.call_tool(function_name, arguments or {})
+                # 解析结果。即使 result.content 为空，也可能是合法的返回值（如空列表）。
+                # 2.0 协议优先，auto 兼容 1.x（isError）。
+                if _sdk_attr(result, "is_error", "isError", False):
+                    error_text = result.content[0].text if result.content else "未知错误"
+                    raise ValueError(f"MCP 工具执行失败: {error_text}")
+                if result.content and len(result.content) > 0:
+                    texts = []
+                    for content_item in result.content:
+                        if hasattr(content_item, 'text') and content_item.text:
+                            texts.append(content_item.text)
+                    return "\n".join(texts) if texts else ""
+                # 没有 content 但也没有错误，可能是空列表等合法返回值。
+                return []
     except Exception as error:
         # 统一异常收口（版本无关）：
         # - anyio 在退出 stdio_client/ClientSession 上下文时会把底层异常打包成

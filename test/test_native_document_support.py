@@ -102,13 +102,14 @@ class TextFileParsingTests(unittest.TestCase):
         self.assertFalse(file_factory.is_probably_binary(b""))
 
     def test_decode_fallback_chain(self):
-        self.assertEqual(file_factory.decode_text_bytes("中文".encode("utf-8"))[1], "utf-8-sig")
+        self.assertEqual(file_factory.decode_text_bytes("中文".encode("utf-8"))[1], "utf-8")
         text, enc = file_factory.decode_text_bytes("中文".encode("gbk"))
         self.assertEqual(text, "中文")
         self.assertIn(enc, ("gb18030", "latin-1"))
-        # latin-1 兜底：任意字节都能解码，不抛异常
+        # 损坏的 UTF-16 BOM 内容：不误按 latin-1 伪装正常文本
         text, enc = file_factory.decode_text_bytes(b"\xff\xfe\xfa")
-        self.assertEqual(enc, "latin-1")
+        self.assertEqual(enc, "utf-16")
+        self.assertIn("\ufffd", text)
 
     def test_known_text_extension_accepts_odd_bytes(self):
         # 已知文本扩展名：即使含空字节也按文本解析（用户显式命名 .txt）

@@ -10,10 +10,19 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, r"C:\Users\Administrator\Desktop\python学习录\main_study\large_model\agent_tool_sse")
 
 from util import config_watcher
+
+
+def test_oversized_config_is_skipped_without_reading_whole_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "models.json"
+        path.write_bytes(b"{" + b"x" * 64)
+        with patch.object(config_watcher, "_MAX_WATCH_CONFIG_BYTES", 64):
+            assert config_watcher.poll_once({"models": path})["models"] == "failed"
 
 
 def _wait_filesystem() -> None:

@@ -450,6 +450,29 @@ class LoadAnyMediaTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_register_local_source_rejects_oversize_before_upload(self):
+        tmp_dir = fm.HISTORY_ROOT / "register_large_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        path = tmp_dir / "large.png"
+        path.write_bytes(b"x" * 65)
+        try:
+            with patch.object(fm, "media_size_limit", return_value=64):
+                result = bt.register_media_source(TEST_SESSION, str(path), "local")
+            self.assertFalse(result["ok"])
+            self.assertIn("读取上限", result["error"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_register_network_source_rejects_oversize(self):
+        class FakeResponse(io.BytesIO):
+            status = 200
+
+        with patch.object(bt.urllib.request, "urlopen", return_value=FakeResponse(b"x" * 65)):
+            with patch.object(fm, "media_size_limit", return_value=64):
+                result = bt.register_media_source(TEST_SESSION, "https://example.test/large.png", "network")
+        self.assertFalse(result["ok"])
+        self.assertIn("超过限制", result["error"])
+
     def test_sniff_calibrates_extension(self):
         # PNG 字节伪装成 .bin 扩展名：入库时按魔数校准为 .png
         png = _make_png_bytes(20, 14)
@@ -605,6 +628,14 @@ class ConcurrencyGuardAndCorruptImageTests(unittest.TestCase):
         self.assertIn("同一条回复只调用一次", description)
         self.assertIn("仅首个会执行", description)
         self.assertIn("references 列表", description)
+
+    def test_quality_description_is_concise_and_keeps_bounds(self):
+        definition = bt.build_read_media_tool_definition()
+        quality = definition["function"]["parameters"]["properties"]["quality"]
+        self.assertEqual(quality["minimum"], 50)
+        self.assertEqual(quality["maximum"], 100)
+        self.assertIn("50-100", quality["description"])
+        self.assertIn("默认 85", quality["description"])
 
     def test_corrupt_local_image_rejected_not_injected(self):
         # 复刻实证案例：仅 PNG 签名 + 零填充的 40 字节伪 PNG

@@ -1126,15 +1126,22 @@ class ContextCompactionThresholdTests(unittest.TestCase):
         # min(1M, 200k) × 0.5 = 100k
         self.assertEqual(compaction.resolve_context_compaction_threshold(), 100_000)
 
-    def test_summary_budget_is_fraction_of_window(self):
+    def test_summary_budget_uses_smaller_model_window(self):
         compaction.resolve_model_max_input_tokens = lambda default=8192: 1_000_000
         compaction.resolve_context_compaction_model_config = lambda _settings: {
             "maxInputTokens": 200_000,
             "apiType": "chat-completions",
         }
         compaction.load_context_compaction_settings = self._settings
-        # 总预算 = 窗口 × 0.2 = 200k
-        self.assertEqual(compaction.resolve_summary_total_budget(), 200_000)
+        # 压缩窗口较小：min(1M, 200k) × 0.2 = 40k。
+        self.assertEqual(compaction.resolve_summary_total_budget(), 40_000)
+        compaction.resolve_model_max_input_tokens = lambda default=8192: 8192
+        compaction.resolve_context_compaction_model_config = lambda _settings: {
+            "maxInputTokens": 600_000,
+            "apiType": "chat-completions",
+        }
+        # 聊天窗口较小：min(8192, 600k) × 0.2 = 1638。
+        self.assertEqual(compaction.resolve_summary_total_budget(), 1638)
 
 
 class RoundMultiBlockCompactionTests(unittest.IsolatedAsyncioTestCase):

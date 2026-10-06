@@ -370,6 +370,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/chat_config/tool_selection" + query);
   }
 
+
   /**
    * 保存工具选择
    * 不传 sessionId：写回全局默认 setting/mcp_servers.json 的 inputs 键（新建会话前的默认）
@@ -590,6 +591,24 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/stop_chat?session_id=" + encodeURIComponent(sessionId || "default"), { method: "POST" });
   }
 
+  function stopSubAgent(sessionId, agentId) {
+    return request("/stop_sub_agent", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, agent_id: agentId }),
+    });
+  }
+
+  function getSubAgentLimitsConfig() {
+    return request("/chat_config/sub_agent_limits");
+  }
+
+  function updateSubAgentLimitsConfig(config) {
+    return request("/chat_config/sub_agent_limits", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
   /**
    * 运行中注入用户消息（消息引导）：任务运行中投递给后端，生成循环在
    * 下一轮检查点（工具结果处理完毕后）取出并作为新一轮继续。
@@ -618,8 +637,8 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   // ---------- 会话文件 ----------
-  function uploadSessionFiles(sessionId, fileList, onProgress) {
-    return uploadRawBatch("/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), fileList, onProgress);
+  function uploadSessionFiles(sessionId, fileList, onProgress, signal) {
+    return uploadRawBatch("/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), fileList, onProgress, signal);
   }
 
   function getSessionFiles(sessionId) {
@@ -1032,6 +1051,9 @@ const api_url = localStorage.getItem("ytools-api-base")
     changeChatDir,
     setSessionWorkDir,
     stopChat,
+    stopSubAgent,
+    getSubAgentLimitsConfig,
+    updateSubAgentLimitsConfig,
     injectMessage,
     cancelInjectMessage,
     uploadSessionFiles,

@@ -4,6 +4,27 @@ const test = require("node:test");
 const path = require("path");
 const WidgetReuse = require(path.join(__dirname, "..", "js", "widget_reuse.js"));
 
+test("连续流式重绘只保留最新正文和原有 Canvas 控件", function () {
+  const root = { childNodes: [], removeChild(node) {
+    this.childNodes.splice(this.childNodes.indexOf(node), 1);
+    node.parentNode = null;
+  } };
+  function add(text) {
+    const node = { text, parentNode: root };
+    root.childNodes.push(node);
+    return node;
+  }
+  const canvas = add("canvas");
+  const reused = new Set([canvas]);
+  for (let frame = 0; frame < 8; frame++) {
+    const before = add("before " + frame);
+    const after = add("after " + frame);
+    WidgetReuse.removeStaleNodes(root, new Set([before, after]), reused);
+    assert.deepStrictEqual(root.childNodes.map(node => node.text),
+      ["canvas", "before " + frame, "after " + frame]);
+  }
+});
+
 test("plan: 无旧控件时全部新建", function () {
   const plan = WidgetReuse.plan([], [{ kind: "canvas", code: "a" }]);
   assert.strictEqual(plan.length, 1);

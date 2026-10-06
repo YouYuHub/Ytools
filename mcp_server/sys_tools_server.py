@@ -14,14 +14,13 @@
     - 阻塞操作（子进程、网络请求、目录遍历）统一通过 asyncio.to_thread
       放到工作线程执行，避免卡死 stdio 事件循环；
     - 所有大输出统一截断保护，避免撑爆模型上下文；
-    - 文本解码采用「BOM 嗅探 + 多候选严格解码评分」策略，降低 GBK/UTF-8 互串乱码概率。
+    - 文本解码采用统一 BOM/严格 UTF-8/声明与本地编码回退，避免汉字评分误判。
 """
 # 标准库
 import asyncio
 import base64
 import difflib
 import fnmatch
-import gzip
 import itertools
 import os
 import re
@@ -36,12 +35,14 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote, urlencode, urlsplit, parse_qs, urljoin
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from util.text_encoding import decode_text
 
 # 第三方库
 try:
@@ -79,83 +80,9 @@ _BROWSER_LIKE_HEADERS = {
 }
 
 
-# BOM 前缀 → 编码名（嗅探优先级最高，字节级无歧义）
-_BOM_TABLE = (
-    (b"\xef\xbb\xbf", "utf-8-sig"),
-    (b"\xff\xfe\x00\x00", "utf-32-le"),
-    (b"\x00\x00\xfe\xff", "utf-32-be"),
-    (b"\xff\xfe", "utf-16-le"),
-    (b"\xfe\xff", "utf-16-be"),
-)
-
-# 乱码特征：CJK 区字符与常见替换符。GBK 误按 UTF-8 解码会大量产生 CJK 扩展区生僻字，
-# UTF-8 误按 GBK 解码则表现为成对"锟斤拷/烫烫烫"类噪声，两者都可用比例识别。
-_REPLACEMENT_CHARS = ("\ufffd", "�")
-
-# UTF-8 中文被误按 GBK 解码的高频特征字（如"中"→"涓"、"："→"锛"、"的"→"鐨"）。
-# 这些字大多落在常用汉字区 U+4E00-9FFF，仅靠扩展区惩罚无法识别，需单独计罚。
-_GBK_MISDECODE_SIGNS = frozenset(
-    "锛涓鐨璁璁鐢ㄦ浣鍚鍦ㄧ笉鑷姝ソ鈥銆銉鏄鍙涔浠鏂鎴戣澶娈鎷瀹寮"
-)
-
-
-def _mojibake_score(text: str) -> float:
-    """估计一段文本的乱码程度（0=干净，越高越乱）。
-
-    规则：
-      - 替换符 � 计重罚；
-      - CJK 兼容/扩展区生僻字（U+3400-4DBF、U+E000-F8FF、U+FE30-FE4F 等）计轻罚；
-      - 正常常用汉字（U+4E00-9FFF）不算乱码。
-    """
-    if not text:
-        return 0.0
-    sample = text[:20000]
-    penalty = 0
-    for ch in sample:
-        code = ord(ch)
-        if ch in _REPLACEMENT_CHARS:
-            penalty += 2
-        elif 0x3400 <= code <= 0x4DBF or 0xE000 <= code <= 0xF8FF or 0xFE30 <= code <= 0xFE4F:
-            penalty += 1
-        elif ch in _GBK_MISDECODE_SIGNS:
-            # UTF-8 中文被误按 GBK 解码的高频特征字（如"中"→"涓"、全角冒号→"锛"）
-            penalty += 1
-        elif 0x9FA6 <= code <= 0x9FFF:
-            # U+9FA6-9FFF 属于 GBK 有映射但 Unicode 主区少用的字，GBK 串被 utf-8 硬解时高频出现
-            penalty += 1
-    return penalty / len(sample)
-
-
 def _decode_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> tuple:
-    """把字节解码为文本，返回 (文本, 实际使用的编码)。
-
-    优先级：显式 encoding > BOM 嗅探 > 多候选严格解码评分。
-    多候选都能严格解码时（如 GBK 中文恰好构成合法 UTF-8 的情形），按乱码特征
-    打分取最优，避免固定顺序导致的高概率互串乱码。
-    显式指定 encoding 时直接按该编码宽松解码（保证不抛异常）。
-    """
-    if encoding:
-        return data.decode(encoding, errors="replace"), encoding
-    for bom, name in _BOM_TABLE:
-        if data.startswith(bom):
-            try:
-                return data.decode(name), name
-            except (UnicodeDecodeError, LookupError):
-                break
-    best_text, best_encoding, best_score = None, None, None
-    for candidate in candidates:
-        try:
-            decoded = data.decode(candidate)
-        except (UnicodeDecodeError, LookupError):
-            continue
-        score = _mojibake_score(decoded)
-        if best_score is None or score < best_score:
-            best_text, best_encoding, best_score = decoded, candidate, score
-        if score == 0.0:
-            break  # 已找到零乱码候选，无需继续比较
-    if best_text is None:
-        return data.decode(candidates[-1], errors="replace"), candidates[-1]
-    return best_text, best_encoding
+    """使用统一 BOM、UTF-8 与常见编码回退。"""
+    return decode_text(data, encoding, candidates)
 
 
 def _decode_bytes(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> str:
@@ -573,24 +500,62 @@ _TAG_SPEC_PATTERN = re.compile(r"^([a-zA-Z][a-zA-Z0-9-]*)((?:[.#][\w-]+)*)$")
 _ATTR_PATTERN = re.compile(r"([\w:-]+)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
 
 
+class _TagBlockParser(HTMLParser):
+    """按真实元素边界抽取内部 HTML，脚本字符串不会成为伪元素。"""
+    _void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, text, tag, conditions):
+        super().__init__(convert_charrefs=False)
+        self.text, self.tag, self.conditions = text, tag, conditions
+        self.offsets = [0]
+        for line in text.splitlines(keepends=True):
+            self.offsets.append(self.offsets[-1] + len(line))
+        self.stack, self.blocks = [], []
+
+    def source_offset(self):
+        line, column = self.getpos()
+        return self.offsets[line - 1] + column
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._void:
+            return
+        values = dict(attrs)
+        selected = tag == self.tag and all(
+            expected in (values.get(key) or "").split() if key == "class"
+            else expected == values.get(key) for key, expected in self.conditions)
+        self.stack.append((tag, self.source_offset() + len(self.get_starttag_text()), selected))
+
+    def handle_startendtag(self, tag, attrs):
+        pass
+
+    def close(self):
+        super().close()
+        for _, start, selected in self.stack:
+            if selected:
+                self.blocks.append((start, self.text[start:].strip()))
+        self.stack.clear()
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                for _, start, selected in self.stack[index:]:
+                    if selected:
+                        self.blocks.append((start, self.text[start:self.source_offset()].strip()))
+                del self.stack[index:]
+                break
+
+
 def _extract_tag_blocks(html_text: str, tag_spec: str) -> list:
-    """按 "div"、"div#main"、"div.content" 形式的标签选择器抽取标签内部内容。
-    说明：同名标签嵌套时按非贪婪最短块匹配，不做严格配对。"""
-    match = _TAG_SPEC_PATTERN.match(tag_spec.strip())
+    """支持 tag、tag#id、tag.class（多个 class 可组合）；不是完整 CSS/XPath。"""
+    match = _TAG_SPEC_PATTERN.fullmatch(tag_spec.strip())
     if not match:
         raise ValueError(f"tag 参数格式不合法: {tag_spec}（示例：div、div#main、div.content）")
-    tag_name, selector_part = match.group(1).lower(), match.group(2)
-    conditions = []
-    for selector in re.findall(r"[.#][\w-]+", selector_part):
-        conditions.append(("id", selector[1:]) if selector[0] == "#" else ("class", selector[1:]))
-    block_pattern = re.compile(rf"<{tag_name}\b([^>]*)>(.*?)</{tag_name}\s*>", re.IGNORECASE | re.DOTALL)
-    blocks = []
-    for matched in block_pattern.finditer(html_text):
-        attrs_text, inner = matched.group(1), matched.group(2)
-        if conditions and not _attrs_match(attrs_text, conditions):
-            continue
-        blocks.append(inner.strip())
-    return blocks
+    conditions = [("id" if part[0] == "#" else "class", part[1:])
+                  for part in re.findall(r"[.#][\w-]+", match.group(2))]
+    parser = _TagBlockParser(html_text, match.group(1).lower(), conditions)
+    parser.feed(html_text)
+    parser.close()
+    return [block for _, block in sorted(parser.blocks)]
 
 
 def _attrs_match(attrs_text: str, conditions: list) -> bool:
@@ -601,6 +566,28 @@ def _attrs_match(attrs_text: str, conditions: list) -> bool:
         if expected not in values:
             return False
     return True
+
+
+_HTTP_MAX_TRANSFER_BYTES = 16 * 1024 * 1024
+_HTTP_MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+
+
+def _decompress_http_body(raw: bytes, wbits: int) -> bytes:
+    decoder = zlib.decompressobj(wbits)
+    result = decoder.decompress(raw, _HTTP_MAX_DECOMPRESSED_BYTES + 1)
+    if len(result) > _HTTP_MAX_DECOMPRESSED_BYTES or decoder.unconsumed_tail:
+        raise ValueError("网页解压后超过 32 MiB 上限")
+    tail = decoder.flush(_HTTP_MAX_DECOMPRESSED_BYTES + 1 - len(result))
+    if len(result) + len(tail) > _HTTP_MAX_DECOMPRESSED_BYTES:
+        raise ValueError("网页解压后超过 32 MiB 上限")
+    return result + tail
+
+
+class _HttpResult(tuple):
+    def __new__(cls, final_url, status, content_type, raw, headers):
+        result = super().__new__(cls, (final_url, status, content_type, raw))
+        result.headers = headers
+        return result
 
 
 def _http_request(url: str, method: str = "GET", body: str = "", headers: Optional[dict] = None,
@@ -621,8 +608,14 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
         merged_headers.setdefault("Accept-Encoding", "gzip, deflate")
     request = Request(url, data=data, headers=merged_headers, method=method.upper())
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read()
+        try:
+            response = urlopen(request, timeout=timeout_seconds)
+        except HTTPError as exc:
+            response = exc  # HTTP 错误仍有可读正文，使用同样的大小与解压保护。
+        with response:
+            raw = response.read(_HTTP_MAX_TRANSFER_BYTES + 1)
+            if len(raw) > _HTTP_MAX_TRANSFER_BYTES:
+                raise ValueError("网页响应超过 16 MiB 下载上限")
             content_type = response.headers.get("Content-Type", "")
             # 按响应头/魔数解压：gzip(1f 8b)、deflate(zlib 头 78 xx 或裸 deflate)
             encoding_header = (response.headers.get("Content-Encoding") or "").lower().strip()
@@ -630,22 +623,15 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
                     not encoding_header and (raw[:2] == b"\x1f\x8b" or raw[:1] == b"\x78")):
                 try:
                     if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
+                        raw = _decompress_http_body(raw, 16 + zlib.MAX_WBITS)
                     else:
                         try:
-                            raw = zlib.decompress(raw)          # zlib 包装的 deflate
+                            raw = _decompress_http_body(raw, zlib.MAX_WBITS)
                         except zlib.error:
-                            raw = zlib.decompress(raw, -15)     # 裸 deflate 流
+                            raw = _decompress_http_body(raw, -zlib.MAX_WBITS)
                 except (OSError, zlib.error):
                     pass  # 解压失败则按原样返回，交由上层按文本处理
-            return response.geturl(), response.status, content_type, raw
-    except HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read(2000).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise ValueError(f"HTTP {exc.code} {exc.reason}: {url}" + (f"\n{detail}" if detail else "")) from exc
+            return _HttpResult(response.geturl(), response.status, content_type, raw, dict(response.headers))
     except URLError as exc:
         raise ValueError(f"请求失败: {url}（{exc.reason}）") from exc
     except TimeoutError as exc:
@@ -1455,9 +1441,9 @@ def _wmi_create_process(command_line: str) -> int:
         ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
         capture_output=True, timeout=30,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    text = completed.stdout.decode(_command_output_candidates()[0], errors="replace").strip()
+    text = decode_text(completed.stdout, candidates=_command_output_candidates())[0].strip()
     if completed.returncode != 0 or not text.isdigit():
-        detail = completed.stderr.decode(errors="replace").strip()[:300]
+        detail = decode_text(completed.stderr, candidates=_command_output_candidates())[0].strip()[:300]
         raise ValueError(f"WMI 回退启动失败（exit={completed.returncode}）: {detail or text}")
     return int(text)
 
@@ -1869,40 +1855,24 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
         timeout = min(max(float(timeout_seconds), 1.0), 120.0)
     except (TypeError, ValueError):
         timeout = 30.0
-    final_url, status, content_type, raw = _http_request(
+    response = _http_request(
         url, method=method or "GET", body=body or "", headers=headers, timeout_seconds=timeout)
-    if encoding:
-        charset = encoding
-        html_text = raw.decode(charset, errors="replace")
-    else:
-        # 声明编码与实际内容不符的站点兜底：按乱码评分在候选编码中择优
-        declared = _pick_web_charset(content_type, raw, "")
-        candidates = [declared] + [alt for alt in ("utf-8", "gbk") if alt.lower() != declared.lower()]
-        best_text, best_charset, best_score = None, declared, None
-        for candidate in candidates:
-            try:
-                decoded = raw.decode(candidate)
-            except (UnicodeDecodeError, LookupError):
-                continue
-            score = _mojibake_score(decoded)
-            if best_score is None or score < best_score:
-                best_text, best_charset, best_score = decoded, candidate, score
-            if score == 0.0:
-                break
-        html_text = best_text if best_text is not None else raw.decode(declared, errors="replace")
-        charset = best_charset
+    final_url, status, content_type, raw = response
+    declared = _pick_web_charset(content_type, raw, "")
+    html_text, charset = decode_text(raw, encoding, candidates=(declared, 'gb18030', 'big5'))
     title = ""
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
     if title_match:
         title = _strip_tags(title_match.group(1))
     extract_note = ""
+    regex_truncated = False
     if mode == "text":
         content, extract_note = _extract_main_text(html_text)
     elif mode == "html":
         content = html_text
     elif mode == "tag":
         blocks = _extract_tag_blocks(html_text, str(tag))
-        content = "\n----\n".join(blocks)
+        content = "\n----\n".join(_html_to_text(block) for block in blocks)
     else:
         # regex 模式：单条匹配展示上限 = max_chars/4，钳制在 [200, 2000]（默认 8000 → 每条 2000 字符）
         per_match_cap = max(200, min(2000, (int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS) // 4))
@@ -1910,23 +1880,35 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
         for found in regex.finditer(html_text):
             piece = (" | ".join(g if g is not None else "" for g in found.groups())
                      if found.groups() else found.group(0))
+            if len(piece) > per_match_cap:
+                regex_truncated = True
             matches.append(piece[:per_match_cap])
             if len(matches) >= 200:
+                regex_truncated = True
                 break
         content = "\n".join(matches)
     limit = min(max(int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS, 200), 100000)
     original_len = len(content)
     content = _truncate_text(content, limit, "网页内容过长已截断")
     header = (f"[fetch_url] HTTP {status} | {str(final_url)}\n"
-              f"[fetch_url] Content-Type: {content_type or '未知'} | 编码: {charset}"
+              f"[fetch_url] Content-Type: {content_type or '未知'} | 声明/推断编码: {declared} | 实际编码: {charset}"
               f" | 原始 {len(raw)} 字节 | 提取后 {original_len} 字符")
     if extract_note:
         header += f" | 提取模式: {extract_note}"
     if title:
         header += f" | 标题: {title}"
     notes = []
+    if regex_truncated:
+        notes.append(f"正则结果已截断：每条最多 {per_match_cap} 字符，最多 200 条；请收窄 pattern 或使用 tag/text")
+    if status >= 400:
+        notes.append("HTTP 错误响应，以下为站点返回的错误正文，不代表抓取成功")
+    for key, value in getattr(response, "headers", {}).items():
+        if key.lower() in ("retry-after", "location"):
+            notes.append(f"{key}: {value}")
     if mode == "tag" and not content:
-        notes.append("未匹配到目标标签，可改用 mode=regex 或调整 tag 选择器")
+        notes.append("目标标签未匹配或内容为空；可用 mode=html 核对真实标签与 id/class（不执行 JavaScript）")
+    if mode == "regex" and not content:
+        notes.append("正则没有匹配内容；匹配对象为原始响应文本，可用 mode=html 核对")
     if original_len > limit:
         notes.append(f"内容超过 max_chars={limit} 已截断；可用 pattern/tag 抽取更小范围或调大 max_chars")
     if notes:
@@ -2006,6 +1988,7 @@ def _bing_block_result(block: str) -> Optional[tuple]:
 
 def _search_keywords(query: str) -> set:
     """从查询中提取关键词集合：整词 + 英文/数字分词（≥2 字符）。"""
+    query = re.sub(r"\bsite:[^\s]+", "", str(query or ""), flags=re.IGNORECASE)
     keywords = set()
     for token in re.split(r"[\s,，、]+", str(query or "").strip()):
         if not token:
@@ -2029,6 +2012,10 @@ def _has_weak_relevance(results: list, query: str) -> bool:
         keyword for keyword in _search_keywords(query)
         if re.search(r"[0-9]", keyword) or any(ord(ch) > 127 for ch in keyword)
     ]
+    keywords = _search_keywords(query)
+    if keywords and not any(any(word in f"{item[0]} {item[1]} {item[2]}".lower()
+                                for word in keywords) for item in results):
+        return True
     if not specific:
         return False
     for item in results:
@@ -2091,9 +2078,11 @@ def _fetch_bing_results(query: str, limit: int) -> list:
     """
     search_url = "https://www.bing.com/search?" + urlencode(
         {"q": query, "count": min(limit * 3, 30), "mkt": "zh-CN"})
-    _, _, content_type, raw = _http_request(search_url, timeout_seconds=15)
+    _, status, content_type, raw = _http_request(search_url, timeout_seconds=15)
+    if status >= 400:
+        raise ValueError(f"Bing HTTP {status}")
     charset = _pick_web_charset(content_type, raw, "")
-    html_text = raw.decode(charset, errors="replace")
+    html_text, charset = decode_text(raw, candidates=(charset,))
     collected = []
     for block in _split_bing_blocks(html_text):
         item = _bing_block_result(block)
@@ -2105,37 +2094,54 @@ def _fetch_bing_results(query: str, limit: int) -> list:
     return _relevance_rank(_dedupe_results(collected, limit * 3), query, limit * 3)
 
 
-def _fetch_ddg_results(query: str, limit: int) -> list:
-    """请求并解析 DuckDuckGo HTML 版搜索结果，返回 [(标题, 链接, 摘要)]。
+class _DdgResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results, self.current, self.anchor = [], None, None
 
-    按文档顺序扫描 result__a（标题/链接）与 result__snippet（摘要）锚点，
-    摘要归属其前面最近的一个标题，避免可选分组跨结果错配。
-    """
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        attrs = dict(attrs)
+        classes = (attrs.get("class") or "").split()
+        kind = "title" if "result__a" in classes else "snippet" if "result__snippet" in classes else None
+        if kind:
+            self.anchor = [kind, attrs.get("href") or "", []]
+
+    def handle_data(self, data):
+        if self.anchor:
+            self.anchor[2].append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "a" or not self.anchor:
+            return
+        kind, href, chunks = self.anchor
+        self.anchor = None
+        if kind == "title":
+            if self.current:
+                self.results.append(tuple(self.current))
+            url = urljoin("https://duckduckgo.com", href)
+            target = parse_qs(urlsplit(url).query).get("uddg")
+            if target:
+                url = target[0]
+            self.current = ["".join(chunks).strip(), url, ""] if urlsplit(url).scheme in ("http", "https") else None
+        elif self.current:
+            self.current[2] = "".join(chunks).strip()[:300]
+
+
+def _fetch_ddg_results(query: str, limit: int) -> list:
     ddg_url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
-    _, _, content_type, raw = _http_request(ddg_url, timeout_seconds=15)
-    charset = _pick_web_charset(content_type, raw, "")
-    html_text = raw.decode(charset, errors="replace")
-    collected = []
-    current = None
-    for anchor in re.finditer(
-            r'<a[^>]+class="result__(a|snippet)"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-            html_text, re.IGNORECASE | re.DOTALL):
-        kind, href, inner = anchor.group(1), anchor.group(2), anchor.group(3)
-        if kind == "a":
-            if current:
-                collected.append(tuple(current))
-            url = unquote(href)
-            # DDG 重定向链接 //duckduckgo.com/l/?uddg=<真实URL>
-            uddg = re.search(r"uddg=([^&]+)", url)
-            if uddg:
-                url = unquote(uddg.group(1))
-            current = [_strip_tags(inner), url, ""] if url.startswith("http") else None
-        elif current is not None:
-            current[2] = _strip_tags(inner)[:300]
-    if current:
-        collected.append(tuple(current))
-    # 返回完整排序池（≤3×limit），由调用方决定展示条数，便于多引擎合并
-    return _relevance_rank(_dedupe_results(collected, limit * 3), query, limit * 3)
+    _, status, content_type, raw = _http_request(ddg_url, timeout_seconds=15)
+    if status >= 400:
+        raise ValueError(f"DuckDuckGo HTTP {status}")
+    html_text, _charset = decode_text(raw, candidates=(_pick_web_charset(content_type, raw, ""),))
+    parser = _DdgResultParser()
+    parser.feed(html_text)
+    if parser.current:
+        parser.results.append(tuple(parser.current))
+    if not parser.results and not re.search(r"no results|no-results|没有找到", html_text, re.I):
+        raise ValueError("DuckDuckGo 未解析到结果：可能验证码、访问受限或页面结构变化")
+    return _relevance_rank(_dedupe_results(parser.results, limit * 3), query, limit * 3)
 
 
 def _web_search_impl(query, max_results, engine="auto") -> str:
@@ -2149,11 +2155,14 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
     elif engine_key not in ("auto", "bing"):
         raise ValueError("engine 仅支持 auto/bing/ddg（duckduckgo）")
     results, engine_name = [], ""
+    diagnostics = []
+    candidate_limit = _WEB_SEARCH_MAX_RESULTS
     if engine_key in ("auto", "bing"):
         try:
-            results = _fetch_bing_results(query, limit)
+            results = _fetch_bing_results(query, candidate_limit)
             engine_name = "Bing 网页版解析"
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            diagnostics.append(f"Bing: {exc}")
             results = []  # Bing 异常时自动走 DuckDuckGo 回退，而不是直接失败
         if not results and engine_key == "bing":
             raise ValueError(
@@ -2162,27 +2171,50 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
         # auto 模式下结果与查询特征词脱节或候选池偏薄时，并入 DuckDuckGo 候选
         # 统一重排扩大召回面；DDG 失败或无增量不影响已有结果
         if engine_key == "auto" and results and (
-                _has_weak_relevance(results, query) or len(results) < limit):
+                _has_weak_relevance(results, query) or len(results) < 8):
             try:
-                ddg_pool = _fetch_ddg_results(query, limit)
-                merged = _dedupe_results(list(results) + list(ddg_pool), limit * 3)
+                ddg_pool = _fetch_ddg_results(query, candidate_limit)
+                merged = _dedupe_results(list(results) + list(ddg_pool), candidate_limit * 3)
                 if len(merged) > len(results):
-                    results = _relevance_rank(merged, query, limit * 3)
+                    results = _relevance_rank(merged, query, candidate_limit * 3)
                     engine_name = "Bing+DuckDuckGo 合并重排"
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as exc:
+                diagnostics.append(f"DuckDuckGo: {exc}")
     if not results:
         try:
-            results = _fetch_ddg_results(query, limit)
+            results = _fetch_ddg_results(query, candidate_limit)
             engine_name = "DuckDuckGo（Bing 无结果/不可达或显式指定）"
         except (ValueError, OSError) as exc:
-            detail = f"（{exc}）" if engine_key == "ddg" else ""
+            detail = "；".join(diagnostics + [f"DuckDuckGo: {exc}"])
+            providers = "DuckDuckGo" if engine_key == "ddg" else "Bing 与 DuckDuckGo"
             raise ValueError(
-                "Bing 与 DuckDuckGo 均未解析到结果（站点改版或访问受限）" + detail +
+                providers + " 未获得搜索结果（站点改版或访问受限）：" + detail +
                 "。可直接用 fetch_url 打开 https://www.bing.com/search?q=关键词 ，"
                 "用 mode=text/regex 自行提取。") from exc
+    # site: 是明确的域名/路径约束，不能返回约束外的结果。
+    sites = re.findall(r"\bsite:([^\s]+)", query, re.I)
+    if sites:
+        def in_site(url, site):
+            wanted = urlsplit(site if "://" in site else "https://" + site)
+            actual = urlsplit(url)
+            host, domain = (actual.hostname or "").lower(), (wanted.hostname or "").lower()
+            return bool(domain) and (host == domain or host.endswith("." + domain)) and actual.path.startswith(wanted.path)
+        filtered = [item for item in results if any(in_site(item[1], site) for site in sites)]
+        if len(filtered) != len(results):
+            diagnostics.append("已剔除不符合 site: 域名/路径约束的结果")
+        results = filtered
+    keywords = _search_keywords(query)
+    if results and keywords and not any(
+            any(word in f"{item[0]} {item[1]} {item[2]}".lower() for word in keywords)
+            for item in results):
+        results = []
+        diagnostics.append("候选结果均未命中查询关键词，已丢弃；不能据此推断网页不存在")
     shown = results[:limit]
     lines = [f"[web_search] 查询: {query} | 共 {len(shown)} 条结果（{engine_name}，链接正文可用 fetch_url 抓取）"]
+    if diagnostics:
+        lines.append("[web_search] 提示: " + "；".join(diagnostics))
+    if not shown:
+        lines.append("[web_search] 未获得可靠结果；可能确实无结果、访问受限或解析失败，请更换关键词/引擎并核验")
     for index, (title, url, snippet) in enumerate(shown, start=1):
         lines.append(f"{index}. {title}\n   链接: {url}" + (f"\n   摘要: {snippet}" if snippet else ""))
     return "\n".join(lines)
@@ -2333,9 +2365,9 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
     参数：
         url:             完整链接，仅支持 http/https
         mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音）、
-                         html=原始 HTML、tag=按标签抽取、regex=按正则抽取
+                         html=原始 HTML、tag=按真实元素抽取纯文本（排除脚本/样式）、regex=按原始响应正则抽取
         pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
-        tag:             mode=tag 时必填，标签选择器：div、div#id、div.class
+        tag:             mode=tag 时必填，简单标签选择器：div、div#id、div.class；不支持完整 CSS/XPath
         max_chars:       返回内容最大字符数（200-100000）；默认 8000
         timeout_seconds: 请求超时秒数（1-120），默认 30
         encoding:        指定响应编码（如 gbk）；留空自动判断
@@ -2344,7 +2376,9 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
         headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}
     返回：
         头部（状态码/最终 URL/Content-Type/标题/长度）+ 提取的内容；内容过长会截断，
-        网页太大时建议用 tag/regex 只抽取需要的部分
+        HTTP 4xx/5xx 保留状态码、错误正文及 Retry-After；网络故障仍报错。
+        tag 返回纯文本，regex 保持原始匹配（包括脚本），并提示局部截断。
+        不执行 JavaScript；网页太大时建议用 tag/regex 只抽取需要的部分
     """
     return await asyncio.to_thread(
         _fetch_url_impl, url, mode, pattern, tag, max_chars, timeout_seconds,
@@ -2363,7 +2397,9 @@ async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> 
         编号结果列表，每条含标题、链接、摘要（已按相关性排序，头部标注实际使用的引擎）；
         需要正文时把链接交给 fetch_url 抓取
     说明：
-        无 API Key（解析搜索引擎网页版）；站点改版或访问受限时可能失败
+        max_results 只控制展示数量，候选池策略固定；site: 域名/路径会二次过滤。
+        无 API Key（解析搜索引擎网页版）；验证码、访问受限或结构变化会提示失败。
+        相关性仅为关键词启发式，请核对原文，不把空结果当成网页不存在。
     """
     return await asyncio.to_thread(_web_search_impl, query, max_results, engine)
 

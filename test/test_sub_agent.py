@@ -446,6 +446,7 @@ class SubAgentRunnerTests(unittest.TestCase):
 
         ChatLLM.chat_completions = slow_fake
         ctx, emitted, _stop = _make_context()
+        ctx.timeout_seconds = 0.5
         with mock.patch.object(
             sub_agent_module, "load_sub_agent_limits",
             return_value={
@@ -504,6 +505,85 @@ class SubAgentRunnerTests(unittest.TestCase):
             self.assertEqual(item["_sub_agent"]["status"], "done")
         agent_ids = {payload["agent_id"] for _, payload in emitted}
         self.assertEqual(len(agent_ids), 2)
+
+    def test_stop_one_agent_keeps_sibling_and_partial_report(self):
+        from dataclasses import replace
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime import sub_agent as module
+
+        async def scenario():
+            partial_received = asyncio.Event()
+            stopped, events, _ = _make_context()
+            sibling = replace(stopped, agent_id=module.new_agent_id(), parent_tool_index=1,
+                              parent_tool_call_id="call_p2", task="正常完成", initial_todo=None, cancel_token=asyncio.Event())
+
+            def fake(request=None, **kwargs):
+                async def gen():
+                    if any(message.content == "正常完成" for message in request.messages):
+                        await partial_received.wait()
+                        yield _sse({"content": "兄弟任务完成"})
+                        yield _sse({"finish_reason": "stop"})
+                    else:
+                        yield _sse({"content": "已完成第一步"})
+                        partial_received.set()
+                        await asyncio.Event().wait()
+                return gen()
+
+            with mock.patch.object(ChatLLM, "chat_completions", side_effect=fake):
+                batch_task = asyncio.create_task(module.run_sub_agent_batch([stopped, sibling]))
+                await asyncio.wait_for(partial_received.wait(), timeout=2)
+                self.assertFalse(module.request_sub_agent_stop("other_session", stopped.agent_id))
+                self.assertTrue(module.request_sub_agent_stop(stopped.session_id, stopped.agent_id))
+                result = await asyncio.wait_for(batch_task, timeout=2)
+            self.assertEqual(result[0]["_sub_agent"]["status"], "stopped")
+            self.assertIn("已完成第一步", result[0]["result"])
+            self.assertIn("用户已单独停止", result[0]["result"])
+            self.assertEqual(result[1]["_sub_agent"]["status"], "done")
+            self.assertEqual(len([p for phase, p in events if phase == "done" and p["agent_id"] == stopped.agent_id]), 1)
+            self.assertFalse(module.request_sub_agent_stop(stopped.session_id, stopped.agent_id))
+        asyncio.run(scenario())
+
+    def test_queued_agent_can_be_stopped_before_model_call(self):
+        from dataclasses import replace
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime import sub_agent as module
+
+        async def scenario():
+            queued_started = asyncio.Event()
+            queued_stopped = asyncio.Event()
+            release_running = asyncio.Event()
+            running, events, _ = _make_context()
+            queued = replace(running, agent_id=module.new_agent_id(), parent_tool_index=1,
+                             parent_tool_call_id="queued_call", task="排队任务",
+                             cancel_token=asyncio.Event())
+            original_emit = queued.emit_event
+            async def emit(event):
+                await original_emit(event)
+                if event["phase"] == "start" and event.get("queued"):
+                    queued_started.set()
+                if event["phase"] == "done":
+                    queued_stopped.set()
+            queued.emit_event = emit
+
+            def fake(request=None, **kwargs):
+                self.assertFalse(any(message.content == "排队任务" for message in request.messages))
+                async def gen():
+                    await release_running.wait()
+                    yield _sse({"content": "运行任务完成"})
+                    yield _sse({"finish_reason": "stop"})
+                return gen()
+            with mock.patch.object(ChatLLM, "chat_completions", side_effect=fake), \
+                 mock.patch.object(module, "load_sub_agent_limits", return_value={"max_concurrent": 1}):
+                batch = asyncio.create_task(module.run_sub_agent_batch([running, queued]))
+                await asyncio.wait_for(queued_started.wait(), 2)
+                self.assertTrue(module.request_sub_agent_stop(queued.session_id, queued.agent_id))
+                await asyncio.wait_for(queued_stopped.wait(), 2)
+                release_running.set()
+                results = await asyncio.wait_for(batch, 2)
+            self.assertEqual(results[0]["_sub_agent"]["status"], "done")
+            self.assertEqual(results[1]["_sub_agent"]["status"], "stopped")
+            self.assertEqual(results[1]["_sub_agent"]["rounds"], 0)
+        asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +894,18 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(result.status, "max_rounds")
         self.assertIn("1 项未完成", result.final_reply)
         self.assertIn("写文件", result.final_reply)
+
+    def test_zero_round_limit_allows_completion_after_many_calls(self):
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+        fake, _state = _fake_llm_script([EMPTY_FINAL_CHUNKS] * 6 + [FINAL_CHUNKS])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(max_rounds=0)
+        with _retry_limits_patch(final_reply_max_attempts=0, todo_remind_max=0):
+            result = asyncio.run(SubAgentRunner(ctx).run())
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.rounds, 7)
+        self.assertTrue(result.final_reply)
 
 
 class SharedFunctionExtractionTests(unittest.TestCase):

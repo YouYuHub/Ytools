@@ -161,6 +161,23 @@ class CallToolUnwrapTests(unittest.IsolatedAsyncioTestCase):
             await mcp_client._call_mcp_tool_impl("demo", {}, "svc")
         self.assertIn("anyio 取消", str(ctx.exception))
 
+    async def test_pipe_connection_error_is_not_retried(self):
+        session_stub = SimpleNamespace(
+            initialize=self.mock.AsyncMock(),
+            discover=None,
+            list_tools=self.mock.AsyncMock(return_value=SimpleNamespace(tools=[SimpleNamespace(name="run_pipe_command")])),
+            call_tool=self.mock.AsyncMock(
+                return_value=SimpleNamespace(
+                    is_error=True,
+                    content=[SimpleNamespace(text="Failed to connect to named-pipe server")],
+                )
+            ),
+        )
+        self._patch_mcp_internals(session_stub)
+        with self.assertRaisesRegex(ValueError, "Failed to connect to named-pipe server"):
+            await mcp_client._call_mcp_tool_impl("run_pipe_command", {}, "svc")
+        session_stub.call_tool.assert_awaited_once_with("run_pipe_command", {})
+
 
 if __name__ == "__main__":
     unittest.main()

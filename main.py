@@ -11,7 +11,7 @@ from config import (
     get_current_dir,
     PROJECT_ROOT,
 )
-from util import config_watcher
+from util import config_watcher, ollama_model_watcher
 from factory.agent_runtime import tool_registry
 from env_manager import init_path
 init_path(PROJECT_ROOT)
@@ -146,6 +146,9 @@ def _start_config_hot_reload() -> None:
 
 _start_config_hot_reload()
 
+# ---------- Ollama 本地模型发现（启动立即检查，之后默认每 30 秒轮询） ----------
+ollama_model_watcher.start_ollama_model_watcher()
+
 
 # ---------- 工具注册表预热：启动即后台探测一次，首个页面加载/首条消息直接命中缓存 ----------
 def _prewarm_tool_registry() -> None:
@@ -188,7 +191,7 @@ _prewarm_tool_registry()
 #         print(f"[INFO] 服务快照已写入: {snapshot}")
 #     except Exception as exc:
 #         # 快照失败不阻断启动；restart_service 调用时会给"未找到快照"的可读报错
-#         print(f"[WARN] 写入服务快照失败（restart_service 将不可用）: {exc}")
+#         print(f"[WARNING] 写入服务快照失败（restart_service 将不可用）: {exc}")
 
 
 if __name__ == '__main__':

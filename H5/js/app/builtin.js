@@ -81,6 +81,8 @@
     read_file: '<path d="M12 7c-1.5-2.1-3.5-3-6-3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h1c2.5 0 4.5.7 6 2M12 7c1.5-2.1 3.5-3 6-3h1a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-1c-2.5 0-4.5.7-6 2M12 7v15"/><path d="M6 9h2M16 9h2"/>',
     search_files: '<path d="M4 4h11l4 4v3M15 4v4h4M4 4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M6 11h7M6 15h4"/><circle cx="17" cy="17" r="3.5"/><path d="m19.6 19.6 2 2"/>',
     run_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+    poll_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+    stop_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
     read_media: '<rect x="7" y="3" width="14" height="15" rx="2" transform="rotate(8 14 10.5)"/><rect x="3" y="6" width="14" height="15" rx="2"/><circle cx="7.5" cy="10.5" r="1.3"/><path d="m4 18 4-4 3 3 2-2 3 3"/>',
     read_document: '<path d="M6 3.5h8l4 4v12A1.5 1.5 0 0 1 16.5 21h-11A1.5 1.5 0 0 1 4 19.5v-14A2 2 0 0 1 6 3.5Z"/><path d="M14 3.5V8h4M8 11h8M8 14.5h8M8 18h5"/>',
   };
@@ -93,6 +95,8 @@
     read_file: "读取文件",
     search_files: "查找文件",
     run_command: "运行命令",
+    poll_command: "查询命令",
+    stop_command: "停止命令",
     read_media: "读取媒体",
     read_document: "读取文档",
   };
@@ -222,11 +226,11 @@
         return row;
       })());
       const optionsWrap = el("div", "ask-options");
-      const custom = document.createElement("input");
-      custom.type = "text";
+      const custom = document.createElement("textarea");
+      custom.rows = 3;
       custom.className = "ask-custom";
       custom.placeholder = "或输入自定义回答…";
-      custom.maxLength = 500;
+      custom.setAttribute("aria-label", "第 " + (index + 1) + " 题自定义回答");
       const clearSelected = function () {
         optionsWrap.querySelectorAll(".ask-option.selected").forEach(function (other) {
           other.classList.remove("selected");

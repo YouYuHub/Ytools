@@ -24,7 +24,7 @@ imageio-ffmpeg
 #################### optional start ####################
 # 文档解析
 PyMuPDF
-docx
+python-docx
 pandas
 
 #################### optional end ####################

@@ -18,6 +18,7 @@ import ctypes
 import json
 import os
 import re
+import copy
 import sys
 from typing import Any
 from pathlib import Path
@@ -31,6 +32,12 @@ models_config = {}
 mcp_config = {}
 model_selection = {}
 _env_file_lock = Lock()
+
+# Ollama 本地模型目录由后台发现线程维护，不写入 models.json。
+# 模型选择接口每次都会重新读取 models.json，因此动态模型必须与静态配置分开保存。
+DEFAULT_OLLAMA_CHAT_URL = "http://localhost:11434/v1"
+_ollama_runtime_lock = Lock()
+_ollama_runtime_models: dict[str, dict[str, Any]] = {}
 
 # 会话级模型选择的"环境覆盖"（ambient override）：
 # 生成任务/手动压缩等会话内执行单元在任务开始时调用 set_ambient_model_selection
@@ -90,7 +97,6 @@ def _normalize_support_doc_types(raw: Any) -> list[str]:
 def _iter_provider_records(config: Any) -> list[dict[str, Any]]:
     if not isinstance(config, dict):
         return []
-
     providers: list[dict[str, Any]] = []
     for provider_name, provider_def in config.items():
         if provider_name in _MODEL_CONFIG_RESERVED_KEYS or not isinstance(provider_def, dict):
@@ -98,7 +104,6 @@ def _iter_provider_records(config: Any) -> list[dict[str, Any]]:
         provider_item = dict(provider_def)
         provider_item["name"] = provider_name
         providers.append(provider_item)
-
         # 扫描该 provider 内部是否还有嵌套的子 provider
         # （如 models.json 中 "Wsl Completions" 下嵌套的 "OpenCode Completions" 等）
         for sub_key, sub_value in provider_def.items():
@@ -120,7 +125,6 @@ def _iter_model_records(provider: dict[str, Any]) -> list[dict[str, Any]]:
     models = provider.get("models")
     if not isinstance(models, dict):
         return []
-
     model_items: list[dict[str, Any]] = []
     for model_name, model_def in models.items():
         if not isinstance(model_def, dict):
@@ -132,15 +136,161 @@ def _iter_model_records(provider: dict[str, Any]) -> list[dict[str, Any]]:
     return model_items
 
 
+def _is_ollama_provider(provider: dict[str, Any]) -> bool:
+    vendor = str(provider.get("vendor") or "").strip().casefold()
+    name = str(provider.get("name") or "").strip().casefold()
+    return vendor == "ollama" or name == "ollama"
+
+
+def get_ollama_provider_configs() -> list[dict[str, Any]]:
+    """返回 Ollama 发现目标；没有配置时默认尝试本机 11434 端口。"""
+    providers = [provider for provider in _iter_provider_records(models_config) if _is_ollama_provider(provider)]
+    if not providers:
+        return [{
+            "name": "Ollama",
+            "vendor": "ollama",
+            "url": DEFAULT_OLLAMA_CHAT_URL,
+            "apiKey": "",
+        }]
+
+    targets: list[dict[str, Any]] = []
+    for provider in providers:
+        target = dict(provider)
+        target["url"] = _normalize_config_name(target.get("url")) or DEFAULT_OLLAMA_CHAT_URL
+        targets.append(target)
+    return targets
+
+
+def set_ollama_runtime_models(
+    provider_name: str,
+    provider_url: str,
+    models: list[dict[str, Any]],
+) -> bool:
+    """原子替换一个 Ollama provider 的运行时模型快照；返回快照是否有变化。"""
+    normalized_name = _normalize_config_name(provider_name)
+    normalized_url = _normalize_config_name(provider_url)
+    if not normalized_name or not normalized_url:
+        return False
+    model_map: dict[str, dict[str, Any]] = {}
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = _normalize_config_name(item.get("id") or item.get("name"))
+        if not model_id:
+            continue
+        model_item = dict(item)
+        model_item["id"] = model_id
+        model_item["name"] = _normalize_config_name(model_item.get("name")) or model_id
+        model_map[model_id] = model_item
+    key = normalized_name.casefold()
+    snapshot = {"name": normalized_name, "url": normalized_url, "models": model_map}
+    with _ollama_runtime_lock:
+        previous = _ollama_runtime_models.get(key)
+        if previous == snapshot:
+            return False
+        _ollama_runtime_models[key] = snapshot
+    return True
+
+
+def get_ollama_runtime_model_snapshots() -> list[dict[str, Any]]:
+    """Return serializable copies of discovered Ollama models for worker processes."""
+    with _ollama_runtime_lock:
+        return [
+            {
+                "provider_name": value["name"],
+                "provider_url": value["url"],
+                "models": [dict(model) for model in value["models"].values()],
+            }
+            for value in _ollama_runtime_models.values()
+        ]
+
+
+def clear_ollama_runtime_models(provider_name: str | None = None) -> None:
+    """清理运行时模型快照（主要供测试和显式重置使用）。"""
+    with _ollama_runtime_lock:
+        if provider_name is None:
+            _ollama_runtime_models.clear()
+        else:
+            key = str(provider_name).strip().casefold()
+            _ollama_runtime_models.pop(key, None)
+
+
+def _merge_provider_models(static_models: Any, dynamic_models: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """静态条目优先，动态发现只补入尚未手工配置的模型。"""
+    merged = dict(static_models) if isinstance(static_models, dict) else {}
+    configured_names: set[str] = set()
+    for key, model in merged.items():
+        configured_names.add(str(key).strip().casefold())
+        if isinstance(model, dict):
+            for candidate in (model.get("id"), model.get("name")):
+                normalized = _normalize_config_name(candidate)
+                if normalized:
+                    configured_names.add(normalized.casefold())
+    for model_id, model in dynamic_models.items():
+        candidates = {str(model_id).strip().casefold()}
+        for candidate in (model.get("id"), model.get("name")):
+            normalized = _normalize_config_name(candidate)
+            if normalized:
+                candidates.add(normalized.casefold())
+        if candidates & configured_names:
+            continue
+        merged[model_id] = dict(model)
+    return merged
+
+
+def _iter_effective_provider_records() -> list[dict[str, Any]]:
+    """静态 models.json 配置与独立的 Ollama 运行时快照合并。"""
+    with _ollama_runtime_lock:
+        snapshots = {
+            key: {
+                "name": value["name"],
+                "url": value["url"],
+                "models": {model_id: dict(model) for model_id, model in value["models"].items()},
+            }
+            for key, value in _ollama_runtime_models.items()
+        }
+    providers = _iter_provider_records(models_config)
+    effective: list[dict[str, Any]] = []
+    present_names: set[str] = set()
+    for provider in providers:
+        provider_item = dict(provider)
+        provider_name = _normalize_config_name(provider_item.get("name"))
+        if not provider_name:
+            continue
+        present_names.add(provider_name.casefold())
+        if _is_ollama_provider(provider_item):
+            provider_url = _normalize_config_name(provider_item.get("url")) or DEFAULT_OLLAMA_CHAT_URL
+            provider_item["url"] = provider_url
+            snapshot = snapshots.get(provider_name.casefold())
+            if snapshot and snapshot["url"].rstrip("/") == provider_url.rstrip("/"):
+                provider_item["models"] = _merge_provider_models(
+                    provider_item.get("models"), snapshot["models"]
+                )
+        effective.append(provider_item)
+    # models.json 可以完全没有 Ollama 段；本机探测成功后仍以 Ollama 分组展示。
+    default_snapshot = snapshots.get("ollama")
+    if (
+        default_snapshot
+        and "ollama" not in present_names
+        and default_snapshot["url"].rstrip("/") == DEFAULT_OLLAMA_CHAT_URL
+    ):
+        effective.append({
+            "name": "Ollama",
+            "vendor": "ollama",
+            "url": DEFAULT_OLLAMA_CHAT_URL,
+            "models": dict(default_snapshot["models"]),
+        })
+    return effective
+
+
 def get_model_config(provider_name: str | None = None, model_name: str | None = None) -> dict[str, Any] | None:
     selected_provider_name = _normalize_config_name(provider_name)
     selected_model_name = _normalize_config_name(model_name)
     if not selected_provider_name or not selected_model_name:
         return None
-
     provider_item = next((
             provider for provider
-            in _iter_provider_records(models_config)
+            in _iter_effective_provider_records()
             if _normalize_config_name(provider.get("name"))
             and _normalize_config_name(provider.get("name")).casefold() == selected_provider_name.casefold()
         ),
@@ -148,7 +298,6 @@ def get_model_config(provider_name: str | None = None, model_name: str | None = 
     )
     if provider_item is None:
         return None
-
     model_item = next((
             model for model
             in _iter_model_records(provider_item)
@@ -222,14 +371,14 @@ def require_default_chat_config() -> dict[str, Any]:
     chat_config = get_model_config(provider_name, model_name)
     if chat_config is None:
         raise ChatModelConfigurationError(
-            f"models.json 中找不到已选择的模型：{provider_name} / {model_name}"
+            f"当前模型目录中找不到已选择的模型：{provider_name} / {model_name}"
         )
     # 聊天角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
     return inject_custom_headers_into_config(chat_config, get_role_headers("chat_model"))
 
 
 def list_available_models() -> list[dict[str, Any]]:
-    """返回 models.json 中所有 provider 及其模型的扁平列表，便于前端下拉选择。
+    """返回静态配置与运行时发现的 provider 模型扁平列表，便于前端下拉选择。
 
     每条记录的字段：
     - provider_name: 顶层 provider 名称
@@ -241,7 +390,7 @@ def list_available_models() -> list[dict[str, Any]]:
     - api_key_present: 是否配置了 API Key（不返回明文）
     """
     records: list[dict[str, Any]] = []
-    for provider in _iter_provider_records(models_config):
+    for provider in _iter_effective_provider_records():
         provider_name = _normalize_config_name(provider.get("name"))
         if not provider_name:
             continue
@@ -427,7 +576,6 @@ def get_model_selection() -> dict[str, dict[str, Any]]:
     叠加顺序：全局 model_selection（models.json）→ 当前任务的会话级覆盖
     （set_ambient_model_selection 写入的角色条目）。未设置覆盖时等价于全局。
     """
-    import copy
     merged = copy.deepcopy(model_selection if isinstance(model_selection, dict) else {})
     ambient = _ambient_model_selection.get()
     if isinstance(ambient, dict):
@@ -643,7 +791,7 @@ def _resolve_selection_target(provider_name: str, model_name: str, role: str) ->
     chat_config = get_model_config(normalized_provider, normalized_model)
     if chat_config is None:
         raise ChatModelConfigurationError(
-            f"models.json 中找不到模型：{normalized_provider} / {normalized_model}"
+            f"当前模型目录中找不到模型：{normalized_provider} / {normalized_model}"
         )
     if role in ("compaction_model", "sub_agent_model") and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
         role_label = "压缩模型" if role == "compaction_model" else "子智能体模型"
@@ -728,7 +876,6 @@ def select_chat_model(
         raise ChatModelConfigurationError("parameter 必须是字典")
     if headers is not None and not isinstance(headers, (list, dict)):
         raise ChatModelConfigurationError("headers 必须是 [{name, value}] 列表或键值字典")
-
     chat_config, api_type = _resolve_selection_target(normalized_provider, normalized_model, role)
     # 写全局配置必须基于纯全局选择（不叠加任何会话级 ambient 覆盖）
     current = get_global_model_selection()

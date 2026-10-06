@@ -896,7 +896,8 @@ def sync_from_disk(session_id: str, key: str) -> dict[str, Any]:
         target_path = Path(meta["path"])
         if not target_path.is_file():
             raise ValueError("文件已不存在，无法从磁盘刷新")
-        data = target_path.read_bytes()[:_FILE_HISTORY_MAX_TEXT_CHARS + 1]
+        with target_path.open("rb") as handle:
+            data = handle.read(_FILE_HISTORY_MAX_TEXT_CHARS + 1)
         if len(data) > _FILE_HISTORY_MAX_TEXT_CHARS:
             raise ValueError("文件过大，无法并入版本链（超过 256KB）")
         if b"\x00" in data:
@@ -1213,3 +1214,4 @@ def cleanup_file_histories(
                 _atomic_write_json(root / "index.json", index)
             removed.append({"key": key, "path": item.get("path", "")})
         return {"removed_count": len(removed), "removed": removed}
+

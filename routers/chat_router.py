@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from typing import Any, Optional, List
 import urllib.parse
 # fastapi 库导入
@@ -151,6 +152,45 @@ async def stop_chat(session_id: str = "default"):
         return {'stop_chat': 'stopped'}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class StopSubAgentRequest(BaseModel):
+    session_id: str
+    agent_id: str
+
+
+@api_chat_router.post('/stop_sub_agent')
+async def stop_sub_agent(payload: StopSubAgentRequest):
+    """停止指定子任务；保留进展报告，父任务和兄弟任务继续。"""
+    session_id = normalize_session_id(payload.session_id)
+    agent_id = payload.agent_id.strip()
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id 不能为空")
+    proxy = peek_worker_proxy(session_id)
+    if proxy is None or not proxy.is_alive():
+        from factory.agent_runtime.sub_agent import request_sub_agent_stop
+        return {"ok": request_sub_agent_stop(session_id, agent_id)}
+    loop = asyncio.get_running_loop()
+    acknowledgment = loop.create_future()
+    request_id = uuid.uuid4().hex
+
+    def receive(evt):
+        if evt.get("type") != "sub_agent_stop_ack" or evt.get("request_id") != request_id:
+            return
+        def resolve():
+            if not acknowledgment.done():
+                acknowledgment.set_result(bool(evt.get("ok")))
+        loop.call_soon_threadsafe(resolve)
+
+    proxy.add_handler(receive)
+    try:
+        if not proxy.request_sub_agent_stop(agent_id, request_id):
+            return {"ok": False}
+        return {"ok": await asyncio.wait_for(acknowledgment, timeout=5)}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="子任务停止确认超时，请重试")
+    finally:
+        proxy.remove_handler(receive)
 
 
 @api_chat_router.post('/inject_message')
@@ -940,7 +980,7 @@ async def compact_chat_context_manual(
 
     会把全部已完成轮次归并为一个累计摘要、重建最近用户问题索引，并把压缩模型
     usage 累计落盘；原始轮次仍保存在历史 JSONL 中，但后续模型上下文不再回传。
-    下限守卫：模型上下文估算（仅消息部分）低于"摘要总预算"（模型窗口 × 摘要
+    下限守卫：模型上下文估算（仅消息部分）低于"摘要总预算"（有效窗口 × 摘要
     预算比例）时压缩无收益，直接拒绝并提示；stream=true 时以
     compaction_manual_result 结果帧的 error 字段返回，stream=false 返回 400。
     `force=true` 可跳过该守卫。
@@ -970,7 +1010,7 @@ async def compact_chat_context_manual(
     try:
         manager = await get_chat_memory_manager(session_id)
         compaction_settings = load_context_compaction_settings()
-        # 手动压缩的门槛与保留预算统一使用"摘要总预算"（聊天窗口 × 摘要预算比例，
+        # 手动压缩的门槛与保留预算统一使用"摘要总预算"（两模型较小窗口 × 摘要预算比例，
         # 聊天设置中可配）：手动确认后把全部已完成轮次归入累计摘要
         manual_budget_tokens = resolve_summary_total_budget(compaction_settings)
         # 下限守卫：模型上下文估算（仅消息部分，工具定义/系统提示不参与压缩）
@@ -1066,7 +1106,7 @@ async def _manual_compaction_event_stream(
             try:
                 await add_event(payload)
             except Exception as exc:
-                print(f"[WARN] 手动压缩事件落盘失败：{exc}")
+                print(f"[WARNING] 手动压缩事件落盘失败：{exc}")
         await queue.put(payload)
 
     async def run() -> None:
@@ -1120,7 +1160,7 @@ async def _manual_compaction_event_stream(
                         "error": None,
                     }))
             except Exception as shield_exc:
-                print(f"[WARN] 手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
+                print(f"[WARNING] 手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
             raise
         except Exception as exc:
             result["error"] = str(exc)
@@ -1160,4 +1200,3 @@ async def _manual_compaction_event_stream(
         except (asyncio.CancelledError, Exception):
             pass
     yield "data: [DONE]\n\n"
-

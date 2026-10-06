@@ -138,21 +138,23 @@ def build_media_tag_prompt() -> str:
         "输出 ```canvas 代码块（块内为一段完整 JavaScript，前端提供沙箱与画布）：\n"
         "````\n"
         "```canvas\n"
-        "const ctx = stage.getContext('2d');\n"
-        "const g = ctx.createLinearGradient(0, 0, 720, 420);\n"
+        "const W = stage.width, H = stage.height;\n"
+        "const g = ctx.createLinearGradient(0, 0, W, H);\n"
         "g.addColorStop(0, '#1e3a8a');\n"
         "g.addColorStop(1, '#0ea5e9');\n"
         "ctx.fillStyle = g;\n"
-        "ctx.fillRect(0, 0, 720, 420);\n"
+        "ctx.fillRect(0, 0, W, H);\n"
         "ctx.fillStyle = '#fff';\n"
         "ctx.font = 'bold 36px sans-serif';\n"
         "ctx.textAlign = 'center';\n"
-        "ctx.fillText('Hello Canvas', 360, 220);\n"
+        "ctx.fillText('Hello Canvas', W / 2, H / 2);\n"
         "console.log('绘制完成');\n"
         "```\n"
         "````\n"
         "运行环境说明（务必遵守）：\n"
-        "1. 画布变量 stage 已预置（720×420 的 canvas 元素），日志用 console.log 输出"
+        "1. 画布变量 stage / canvas 指向同一个预置画布（默认 720×420）；二维上下文 ctx / context 已预置；"
+        "width / height、W / H、WIDTH / HEIGHT 是画布尺寸别名。可以直接使用这些变量，"
+        "也可以在脚本内部用 const 声明同名局部变量；日志用 console.log 输出"
         "（实时显示在画布下方；帧循环内不要高频刷日志）；\n"
         "2. 默认不自动执行：用户点击「运行」确认后才在隔离沙箱中执行，"
         "脚本顶部可用 1-2 行注释说明将绘制什么；\n"
@@ -253,12 +255,21 @@ def build_sys_prompt(
                 # "请告知用户切换支持视觉的模型。音频不受影响，仍会以多模态部件回传。"
             )
     tool_note = "你只能调用当前请求 tools 字段提供的工具；此前用过的工具若不在当前列表中，就不可用。"
+    tool_choice_note = (
+        "search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名；按文件名查找或列出文件时，"
+        "若 run_command 可用则使用相应终端命令，否则说明当前工具无法枚举文件名。"
+        "查到目标内容后用 read_file 查看必要上下文；"
+        "局部修改用 edit_file，新建或整文件写入用 write_file；"
+        "需要运行命令、构建或检查时再用 run_command。"
+        "PowerShell 工具默认 UTF-8 读写文本；旧编码文件需显式指定 -Encoding，"
+        "不要将含替换字符的输出视为原文，可用 read_file 的 encoding 核验。"
+    )
     if include_user_progress_note:
         tool_note += (
             "任务过程中，你的思考过程只保留最近一次，过程中的重要内容需要实时告诉用户，"
             "这也是为了后续任务的连贯性。"
         )
-    notes = [tool_note, timeout_note]
+    notes = [tool_note, tool_choice_note, timeout_note]
     if media_note is not None:
         notes.insert(1, media_note)
     if include_quote_note:

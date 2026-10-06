@@ -1,7 +1,7 @@
 # coding: utf-8
 # fastapi 库导入
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pathlib import Path
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,7 +47,7 @@ async def _record_session_upload_id(session_id: str) -> str | None:
         await chat_manager.update_session_upload_id(upload_id)
         return upload_id
     except Exception as record_error:
-        print(f"[WARN] 记录 upload_id 失败: {record_error}")
+        print(f"[WARNING] 记录 upload_id 失败: {record_error}")
         return None
 
 
@@ -119,7 +119,7 @@ def _resolve_session_support_doc_types(session_id: str) -> list[str]:
         support = chat_config.get("support_doc_types")
         return [str(item) for item in support] if isinstance(support, list) else []
     except Exception as exc:
-        print(f"[WARN] 解析会话模型 supportDocTypes 失败（按不支持处理）: {exc}")
+        print(f"[WARNING] 解析会话模型 supportDocTypes 失败（按不支持处理）: {exc}")
         return []
 
 
@@ -203,7 +203,7 @@ async def upload_files(
                             abs_path = str(doc_path).replace("\\", "/")
                             file_info["abs_path"] = abs_path
                     except Exception as save_error:
-                        print(f"[WARN] 保存文档原始字节失败（不影响解析文本）: {save_error}")
+                        print(f"[WARNING] 保存文档原始字节失败（不影响解析文本）: {save_error}")
                     # 原生文档标记：当前模型声明支持该类型且原始文件已保存时，
                     # read_document 可按需走原生输入；文本解析结果仍可单独读取
                     native_supported = bool(
@@ -249,7 +249,7 @@ async def upload_files(
                         if doc_path is not None:
                             abs_path = str(doc_path).replace("\\", "/")
                     except Exception as save_error:
-                        print(f"[WARN] 保存文档原始字节失败: {save_error}")
+                        print(f"[WARNING] 保存文档原始字节失败: {save_error}")
                     if not stored_name:
                         results.append(parse_result)
                         failed_count += 1
@@ -306,6 +306,7 @@ async def upload_files(
         "results": results,
         "upload_id": upload_id,
     })
+
 
 @api_file_router.post("/upload_session_media")
 async def upload_session_media(
@@ -402,29 +403,28 @@ def _file_response_with_range(request_headers, path: Path, media_type: str) -> R
     range_header = request_headers.get("range")
     span = _parse_range_header(range_header, total)
     base_headers = {"Accept-Ranges": "bytes"}
-    if span is None:
-        with path.open("rb") as fp:
-            data = fp.read()
-        return Response(
-            content=data,
-            media_type=media_type,
-            status_code=200,
-            headers={**base_headers, "Content-Length": str(total)},
-        )
-    start, end = span
+    start, end = span if span is not None else (0, total - 1)
     length = end - start + 1
-    with path.open("rb") as fp:
-        fp.seek(start)
-        data = fp.read(length)
-    return Response(
-        content=data,
+
+    def chunks():
+        remaining = length
+        with path.open("rb") as fp:
+            fp.seek(start)
+            while remaining > 0:
+                chunk = fp.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {**base_headers, "Content-Length": str(length)}
+    if span is not None:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    return StreamingResponse(
+        chunks(),
         media_type=media_type,
-        status_code=206,
-        headers={
-            **base_headers,
-            "Content-Range": f"bytes {start}-{end}/{total}",
-            "Content-Length": str(length),
-        },
+        status_code=206 if span is not None else 200,
+        headers=headers,
     )
 
 
@@ -563,3 +563,5 @@ async def delete_file_history(
         "message": f"已删除 {deleted_count} 个文件记录" if deleted_count > 0 else "未找到匹配的文件",
         "deleted_count": deleted_count
     })
+
+

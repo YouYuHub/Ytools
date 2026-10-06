@@ -44,6 +44,7 @@ from memory.file_memory import (
 
 from factory.agent_runtime.builtin_tools import (
     RUN_COMMAND_NAME,
+    COMMAND_TOOL_NAMES,
     READ_MEDIA_NAME,
     READ_DOCUMENT_NAME,
     SUB_AGENT_TOOL_NAME,
@@ -52,6 +53,8 @@ from factory.agent_runtime.builtin_tools import (
     execute_read_media,
     execute_read_document,
     load_any_media_model_part,
+    model_tool_output_char_budget,
+    resolve_default_command_shell,
     normalize_todo_items,
     retire_prior_video_parts,
     cap_video_parts_in_batch,
@@ -117,6 +120,8 @@ class SubAgentContext:
     parent_round_number: int = 0
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
+    # 单个子任务的用户停止，与父级停止/超时分别判定。
+    user_stop_requested: bool = False
     # 模型可见名称到 MCP 原始工具名的映射，供子任务调用时还原协议名称。
     tool_original_names: Dict[str, str] = field(default_factory=dict)
 
@@ -170,7 +175,7 @@ def load_sub_agent_limits() -> dict[str, Any]:
             return int(default)
         return value if value >= minimum else int(default)
 
-    max_rounds = _int("SUB_AGENT_MAX_ROUNDS", DEFAULT_SUB_AGENT_MAX_ROUNDS, 1)
+    max_rounds = _int("SUB_AGENT_MAX_ROUNDS", DEFAULT_SUB_AGENT_MAX_ROUNDS, 0)
     max_concurrent = _int("SUB_AGENT_MAX_CONCURRENT", DEFAULT_SUB_AGENT_MAX_CONCURRENT, 1)
     reply_max_chars = _int("SUB_AGENT_REPLY_MAX_CHARS", DEFAULT_SUB_AGENT_REPLY_MAX_CHARS, 256)
     try:
@@ -196,7 +201,7 @@ def load_sub_agent_retry_limits() -> dict[str, int]:
       只对「模型创建/更新过的计划」生效（父级预置但从未被触碰的计划
       不拦截有效交付）；每次完整工具执行轮后额度重置。
 
-    三项全部受 max_rounds/timeout 双重硬封顶，配置为不限制也不会失控。
+    三项重试受已启用的轮次/超时限制约束；两项限制均为 0 时由用户手动停止。
     """
     from config import (
         DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
@@ -249,9 +254,10 @@ def _collect_usage(accumulator: UsageAccumulator) -> dict[str, Any]:
 def _format_result_text(result: Any) -> str:
     if isinstance(result, dict):
         # 内置文件工具的展示用 diff 与版本链入链数据：只推送前端与落盘，不进入子模型上下文
-        result = {
+        model_result = result.get("_model_result")
+        result = model_result if isinstance(model_result, dict) else {
             k: v for k, v in result.items()
-            if k not in ("_file_diff", "_file_history")
+            if k not in ("_file_diff", "_file_history", "_model_result")
         }
         # 原生文档块（read_document 返回）：数据本体为 base64，绝不能进入
         # 模型文本上下文或 JSONL；只保留可追溯文件引用和一次性发送说明
@@ -406,10 +412,12 @@ class SubAgentRunner:
         self.started_at = now_str()
         self._started_monotonic = time.monotonic()
         self.done_emitted = False
+        self.start_emitted = False
         self._seq = 0
         self._status = "done"
         self._error: str | None = None
         self._final_reply = ""
+        self._live_content = ""
         self._consecutive_oversized = 0
         # 交付保障重试计数（配置见 load_sub_agent_retry_limits）：
         # - 空收尾重试 / 流错误续跑：累计计数，耗尽按 error 收尾；
@@ -473,7 +481,7 @@ class SubAgentRunner:
             await self.context.emit_event(payload)
         except Exception as exc:  # 事件发射失败不拖垮子任务
             print(
-                f"[WARN] sub_agent 事件发射失败"
+                f"[WARNING] sub_agent 事件发射失败"
                 f"（agent_id={self.context.agent_id}, phase={phase}）: {exc}"
             )
 
@@ -494,9 +502,12 @@ class SubAgentRunner:
                 encoding=str(payload.get("encoding") or "utf-8"),
             )
         except Exception as record_error:
-            print(f"[WARN] 子任务文件版本链记录失败（不影响子任务）: {record_error}")
+            print(f"[WARNING] 子任务文件版本链记录失败（不影响子任务）: {record_error}")
 
-    async def _emit_start(self) -> None:
+    async def _emit_start(self, *, queued: bool = False) -> None:
+        if self.start_emitted:
+            return
+        self.start_emitted = True
         await self._emit(
             "start",
             task=self.context.task,
@@ -507,6 +518,7 @@ class SubAgentRunner:
             ],
             rounds_limit=self.context.max_rounds,
             timeout_seconds=self.context.timeout_seconds,
+            queued=queued,
         )
 
     async def _emit_done(self, status: str, final_reply: str, error: str | None) -> None:
@@ -556,7 +568,7 @@ class SubAgentRunner:
                     chat_config, get_role_headers("sub_agent_model")
                 ), parameter
             print(
-                f"[WARN] 子智能体模型配置无效或协议不支持"
+                f"[WARNING] 子智能体模型配置无效或协议不支持"
                 f"（{provider} / {model}），子任务回退父级聊天模型"
             )
         # 未配置：继承父级聊天模型的生成参数（模型本身由 ambient 覆盖链解析）
@@ -584,7 +596,7 @@ class SubAgentRunner:
             support = model_config.get("support_doc_types")
             return [str(item) for item in support] if isinstance(support, list) else []
         except Exception as exc:
-            print(f"[WARN] 子任务 supportDocTypes 解析失败（按不支持处理）: {exc}")
+            print(f"[WARNING] 子任务 supportDocTypes 解析失败（按不支持处理）: {exc}")
             return []
 
     def _build_request(self, parameter: dict[str, Any]) -> ChatLLMRequest:
@@ -638,6 +650,7 @@ class SubAgentRunner:
         """一次流式模型调用；返回本轮聚合结果（正文/思考/工具调用/finish_reason）。"""
         ctx = self.context
         full_response = ""
+        self._live_content = ""
         full_reasoning = ""
         tool_calls: list[dict] = []
         finish_reason: str | None = None
@@ -705,6 +718,7 @@ class SubAgentRunner:
                 function_call_delta = event.get("function_call")
                 if content:
                     full_response += content
+                    self._live_content = full_response
                     # seq 与本轮 model_call/tool_* 对齐：前端按 seq 归位轮次，
                     # 避免 delta 先于 model_call 到达时轮次错位/重复分区
                     await self._emit("delta", content_delta=content, seq=self._seq)
@@ -720,6 +734,13 @@ class SubAgentRunner:
                     if tool_call_stream_timeout > 0:
                         tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
         except asyncio.CancelledError:
+            # delta 只推 SSE；取消当前模型调用时补落盘已产生的完整片段，
+            # 以免刷新后看不到停止前的正文/思考（未完成工具调用不执行）。
+            if full_response or full_reasoning:
+                await self._emit(
+                    "model_call", seq=self._seq, content=full_response,
+                    reasoning_content=full_reasoning, tool_calls=[], finish_reason="cancelled",
+                )
             raise
         finally:
             try:
@@ -887,7 +908,7 @@ class SubAgentRunner:
                 # 按子任务模型对此文件扩展名的 supportDocTypes 决定 auto 模式；
                 # 不依据 vision 标志。原生输入只进入下一次请求一次。
                 read_document_result = execute_read_document(
-                    ta, ctx.session_id, support_doc_types=self._native_doc_types(),
+                    {**ta, "_max_chars": model_tool_output_char_budget()}, ctx.session_id, support_doc_types=self._native_doc_types(),
                 )
                 native_block = (
                     read_document_result.get("native")
@@ -909,7 +930,7 @@ class SubAgentRunner:
                         if request_mode == "native" or is_page_range:
                             read_document_result = {"error": budget_error}
                         else:
-                            text_args = {**ta, "mode": "text"}
+                            text_args = {**ta, "mode": "text", "_max_chars": model_tool_output_char_budget()}
                             read_document_result = execute_read_document(
                                 text_args, ctx.session_id,
                                 support_doc_types=self._native_doc_types(),
@@ -924,16 +945,19 @@ class SubAgentRunner:
                         self.native_doc_pending_bytes += native_size
                 builtin_results.append((idx, tc, tn, ta, read_document_result))
                 continue
-            file_tool_result = try_execute_builtin_file_tool(tn, ta)
+            bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(),
+                            "_default_shell": resolve_default_command_shell(ctx.session_id),
+                            "_session_id": ctx.session_id}
+            file_tool_result = try_execute_builtin_file_tool(tn, bounded_args)
             if file_tool_result is not None:
                 builtin_results.append((idx, tc, tn, ta, file_tool_result))
                 continue
             # 内置终端命令工具（run_command）：服务端本地执行；命令为同步阻塞
             # 调用（可能长达分钟级），经 asyncio.to_thread 放到工作线程执行，
             # 避免卡死子任务事件循环（与 MCP 工具走线程池的语义一致）
-            if tn == RUN_COMMAND_NAME:
+            if tn in COMMAND_TOOL_NAMES:
                 command_result = await asyncio.to_thread(
-                    try_execute_builtin_command_tool, tn, ta)
+                    try_execute_builtin_command_tool, tn, bounded_args)
                 builtin_results.append((idx, tc, tn, ta, command_result))
                 continue
             external_tools.append((idx, tc, tn, ta))
@@ -969,10 +993,10 @@ class SubAgentRunner:
         try:
             return await self._run_inner()
         except asyncio.CancelledError:
-            # 层级取消：父级停止 / 父级超时兜底 触发。状态判定：
-            # 取消令牌显式置位 → timeout；父级停止信号 → stopped；
-            # 两者都不是的取消（wait_for 硬兜底）按 timeout 处理。
-            if self.context.cancel_token.is_set():
+            # 用户单独停止优先标记 stopped；超时取消仍标记 timeout。
+            if self.context.user_stop_requested:
+                status = "stopped"
+            elif self.context.cancel_token.is_set():
                 status = "timeout"
             elif self.context.stop_requested():
                 status = "stopped"
@@ -1032,7 +1056,7 @@ class SubAgentRunner:
         max_oversized_rejections = compaction_settings.max_oversized_rejections
         while True:
             # ---- 停止条件检查（每轮顶部）----
-            if ctx.cancel_token.is_set():
+            if ctx.cancel_token.is_set() and not ctx.user_stop_requested:
                 self._status = "timeout"
                 self._final_reply = self._build_progress_reply("timeout")
                 await self._emit_done("timeout", self._final_reply, None)
@@ -1048,25 +1072,34 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("timeout")
                 await self._emit_done("timeout", self._final_reply, None)
                 return self._make_result()
-            if self.rounds >= ctx.max_rounds:
+            if ctx.max_rounds > 0 and self.rounds >= ctx.max_rounds:
                 self._status = "max_rounds"
                 self._final_reply = self._build_progress_reply("max_rounds")
                 await self._emit_done("max_rounds", self._final_reply, None)
                 return self._make_result()
             self.rounds += 1
             self._seq += 1
+            if ctx.max_rounds > 0 and self.rounds == ctx.max_rounds:
+                self.messages.append({
+                    "role": "user", "_internal": True,
+                    "content": (
+                        "这是本子任务允许的最后一次模型调用。请优先交付报告，"
+                        "说明已完成工作、验证结果、未完成事项和下一步建议；"
+                        "即使任务尚未完成也必须报告实际进展，不要声称全部完成。"
+                    ),
+                })
             call = await self._model_call()
             if call["stream_error"] is not None:
                 stream_error_detail = f"子任务模型流式响应出错：{call['stream_error']}"
                 # 断点续跑重试：已生成的部分内容进入 messages（内部消息不落盘），
                 # 让子模型从已有进度继续——工具轨迹/todo 都在上下文中不丢失；
-                # 0/负=不限制（仍受 max_rounds/timeout 硬封顶），耗尽才 error 收尾
+                # 0/负=不限制（仍受已启用的轮次/超时限制约束），耗尽才 error 收尾
                 se_limit = self._retry_limits["stream_error_max_attempts"]
                 if se_limit <= 0 or self._stream_error_retries_used < se_limit:
                     self._stream_error_retries_used += 1
                     se_label = str(se_limit) if se_limit > 0 else "∞"
                     print(
-                        f"[WARN] 子任务模型调用失败，断点续跑重试 "
+                        f"[WARNING] 子任务模型调用失败，断点续跑重试 "
                         f"#{self._stream_error_retries_used}（上限 {se_label}）"
                     )
                     partial_message = {"role": "assistant"}
@@ -1210,7 +1243,7 @@ class SubAgentRunner:
                 # 承诺）；父级预置但从未被触碰的计划是隐藏状态，不拦截有效
                 # 交付——否则模型完成工作后仍会被迫补计划再重复交付一遍。
                 # 提醒额度在每次完整工具执行轮后重置；空收尾/提醒都以内部
-                # 消息推进，消耗 rounds，受 max_rounds/timeout 双重硬封顶。
+                # 消息推进，消耗 rounds，受已启用的轮次/超时限制约束。
                 pending_todo = [
                     item for item in self.todo
                     if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
@@ -1222,7 +1255,7 @@ class SubAgentRunner:
                     self._todo_remind_used += 1
                     tr_label = str(tr_limit) if tr_limit > 0 else "∞"
                     print(
-                        f"[WARN] 子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
+                        f"[WARNING] 子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
                         f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）"
                     )
                     partial_message = {"role": "assistant"}
@@ -1262,7 +1295,7 @@ class SubAgentRunner:
                         self._final_reply_retries_used += 1
                         fr_label = str(fr_limit) if fr_limit > 0 else "∞"
                         print(
-                            f"[WARN] 子任务最终回复为空，空收尾重试 "
+                            f"[WARNING] 子任务最终回复为空，空收尾重试 "
                             f"#{self._final_reply_retries_used}（上限 {fr_label}）"
                         )
                         if full_reasoning:
@@ -1474,8 +1507,10 @@ class SubAgentRunner:
     # ----------------------------- 收尾辅助 -----------------------------
     def _build_progress_reply(self, status: str, error: str | None = None) -> str:
         """非正常收尾时返回给父级的"进展 + 未完成原因"说明。"""
-        last_text = ""
+        last_text = self._live_content.strip()
         for message in reversed(self.messages):
+            if last_text:
+                break
             if isinstance(message, dict) and message.get("role") == "assistant":
                 content = message.get("content")
                 if isinstance(content, str) and content.strip():
@@ -1483,11 +1518,12 @@ class SubAgentRunner:
                     break
         reason_map = {
             "timeout": "子任务执行超时，被强制中止",
-            "stopped": "父级任务已停止，子任务被中止",
+            "stopped": "用户已单独停止本子任务" if self.context.user_stop_requested else "父级任务已停止，子任务被中止",
             "max_rounds": f"子任务达到轮次上限（{self.context.max_rounds} 轮）仍未完成",
             "error": "子任务执行出错",
         }
         parts = [f"子任务未完成：{reason_map.get(status, status)}。"]
+        parts.append(f"已执行 {self.rounds} 次模型调用。")
         if error:
             parts.append(f"错误信息：{error}")
         pending_todo = [
@@ -1505,6 +1541,14 @@ class SubAgentRunner:
         if last_text:
             preview = last_text[:1500]
             parts.append(f"已完成进展（最后一段正文）：{preview}")
+        recent_tools = []
+        for message in reversed(self.messages):
+            if isinstance(message, dict) and message.get("role") == "tool":
+                recent_tools.append(str(message.get("content") or "")[:500])
+                if len(recent_tools) >= 3:
+                    break
+        if recent_tools:
+            parts.append("最近工具执行反馈（供核对实际进展）：\n" + "\n".join(reversed(recent_tools)))
         parts.append("请父智能体基于以上进展决定：重派子任务、换路径，或直接向用户说明。")
         return "\n".join(parts)
 
@@ -1533,6 +1577,22 @@ class SubAgentRunner:
 # ---------------------------------------------------------------------------
 # 并发编排（父循环入口）
 # ---------------------------------------------------------------------------
+_active_sub_agents: dict[tuple[str, str], tuple[SubAgentContext, asyncio.Task]] = {}
+
+
+def request_sub_agent_stop(session_id: str, agent_id: str) -> bool:
+    """在生成任务所属事件循环中停止单个子任务，不取消批次/父任务。"""
+    active = _active_sub_agents.get((session_id, agent_id))
+    if active is None or active[1].done():
+        return False
+    context, task = active
+    if not context.user_stop_requested:
+        context.user_stop_requested = True
+        context.cancel_token.set()
+        task.cancel()
+    return True
+
+
 async def run_sub_agent_batch(
     contexts: list[SubAgentContext],
 ) -> list[dict[str, Any]]:
@@ -1551,10 +1611,12 @@ async def run_sub_agent_batch(
         return []
     limits = load_sub_agent_limits()
     semaphore = asyncio.Semaphore(limits["max_concurrent"])
-    timeout = limits["timeout_seconds"]
 
     async def _run_one(context: SubAgentContext) -> dict[str, Any]:
         runner = SubAgentRunner(context)
+        key = (context.session_id, context.agent_id)
+        registered = (context, asyncio.current_task())
+        _active_sub_agents[key] = registered
         tool_call = {
             "id": context.parent_tool_call_id,
             "type": "function",
@@ -1563,8 +1625,14 @@ async def run_sub_agent_batch(
                 "arguments": json.dumps({"task": context.task}, ensure_ascii=False),
             },
         }
-        try:
+        async def execute():
+            timeout = context.timeout_seconds
+            queued = semaphore.locked()
+            # 排队任务也先创建可控制的块，不必等获得并发名额才显示停止按钮。
+            await runner._emit_start(queued=queued)
             async with semaphore:
+                if queued:
+                    await runner._emit("notice", message="排队结束，子任务开始执行", queued=False)
                 if timeout > 0:
                     try:
                         result = await asyncio.wait_for(runner.run(), timeout=timeout)
@@ -1588,6 +1656,22 @@ async def run_sub_agent_batch(
                         )
                 else:
                     result = await runner.run()
+            return result
+
+        try:
+            try:
+                result = await execute()
+            except asyncio.CancelledError:
+                # 单独停止不能向 gather 传播取消，否则兄弟/父任务也会结束。
+                if not context.user_stop_requested or context.stop_checker():
+                    raise
+                runner._status = "stopped"
+                runner._final_reply = runner._build_progress_reply("stopped")
+                if not runner.done_emitted:
+                    if runner.rounds == 0:
+                        await runner._emit_start()
+                    await runner._emit_done("stopped", runner._final_reply, None)
+                result = runner._make_result()
             print(
                 f"[INFO] 子任务完成（agent_id={result.agent_id}, status={result.status}, "
                 f"rounds={result.rounds}）"
@@ -1607,7 +1691,7 @@ async def run_sub_agent_batch(
                 },
             }
         except Exception as exc:  # 子任务异常不外溢（CancelledError 为 BaseException，不在其中）
-            print(f"[WARN] 子任务异常（agent_id={context.agent_id}）: {exc}")
+            print(f"[WARNING] 子任务异常（agent_id={context.agent_id}）: {exc}")
             return {
                 "index": context.parent_tool_index,
                 "tool_call": tool_call,
@@ -1617,6 +1701,9 @@ async def run_sub_agent_batch(
                 "error": exc,
                 "_sub_agent": {"agent_id": context.agent_id, "status": "error"},
             }
+        finally:
+            if _active_sub_agents.get(key) is registered:
+                _active_sub_agents.pop(key, None)
 
     results = await asyncio.gather(*[_run_one(ctx) for ctx in contexts])
     return list(results)

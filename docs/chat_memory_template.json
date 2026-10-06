@@ -26,6 +26,7 @@
       "model_selection": null,
       "config_snapshot_at": null,
       "context_summary": null,
+      "context_summary_raw_rounds": [],
       "compress_usage": {},
       "_history_compress_usage": {}
     }
@@ -41,6 +42,7 @@
     "model_selection": "会话独立模型选择覆盖值（携带 session_id 的 POST /chat_config/models/select 写入，clear=true 清除）；结构为 {角色: {ownership_name, model_name, parameter, api_type}}，仅存已覆盖的角色。角色集：chat_model / compaction_model / title_model / sub_agent_model。null/缺省/空表示未覆盖，跟随全局默认（models.json 顶层 model_selection）。生成/压缩/子任务/参数默认值填充按『会话覆盖 → 全局默认』逐角色解析；覆盖模型失效时回退全局并向前端发 warning。sub_agent_model 未配置时子智能体继承聊天模型（ambient 会话覆盖经 asyncio 上下文自动传递）。clear_chat_history 保留本字段",
     "config_snapshot_at": "最近一次会话配置快照（ensure_session_config_snapshot）写入 meta 的时间戳；快照内容含 work_dir / tool_selection / model_selection 的当时值",
     "context_summary": "null 或跨轮累计摘要状态，结构见下方 context_summary模板",
+    "context_summary_raw_rounds": "摘要游标内需要额外以原文回传的轮次号（1-based）；编辑/插入后摘要正文仍保留为压缩时快照，插入/删除时同步平移该索引",
     "compress_usage": "全部压缩模型调用的 usage 累计（含 compression_count 与 last 两个字段）",
     "_history_compress_usage": "跨轮历史压缩单独的 usage 累计（已并入 compress_usage，用于区分统计口径）",
     "_active_round_compaction": "临时字段：任务进行中单轮压缩的检查点 {question, events, started_at}，轮次收尾/新轮次开始时清除",
@@ -378,7 +380,7 @@
       "timestamp": "YYYY-MM-DD HH:MM:SS"
     }
   ],
-  "_session事件备注": "session 级压缩事件独立成行（不挂在 chat_round 下）；scope=round 的 aborted 事件同样可能独立成行。phase=delta 仅 SSE 实时推送、不落盘。",
+  "_session事件备注": "session 级压缩事件独立成行（不挂在 chat_round 下）；scope=round 的 aborted 事件同样可能独立成行。phase=delta 仅 SSE 实时推送、不落盘。编辑/插入历史轮次会保留压缩时的摘要快照，不会因此写入 invalidated=true；仅结构性失效等专门路径可保留该标记供历史回放。",
   "检查点侧车文件": {
     "_文件名": "<session_id>_chat.jsonl.pending（单对象，非 JSONL）",
     "event": "chat_round",

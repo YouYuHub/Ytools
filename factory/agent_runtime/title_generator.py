@@ -150,10 +150,10 @@ def build_title_content(
             session_id, question_parts, vision_enabled=vision_enabled
         )
     except Exception as exc:
-        print(f"[WARN] 标题请求媒体解析失败（回退纯文本标题）: {exc}")
+        print(f"[WARNING] 标题请求媒体解析失败（回退纯文本标题）: {exc}")
         return plain_text
     if unresolved:
-        print(f"[WARN] 标题请求 {len(unresolved)} 个媒体引用解析失败（按文本占位发送）")
+        print(f"[WARNING] 标题请求 {len(unresolved)} 个媒体引用解析失败（按文本占位发送）")
     parts: list[dict[str, Any]] = [{"type": "text", "text": plain_text}]
     for part in resolved:
         if isinstance(part, dict):
@@ -316,13 +316,13 @@ async def maybe_generate_session_title(
         # 失败原因完整保留（含上游 403/区域限制等响应体）：所选标题模型在
         # 其网关侧可能不可用（如 OpenCode 网关按工作区对部分模型做区域门控，
         # 同 provider 下聊天模型可用不代表标题角色可用），提示用户更换
-        print(f"[WARN] 标题模型调用失败（保持旧机制标题，可尝试更换标题模型）: {exc}")
+        print(f"[WARNING] 标题模型调用失败（保持旧机制标题，可尝试更换标题模型）: {exc}")
         return None
     title = ""
     if isinstance(result, dict):
         title = _clean_title_text(result.get("content") or result.get("reasoning_content"))
     if not title:
-        print("[WARN] 标题模型返回空内容（保持旧机制标题）")
+        print("[WARNING] 标题模型返回空内容（保持旧机制标题）")
         return None
     return title
 
@@ -389,7 +389,7 @@ def _log_title_task_error(task: "asyncio.Task") -> None:
         return
     exc = task.exception()
     if exc is not None:
-        print(f"[WARN] 会话标题任务异常终止（保持旧机制标题）: {exc}")
+        print(f"[WARNING] 会话标题任务异常终止（保持旧机制标题）: {exc}")
 
 
 # 前端触发生成时的同会话防抖窗口（秒）：一轮任务只会触发一次请求，
@@ -526,4 +526,4 @@ def schedule_title_generation(
         )
         task.add_done_callback(_log_title_task_error)
     except Exception as exc:
-        print(f"[WARN] 会话标题任务启动失败（保持旧机制标题）: {exc}")
+        print(f"[WARNING] 会话标题任务启动失败（保持旧机制标题）: {exc}")

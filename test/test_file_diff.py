@@ -38,6 +38,9 @@ def test_build_file_diff_basic_stats():
     assert "+    value = 2" in diff["diff"]
     assert "-    value = 1" in diff["diff"]
     assert "@@ -1,4 +1,4 @@" in diff["diff"]
+    assert diff["changed_ranges"] == [
+        {"old_start_line": 2, "old_end_line": 3, "new_start_line": 2, "new_end_line": 3},
+    ]
 
 
 def test_build_file_diff_crlf_normalized():
@@ -54,14 +57,38 @@ def test_build_file_diff_new_file_all_added():
     assert diff["lines_added"] == 2
     assert diff["lines_removed"] == 0
     assert diff["diff_skipped"] == ""
+    assert diff["changed_ranges"] == [
+        {"old_start_line": None, "old_end_line": None, "new_start_line": 1, "new_end_line": 2},
+    ]
 
 
 def test_build_file_diff_too_large_skipped():
     big = "x" * (256 * 1024 + 1)
     diff = _build_file_diff(big, big, "big.bin")
     assert diff["diff"] == ""
-    assert diff["diff_skipped"] == "file_too_large"
+    assert diff["diff_skipped"] == "unchanged"
     assert diff["lines_added"] == 0 and diff["lines_removed"] == 0
+
+
+def test_build_file_diff_large_changed_file_stats_are_unavailable():
+    big = "a" * (256 * 1024 + 1)
+    diff = _build_file_diff(big, big + "b", "big.txt")
+    assert diff["diff_skipped"] == "file_too_large"
+    assert diff["lines_added"] is None and diff["lines_removed"] is None
+    assert diff["changed_ranges"] is None
+
+
+def test_build_file_diff_truncation_keeps_complete_stats(monkeypatch):
+    import factory.agent_runtime.builtin_tools as bt
+    nl = chr(10)
+    old = nl.join(f"line {i}" for i in range(12)) + nl
+    new = old.replace("line 1" + nl, "changed 1" + nl).replace("line 10" + nl, "changed 10" + nl)
+    monkeypatch.setattr(bt, "_FILE_DIFF_MAX_DIFF_CHARS", 55)
+    diff = _build_file_diff(old, new, "truncated.txt")
+    assert diff["diff_truncated"] is True
+    assert diff["lines_added"] == 2
+    assert diff["lines_removed"] == 2
+    assert len(diff["changed_ranges"]) == 2
 
 
 def test_build_file_diff_unchanged():
@@ -117,6 +144,15 @@ def test_edit_file_result_contains_diff(tmp_path):
     assert "+value = 2" in result["_file_diff"]["diff"]
     assert result["content_hash"] == _content_hash(target.read_bytes().decode("utf-8"))
     assert "diff +1 -1 行" in result["message"]
+    summary = result["_model_result"]
+    assert summary["success"] is True
+    assert summary["replacements"] == 1
+    assert summary["changed_range"] == {
+        "old_start_line": 1, "old_end_line": 1,
+        "new_start_line": 1, "new_end_line": 1,
+    }
+    assert summary["diff_omitted_reason"] == "duplicates_edit_request"
+    assert "_file_diff" in result and "diff" not in summary
 
 
 def test_edit_file_error_no_diff(tmp_path):
@@ -129,6 +165,7 @@ def test_edit_file_error_no_diff(tmp_path):
     })
     assert "error" in result
     assert "_file_diff" not in result
+    assert result["success"] is False
 
 
 def test_format_result_text_strips_file_diff():
@@ -143,6 +180,32 @@ def test_format_tool_result_strips_file_diff():
     text = _format_tool_result(payload)
     assert "_file_diff" not in text
     assert json.loads(text)["message"] == "ok"
+
+
+def test_formatters_use_private_model_summary_and_keep_ui_diff_separate():
+    payload = {
+        "message": "legacy fields",
+        "path": "a.txt",
+        "_model_result": {"success": True, "path": "a.txt", "replacements": 1},
+        "_file_diff": {"diff": "-old" + chr(10) + "+new"},
+    }
+    for formatted in (_format_tool_result(payload), _format_result_text(payload)):
+        model_payload = json.loads(formatted)
+        assert model_payload == {"success": True, "path": "a.txt", "replacements": 1}
+        assert "_file_diff" not in formatted
+
+
+def test_edit_file_returns_compact_novel_diff(tmp_path):
+    target = tmp_path / "inline.py"
+    target.write_text("prefix OLD suffix" + chr(10), encoding="utf-8")
+    result = try_execute_builtin_file_tool("edit_file", {
+        "full_file_name": str(target), "old_string": "OLD", "new_string": "NEW",
+    })
+    summary = result["_model_result"]
+    assert summary["success"] is True
+    assert summary["diff_truncated"] is False
+    assert "-prefix OLD suffix" in summary["diff"]
+    assert "+prefix NEW suffix" in summary["diff"]
 
 
 def test_read_file_content_hash(tmp_path):

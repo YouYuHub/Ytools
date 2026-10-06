@@ -190,6 +190,32 @@
     }).catch(function () { return file; });
   }
 
+  async function prepareMediaFile(file) {
+    if (!file) return null;
+    const kind = mediaKindOf(file.name || "");
+    if (!kind) {
+      toast("不支持的媒体类型：" + (file.name || "未命名文件"));
+      return null;
+    }
+    let finalFile = file;
+    if (kind === "image") finalFile = await compressImageFile(file);
+    // 动图 gif 按视频档（600MB）预检：发送/读取侧同样归视频档（转码前先缩放）
+    const extLower = ((file.name || "").split(".").pop() || "").toLowerCase();
+    const limitKind = extLower === "gif" ? "video" : kind;
+    const sizeLimit = MEDIA_SIZE_LIMITS[limitKind] || MEDIA_SIZE_LIMITS.image;
+    if (finalFile.size > sizeLimit) {
+      toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
+      return null;
+    }
+    return {
+      id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      file: finalFile,
+      name: finalFile.name,
+      kind: kind,
+      dataUrl: "",
+    };
+  }
+
   async function addPendingMediaFiles(files) {
     const added = [];
     // 模型不支持视觉（vision=false）时的能力提示：附件照常上传存档，
@@ -203,31 +229,10 @@
         toast("最多附加 " + MAX_PENDING_MEDIA + " 个媒体文件");
         break;
       }
-      const kind = mediaKindOf(file.name || "");
-      if (!kind) {
-        toast("不支持的媒体类型：" + file.name);
-        continue;
-      }
-      let finalFile = file;
-      if (kind === "image") {
-        finalFile = await compressImageFile(file);
-      }
-      // 动图 gif 按视频档（600MB）预检：发送/读取侧同样归视频档（转码前先缩放）
-      const extLower = ((file.name || "").split(".").pop() || "").toLowerCase();
-      const limitKind = extLower === "gif" ? "video" : kind;
-      const sizeLimit = MEDIA_SIZE_LIMITS[limitKind] || MEDIA_SIZE_LIMITS.image;
-      if (finalFile.size > sizeLimit) {
-        toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
-        continue;
-      }
-      state.pendingMedia.push({
-        id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
-        file: finalFile,
-        name: finalFile.name,
-        kind: kind,
-        dataUrl: "",
-      });
-      added.push(state.pendingMedia[state.pendingMedia.length - 1]);
+      const item = await prepareMediaFile(file);
+      if (!item) continue;
+      state.pendingMedia.push(item);
+      added.push(item);
     }
     if (added.length) {
       // 图片读成 dataURL 供预览；音频/视频只显示名称徽标
@@ -329,7 +334,20 @@
     visibleDocs.forEach(function (item) {
       const chip = el("div", "doc-chip doc-chip-pending");
       appendDocumentMark(chip, item.filename);
-      addProgress(chip, item);
+      if (item.staged) {
+        chip.title = "待发送文档：" + (item.filename || "未命名") + "；点击发送后上传并解析";
+        const remove = el("button", "media-remove", "✕");
+        remove.type = "button";
+        remove.title = "移除待发送文档";
+        remove.addEventListener("click", function (event) {
+          event.stopPropagation();
+          state.pendingDocs = state.pendingDocs.filter(function (doc) { return doc.id !== item.id; });
+          renderComposerAttachments();
+        });
+        chip.appendChild(remove);
+      } else {
+        addProgress(chip, item);
+      }
       composerAttachments.appendChild(chip);
     });
     state.sessionDocs.forEach(function (doc) {
@@ -401,6 +419,7 @@
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.mediaKindOf = mediaKindOf;
+  App.prepareMediaFile = prepareMediaFile;
   App.addPendingMediaFiles = addPendingMediaFiles;
   App.renderComposerAttachments = renderComposerAttachments;
   App.clearPendingMedia = clearPendingMedia;

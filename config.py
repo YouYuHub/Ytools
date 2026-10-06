@@ -39,12 +39,12 @@ DEFAULT_REQUEST_HARD_LIMIT_TOKENS = 1048576  # 供应商请求硬限制：input_
 
 # sub_agent 子智能体（docs/sub_agent_v1.md §10）
 DEFAULT_SUB_AGENT_ENABLED = True             # 总开关：false 时不注入 sub_agent 工具定义
-DEFAULT_SUB_AGENT_MAX_ROUNDS = 40            # 单个子任务的模型调用轮次上限
+DEFAULT_SUB_AGENT_MAX_ROUNDS = 40            # 单个子任务的模型调用轮次上限；0 表示不限制
 DEFAULT_SUB_AGENT_MAX_CONCURRENT = 3         # 同一父轮并发子任务上限（超出排队执行）
 DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 900      # 单个子任务整体超时秒数；0 或负数表示不限制
 DEFAULT_SUB_AGENT_REPLY_MAX_CHARS = 30000    # 子任务最终回复返回父级前的截断保护（完整轨迹在 JSONL 块内）
-DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX = 3  # 子任务空收尾重试上限：最终回复为空时注入内部消息让子模型再次交付；0 或负数=不限制（一直重试，仍受 max_rounds/timeout 硬封顶）
-DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX = 3  # 子任务模型调用流式错误续跑上限：出错后注入内部消息从断点继续；0 或负数=不限制（仍受硬封顶）
+DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX = 3  # 子任务空收尾重试上限：最终回复为空时注入内部消息让子模型再次交付；0 或负数=不限制（一直重试，仍受已启用的轮次/超时限制约束）
+DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX = 3  # 子任务模型调用流式错误续跑上限：出错后注入内部消息从断点继续；0 或负数=不限制（仍受已启用的轮次/超时限制约束）
 DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 3        # 子任务 todo 未完成提醒上限（每次工具执行轮后额度重置）；0=关闭提醒，负数=不限制
 
 # 工具并发执行（前端聊天设置可调，GET/POST /chat_config/tool_concurrency）
@@ -119,7 +119,8 @@ class ChatLLMRequest(BaseModel):
     use_backend_history: Optional[bool] = None   # 是否启用后端会话历史拼接（None 表示走服务端默认）
     backend_history_rounds: Optional[int] = None # 兼容参数；摘要-only 模式不限制已完成历史回传
     target_round: Optional[int] = None          # 编辑重发的目标轮次号（1-based）：本轮回复原地替换历史第 N 轮，None 表示正常追加新轮
-    insert_round: Optional[int] = None          # 回答插入轮次号（1-based）：收尾轮次插入历史第 N 轮之后、后续轮次整体后推，上下文截到第 N 轮为止（ask_user 卡片再答专用）
+    insert_round: Optional[int] = None          # 插入位置：新轮插入历史第 N 轮之后，0 表示首轮之前；请求上下文只保留前 N 轮
+    strict_insert_context: bool = False         # 兼容旧客户端；插入请求按位置截断上下文，摘要快照不会因此失效
 
 
 class ChatModelSelection(BaseModel):
@@ -262,23 +263,30 @@ class ToolConcurrencyConfig(BaseModel):
     )
 
 
+class SubAgentLimitsConfig(BaseModel):
+    """全局子任务限制，派发时固化；0 表示不限制。"""
+
+    max_rounds: int = Field(DEFAULT_SUB_AGENT_MAX_ROUNDS, ge=0)
+    timeout_seconds: float = Field(DEFAULT_SUB_AGENT_TIMEOUT_SECONDS, ge=0, allow_inf_nan=False)
+
+
 class SubAgentRetryConfig(BaseModel):
     """子智能体交付保障重试配置（三项均支持 0/负数语义见各自描述）。"""
 
     final_reply_max_attempts: int = Field(
         DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
         description="子任务空收尾重试上限：最终回复为空时注入内部消息让子模型再次交付；"
-                    "0 或负数=不限制（一直重试，仍受 max_rounds/timeout 硬封顶）",
+                    "0 或负数=不限制（一直重试，仍受已启用的轮次/超时限制约束）",
     )
     stream_error_max_attempts: int = Field(
         DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
         description="子任务模型流式调用出错后的断点续跑上限：注入内部消息从已有进度继续；"
-                    "0 或负数=不限制（仍受 max_rounds/timeout 硬封顶）",
+                    "0 或负数=不限制（仍受已启用的轮次/超时限制约束）",
     )
     todo_remind_max: int = Field(
         DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
         description="子任务收尾时 todo 未完成提醒次数（每次完整工具执行轮后额度重置）；"
-                    "0=关闭提醒，负数=不限制（仍受 max_rounds/timeout 硬封顶）",
+                    "0=关闭提醒，负数=不限制（仍受已启用的轮次/超时限制约束）",
     )
 
 

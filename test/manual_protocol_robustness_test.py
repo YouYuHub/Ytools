@@ -28,7 +28,7 @@ async def sdk_e2e():
             init = await s.initialize()
             negotiated = getattr(init, "protocol_version", None) or getattr(
                 init, "protocolVersion", None)
-            print(f"[{'PASS' if negotiated == mcp.types.LATEST_PROTOCOL_VERSION else 'WARN'}] "
+            print(f"[{'PASS' if negotiated == mcp.types.LATEST_PROTOCOL_VERSION else 'WARNING'}] "
                   f"SDK 协商结果: {negotiated!r} (serverInfo={init.server_info.name})")
             tools = await s.list_tools()
             print(f"[PASS] SDK list_tools: {[t.name for t in tools.tools]}")
@@ -45,19 +45,19 @@ def robustness():
         if resp is None:
             print(f"[FAIL] {label}: 无响应")
         elif "__timeout__" in resp:
-            print(f"[{'WARN' if expect_ok else 'PASS'}] {label}: 超时（无响应）")
+            print(f"[{'WARNING' if expect_ok else 'PASS'}] {label}: 超时（无响应）")
         elif "__eof__" in resp:
             print(f"[FAIL] {label}: 进程退出 EOF")
         elif "__raw__" in resp:
-            print(f"[WARN] {label}: 非JSON响应 {resp['__raw__'][:80]!r}")
+            print(f"[WARNING] {label}: 非JSON响应 {resp['__raw__'][:80]!r}")
         elif "error" in resp:
-            print(f"[{'PASS' if not expect_ok else 'WARN'}] {label}: 错误 "
+            print(f"[{'PASS' if not expect_ok else 'WARNING'}] {label}: 错误 "
                   f"code={resp['error'].get('code')} msg={resp['error'].get('message', '')[:90]!r}")
         else:
             r = resp.get("result")
             brief = json.dumps(r, ensure_ascii=False)[:90] if r is not None else "null"
             import json as _json
-            print(f"[{'PASS' if expect_ok else 'WARN'}] {label}: result={brief}")
+            print(f"[{'PASS' if expect_ok else 'WARNING'}] {label}: result={brief}")
 
     import json
     # 1) 正常初始化

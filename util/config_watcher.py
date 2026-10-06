@@ -46,6 +46,15 @@ _watcher_start_lock = threading.Lock()
 
 WATCH_INTERVAL_ENV_NAME = "CONFIG_HOT_RELOAD_INTERVAL_SECONDS"
 DEFAULT_WATCH_INTERVAL_SECONDS = 5.0
+_MAX_WATCH_CONFIG_BYTES = 16 * 1024 * 1024
+
+
+def _read_watch_config(path: Path) -> bytes:
+    with path.open("rb") as handle:
+        payload = handle.read(_MAX_WATCH_CONFIG_BYTES + 1)
+    if len(payload) > _MAX_WATCH_CONFIG_BYTES:
+        raise ValueError(f"配置文件超过 {_MAX_WATCH_CONFIG_BYTES // (1024 * 1024)} MiB 上限")
+    return payload
 
 
 def default_watch_targets() -> dict[str, Path]:
@@ -130,8 +139,8 @@ def _check_target(target: str, path: Path) -> str:
     if stored_size == stat.st_size and stored_mtime_ns == stat.st_mtime_ns and stored_hash is not None:
         return "unchanged"
     try:
-        payload = path.read_bytes()
-    except OSError as exc:
+        payload = _read_watch_config(path)
+    except (OSError, ValueError) as exc:
         print(f"[config-watch] 读取 {path} 失败，保留内存配置: {exc}")
         return "failed"
     payload_hash = _file_hash(payload)
@@ -197,10 +206,10 @@ def prime_watch_state(watch_targets: dict[str, Path] | None = None) -> None:
     """记录当前文件 hash 作为基线，避免启动后第一轮就把“未变化”当变更。"""
     for target, path in _resolve_watch_targets(watch_targets).items():
         try:
-            payload = path.read_bytes()
+            payload = _read_watch_config(path)
             payload_hash = _file_hash(payload)
             stat = path.stat()
-        except OSError:
+        except (OSError, ValueError):
             continue
         with _state_lock:
             _watch_state[target] = {"hash": payload_hash, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}

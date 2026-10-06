@@ -49,6 +49,20 @@ test("parseHistory: 用量记录携带该轮落盘的模型快照", function () 
   assert.deepEqual(usage.model, round.model);
 });
 
+test("parseHistory: 没有 usage 时仍生成模型摘要记录", function () {
+  const round = JSON.parse(fakeRound([
+    { role: "user", content: "问题" },
+    { role: "assistant", content: "回答" },
+  ]));
+  round.model = { provider: "Ollama", name: "qwen3.5:9b", id: "qwen3.5:9b" };
+
+  const records = historyParser.parseHistory(JSON.stringify(round)).records;
+  const summary = records.find(function (record) { return record.kind === "usage"; });
+  assert.ok(summary);
+  assert.deepEqual(summary.usage, {});
+  assert.deepEqual(summary.model, round.model);
+});
+
 test("parseHistory: 用户消息携带引用快照透传给渲染层", function () {
   const quotes = [{ text: "被选中的原文", source: { role: "assistant", round: 1 } }];
   const round = fakeRound([
@@ -161,6 +175,18 @@ test("parseHistory: context_compaction 事件行解析为 compaction 记录", fu
   assert.equal(parsed.records[1].phase, "done");
   assert.equal(parsed.records[1].summary_text, "【任务目标】完成压缩功能");
   assert.equal(parsed.records[1].usage.compressed_rounds, 2);
+});
+
+test("parseHistory: 已失效的历史压缩仍回放并标记状态", function () {
+  const line = JSON.stringify({
+    event: "context_compaction", scope: "session", phase: "done",
+    summary_text: "旧摘要", invalidated: true,
+  });
+  const parsed = historyParser.parseHistory(line);
+  assert.equal(parsed.records.length, 1);
+  assert.equal(parsed.records[0].kind, "compaction");
+  assert.equal(parsed.records[0].summary_text, "旧摘要");
+  assert.equal(parsed.records[0].invalidated, true);
 });
 
 test("parseHistory: 手动压缩独立 JSONL 行保留在旧历史与后续轮次之间", function () {
@@ -644,4 +670,33 @@ test("parseHistory: 孤儿 sub_agent 事件（缺 start）被忽略", function (
   ]);
   const parsed = historyParser.parseHistory(round);
   assert.deepEqual(parsed.records, []);
+});
+
+
+test("parseHistory: 委派参数与子任务按调用 ID 整合，逆序启动也不串任务", () => {
+  const events = [
+    { role: "assistant", tool_calls: [
+      { id: "call_a", function: { name: "sub_agent", arguments: '{"task":"A"}' } },
+      { id: "call_b", function: { name: "sub_agent", arguments: '{"task":"B"}' } },
+    ] },
+    { event: "sub_agent", phase: "start", agent_id: "b", parent_tool_call_id: "call_b", task: "B" },
+    { event: "sub_agent", phase: "start", agent_id: "a", parent_tool_call_id: "call_a", task: "A" },
+    { event: "sub_agent", phase: "done", agent_id: "a", status: "done", final_reply: "A完成" },
+  ];
+  const blocks = historyParser.parseHistory(fakeRound(events)).records.filter(r => r.kind === "agentBlock");
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0].task, "A");
+  assert.equal(blocks[0].args, '{"task":"A"}');
+  assert.equal(blocks[0].final_reply, "A完成");
+  assert.equal(blocks[1].task, "B");
+  assert.equal(blocks[1].args, '{"task":"B"}');
+});
+
+test("parseHistory: 启动前中断的委派也保留参数卡片", () => {
+  const blocks = historyParser.parseHistory(fakeRound([
+    { role: "assistant", tool_calls: [{ id: "pending", function: { name: "sub_agent", arguments: '{"task":"尚未启动"}' } }] },
+  ])).records.filter(r => r.kind === "agentBlock");
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].status, "interrupted");
+  assert.equal(blocks[0].args, '{"task":"尚未启动"}');
 });

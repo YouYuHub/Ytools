@@ -25,10 +25,33 @@ IS_WINDOWS = os.name == "nt"
 class BuiltinCommandToolTests(unittest.TestCase):
     # ---------- 注入与名称注册 ----------
 
+    def test_auto_shell_prefers_windows_powershell_and_falls_back_to_cmd(self):
+        with patch.object(bt.shutil, "which", return_value="C:/Windows/powershell.exe"):
+            exe, kind, args = bt._resolve_shell("auto", True)
+            self.assertEqual(kind, "powershell")
+            self.assertIn("-Command", args)
+        with patch.object(bt.shutil, "which", return_value=None):
+            self.assertEqual(bt._resolve_shell("auto", True)[1], "cmd")
+
+    def test_auto_shell_is_sh_on_linux_even_when_bash_is_available(self):
+        with patch.object(bt.shutil, "which", side_effect=lambda name: "/bin/" + name):
+            self.assertEqual(bt._resolve_shell("auto", False), ("/bin/sh", "sh", []))
+
+    def test_large_command_output_preview_is_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "output.txt"
+            path.write_bytes(b"a" * 65)
+            with patch.object(bt, "_RUN_COMMAND_PREVIEW_BYTES", 64):
+                preview, truncated = bt._read_command_output_preview(path, ["utf-8"])
+            self.assertEqual(preview, "a" * 64)
+            self.assertTrue(truncated)
+
     def test_inject_run_command(self):
         tools, servers = bt.inject_builtin_tools([], {}, include_run_command=True)
         names = {t["function"]["name"] for t in tools}
         self.assertIn("run_command", names)
+        self.assertIn("poll_command", names)
+        self.assertIn("stop_command", names)
         self.assertEqual(servers["run_command"], "__builtin__")
         # 不勾选时不注入
         tools2, _ = bt.inject_builtin_tools([], {})
@@ -45,8 +68,23 @@ class BuiltinCommandToolTests(unittest.TestCase):
         params = definition["parameters"]
         self.assertEqual(params["type"], "object")
         self.assertEqual(params["required"], ["command"])
-        for key in ("shell", "work_dir", "timeout_seconds", "background"):
+        for key in ("command", "shell", "work_dir", "timeout_seconds", "background"):
             self.assertIn(key, params["properties"])
+        self.assertNotIn("job_id", params["properties"])
+        self.assertEqual(bt.POLL_COMMAND_TOOL_DEFINITION["function"]["parameters"]["required"], ["job_id"])
+        self.assertEqual(bt.STOP_COMMAND_TOOL_DEFINITION["function"]["parameters"]["required"], ["job_id"])
+
+    def test_command_action_tools_dispatch_and_reject_mixed_parameters(self):
+        for name in ("poll_command", "stop_command"):
+            result = bt.try_execute_builtin_command_tool(name, {"job_id": "missing"})
+            self.assertIsNotNone(result)
+            self.assertEqual(result.get("tool"), name)
+            invalid = bt.try_execute_builtin_command_tool(name, {"job_id": "missing", "command": "echo bad"})
+            self.assertIn("只接受 job_id", invalid["error"])
+        with self.assertRaisesRegex(ValueError, "不接受 job_id"):
+            bt.execute_run_command({"command": "echo bad", "job_id": "missing"})
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            bt.execute_run_command({"command": "echo bad", "timeout_seconds": 0})
 
     # ---------- 执行入口 ----------
 
@@ -73,6 +111,55 @@ class BuiltinCommandToolTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(result["tool"], "run_command")
 
+    def test_structured_result_preserves_legacy_message(self):
+        result = bt._structured_command_result(
+            "[run_command] shell=cmd | cwd=C:/work | exit=7 | 耗时 0.1s\n--- stderr ---\nfailed"
+        )
+        self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["shell"], "cmd")
+        self.assertIn("--- stderr ---", result["message"])
+        background = bt._structured_command_result(
+            "[run_command] 后台模式已启动 | shell=cmd | pid=12 | job_id=bg_demo\n"
+            "输出文件: C:/logs/bg_demo.out.txt\n"
+            "结束标记: C:/logs/bg_demo.done.txt（完成后写入退出码）"
+        )
+        self.assertEqual(background["status"], "running")
+        self.assertEqual(background["job_id"], "bg_demo")
+        self.assertEqual(background["output_path"], "C:/logs/bg_demo.out.txt")
+
+    @unittest.skipUnless(IS_WINDOWS, "真实命令执行用例仅 Windows 验证")
+    def test_model_result_has_nonduplicated_output_fields(self):
+        result = bt.try_execute_builtin_command_tool("run_command", {"command": "echo structured_ok"})
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("structured_ok", result["stdout"])
+        self.assertNotIn("structured_ok", result["message"])
+
+    def test_background_job_can_be_polled_and_stopped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(bt, "_BG_LOG_DIR", Path(folder)):
+                output = Path(folder) / "bg_test.out.txt"
+                output.write_text("progress", encoding="utf-8")
+                job_id = bt._save_command_job(12345, output, None, "cmd", folder, "session-a")
+                with patch.object(bt, "_pid_alive_windows", return_value=True), \
+                        patch.object(bt, "_pid_alive_posix", return_value=True), \
+                        patch.object(bt.os, "killpg", create=True) as stop_group, \
+                        patch.object(bt.subprocess, "run") as stop_command:
+                    stop_command.return_value.returncode = 0
+                    with self.assertRaisesRegex(ValueError, "不属于当前会话"):
+                        bt.execute_run_command({"action": "poll", "job_id": job_id, "_session_id": "session-b"})
+                    polled = bt.execute_run_command({"action": "poll", "job_id": job_id, "_session_id": "session-a"})
+                    self.assertEqual(polled["status"], "running")
+                    self.assertEqual(polled["output_tail"], "progress")
+                    stopped = bt.execute_run_command({"action": "stop", "job_id": job_id, "_session_id": "session-a"})
+                    self.assertEqual(stopped["status"], "stopped")
+                    if IS_WINDOWS:
+                        stop_command.assert_called_once()
+                    else:
+                        stop_group.assert_called_once()
+                with self.assertRaisesRegex(ValueError, "job_id 无效"):
+                    bt.execute_run_command({"action": "poll", "job_id": "../other"})
+
     # ---------- cmd 家族补丁辅助 ----------
 
     def test_multiline_inline_code_rewrite(self):
@@ -97,7 +184,7 @@ class BuiltinCommandToolTests(unittest.TestCase):
     @unittest.skipUnless(IS_WINDOWS, "cmd 语法仅 Windows 验证")
     def test_cmd_heredoc_rejected_before_execution(self):
         with self.assertRaisesRegex(ValueError, "heredoc.*命令未执行"):
-            bt.execute_run_command({"command": "python - <<'EOF'\nprint('hello')\nEOF"})
+            bt.execute_run_command({"command": "python - <<'EOF'\nprint('hello')\nEOF", "shell": "cmd"})
 
     def test_mixed_utf8_and_gbk_output_keeps_each_line(self):
         raw = "子任务 supportDocTypes 解析失败\n".encode("utf-8")
@@ -203,7 +290,7 @@ class BuiltinCommandToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="rc_test_", dir=".") as directory:
             with patch.object(bt, "_BG_LOG_DIR", Path(directory).resolve()), \
                     patch.object(bt, "_wmi_create_process", side_effect=RuntimeError("test direct path")):
-                result = bt.execute_run_command({"command": 'python -c "print(\'100%\')"'})
+                result = bt.execute_run_command({"command": 'python -c "print(\'100%\')"', "shell": "cmd"})
         self.assertIn("exit=0", result)
         self.assertIn("100%", result)
         self.assertIn("已自动改写为临时脚本", result)

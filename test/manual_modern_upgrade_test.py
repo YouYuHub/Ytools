@@ -29,7 +29,7 @@ async def main():
             if ver_after == "2026-07-28":
                 print("[PASS] 会话已升级到 modern 2026-07-28")
             else:
-                print(f"[WARN] 会话版本: {ver_after!r}")
+                print(f"[WARNING] 会话版本: {ver_after!r}")
 
             tools = await s.list_tools()
             print(f"[4] 2026-07-28 会话 list_tools: {[t.name for t in tools.tools]}")

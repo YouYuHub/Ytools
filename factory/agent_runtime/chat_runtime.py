@@ -595,7 +595,7 @@ def copy_for_request(
     shaped = _shape_reasoning_for_send(messages, limit)
     cleaned, removed = sanitize_tool_call_pairing(shaped)
     if removed:
-        print(f"[WARN] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
+        print(f"[WARNING] 请求前清理 {removed} 个悬空 tool_call（无配对结果）")
     return [_drop_quote_fields(message) for message in cleaned]
 
 

@@ -51,9 +51,15 @@
       },
       signal
     );
-    (uploadRes.results || []).forEach(function (result) {
-      if (result.status === "success") uploadedMedia.push(result);
-      else toast("附件上传失败：" + result.filename + "：" + (result.message || "未知原因"));
+    (uploadRes.results || []).forEach(function (result, index) {
+      const item = items[index];
+      if (result.status === "success") {
+        if (item) Object.assign(item, result);
+        uploadedMedia.push(result);
+      } else {
+        if (item) item.uploadError = result.message || "未知原因";
+        toast("附件上传失败：" + result.filename + "：" + (result.message || "未知原因"));
+      }
     });
     return uploadedMedia;
   }
@@ -144,6 +150,13 @@
       return usageLine;
     }
 
+    function renderRoundSummary() {
+      const summary = FormatUtils.roundSummaryText(roundUsageAcc, roundModel);
+      if (!summary) return;
+      ensureUsageLine().textContent = summary;
+      msg.appendChild(usageLine);
+    }
+
     function accumulateUsage(target, delta) {
       ["prompt_tokens", "completion_tokens", "total_tokens"].forEach(function (key) {
         const value = Number(delta[key] || 0);
@@ -180,20 +193,19 @@
       }
       roundUsageAcc = rebuildRoundUsage();
       activeStream.usage = roundUsageAcc;
-      ensureUsageLine().textContent = FormatUtils.usageText(roundUsageAcc, roundModel);
-      msg.appendChild(usageLine);
+      renderRoundSummary();
       return true;
     }
 
-    // 更新本轮展示模型（usage 行「模型 provider/name」文案的数据源）：
-    // 同步写入管线内部与 activeStream（切走再切回会话时复用），并在 usage
-    // 行已渲染时立即重绘。唯一下发通道为 round_model 帧（round_started 帧
-    // 不再携带 model）；附接回放走 marker.model → 同一入口。
+    // 更新本轮展示模型：同步写入管线内部与 activeStream（切走再切回会话时
+    // 复用），并立即显示/刷新轮次摘要。服务端不提供 usage 时只显示模型名。
+    // 唯一下发通道为 round_model 帧（round_started 帧不再携带 model）；
+    // 附接回放走 marker.model → 同一入口。
     function setRoundModel(model) {
       if (!model || typeof model.name !== "string" || !model.name.trim()) return false;
       roundModel = model;
       activeStream.model = model;
-      if (roundUsageAcc) ensureUsageLine().textContent = FormatUtils.usageText(roundUsageAcc, roundModel);
+      renderRoundSummary();
       return true;
     }
 
@@ -201,6 +213,29 @@
     // 同一块对象双键登记：父级 tool_start 只带 tool_call id（预建占位），
     // 子事件带 agent_id（start 到达后绑定）。done 后保留在索引中，
     // tool_return(sub_agent) 到达时据此追加"最终回复已返回父智能体"引用条。
+    function bindAgentCall(block, callId) {
+      if (callId) {
+        block.callId = callId;
+        agentByCall.set(callId, block);
+      }
+    }
+
+    function promoteAgentTool(tb, callId) {
+      let block = tb.agentBlock || (callId && agentByCall.get(callId));
+      if (!block) {
+        block = { ui: App.buildSubAgentBlock(sessionId), callId: "", agentId: "", done: false };
+        agentBlocksAll.push(block);
+        if (tb.ui.wrap.parentNode) tb.ui.wrap.parentNode.replaceChild(block.ui.wrap, tb.ui.wrap);
+        else appendStage(block.ui.wrap);
+      } else if (tb.ui.wrap.parentNode) {
+        tb.ui.wrap.parentNode.removeChild(tb.ui.wrap);
+      }
+      tb.agentBlock = block;
+      bindAgentCall(block, callId);
+      block.ui.setDispatchInput(tb.argsText || "");
+      return block;
+    }
+
     function handleSubAgentEvent(data) {
       let block = null;
       if (data.agent_id && agentById.has(data.agent_id)) block = agentById.get(data.agent_id);
@@ -208,7 +243,7 @@
         block = agentByCall.get(data.parent_tool_call_id);
       }
       if (!block) {
-        block = { ui: App.buildSubAgentBlock(), callId: "", agentId: "", done: false };
+        block = { ui: App.buildSubAgentBlock(sessionId), callId: "", agentId: "", done: false };
         agentBlocksAll.push(block);
         hasStage = true;
         appendStage(block.ui.wrap);
@@ -273,6 +308,7 @@
           msg
         );
         hasStage = true;
+        App.rebuildQnav();
         if (state.sessionId === sessionId) stickToBottom();
         return;
       }
@@ -451,19 +487,23 @@
           }
           const tb = activeToolBlocks.get(idx);
           const fn = d.function || {};
+          if (d.id) tb.callId = d.id;
           if (fn.name) tb.ui.setName(tb.name = fn.name);
+          if (tb.name === "sub_agent") promoteAgentTool(tb, tb.callId);
+
           // 首个参数数据到达：进入流式展示态（自动展开 + 执行中样式）
-          if (!tb.streamStarted && fn.arguments) {
+          if (!tb.agentBlock && !tb.streamStarted && fn.arguments) {
             tb.streamStarted = true;
             tb.ui.beginStream();
           }
           if (typeof fn.arguments === "string" && fn.arguments) {
             tb.argsText += fn.arguments;
-            tb.ui.addInputDelta(fn.arguments);
+            if (!tb.agentBlock) tb.ui.addInputDelta(fn.arguments);
           } else if (fn.arguments && typeof fn.arguments === "object") {
             tb.argsText = JSON.stringify(fn.arguments, null, 2);
-            tb.ui.setInputText(tb.argsText);
+            if (!tb.agentBlock) tb.ui.setInputText(tb.argsText);
           }
+          if (tb.agentBlock) tb.agentBlock.ui.setDispatchInput(tb.argsText);
         });
       }
       // 工具开始执行：参数已完整、后端正在调用（等待结果阶段的可感知状态）
@@ -473,13 +513,22 @@
         // 不进入普通工具气泡渲染
         if (ts.function_name === "sub_agent") {
           const key = ts.tool_call_id || "";
-          if (!key || !agentByCall.has(key)) {
-            const block = { ui: App.buildSubAgentBlock(), callId: key, agentId: "", done: false };
-            if (key) agentByCall.set(key, block);
+          const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
+          const tb = activeBlocks.find(t => t.callId === key && key)
+            || activeBlocks.find(t => t.name === "sub_agent" && !t.dispatched && (!t.callId || t.callId === key));
+          let block = key && agentByCall.get(key);
+          if (tb) {
+            block = promoteAgentTool(tb, key);
+            tb.dispatched = true;
+          }
+          if (!block) {
+            block = { ui: App.buildSubAgentBlock(sessionId), callId: key, agentId: "", done: false };
+            bindAgentCall(block, key);
             agentBlocksAll.push(block);
             hasStage = true;
             appendStage(block.ui.wrap);
           }
+          if (ts.arguments) block.ui.setDispatchInput(ts.arguments);
           return;
         }
         const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
@@ -501,8 +550,11 @@
         // 此处仅在块尾追加引用条；无块可挂时降级为普通工具块
         if (tr.function_name === "sub_agent") {
           const info = tr.sub_agent || null;
-          let block = info && info.agent_id ? agentById.get(info.agent_id) : null;
+          let block = (info && info.agent_id ? agentById.get(info.agent_id) : null)
+            || agentByCall.get(tr.tool_call_id);
           if (block) {
+            if (tr.arguments) block.ui.setDispatchInput(tr.arguments);
+            if (!block.ui.isDone()) block.ui.finalizeInterrupted();
             block.ui.markReturned(info);
             block.done = true;
           } else {
@@ -519,6 +571,12 @@
             tb.done = true;
             hasStage = true;
             appendStage(tb.ui.wrap);
+          }
+          if (activeToolBlocks) {
+            activeToolBlocks.forEach(function (tb) {
+              if (tb.agentBlock === block) { tb.done = true; tb.ui.finish(); }
+            });
+            if (Array.from(activeToolBlocks.values()).every(tb => tb.done)) activeToolBlocks = null;
           }
           if (state.sessionId === sessionId) {
             App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, sessionId);
@@ -614,15 +672,22 @@
   /**
    * 发送一条用户消息并开启新一轮回复。
    * @param {object} [direct] 直接载荷（引导/队列 flush/编辑重发调用）：
-   *   { text, media, quotes, targetRound?, insertAfterRound? } —— media 为待上传
-   *   附件快照、quotes 为引用快照；缺省时从输入框读取。
+   *   { text, media, docs, quotes, targetRound?, insertAfterRound?, strictInsertContext? } —— 编辑态
+   *   media/docs 为待上传附件快照；缺省时从输入框读取文本、媒体和引用。
    */
   async function send(direct) {
     // 防御：事件监听器直接传引用时，MouseEvent 等非普通对象不算直接载荷
     if (direct && (typeof direct !== "object" || direct instanceof Event)) direct = undefined;
     const fromInput = !direct;
+    // 先冻结当前语音预览，再取发送快照；旧识别回调不能写回已清空的输入框。
+    if (fromInput && App.stopVoiceInput) App.stopVoiceInput();
     const text = direct ? (direct.text || "") : input.value.trim();
     const pendingMedia = direct ? (direct.media || []).slice() : state.pendingMedia.slice();
+    const pendingDocs = direct
+      ? (direct.docs || []).slice()
+      : (state.pendingDocs || []).filter(function (item) {
+        return item.staged && item.sessionId === state.sessionId;
+      });
     // 引用快照（选中文本引用到提问）：与消息一起上送，不作为独立用户消息
     const pendingQuotes = direct
       ? (direct.quotes || []).slice()
@@ -653,42 +718,131 @@
 
     // 上传媒体附件（输入框路径用 state.pendingMedia 的 file；flush 路径同构；
     // 编辑重发路径的元素已带 media_ref/stored_name 无 file —— 直接复用原引用，不重新上传）
-    const uploadedMedia = [];
     const needUploadMedia = [];
     pendingMedia.forEach(function (m) {
-      if (m && m.file) needUploadMedia.push(m);
-      else if (m && m.media_ref) uploadedMedia.push(m);
+      if (m && !m.media_ref && m.file) needUploadMedia.push(m);
     });
+
+    function resetPreflightState() {
+      state.streaming = false;
+      state.streamingSession = null;
+      state.abort = null;
+      App.refreshComposerButtons();
+    }
+
+    function queueDirectRetry() {
+      if (fromInput) return;
+      state.pendingQueue.unshift({
+        text: text,
+        media: pendingMedia,
+        docs: pendingDocs,
+        quotes: pendingQuotes,
+        targetRound: direct && direct.targetRound,
+        insertAfterRound: direct && direct.insertAfterRound,
+        strictInsertContext: direct && direct.strictInsertContext,
+        sessionId: streamSessionId,
+      });
+      App.renderPendingOutbox();
+    }
+
+    let failedMedia = [];
     if (needUploadMedia.length) {
       try {
-        const results = await uploadMediaFiles(streamSessionId, needUploadMedia, state.abort.signal);
-        results.forEach(function (result) { uploadedMedia.push(result); });
+        await uploadMediaFiles(streamSessionId, needUploadMedia, state.abort.signal);
       } catch (err) {
         toast("附件上传失败：" + err.message);
-        state.streaming = false;
-        state.streamingSession = null;
-        state.abort = null;
-        App.refreshComposerButtons();
-        // flush 来源的失败消息放回队列头部，避免丢失（引用快照一并保留）
-        if (!fromInput) {
-          state.pendingQueue.unshift({
-            text: text,
-            media: pendingMedia,
-            quotes: pendingQuotes,
-            sessionId: streamSessionId,
-          });
-          App.renderPendingOutbox();
-        }
+        resetPreflightState();
+        queueDirectRetry();
         return;
       }
-      // 上传成功后附件已换为 media:// 引用：flush 来源的本地预览 URL 不再需要，释放
-      if (!fromInput) {
-        pendingMedia.forEach(function (m) {
-          if (m.objUrl) {
-            try { URL.revokeObjectURL(m.objUrl); } catch (_) { /* ignore */ }
+      // 编辑重发/队列消息中可能有部分文件成功、部分失败；保存成功文件引用，
+      // 只把失败文件放回重试队列，避免重复上传已成功的文件。
+      failedMedia = needUploadMedia.filter(function (item) { return !item.media_ref; });
+      if (!fromInput && failedMedia.length) {
+        failedMedia.forEach(function (item) {
+          toast("附件上传失败：" + (item.name || item.file.name));
+        });
+        resetPreflightState();
+        queueDirectRetry();
+        return;
+      }
+    }
+
+    // 按编辑框中的附件顺序组装，避免新增文件被挪到旧附件末尾。
+    const uploadedMedia = pendingMedia.filter(function (item) { return item && item.media_ref; });
+
+    // 历史编辑框中的新文档在用户点击发送前只保存在浏览器内存；
+    // 确认发送后才进入会话 file_memory（解析内容对本会话后续轮次共享）。
+    if (pendingDocs.length) {
+      const needUploadDocs = pendingDocs.filter(function (item) { return !item.uploaded; });
+      try {
+        const docRes = needUploadDocs.length
+          ? await API.uploadSessionFiles(
+            streamSessionId,
+            needUploadDocs.map(function (item) { return item.file; }),
+            function () {},
+            state.abort.signal
+          )
+          : { success: 0, failed: 0, results: [] };
+        (docRes.results || []).forEach(function (result, index) {
+          if (result.status === "success" && needUploadDocs[index]) {
+            needUploadDocs[index].uploaded = true;
           }
         });
+        const failedDocs = (docRes.results || []).filter(function (item) {
+          return item.status !== "success";
+        });
+        if (docRes.success) {
+          if (typeof App.loadSessionFiles === "function") {
+            await App.loadSessionFiles(streamSessionId);
+          }
+        }
+        if (failedDocs.length) {
+          failedDocs.slice(0, 3).forEach(function (item) {
+            toast("文档上传失败：" + (item.filename || "文件") + "：" + (item.message || "解析失败"));
+          });
+          if (!fromInput) {
+            resetPreflightState();
+            queueDirectRetry();
+            return;
+          }
+        }
+        if (fromInput) {
+          const uploadedStagedDocs = pendingDocs.filter(function (item) { return item.uploaded; });
+          if (uploadedStagedDocs.length) {
+            state.pendingDocs = state.pendingDocs.filter(function (item) {
+              return uploadedStagedDocs.indexOf(item) < 0;
+            });
+            App.renderComposerAttachments();
+          }
+          if (failedDocs.length) {
+            resetPreflightState();
+            return;
+          }
+        }
+      } catch (err) {
+        toast("文档上传失败：" + err.message);
+        resetPreflightState();
+        queueDirectRetry();
+        return;
       }
+    }
+
+    // 输入框暂存文档在此时已经上传完毕；不再保留待发副本。
+    if (fromInput && pendingDocs.length) {
+      state.pendingDocs = state.pendingDocs.filter(function (item) {
+        return pendingDocs.indexOf(item) < 0;
+      });
+      App.renderComposerAttachments();
+    }
+
+    // 预检上传成功后释放待发媒体的本地预览 URL；点击取消或重试之前都保留。
+    if (!fromInput) {
+      pendingMedia.forEach(function (item) {
+        if (!item.objUrl) return;
+        try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
+        item.objUrl = "";
+      });
     }
 
     const userContent = buildUserContent(text, uploadedMedia);
@@ -703,7 +857,20 @@
     // 若在手术前重建，旧第 N 轮节点仍在（旧文本占第 N 位），新气泡又临时
     // 挂在末尾（新文本占第 total+1 位），导航面板会出现新旧两条重复条目
     if (fromInput) {
-      App.clearPendingMedia();
+      // 若媒体 API 逐文件返回部分失败，保留失败文件供下一条消息重试；
+      // 已成功文件已换成 media:// 并进入本轮，不留在输入区重复发送。
+      failedMedia = pendingMedia.filter(function (item) { return item.file && !item.media_ref; });
+      if (failedMedia.length) {
+        pendingMedia.filter(function (item) { return item.media_ref && item.objUrl; })
+          .forEach(function (item) {
+            try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
+            item.objUrl = "";
+          });
+        state.pendingMedia = failedMedia;
+        App.renderComposerAttachments();
+      } else {
+        App.clearPendingMedia();
+      }
       // 引用随输入框一起清空（快照已进本轮消息，失败重发由气泡上的编辑入口承担）
       App.clearPendingQuotes();
       input.value = "";
@@ -763,7 +930,7 @@
         chatInner.appendChild(userNode);
         chatInner.appendChild(msg);
       }
-    } else if (direct && direct.insertAfterRound) {
+    } else if (direct && direct.insertAfterRound != null) {
       // 回答轮插入：锚点为旧编号第 N+1 轮首节点（其后所有轮次在屏幕上自然后推）。
       // 先取锚点引用再重编号：后端插入语义会把后续轮次编号整体 +1，屏幕节点
       // data-round 同步重编，否则新节点补打 data-round=N+1 后与旧编号碰撞
@@ -840,13 +1007,14 @@
     // 为模型视图的 <quote_list>；无引用不携带（旧行为完全一致）
     if (requestQuotes.length) payload.messages[0].quotes = requestQuotes;
     // 编辑重发「重新生成该轮」：携带 target_round，后端把本轮回复原地替换
-    // 历史第 N 轮（上下文截到第 N-1 轮）；ask_user 卡片再答携带 insert_round，
+    // 历史第 N 轮（上下文截到第 N-1 轮）；ask_user 再答及手动插入携带 insert_round，
     // 后端把回答轮插入历史第 N 轮之后（上下文截到第 N 轮）；普通发送不带
     // 该字段走追加语义
     if (direct && direct.targetRound) {
       payload.target_round = direct.targetRound;
-    } else if (direct && direct.insertAfterRound) {
+    } else if (direct && direct.insertAfterRound != null) {
       payload.insert_round = direct.insertAfterRound;
+      if (direct.strictInsertContext) payload.strict_insert_context = true;
     }
     // 内置工具（todo_write/ask_user）并入 selectedTools，与 MCP 工具一起随 tool_names 上送，
     // 后端按名称识别注入；未选择任何工具时不携带该字段，由后端回退会话/全局默认选择
@@ -1062,6 +1230,7 @@
               }
               // 补挂轮次标记与编辑/复制/删除入口（复用节点时幂等跳过）
               App.attachLiveRoundEntry(activeStream, activeStream.round);
+              App.rebuildQnav();
             }
             return;
           }
@@ -1238,7 +1407,8 @@
    * 编辑重发总编排：按模式执行删除/预演确认 → 重载会话 → 发送。
    * @param {{msg: HTMLElement, round: number, text: string, media: Array, mode: string}} plan
    *   mode: "regen"=重新生成该轮（原地替换，保留后续轮次）；
-   *         "truncate"=删除该轮及之后（GPT 语义）
+   *         "truncate"=删除该轮及之后（GPT 语义）；
+   *         "insert"=在该轮之前插入新对话
    */
   async function confirmEditResend(plan) {
     const sessionId = state.sessionId;
@@ -1248,6 +1418,15 @@
     if (state.streaming && state.streamingSession === sessionId) {
       const proceed = await requestStopRunningGeneration(sessionId);
       if (!proceed) return;
+    }
+    if (plan.mode === "insert") {
+      App.exitUserMessageEdit(plan.msg);
+      App.send({
+        text: plan.text, media: plan.media, docs: plan.docs || [],
+        quotes: plan.quotes || [], insertAfterRound: plan.round - 1,
+        strictInsertContext: true,
+      });
+      return;
     }
     // 复用附件：编辑重发不重新上传，删除清理时后端按 keep_media_refs 排除
     const keptRefs = (plan.media || [])
@@ -1259,6 +1438,7 @@
       App.send({
         text: plan.text,
         media: plan.media,
+        docs: plan.docs || [],
         // 引用快照：编辑态保留/移除后的最终列表（无则空数组）
         quotes: plan.quotes || [],
         targetRound: targetRound,
@@ -1290,8 +1470,8 @@
       // 重新生成该轮：不预删！直接带 target_round 发送，后端轮次收尾时把
       // 新回复整轮替换到历史第 N 轮位置（替换即删旧插新）。
       // 若先删后发，后续轮次会前移导致 target_round 与删后编号错位，
-      // 新回复会错误替换到原第 N+1 轮的位置。
-      // 旧轮的孤儿附件留在盘上（无引用、占位极小），可经消息媒体删除功能清理。
+      // 新回复会错误替换到原第 N+1 轮的位置。旧轮附件等新轮原子写入后，
+      // 后端再按剩余历史引用差集清理；重发失败时不会提前删除旧附件。
       doSend(plan.round);
       return;
     }

@@ -451,27 +451,49 @@ html[data-theme="dark"] {
 
 // ---------- 子任务块（sub_agent） ----------
 // 父智能体派发的子任务独立块：标题条（#序号·任务摘要·状态徽标）+
-// 可折叠区（任务/计划/思考/正文/工具轨迹/最终回复）。左侧缩进边框
-// 视觉上区分父子层级。
+// 可折叠区（任务/计划/思考/正文/工具轨迹/最终回复），与其他工具块对齐。
 
 // 思考复用主区 think-block（默认折叠）；正文区始终显示（空时隐藏标题）；
 // 工具调用复用主区 tool-block（默认折叠）
 .agent-block {
-  // 左缩进 18px：宽度同步减去该缩进，避免 100% + 18px 溢出消息区右缘
-  width: calc(100% - 18px);
-  margin: 4px 0 4px 18px;
+  width: 100%;
+  margin: 4px 0;
   border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
   overflow: hidden;
   animation: msg-in 0.2s ease;
 
+  .agent-dispatch {
+    margin: 8px 0;
+    > summary { cursor: pointer; }
+    > pre { margin-top: 6px; }
+  }
+
+  .agent-header {
+    display: flex;
+    align-items: center;
+  }
+
+  .agent-stop {
+    flex-shrink: 0;
+    margin-right: 12px;
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 12px;
+    &:hover { background: var(--bg-hover); }
+    &:disabled { opacity: 0.6; cursor: wait; }
+    &[hidden] { display: none; }
+  }
+
   .agent-head {
     display: flex;
     align-items: center;
     gap: 8px;
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     min-height: 38px;
     padding: 8px 14px;
     font-size: 13px;
@@ -487,18 +509,11 @@ html[data-theme="dark"] {
   .agent-icon {
     display: inline-flex;
     flex-shrink: 0;
+    color: var(--tool-icon-pink);
 
     .icon {
-      width: 15px;
-      height: 15px;
-    }
-  }
-
-  &.is-running .agent-icon {
-    color: var(--text-secondary);
-
-    .icon {
-      animation: spin 1.2s linear infinite;
+      width: 18px;
+      height: 18px;
     }
   }
 
@@ -509,6 +524,7 @@ html[data-theme="dark"] {
   }
 
   .agent-summary {
+    flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -608,6 +624,10 @@ html[data-theme="dark"] {
 // 任务区（start.task 原文）
 .agent-task {
   color: var(--text);
+  max-height: none;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 // 每轮分区
@@ -1366,7 +1386,8 @@ html[data-theme="dark"] {
   .msg-quote-jump {
     appearance: none;
     display: block;
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     padding: 8px 7px;
     border: 0;
     border-radius: 8px;
@@ -1578,6 +1599,39 @@ html[data-theme="dark"] {
     flex-wrap: wrap;
     gap: 8px;
     margin: 0 0 8px;
+  }
+
+  .msg-edit-upload-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 8px;
+  }
+
+  .msg-edit-upload {
+    padding: 5px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+
+    &:hover {
+      background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+      color: var(--text-primary);
+    }
+  }
+
+  .msg-edit-upload-hint {
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  .msg-edit-file-input {
+    display: none;
   }
 
   // 引用芯片行（编辑态）：短预览 + 移除，位于附件行下方、输入框上方

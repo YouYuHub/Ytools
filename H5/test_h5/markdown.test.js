@@ -246,6 +246,29 @@ test("render: ```mermaid 代码块渲染为双视图控件（渲染中占位）"
   assert.ok(html.includes('data-svg-code="graph TD'), html);
 });
 
+test("render: Mermaid 后续流式内容与图表处于同一 .md 根容器", function () {
+  const prefix = "## 流程图\n\n```mermaid\ngraph LR\n  A --> B\n```";
+  const firstRender = Markdown.render(prefix);
+  const nextRender = Markdown.render(prefix + "\n\n图表之后的说明");
+
+  // renderPreservingWidgets 必须以 .md 根节点为重绘容器：图表是其直接子节点，
+  // 后续文本也位于同一根节点；若错误地用外层消息容器作锚点，重绘会抛错。
+  assert.ok(firstRender.startsWith('<div class="md"><h2>流程图</h2><div class="md-svg-block md-mermaid-block"'), firstRender);
+  assert.ok(nextRender.startsWith('<div class="md"><h2>流程图</h2><div class="md-svg-block md-mermaid-block"'), nextRender);
+  assert.ok(nextRender.endsWith("<p>图表之后的说明</p></div>"), nextRender);
+});
+
+test("render: SVG 控件之后追加流式内容时仍处于同一 .md 根容器", function () {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><rect width="20" height="10"/></svg>';
+  const prefix = "## SVG 图\n\n```svg\n" + svg + "\n```";
+  const firstRender = Markdown.render(prefix);
+  const nextRender = Markdown.render(prefix + "\n\nSVG 图之后的说明");
+
+  assert.ok(firstRender.startsWith('<div class="md"><h2>SVG 图</h2><div class="md-svg-block"'), firstRender);
+  assert.ok(nextRender.startsWith('<div class="md"><h2>SVG 图</h2><div class="md-svg-block"'), nextRender);
+  assert.ok(nextRender.endsWith("<p>SVG 图之后的说明</p></div>"), nextRender);
+});
+
 test("render: 一行一张 mermaid 图（多块独立）", function () {
   const block = (dir) => "```mermaid\ngraph " + dir + "\n  A --> B\n```";
   const html = Markdown.render(block("TD") + "\n\n" + block("LR"));
@@ -523,4 +546,3 @@ test("mermaid: applyMermaidSvg 注入的宽度同乘 --md-zoom", async function 
   assert.ok(String(holder._svg.style.maxWidth).includes("var(--md-zoom, 1)"), String(holder._svg.style.maxWidth));
   delete global.mermaid;
 });
-

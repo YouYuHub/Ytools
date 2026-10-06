@@ -1642,20 +1642,52 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   }
 }
 .agent-block {
-  width: calc(100% - 18px);
-  margin: 4px 0 4px 18px;
+  width: 100%;
+  margin: 4px 0;
   border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
   overflow: hidden;
   animation: msg-in 0.2s ease;
 }
+.agent-block .agent-dispatch {
+  margin: 8px 0;
+}
+.agent-block .agent-dispatch > summary {
+  cursor: pointer;
+}
+.agent-block .agent-dispatch > pre {
+  margin-top: 6px;
+}
+.agent-block .agent-header {
+  display: flex;
+  align-items: center;
+}
+.agent-block .agent-stop {
+  flex-shrink: 0;
+  margin-right: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.agent-block .agent-stop:hover {
+  background: var(--bg-hover);
+}
+.agent-block .agent-stop:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.agent-block .agent-stop[hidden] {
+  display: none;
+}
 .agent-block .agent-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 38px;
   padding: 8px 14px;
   font-size: 13px;
@@ -1669,16 +1701,11 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .agent-block .agent-icon {
   display: inline-flex;
   flex-shrink: 0;
+  color: var(--tool-icon-pink);
 }
 .agent-block .agent-icon .icon {
-  width: 15px;
-  height: 15px;
-}
-.agent-block.is-running .agent-icon {
-  color: var(--text-secondary);
-}
-.agent-block.is-running .agent-icon .icon {
-  animation: spin 1.2s linear infinite;
+  width: 18px;
+  height: 18px;
 }
 .agent-block .agent-title {
   flex-shrink: 0;
@@ -1686,6 +1713,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   color: var(--text);
 }
 .agent-block .agent-summary {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1770,6 +1798,10 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 
 .agent-task {
   color: var(--text);
+  max-height: none;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .agent-round {
@@ -2410,7 +2442,8 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .msg-quote-popover .msg-quote-jump {
   appearance: none;
   display: block;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   padding: 8px 7px;
   border: 0;
   border-radius: 8px;
@@ -2585,6 +2618,34 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   flex-wrap: wrap;
   gap: 8px;
   margin: 0 0 8px;
+}
+.msg-user .msg-edit-upload-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+.msg-user .msg-edit-upload {
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-user .msg-edit-upload:hover {
+  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+  color: var(--text-primary);
+}
+.msg-user .msg-edit-upload-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.msg-user .msg-edit-file-input {
+  display: none;
 }
 .msg-user .msg-edit-quote-row {
   display: flex;
@@ -6261,8 +6322,14 @@ html:not([data-theme=dark]) #voiceBtn.is-recording {
   font-weight: 600;
 }
 .ask-questions .ask-custom {
-  height: 38px;
-  padding: 0 12px;
+  width: 100%;
+  min-height: 88px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.5;
+  font-family: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--bg-code);

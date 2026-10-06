@@ -15,7 +15,7 @@
 | 2 | diff 生成时机 | 写入**之前**生成（read → validate → new_content → diff → write） | ✅ 采纳：edit_file 在内存中用归一化文本算 diff 后写回；write_file 先读旧内容 | 为将来「确认后再写」的审批流留好接入点 |
 | 3 | 结果结构 | 新建 `EditResult` dataclass | 🔧 变通：不建 dataclass，直接在现有结构化 result dict 上加字段 | 全链路是 dict 直传（有 `_sub_agent` 先例），加字段零序列化成本 |
 | 4 | 前端数据形态 | 后端发结构化 diff 行数组 `{type, old_line, new_line, content}` | ❌ 改用 **unified diff 文本 + 前端轻解析** | 本项目一份工具结果文本同时走「模型上下文 / SSE / JSONL」三条链路，结构化数组体积 3~5 倍会明显吃 token 与历史文件体积；unified diff 是标准格式，前端逐行看首字符即可解析 |
-| 5 | diff 进模型上下文 | diff 原样进 result 给模型核对 | ❌ **不进模型上下文**：模型只看 message 中「+N -M 行」统计摘要，diff 全文经 `_file_diff` 顶级键剥离、仅推前端与落盘 | 模型刚提交过 old/new，diff 主要是给用户看的；省 token 且历史文件不膨胀 |
+| 5 | diff 进模型上下文 | diff 原样进 result 给模型核对 | ✅ **紧凑摘要 + 按需 diff**：模型收到 success、path、替换数量、修改行范围、统计与 hash；仅小型且不重复请求参数的 diff 会进入模型结果。完整 diff 仍单独走前端与落盘 | 让模型能确认是否成功和改动范围，同时限制重复文本与 token 消耗 |
 | 6 | 原子写入 | tmp + fsync + os.replace | ✅ 覆盖写和 edit_file 已实现；追加保留追加写语义 | 同目录临时文件写完后替换目标 |
 | 7 | 文件版本校验 | read 返回 content_hash + edit 传 expected_hash | ✅ 已实现 | 指纹不一致返回 `FILE_MODIFIED_EXTERNALLY`，原文件不写入 |
 | 8 | history 版本快照 / Batch Edit / preview 审阅 | 均建议实现 | ⏭️ 全部放阶段 2 | GPT 自己也建议第一版收敛 |
@@ -28,19 +28,21 @@
 - 内置 `edit_file`：写回前生成 unified diff（归一化旧文本 vs 更新后文本），结果携带 `_file_diff` 顶级键；message 追加「diff +N -M 行」与「内容指纹 xxxx」；
 - 内置 `write_file`：写回前读旧内容（跳过二进制），覆盖 / 追加 / 新建三路径生成 diff；新建文件 diff 呈纯 `+` hunk；追加模式 diff 的 new_text = 旧内容 + 新内容；
 - `read_file` 返回 `content_hash`（全文指纹，可传给 `edit_file.expected_hash`）；
-- diff **不进模型上下文**（主循环与子任务循环统一剥离），仅随 SSE 事件与 JSONL 落盘分发；
+- 完整 `_file_diff` 不进模型上下文，仅随 SSE 事件与 JSONL 落盘分发；edit_file 另生成精简的模型结果，小型且非重复的 diff 可按需附带；
 - 前端工具块输出区渲染彩色 diff 视图（实时 + 历史回放 + 子任务块三挂点）；
 - MCP sys_tools_server 版同名工具不受影响（返回纯文本，无 diff，前端自动回退）。
 
-### 1.2 V1 明确不做（阶段 2 预留）
-| 项 | 说明 | 阶段 2 方向 |
+### 1.2 V1 明确不做（阶段 2 预留）——后续版本已陆续落地
+> 原「阶段 2 预留」的前三项（原子写入 / 版本校验 / history 版本快照）已分别在 V1.x 与 V2 实现；本表仅作历史记录。
+
+| 项 | 说明 | 落地状态 |
 |---|---|---|
-| 原子写入 | tmp + fsync + os.replace | `factory/agent_runtime/builtin_tools.py` 写回处替换实现即可 |
-| 版本校验 | edit 增加 `expected_hash` 参数，与当前 `content_hash` 不匹配时报 `FILE_MODIFIED_EXTERNALLY` | 防御「模型读后用户手改」竞态；`content_hash` 已就绪 |
-| 用户审批流 | 展示 diff → 用户确认 → 应用 | 复用现有 `ask_user` 卡片交互，无需新状态机 |
-| history_files 版本快照 | `001_main.py → 002_main.py` 链式版本 | 基于 `content_hash` 判断无变化跳过 |
-| 同文件 Batch Edit | 一次读入、批量替换、单一总 diff、原子写 | 一个失败全部不写 |
-| delete_file / move_file | 统一 FileChange 结果结构 | 复用 `_file_diff` 通道 |
+| 原子写入 | tmp + fsync + os.replace | ✅ 已实现（`_atomic_write_text`，覆盖写与 edit_file 写回均走它；追加保留追加写语义） |
+| 版本校验 | edit 增加 `expected_hash` 参数，与当前 `content_hash` 不匹配时报 `FILE_MODIFIED_EXTERNALLY` | ✅ 已实现 |
+| history 版本快照 | `001_main.py → 002_main.py` 链式版本 | ✅ 已实现（本文 §9，基于 `content_hash` 去重） |
+| 用户审批流 | 展示 diff → 用户确认 → 应用 | ⏭️ 未实现（阶段 3 预留） |
+| 同文件 Batch Edit | 一次读入、批量替换、单一总 diff、原子写 | ⏭️ 未实现 |
+| delete_file / move_file | 统一 FileChange 结果结构 | ⏭️ 未实现（delete_file 列于 §9.8 阶段 3 预留） |
 
 ---
 
@@ -80,6 +82,8 @@ graph TD
 | `lines_removed` | int | `-` 行数（不含文件头） |
 | `diff_truncated` | bool | diff 文本超过上限被提前截断时为 true |
 | `diff_skipped` | str | `""`（正常）/ `"file_too_large"`（超限跳过）/ `"unchanged"`（内容无变化） |
+| `path` | str | 文件绝对路径（V2.2 新增；`file_too_large` 跳过分支等可能缺省，前端按调用参数 / diff 文件头兜底） |
+| `display_path` | str | 展示用路径（V2.2 新增；缺省兜底同上） |
 
 常量（文件顶部 diff 段注释处）：
 
@@ -103,7 +107,7 @@ graph TD
 
 | 去向 | 处理点 | 行为 |
 |---|---|---|
-| 模型上下文 | `factory/chat_factory.py::_format_tool_result` 与 `factory/agent_runtime/sub_agent.py::_format_result_text` | 统一剥离 `_file_diff` 后 json.dumps；模型只在 message 里看到「diff +N -M 行」统计 |
+| 模型上下文 | `factory/chat_factory.py::_format_tool_result` 与 `factory/agent_runtime/sub_agent.py::_format_result_text` | 选用 `_model_result` 精简视图；完整 `_file_diff` 不进模型。edit_file 返回成功标志、路径、替换数、修改范围、统计和 hash；紧凑且不重复的 diff 可选进入 |
 | JSONL 落盘 | `chat_factory.py` 主循环 history_record（正常结果路径） | record 增加 `file_diff` 字段（与 `result` 并列） |
 | SSE 事件 | `chat_factory.py` tool_return 事件与 `sub_agent.py` 正常 tool_result 子事件 | 事件对象增加 `file_diff` 字段（与 `result` 并列） |
 
@@ -113,9 +117,9 @@ graph TD
 
 - 生成：`_content_hash(text)` = 解码后全文 UTF-8 sha256 前 16 位 hex（`errors="replace"`）；
 - 三个工具均返回：
-  - `read_file`：**全文**（非本次读取区间）的指纹；两个 return 点（lines 模式与 char_chunk 模式）都有；
+  - `read_file`：**全文**（非本次读取区间）的指纹；三个 return 点（空文件早退 / lines 模式 / char_chunk 模式）都有；
   - `edit_file`：替换后全文的指纹；
-  - `write_file`：写入内容的指纹（空内容省略）；
+  - `write_file`：写入内容的指纹（仅"追加模式且旧内容不可读（二进制 / 旧文件超 256KB）"时省略；覆盖模式写空内容仍返回空串指纹）；
 - message 同步附带「内容指纹 xxxx」便于用户/模型肉眼比对；
 - 当前用法：模型把 `read_file.content_hash` 作为 `edit_file.expected_hash` 传入；执行时与当前文件的全文指纹比对，不一致报 `FILE_MODIFIED_EXTERNALLY`，原文件保持不变。
 
@@ -188,7 +192,7 @@ tool-block 状态机配套：
 
 - 明色：add 行 `rgba(46,160,67,.16)` 绿底、del 行 `rgba(248,81,73,.16)` 红底、徽标 `#1a7f37` / `#cf222e`；
 - 暗色（`html[data-theme="dark"]`）：徽标换 `#7ee787` / `#ff9492`；
-- `.diff-code` `max-height: 260px` 滚动；`.diff-no` 双行号列 `min-width: 56px` 右对齐；等宽字体与 tool-io 一致。
+- `.diff-code` `max-height: 260px` 滚动；`.diff-no` 拆为 `.diff-no-old` / `.diff-no-new` 两个子列，各 `min-width: 34px` 右对齐；等宽字体与 tool-io 一致。
 
 **改 SCSS 后必须重编译**：`sass H5\style\scss\main.scss H5\style\css\main.css --style=expanded --no-source-map`（sass 在 D:\npm_global）。
 
@@ -203,7 +207,7 @@ tool-block 状态机配套：
 | 后端旧版本 + 新前端 | 事件无 file_diff → applyToolResult 直接走纯文本分支，不报错 |
 | 新后端 + 旧前端缓存 | 多出的 file_diff 字段被忽略，输出仍为 result 纯文本 |
 | 超大文件（>256KB） | diff 置空 + `diff_skipped="file_too_large"`，前端显示「文件过大，跳过 diff」 |
-| write_file 覆盖二进制文件 | 读旧内容时检测到二进制 → old_text 为空 → diff 呈纯 `+`（按新建语义展示） |
+| write_file 覆盖二进制文件 | 读旧内容时检测到二进制 → old_text 置 None → 返回空 diff 占位 `diff_skipped="file_too_large"`，前端徽标显示「文件过大」（不渲染纯 `+` hunk） |
 
 ---
 
@@ -271,7 +275,7 @@ history_files/session_files/<session>/file_diffs/
 meta.json 结构：`{version:1, key, path(绝对), display_path, kept, gens:[{gen,at,round,reason,locked}], versions:[...], total:{...缓存}, encoding, eol}`；
 每版本条目：`{v, gen, file, hash(sha256:16 复用 content_hash 口径), bytes, at, round, role, tool, eol, encoding, added, removed, diff(单次diff文本), diff_truncated, diff_skipped, prev_v, undone_hunks[], rollback_from?, rollback_to?}`。
 
-**role 白名单**：`baseline`（代起点）/ `tool`（write_file、edit_file、sub_agent.*）/ `user_edit`（编辑器保存）/ `hunk_undo` / `rollback` / `external`（外部改动探测，见下）。
+**role 白名单**（`_VALID_ROLES`，共 7 个）：`baseline`（代起点）/ `tool`（write_file、edit_file、sub_agent.*）/ `user_edit`（编辑器保存）/ `hunk_undo` / `hunk_keep` / `rollback` / `external`（外部改动探测，见下）。版本条目另可携带 `source`（如 `disk_sync`）与 `kept_hunks`（hunk_keep 记录保留块）字段。
 
 ### 9.3 入链数据流（对 V1 链路最小侵入）
 
@@ -294,17 +298,17 @@ graph TD
 - write_file **追加模式** new_text = old_text + content（最终全文，保证版本链内容真实）；
 - **外部改动探测**：工具读到的 old_text hash ≠ 链上最新版本 hash → 先补记 `role=external` 版本（diff = 最新版本→外部状态，即"用户改了什么"），再入 tool 版本；时间线形如 `[base, tool, external, tool]`；
 - record_change 不写工作文件（工具已写完磁盘），rollback / user_save 会写回磁盘并按版本 eol/encoding 还原；
-- 会话目录命名复用 `memory.file_memory._safe_session_id`；进程内每会话一把 `threading.RLock`（生成任务在 worker 进程内由 asyncio 单线程调度，跨进程由 FastAPI 路由的锁互斥兜底）。
+- 会话目录命名复用 `memory.file_memory._safe_session_id`；进程内每会话一把 `threading.RLock`（生成任务在 worker 进程内由 asyncio 单线程调度；FastAPI 路由直接调用 store 函数、无额外路由级锁，跨进程互斥依赖单 worker 部署形态）。
 
 ### 9.4 REST 接口（`routers/file_history_router.py`，前缀 `/file_diff`）
 
 | 方法 | 路径 | 参数 | 返回 |
 |---|---|---|---|
-| GET | `/file_diff/list` | session_id | `{files:[{key,path,display_path,kept,versions,added,removed,updated_at,last_role}], stats:{total,added,removed}}` |
-| GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed}]}` |
+| GET | `/file_diff/list` | session_id, hide_clean?(默认 true，只列仍有行数变化的文件) | `{files:[{key,path,display_path,kept,versions,added,removed,updated_at,last_role}], stats:{total,added,removed}}` |
+| GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed,kept}]}` |
 | GET | `/file_diff/content` | session_id, key, v?(缺省最新) | `{...,v,hash,role,tool,round,encoding,eol,kept,content(全文)}` |
 | GET | `/file_diff/total_diff` | session_id, key | `{key,display_path,baseline_v,current_v,kept,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` |
-| GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h}],hunks:[{index,old_start,old_count,new_start,new_count}],truncated,max_rows,diff,...统计}`（V2.2 全文视图，见 9.8） |
+| GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h?(仅 del/add 行有 h，ctx 行无)}],rows_total,hunks:[{index,old_start,old_count,new_start,new_count}],truncated,max_rows,diff,...统计}`（V2.2 全文视图，见 9.8） |
 | GET | `/file_diff/change_diff` | session_id, key, v | `{...,v,prev_v,gen,role,tool,round,at,diff,lines_added,lines_removed}` |
 | POST | `/file_diff/hunk_undo` | body {session_id,key,hunk_index,until_hunk?} | `{ok,hunk,undone_count,total,version}`（追加 hunk_undo 版本并写回磁盘，不可恢复；until_hunk=True 撤回此处及之后） |
 | POST | `/file_diff/hunk_keep` | body {session_id,key,hunk_index,until_hunk?} | `{ok,version,new_gen,kept_hunk,kept_count,total}`（保留该块：其余还原为基线；开新代基线并写回磁盘；until_hunk=True 保留此处及之后） |
@@ -332,7 +336,8 @@ hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上�
 | 文件 | 内容 |
 |---|---|
 | `js/api.js` | listFileChanges / fileVersions / fileContent / fileTotalDiff / fileFullView / fileChangeDiff / fileHunkUndo / fileHunkKeep / fileSyncFromDisk / fileRollback / fileSave / fileKeep / fileHistoryDelete / fileCleanup / fileKeepAll / fileRevertAll |
-| `js/app/filehistory.js` | 顶栏徽标（文件数，2s 轮询 sessionId 变化 + 400ms 防抖刷新）+ 统计面板（全部保留 / 全部撤回 / 清理留档按钮，均二次确认）；点击文件新窗口打开 `editor.html` |
+| `js/file_history_sync.js` | 跨页徽标脏标记同步：BroadcastChannel + storage + localStorage 三通道，主页面 / 编辑器页共享（配套测试 `H5/test_h5/file_history_sync.test.js`） |
+| `js/app/filehistory.js` | 顶栏徽标（文件数，纯事件驱动刷新：`noteSessionChanged` 会话切换事件 + `FileHistorySync` 脏标记，`BADGE_REFRESH_MIN_INTERVAL_MS=1500` 节流；不再保留定时轮询）+ 统计面板（全部保留 / 全部撤回 / 清理留档按钮，均二次确认）；点击文件新窗口打开 `editor.html` |
 | `editor.html` + `js/app/editor.js` | **V2.3 独立 diff 编辑器页**：URL 参数 `?session_id&key`；全文视图 ctx/add 行均可编辑（overlay：Prism 高亮层 + 透明 textarea）；del 红块只读；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留；顶栏固定「↑上一块 / ↓下一块」差异块跳转（V2.5，滚动位置锚定）；顶栏主题下拉（跟随系统/浅色/深色，与主应用共用 ThemeManager / ytools-theme-preference），API 指向同源 localStorage `ytools-api-base` |
 | `js/app/chat.js` | tool_return 处挂 `scheduleFileChangesBadgeRefresh` |
 | `style/scss/_filehistory.scss` | 面板/编辑器样式（add/del 色值与 V1 diff-view 同口径；dark 主题变量） |
@@ -340,14 +345,14 @@ hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上�
 编辑器交互规则（对齐 VS Code inline diff 效果）：
 - 行级 Total Diff 单栏：`ctx` 行（未变）正常渲染**不可编辑**（保持定位稳定）；`add` 行绿底 textarea **可编辑**；`del` 行红底**无行号**只读（删除线，模拟 VS Code 删除行内联展示）；
 - 每个 hunk 头部独立「撤回此块」按钮：后端把该 hunk 的 +/- 区段还原为基线旧行（`_undo_one_hunk`），追加 `hunk_undo` 版本；**无 redo**（撤回即消失，历史快照仍在链上可看）；
-- 「保存」：前端把 ctx 行原文 + add 行当前值重组全文提交（`composeCurrentContent`），走 expected_hash 乐观锁（磁盘被外部修改 → 409 提示刷新），成功后追加 `user_edit` 版本并写回磁盘；
+- 「保存」：前端把 ctx 行原文 + add 行当前值按行序重组全文提交（`composeContent`；undo 快照走 `serializeRows`），走 expected_hash 乐观锁（磁盘被外部修改 → 409 提示刷新），成功后追加 `user_edit` 版本并写回磁盘；
 - 「回退到基线」（Revert file）/「回退到第 N 轮发起时」（下拉框，可选轮次 = 链上出现过的 round 降序）：追加 `rollback` 版本并写回磁盘；
 - 「保留」：当前代锁定（历史代版本拒绝作为回退/撤回目标，409），以当前内容开新代基线；保留后继续变更在新代跟踪；
 - 面板行徽标：`+N` 绿 `-M` 红 / `已保留` 锁标；超大文件（>256KB 未入链）不出现在面板。
 
 ### 9.7 测试与验证
 
-`test/test_file_history.py`（V2.4：29 用例）：record 入链结构（baseline+tool 全文落盘）/ Total Diff=基线→当前（GPT 建议核心场景）/ 单次 diff / 幂等 unchanged / external 探测 / rollback to_round 与 baseline（磁盘写回验证）/ hunk undo 单块还原（含磁盘写回）/ until_hunk 区间撤/留 / 越界与空变更报错 / user_save 乐观锁冲突与成功 / keep 锁定+新代 / 超大文件不入链 / file_key 大小写稳定 / hunk 头解析 / full_view rows+hunks+截断 / cleanup 批量清理 / full_view.hunks 与接口坐标一致 / keep_all·revert_all 批量封版与批量回退（含错误隔离）。
+`test/test_file_history.py`（32 用例）：record 入链结构（baseline+tool 全文落盘）/ Total Diff=基线→当前（GPT 建议核心场景）/ 单次 diff / 幂等 unchanged / external 探测 / rollback to_round 与 baseline（磁盘写回验证）/ hunk undo 单块还原（含磁盘写回）/ until_hunk 区间撤/留 / 越界与空变更报错 / user_save 乐观锁冲突与成功 / keep 锁定+新代 / 超大文件不入链 / file_key 大小写稳定 / hunk 头解析 / full_view rows+hunks+截断 / cleanup 批量清理 / full_view.hunks 与接口坐标一致 / keep_all·revert_all 批量封版与批量回退（含错误隔离）。
 
 验证命令：`python -m pytest test/test_file_history.py -q --no-header`；全量（当前 539 passed，其中含 V1 的 13 用例）。
 
@@ -357,7 +362,7 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 
 **V2.1 追加（2026-09，按用户实测反馈）**：
 - 统计面板只显示**文件名**（完整路径入 `title` hover 可见；同目录前缀不再截断行宽）；`/file_diff/list` 默认 `hide_clean=true`——已保留 / 已全部撤回（Total 无行数变化）的文件不再展示，版本链留档可经 `DELETE /file_diff/delete` 清理（`/list?hide_clean=false` 可显式列出全部）；
-- **保存算法修正**：编辑器保存改为"以当前版本全文为底、仅替换被编辑过的绿行"（`composeCurrentContent`）。旧实现按 diff 行重组会丢失 hunk 之间的大段正文（compact diff 只有 ±2 行上下文），属严重缺陷，已修复并补测试；
+- **保存算法修正**：编辑器保存改为"以当前版本全文为底、仅替换被编辑过的绿行"（`composeContent`）。旧实现按 diff 行重组会丢失 hunk 之间的大段正文（compact diff 只有 ±2 行上下文），属严重缺陷，已修复并补测试；
 - 新增 **hunk_keep（保留此处）**：`/file_diff/hunk_keep` 把单个差异块固化为新代基线（其余块还原为基线、Total 归零、写回磁盘、旧代不锁定），del-only 块同样适用；
 - 回退到基线 / 回退到某轮 / 保留 / 保留此处 / 撤回此块全部走**二次确认**模态框（`#fhConfirmModal`）；
 - 编辑器标题完整显示文件路径（换行 + 缩小字号 + 点击复制完整路径）；
@@ -390,11 +395,11 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **面板文件名单行化**：列表改用 `baseNameOf()` 只显示文件名末段（完整路径 hover title 可见，点击编辑器头部仍显完整路径），长路径不再截断行宽；
 - **顶栏层级修复**：`.topbar` z-index 25→26（原与输入区 `.bottom` 同为 25 且 DOM 靠前，输入框多行时文件变更面板被输入区遮挡）；
 - 面板 footer 改两行布局：提示语一行、三个操作按钮（全部保留绿 / 全部撤回橙 / 清理留档红）右对齐一行；
-- **修复 422**：批量接口请求模型改用独立的 `SessionOnlyRequest`（仅 session_id，初版误复用含必填 `key` 的 KeepRequest 导致 422）；`api.js` 的 `request()` 对 FastAPI 422 数组型 detail 逐条转可读文本（原直接塞对象显示 `[object Object]`）；新增路由级回归 `test/test_file_history_router.py`（TestClient 锁定只发 `{session_id}` 必须 200，3 用例）；
+- **修复 422**：批量接口请求模型改用独立的 `SessionOnlyRequest`（仅 session_id，初版误复用含必填 `key` 的 KeepRequest 导致 422）；`api.js` 的 `request()` 对 FastAPI 422 数组型 detail 逐条转可读文本（原直接塞对象显示 `[object Object]`）；新增路由级回归 `test/test_file_history_router.py`（TestClient 锁定只发 `{session_id}` 必须 200，4 用例）；
 - **徽标实时同步**：面板数据刷新（refreshPanelData）与顶栏徽标统一走 `refreshBadge(prefetched?)`（复用同一次 /list 响应免二次请求）；编辑器窗口（独立页）内操作后回到主页：window focus / visibilitychange 时同步；keep_all（含 cleanup）/ revert_all 完成回调也即时刷新——红点数字不再滞后；
 - **回退空基线删除磁盘文件**：`rollback` 与 `hunk_undo` 写回内容为空文本（= 新建文件的"从未创建"基线）时 `unlink` 删除磁盘文件（返回新增 `disk_removed` 标记），不再留 0 字节空文件；revert_all 结果逐条带 `disk_removed`，前端 toast 提示"含 N 个新建文件已删除"；
 - **keep_all 自动清理留档**：封版后历史代已锁定（回退被 409 拒绝），版本链仅剩"编辑器回看"价值——`POST /file_diff/keep_all` 请求模型改为 `KeepAllRequest{session_id, cleanup?=true}`，默认封版完成后顺带 `cleanup_file_histories(clean_only=True)` 清理留档目录（响应新增 `cleaned_count`），历史不再自动累积占磁盘；
-- 测试：`test_file_history.py` 新增 keep_all 批量封版 / revert_all 批量回退 / 错误隔离 / 空基线删文件 / 混合场景 / cleanup 留档 6 用例（33 个）；路由套件 5 用例（49 个含 V1 file_diff）。
+- 测试：`test_file_history.py` 新增 keep_all 批量封版 / revert_all 批量回退 / 错误隔离 / 空基线删文件 / 混合场景 / cleanup 留档 6 用例（累计 32 个）；路由套件 4 用例。
 
 **V2.5 追加（2026-09，按用户实测反馈）**：
 - **差异块导航**：顶栏操作栏新增固定「↑ 上一块 / ↓ 下一块」按钮（`eh-hunk-nav`，关闭按钮左侧）——初版把按钮放进 hunk 头并给块头加 sticky 钉顶，实测同一滚动容器内多个 sticky 块头互相叠压显示错乱、钉住态 rect 不反映真实文档位置导致跳转只挪一行；V2.5 重构为固定顶栏 + `jumpHunk(dir)` **滚动位置锚定**：以滚动容器顶 32px 锚定带内命中的块头为"当前块"（带内没有取容器上方最近块头，上方没有返回 -1 落到头/尾块），跳到相邻块头并把其滚到容器顶下 8px（正好落回锚定带，可连续点击逐块推进）；纵向只调 `scrollTop` 不经 `scrollIntoView`（避免横向滚动位置被拉回最左）；跳转后目标块头 `is-flash` 900ms 高亮辅助定位，到达头/尾时 toast 提示。紧凑视图（truncated）同样适用，无差异块时 toast「没有可跳转的差异块」；
@@ -402,4 +407,6 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **面板避让问题导航条**：顶栏展开面板 `right: 12px → 40px`——右侧问题导航条 qnav（`right:14px`、轨道虚线最宽 20px，最左缘约距右 38px）z-index 30 高于顶栏 26，空间重叠时导航条会画在面板上；面板右缘外移至距主区右缘约 56px、与轨道留 ~18px 间隙（移动端 qnav 隐藏，媒体查询内 `right:8px` 覆盖不变）；
 - **编辑器页主题切换**：顶栏新增下拉（跟随系统/浅色/深色），复用 `js/theme.js` ThemeManager（同一 `ytools-theme-preference` 偏好、`themechange` 事件、system 跟随 prefers-color-scheme）；页面 `<html data-theme="light">` 初值由 theme.js 首绘前按偏好覆盖，消除"编辑器页只有深色"的不可切换问题。
 
-阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 版本链原子写入（tmp+os.replace）/ 删除文件（delete_file）入链 / 编辑器行内 Prism 语法高亮 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地。
+阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 版本链原子写入（tmp+os.replace）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。
+
+`read_file` 现已在读取前检查 64 MiB 上限，并在读取时再次限制字节数；模型调用链中的返回字符预算还会随当前模型窗口收紧。

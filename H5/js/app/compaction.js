@@ -72,13 +72,13 @@
     try {
       const results = await Promise.all([
         API.getContextTokenStats(state.sessionId, null, Array.from(state.selectedTools)),
-        API.getHistoryCompactionConfig(),
+        API.getHistoryCompactionConfig(state.sessionId),
       ]);
       const stats = results[0] || {};
       const config = results[1] || {};
       const limit = Number(stats.context_token_limit) || 0;
       used = Number(stats.request_context_tokens) || 0;
-      // 仅展示参考预算 = 摘要总预算上下文（聊天窗口 × 摘要预算比例，聊天设置中可配）；
+      // 摘要预算按当前会话聊天/压缩模型的较小窗口计算，与后端手动压缩一致。
       // 手动确认后无论当前占用是否达到该预算，都统一纳入累计摘要
       threshold = Number(config.summary_total_budget);
       if (!Number.isFinite(threshold) || threshold <= 0) {

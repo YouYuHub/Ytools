@@ -7,6 +7,7 @@ import io
 import subprocess
 # import typing
 import tempfile
+from util.text_encoding import decode_text, unicode_bom
 from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -36,17 +37,9 @@ except Exception:
 
 
 def _parse_txt(data: bytes, encoding: Optional[str] = 'utf-8') -> str:
-    """文本解码：指定编码优先，失败后走统一回退链（utf-8-sig/utf-8/gb18030/big5/latin-1）。
-
-    此前失败直接 latin-1（会把 GBK 中文解成乱码）；改用回退链后
-    GBK/GB2312/Big5 等常见编码的中文文本都能正确还原。
-    """
-    if encoding:
-        try:
-            return data.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            pass
-    text, _used = decode_text_bytes(data)
+    """文本采用 BOM / 严格 UTF-8 / 常见中文编码回退，避免静默丢字。"""
+    # BOM takes precedence over the parser's default UTF-8 hint.
+    text, _used = decode_text(data, candidates=(encoding or 'utf-8',))
     return text
 
 
@@ -228,12 +221,9 @@ def _parse_doc(data: bytes) -> str:
             result = subprocess.run(
                 ['antiword', tmp_path],
                 capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore'
             )
             if result.returncode == 0:
-                return result.stdout
+                return decode_text_bytes(result.stdout)[0]
         except (subprocess.SubprocessError, FileNotFoundError):
             # antiword不可用，继续尝试catdoc
             pass
@@ -256,12 +246,9 @@ def _parse_doc(data: bytes) -> str:
             result = subprocess.run(
                 ['catdoc', tmp_path],
                 capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore'
             )
             if result.returncode == 0:
-                return result.stdout
+                return decode_text_bytes(result.stdout)[0]
         except (subprocess.SubprocessError, FileNotFoundError):
             # catdoc也不可用
             pass
@@ -304,13 +291,9 @@ def _parse_doc_with_pages(data: bytes) -> List[Dict]:
 def _parse_csv(data: bytes) -> str:
     if pd is None:
         raise RuntimeError('pandas not installed')
-    with io.BytesIO(data) as bio:
-        bio.seek(0)
-        try:
-            df = pd.read_csv(bio, dtype=str, engine='python')
-        except Exception:
-            bio.seek(0)
-            df = pd.read_csv(bio, dtype=str, encoding='utf-8', engine='python', on_bad_lines='skip')
+    text, _encoding = decode_text_bytes(data)
+    with io.StringIO(text) as bio:
+        df = pd.read_csv(bio, dtype=str, engine='python')
         texts = []
         for r in df.fillna('').astype(str).values:
             texts.append(' '.join(r.tolist()))
@@ -368,13 +351,7 @@ def _parse_txt_with_pages(data: bytes, encoding: Optional[str] = 'utf-8') -> Lis
     解析 TXT 文件（TXT 文件没有页码概念，返回 None）
     返回：包含 content 和 page_number 的字典列表
     """
-    if encoding:
-        try:
-            text = data.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            text, _used = decode_text_bytes(data)
-    else:
-        text, _used = decode_text_bytes(data)
+    text = _parse_txt(data, encoding)
     # TXT 文件没有页码概念，直接返回整个内容，页码设为 None
     return [{"content": text, "page_number": None}]
 
@@ -451,6 +428,8 @@ def is_probably_binary(data: bytes) -> bool:
     二进制（覆盖无空字节的压缩/编码数据）。
     """
     sample = bytes(data[:_BINARY_SNIFF_SAMPLE_BYTES])
+    if unicode_bom(data):
+        return False
     if b"\x00" in sample:
         return True
     if not sample:
@@ -468,12 +447,7 @@ def decode_text_bytes(data: bytes) -> tuple[str, str]:
     回退链：utf-8-sig（带 BOM 的 UTF-8）→ utf-8 → gb18030（GBK/GB2312 超集）
     → big5 → latin-1（单字节兜底，永不失败）。
     """
-    for candidate in _TEXT_DECODE_CANDIDATES:
-        try:
-            return data.decode(candidate), candidate
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return data.decode("latin-1", errors="replace"), "latin-1"
+    return decode_text(data, candidates=_TEXT_DECODE_CANDIDATES)
 
 
 def parse_text_file_bytes(filename: str, data: bytes) -> str:

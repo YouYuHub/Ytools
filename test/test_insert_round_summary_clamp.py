@@ -1,14 +1,5 @@
 # -*- coding: utf-8 -*-
-"""回答插入（insert_round）摘要钳制 + 摘要写盘失败可见化 测试。
-
-覆盖用户报告的两个压缩问题：
-1. "回答模型提问后立即大规模压缩"：旧实现整份失效累计摘要，下次任务全部
-   轮次退回未压缩，auto 压缩从第 1 轮整段重压。修复为覆盖范围钳制到插入点，
-   摘要保留、仅未覆盖轮次参与后续压缩。
-2. "压缩失败后不从上次位置/上次摘要继续"：update_context_summary 写盘失败
-   静默跳过会让摘要不生效、下次从原始历史重压。修复为抛出，调用方区分
-   关键/非关键路径。
-"""
+"""历史编辑/插入保留压缩快照，并校验轮次索引与原文补充行为。"""
 import shutil
 import tempfile
 import unittest
@@ -18,70 +9,39 @@ import memory.chat_memory as chat_memory
 from config import ChatLLMRequest
 from factory.agent_runtime import context_compaction as compaction
 from memory.chat_history_format import (
-    clamp_context_summary_to_rounds,
-    normalize_context_summary,
     render_context_summary,
+    shift_context_summary_for_inserted_round,
 )
 from memory.chat_memory import ChatMemoryManager
 
 
-class ClampContextSummaryTests(unittest.TestCase):
-    """clamp_context_summary_to_rounds 纯函数行为。"""
+class ShiftContextSummaryTests(unittest.TestCase):
+    """插入轮次只平移摘要索引，不改摘要快照正文。"""
 
-    def test_shrinks_cursor_block_and_question_numbers(self):
+    def test_shifts_cursor_blocks_and_question_numbers(self):
         summary = {
             "source_round_count": 5,
             "blocks": [{"summary": "旧摘要", "round_start": 1, "round_end": 5}],
             "recent_questions": ["问题一", "问题二", "问题三", "问题四", "问题五"],
             "recent_question_numbers": [1, 2, 3, 4, 5],
         }
-        clamped = clamp_context_summary_to_rounds(summary, 3)
-        self.assertEqual(clamped["source_round_count"], 3)
-        self.assertEqual(clamped["blocks"][0]["round_end"], 3)
-        self.assertEqual(clamped["blocks"][0]["round_start"], 1)
-        self.assertEqual(clamped["recent_question_numbers"], [1, 2, 3])
-        self.assertEqual(clamped["recent_questions"], ["问题一", "问题二", "问题三"])
-        # 原对象不被就地修改
+        shifted = shift_context_summary_for_inserted_round(summary, 2)
+        self.assertEqual(shifted["source_round_count"], 6)
+        self.assertEqual(shifted["blocks"][0]["round_start"], 1)
+        self.assertEqual(shifted["blocks"][0]["round_end"], 6)
+        self.assertEqual(shifted["recent_question_numbers"], [1, 2, 4, 5, 6])
+        self.assertEqual(shifted["recent_questions"], summary["recent_questions"])
+        # 原摘要正文和源对象均保持不变。
         self.assertEqual(summary["source_round_count"], 5)
         self.assertEqual(len(summary["recent_questions"]), 5)
 
-    def test_returns_same_object_when_cursor_within_limit(self):
-        summary = {"source_round_count": 3, "blocks": []}
-        self.assertIs(clamp_context_summary_to_rounds(summary, 5), summary)
-        self.assertIs(clamp_context_summary_to_rounds(summary, 3), summary)
-
-    def test_drops_blocks_beyond_limit(self):
-        summary = {
-            "source_round_count": 6,
-            "blocks": [
-                {"summary": "第一段", "round_start": 1, "round_end": 2},
-                {"summary": "第二段", "round_start": 4, "round_end": 6},
-            ],
-        }
-        clamped = clamp_context_summary_to_rounds(summary, 3)
-        self.assertEqual(len(clamped["blocks"]), 1)
-        self.assertEqual(clamped["blocks"][0]["round_end"], 2)
-
-    def test_clamps_top_level_legacy_range(self):
-        summary = {
-            "source_round_count": 5,
-            "round_start": 1,
-            "round_end": 5,
-            "summary": "旧版结构",
-        }
-        clamped = clamp_context_summary_to_rounds(summary, 2)
-        self.assertEqual(clamped["round_end"], 2)
-        self.assertEqual(clamped["source_round_count"], 2)
-
-    def test_invalid_input_passthrough(self):
-        self.assertIsNone(clamp_context_summary_to_rounds(None, 3))
-        self.assertEqual(clamp_context_summary_to_rounds("文本摘要", 3), "文本摘要")
-        summary = {"source_round_count": 5}
-        self.assertIs(clamp_context_summary_to_rounds(summary, None), summary)
+    def test_insert_after_summary_coverage_keeps_cursor(self):
+        summary = {"source_round_count": 3, "summary": "旧摘要"}
+        self.assertIs(shift_context_summary_for_inserted_round(summary, 3), summary)
 
 
-class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
-    """ChatMemoryManager.clamp_context_summary_for_insert_round 落盘行为。"""
+class InsertRoundSummarySnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """插入/摘要落盘行为。"""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -112,14 +72,14 @@ class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
             "recent_question_numbers": list(range(1, source_count + 1)),
         })
 
-    async def test_clamp_writes_adjusted_summary(self):
+    async def test_legacy_clamp_wrapper_preserves_snapshot_without_writing(self):
         await self._seed_rounds(5)
         await self._seed_summary(5)
         self.manager.clamp_context_summary_for_insert_round(3)
         summary = await self.manager.get_context_summary()
-        self.assertEqual(summary["source_round_count"], 3)
-        self.assertEqual(summary["blocks"][0]["round_end"], 3)
-        self.assertEqual(summary["recent_question_numbers"], [1, 2, 3])
+        self.assertEqual(summary["source_round_count"], 5)
+        self.assertEqual(summary["blocks"][0]["round_end"], 5)
+        self.assertEqual(summary["recent_question_numbers"], [1, 2, 3, 4, 5])
         # 摘要正文仍在（不是整份失效）
         rendered = render_context_summary(summary)
         self.assertIn("历史事实", rendered)
@@ -144,7 +104,7 @@ class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
         # 游标已在插入点之内：无需写盘
         self.assertEqual(writes, [])
 
-    async def test_clamp_write_failure_raises(self):
+    async def test_legacy_clamp_wrapper_does_not_write_or_raise(self):
         await self._seed_rounds(5)
         await self._seed_summary(5)
         original = chat_memory._write_meta_and_entries
@@ -154,8 +114,7 @@ class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
 
         chat_memory._write_meta_and_entries = failing_write
         try:
-            with self.assertRaises(RuntimeError):
-                self.manager.clamp_context_summary_for_insert_round(3)
+            self.manager.clamp_context_summary_for_insert_round(3)
         finally:
             chat_memory._write_meta_and_entries = original
 
@@ -191,39 +150,42 @@ class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(entry, dict) and entry.get("event") == "chat_round"
         )
 
-    async def test_insert_finish_keeps_clamped_summary(self):
-        """插入收尾后摘要保留（钳制值），不再被清空触发整段重压。"""
+    async def test_insert_finish_shifts_summary_indices_and_tracks_raw_round(self):
+        """插入收尾保留摘要快照，平移锚点并原文补入新轮。"""
         await self._seed_rounds(5)
         await self._seed_summary(5)
         self.manager.set_insert_round(3)
-        self.manager.clamp_context_summary_for_insert_round(3)
         await self._finish_insert_round("【回答模型提问】回答内容")
 
         self.assertEqual(self._round_count(), 6, "回答轮应插入第 3 轮之后")
         summary = await self.manager.get_context_summary()
         self.assertIsNotNone(summary, "插入收尾后摘要不应被清空")
-        self.assertEqual(summary["source_round_count"], 3)
+        self.assertEqual(summary["source_round_count"], 6)
+        self.assertEqual(summary["blocks"][0]["round_end"], 6)
+        self.assertEqual(summary["recent_question_numbers"], [1, 2, 3, 5, 6])
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [4])
         self.assertIn("历史事实", render_context_summary(summary))
 
-    async def test_insert_finish_defensively_clamps_when_request_clamp_skipped(self):
-        """请求开始未钳制（写盘失败等）时，收尾写入再做一次防御钳制。"""
+    async def test_insert_finish_shifts_summary_without_request_preprocessing(self):
+        """摘要只在插入轮成功落盘后调整索引，不在请求开始时改写。"""
         await self._seed_rounds(5)
         await self._seed_summary(5)
         self.manager.set_insert_round(3)
-        # 故意跳过 clamp_context_summary_for_insert_round
         await self._finish_insert_round("【回答模型提问】回答内容")
 
         self.assertEqual(self._round_count(), 6)
         summary = await self.manager.get_context_summary()
         self.assertIsNotNone(summary)
-        self.assertEqual(summary["source_round_count"], 3, "收尾防御钳制应生效")
+        self.assertEqual(summary["source_round_count"], 6)
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [4])
 
     async def test_stop_current_round_insert_keeps_summary(self):
         """用户停止（stop_current_round）中断收尾的插入分支同样保留摘要。"""
         await self._seed_rounds(5)
         await self._seed_summary(5)
         self.manager.set_insert_round(3)
-        self.manager.clamp_context_summary_for_insert_round(3)
         # 模拟中断收尾：先记录回答轮消息，再走 stop_current_round
         await self.manager.add_chat_history({"role": "user", "content": "【回答模型提问】中断的回答"})
         await self.manager.add_chat_history({"role": "assistant", "content": "部分输出"})
@@ -231,7 +193,9 @@ class InsertRoundClampManagerTests(unittest.IsolatedAsyncioTestCase):
 
         summary = await self.manager.get_context_summary()
         self.assertIsNotNone(summary, "中断插入收尾后摘要不应被清空")
-        self.assertEqual(summary["source_round_count"], 3)
+        self.assertEqual(summary["source_round_count"], 6)
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [4])
 
 
 class ReanswerTruncateSummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -320,7 +284,55 @@ class InsertRoundCutoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("问题3", text)
         self.assertNotIn("问题4", text)
 
-    async def test_cutoff_with_summary_clamped(self):
+    async def test_insert_before_first_round_uses_empty_history_and_keeps_suffix(self):
+        await self._seed_rounds(3)
+        await self.manager.update_context_summary({
+            "source_round_count": 2,
+            "blocks": [{"summary": "后续轮次秘密", "round_start": 1, "round_end": 2}],
+        })
+        self.manager.set_insert_round(0)
+        self.assertEqual(await self.manager.get_context_messages(), [])
+        await self.manager.add_chat_history({"role": "user", "content": "插入问题"})
+        await self.manager.add_chat_history({"role": "assistant", "content": "插入回答"})
+        await self.manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
+        _, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        rounds = [row for row in entries if row.get("event") == "chat_round"]
+        self.assertEqual([row["question"] for row in rounds],
+                         ["插入问题", "问题1", "问题2", "问题3"])
+        summary = await self.manager.get_context_summary()
+        self.assertEqual(summary["source_round_count"], 3)
+        self.assertEqual(summary["blocks"][0]["round_start"], 2)
+        self.assertEqual(summary["blocks"][0]["round_end"], 3)
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [1])
+
+    async def test_insert_before_first_round_temporarily_skips_legacy_unindexed_summary(self):
+        await self._seed_rounds(2)
+        await self.manager.update_context_summary("包含后续对话的旧格式摘要")
+        self.manager.set_insert_round(0)
+
+        self.assertEqual(await self.manager.get_context_messages(), [])
+        self.assertIn(
+            "包含后续对话的旧格式摘要",
+            render_context_summary(await self.manager.get_context_summary()),
+        )
+
+    async def test_stopped_insert_before_first_round_keeps_suffix(self):
+        await self._seed_rounds(2)
+        self.manager.set_insert_round(0)
+        await self.manager.add_chat_history({"role": "user", "content": "中断问题"})
+        await self.manager.add_chat_history({"role": "assistant", "content": "部分回答"})
+        await self.manager.stop_current_round()
+        _, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        rounds = [row for row in entries if row.get("event") == "chat_round"]
+        self.assertEqual([row["question"] for row in rounds],
+                         ["中断问题", "问题1", "问题2"])
+
+    async def test_cutoff_with_summary_inside_prefix(self):
         await self._seed_rounds(4)
         await self.manager.update_context_summary({
             "source_round_count": 3,
@@ -329,10 +341,48 @@ class InsertRoundCutoffTests(unittest.IsolatedAsyncioTestCase):
         self.manager.set_insert_round(3)
         messages = await self.manager.get_context_messages()
         text = "\n".join(str(item.get("content")) for item in messages)
-        # 摘要覆盖第 1-3 轮：原始对话只回传第 4 轮之前的窗口；截断到第 3 轮后
-        # 无未压缩轮次，仅摘要 system 消息
+        # 摘要覆盖的轮次全部位于插入点之前，可以直接使用摘要。
         self.assertIn("已压缩事实", text)
         self.assertNotIn("问题4", text)
+
+    async def test_insert_request_temporarily_omits_summary_crossing_prefix(self):
+        await self._seed_rounds(3)
+        await self.manager.update_context_summary({
+            "source_round_count": 3,
+            "blocks": [{"summary": "问题3的后续秘密", "round_start": 1, "round_end": 3}],
+        })
+        await self.manager.add_context_compaction_event({
+            "event": "context_compaction", "scope": "session", "phase": "done",
+            "summary_text": "问题3的后续秘密",
+        })
+        self.manager.set_insert_round(1)
+        messages = await self.manager.get_context_messages()
+        text = "\n".join(str(item.get("content")) for item in messages)
+        self.assertIn("问题1", text)
+        self.assertNotIn("问题2", text)
+        self.assertNotIn("问题3", text)
+        self.assertNotIn("后续秘密", text)
+        summary = await self.manager.get_context_summary()
+        self.assertIn("问题3的后续秘密", render_context_summary(summary))
+        _, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        historical = [row for row in entries if row.get("event") == "context_compaction"]
+        self.assertEqual(len(historical), 1)
+        self.assertFalse(historical[0].get("invalidated", False))
+
+    async def test_strict_insert_keeps_summary_before_position(self):
+        await self._seed_rounds(3)
+        await self.manager.update_context_summary({
+            "source_round_count": 1,
+            "blocks": [{"summary": "第一轮事实", "round_start": 1, "round_end": 1}],
+        })
+        self.manager.set_insert_round(2)
+        messages = await self.manager.get_context_messages()
+        text = "\n".join(str(item.get("content")) for item in messages)
+        self.assertIn("第一轮事实", text)
+        self.assertIn("问题2", text)
+        self.assertNotIn("问题3", text)
 
 
 class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
@@ -384,7 +434,7 @@ class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
             await self.manager.add_chat_history({"role": "assistant", "content": payload})
             await self.manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
 
-    async def test_auto_compaction_continues_after_clamp(self):
+    async def test_inserted_raw_override_does_not_discard_or_recompress_snapshot(self):
         await self._seed_rounds(5, "回答" * 2000)
         await self.manager.update_context_summary({
             "source_round_count": 5,
@@ -392,13 +442,18 @@ class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
             "recent_questions": [f"问题{i}" for i in range(1, 6)],
             "recent_question_numbers": list(range(1, 6)),
         })
-        # 回答插入第 3 轮：摘要覆盖范围钳到第 3 轮
-        self.manager.clamp_context_summary_for_insert_round(3)
+        # 回答插入第 3 轮后：摘要游标和问题索引平移，新轮以原文补充。
+        self.manager.set_insert_round(3)
+        await self.manager.add_chat_history({"role": "user", "content": "插入的新问题"})
+        await self.manager.add_chat_history({"role": "assistant", "content": "插入的新回答"})
+        await self.manager.add_chat_history({"role": "assistant", "done": "[DONE]"})
         summary = await self.manager.get_context_summary()
-        self.assertEqual(summary["source_round_count"], 3)
+        self.assertEqual(summary["source_round_count"], 6)
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [4])
 
-        # 模拟插入完成后收尾压缩（无 force）：配置阈值低于未覆盖历史，
-        # 第 4、5 轮需要压缩，但压缩源必须从第 4 轮开始
+        # 新摘要游标已经覆盖原有历史；检查触发预算时不会因插入而把摘要清空，
+        # 也不会自动从第一轮重新压缩。
         request = ChatLLMRequest(messages=[{"role": "user", "content": "新任务"}])
         settings = compaction.ContextCompactionSettings(
 
@@ -413,22 +468,17 @@ class InsertRoundNoRepressTests(unittest.IsolatedAsyncioTestCase):
             settings=settings,
             budget_tokens=1024,
         )
-        self.assertGreater(compacted, 0, "第 4、5 轮超预算应被压缩")
-        self.assertTrue(self.captured_requests, "应发生压缩模型调用")
-        first_prompt = "\n".join(
-            str(getattr(message, "content", "") or "")
-            for message in self.captured_requests[0].messages
-        )
-        # 压缩源从第 4 轮开始：不再包含第 1-3 轮原文（旧行为整段重压会包含）
-        self.assertIn("问题4", first_prompt)
-        self.assertNotIn("问题1", first_prompt)
-        self.assertNotIn("问题2", first_prompt)
-        # 游标从上次位置继续推进（不是从 0 重建）
+        self.assertEqual(compacted, 0)
+        self.assertFalse(self.captured_requests, "插入本身不应触发重压缩")
         final_summary = await self.manager.get_context_summary()
-        self.assertGreaterEqual(final_summary["source_round_count"], 4)
-        # 摘要正文保留旧事实（拼接合并，不丢弃历史）
+        self.assertEqual(final_summary["source_round_count"], 6)
         rendered = render_context_summary(final_summary)
         self.assertIn("历史事实", rendered)
+        messages = await self.manager.get_context_messages()
+        context_text = "\n".join(str(message.get("content")) for message in messages)
+        self.assertIn("插入的新问题", context_text)
+        self.assertIn("插入的新回答", context_text)
+        self.assertIn("第 4 轮在摘要生成后被编辑或插入", context_text)
 
 
 if __name__ == "__main__":

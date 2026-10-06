@@ -1,6 +1,6 @@
 /**
  * 模型与参数面板（“参数”按钮）
- * - 三个角色（聊天/压缩/标题模型）的模型选择与生成参数编辑
+ * - 四个角色（聊天/压缩/标题/子智能体模型）的模型选择与生成参数编辑
  * - 会话独立选择 vs 全局默认语义、api_type 参数分桶、恢复默认预设
  * 依赖：app/core.js、API；App.*：stats 模块（token 统计刷新）
  */
@@ -285,19 +285,21 @@
     return headers;
   }
 
-  // 按选中模型的 api_type 分桶组装 parameter（responses 协议用 max_output_tokens）
-  function buildParameterObject() {
-    const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
+  // 按角色草稿对应模型的 api_type 分桶组装 parameter（responses 协议用 max_output_tokens）
+  function buildParameterObject(role, draft) {
+    const modelKey = draft ? draft.selectedModelKey : state.selectedModelKey;
+    const model = modelInfoByKey(role, modelKey);
     const apiType = model && model.api_type ? String(model.api_type).replace(/-/g, "_").toLowerCase() : "chat_completions";
     const param = {
-      temperature: Number(temperature.value),
-      top_p: Number(topP.value),
-      presence_penalty: Number(presencePenalty.value),
-      reasoning_effort: reasoningEffort.value,
-      extra_body: { enable_thinking: enableThinking.checked },
+      temperature: Number(draft ? draft.temperature : temperature.value),
+      top_p: Number(draft ? draft.topP : topP.value),
+      presence_penalty: Number(draft ? draft.presencePenalty : presencePenalty.value),
+      reasoning_effort: draft ? draft.reasoningEffort : reasoningEffort.value,
+      extra_body: { enable_thinking: draft ? draft.enableThinking : enableThinking.checked },
     };
-    if (apiType === "responses") param.max_output_tokens = Number(maxTokens.value);
-    else param.max_tokens = Number(maxTokens.value);
+    const maxTokensDraft = draft ? draft.maxTokens : maxTokens.value;
+    if (apiType === "responses") param.max_output_tokens = Number(maxTokensDraft);
+    else param.max_tokens = Number(maxTokensDraft);
     return param;
   }
 
@@ -450,53 +452,86 @@
   enhanceReset.addEventListener("click", applyRoleDefaults);
 
   enhanceConfirm.addEventListener("click", async function () {
-    const key = state.selectedModelKey;
-    if (!key) { toast("请先选择模型"); return; }
-    const sep = key.indexOf("::");
-    if (sep <= 0) return;
-    const provider = key.slice(0, sep);
-    const model = key.slice(sep + 2);
-    // 先与面板打开时快照的服务端当前选择比对：模型未更换且参数未改动时
-    // 不再调用切换接口，避免每次确定都弹"已切换"提示。
-    // 快照缺失（配置加载失败）时按有变化处理，仍允许显式保存
-    const modelChanged = key !== currentModelKey(state.activeModelRole);
-    // 头部行与回填快照对比：有增删改才算改动（避免空编辑器误覆盖已有配置）
-    const headersNow = JSON.stringify(collectHeaderRows());
-    const headersBefore = JSON.stringify(
-      (roleConfig() && roleConfig().role_info && roleConfig().role_info.effective_headers) || []
-    );
-    const headersChanged = headersNow !== headersBefore;
-    const paramsChanged = state.modelParamDirty || headersChanged;
-    if (!modelChanged && !paramsChanged) {
+    // 确认时先把当前页最新表单也写入草稿，再检查四个角色的草稿。
+    // 页签切换只切换表单视图，未保存改动一直由 modelPanelDrafts 按角色持有。
+    saveRoleDraft(state.activeModelRole);
+    const changes = [];
+    for (const item of MODEL_ROLES) {
+      const role = item.role;
+      const draft = drafts()[role];
+      if (!draft) continue;
+      const key = String(draft.selectedModelKey || "");
+      const modelChanged = key !== currentModelKey(role);
+      const headersNow = JSON.stringify(Array.isArray(draft.headers) ? draft.headers : []);
+      const cfg = state.modelConfigs[role];
+      const headersBefore = JSON.stringify(
+        (cfg && cfg.role_info && cfg.role_info.effective_headers) || []
+      );
+      const headersChanged = headersNow !== headersBefore;
+      const paramsChanged = Boolean(draft.dirty || headersChanged);
+      if (!modelChanged && !paramsChanged) continue;
+      if (!key) {
+        toast("请先为「" + item.label + "」选择模型");
+        return;
+      }
+      const sep = key.indexOf("::");
+      if (sep <= 0) {
+        toast("「" + item.label + "」的模型选择无效");
+        return;
+      }
+      changes.push({
+        role: role,
+        label: item.label,
+        key: key,
+        provider: key.slice(0, sep),
+        model: key.slice(sep + 2),
+        modelChanged: modelChanged,
+        parameter: paramsChanged ? buildParameterObject(role, draft) : null,
+        headers: headersChanged ? draft.headers : null,
+      });
+    }
+    if (!changes.length) {
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
       toast("模型与参数均未变化");
       return;
     }
     enhanceConfirm.disabled = true;
+    const wasInert = enhancePanel.inert;
+    enhancePanel.inert = true; // 保存请求期间冻结表单，避免快照之后的新编辑被关闭面板丢弃
+    const saved = [];
+    const sessionId = state.sessionId || undefined;
     try {
-      const parameter = paramsChanged ? buildParameterObject() : null;
-      // headers 仅在有改动时提交（None = 后端保持现有配置不变）
-      const headers = headersChanged ? collectHeaderRows() : null;
-      // 会话内保存为该会话独立模型选择；新对话（无 sessionId）保存为全局默认
-      const res = await API.selectModel(provider, model, state.activeModelRole, parameter, state.sessionId || undefined, false, headers);
-      // 模型未更换（仅保存参数）时不用后端的"已切换"文案，避免误导
-      toast(modelChanged ? (res.message || "已保存") : "模型未更换，参数已保存");
+      // 同一全局配置文件/会话元数据由多个角色共写，顺序提交避免并发覆盖。
+      for (const change of changes) {
+        await API.selectModel(
+          change.provider,
+          change.model,
+          change.role,
+          change.parameter,
+          sessionId,
+          false,
+          change.headers
+        );
+        saved.push(change);
+      }
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
-      const data = await API.getModels(state.activeModelRole, state.sessionId || undefined);
-      // 写缓存 + 状态条模型名原子更新（单一入口，chat_model 角色才影响状态条）
-      if (state.activeModelRole === "chat_model") App.setChatModelConfig(data);
-      else if (data) state.modelConfigs[state.activeModelRole] = data;
+      const failed = await loadModelConfigs();
+      state.modelLoadFailed = failed;
       state.modelPanelDrafts = {};   // 保存成功：服务端状态已变化，草稿基线作废
-      // 仅模型更换才影响 token 估算口径（窗口取自模型定义，参数不影响）：
-      // 切换聊天模型后立即刷新统计标签；压缩/标题模型不影响统计，无需刷新
-      if (modelChanged && state.activeModelRole === "chat_model") {
+      toast("已保存：" + saved.map(function (item) { return item.label; }).join("、"));
+      // 仅聊天模型更换才影响 token 估算口径；其他角色不影响聊天上下文统计。
+      if (saved.some(function (item) { return item.role === "chat_model" && item.modelChanged; })) {
         App.refreshContextTokenStats(state.sessionId);
       }
     } catch (err) {
-      toast("保存失败：" + err.message);
+      const savedLabels = saved.map(function (item) { return item.label; });
+      toast(saved.length
+        ? "保存中断，已保存「" + savedLabels.join("、") + "」；未完成的草稿仍保留，可重新确定。原因：" + err.message
+        : "保存失败：" + err.message);
     } finally {
+      enhancePanel.inert = wasInert;
       enhanceConfirm.disabled = false;
     }
   });

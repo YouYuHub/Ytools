@@ -47,6 +47,15 @@ test("usageText: 生成本轮 token 文案", function () {
     "本轮消耗 2 tokens（输入 0 · 输出 0） · 模型 服务商/模型 A");
 });
 
+test("roundSummaryText: 没有 usage 时只显示模型，有 usage 时显示 tokens 与模型", function () {
+  const model = { provider: "Ollama", name: "qwen3.5:9b" };
+  assert.equal(formatUtils.roundSummaryText(null, model), "本轮模型 Ollama/qwen3.5:9b");
+  assert.equal(formatUtils.roundSummaryText({}, model), "本轮模型 Ollama/qwen3.5:9b");
+  assert.equal(formatUtils.roundSummaryText({ prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 }, model),
+    "本轮消耗 20 tokens（输入 12 · 输出 8） · 模型 Ollama/qwen3.5:9b");
+  assert.equal(formatUtils.roundSummaryText(null, null), "");
+});
+
 test("compactionUsageText: 压缩 usage 文案", function () {
   assert.equal(
     formatUtils.compactionUsageText({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, compressed_rounds: 2 }),

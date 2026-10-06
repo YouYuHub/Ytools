@@ -1,5 +1,5 @@
 /*
- * widget_reuse.js — md-svg 控件复用配对决策（纯逻辑，无 DOM 依赖）
+ * widget_reuse.js — md-svg 控件复用配对与逐帧旧节点清理
  *
  * 背景：流式渲染按 Markdown.render 全量重建正文，```svg/mermaid/canvas 控件
  * 会随节点销毁重建（代码视图滚动位置丢失、运行中的 canvas iframe 被丢弃）。
@@ -82,7 +82,15 @@
   }
 
   const plan = planWidgetReuse;
-  const api = { plan: plan, planWidgetReuse: plan };
+  // 每一帧只保留本次新插入的节点和复用的控件；旧正文必须在下一帧清掉。
+  function removeStaleNodes(root, freshNodes, reusedNodes) {
+    Array.prototype.slice.call(root.childNodes).forEach(function (node) {
+      if (freshNodes.has(node) || reusedNodes.has(node)) return;
+      if (node.parentNode) node.parentNode.removeChild(node);
+    });
+  }
+
+  const api = { plan: plan, planWidgetReuse: plan, removeStaleNodes: removeStaleNodes };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

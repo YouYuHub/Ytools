@@ -561,7 +561,7 @@ def _round_entry_to_tool_result_context_messages(
     # 见 chat_runtime.sanitize_tool_call_pairing）
     cleaned, removed = sanitize_tool_call_pairing(messages)
     if removed:
-        print(f"[WARN] 历史轮次构建清理 {removed} 个悬空 tool_call（无配对结果）")
+        print(f"[WARNING] 历史轮次构建清理 {removed} 个悬空 tool_call（无配对结果）")
     return cleaned
 
 
@@ -887,78 +887,52 @@ def adjust_context_summary_for_deleted_rounds(
     return adjusted
 
 
-def clamp_context_summary_to_rounds(
+def shift_context_summary_for_inserted_round(
     summary: Any,
-    max_round: int,
+    insert_after_round: Any,
 ) -> Any:
-    """把累计摘要的覆盖范围钳制到不超过第 max_round 轮（回答插入场景）。
+    """在第 N 轮后插入新轮时，平移累计摘要的旧轮次锚点。
 
-    回答插入（insert_round）：新回答轮插入第 N 轮之后、后续轮次整体后推。
-    摘要正文对"插入点之前"轮次的描述仍然有效（内容未变、编号未变），但对
-    被后推的轮次若继续声明覆盖，插入轮本身（位于摘要覆盖范围内）却没有
-    摘要正文，模型将看不到它。这里把覆盖范围钳到插入点（含第 N 轮）为止，
-    让插入轮及其后轮次以原始对话回传，下一次压缩再自然纳入新批次：
-
-    - source_round_count：钳到 max_round；
-    - blocks[].round_start/round_end：round_start 超过 max_round 的块整体
-      丢弃（不再锚定任何现存轮次），否则 round_end 钳到 max_round；
-    - recent_question_numbers / recent_questions：编号超过 max_round 的项
-      移除（这些轮次已随插入点后移，等下一次压缩重建索引）。
-
-    摘要为 None / 非法结构时原样返回；无需调整（游标已在范围内）时返回
-    原对象（调用方可据此跳过写盘）。
+    摘要正文是压缩时的历史快照，插入新轮不重写正文。旧轮次在插入点之后
+    整体后移，因此同步平移 source_round_count、摘要块范围和保真问题编号。
+    新插入轮是否需要额外以原文回传，由调用方的 context_summary_raw_rounds
+    元数据记录。
     """
     if not isinstance(summary, dict):
         return summary
     try:
-        limit = int(max_round)
+        insert_after = max(0, int(insert_after_round))
+        source_count = max(0, int(summary.get("source_round_count") or 0))
     except (TypeError, ValueError):
         return summary
-    if limit < 1:
-        limit = 0
-    try:
-        old_count = int(summary.get("source_round_count") or 0)
-    except (TypeError, ValueError):
-        old_count = 0
-    if old_count <= limit:
-        # 游标已在插入点之内（含相等）：插入不改变已压缩轮次的内容与编号，
-        # 摘要与索引原样可用（插入轮位于游标之后的未压缩区）
+    if source_count <= insert_after:
         return summary
+
     adjusted = dict(summary)
-    adjusted["source_round_count"] = limit
+    adjusted["source_round_count"] = source_count + 1
 
-    def _clamp_block(block: Any) -> Any:
-        if not isinstance(block, dict):
-            return block
+    def _shift_range(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
         try:
-            round_start = int(block.get("round_start") or 0)
-            round_end = int(block.get("round_end") or 0)
+            start = int(value.get("round_start") or 0)
+            end = int(value.get("round_end") or 0)
         except (TypeError, ValueError):
-            return block
-        if round_start > 0 and round_end >= round_start:
-            if round_start > limit:
-                return None  # 覆盖轮次全部在插入点之后，块不再锚定现存轮次
-            block = dict(block)
-            block["round_end"] = min(round_end, limit)
-        return block
+            return value
+        if start <= 0 or end < start:
+            return value
+        shifted = dict(value)
+        if start > insert_after:
+            shifted["round_start"] = start + 1
+        if end > insert_after:
+            shifted["round_end"] = end + 1
+        return shifted
 
-    raw_blocks = adjusted.get("blocks")
-    if isinstance(raw_blocks, list) and raw_blocks:
-        kept_blocks: list[Any] = []
-        for block in raw_blocks:
-            clamped_block = _clamp_block(block)
-            if clamped_block is not None:
-                kept_blocks.append(clamped_block)
-        adjusted["blocks"] = kept_blocks
-    # 旧格式遗留：覆盖范围可能直接写在顶层（无 blocks 或单块直存）
+    blocks = adjusted.get("blocks")
+    if isinstance(blocks, list):
+        adjusted["blocks"] = [_shift_range(block) for block in blocks]
     if "round_start" in adjusted or "round_end" in adjusted:
-        clamped_top = _clamp_block(adjusted)
-        if clamped_top is None:
-            adjusted.pop("round_start", None)
-            adjusted.pop("round_end", None)
-        else:
-            adjusted["round_start"] = clamped_top.get("round_start")
-            adjusted["round_end"] = clamped_top.get("round_end")
+        adjusted.update(_shift_range(adjusted))
 
     questions = adjusted.get("recent_questions")
     numbers = adjusted.get("recent_question_numbers")
@@ -967,15 +941,10 @@ def clamp_context_summary_to_rounds(
         and isinstance(numbers, list)
         and len(questions) == len(numbers)
     ):
-        kept_questions: list[Any] = []
-        kept_numbers: list[Any] = []
-        for number, question in zip(numbers, questions):
-            if isinstance(number, int) and number > limit:
-                continue
-            kept_questions.append(question)
-            kept_numbers.append(number)
-        adjusted["recent_questions"] = kept_questions
-        adjusted["recent_question_numbers"] = kept_numbers
+        adjusted["recent_question_numbers"] = [
+            number + 1 if isinstance(number, int) and number > insert_after else number
+            for number in numbers
+        ]
     return adjusted
 
 

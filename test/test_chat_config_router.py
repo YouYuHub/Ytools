@@ -511,6 +511,25 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             manager._file_path.unlink(missing_ok=True)
 
+    async def test_session_command_shell_uses_platform_default(self) -> None:
+        from unittest import mock
+        from fastapi import HTTPException
+        from memory.chat_memory import get_chat_memory_manager
+        from factory.agent_runtime.builtin_tools import resolve_default_command_shell
+        session_id = "command_shell_ut"
+        manager = await get_chat_memory_manager(session_id)
+        try:
+            await manager.update_session_command_shell("bash")
+            with mock.patch("factory.agent_runtime.builtin_tools._resolve_shell", return_value=("powershell.exe", "powershell", [])):
+                self.assertEqual(resolve_default_command_shell(session_id), "powershell")
+                self.assertEqual((await self.router.get_run_command_shell(session_id))["shell"], "powershell")
+            with self.assertRaises(HTTPException):
+                await self.router.update_run_command_shell(
+                    self.router.RunCommandShellConfig(session_id=session_id, shell="cmd")
+                )
+        finally:
+            manager._file_path.unlink(missing_ok=True)
+
     async def test_tool_selection_builtin_session_override(self) -> None:
         """会话级内置工具选择：写入 _meta.tool_selection 并被回退解析原样返回。"""
         from memory.chat_memory import (
@@ -660,6 +679,22 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         )
         unlimited_body = json.loads(response_unlimited.body.decode("utf-8"))
         self.assertEqual(unlimited_body["config"]["max_attempts"], 0)
+
+    async def test_sub_agent_limits_are_global_persisted_and_allow_zero(self) -> None:
+        from config import SubAgentLimitsConfig
+        from pydantic import ValidationError
+        response = await self.router.update_sub_agent_limits_config(
+            SubAgentLimitsConfig(max_rounds=0, timeout_seconds=120)
+        )
+        self.assertEqual(json.loads(response.body)["config"]["max_rounds"], 0)
+        values = json.loads((await self.router.get_sub_agent_limits_config()).body)
+        self.assertEqual(values["timeout_seconds"], 120)
+        persisted = (self._temp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn("SUB_AGENT_MAX_ROUNDS=0", persisted)
+        with self.assertRaises(ValidationError):
+            SubAgentLimitsConfig(max_rounds=-1)
+        with self.assertRaises(ValidationError):
+            SubAgentLimitsConfig(timeout_seconds=float("inf"))
 
     async def test_sub_agent_retry_config_get_and_post(self) -> None:
         before = await self.router.get_sub_agent_retry_config()

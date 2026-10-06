@@ -226,7 +226,9 @@ class MediaEndpointTests(unittest.TestCase):
             name=stored, session_id=TEST_SESSION,
         ))
         self.assertEqual(media_response.status_code, 200)
-        self.assertIn(bytes(media_response.body), (PNG_BYTES, WAV_BYTES))
+        async def collect(response):
+            return b"".join([part async for part in response.body_iterator])
+        self.assertIn(asyncio.run(collect(media_response)), (PNG_BYTES, WAV_BYTES))
 
     def test_upload_rejects_non_media(self):
         response = self._post_media("doc.pdf", b"%PDF-1.4")
@@ -516,7 +518,9 @@ class RangeRequestTests(unittest.TestCase):
         ))
         self.assertEqual(partial.status_code, 206)
         self.assertEqual(partial.headers["content-range"], f"bytes 2-5/{len(WAV_BYTES)}")
-        self.assertEqual(bytes(partial.body), WAV_BYTES[2:6])
+        async def collect(response):
+            return b"".join([part async for part in response.body_iterator])
+        self.assertEqual(asyncio.run(collect(partial)), WAV_BYTES[2:6])
 
         full = asyncio.run(file_router.get_session_media(
             request=make_request({}),
@@ -524,7 +528,7 @@ class RangeRequestTests(unittest.TestCase):
         ))
         self.assertEqual(full.status_code, 200)
         self.assertEqual(full.headers["accept-ranges"], "bytes")
-        self.assertEqual(bytes(full.body), WAV_BYTES)
+        self.assertEqual(asyncio.run(collect(full)), WAV_BYTES)
 
 
 class StreamMediaTests(unittest.TestCase):
@@ -643,7 +647,8 @@ class ImageThumbnailTests(unittest.TestCase):
         self.assertGreater(len(big_png), fm.IMAGE_THUMBNAIL_THRESHOLD_BYTES)
         saved = fm.save_session_media(TEST_SESSION, "大截图.png", big_png)
         content = [{"type": "image_url", "image_url": {"url": saved["media_ref"]}}]
-        resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
+        with patch.object(fm, "load_session_media_base64", side_effect=AssertionError("原图不应先编码")):
+            resolved, unresolved = fm.resolve_media_content_parts(TEST_SESSION, content)
         self.assertEqual(unresolved, [])
         url = resolved[0]["image_url"]["url"]
         self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:40])

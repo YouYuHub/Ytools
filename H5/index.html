@@ -488,23 +488,16 @@
                 </button>
             </header>
             <div class="chat-settings-body">
+                <p class="chat-settings-note">数值设置均为全局配置，影响所有会话；压缩预算提示按当前会话模型窗口计算。“每条消息重新标题”仅对当前会话生效，切换开关立即保存。</p>
                 <section class="chat-settings-section">
                     <h3>模型与工具配置</h3>
                     <div class="tool-retitle-row" id="settingsRetitleRow" hidden>
                         <label class="tool-retitle-label" title="开启后本会话每条消息发送完成都会重新生成会话标题；关闭则仅首个任务尝试一次">
                             <input type="checkbox" id="settingsRetitleToggle">
-                            <span>每条消息重新标题</span>
+                            <span>每条消息重新标题（仅本会话）</span>
                         </label>
                         <span class="tool-retitle-status" id="settingsRetitleStatus"></span>
                     </div>
-                    <label class="chat-setting-field">
-                        <span>思考过程回传长度<small>0=不回传 · 负数=全部 · 正数=保留末尾 N 字符</small></span>
-                        <input id="reasoningMaxLength" type="number" step="1">
-                    </label>
-                    <label class="chat-setting-field">
-                        <span>工具结果回传长度<small>0=不回传 · 负数=全部 · 正数=保留开头 N 字符</small></span>
-                        <input id="toolResultMaxLength" type="number" step="1">
-                    </label>
                     <label class="chat-setting-field">
                         <span>工具执行超时（秒）<small>单次 MCP 工具执行超过该秒数后中止并反馈模型；0=不限制</small></span>
                         <input id="toolCallTimeoutSeconds" type="number" min="0" step="1">
@@ -521,12 +514,24 @@
                         <span>MCP 工具并发数<small>同一轮多个工具调用并发执行的线程数（实际并发不超过本轮工具数）</small></span>
                         <input id="mcpToolWorkers" type="number" min="1" step="1">
                     </label>
+                </section>
+                <section class="chat-settings-section">
+                    <h3>子智能体（全局）</h3>
+                    <p class="chat-settings-note">保存后用于后续聊天任务；正在运行的子任务沿用派发时的限制。每个子任务可单独停止，停止或达到限制时会向父智能体返回进展报告。</p>
+                    <label class="chat-setting-field">
+                        <span>模型调用轮次上限<small>单个子任务最多调用模型的次数；0=不限制</small></span>
+                        <input id="subAgentMaxRounds" type="number" min="0" step="1">
+                    </label>
+                    <label class="chat-setting-field">
+                        <span>整体超时（秒）<small>单个子任务执行时间上限；0=不限制</small></span>
+                        <input id="subAgentTimeoutSeconds" type="number" min="0" step="1">
+                    </label>
                     <label class="chat-setting-field">
                         <span>子智能体并发上限<small>同一轮最多同时运行的子任务数量，超出的排队执行</small></span>
                         <input id="subAgentMaxConcurrent" type="number" min="1" step="1">
                     </label>
                     <label class="chat-setting-field">
-                        <span>子任务空收尾重试次数<small>子任务最终回复为空时注入内部消息要求重新交付；0/负数=不限制（一直重试，仍受轮次/超时硬封顶）</small></span>
+                        <span>子任务空收尾重试次数<small>子任务最终回复为空时注入内部消息要求重新交付；0/负数=不限制（一直重试，仍受已启用的轮次/超时限制约束）</small></span>
                         <input id="subAgentFinalReplyRetryMax" type="number" step="1">
                     </label>
                     <label class="chat-setting-field">
@@ -539,7 +544,7 @@
                     </label>
                 </section>
                 <section class="chat-settings-section">
-                    <h3>历史压缩策略</h3>
+                    <h3>历史压缩策略（全局）</h3>
                     <label class="chat-setting-field">
                         <span>触发比例<small>历史上下文达到压缩阈值时触发压缩；阈值=两模型窗口较小者×该比例</small></span>
                         <input id="triggerRatio" type="number" min="0.01" max="0.95" step="0.01">

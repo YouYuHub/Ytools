@@ -70,6 +70,25 @@ def worker_main(session_id: str, cmd_conn, evt_conn) -> None:
         _safe_send(evt_conn, {"type": "worker_exit"})
 
 
+def _apply_runtime_ollama_model_snapshots(snapshots: Any) -> None:
+    """Install the parent process' discovered Ollama catalog in this worker."""
+    from env_manager import clear_ollama_runtime_models, set_ollama_runtime_models
+
+    # A worker may serve multiple generations before idle shutdown. Replace the
+    # snapshot on every task so removed models and changed endpoints do not linger.
+    clear_ollama_runtime_models()
+    if not isinstance(snapshots, list):
+        return
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        provider_name = snapshot.get("provider_name")
+        provider_url = snapshot.get("provider_url")
+        models = snapshot.get("models")
+        if isinstance(models, list):
+            set_ollama_runtime_models(provider_name, provider_url, models)
+
+
 def _worker_idle_timeout() -> float:
     try:
         from env_manager import load_var
@@ -230,7 +249,12 @@ def _emit_uncaught_generate_error(task: "asyncio.Task", adapter: "_WorkerStreamA
             pass
 
 
-async def _worker_generate(session_id: str, request_data: dict, adapter: _WorkerStreamAdapter) -> None:
+async def _worker_generate(
+    session_id: str,
+    request_data: dict,
+    adapter: _WorkerStreamAdapter,
+    runtime_ollama_models: Any = None,
+) -> None:
     """worker 内执行一次完整生成任务：刷新环境 → 解析会话目录 → chdir → 生成循环。"""
     from config import PROJECT_ROOT as CONFIG_PROJECT_ROOT, ChatLLMRequest
     from env_manager import init_path
@@ -241,7 +265,14 @@ async def _worker_generate(session_id: str, request_data: dict, adapter: _Worker
     try:
         init_path(CONFIG_PROJECT_ROOT)
     except Exception as exc:
-        print(f"[WARN] worker 刷新环境配置失败（沿用启动时配置）: {exc}")
+        print(f"[WARNING] worker 刷新环境配置失败（沿用启动时配置）: {exc}")
+    # Windows spawn creates a fresh process, so the watcher-owned in-memory
+    # catalog is not inherited from the FastAPI process. Restore its snapshot
+    # after init_path, which only reloads static config from disk.
+    try:
+        _apply_runtime_ollama_model_snapshots(runtime_ollama_models)
+    except Exception as exc:
+        print(f"[WARNING] worker 恢复运行时 Ollama 模型列表失败: {exc}")
 
     # 会话工作目录解析：_meta.work_dir 覆盖 → DEFAULT_CHAT_WORK_DIR 兜底；
     # 目录失效时发 warning 并回退，不终止任务
@@ -281,7 +312,7 @@ async def _interrupt_worker_task(session_id: str, current_task: "asyncio.Task | 
     except asyncio.CancelledError:
         pass
     except Exception as exc:
-        print(f"[WARN] worker 旧生成任务退出异常（已忽略）: {exc}")
+        print(f"[WARNING] worker 旧生成任务退出异常（已忽略）: {exc}")
 
 
 async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
@@ -347,7 +378,12 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                     adapter = _WorkerStreamAdapter(session_id, evt_queue)
                     evt_queue.put({"type": "task_started"})
                     current_task = asyncio.create_task(
-                        _worker_generate(session_id, raw.get("request") or {}, adapter)
+                        _worker_generate(
+                            session_id,
+                            raw.get("request") or {},
+                            adapter,
+                            raw.get("runtime_ollama_models"),
+                        )
                     )
 
                     def _on_generate_done(
@@ -385,6 +421,12 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         for item in kept:
                             adapter.injected_messages.put(item)
                     evt_queue.put({"type": "injected_cancelled", "ok": removed})
+                elif ctype == "stop_sub_agent":
+                    from factory.agent_runtime.sub_agent import request_sub_agent_stop
+                    ok = request_sub_agent_stop(session_id, str(raw.get("agent_id") or ""))
+                    evt_queue.put({
+                        "type": "sub_agent_stop_ack", "request_id": raw.get("request_id"), "ok": ok,
+                    })
                 elif ctype == "stop":
                     reason = "user" if raw.get("reason") == "user" else "interrupt"
                     if current_task is not None and not current_task.done():
@@ -401,9 +443,9 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         await _interrupt_worker_task(session_id, current_task, user_stop=False)
                     break
                 else:
-                    print(f"[WARN] worker 收到未知命令: {ctype!r}")
+                    print(f"[WARNING] worker 收到未知命令: {ctype!r}")
             except Exception as exc:
-                print(f"[WARN] worker 处理命令 {ctype!r} 失败: {exc}")
+                print(f"[WARNING] worker 处理命令 {ctype!r} 失败: {exc}")
     finally:
         evt_queue.put(None)  # 让 evt 写线程退出
 
@@ -551,12 +593,12 @@ class SessionWorkerProxy:
                 manager = await get_chat_memory_manager(session_id)
                 await manager.add_chat_history({"role": "assistant", "error": message})
             except Exception as exc:
-                print(f"[WARN] 会话 [{session_id}] worker 崩溃错误说明落盘失败: {exc}")
+                print(f"[WARNING] 会话 [{session_id}] worker 崩溃错误说明落盘失败: {exc}")
 
         try:
             asyncio.run_coroutine_threadsafe(_record(), loop)
         except RuntimeError as exc:
-            print(f"[WARN] 会话 [{session_id}] worker 崩溃错误说明调度失败: {exc}")
+            print(f"[WARNING] 会话 [{session_id}] worker 崩溃错误说明调度失败: {exc}")
 
     def _dispatch(self, evt: dict) -> None:
         if not isinstance(evt, dict):
@@ -572,7 +614,7 @@ class SessionWorkerProxy:
             try:
                 handler(evt)
             except Exception as exc:
-                print(f"[WARN] 会话 [{self.session_id}] worker 事件处理失败: {exc}")
+                print(f"[WARNING] 会话 [{self.session_id}] worker 事件处理失败: {exc}")
 
     # ---- 状态查询 ----
     def is_alive(self) -> bool:
@@ -607,12 +649,25 @@ class SessionWorkerProxy:
     def start_generation(self, request_data: dict) -> bool:
         """确保 worker 存活并发送 generate 命令。"""
         self._ensure_process()
-        return self._send({"type": "generate", "request": request_data or {}})
+        try:
+            from env_manager import get_ollama_runtime_model_snapshots
+            runtime_ollama_models = get_ollama_runtime_model_snapshots()
+        except Exception as exc:
+            print(f"[WARNING] 读取运行时 Ollama 模型快照失败: {exc}")
+            runtime_ollama_models = []
+        return self._send({
+            "type": "generate",
+            "request": request_data or {},
+            "runtime_ollama_models": runtime_ollama_models,
+        })
 
     def request_stop(self, reason: str = "user") -> bool:
         if not self.is_alive():
             return False
         return self._send({"type": "stop", "reason": reason})
+
+    def request_sub_agent_stop(self, agent_id: str, request_id: str) -> bool:
+        return self._send({"type": "stop_sub_agent", "agent_id": agent_id, "request_id": request_id})
 
     def inject_message(self, message: dict) -> bool:
         """向运行中的生成任务注入一条用户消息（消息引导）。
@@ -646,7 +701,7 @@ class SessionWorkerProxy:
 
     def terminate(self, reason: str = "") -> None:
         """强制终止（等待优雅退出超时后的兜底，JSONL 原子写保证不损坏）。"""
-        print(f"[WARN] 强制终止会话 [{self.session_id}] worker 进程: {reason}")
+        print(f"[WARNING] 强制终止会话 [{self.session_id}] worker 进程: {reason}")
         with self._state_lock:
             self._terminate_locked()
 
@@ -675,7 +730,7 @@ def drop_worker_proxy(session_id: str, shutdown: bool = True) -> None:
         try:
             proxy.shutdown()
         except Exception as exc:
-            print(f"[WARN] 关停会话 [{session_id}] worker 失败: {exc}")
+            print(f"[WARNING] 关停会话 [{session_id}] worker 失败: {exc}")
 
 
 def sweep_dead_worker_proxies() -> None:

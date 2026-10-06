@@ -17,6 +17,8 @@ from config import (
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX,
     DEFAULT_SUB_AGENT_MAX_CONCURRENT,
+    DEFAULT_SUB_AGENT_MAX_ROUNDS,
+    DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
     DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX,
     DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
@@ -35,6 +37,7 @@ from config import (
     RetitleSettingPayload,
     SessionWorkDirConfig,
     SubAgentRetryConfig,
+    SubAgentLimitsConfig,
     ToolConcurrencyConfig,
 )
 import env_manager
@@ -54,6 +57,8 @@ from factory.agent_runtime.chat_runtime import (
     parse_return_length,
     resolve_model_max_input_tokens,
 )
+
+
 from factory.agent_runtime.context_compaction import (
     get_context_compaction_defaults,
     get_context_compaction_model_status,
@@ -77,6 +82,25 @@ from factory.agent_runtime.title_generator import generate_title_for_frontend
 
 # 创建 API 路由器实例
 api_chat_config_router = APIRouter()
+
+
+class RunCommandShellConfig(BaseModel):
+    session_id: str
+    shell: str
+
+
+@api_chat_config_router.get("/chat_config/run_command_shell")
+async def get_run_command_shell(session_id: str | None = None):
+    from factory.agent_runtime.builtin_tools import resolve_default_command_shell
+    return {"state": "succeed", "shell": resolve_default_command_shell(session_id)}
+
+
+@api_chat_config_router.post("/chat_config/run_command_shell")
+async def update_run_command_shell(payload: RunCommandShellConfig):
+    raise HTTPException(
+        status_code=400,
+        detail="默认 shell 已按操作系统自动选择；需要其他 shell 时请在 run_command 调用中指定",
+    )
 
 
 def _normalized_dir_for_compare(directory: str | None) -> str | None:
@@ -637,6 +661,38 @@ async def update_compaction_retry_config(payload: CompactionRetryConfig):
     })
 
 
+# ---------- 子智能体全局执行限制 ----------
+
+def _sub_agent_limits_config_payload() -> dict:
+    from factory.agent_runtime.sub_agent import load_sub_agent_limits
+    limits = load_sub_agent_limits()
+    return {
+        "max_rounds": limits["max_rounds"],
+        "timeout_seconds": max(0, limits["timeout_seconds"]),
+        "defaults": {
+            "max_rounds": DEFAULT_SUB_AGENT_MAX_ROUNDS,
+            "timeout_seconds": DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
+        },
+    }
+
+
+@api_chat_config_router.get("/chat_config/sub_agent_limits")
+async def get_sub_agent_limits_config():
+    return JSONResponse(content=_sub_agent_limits_config_payload())
+
+
+@api_chat_config_router.post("/chat_config/sub_agent_limits")
+async def update_sub_agent_limits_config(payload: SubAgentLimitsConfig):
+    updated = set_env_vars({
+        "SUB_AGENT_MAX_ROUNDS": payload.max_rounds,
+        "SUB_AGENT_TIMEOUT_SECONDS": payload.timeout_seconds,
+    })
+    return JSONResponse(content={
+        "state": "succeed", "updated": updated,
+        "config": _sub_agent_limits_config_payload(),
+    })
+
+
 # ---------- 子智能体交付保障重试配置 ----------
 
 _SUB_AGENT_RETRY_ENV_NAMES = {
@@ -674,16 +730,16 @@ def _sub_agent_retry_config_payload() -> dict:
         "semantics": {
             "final_reply_max_attempts": {
                 "positive": "子任务最终回复为空时最多注入内部消息重试 N 次，耗尽后按 error 收尾",
-                "0_or_negative": "不限制（一直重试，仍受 max_rounds/timeout 硬封顶）",
+                "0_or_negative": "不限制（一直重试，仍受已启用的轮次/超时限制约束）",
             },
             "stream_error_max_attempts": {
                 "positive": "模型流式调用出错后最多从断点续跑 N 次，耗尽后按 error 收尾",
-                "0_or_negative": "不限制（仍受 max_rounds/timeout 硬封顶）",
+                "0_or_negative": "不限制（仍受已启用的轮次/超时限制约束）",
             },
             "todo_remind_max": {
                 "positive": "收尾时 todo 未完成最多提醒 N 次（每次完整工具执行轮后额度重置）",
                 "0": "关闭提醒（收尾即结束）",
-                "negative": "不限制提醒（仍受 max_rounds/timeout 硬封顶）",
+                "negative": "不限制提醒（仍受已启用的轮次/超时限制约束）",
             },
         },
         "env_names": dict(_SUB_AGENT_RETRY_ENV_NAMES),
@@ -705,7 +761,7 @@ async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
     """实时更新子智能体交付保障重试配置并持久化。
 
     - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次子任务立即生效
-    - final_reply / stream_error：0 或负数=不限制（仍受 max_rounds/timeout 硬封顶）
+    - final_reply / stream_error：0 或负数=不限制（仍受已启用的轮次/超时限制约束）
     - todo_remind_max：0=关闭提醒，负数=不限制，正数=每工具轮后额度重置的提醒次数
     """
     update_env = {

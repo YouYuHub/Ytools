@@ -262,6 +262,11 @@ class DeleteRoundsSummaryTests(unittest.TestCase):
             "recent_questions": ["问题二", "问题三"],
             "recent_question_numbers": [2, 3],
         }))
+        meta, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        meta["context_summary_raw_rounds"] = [2, 3]
+        chat_memory._write_meta_and_entries(self.manager._file_path, meta, entries)
 
     def tearDown(self):
         chat_memory.HISTORY_ROOT = self._orig_chat_root
@@ -281,6 +286,8 @@ class DeleteRoundsSummaryTests(unittest.TestCase):
         self.assertEqual(summary["blocks"][0]["round_end"], 2)
         self.assertEqual(summary["recent_question_numbers"], [2])
         self.assertEqual(summary["recent_questions"], ["问题三"])
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [2])
 
     def test_truncate_inside_summary_shrinks_cursor(self):
         asyncio.run(self.manager.delete_rounds(2, mode="truncate"))
@@ -289,6 +296,8 @@ class DeleteRoundsSummaryTests(unittest.TestCase):
         self.assertEqual(summary["source_round_count"], 1)
         self.assertEqual(summary["blocks"][0]["round_end"], 1)
         self.assertEqual(summary["recent_questions"], [])
+        meta, _ = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        self.assertEqual(meta["context_summary_raw_rounds"], [])
 
     def test_context_messages_use_summary_after_delete(self):
         asyncio.run(self.manager.delete_rounds(2, mode="single"))
@@ -365,6 +374,27 @@ class TargetRoundTests(unittest.TestCase):
         self.assertEqual(self._answers(), ["回答一", "新回答二", "回答三"])
         # 收尾后 target 状态自动复位
         self.assertIsNone(asyncio.run(self.manager.get_target_round()))
+
+    def test_replacing_round_removes_its_sub_agent_events_only(self):
+        self._seed_three_rounds()
+        meta, entries = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        for index, entry in enumerate(entries):
+            if entry.get("event") == "chat_round":
+                entry["events"].append({
+                    "event": "sub_agent", "phase": "start", "agent_id": f"agent_old_{index}",
+                    "parent_tool_call_id": f"call_{index}", "task": f"旧子任务{index}",
+                    "timestamp": entry["started_at"], "parent_agent_id": "main", "agent_index": 0,
+                })
+        chat_memory._write_meta_and_entries(self.manager._file_path, meta, entries)
+        self.manager.set_target_round(2)
+        for record in [{"role": "user", "content": "新问题二"},
+                       {"role": "assistant", "content": "新回复"},
+                       {"role": "assistant", "done": "[DONE]"}]:
+            asyncio.run(self.manager.add_chat_history(record))
+        _, updated = chat_memory._load_meta_and_entries(self.manager._file_path, self.session_id)
+        agent_ids = [event.get("agent_id") for entry in updated for event in entry.get("events", [])
+                     if event.get("event") == "sub_agent"]
+        self.assertEqual(agent_ids, ["agent_old_0", "agent_old_2"])
 
     def test_same_question_regenerates_keeps_started_at(self):
         self._seed_three_rounds()

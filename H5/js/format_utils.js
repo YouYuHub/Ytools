@@ -50,6 +50,23 @@
       + (label ? " · 模型 " + label : "");
   }
 
+  // 轮次摘要：仅在服务端实际提供 token 字段时显示用量；Ollama 等未返回
+  // usage 的服务仍显示本轮模型，避免把缺失统计误写成 0 tokens。
+  function roundSummaryText(usage, model) {
+    const tokenKeys = ["prompt_tokens", "completion_tokens", "total_tokens"];
+    const hasUsage = usage && typeof usage === "object" && tokenKeys.some(function (key) {
+      if (!Object.prototype.hasOwnProperty.call(usage, key)) return false;
+      const value = usage[key];
+      return value !== null && value !== "" && Number.isFinite(Number(value));
+    });
+    if (hasUsage) return usageText(usage, model);
+
+    const modelName = model && typeof model.name === "string" ? model.name.trim() : "";
+    const provider = model && typeof model.provider === "string" ? model.provider.trim() : "";
+    if (!modelName) return "";
+    return "本轮模型 " + (provider ? provider + "/" : "") + modelName;
+  }
+
   function compactionUsageText(usage) {
     if (!usage || typeof usage !== "object") return "";
     const p = usage.prompt_tokens || 0;
@@ -74,6 +91,7 @@
     prettyJson: prettyJson,
     normalizeUsage: normalizeUsage,
     usageText: usageText,
+    roundSummaryText: roundSummaryText,
     compactionUsageText: compactionUsageText,
   };
 

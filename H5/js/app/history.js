@@ -398,18 +398,21 @@
     }
   });
 
-  async function loadSessionFiles() {
+  async function loadSessionFiles(sessionIdOverride) {
+    const targetSessionId = sessionIdOverride || state.sessionId;
     // 待开始会话没有文件记录可查，直接清空，不发请求
-    if (!state.sessionId) {
+    if (!targetSessionId) {
       state.sessionDocs = [];
       App.renderComposerAttachments();
       return;
     }
     let files = [];
     try {
-      const data = await API.getSessionFiles(state.sessionId);
+      const data = await API.getSessionFiles(targetSessionId);
       files = data.files || [];
     } catch (_) { /* 读取失败不阻塞 */ }
+    // 上传期间如果用户切换了会话，不要把旧会话文档显示进新会话。
+    if (state.sessionId !== targetSessionId) return;
     state.sessionDocs = files.map(function (f) {
       return { filename: f.filename || "未命名", type: f.type || "", stored_name: f.stored_name || "" };
     });

@@ -1,14 +1,11 @@
 """MCP 工具调用的归一化、解析和并发执行。"""
 import asyncio
 import json
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from config import DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS
-from env_manager import load_var
 from util.mcp_client import call_mcp_tool
 
 
@@ -134,22 +131,6 @@ def prepare_tool_execution(tool_calls: List[dict], known_names: List[str]) -> To
     return ToolExecutionPlan(parsed_tools=parsed_tools, over_task_call=over_task_call, has_parse_error=has_parse_error)
 
 
-def _load_tool_call_timeout() -> float:
-    """读取 MCP 工具单次执行超时（秒）；<=0 表示不限制。
-
-    覆盖 call_mcp_tool 全过程（连接服务器/初始化会话/调用工具）：
-    任一环节卡住都会在超时后取消并返回错误，不再永久阻塞工具线程。
-    """
-    try:
-        value = float(load_var(
-            "MCP_TOOL_CALL_TIMEOUT_SECONDS",
-            DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
-        ))
-    except (TypeError, ValueError):
-        return float(DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS)
-    return value
-
-
 def _invoke_tool_function(
     name: str,
     arguments: dict,
@@ -158,47 +139,17 @@ def _invoke_tool_function(
 ) -> Any:
     if name not in tool_mcp_servers:
         raise ValueError(f"工具 {name} 未在MCP服务器中注册，无法调用")
-    mcp_server_file = tool_mcp_servers[name]
+    mcp_service = tool_mcp_servers[name]
     original_name = (tool_original_names or {}).get(name, name)
-    pipe_tools = {"setup_pipe", "run_pipe_command", "read_pipe_history"}
-    max_retry = 3 if original_name in pipe_tools else 1
-    last_error = None
-    call_timeout = _load_tool_call_timeout()
-    for attempt in range(1, max_retry + 1):
-        loop = asyncio.new_event_loop()
-        try:
-            call_coro = call_mcp_tool(
-                function_name=original_name,
-                arguments=arguments,
-                mcp_service=mcp_server_file)
-            if call_timeout > 0:
-                result = loop.run_until_complete(
-                    asyncio.wait_for(call_coro, timeout=call_timeout)
-                )
-            else:
-                result = loop.run_until_complete(call_coro)
-            return result
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"工具 {name} 执行超过 {call_timeout:g} 秒"
-                f"（MCP_TOOL_CALL_TIMEOUT_SECONDS={call_timeout:g}），"
-                "已中止本次调用；请缩小执行范围或检查工具服务是否卡死"
-            )
-        except Exception as exc:
-            last_error = exc
-            err_text = str(exc)
-            should_retry = (
-                "Failed to connect to named-pipe server" in err_text
-                and attempt < max_retry
-            )
-            if should_retry:
-                time.sleep(0.4 * attempt)
-                continue
-            raise
-        finally:
-            loop.close()
-    if last_error is not None:
-        raise last_error
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(call_mcp_tool(
+            function_name=original_name,
+            arguments=arguments,
+            mcp_service=mcp_service,
+        ))
+    finally:
+        loop.close()
 
 
 def execute_tool_round(

@@ -1748,8 +1748,14 @@
   }
 
   .ask-custom {
-    height: 38px;
-    padding: 0 12px;
+    width: 100%;
+    min-height: 88px;
+    padding: 10px 12px;
+    resize: vertical;
+    line-height: 1.5;
+    font-family: inherit;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
     background: var(--bg-code);

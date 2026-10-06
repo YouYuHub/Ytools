@@ -123,16 +123,19 @@
       return;
     }
     if (rec.kind === "usage") {
-      container.appendChild(el("div", "round-usage", FormatUtils.usageText(rec.usage, rec.model)));
+      const summary = FormatUtils.roundSummaryText(rec.usage, rec.model);
+      if (summary) container.appendChild(el("div", "round-usage", summary));
       return;
     }
     if (rec.kind === "agentBlock") {
       // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
       appendTimeInto(container, rec.started_at);
       const agentUi = buildSubAgentBlock();
-      agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit });
+      agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit,
+        timeout_seconds: rec.timeout_seconds });
+      if (rec.args) agentUi.setDispatchInput(rec.args);
       agentUi.hydrate(rec);
-      agentUi.markReturned(rec);
+      if (rec.done_emitted) agentUi.markReturned(rec);
       container.appendChild(agentUi.wrap);
       return;
     }
@@ -163,6 +166,7 @@
       const compactionPayload = {
         scope: rec.scope,
         phase: rec.phase,
+        invalidated: !!rec.invalidated,
         compress_context: rec.phase === "start" ? rec.content : "",
         context_summary: rec.phase === "start" ? rec.content : "",
         // done 记录携带最终摘要全文，刷新后仍可在压缩块中回放
@@ -522,18 +526,13 @@
      * 追加压缩模型流式增量（phase=delta 事件）：
      * - reasoning_content -> “压缩模型思考”区（弱化色，独立滚动）
      * - content           -> “摘要正文（生成中）”区
-     * 首个增量到达时自动展开块体；done 后到达的残留 delta 直接忽略。
+     * 增量追加不改变用户设置的展开状态；done 后到达的残留 delta 直接忽略。
      */
     function appendDelta(delta) {
       if (!delta || latestCompaction.phase === "done") return;
       const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
       const ct = typeof delta.content === "string" ? delta.content : "";
       if (!rc && !ct) return;
-      if (!box.classList.contains("open")) {
-        isOpen = true;
-        box.classList.add("open");
-        head.setAttribute("aria-expanded", "true");
-      }
       if (rc) {
         reasoningText += rc;
         if (!thinkPre || !thinkPre.parentNode) {
@@ -564,15 +563,18 @@
       }
       thinkPre = null;
       summaryPre = null;
-      box.classList.toggle("is-running", nextPhase === "start");
+      box.classList.toggle("is-running", nextPhase === "start" && !latestCompaction.invalidated);
       box.classList.toggle("is-done", nextPhase === "done");
       box.classList.toggle("is-failed", isAborted);
+      box.classList.toggle("is-invalidated", !!latestCompaction.invalidated);
       iconWrap.innerHTML = nextPhase === "start"
         ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>'
         : nextPhase === "aborted"
           ? '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M12 8v5"/><circle cx="12" cy="16.5" r="0.6" fill="currentColor"/><circle cx="12" cy="12" r="9.2"/></svg>'
           : '<svg class="icon compaction-icon" viewBox="0 0 24 24"><path d="M5 4h14M12 4v6m-3-3 3 3 3-3M5 20h14M12 20v-6m-3 3 3-3 3 3"/></svg>';
-      title.textContent = nextPhase === "start"
+      title.textContent = latestCompaction.invalidated
+        ? "历史压缩记录 · 摘要已失效"
+        : nextPhase === "start"
         ? "正在压缩 · " + scopeLabel
         : nextPhase === "aborted"
           ? "压缩失败 · " + scopeLabel
@@ -779,10 +781,12 @@
     if (window.Prism && container) Prism.highlightAllUnder(container);
   }
 
-  // ---------- 保活渲染：innerHTML 重渲染时保留 md-svg 控件内部状态 ----------
-  // 流式期间正文按 Markdown.render 全量重建，```svg/mermaid/canvas 控件会随节点
-  // 一起被销毁重建：代码视图滚动位置每帧丢失回顶、运行中的 canvas iframe 被丢弃
-  // （表现为"生成中点运行无反应"、切到代码视图拖动滚动条立刻回滚）。
+  // ---------- 保活渲染：重渲染时保留代码块滚动位置与 md-svg 控件 ----------
+  // 流式期间正文按 Markdown.render 全量重建，普通代码块的 pre 和
+  // ```svg/mermaid/canvas 控件会随节点一起被销毁重建；保存/恢复代码块
+  // pre 的滚动位置，避免生成增量到达时用户在块内滚动被拉回顶部。
+  // md-svg 控件还需保留原节点，否则 canvas iframe 会被丢弃重建（表现为
+  // "生成中点运行无反应"、切到代码视图拖动滚动条立刻回滚）。
   // 修复采用「锚点挖洞」整块移植：
   //   1. 配对决策走 WidgetReuse.plan（kind+源码精确 → svg/canvas 流式前缀 →
   //      运行中 canvas iframe 兜底）；
@@ -792,17 +796,46 @@
   //   3. 配不上的控件按新建处理（正常升级/重建）。
   function renderPreservingWidgets(host, html) {
     if (!host || typeof html !== "string") return;
-    const oldBlocks = Array.prototype.slice.call(host.querySelectorAll(".md-svg-block"));
-    if (!oldBlocks.length) {
+    const codeScroll = Array.prototype.map.call(
+      host.querySelectorAll(".codeblock pre"),
+      function (pre) { return { top: pre.scrollTop, left: pre.scrollLeft }; }
+    );
+    function replaceHostHtml() {
       host.innerHTML = html;
+      restoreCodeblockScroll(host, codeScroll);
+    }
+    // Markdown.render() 的返回值会统一包在 <div class="md"> 中。控件是
+    // .md 的直接子节点，因此后续插入/清理必须以旧、新 .md 为根；若以
+    // host 为根，insertBefore 会拿到不属于 host 的后代控件作为锚点并抛错，
+    // 导致第一个 Mermaid 图出现后所有后续流式重绘都失败。
+    function directMarkdownRoot(container) {
+      const children = container && container.children;
+      if (!children) return container;
+      for (let i = 0; i < children.length; i++) {
+        if (children[i].classList && children[i].classList.contains("md")) return children[i];
+      }
+      return container;
+    }
+    const oldRoot = directMarkdownRoot(host);
+    const oldBlocks = Array.prototype.slice.call(oldRoot.querySelectorAll(".md-svg-block"));
+    if (!oldBlocks.length) {
+      replaceHostHtml();
       return;
     }
     const fresh = document.createElement("div");
     fresh.innerHTML = html;
-    const newBlocks = Array.prototype.slice.call(fresh.querySelectorAll(".md-svg-block"));
+    const freshRoot = directMarkdownRoot(fresh);
+    const newBlocks = Array.prototype.slice.call(freshRoot.querySelectorAll(".md-svg-block"));
     if (!newBlocks.length) {
       // 新渲染里已无控件（源码被改掉/删除）：正常替换，控件随之消失
-      host.innerHTML = html;
+      replaceHostHtml();
+      return;
+    }
+    // 锚点分段算法只处理根容器的直接子控件。遇到嵌套控件时安全退回
+    // 普通重绘，避免把后代节点误传给根容器 insertBefore 而中断流式更新。
+    if (oldBlocks.some(function (block) { return block.parentNode !== oldRoot; }) ||
+        newBlocks.some(function (block) { return block.parentNode !== freshRoot; })) {
+      replaceHostHtml();
       return;
     }
     const describe = function (block) {
@@ -832,16 +865,19 @@
       marker.hidden = true;
       markerFor.set(marker, reuseIndex);
       keepSet.add(keep);
-      fresh.replaceChild(marker, newBlocks[k]);
+      freshRoot.replaceChild(marker, newBlocks[k]);
     }
     if (!markerFor.size) {
-      host.innerHTML = html;
+      replaceHostHtml();
       return;
     }
     // 分段搬移：以最靠前的保留块为锚插入其前内容；遇 marker 则推进锚点到
     // 该保留块的下一个兄弟（保留块本身永不脱离文档，iframe 不重载）；
     // 尾部剩余内容追加到最后。
-    const nodes = Array.prototype.slice.call(fresh.childNodes);
+    const nodes = Array.prototype.slice.call(freshRoot.childNodes);
+    // 只记录本次插入的节点。把标记写到 DOM 节点上会跨越下一次流式重绘，
+    // 令上次的正文被误判为“新节点”而永远无法清理，逐帧累积重复内容。
+    const freshNodes = new Set();
     let refNode = null;
     for (let i = 0; i < oldBlocks.length; i++) {
       if (keepSet.has(oldBlocks[i])) { refNode = oldBlocks[i]; break; }
@@ -853,15 +889,28 @@
         refNode = oldBlocks[reuseIndex].nextSibling;
         continue;
       }
-      node.__rpwFresh = true;
-      host.insertBefore(node, refNode);
+      freshNodes.add(node);
+      oldRoot.insertBefore(node, refNode);
     }
     // 清理旧残留：顶层节点既非本轮新插入、也非保留块的一律移除
     // （快照后遍历，避免 live childNodes 边删边移位）
-    Array.prototype.slice.call(host.childNodes).forEach(function (n) {
-      if (n.__rpwFresh || keepSet.has(n)) return;
-      if (n.parentNode) n.parentNode.removeChild(n);
-    });
+    WidgetReuse.removeStaleNodes(oldRoot, freshNodes, keepSet);
+    restoreCodeblockScroll(host, codeScroll);
+  }
+
+  // 普通代码块会随流式 Markdown 全量重建，按块序恢复滚动位置。
+  // 流式回答只在尾部追加，已有代码块的顺序稳定；超出新内容范围的位置
+  // 由浏览器自然限制到当前可滚动区域。
+  function restoreCodeblockScroll(host, savedPositions) {
+    if (!host || !savedPositions || !savedPositions.length) return;
+    const codeBlocks = host.querySelectorAll(".codeblock pre");
+    for (let i = 0; i < savedPositions.length && i < codeBlocks.length; i += 1) {
+      const pre = codeBlocks[i];
+      const saved = savedPositions[i];
+      if (!saved) continue;
+      pre.scrollTop = saved.top;
+      pre.scrollLeft = saved.left;
+    }
   }
 
   // 用户气泡：content 可为字符串或多部件列表（多模态消息与其历史回放）。
@@ -1068,6 +1117,11 @@
     editBtn.innerHTML = EDIT_PENCIL_ICON + '<span class="msg-user-action-label">编辑</span>';
     editBtn.addEventListener("click", function () { beginUserMessageEdit(msg); });
 
+    const insertBtn = el("button", "msg-user-action-btn msg-user-insert-btn", "插入对话");
+    insertBtn.type = "button";
+    insertBtn.title = "在这条消息之前插入新对话，生成时只使用此前的上下文";
+    insertBtn.addEventListener("click", function () { beginUserMessageEdit(msg, true); });
+
     // 删除该轮（用户消息与回复一并删除，后续轮次保留、轮次号自动前移）：
     // hover 显示，点击弹确认框，确认后走 single 删除并重载会话
     const deleteBtn = el("button", "msg-user-action-btn msg-user-delete-btn");
@@ -1079,6 +1133,7 @@
     // 显示顺序：删除在左（危险操作与内容区隔离），复制/编辑靠右——
     // 常用的复制/编辑位于视觉末端，减少删除按钮的误触概率
     actions.appendChild(deleteBtn);
+    actions.appendChild(insertBtn);
     actions.appendChild(copyBtn);
     actions.appendChild(editBtn);
     msg.appendChild(actions);
@@ -1179,6 +1234,11 @@
     if (!activeStream || typeof round !== "number" || round < 1) return;
     const userNode = activeStream.userNode;
     if (!userNode) return;
+    // 刷新重连可复用已打标的历史提问，但回复容器是新建的；也必须补上
+    // 轮次归属，否则编辑重发会漏删该容器内的子任务/思考/工具轨迹。
+    if (activeStream.messageNode) {
+      activeStream.messageNode.dataset.round = userNode.dataset.round || String(round);
+    }
     // 已有轮次标记（历史渲染节点 / send() 内编辑重发路径已打标）：视为幂等
     // 命中直接返回，不改写——节点归属与入口数据以先打的标为准，避免错轮
     if (userNode.dataset.round) {
@@ -1194,12 +1254,9 @@
       quotes: activeStream.quotes || [],
     };
     attachUserEditAction(userNode);
-    if (activeStream.messageNode) {
-      activeStream.messageNode.dataset.round = String(round);
-    }
   }
 
-  function beginUserMessageEdit(msg) {
+  function beginUserMessageEdit(msg, insertBefore) {
     if (!msg || !msg._editData || msg.classList.contains("is-editing")) return;
     // 运行中也允许编辑：发送编排（confirmEditResend）在用户二次确认后会
     // 停止进行中的生成任务再删除/重发；此处仅提示用户存在未完成生成
@@ -1207,26 +1264,57 @@
       App.toast("会话正在生成回复：确认发送后会先停止生成再重发");
     }
     const data = msg._editData;
-    const originalText = contentToPlainText(data.content);
-    const mediaItems = extractUserMediaItems(data.content);
+    const originalText = insertBefore ? "" : contentToPlainText(data.content);
+    const mediaItems = insertBefore ? [] : extractUserMediaItems(data.content);
     // 引用快照（选中文本引用到提问）：编辑态可移除、保留，随重发一起上送
-    const originalQuotes = (data.quotes || []).slice();
+    const originalQuotes = insertBefore ? [] : (data.quotes || []).slice();
     const keptQuotes = originalQuotes.slice();
+    const keptDocs = [];
 
     msg.classList.add("is-editing");
     msg._editRestore = msg.querySelector(".msg-bubble");
-    if (msg._editRestore) msg._editRestore.style.display = "none";
+    if (msg._editRestore && !insertBefore) msg._editRestore.style.display = "none";
 
     const panel = el("div", "msg-bubble msg-edit-bubble");
     const textarea = el("textarea", "msg-edit-textarea");
     textarea.value = originalText;
     textarea.rows = Math.min(10, Math.max(2, originalText.split("\n").length));
-    textarea.placeholder = "编辑消息内容…";
+    textarea.placeholder = insertBefore ? "在此轮之前插入新消息…" : "编辑消息内容…";
 
-    // 引用芯片（编辑态）：短预览 + 移除按钮；空则整行隐藏
+    // 引用芯片（编辑态）：保留/移除旧引用，也可从当前选区新增引用。
     const quoteRow = el("div", "msg-edit-quote-row");
+    const addQuoteButton = el("button", "msg-edit-upload", "引用所选文字");
+    addQuoteButton.type = "button";
+    addQuoteButton.title = "先在对话正文中选择一段文字，再点击添加引用";
+    let quoteSnapshot = null;
+    addQuoteButton.addEventListener("mousedown", function (event) {
+      // 按钮获取焦点会清掉浏览器选区；先读取并保留来源快照。
+      if (event.button !== 0) return;
+      if (App.captureQuoteSelection) quoteSnapshot = App.captureQuoteSelection();
+      event.preventDefault();
+    });
+    addQuoteButton.addEventListener("click", function () {
+      const snapshot = quoteSnapshot || (App.captureQuoteSelection && App.captureQuoteSelection());
+      quoteSnapshot = null;
+      if (!snapshot) {
+        App.toast("请先在对话正文中选择一段可引用文字");
+        return;
+      }
+      const check = QuoteUtils.checkQuoteAppend(keptQuotes, snapshot.text);
+      if (!check.ok) {
+        App.toast(check.reason);
+        return;
+      }
+      keptQuotes.push({
+        id: "q_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+        text: snapshot.text,
+        source: QuoteUtils.normalizeQuoteSource(snapshot.source),
+      });
+      renderQuoteRow();
+    });
     function renderQuoteRow() {
       quoteRow.innerHTML = "";
+      quoteRow.appendChild(addQuoteButton);
       keptQuotes.forEach(function (quote, index) {
         const chip = el("span", "msg-edit-quote-chip");
         chip.title = quote.text;
@@ -1236,21 +1324,40 @@
         const remove = el("button", "msg-edit-chip-remove", "×");
         remove.type = "button";
         remove.title = "移除该引用";
-        remove.addEventListener("click", function () {
+        remove.addEventListener("click", function (event) {
+          event.stopPropagation();
           keptQuotes.splice(index, 1);
           renderQuoteRow();
         });
         chip.appendChild(remove);
         quoteRow.appendChild(chip);
       });
-      quoteRow.style.display = keptQuotes.length ? "" : "none";
+      quoteRow.style.display = "";
     }
     renderQuoteRow();
 
-    // 附件芯片（在输入框上方，GPT 编辑态同款）：可移除，原样复用 media:// 引用
-    // 不重新上传；图片/视频显示缩略图，音频显示徽标
+    // 附件芯片：旧 media:// 引用可直接复用，新选文件仅保存在浏览器内存，
+    // 确认发送后才上传；图片/视频显示缩略图，音频显示徽标
     const keptMedia = mediaItems.slice();
     const mediaRow = el("div", "msg-edit-media-row");
+    const docRow = el("div", "msg-edit-media-row msg-edit-doc-row");
+    const uploadControls = el("div", "msg-edit-upload-row");
+    const uploadButton = el("button", "msg-edit-upload", "添加图片、音视频或文档");
+    uploadButton.type = "button";
+    const uploadHint = el("span", "msg-edit-upload-hint", "文档会加入当前会话，点击发送后上传");
+    const fileInput = el("input", "msg-edit-file-input");
+    fileInput.type = "file";
+    fileInput.multiple = true;
+    fileInput.setAttribute("aria-label", "选择要添加到历史消息的附件");
+    uploadButton.addEventListener("click", function () { fileInput.click(); });
+    uploadControls.appendChild(uploadButton);
+    uploadControls.appendChild(uploadHint);
+    uploadControls.appendChild(fileInput);
+    function revokeObjectUrl(item) {
+      if (!item || !item.objUrl) return;
+      try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
+      item.objUrl = "";
+    }
     function renderMediaRow() {
       mediaRow.innerHTML = "";
       keptMedia.forEach(function (item, index) {
@@ -1258,17 +1365,20 @@
         const remove = el("button", "msg-edit-chip-remove", "×");
         remove.type = "button";
         remove.title = "移除该附件";
-        remove.addEventListener("click", function () {
+        remove.addEventListener("click", function (event) {
+          event.stopPropagation();
+          revokeObjectUrl(item);
           keptMedia.splice(index, 1);
           renderMediaRow();
         });
-        const src = App.resolveMediaSrc(item.media_ref, App.state.sessionId);
+        const src = item.objUrl || (item.media_ref
+          ? App.resolveMediaSrc(item.media_ref, App.state.sessionId) : "");
         if (item.kind === "image" && src) {
           const thumb = el("img", "msg-edit-chip-thumb");
           thumb.src = src;
           thumb.alt = "附件图片";
           chip.appendChild(thumb);
-          chip.appendChild(el("span", "msg-edit-chip-name", chipShortName(item.stored_name)));
+          chip.appendChild(el("span", "msg-edit-chip-name", chipShortName(item.stored_name || item.name)));
           // 点击预览（编辑态同样支持，与消息气泡缩略图一致）
           chip.classList.add("clickable");
           chip.title = "点击预览";
@@ -1282,36 +1392,102 @@
           thumb.preload = "metadata";
           thumb.playsInline = true;
           chip.appendChild(thumb);
-          chip.appendChild(el("span", "msg-edit-chip-name", "🎬 " + chipShortName(item.stored_name)));
+          chip.appendChild(el("span", "msg-edit-chip-name", "🎬 " + chipShortName(item.stored_name || item.name)));
           chip.classList.add("clickable");
           chip.title = "点击播放";
           chip.addEventListener("click", function () {
             App.openMediaPreview({ type: "video", src: src, title: "视频" });
           });
         } else if (item.kind === "audio" && src) {
-          chip.appendChild(el("span", "msg-edit-chip-name", mediaChipLabel(item.media_ref, "🎵")));
+          chip.appendChild(el("span", "msg-edit-chip-name", item.name || mediaChipLabel(item.media_ref, "🎵")));
           chip.classList.add("clickable");
           chip.title = "点击收听";
           chip.addEventListener("click", function () {
             App.openMediaPreview({ type: "audio", src: src, title: "音频" });
           });
         } else {
-          chip.appendChild(el("span", "msg-edit-chip-name", mediaChipLabel(item.media_ref, "🎵")));
+          chip.appendChild(el("span", "msg-edit-chip-name", item.name || mediaChipLabel(item.media_ref, "🎵")));
         }
         chip.appendChild(remove);
         mediaRow.appendChild(chip);
       });
       mediaRow.style.display = keptMedia.length ? "" : "none";
     }
+    function renderDocRow() {
+      docRow.innerHTML = "";
+      keptDocs.forEach(function (item, index) {
+        const chip = el("span", "msg-edit-chip");
+        chip.appendChild(el("span", "msg-edit-chip-name", "📄 " + item.name));
+        const remove = el("button", "msg-edit-chip-remove", "×");
+        remove.type = "button";
+        remove.title = "移除待上传文档";
+        remove.addEventListener("click", function (event) {
+          event.stopPropagation();
+          keptDocs.splice(index, 1);
+          renderDocRow();
+        });
+        chip.appendChild(remove);
+        docRow.appendChild(chip);
+      });
+      docRow.style.display = keptDocs.length ? "" : "none";
+    }
+    fileInput.addEventListener("change", async function () {
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = "";
+      if (!files.length) return;
+      const mediaFiles = files.filter(function (file) { return App.mediaKindOf(file.name); });
+      const docFiles = files.filter(function (file) { return !App.mediaKindOf(file.name); });
+      const stagedMediaCount = keptMedia.filter(function (item) { return !!item.file; }).length;
+      let mediaAdded = 0;
+      for (const file of mediaFiles) {
+        if (stagedMediaCount + mediaAdded >= App.MAX_PENDING_MEDIA) {
+          App.toast("最多新增 " + App.MAX_PENDING_MEDIA + " 个待上传媒体文件");
+          break;
+        }
+        const item = await App.prepareMediaFile(file);
+        if (!item) continue;
+        if (typeof URL.createObjectURL === "function") {
+          item.objUrl = URL.createObjectURL(item.file);
+        }
+        keptMedia.push(item);
+        mediaAdded += 1;
+      }
+      if (mediaAdded && !App.getChatModelVision()) {
+        App.toast("当前模型不支持视觉：新增媒体会存档，但模型可能无法读取图片内容");
+      }
+      for (const file of docFiles) {
+        if (keptDocs.length >= 10) {
+          App.toast("最多新增 10 个文档");
+          break;
+        }
+        if (file.size > App.MAX_DOC_FILE_SIZE) {
+          App.toast("文件超过 10MB 限制：" + file.name);
+          continue;
+        }
+        keptDocs.push({
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+          file: file,
+          name: file.name,
+        });
+      }
+      renderMediaRow();
+      renderDocRow();
+    });
     renderMediaRow();
+    renderDocRow();
+    panel._cleanupEdit = function () {
+      keptMedia.forEach(revokeObjectUrl);
+    };
+    panel.appendChild(uploadControls);
     panel.appendChild(mediaRow);
+    panel.appendChild(docRow);
     // 引用芯片行在附件行下方（两者都不占 textarea 文本值）
     panel.appendChild(quoteRow);
     panel.appendChild(textarea);
 
     const foot = el("div", "msg-edit-foot");
     const modes = el("div", "msg-edit-modes");
-    let mode = "regen";
+    let mode = insertBefore ? "insert" : "regen";
     const regenBtn = el("button", "msg-edit-mode selected", "重新生成该轮");
     const truncateBtn = el("button", "msg-edit-mode", "删除该轮及之后");
     regenBtn.type = "button";
@@ -1328,8 +1504,12 @@
       truncateBtn.classList.add("selected");
       regenBtn.classList.remove("selected");
     });
-    modes.appendChild(regenBtn);
-    modes.appendChild(truncateBtn);
+    if (insertBefore) {
+      modes.appendChild(el("span", "msg-edit-insert-hint", "在第 " + data.round + " 轮之前插入 · 仅使用此前上下文"));
+    } else {
+      modes.appendChild(regenBtn);
+      modes.appendChild(truncateBtn);
+    }
     foot.appendChild(modes);
 
     const buttons = el("div", "msg-edit-buttons");
@@ -1368,10 +1548,14 @@
     // 编辑是否产生过改动（文本/附件集合/引用集合任一变化即视为已编辑）
     function isEdited() {
       if (textarea.value !== originalText) return true;
+      if (keptDocs.length) return true;
       if (keptMedia.length !== mediaItems.length) return true;
       if (keptQuotes.length !== originalQuotes.length) return true;
       if (keptQuotes.some(function (quote, index) {
-        return !originalQuotes[index] || originalQuotes[index].text !== quote.text;
+        return !originalQuotes[index]
+          || originalQuotes[index].text !== quote.text
+          || JSON.stringify(originalQuotes[index].source || null)
+            !== JSON.stringify(quote.source || null);
       })) return true;
       return keptMedia.some(function (item, index) {
         return !mediaItems[index] || mediaItems[index].stored_name !== item.stored_name;
@@ -1404,6 +1588,13 @@
         App.toast("消息内容不能为空");
         return;
       }
+      if (mode === "insert") {
+        App.confirmEditResend({
+          msg: msg, round: data.round, text: text,
+          media: keptMedia, docs: keptDocs.slice(), quotes: keptQuotes.slice(), mode: mode,
+        });
+        return;
+      }
       if (mode === "truncate") {
         // 删除该轮及之后：confirmEditResend 内部先 dry_run 展示明细再确认
         App.confirmEditResend({
@@ -1411,6 +1602,7 @@
           round: data.round,
           text: text,
           media: keptMedia,
+          docs: keptDocs.slice(),
           quotes: keptQuotes.slice(),
           mode: mode,
         });
@@ -1423,6 +1615,7 @@
           round: data.round,
           text: text,
           media: keptMedia,
+          docs: keptDocs.slice(),
           quotes: keptQuotes.slice(),
           mode: mode,
         });
@@ -1440,7 +1633,8 @@
     panel._getText = function () { return textarea.value.trim(); };
     panel._getMedia = function () { return keptMedia.slice(); };
 
-    msg.appendChild(panel);
+    if (insertBefore) msg.insertBefore(panel, msg.firstChild);
+    else msg.appendChild(panel);
     textarea.focus();
     textarea.selectionStart = textarea.value.length;
     App.autosize && App.autosize();
@@ -1449,7 +1643,16 @@
   function exitUserMessageEdit(msg) {
     if (!msg || !msg.classList.contains("is-editing")) return;
     const panel = msg.querySelector(".msg-edit-bubble");
-    if (panel) panel.remove();
+    if (panel) {
+      panel.querySelectorAll(".msg-edit-chip-thumb").forEach(function (thumb) {
+        if (thumb.tagName === "VIDEO") {
+          try { thumb.pause(); } catch (_) { /* ignore */ }
+        }
+        thumb.removeAttribute("src");
+      });
+      if (panel._cleanupEdit) panel._cleanupEdit();
+      panel.remove();
+    }
     if (msg._editRestore) msg._editRestore.style.display = "";
     msg._editRestore = null;
     msg.classList.remove("is-editing");
@@ -2042,10 +2245,10 @@
    * 字段的旧数据里兜底提取完整文件路径（full_file_name），以及为 read_file /
    * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
   function applyToolResult(block, name, resultText, fileDiff, args) {
-    if (name === "edit_file" || name === "write_file" || name === "run_command") {
+    if (name === "edit_file" || name === "write_file" || name === "run_command" || name === "poll_command" || name === "stop_command") {
       const toolIcon = block && block.wrap && block.wrap.querySelector(".tool-block-tool-icon");
       if (toolIcon) {
-        const failed = name === "run_command"
+        const failed = name === "run_command" || name === "poll_command" || name === "stop_command"
           ? isCommandFailureResult(resultText)
           : isToolFailureResult(resultText);
         toolIcon.classList.toggle("is-failed", failed);
@@ -2063,7 +2266,19 @@
           || extractPathFromDiffText(fileDiff.diff) || "";
       }
     }
-    if (parsed) {
+    if (name === "run_command" || name === "poll_command" || name === "stop_command") {
+      let commandResult = null;
+      try { commandResult = JSON.parse(resultText); } catch (_) { /* 旧版纯文本 */ }
+      if (commandResult && typeof commandResult.message === "string") {
+        const parts = [commandResult.message];
+        if (commandResult.stdout) parts.push("--- stdout ---\n" + commandResult.stdout);
+        if (commandResult.stderr) parts.push("--- stderr ---\n" + commandResult.stderr);
+        if (commandResult.output_tail) parts.push("--- 输出末尾 ---\n" + commandResult.output_tail);
+        block.setOutput(parts.join("\n"));
+      } else {
+        block.setOutput(resultText);
+      }
+    } else if (parsed) {
       const statsBits = [];
       if (parsed.lines_added || parsed.lines_removed) {
         statsBits.push("diff +" + parsed.lines_added + " -" + parsed.lines_removed + " 行");
@@ -2101,6 +2316,17 @@
   }
 
   function isCommandFailureResult(resultText) {
+    if (typeof resultText === "string") {
+      try {
+        const result = JSON.parse(resultText);
+        if (result && typeof result === "object") {
+          if (result.error) return true;
+          if (result.timed_out === true) return true;
+          if (result.status === "stopped" || result.status === "failed") return true;
+          if (typeof result.exit_code === "number") return result.exit_code !== 0;
+        }
+      } catch (_) { /* 旧版纯文本结果 */ }
+    }
     const text = typeof resultText === "string"
       ? resultText
       : JSON.stringify(resultText == null ? "" : resultText);
@@ -2117,7 +2343,8 @@
   // 父智能体经 sub_agent 工具派发的子任务独立渲染块：完整保存思考/正文/
   // 工具轨迹/todo，按 agent_id 聚合。SSE（start/delta/model_call/tool_start/
   // tool_result/todo/done）与历史回放（history_parser 聚合的 agentBlock
-  // 记录）共用同一状态机；done 后折叠为摘要态，点击头部可再展开。
+  // 记录）共用同一状态机；首次运行自动展开，用户手动折叠后保留状态，
+  // done 后折叠为摘要态，点击头部可再展开。
 
   const SUB_AGENT_STATUS_TEXT = {
     done: "已完成",
@@ -2135,11 +2362,14 @@
     return firstLine.trim().slice(0, 80) || "子任务";
   }
 
-  function buildSubAgentBlock() {
+  function buildSubAgentBlock(sessionId) {
+    const agentSessionId = sessionId || state.sessionId;
     const wrap = el("div", "agent-block is-running");
+    const header = el("div", "agent-header");
     const head = el("button", "agent-head");
     head.type = "button";
     const iconWrap = el("span", "agent-icon");
+    iconWrap.innerHTML = App.toolIconSvg("sub_agent", "icon is-builtin-tool-icon");
     const title = el("span", "agent-title", "子任务");
     const summary = el("span", "agent-summary");
     const badge = el("span", "agent-badge", "运行中");
@@ -2151,10 +2381,25 @@
     head.appendChild(badge);
     head.appendChild(chevron);
     const body = el("div", "agent-body");
-    wrap.appendChild(head);
+    const stopAgentBtn = el("button", "agent-stop", "停止");
+    stopAgentBtn.type = "button";
+    stopAgentBtn.title = "仅停止本子任务，父任务和其他子任务继续";
+    stopAgentBtn.hidden = true;
+    header.appendChild(head);
+    header.appendChild(stopAgentBtn);
+    wrap.appendChild(header);
     wrap.appendChild(body);
 
+    const dispatchDetails = el("details", "agent-dispatch");
+    dispatchDetails.appendChild(el("summary", "agent-label", "调用参数"));
+    const dispatchPre = el("pre", "agent-pre");
+    dispatchDetails.appendChild(dispatchPre);
+    let dispatchText = "";
+    let hasStarted = false;
+
     let taskSummary = "";
+    let taskText = "";
+    const taskSection = el("div", "agent-task-section");
     let todoItems = null;
     let rounds = [];          // [{seq, el, thinkBlock, contentLabel, contentEl, toolEntries: Map}]
     let status = "running";
@@ -2163,15 +2408,39 @@
     let errorText = "";
     let roundsLimit = null;
     let isDone = false;
+    let agentId = "";
+    let hasUserControlledExpansion = false;
+    stopAgentBtn.addEventListener("click", async function () {
+      if (!agentId || isDone || stopAgentBtn.disabled) return;
+      stopAgentBtn.disabled = true;
+      stopAgentBtn.textContent = "停止中…";
+      try {
+        const result = await API.stopSubAgent(agentSessionId, agentId);
+        if (!result.ok) {
+          stopAgentBtn.hidden = true;
+          toast("子任务已结束或不在运行中");
+        }
+      } catch (err) {
+        if (!isDone) {
+          stopAgentBtn.disabled = false;
+          stopAgentBtn.textContent = "停止";
+        }
+        toast("停止子任务失败：" + err.message);
+      }
+    });
 
     head.addEventListener("click", function () {
       if (!body.children.length) return;
       wrap.classList.toggle("open");
+      hasUserControlledExpansion = true;
+      head.setAttribute("aria-expanded", wrap.classList.contains("open") ? "true" : "false");
     });
     body.title = "双击折叠";
     body.addEventListener("dblclick", function () {
       if (!wrap.classList.contains("open")) return;
       wrap.classList.remove("open");
+      hasUserControlledExpansion = true;
+      head.setAttribute("aria-expanded", "false");
     });
 
     function appendLabeledPre(labelText, cls) {
@@ -2182,8 +2451,9 @@
     }
 
     function autoOpen() {
-      if (!wrap.classList.contains("open")) {
+      if (!hasUserControlledExpansion && !wrap.classList.contains("open")) {
         wrap.classList.add("open");
+        head.setAttribute("aria-expanded", "true");
       }
     }
 
@@ -2195,6 +2465,7 @@
     function applyStatus(nextStatus) {
       status = nextStatus;
       isDone = nextStatus !== "running";
+      stopAgentBtn.hidden = isDone;
       wrap.classList.remove("is-running", "is-done", "is-error");
       if (nextStatus === "running") wrap.classList.add("is-running");
       else if (SUB_AGENT_ERROR_STATUSES.indexOf(nextStatus) >= 0) wrap.classList.add("is-error");
@@ -2392,19 +2663,21 @@
 
     /** start / todo / done 统一重渲染头部与任务/计划/收尾区。 */
     function renderBody() {
-      // 任务区 + 计划区固定在最前：重建时保留 rounds 区与最终回复区
-      const keep = [];
-      while (body.firstChild) {
-        keep.push(body.removeChild(body.firstChild));
-      }
-      if (taskSummary) {
-        appendLabeledPre("任务", "agent-task").textContent = taskSummary;
+      // 只替换任务/计划区域，保留调用参数的折叠状态和已生成的轮次内容。
+      if (taskSection.parentNode) taskSection.parentNode.removeChild(taskSection);
+      while (taskSection.firstChild) taskSection.removeChild(taskSection.firstChild);
+      if (taskText) {
+        taskSection.appendChild(el("div", "agent-label", "任务"));
+        taskSection.appendChild(el("pre", "agent-pre agent-task", taskText));
       }
       if (todoItems && todoItems.length) {
-        body.appendChild(el("div", "agent-label", "计划"));
+        taskSection.appendChild(el("div", "agent-label", "计划"));
         const todoBox = renderTodo(todoItems);
-        if (todoBox) body.appendChild(todoBox);
+        if (todoBox) taskSection.appendChild(todoBox);
       }
+      const keep = [];
+      while (body.firstChild) keep.push(body.removeChild(body.firstChild));
+      if (taskSection.children.length) body.appendChild(taskSection);
       keep.forEach(function (node) { body.appendChild(node); });
     }
 
@@ -2462,14 +2735,33 @@
 
     return {
       wrap: wrap,
+      setDispatchInput: function (value) {
+        dispatchText = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+        let parsed = null;
+        try { parsed = JSON.parse(dispatchText); } catch (_) { /* 参数尚未生成完整 */ }
+        dispatchPre.textContent = parsed ? JSON.stringify(parsed, null, 2) : dispatchText;
+        if (!dispatchDetails.parentNode) body.appendChild(dispatchDetails);
+        if (!hasStarted && !isDone) {
+          badge.textContent = "准备中";
+          if (parsed && parsed.task) summary.textContent = subAgentTaskSummary(parsed.task);
+        }
+      },
       applyEvent: function (evt) {
         if (!evt || typeof evt !== "object") return;
+        if (evt.agent_id) agentId = evt.agent_id;
+        if (agentId && !isDone) stopAgentBtn.hidden = false;
         const phase = evt.phase;
         if (phase === "start") {
-          taskSummary = subAgentTaskSummary(evt.task);
+          hasStarted = true;
+          taskText = String(evt.task || "");
+          taskSummary = subAgentTaskSummary(taskText);
           summary.textContent = taskSummary;
           if (Array.isArray(evt.todo) && evt.todo.length) todoItems = evt.todo;
           if (evt.rounds_limit != null) roundsLimit = Number(evt.rounds_limit);
+          badge.textContent = evt.queued ? "排队中" : "运行中";
+          head.title = "模型调用轮次上限：" + (roundsLimit > 0 ? roundsLimit : "不限制") +
+            "；整体超时：" + (evt.timeout_seconds == null ? "未记录" :
+              Number(evt.timeout_seconds) > 0 ? evt.timeout_seconds + " 秒" : "不限制");
           renderBody();
           autoOpen();
           return;
@@ -2485,6 +2777,7 @@
         }
         if (phase === "done") { applyDone(evt); return; }
         if (phase === "notice") {
+          if (evt.queued === false && !isDone) badge.textContent = "运行中";
           // 交付保障重试提示（空收尾重试/断流续跑/todo 提醒）：
           // 以浅色条目追加到块内；历史回放侧 history_parser 对该 phase
           // 走通用条目兜底，hydrate 忽略（仅实时流展示）
@@ -2962,6 +3255,11 @@
   // 沙箱内宿主脚本：监听父页指令，执行用户脚本并回传日志/异常/快照
   const CANVAS_BOOT_JS = [
     "var stage=document.getElementById('stage');",
+    // 常见 Canvas 全局别名。作为沙箱 window 全局暴露而不是 new Function 参数，
+    // 这样既能直接使用 ctx，也兼容脚本内部 `const ctx = ...` 的声明写法。
+    "var canvas=stage;",
+    "var ctx=stage.getContext('2d'),context=ctx;",
+    "var width=stage.width,height=stage.height,W=width,H=height,WIDTH=width,HEIGHT=height;",
     // 保留原生定时器引用（包装前的），探测逻辑自身不走被包装的全局
     "var __raf=window.requestAnimationFrame.bind(window),",
     "  __craf=window.cancelAnimationFrame.bind(window),",
@@ -3034,7 +3332,7 @@
     "  if(d.zoom&&d.zoom!==1){try{stage.style.width=(d.zoom*100)+'%';stage.style.height=(d.zoom*100)+'%';}catch(_){}}",
     "  var sc={log:function(){push(join(arguments));},",
     "    info:function(){push(join(arguments));},",
-    "    warn:function(){push('[warn] '+join(arguments));},",
+    "    warn:function(){push('[WARNING] '+join(arguments));},",
     "    error:function(){push('[error] '+join(arguments));}};",
     "  try{",
     "    new Function('stage','console',d.code)(stage,sc);",

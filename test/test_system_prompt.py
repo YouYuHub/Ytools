@@ -112,6 +112,16 @@ class ConditionalNoteTests(unittest.TestCase):
         self.assertIn("思考过程只保留最近一次", prompt)
         self.assertIn("重要内容需要实时告诉用户", prompt)
 
+    def test_file_tool_selection_priority_is_present(self):
+        prompt = sp.build_sys_prompt()
+        self.assertIn("search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名", prompt)
+        self.assertIn("按文件名查找或列出文件时", prompt)
+        self.assertIn("若 run_command 可用则使用相应终端命令", prompt)
+        self.assertIn("查到目标内容后用 read_file 查看必要上下文", prompt)
+        self.assertIn("局部修改用 edit_file", prompt)
+        self.assertIn("新建或整文件写入用 write_file", prompt)
+        self.assertIn("再用 run_command", prompt)
+
 
 class ReadMediaNoteTests(unittest.TestCase):
     """read_media 使用指引的条件注入：提示词提及的工具必须与请求 tools 一致。

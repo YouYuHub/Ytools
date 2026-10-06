@@ -1,6 +1,7 @@
 """ 记录当前轮次对话上传的文件信息，持久化到项目 history 文件夹中 """
 # from __future__ import annotations
 # 标准库
+from util.text_encoding import decode_text
 import base64
 import json
 import re
@@ -1010,7 +1011,7 @@ def _probe_video_metadata_uncached(path: Path, suffix: str) -> dict[str, Any] | 
         )
     except Exception:
         return None
-    stderr = proc.stderr.decode("utf-8", errors="replace")
+    stderr = decode_text(proc.stderr)[0]
     if "Video:" not in stderr:
         return None
     duration = None
@@ -1132,7 +1133,7 @@ def _cut_video_clip_file(
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"ffmpeg 切片超时（>{_GIF_VIDEO_TIMEOUT_SECONDS}s）") from exc
     if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
-        stderr_tail = (proc.stderr or b"")[-300:].decode("utf-8", errors="replace")
+        stderr_tail = decode_text(proc.stderr or b"")[0][-300:]
         raise RuntimeError(f"ffmpeg 切片失败: {stderr_tail or proc.returncode}")
 
 
@@ -1334,7 +1335,7 @@ def _convert_gif_to_mp4_file(gif_path: Path, out_path: Path) -> None:
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"ffmpeg 转码超时（>{_GIF_VIDEO_TIMEOUT_SECONDS}s）") from exc
     if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
-        stderr_tail = (proc.stderr or b"")[-300:].decode("utf-8", errors="replace")
+        stderr_tail = decode_text(proc.stderr or b"")[0][-300:]
         raise RuntimeError(f"ffmpeg 转码失败: {stderr_tail or proc.returncode}")
 
 
@@ -2095,22 +2096,16 @@ def resolve_media_content_parts(
                 continue
             url = value.get("url")
             if _is_media_reference(url):
-                loaded = load_session_media_base64(session_id, url)
-                if loaded is None:
+                media_path = resolve_media_path(session_id, url)
+                if media_path is None:
                     unresolved.append(url)
                 else:
-                    mime, base64_data = loaded
                     # 统一发送口径（与 _media_model_part_from_path 一致）：
                     # 视觉 API 拒绝的格式（静图 gif/bmp/ico/tif/tiff→PNG、
                     # 动图 gif→mp4）转换后发送；原图字节完整落盘不受影响
-                    media_path = resolve_media_path(session_id, url)
                     try:
-                        converted_result = (
-                            _load_converted_media_base64(
-                                _transcode_cache_dir(session_id), media_path
-                            )
-                            if media_path is not None
-                            else None
+                        converted_result = _load_converted_media_base64(
+                            _transcode_cache_dir(session_id), media_path
                         )
                     except MediaSendTooLargeError as gate_error:
                         # 超过发送/读取上限：不再解析原图（避免超大 base64
@@ -2130,18 +2125,21 @@ def resolve_media_content_parts(
                     # 缩略图生成失败或动图（GIF）按原图发送
                     try:
                         oversized = (
-                            media_path is not None
-                            and media_path.stat().st_size > IMAGE_THUMBNAIL_THRESHOLD_BYTES
+                            media_path.stat().st_size > IMAGE_THUMBNAIL_THRESHOLD_BYTES
                             and Path(media_path.name).suffix.lower() not in _IMAGE_THUMBNAIL_SKIP_EXTENSIONS
                         )
                     except OSError:
                         oversized = False
-                    if oversized and media_path is not None:
+                    if oversized:
                         thumb = _load_image_thumbnail_base64(
                             _thumb_dir(session_id), media_path
                         )
                         if thumb is not None:
-                            mime, base64_data = thumb
+                            thumb_mime, thumb_base64 = thumb
+                            new_part[key] = {
+                                **value, "url": _media_data_url(thumb_mime, thumb_base64)
+                            }
+                            continue
                         elif media_path.stat().st_size > MEDIA_SEND_IMAGE_LIMIT_BYTES:
                             # 缩略图失败且超过图片读取上限：原图绝不上行
                             # （防御兜底；正常情况下读取/转换层已先行拦截）
@@ -2157,7 +2155,12 @@ def resolve_media_content_parts(
                             })
                             media_replaced = True
                             break
-                    new_part[key] = {**value, "url": _media_data_url(mime, base64_data)}
+                    loaded = load_session_media_base64(session_id, url)
+                    if loaded is None:
+                        unresolved.append(url)
+                    else:
+                        mime, base64_data = loaded
+                        new_part[key] = {**value, "url": _media_data_url(mime, base64_data)}
         # 超限占位已整体替换：不再走后续解析（含音频分支）
         if media_replaced:
             continue

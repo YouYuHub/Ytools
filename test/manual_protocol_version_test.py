@@ -134,13 +134,13 @@ def case_negotiate(name, requested, expect=None):
         return f"[FAIL] {name}: 响应超时(8s)", False
     if "error" in resp:
         err = resp["error"]
-        return (f"[{'PASS' if expect == 'error' else 'WARN'}] {name}: 返回错误 "
+        return (f"[{'PASS' if expect == 'error' else 'WARNING'}] {name}: 返回错误 "
                 f"code={err.get('code')} msg={err.get('message')!r}", expect == "error")
     result = resp.get("result", {})
     got = result.get("protocolVersion")
     server_info = result.get("serverInfo", {})
     ok = (got == requested) if expect == "echo" else (expect is None or got == expect)
-    tag = "PASS" if ok else "WARN"
+    tag = "PASS" if ok else "WARNING"
     return (f"[{tag}] {name}: 请求={requested!r} -> 响应={got!r} "
             f"serverInfo={server_info.get('name')}@{server_info.get('version')} "
             f"capabilities={sorted(result.get('capabilities', {}).keys())}", ok)
@@ -183,7 +183,7 @@ def full_session_test(version):
         steps.append(f"[INFO] tools/call 响应 _meta 键: {sorted(meta.keys())} "
                      f"协议版本={meta.get(META_KEY)!r}")
         meta_ok = meta.get(META_KEY) == version
-        steps.append(f"[{'PASS' if meta_ok else 'WARN'}] 响应 _meta 协议版本一致性: "
+        steps.append(f"[{'PASS' if meta_ok else 'WARNING'}] 响应 _meta 协议版本一致性: "
                      f"期望 {version!r}, 实际 {meta.get(META_KEY)!r}")
     finally:
         c.close()

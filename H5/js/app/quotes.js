@@ -341,5 +341,9 @@
   App.removeDraftQuote = removeDraftQuote;
   App.clearPendingQuotes = clearPendingQuotes;
   App.buildQuoteList = buildQuoteList;
+  App.captureQuoteSelection = function () {
+    const snapshot = readSelection();
+    return snapshot ? { text: snapshot.text, source: snapshot.source } : null;
+  };
   App.hideQuoteFloat = hideFloatBtn;
 })(window.App);

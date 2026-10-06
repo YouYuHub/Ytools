@@ -52,6 +52,46 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertTrue(bt.is_builtin_tool("write_file"))
         self.assertTrue(bt.is_builtin_tool("edit_file"))
 
+    def test_file_tool_schemas_and_descriptions_are_aligned(self):
+        definitions = {
+            definition["function"]["name"]: definition["function"]
+            for definition in (
+                bt.WRITE_FILE_TOOL_DEFINITION,
+                bt.EDIT_FILE_TOOL_DEFINITION,
+                bt.READ_FILE_TOOL_DEFINITION,
+                bt.SEARCH_FILES_TOOL_DEFINITION,
+            )
+        }
+
+        write = definitions["write_file"]
+        self.assertIn("mode=overwrite", write["description"])
+        self.assertIn("edit_file", write["description"])
+        self.assertEqual(write["parameters"]["properties"]["mode"]["enum"], [
+            "create", "overwrite", "append",
+        ])
+        self.assertIn("mode", write["parameters"]["required"])
+        self.assertNotIn("create_only", write["description"])
+
+        edit = definitions["edit_file"]
+        self.assertIn("old_string", edit["description"])
+        self.assertIn("edits", edit["description"])
+        self.assertIn("二者不可混用", edit["description"])
+        properties = edit["parameters"]["properties"]
+        self.assertIn("不可与 edits 同用", properties["old_string"]["description"])
+        self.assertIn("只传 edits", properties["edits"]["description"])
+
+        read = definitions["read_file"]
+        self.assertIn("start_line", read["parameters"]["properties"])
+        self.assertIn("limit", read["parameters"]["properties"])
+        self.assertNotIn("end_line", read["parameters"]["properties"])
+
+        search = definitions["search_files"]
+        self.assertIn("跨文件搜索", search["description"])
+        self.assertIn("只搜索内容，不枚举文件名", search["description"])
+        self.assertIn("file_pattern 只筛选待搜索文件", search["description"])
+        self.assertIn("不返回文件清单", search["parameters"]["properties"]["file_pattern"]["description"])
+        self.assertIn("pattern", search["parameters"]["required"])
+
     # ---------- write_file ----------
 
     def test_write_file_creates_and_overwrites(self):
@@ -61,6 +101,7 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         target = Path(self._tmp) / "sub" / "dir" / "a.txt"
         self.assertTrue(target.exists())
+        self.assertTrue(result["success"])
         self.assertEqual(target.read_text(encoding="utf-8"), "第一行\n第二行")
         self.assertTrue(result["created"])
         self.assertFalse(result["action"] == "append")
@@ -78,6 +119,48 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertEqual(result["action"], "append")
         self.assertFalse(result["created"])
         self.assertEqual(result["content_hash"], bt._content_hash("hello-world"))
+
+    def test_write_file_guards_existing_content(self):
+        path = Path(self._tmp) / "guard.txt"
+        path.write_text("before", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "FILE_ALREADY_EXISTS"):
+            bt.execute_write_file({"full_file_name": str(path), "content": "after", "create_only": True})
+        with self.assertRaisesRegex(ValueError, "FILE_MODIFIED_EXTERNALLY"):
+            bt.execute_write_file({"full_file_name": str(path), "content": "after", "expected_hash": "stale"})
+        self.assertEqual(path.read_text(encoding="utf-8"), "before")
+        bt.execute_write_file({"full_file_name": str(path), "content": "after", "expected_hash": bt._content_hash("before")})
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+
+    def test_write_file_explicit_modes_and_conflicts(self):
+        path = Path(self._tmp) / "mode.txt"
+        created = bt.execute_write_file({"full_file_name": str(path), "content": "first", "mode": "create"})
+        self.assertEqual(created["action"], "create")
+        with self.assertRaisesRegex(ValueError, "FILE_ALREADY_EXISTS"):
+            bt.execute_write_file({"full_file_name": str(path), "content": "lost", "mode": "create"})
+        with self.assertRaisesRegex(ValueError, "冲突"):
+            bt.execute_write_file({"full_file_name": str(path), "content": "lost", "mode": "overwrite", "append": True})
+        self.assertEqual(path.read_text(encoding="utf-8"), "first")
+        overwritten = bt.execute_write_file({"full_file_name": str(path), "content": "second", "mode": "overwrite"})
+        self.assertEqual(overwritten["action"], "overwrite")
+        bt.execute_write_file({"full_file_name": str(path), "content": "+tail", "mode": "append"})
+        self.assertEqual(path.read_text(encoding="utf-8"), "second+tail")
+
+    def test_create_only_does_not_replace_concurrently_created_file(self):
+        path = Path(self._tmp) / "race.txt"
+        def concurrent_create(_source, destination):
+            Path(destination).write_text("other writer", encoding="utf-8")
+            raise FileExistsError(destination)
+        with patch.object(bt.os, "link", side_effect=concurrent_create):
+            with self.assertRaisesRegex(ValueError, "FILE_ALREADY_EXISTS"):
+                bt.execute_write_file({"full_file_name": str(path), "content": "mine", "create_only": True})
+        self.assertEqual(path.read_text(encoding="utf-8"), "other writer")
+
+    def test_write_file_append_detects_existing_encoding(self):
+        path = Path(self._tmp) / "gbk.txt"
+        path.write_text("中文", encoding="gbk")
+        result = bt.execute_write_file({"full_file_name": str(path), "content": "追加", "append": True})
+        self.assertEqual(result["encoding"], "gbk")
+        self.assertEqual(path.read_text(encoding="gbk"), "中文追加")
 
     def test_write_file_rejects_bad_args(self):
         with self.assertRaises(ValueError):
@@ -107,8 +190,27 @@ class BuiltinFileToolTests(unittest.TestCase):
         text = Path(path).read_text(encoding="utf-8")
         self.assertIn("return 42", text)
         self.assertNotIn("return 1", text)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["_model_result"]["success"])
         self.assertEqual(result["replacements"], 1)
         self.assertEqual(result["matched_occurrences"], 1)
+
+    def test_edit_file_reports_clear_errors_for_parameter_shapes(self):
+        with self.assertRaisesRegex(ValueError, "单次替换必须同时提供 old_string 和 new_string"):
+            bt.execute_edit_file({"full_file_name": "x.txt", "old_string": "old"})
+        with self.assertRaisesRegex(ValueError, "参数格式冲突.*只选一种"):
+            bt.execute_edit_file({
+                "full_file_name": "x.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "edits": [{"old_string": "a", "new_string": "b"}],
+            })
+
+    def test_edit_file_accepts_read_file_numbered_lines(self):
+        path = self._make_file("numbered.py", "first\nsecond\nthird\n")
+        result = bt.execute_edit_file({"full_file_name": path, "old_string": "1| first\n2| second", "new_string": "changed"})
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "changed\nthird\n")
+        self.assertIn("已去除 read_file 行号", result["message"])
 
     def test_edit_file_zero_match_hint(self):
         path = self._make_file("hint.txt", "alpha line\nbeta line\n")
@@ -198,27 +300,73 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         self.assertEqual(Path(path).read_text(encoding="utf-8"), "keep A\nkeep B\n")
 
+    def test_edit_file_batch_is_all_or_nothing(self):
+        path = self._make_file("batch.txt", "first\nsecond\nthird\n")
+        bt.execute_edit_file({"full_file_name": path, "edits": [
+            {"old_string": "first", "new_string": "FIRST"},
+            {"old_string": "second", "new_string": "SECOND"},
+        ]})
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "FIRST\nSECOND\nthird\n")
+        with self.assertRaisesRegex(ValueError, "第 2 项"):
+            bt.execute_edit_file({"full_file_name": path, "edits": [
+                {"old_string": "FIRST", "new_string": "lost"},
+                {"old_string": "missing", "new_string": "never"},
+            ]})
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "FIRST\nSECOND\nthird\n")
+
     def test_try_execute_dispatch_and_error_shape(self):
         # 非目标名称返回 None
         self.assertIsNone(bt.try_execute_builtin_file_tool("todo_write", {}))
         self.assertIsNone(bt.try_execute_builtin_file_tool("list_dir", {}))
         # 正常分发
         ok = bt.try_execute_builtin_file_tool(
-            "write_file", {"full_file_name": "d.txt", "content": "ok"}
+            "write_file", {"full_file_name": "d.txt", "content": "ok", "mode": "create"}
         )
         self.assertIn("message", ok)
+        self.assertTrue(ok["success"])
         # 异常转结构化 error
         bad = bt.try_execute_builtin_file_tool(
             "edit_file", {"full_file_name": "missing.txt", "old_string": "a", "new_string": "b"}
         )
         self.assertIn("error", bad)
         self.assertEqual(bad.get("tool"), "edit_file")
+        self.assertIs(bad.get("success"), False)
+
+        invalid_calls = [
+            ("write_file", {"full_file_name": "", "content": "x", "mode": "create"}),
+            ("edit_file", {"full_file_name": "x.txt", "edits": [], "old_string": "x", "new_string": "y"}),
+            ("read_file", {"full_file_name": "missing.txt"}),
+            ("search_files", {"pattern": ""}),
+        ]
+        for name, args in invalid_calls:
+            with self.subTest(tool=name):
+                result = bt.try_execute_builtin_file_tool(name, args)
+                self.assertIs(result.get("success"), False)
+                self.assertIn("error", result)
 
     # ---------- read_file ----------
+
+    def test_read_file_rejects_large_file_before_full_read(self):
+        path = Path(self._tmp) / "large.txt"
+        with path.open("wb") as handle:
+            handle.truncate(65)
+        with patch.object(bt, "_READ_FILE_MAX_BYTES", 64):
+            with self.assertRaisesRegex(ValueError, "读取上限"):
+                bt.execute_read_file({"full_file_name": str(path)})
+
+    def test_search_files_zero_limit_still_has_hard_cap(self):
+        path = Path(self._tmp) / "large.txt"
+        path.write_bytes(b"TARGET" + b"x" * 65)
+        with patch.object(bt, "_SEARCH_HARD_FILE_MAX_BYTES", 64):
+            result = bt.execute_search_files({"pattern": "TARGET", "max_file_mb": 0})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["files_scanned"], 0)
+        self.assertIn("跳过 1 个", result["message"])
 
     def test_read_file_lines_with_numbers(self):
         path = self._make_file("demo.txt", "alpha\nbeta\ngamma\n")
         result = bt.execute_read_file({"full_file_name": path})
+        self.assertTrue(result["success"])
         self.assertEqual(result["total_lines"], 3)
         self.assertEqual(result["range_start"], 1)
         self.assertEqual(result["range_end"], 3)
@@ -230,15 +378,22 @@ class BuiltinFileToolTests(unittest.TestCase):
     def test_read_file_empty_and_truncated_range_metadata(self):
         empty = self._make_file("empty.txt", "")
         result = bt.execute_read_file({"full_file_name": empty})
+        self.assertTrue(result["success"])
         self.assertEqual(result["content"], "")
         self.assertEqual(result["total_lines"], 0)
         long_path = self._make_file("many.txt", ("x" * 1000 + "\n") * 100)
         limited = bt.execute_read_file({"full_file_name": long_path})
+        self.assertTrue(limited["success"])
         self.assertTrue(limited["truncated"])
         self.assertTrue(limited["has_more"])
-        self.assertLess(limited["retry_end_line"], limited["range_end"])
+        self.assertEqual(limited["next_start_line"], limited["range_end"] + 1)
+        self.assertNotIn("已省略", limited["content"])
+        continued = bt.execute_read_file({"full_file_name": long_path,
+                                          "start_line": limited["next_start_line"]})
+        self.assertIn(f'{limited["next_start_line"]}| ', continued["content"])
 
     def test_read_file_range_and_no_line_numbers(self):
+        # end_line 不再暴露给模型，但旧调用仍可单独使用。
         path = self._make_file("range.txt", "l1\nl2\nl3\nl4\n")
         result = bt.execute_read_file({
             "full_file_name": path, "start_line": 2, "end_line": 3,
@@ -246,6 +401,32 @@ class BuiltinFileToolTests(unittest.TestCase):
         })
         self.assertEqual(result["content"], "l2\nl3")
         self.assertTrue(result["has_more"])
+
+    def test_read_file_limit_and_argument_validation(self):
+        path = self._make_file("paged.txt", "\n".join(f"line {i}" for i in range(1, 11)))
+        first = bt.execute_read_file({"full_file_name": path, "limit": 3})
+        self.assertEqual(first["range_end"], 3)
+        second = bt.execute_read_file({"full_file_name": path, "start_line": first["next_start_line"], "limit": 3})
+        self.assertEqual(second["range_start"], 4)
+        self.assertNotIn("line 3", second["content"])
+        with self.assertRaisesRegex(ValueError, "不能同时"):
+            bt.execute_read_file({"full_file_name": path, "limit": 3, "end_line": 5})
+        with self.assertRaisesRegex(ValueError, "布尔值"):
+            bt.execute_read_file({"full_file_name": path, "show_line_numbers": "false"})
+
+    def test_read_file_wrong_explicit_encoding_rejected(self):
+        path = self._make_file("utf8.txt", "你好")
+        with self.assertRaisesRegex(ValueError, "指定编码"):
+            bt.execute_read_file({"full_file_name": path, "encoding": "ascii"})
+
+    def test_read_file_model_budget_supports_followup_chunk(self):
+        path = self._make_file("budget.txt", "a" * 1400)
+        first = bt.execute_read_file({"full_file_name": path, "_max_chars": 512})
+        self.assertEqual(first["mode"], "char_chunk")
+        self.assertEqual(first["next_char_offset"], 512)
+        second = bt.execute_read_file({"full_file_name": path, "_max_chars": 512,
+                                       "char_offset": first["next_char_offset"]})
+        self.assertEqual(second["char_offset"], 512)
 
     def test_read_file_rejects_missing_and_binary(self):
         with self.assertRaises(FileNotFoundError):
@@ -276,7 +457,7 @@ class BuiltinFileToolTests(unittest.TestCase):
         self._make_file("b.md", "some TARGET_2 text\n")
         Path(self._tmp, "node_modules").mkdir()
         Path(self._tmp, "node_modules", "c.js").write_text("TARGET_3\n", encoding="utf-8")
-        result = bt.execute_search_files({"pattern": r"TARGET_\d"})
+        result = bt.execute_search_files({"pattern": r"TARGET_\d", "is_regex": True})
         self.assertEqual(result["files_matched"], 2)
         self.assertEqual(result["total_matches"], 2)
         self.assertNotIn("node_modules", result["message"])
@@ -299,7 +480,7 @@ class BuiltinFileToolTests(unittest.TestCase):
         none = bt.execute_search_files({"pattern": "zzz-not-exist"})
         self.assertIn("（无匹配结果）", none["message"])
         with self.assertRaises(ValueError):
-            bt.execute_search_files({"pattern": "("})  # 非法正则
+            bt.execute_search_files({"pattern": "(", "is_regex": True})  # 非法正则
         with self.assertRaises(ValueError):
             bt.execute_search_files({"pattern": ""})
 
@@ -318,14 +499,17 @@ class BuiltinFileToolTests(unittest.TestCase):
             "pattern": "a.c", "is_regex": False,
         })
         self.assertEqual(literal["total_matches"], 1)   # 仅字面行命中
-        regex = bt.execute_search_files({"pattern": "a.c"})
+        regex = bt.execute_search_files({"pattern": "a.c", "is_regex": True})
         self.assertEqual(regex["total_matches"], 2)     # 正则两行都命中
+        self.assertEqual(bt.execute_search_files({"pattern": "a.c"})["total_matches"], 1)
+        with self.assertRaisesRegex(ValueError, "布尔值"):
+            bt.execute_search_files({"pattern": "a.c", "is_regex": "false"})
 
     def test_search_files_max_results_cap(self):
         for i in range(5):
             self._make_file(f"m{i}.txt", f"hit{i}\n")
         result = bt.execute_search_files({
-            "pattern": r"hit\d", "max_results": 2,
+            "pattern": r"hit\d", "is_regex": True, "max_results": 2,
         })
         self.assertTrue(result["truncated"])
         self.assertEqual(result["total_matches"], 5)

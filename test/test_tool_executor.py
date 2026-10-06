@@ -68,13 +68,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(plan.parsed_tools[0][2], "format_current_time")
         self.assertFalse(plan.has_parse_error)
 
-    def test_invoke_tool_function_honors_configured_timeout(self):
-        async def slow_call(**_kwargs):
-            await asyncio.sleep(0.05)
+    def test_invoke_tool_function_propagates_client_timeout(self):
+        async def timed_out_call(**_kwargs):
+            raise TimeoutError("client timeout")
 
-        with patch("factory.agent_runtime.tool_executor.load_var", return_value="0.01"), \
-                patch("factory.agent_runtime.tool_executor.call_mcp_tool", slow_call):
-            with self.assertRaises(TimeoutError):
+        with patch("factory.agent_runtime.tool_executor.call_mcp_tool", timed_out_call):
+            with self.assertRaisesRegex(TimeoutError, "client timeout"):
                 _invoke_tool_function("slow_tool", {}, {"slow_tool": "server"})
 
     def test_invoke_tool_function_restores_original_mcp_name(self):
@@ -84,8 +83,7 @@ class ToolExecutorTests(unittest.TestCase):
             calls.append(kwargs)
             return "ok"
 
-        with patch("factory.agent_runtime.tool_executor.load_var", return_value="0"), \
-                patch("factory.agent_runtime.tool_executor.call_mcp_tool", fake_call):
+        with patch("factory.agent_runtime.tool_executor.call_mcp_tool", fake_call):
             result = _invoke_tool_function(
                 "mcp_123456789abc_find_item",
                 {"query": "x"},
@@ -96,6 +94,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(calls[0]["function_name"], "find_item")
         self.assertEqual(calls[0]["mcp_service"], "catalog_server")
+
+    def test_pipe_connection_error_is_not_retried_by_executor(self):
+        calls = []
+
+        async def failed_call(**_kwargs):
+            calls.append(1)
+            raise RuntimeError("Failed to connect to named-pipe server")
+
+        with patch("factory.agent_runtime.tool_executor.call_mcp_tool", failed_call):
+            with self.assertRaisesRegex(RuntimeError, "named-pipe server"):
+                _invoke_tool_function(
+                    "run_pipe_command", {}, {"run_pipe_command": "pipe_server"}
+                )
+
+        self.assertEqual(len(calls), 1)
 
     def test_mcp_client_direct_call_honors_timeout(self):
         async def slow_call(*_args, **_kwargs):

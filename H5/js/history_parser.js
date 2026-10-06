@@ -69,6 +69,7 @@
       kind: "compaction",
       scope: obj.scope || "round",
       phase: obj.phase || "",
+      invalidated: !!obj.invalidated,
       content: obj.compress_context || obj.context_summary || "",
       summary_text: typeof obj.summary_text === "string" ? obj.summary_text : "",
       usage: compactionUsage,
@@ -163,6 +164,7 @@
       todo: Array.isArray(evt.todo) ? evt.todo : null,
       tools: Array.isArray(evt.tools) ? evt.tools : [],
       rounds_limit: evt.rounds_limit != null ? Number(evt.rounds_limit) : null,
+      timeout_seconds: evt.timeout_seconds != null ? Number(evt.timeout_seconds) : null,
       started_at: evt.timestamp || "",
       // 块体条目（model_call/tool_start/tool_result/todo 按 seq 归位）
       entries: [],
@@ -185,8 +187,12 @@
   function foldSubAgentEvent(records, evt, openBlocks) {
     const agentId = evt.agent_id || "";
     if (evt.phase === "start") {
-      const record = subAgentRecord(evt);
-      records.push(record);
+      const existing = evt.parent_tool_call_id && records.find(function (record) {
+        return record.kind === "agentBlock" && record.parent_tool_call_id === evt.parent_tool_call_id;
+      });
+      const record = existing || subAgentRecord(evt);
+      if (existing) Object.assign(record, subAgentRecord(evt));
+      else records.push(record);
       openBlocks[agentId] = record;
       return;
     }
@@ -452,14 +458,34 @@
           evt.tool_calls.forEach(function (call) {
             const fn = call.function || {};
             // 父级 sub_agent 派发调用：块内已显示完整任务与轨迹，跳过普通工具块
-            if ((fn.name || call.name) === "sub_agent") return;
+            if ((fn.name || call.name) === "sub_agent") {
+              // 旧数据没有调用 ID 时不能可靠关联，保持按 start 事件展示。
+              if (!call.id) return;
+              const existing = call.id && records.find(function (record) {
+                return record.kind === "agentBlock" && record.parent_tool_call_id === call.id;
+              });
+              const record = existing || subAgentRecord({ parent_tool_call_id: call.id, timestamp: ts });
+              record.args = fn.arguments || "";
+              record.round = roundNo;
+              if (!existing) records.push(record);
+              return;
+            }
             records.push({ kind: "tool", name: fn.name || call.name || "tool", args: fn.arguments || "", ts: ts, round: roundNo });
           });
         }
       });
 
-      if (obj.usage_total && obj.usage_total.total_tokens) {
-        records.push({ kind: "usage", usage: obj.usage_total, model: obj.model, round: roundNo });
+      const roundUsage = obj.usage_total && typeof obj.usage_total === "object"
+        ? obj.usage_total : {};
+      const hasTokenUsage = ["prompt_tokens", "completion_tokens", "total_tokens"].some(function (key) {
+        if (!Object.prototype.hasOwnProperty.call(roundUsage, key)) return false;
+        const value = roundUsage[key];
+        return value !== null && value !== "" && Number.isFinite(Number(value));
+      });
+      const roundModel = obj.model && typeof obj.model === "object" ? obj.model : null;
+      const hasRoundModel = roundModel && typeof roundModel.name === "string" && roundModel.name.trim();
+      if (hasTokenUsage || hasRoundModel) {
+        records.push({ kind: "usage", usage: roundUsage, model: roundModel, round: roundNo });
       }
       // 轮内子块（sub_agent 聚合块等由辅助函数 push 的记录）统一补轮次号
       for (let r = roundStart; r < records.length; r += 1) {

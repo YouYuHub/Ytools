@@ -52,7 +52,7 @@ window.App = window.App || {};
     modelParamDirty: false,
     // 待发送的多媒体附件（粘贴/选择的图片音频视频）：[{id,file,name,kind,dataUrl}]
     pendingMedia: [],
-    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection.md）：
+    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection_design.md）：
     // [{id, text, source:{role,session_id,round}}]；随会话草稿保存/恢复，
     // 发送成功后清空（id 仅本地 UI 用，请求上送前由 QuoteUtils 剥离）
     pendingQuotes: [],
@@ -103,35 +103,9 @@ window.App = window.App || {};
     audio: ["wav", "mp3", "m4a", "ogg", "flac"],
     video: ["mp4", "webm", "mov", "mkv"],
   };
-  // 与后端一致的「可上传文档」类型：
-  // - 富文档（pdf/docx/doc/xls/xlsx/csv）走专用解析器；
-  // - 常见文本类（代码/配置/日志/字幕/数据等）直接按文本内容解析入库；
-  // 其余类型（未知扩展名）由后端按二进制嗅探判定：像文本则按文本解析、
-  // 否则拒绝（避免二进制文件被硬解码成乱码文本塞进上下文）。
-  const DOC_EXTENSIONS = [
-    "txt", "md", "pdf", "docx", "doc", "csv", "xls", "xlsx",
-    // 数据 / 配置
-    "markdown", "rst", "log", "text", "me", "tsv", "json", "jsonl", "ndjson",
-    "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env",
-    "gitignore", "gitattributes", "editorconfig", "srt", "vtt", "ass", "tex", "bib",
-    // Web / 前端
-    "html", "htm", "xhtml", "xml", "xsl", "xslt", "css", "scss", "sass",
-    "less", "styl", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "svg",
-    "map",
-    // 通用编程语言
-    "py", "pyi", "ipynb", "java", "kt", "kts", "scala", "groovy",
-    "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "go", "rs",
-    "swift", "m", "mm", "php", "rb", "pl", "pm", "lua", "r", "jl", "dart",
-    "ex", "exs", "erl", "hrl", "hs", "clj", "cljs", "el", "vim",
-    "asm", "s", "f", "f90", "f95", "for", "pas", "d", "nim",
-    "zig", "v", "sol", "tcl", "awk", "sed",
-    // 脚本 / 构建 / 其它纯文本
-    "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", "sql",
-    "graphql", "gql", "proto", "thrift", "cmake", "make", "mk", "gradle",
-    "dockerfile", "containerfile", "tf", "tfvars", "hcl", "nix",
-    "diff", "patch", "po", "pot", "strings", "pem",
-    "crt", "cer", "key", "pub", "asc", "lic", "license",
-  ];
+  // 与后端 file_factory.PARSER_BY_EXT 一致的可解析文档类型
+  // （解析文本写入 file_memory，由后端注入系统提示词，与二进制媒体走不同通道）
+  const DOC_EXTENSIONS = ["txt", "md", "pdf", "docx", "doc", "csv", "xls", "xlsx"];
   const MAX_DOC_FILE_SIZE = 10 * 1024 * 1024;
 
   function docKindOf(filename) {
@@ -169,9 +143,9 @@ window.App = window.App || {};
   const stopGroup = $("#stopGroup");
   const stopMenuBtn = $("#stopMenuBtn");
   const queueMenu = $("#queueMenu");
-  const composerAttachmentBlocks = $("#composerAttachmentBlocks");
-  const composerQuotes = $("#composerQuotes");
   const composerAttachments = $("#composerAttachments");
+  const composerQuotes = $("#composerQuotes");
+  const composerAttachmentBlocks = $("#composerAttachmentBlocks");
   const pendingOutbox = $("#pendingOutbox");
   const contextTokenTodoSlot = $("#contextTokenTodoSlot");
   const contextTokenModel = $("#contextTokenModel");
@@ -249,8 +223,6 @@ window.App = window.App || {};
   const chatSettingsCancel = $("#chatSettingsCancel");
   const chatSettingsConfirm = $("#chatSettingsConfirm");
   const chatSettingsReset = $("#chatSettingsReset");
-  const reasoningMaxLength = $("#reasoningMaxLength");
-  const toolResultMaxLength = $("#toolResultMaxLength");
   const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
   const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
   const compactionRetryMaxAttempts = $("#compactionRetryMaxAttempts");
@@ -259,7 +231,9 @@ window.App = window.App || {};
   const subAgentTodoRemindMax = $("#subAgentTodoRemindMax");
   const videoReadMaxSeconds = $("#videoReadMaxSeconds");
   const mcpToolWorkers = $("#mcpToolWorkers");
-  const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
+    const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
+    const subAgentMaxRounds = $("#subAgentMaxRounds");
+    const subAgentTimeoutSeconds = $("#subAgentTimeoutSeconds");
   const triggerRatio = $("#triggerRatio");
   const summaryBudgetRatio = $("#summaryBudgetRatio");
   const historyTargetTokens = $("#historyTargetTokens");
@@ -297,8 +271,6 @@ window.App = window.App || {};
 
   // 后端接口会返回同一份 defaults；这里仅作为后端暂不可用时的离线回退。
   const CHAT_SETTINGS_DEFAULTS = {
-    reasoning_max_length: -1,
-    tool_result_max_length: -1,
     call_timeout_seconds: 300,
     network_retry_max_attempts: 3,
     compaction_retry_max_attempts: 2,
@@ -308,6 +280,8 @@ window.App = window.App || {};
     video_read_max_seconds: 60,
     mcp_tool_workers: 3,
     sub_agent_max_concurrent: 3,
+    sub_agent_max_rounds: 40,
+    sub_agent_timeout_seconds: 900,
     trigger_ratio: 0.8,
     summary_budget_ratio: 0.2,
     target_tokens: 0,
@@ -332,85 +306,6 @@ window.App = window.App || {};
     return node;
   }
 
-  function fitAttachmentBlockGrid(grid) {
-    if (!grid) return;
-    const tiles = grid.querySelectorAll(
-      ".composer-quotes-tile, .media-chip, .doc-chip, .msg-quote-tile, " +
-      ".msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-video, .msg-user-media-doc"
-    );
-    const count = tiles.length;
-    if (!count) return;
-
-    const style = window.getComputedStyle(grid);
-    const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-    const gap = parseFloat(style.columnGap) || 0;
-    const minimumSize = parseFloat(style.getPropertyValue("--attachment-block-min-size")) || 20;
-    // 用户消息气泡按内容收缩。给附件网格一个由数量决定的宽度上限，
-    // 否则纯附件消息会按首个默认网格列收窄，无法在插入后正确测量布局。
-    if (grid.classList.contains("msg-user-attachment-blocks") && chatInner.clientWidth) {
-      const bubble = grid.parentElement;
-      const bubbleStyle = bubble ? window.getComputedStyle(bubble) : null;
-      const bubblePadding = bubbleStyle
-        ? (parseFloat(bubbleStyle.paddingLeft) || 0) + (parseFloat(bubbleStyle.paddingRight) || 0)
-        : 0;
-      const maxGridWidth = Math.max(1, chatInner.clientWidth * 0.9 - bubblePadding);
-      const oneRowWidth = 52 * count + gap * (count - 1);
-      grid.style.width = Math.min(oneRowWidth, maxGridWidth).toFixed(2) + "px";
-    }
-    const availableWidth = grid.clientWidth;
-    if (!availableWidth) return;
-
-    const contentWidth = Math.max(1, availableWidth - padding);
-    const maxColumnsAtMinimum = Math.max(
-      1,
-      Math.floor((contentWidth + gap) / (minimumSize + gap))
-    );
-    // 宽度允许时全部保持一行；否则最多两行，并让每个方块尺寸保持一致。
-    const columns = count <= maxColumnsAtMinimum ? count : Math.ceil(count / 2);
-    const tileSize = Math.max(
-      1,
-      Math.min(52, (contentWidth - gap * (columns - 1)) / columns)
-    );
-    grid.style.setProperty("--attachment-block-columns", String(columns));
-    grid.style.setProperty("--attachment-block-size", tileSize.toFixed(2) + "px");
-  }
-
-  function syncMessageAttachmentBlocks() {
-    if (!chatInner) return;
-    chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(fitAttachmentBlockGrid);
-  }
-
-  function syncAttachmentBlockLayouts() {
-    syncComposerAttachmentBlocks();
-    syncMessageAttachmentBlocks();
-  }
-
-  function syncComposerAttachmentBlocks() {
-    if (!composerAttachmentBlocks) return;
-    const hasQuotes = composerQuotes
-      && !composerQuotes.classList.contains("hidden")
-      && composerQuotes.childElementCount > 0;
-    const hasAttachments = composerAttachments
-      && !composerAttachments.classList.contains("hidden")
-      && composerAttachments.childElementCount > 0;
-    const hasItems = hasQuotes || hasAttachments;
-    composerAttachmentBlocks.classList.toggle("hidden", !hasItems);
-    if (!hasItems) {
-      composerAttachmentBlocks.style.removeProperty("--attachment-block-columns");
-      composerAttachmentBlocks.style.removeProperty("--attachment-block-size");
-      return;
-    }
-    fitAttachmentBlockGrid(composerAttachmentBlocks);
-  }
-
-  if (composerAttachmentBlocks && typeof ResizeObserver !== "undefined") {
-    const composerAttachmentObserver = new ResizeObserver(syncAttachmentBlockLayouts);
-    composerAttachmentObserver.observe(composerAttachmentBlocks);
-    composerAttachmentObserver.observe(chatScroll);
-  } else {
-    window.addEventListener("resize", syncAttachmentBlockLayouts);
-  }
-
   function toast(message) {
     const node = el("div", "toast", message);
     toastWrap.appendChild(node);
@@ -424,21 +319,34 @@ window.App = window.App || {};
     return window.matchMedia("(max-width: 768px)").matches;
   }
 
+  // 自动跟随与用户滚动共用一份状态；用户意图优先于流式更新。
+  let autoScrollPaused = false;
+  let lastScrollTop = chatScroll.scrollTop;
+  let bottomScrollFrame = null;
+
+  function cancelBottomCorrection() {
+    if (bottomScrollFrame != null) cancelAnimationFrame(bottomScrollFrame);
+    bottomScrollFrame = null;
+  }
+
   function scrollToBottom(instant) {
-    // 瞬跳：.chat-scroll 的 CSS 是 scroll-behavior: smooth，scrollTop 赋值会继承该属性触发动画，
-    // 临时覆盖为 auto 再恢复，保证切换历史会话时瞬间跳到底部
-    // 主动置底（发送消息/点回底按钮/程序跳转）都视为恢复自动贴底
     autoScrollPaused = false;
+    cancelBottomCorrection();
     const prev = instant ? chatScroll.style.scrollBehavior : null;
     if (instant) chatScroll.style.scrollBehavior = "auto";
     updateScrollBottomOffset();
     chatScroll.scrollTop = chatScroll.scrollHeight;
+    lastScrollTop = chatScroll.scrollTop;
     if (instant) chatScroll.style.scrollBehavior = prev;
-    // content-visibility 懒渲染修正：屏幕外消息以估算占位参与 scrollHeight，
-    // 真实高度回填（视口附近内容完成渲染）后底部会再伸长一截，下一帧复位一次
-    // 保证真正贴底；已在底部时 scrollTop 不变，重复调用无副作用
-    requestAnimationFrame(function () {
+    // content-visibility 高度回填修正；用户开始浏览后不得执行过期的置底。
+    bottomScrollFrame = requestAnimationFrame(function () {
+      bottomScrollFrame = null;
+      if (autoScrollPaused) return;
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
       chatScroll.scrollTop = chatScroll.scrollHeight;
+      lastScrollTop = chatScroll.scrollTop;
+      chatScroll.style.scrollBehavior = behavior;
     });
   }
 
@@ -446,41 +354,59 @@ window.App = window.App || {};
     return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 120;
   }
 
-  // ---------- 自动贴底暂停机制 ----------
-  // 流式 delta 高频调用 scrollToBottom 时，若用户在低速上滚阅读历史，每次滚动
-  // 偏离底部都不超过 nearBottom 的 120px 阈值，会被下一帧强制拉回（表现为
-  // "压缩/流式进行时页面滚不上去"）。这里改为：检测到用户向上滚动即暂停
-  // 自动贴底，滚回底部 24px 内（或点"回到底部"按钮）自动恢复。
-  let autoScrollPaused = false;
-  let lastScrollTop = chatScroll.scrollTop;
+  function pauseAutoScroll() {
+    autoScrollPaused = true;
+    cancelBottomCorrection();
+    // 立即终止此前的 smooth 置底动画，避免它在上滚输入后继续推进。
+    const behavior = chatScroll.style.scrollBehavior;
+    chatScroll.style.scrollBehavior = "auto";
+    chatScroll.scrollTop = chatScroll.scrollTop;
+    lastScrollTop = chatScroll.scrollTop;
+    chatScroll.style.scrollBehavior = behavior;
+  }
+
+  // 捕获阶段在 scroll 事件及内部控件阻止冒泡之前响应上滚意图。
+  chatScroll.addEventListener("wheel", function (event) {
+    if (event.deltaY < 0) pauseAutoScroll();
+  }, { passive: true, capture: true });
+  let lastTouchY = null;
+  chatScroll.addEventListener("touchstart", function (event) {
+    lastTouchY = event.touches.length ? event.touches[0].clientY : null;
+  }, { passive: true });
+  chatScroll.addEventListener("touchmove", function (event) {
+    const y = event.touches.length ? event.touches[0].clientY : null;
+    if (y != null && lastTouchY != null && y > lastTouchY) pauseAutoScroll();
+    lastTouchY = y;
+  }, { passive: true });
+  chatScroll.addEventListener("keydown", function (event) {
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) {
+      pauseAutoScroll();
+    }
+  });
 
   chatScroll.addEventListener("scroll", function () {
     const top = chatScroll.scrollTop;
-    if (top < lastScrollTop - 1) {
-      // 用户上滚（wheel 上滚/滚动条上拖/键盘 PageUp 都表现为 scrollTop 减小）
+    const movingUp = top < lastScrollTop - 1;
+    const movingDown = top > lastScrollTop + 1;
+    if (movingUp) {
       autoScrollPaused = true;
-    }
-    if (autoScrollPaused &&
-      chatScroll.scrollHeight - top - chatScroll.clientHeight < 24) {
-      autoScrollPaused = false; // 已回到底部附近，恢复跟随
+      cancelBottomCorrection();
+    } else if (autoScrollPaused && movingDown &&
+      chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
+      autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
     }
     lastScrollTop = top;
   });
 
-  // 流式追加内容的贴底入口：暂停期间只调整底部 padding 不拉回视口
   function stickToBottom() {
     if (autoScrollPaused) {
       updateScrollBottomOffset();
       return;
     }
-    scrollToBottom();
-  }
-
-  // 程序化跳转后显式暂停自动贴底（原地重发把视口对齐到发起位置等场景）：
-  // 用户上滚暂停机制只认滚动事件方向（scrollTop 变小），向下跳转触发不了，
-  // 需要调用方显式声明；用户滚回底部 24px 内或点“回到底部”自动恢复
-  function pauseAutoScroll() {
-    autoScrollPaused = true;
+    // 流式跟随采用瞬时更新，避免连续的 smooth 动画与用户操作竞争。
+    scrollToBottom(true);
   }
 
   function setEmpty(empty) {
@@ -747,6 +673,32 @@ window.App = window.App || {};
   }
 
 
+  // 引用与附件使用 display:contents 子槽，必须同步外层容器显隐。
+  function fitAttachmentBlockGrid(container) {
+    if (!container) return;
+    const tiles = container.querySelectorAll(
+      ".composer-quotes-tile, .media-chip, .doc-chip, .msg-quote-tile, .msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-doc"
+    );
+    if (!tiles.length) return;
+    const style = getComputedStyle(container);
+    const available = container.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+    const gap = parseFloat(style.columnGap) || 6;
+    const columns = Math.min(tiles.length, Math.max(1, Math.floor((available + gap) / (52 + gap))));
+    container.style.setProperty("--attachment-block-columns", String(columns));
+    container.style.setProperty("--attachment-block-size", "52px");
+  }
+
+  function syncComposerAttachmentBlocks() {
+    if (!composerAttachmentBlocks) return;
+    const hasQuotes = Boolean(composerQuotes && composerQuotes.children.length && !composerQuotes.classList.contains("hidden"));
+    const hasMedia = Boolean(composerAttachments && composerAttachments.children.length && !composerAttachments.classList.contains("hidden"));
+    composer.classList.toggle("has-quotes", hasQuotes);
+    composer.classList.toggle("has-media", hasMedia);
+    composerAttachmentBlocks.classList.toggle("hidden", !hasQuotes && !hasMedia);
+    if (hasQuotes || hasMedia) fitAttachmentBlockGrid(composerAttachmentBlocks);
+    updateScrollBottomOffset();
+  }
+
   // ---------- 导出到共享命名空间（各模块按需解构） ----------
   Object.assign(App, {
   MAX_PENDING_MEDIA, MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS,
@@ -761,10 +713,8 @@ window.App = window.App || {};
   composerWrap, contextTokenStatus, contextTokenSummary,
   contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn,
   voiceBtn, stopGroup, stopMenuBtn, queueMenu,
-  composerAttachmentBlocks, syncComposerAttachmentBlocks, syncMessageAttachmentBlocks,
-  fitAttachmentBlockGrid,
   composerAttachments, pendingOutbox, contextTokenTodoSlot,
-  composerQuotes,
+  composerQuotes, composerAttachmentBlocks, syncComposerAttachmentBlocks, fitAttachmentBlockGrid,
   todoPanelHost, askModal, askQuestions,
   askSubmit, mediaPreviewModal, mediaPreviewBody,
   mediaPreviewTitle, boostBtn, enhancePanel,
@@ -789,10 +739,11 @@ window.App = window.App || {};
   importConflictCancel, importConflictSubmit,
   chatSettingsModal, chatSettingsBackdrop,
   chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
-  chatSettingsReset, reasoningMaxLength, toolResultMaxLength,
+  chatSettingsReset,
   toolCallTimeoutSeconds, networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
   subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
   subAgentMaxConcurrent,
+  subAgentMaxRounds, subAgentTimeoutSeconds,
   triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
