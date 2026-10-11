@@ -168,6 +168,47 @@ class TruncationTestBase(unittest.IsolatedAsyncioTestCase):
 
 
 class TextToolCallRecoveryTests(TruncationTestBase):
+    async def test_recorded_todo_formats_retry_without_executing_or_persisting_markup(self):
+        formats = [
+            '@@TodoWrite@@{"todos":[]}',
+            '<tool_calls><invoke name="todo_write"><parameter name="todos">[]</parameter></invoke></tool_calls>',
+        ]
+        for markup in formats:
+            for stuck in (False, True):
+                sid = f"mock_recorded_todo_{uuid.uuid4().hex}"
+                snapshots = []
+
+                async def reply(request=None, **kw):
+                    snapshots.append(_snapshot_request_messages(request))
+                    assert len(snapshots) <= 3
+                    content = markup if stuck or len(snapshots) == 1 else "已完成测试，正常汇报。"
+                    for char in content:
+                        yield 'data: ' + json.dumps({"content": char}, ensure_ascii=False) + '\n\n'
+                    yield 'data: {"finish_reason":"stop"}\n\n'
+                    yield 'data: [DONE]\n\n'
+
+                cf.ChatLLM.chat_completions = reply
+                try:
+                    text = await self._consume(sid)
+                    self.assertEqual(len(snapshots), 3 if stuck else 2)
+                    self.assertIn("TEXT_TOOL_CALL_RETRY", text)
+                    self.assertNotIn(markup, text)
+                    with open(self._history_path(sid), encoding="utf-8") as file:
+                        records = [json.loads(line) for line in file]
+                    events = [e for row in records for e in row.get("events", [])]
+                    self.assertFalse(any(e.get("role") == "tool" for e in events))
+                    self.assertFalse(any(markup in str(e.get("content", "")) for e in events))
+                    self.assertIn("原生 tool_calls", str(snapshots[-1]))
+                    if stuck:
+                        self.assertIn("模型连续输出文本形式的工具调用", text)
+                    else:
+                        shown = "".join(json.loads(line[6:]).get("content", "") for line in text.splitlines()
+                                        if line.startswith("data: {") and '"content"' in line)
+                        self.assertIn("正常汇报", shown)
+                finally:
+                    await cleanup_chat_memory_manager(sid)
+                    ChatMemoryManager.delete_chat_session_file(sid)
+
     async def test_text_tool_call_is_hidden_and_model_retries(self):
         sid = f"mock_text_tool_{uuid.uuid4().hex}"
         TextToolCallLLM.calls = 0
@@ -205,6 +246,48 @@ class TextToolCallRecoveryTests(TruncationTestBase):
 
 
 class StreamTruncationRecoveryTests(TruncationTestBase):
+
+    async def test_provider_retry_does_not_execute_incomplete_tools_or_persist_intermediate_error(self):
+        async def reply(**kwargs):
+            yield 'data: {"tool_calls":[{"index":0,"id":"broken","function":{"name":"todo_write","arguments":"{broken"}}]}\n\n'
+            yield 'data: {"error":"temporary failure","retrying":true,"retry":1,"discard_tool_calls":true}\n\n'
+            yield 'data: {"content":"恢复后的完整回答"}\n\n'
+            yield 'data: {"finish_reason":"stop"}\n\n'
+            yield 'data: [DONE]\n\n'
+        cf.ChatLLM.chat_completions = reply
+        sid = f"mock_provider_retry_{uuid.uuid4().hex}"
+        try:
+            text = await self._consume(sid)
+            self.assertIn("temporary failure", text)
+            self.assertIn("恢复后的完整回答", text)
+            with open(self._history_path(sid), encoding="utf-8") as file:
+                history = file.read()
+            self.assertNotIn("temporary failure", history)
+            self.assertNotIn("{broken", history)
+            self.assertNotIn('"role": "tool"', history)
+            self.assertIn("恢复后的完整回答", history)
+        finally:
+            await cleanup_chat_memory_manager(sid)
+            ChatMemoryManager.delete_chat_session_file(sid)
+
+    async def test_only_exhausted_provider_error_is_persisted(self):
+        async def reply(**kwargs):
+            yield 'data: {"error":"temporary failure","retrying":true,"retry":1}\n\n'
+            yield 'data: {"error":"final failure","error_type":"upstream_error_frame","retrying":false,"retry":4,"max_attempts":3}\n\n'
+            yield 'data: [DONE]\n\n'
+        cf.ChatLLM.chat_completions = reply
+        sid = f"mock_provider_exhausted_{uuid.uuid4().hex}"
+        try:
+            await self._consume(sid)
+            with open(self._history_path(sid), encoding="utf-8") as file:
+                history = file.read()
+            self.assertNotIn("temporary failure", history)
+            self.assertIn("final failure", history)
+            self.assertIn('"retry": 4', history)
+            self.assertIn('"max_attempts": 3', history)
+        finally:
+            await cleanup_chat_memory_manager(sid)
+            ChatMemoryManager.delete_chat_session_file(sid)
 
     async def test_truncated_stream_retries_and_completes(self):
         # 第一次调用被截断 → 自动重试 → 第二次正常回答收尾，任务不假结束
@@ -284,6 +367,28 @@ class StreamTruncationRecoveryTests(TruncationTestBase):
 
 class SubAgentTruncationRecoveryTests(unittest.TestCase):
     """子智能体截断续写：第一次调用被截断 → 重试后正常给出结论（done）。"""
+
+    def test_provider_retry_clears_child_incomplete_tool_arguments(self):
+        from unittest.mock import patch
+        from factory.agent_runtime.sub_agent import SubAgentContext, SubAgentRunner, new_agent_id
+        async def emit(payload):
+            pass
+        async def reply(**kwargs):
+            yield 'data: {"tool_calls":[{"index":0,"id":"broken","function":{"name":"read_file","arguments":"{broken"}}]}\n\n'
+            yield 'data: {"error":"temporary failure","retrying":true,"discard_tool_calls":true}\n\n'
+            yield 'data: {"content":"任务已完成"}\n\n'
+            yield 'data: {"finish_reason":"stop"}\n\n'
+            yield 'data: [DONE]\n\n'
+        ctx = SubAgentContext(
+            agent_id=new_agent_id(), parent_agent_id="main", parent_tool_call_id="call1",
+            parent_tool_index=0, agent_index=0, session_id="mock_sub_provider_retry",
+            task="测试任务", initial_todo=None, tools=[], tool_servers={}, max_rounds=5,
+            timeout_seconds=0, reply_max_chars=1000, emit_event=emit, stop_checker=lambda: False)
+        with patch.object(cf.ChatLLM, "chat_completions", side_effect=reply):
+            call = asyncio.run(SubAgentRunner(ctx)._model_call())
+        self.assertEqual(call["tool_calls"], [])
+        self.assertIsNone(call["stream_error"])
+        self.assertEqual(call["full_response"], "任务已完成")
 
     def test_sub_agent_truncated_stream_retries_and_completes(self):
         from chat.chat_llm import ChatLLM

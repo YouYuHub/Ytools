@@ -305,6 +305,7 @@
   function previewLocalHistory(text, parsed, sessionId, toastMsg) {
     App.resetContextTokenStats();
     state.sessionId = sessionId;
+    if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     // 预览内容已直接铺进聊天区：标记视图就绪，重复点击该会话行不再重载
     if (App.markSessionViewReady) App.markSessionViewReady(sessionId);
     if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();

@@ -59,7 +59,7 @@ _MODEL_CONFIG_RESERVED_KEYS = frozenset({"variables", "runtime", "model_selectio
 _MODEL_CONFIG_INTERNAL_PROVIDER_KEYS = frozenset({
     "vendor", "apiKey", "apiType", "models", "url", "name",
     "toolCalling", "vision", "maxInputTokens", "maxOutputTokens",
-    "settings", "id", "description",
+    "settings", "id", "description", "mediaLimits",
 })
 
 

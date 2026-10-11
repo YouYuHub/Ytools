@@ -12,3 +12,12 @@ _sec*.txt
 pytest_out.log
 setting/models.json
 history_files/
+
+# Local secrets and transient files
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+log/
+tmp/

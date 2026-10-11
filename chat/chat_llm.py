@@ -23,6 +23,7 @@ from typing import(
 import asyncio
 from contextlib import suppress
 
+from util.media_limits import limit_media_messages, learn_media_limit
 from util.logger import get_logger
 
 logger = get_logger("chat.chat_llm")
@@ -52,7 +53,7 @@ def _resolve_network_retry_max_attempts() -> int:
     """解析网络请求连续失败重试上限（聊天设置可配，持久化在 .env）。
 
     返回值语义：0 或负数 = 不限制（保持旧行为，一直重试直到手动停止）；
-    正数 = 同一轮流式请求连续失败达到该次数后不再重试，直接报错。
+    正数 = 首次请求之外允许的重试次数；首次 + N 次重试都失败后才报错。
     """
     raw = load_var("NETWORK_RETRY_MAX_ATTEMPTS", DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS)
     try:
@@ -64,6 +65,63 @@ def _resolve_network_retry_max_attempts() -> int:
 # 网络重试固定间隔（秒）：重试之间等待，避免对供应商网关形成无间隔轰炸。
 # 按需求固定 1 秒、不做配置项（详见 docs/api_docs.md 重试语义）。
 _NETWORK_RETRY_INTERVAL_SECONDS = 1.0
+
+
+def _http_status_code(status_line: str) -> int:
+    match = re.match(r"^HTTP/\S+\s+(\d{3})(?:\s|$)", status_line)
+    return int(match.group(1)) if match else 0
+
+
+def _upstream_error(chunk):
+    """Recognize gateway error envelopes without treating usage/heartbeat frames as errors."""
+    if not isinstance(chunk, dict):
+        return None
+    if chunk.get("error") is not None:
+        return chunk["error"]
+    kind = str(chunk.get("type") or chunk.get("event") or "").lower()
+    if kind in {"error", "response.failed", "failed"} or kind.endswith("_error"):
+        return chunk
+    message = chunk.get("message")
+    if not message or chunk.get("choices"):
+        return None
+    status = chunk.get("status_code", chunk.get("status", chunk.get("code")))
+    try:
+        failed_status = int(status) not in (0, 200, 201) if status is not None else False
+    except (TypeError, ValueError):
+        failed_status = str(status).lower() in {"error", "failed"}
+    if failed_status or chunk.get("success") is False or re.search(
+            r"出错|错误|失败|超时|error|fail|timeout|unavailable|overload", str(message), re.I):
+        return chunk
+    return None
+
+
+def _upstream_retry_frame(detail, retry, maximum, *, partial=False):
+    exhausted = maximum > 0 and retry > maximum
+    message = "供应商错误帧: " + detail
+    if exhausted:
+        message += f"；已重试 {maximum} 次仍失败"
+    return {"error": message, "error_type": "upstream_error_frame", "step": "read_sse_stream",
+            "error_detail": detail, "retry": retry, "max_attempts": maximum if maximum > 0 else None,
+            "retrying": not exhausted, "discard_tool_calls": True,
+            "resume_from_partial": partial}
+
+
+def _upstream_resume_messages(messages, content, reasoning):
+    # Replaying the original request after visible output duplicates that output.
+    # Preserve its prefix and ask for continuation; incomplete tools are never executed.
+    resumed = list(messages)
+    partial = {"role": "assistant"}
+    if content:
+        partial["content"] = "".join(content)
+    if reasoning:
+        partial["reasoning_content"] = "".join(reasoning)
+    if len(partial) > 1:
+        partial.setdefault("content", "")
+        resumed.append(partial)
+    resumed.append({"role": "user", "content": (
+        "上一次回复因供应商流式错误中断。请基于已输出内容从中断处继续，避免重复正文；"
+        "尚未完成的工具调用没有执行，请重新生成完整的工具调用。")})
+    return resumed
 
 # 供应商请求硬限制的安全余量与最低输出预算：
 # 估算口径与真实 tokenizer 有偏差，预留余量；max_tokens 降到最低仍超限才判定不可发送。
@@ -586,6 +644,7 @@ class ChatLLM:
         last_step = "none"
         retry_count = 0
         retry_max_attempts = _resolve_network_retry_max_attempts()
+        retry_messages = None
         while True:
             # 网络重试固定间隔：第 2 次及以后尝试前等待，避免无间隔轰炸
             # 供应商网关（重试均为同一 payload，间隔不改变请求内容）
@@ -600,6 +659,9 @@ class ChatLLM:
                     stream=True,
                     model_name=chat_config["selected_model_id"],
                 )
+                if retry_messages is not None:
+                    payload["messages"] = retry_messages
+                payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
@@ -622,6 +684,7 @@ class ChatLLM:
                     sock.settimeout(timeout_connect)
                     ctx = ssl.create_default_context()
                     sock = ctx.wrap_socket(sock, server_hostname=host)
+                f = None
                 try:
                     request_line = f"POST {path} HTTP/1.1\r\n"
                     header_lines = (
@@ -642,7 +705,7 @@ class ChatLLM:
                     f = sock.makefile("rb")
                     status_line = f.readline()
                     status_str = status_line.decode("utf-8", errors="replace").strip()
-                    while "100" in status_str or "Continue" in status_str:
+                    while 100 <= _http_status_code(status_str) < 200:
                         while True:
                             header_line = f.readline()
                             header_str = header_line.decode("utf-8", errors="replace").strip()
@@ -662,7 +725,7 @@ class ChatLLM:
                             h_key, h_val = header_str.split(":", 1)
                             resp_headers[h_key.strip().lower()] = h_val.strip()
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
-                    if "200" not in status_str and "201" not in status_str:
+                    if not 200 <= _http_status_code(status_str) < 300:
                         # 网关偶发 4xx/5xx（如瞬时 400 Bad Request）与网络错误同源：
                         # 纳入 NETWORK_RETRY_MAX_ATTEMPTS 重试（语义见异步版注释）
                         last_step = "read_error_body"
@@ -678,6 +741,9 @@ class ChatLLM:
                                     resp_headers.get("x-opencode-endpoint-id", "-"),
                                 )
                             )
+                        if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
+                            yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求；未发送内容会明确告知模型。'}}, ensure_ascii=False)}\n\n"
+                            continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -697,11 +763,21 @@ class ChatLLM:
                     # 供应商过载、内容被上游静默丢弃）与连接失败同源且瞬时
                     # 概率高，纳入 NETWORK_RETRY_MAX_ATTEMPTS 重连重发
                     saw_any_output = False
+                    media_limit_retry = False
+                    upstream_retry = False
+                    attempt_content, attempt_reasoning = [], []
+                    sse_event = b""
                     for line in ChatLLM._iter_sse_body_lines(f, is_chunked):
                         line = line.strip()
-                        if not line or not line.startswith(b"data: "):
+                        if not line:
+                            sse_event = b""
                             continue
-                        data_str = line[6:]
+                        if line.startswith(b"event:"):
+                            sse_event = line[6:].strip()
+                            continue
+                        if not line.startswith(b"data:"):
+                            continue
+                        data_str = line[5:].lstrip()
                         if data_str.strip() == b"[DONE]":
                             saw_done = True
                             break
@@ -709,19 +785,30 @@ class ChatLLM:
                             chunk = json.loads(data_str)
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            # 供应商错误帧（如 data: {"error": {...}}）不再静默吞掉：
-                            # 提取真实错误信息上报并终止，避免仅表现为"空响应"无从定位
-                            error_frame = chunk.get("error")
-                            if error_frame is not None:
-                                try:
-                                    error_frame_text = json.dumps(error_frame, ensure_ascii=False)
-                                except Exception:
-                                    error_frame_text = str(error_frame)
-                                yield f"data: {json.dumps({'error': '供应商错误帧: ' + error_frame_text, 'error_type': 'upstream_error_frame', 'retrying': False}, ensure_ascii=False)}\n\n"
+                        error_frame = _upstream_error(chunk)
+                        if error_frame is None and sse_event in {b"error", b"response.failed"}:
+                            error_frame = chunk
+                        sse_event = b""
+                        if error_frame is not None:
+                            error_frame_text = json.dumps(error_frame, ensure_ascii=False)
+                            if not saw_any_output and learn_media_limit(error_frame_text, payload["messages"], chat_config):
+                                media_limit_retry = True
+                                yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求。'}}, ensure_ascii=False)}\n\n"
+                                break
+                            retry_count += 1
+                            failure = _upstream_retry_frame(error_frame_text, retry_count, retry_max_attempts, partial=saw_any_output)
+                            yield f"data: {json.dumps(failure, ensure_ascii=False)}\n\n"
+                            if not failure["retrying"]:
                                 yield "data: [DONE]\n\n"
                                 return
+                            if saw_any_output:
+                                retry_messages = _upstream_resume_messages(payload["messages"], attempt_content, attempt_reasoning)
+                            upstream_retry = True
+                            break
+                        if not isinstance(chunk, dict):
+                            continue
+                        choices = chunk.get("choices", [])
+                        if not choices:
                             usage_only = chunk.get("usage")
                             chunk_id_only = chunk.get("id")
                             if usage_only is not None or chunk_id_only is not None:
@@ -741,6 +828,10 @@ class ChatLLM:
                         tool_calls_delta = delta.get("tool_calls")
                         if content or reasoning_content or tool_calls_delta:
                             saw_any_output = True
+                        if content:
+                            attempt_content.append(content)
+                        if reasoning_content:
+                            attempt_reasoning.append(reasoning_content)
                         sse_data = {}
                         if chunk_id is not None:
                             sse_data["id"] = chunk_id
@@ -762,6 +853,8 @@ class ChatLLM:
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if media_limit_retry or upstream_retry:
+                        continue
                     if not saw_any_output:
                         # 200 + 正常收尾（或空收尾标记）但零输出：视同连接失败
                         # 纳入网络重试，重连重发同一 payload（messages 未变，
@@ -789,6 +882,9 @@ class ChatLLM:
                     yield "data: [DONE]\n\n"
                     return
                 finally:
+                    if f is not None:
+                        with suppress(Exception):
+                            f.close()
                     try:
                         sock.close()
                     except Exception:
@@ -847,6 +943,7 @@ class ChatLLM:
         last_step = "none"
         retry_count = 0
         retry_max_attempts = _resolve_network_retry_max_attempts()
+        retry_messages = None
         while True:
             if ChatLLM._should_stop(stop_checker):
                 yield "data: [DONE]\n\n"
@@ -855,6 +952,9 @@ class ChatLLM:
             # 供应商网关（重试均为同一 payload，间隔不改变请求内容）
             if retry_count > 0:
                 await asyncio.sleep(_NETWORK_RETRY_INTERVAL_SECONDS)
+                if ChatLLM._should_stop(stop_checker):
+                    yield "data: [DONE]\n\n"
+                    return
             try:
                 chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
@@ -864,6 +964,9 @@ class ChatLLM:
                     stream=True,
                     model_name=chat_config["selected_model_id"],
                 )
+                if retry_messages is not None:
+                    payload["messages"] = retry_messages
+                payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
@@ -908,7 +1011,7 @@ class ChatLLM:
                     last_step = "read_status"
                     status_line = await ChatLLM._wait_with_stop(reader.readline(), timeout_read, stop_checker)
                     status_str = status_line.decode("utf-8", errors="replace").strip()
-                    while "100" in status_str or "Continue" in status_str:
+                    while 100 <= _http_status_code(status_str) < 200:
                         while True:
                             header_line = await ChatLLM._wait_with_stop(reader.readline(), timeout_read, stop_checker)
                             header_str = header_line.decode("utf-8", errors="replace").strip()
@@ -928,7 +1031,7 @@ class ChatLLM:
                             h_key, h_val = header_str.split(":", 1)
                             resp_headers[h_key.strip().lower()] = h_val.strip()
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
-                    if "200" not in status_str and "201" not in status_str:
+                    if not 200 <= _http_status_code(status_str) < 300:
                         # 网关偶发 4xx/5xx（如瞬时 400 Bad Request）与网络错误同源：
                         # 纳入 NETWORK_RETRY_MAX_ATTEMPTS 重试。未达上限发
                         # retrying=True 重试帧（仅推送前端提示，不落盘）后重连重发；
@@ -947,6 +1050,9 @@ class ChatLLM:
                                     resp_headers.get("x-opencode-endpoint-id", "-"),
                                 )
                             )
+                        if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
+                            yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求；未发送内容会明确告知模型。'}}, ensure_ascii=False)}\n\n"
+                            continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -964,11 +1070,21 @@ class ChatLLM:
                     # 零输出检测（语义见同步版注释）：HTTP 200 但整条流没有
                     # 任何有效输出时纳入 NETWORK_RETRY_MAX_ATTEMPTS 重连重发
                     saw_any_output = False
+                    media_limit_retry = False
+                    upstream_retry = False
+                    attempt_content, attempt_reasoning = [], []
+                    sse_event = b""
                     async for line in ChatLLM._aiter_sse_body_lines(reader, is_chunked, timeout_read, stop_checker):
                         line = line.strip()
-                        if not line or not line.startswith(b"data: "):
+                        if not line:
+                            sse_event = b""
                             continue
-                        data_str = line[6:]
+                        if line.startswith(b"event:"):
+                            sse_event = line[6:].strip()
+                            continue
+                        if not line.startswith(b"data:"):
+                            continue
+                        data_str = line[5:].lstrip()
                         if data_str.strip() == b"[DONE]":
                             saw_done = True
                             break
@@ -976,19 +1092,30 @@ class ChatLLM:
                             chunk = json.loads(data_str)
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            # 供应商错误帧（如 data: {"error": {...}}）不再静默吞掉：
-                            # 提取真实错误信息上报并终止，避免仅表现为"空响应"无从定位
-                            error_frame = chunk.get("error")
-                            if error_frame is not None:
-                                try:
-                                    error_frame_text = json.dumps(error_frame, ensure_ascii=False)
-                                except Exception:
-                                    error_frame_text = str(error_frame)
-                                yield f"data: {json.dumps({'error': '供应商错误帧: ' + error_frame_text, 'error_type': 'upstream_error_frame', 'retrying': False}, ensure_ascii=False)}\n\n"
+                        error_frame = _upstream_error(chunk)
+                        if error_frame is None and sse_event in {b"error", b"response.failed"}:
+                            error_frame = chunk
+                        sse_event = b""
+                        if error_frame is not None:
+                            error_frame_text = json.dumps(error_frame, ensure_ascii=False)
+                            if not saw_any_output and learn_media_limit(error_frame_text, payload["messages"], chat_config):
+                                media_limit_retry = True
+                                yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求。'}}, ensure_ascii=False)}\n\n"
+                                break
+                            retry_count += 1
+                            failure = _upstream_retry_frame(error_frame_text, retry_count, retry_max_attempts, partial=saw_any_output)
+                            yield f"data: {json.dumps(failure, ensure_ascii=False)}\n\n"
+                            if not failure["retrying"]:
                                 yield "data: [DONE]\n\n"
                                 return
+                            if saw_any_output:
+                                retry_messages = _upstream_resume_messages(payload["messages"], attempt_content, attempt_reasoning)
+                            upstream_retry = True
+                            break
+                        if not isinstance(chunk, dict):
+                            continue
+                        choices = chunk.get("choices", [])
+                        if not choices:
                             usage_only = chunk.get("usage")
                             chunk_id_only = chunk.get("id")
                             if usage_only is not None or chunk_id_only is not None:
@@ -1008,6 +1135,10 @@ class ChatLLM:
                         tool_calls_delta = delta.get("tool_calls")
                         if content or reasoning_content or tool_calls_delta:
                             saw_any_output = True
+                        if content:
+                            attempt_content.append(content)
+                        if reasoning_content:
+                            attempt_reasoning.append(reasoning_content)
                         sse_data = {}
                         if chunk_id is not None:
                             sse_data["id"] = chunk_id
@@ -1029,6 +1160,8 @@ class ChatLLM:
                             if usage is not None:
                                 finish_payload["usage"] = usage
                             yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+                    if media_limit_retry or upstream_retry:
+                        continue
                     if not saw_any_output:
                         # 200 + 正常收尾（或空收尾标记）但零输出：视同连接失败
                         # 纳入网络重试（语义见同步版注释）
@@ -1150,6 +1283,7 @@ class ChatLLM:
                 stream=False,
                 model_name=chat_config["selected_model_id"],
             )
+            payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
             # 每次尝试都预检（语义见流式版注释）
             hard_limit_error = ChatLLM._precheck_hard_limit(payload)
             if hard_limit_error is not None:
@@ -1180,7 +1314,7 @@ class ChatLLM:
                 f = sock.makefile("rb")
                 status_line = f.readline()
                 status_str = status_line.decode("utf-8", errors="replace").strip()
-                while "100" in status_str or "Continue" in status_str:
+                while 100 <= _http_status_code(status_str) < 200:
                     while True:
                         header_line = f.readline()
                         header_str = header_line.decode("utf-8", errors="replace").strip()
@@ -1198,7 +1332,7 @@ class ChatLLM:
                         h_key, h_val = header_str.split(":", 1)
                         resp_headers[h_key.strip().lower()] = h_val.strip()
                 is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
-                if "200" not in status_str and "201" not in status_str:
+                if not 200 <= _http_status_code(status_str) < 300:
                     last_step = "read_error_body"
                     error_body = ChatLLM._read_full_response_body(f, is_chunked)
                     error_text = error_body.decode("utf-8", errors="replace")
@@ -1211,6 +1345,8 @@ class ChatLLM:
                                 resp_headers.get("x-opencode-endpoint-id", "-"),
                             )
                         )
+                    if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
+                        continue
                     raise RuntimeError(f"HTTP Error: {status_str}: {error_text}")
                 last_step = "read_body"
                 response_body = ChatLLM._read_full_response_body(f, is_chunked)

@@ -504,9 +504,9 @@ class _TagBlockParser(HTMLParser):
     """按真实元素边界抽取内部 HTML，脚本字符串不会成为伪元素。"""
     _void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
-    def __init__(self, text, tag, conditions):
+    def __init__(self, text, selectors):
         super().__init__(convert_charrefs=False)
-        self.text, self.tag, self.conditions = text, tag, conditions
+        self.text, self.selectors = text, selectors
         self.offsets = [0]
         for line in text.splitlines(keepends=True):
             self.offsets.append(self.offsets[-1] + len(line))
@@ -520,9 +520,10 @@ class _TagBlockParser(HTMLParser):
         if tag in self._void:
             return
         values = dict(attrs)
-        selected = tag == self.tag and all(
+        selected = any(tag == wanted_tag and all(
             expected in (values.get(key) or "").split() if key == "class"
-            else expected == values.get(key) for key, expected in self.conditions)
+            else expected == values.get(key) for key, expected in conditions)
+            for wanted_tag, conditions in self.selectors)
         self.stack.append((tag, self.source_offset() + len(self.get_starttag_text()), selected))
 
     def handle_startendtag(self, tag, attrs):
@@ -532,7 +533,7 @@ class _TagBlockParser(HTMLParser):
         super().close()
         for _, start, selected in self.stack:
             if selected:
-                self.blocks.append((start, self.text[start:].strip()))
+                self.blocks.append((start, len(self.text), self.text[start:].strip()))
         self.stack.clear()
 
     def handle_endtag(self, tag):
@@ -540,22 +541,35 @@ class _TagBlockParser(HTMLParser):
             if self.stack[index][0] == tag:
                 for _, start, selected in self.stack[index:]:
                     if selected:
-                        self.blocks.append((start, self.text[start:self.source_offset()].strip()))
+                        end = self.source_offset()
+                        self.blocks.append((start, end, self.text[start:end].strip()))
                 del self.stack[index:]
                 break
 
 
 def _extract_tag_blocks(html_text: str, tag_spec: str) -> list:
-    """支持 tag、tag#id、tag.class（多个 class 可组合）；不是完整 CSS/XPath。"""
-    match = _TAG_SPEC_PATTERN.fullmatch(tag_spec.strip())
-    if not match:
-        raise ValueError(f"tag 参数格式不合法: {tag_spec}（示例：div、div#main、div.content）")
-    conditions = [("id" if part[0] == "#" else "class", part[1:])
-                  for part in re.findall(r"[.#][\w-]+", match.group(2))]
-    parser = _TagBlockParser(html_text, match.group(1).lower(), conditions)
+    """Simple selector union in source order; overlapping selections appear once."""
+    specs = tag_spec.split(',')
+    if len(specs) > 20:
+        raise ValueError("tag 最多接受 20 个逗号分隔的简单选择器")
+    selectors = []
+    for spec in specs:
+        match = _TAG_SPEC_PATTERN.fullmatch(spec.strip())
+        if not match:
+            raise ValueError(f"tag 参数格式不合法: {spec}（示例：div、div#main、div.content、h2,p）")
+        conditions = [("id" if part[0] == "#" else "class", part[1:])
+                      for part in re.findall(r"[.#][\w-]+", match.group(2))]
+        selectors.append((match.group(1).lower(), conditions))
+    parser = _TagBlockParser(html_text, selectors)
     parser.feed(html_text)
     parser.close()
-    return [block for _, block in sorted(parser.blocks)]
+    blocks, covered_end = [], -1
+    for start, end, block in sorted(parser.blocks, key=lambda item: (item[0], -item[1])):
+        if start < covered_end:
+            continue  # 父元素已含子元素正文，避免重叠选择重复输出。
+        blocks.append(block)
+        covered_end = end
+    return blocks
 
 
 def _attrs_match(attrs_text: str, conditions: list) -> bool:
@@ -2000,6 +2014,16 @@ def _search_keywords(query: str) -> set:
     return keywords
 
 
+def _search_numeric_entities(query: str) -> set:
+    """Keep versions/years intact instead of treating 3.13 as the common token 13."""
+    query = re.sub(r"\bsite:[^\s]+", "", str(query or ""), flags=re.I)
+    return set(re.findall(r"(?<![\d.])(?:\d+(?:\.\d+)+|(?:19|20)\d{2})(?![\d.])", query))
+
+
+def _entity_in_text(entity: str, text: str) -> bool:
+    return bool(re.search(r"(?<![\d.])" + re.escape(entity) + r"(?![\d.])", text))
+
+
 def _has_weak_relevance(results: list, query: str) -> bool:
     """判断候选结果是否与查询的「特征关键词」脱节（用于触发多引擎合并召回）。
 
@@ -2049,9 +2073,16 @@ def _relevance_rank(results: list, query: str, limit: int) -> list:
     以原始顺序作为稳定平手依据，避免无关键词时乱序。
     """
     keywords = _search_keywords(query)
+    entities = _search_numeric_entities(query)
+    def score(item):
+        # 精确版本/年份覆盖优先于通用语言名反复出现的页面；相同覆盖度再按
+        # 标题/摘要/URL 关键词评分，仍保留搜索引擎顺序作为平手依据。
+        text = ' '.join(map(str, item)).lower()
+        return (sum(_entity_in_text(entity, text) for entity in entities),
+                _keyword_score(item, keywords))
     ranked = sorted(
         enumerate(results),
-        key=lambda pair: (-_keyword_score(pair[1], keywords), pair[0]))
+        key=lambda pair: (*(-value for value in score(pair[1])), pair[0]))
     return [item for _, item in ranked[:limit]]
 
 
@@ -2100,22 +2131,23 @@ class _DdgResultParser(HTMLParser):
         self.results, self.current, self.anchor = [], None, None
 
     def handle_starttag(self, tag, attrs):
-        if tag != "a":
+        if tag not in ("a", "td"):
             return
         attrs = dict(attrs)
         classes = (attrs.get("class") or "").split()
-        kind = "title" if "result__a" in classes else "snippet" if "result__snippet" in classes else None
+        kind = ("title" if tag == "a" and ("result__a" in classes or "result-link" in classes)
+                else "snippet" if "result__snippet" in classes or "result-snippet" in classes else None)
         if kind:
-            self.anchor = [kind, attrs.get("href") or "", []]
+            self.anchor = [kind, attrs.get("href") or "", [], tag]
 
     def handle_data(self, data):
         if self.anchor:
             self.anchor[2].append(data)
 
     def handle_endtag(self, tag):
-        if tag != "a" or not self.anchor:
+        if not self.anchor or tag != self.anchor[3]:
             return
-        kind, href, chunks = self.anchor
+        kind, href, chunks, _tag = self.anchor
         self.anchor = None
         if kind == "title":
             if self.current:
@@ -2130,18 +2162,26 @@ class _DdgResultParser(HTMLParser):
 
 
 def _fetch_ddg_results(query: str, limit: int) -> list:
-    ddg_url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
-    _, status, content_type, raw = _http_request(ddg_url, timeout_seconds=15)
-    if status >= 400:
-        raise ValueError(f"DuckDuckGo HTTP {status}")
-    html_text, _charset = decode_text(raw, candidates=(_pick_web_charset(content_type, raw, ""),))
-    parser = _DdgResultParser()
-    parser.feed(html_text)
-    if parser.current:
-        parser.results.append(tuple(parser.current))
-    if not parser.results and not re.search(r"no results|no-results|没有找到", html_text, re.I):
-        raise ValueError("DuckDuckGo 未解析到结果：可能验证码、访问受限或页面结构变化")
-    return _relevance_rank(_dedupe_results(parser.results, limit * 3), query, limit * 3)
+    failures = []
+    # HTML 无法解析/访问失败时仅追加一次 Lite 尝试，不绕过验证码，也不无限重试。
+    for endpoint in ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"):
+        try:
+            _, status, content_type, raw = _http_request(endpoint + "?" + urlencode({"q": query}), timeout_seconds=15)
+            if status >= 400:
+                raise ValueError(f"HTTP {status}")
+            html_text, _charset = decode_text(raw, candidates=(_pick_web_charset(content_type, raw, ""),))
+            parser = _DdgResultParser()
+            parser.feed(html_text)
+            if parser.current:
+                parser.results.append(tuple(parser.current))
+            if parser.results:
+                return _relevance_rank(_dedupe_results(parser.results, limit * 3), query, limit * 3)
+            if re.search(r"no results|no-results|没有找到", html_text, re.I):
+                return []
+            raise ValueError("未解析到结果：可能验证码、访问受限或页面结构变化")
+        except (ValueError, OSError) as exc:
+            failures.append(f"{urlsplit(endpoint).hostname}: {exc}")
+    raise ValueError("DuckDuckGo HTML/Lite 均失败：" + "；".join(failures))
 
 
 def _web_search_impl(query, max_results, engine="auto") -> str:
@@ -2174,7 +2214,8 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
                 _has_weak_relevance(results, query) or len(results) < 8):
             try:
                 ddg_pool = _fetch_ddg_results(query, candidate_limit)
-                merged = _dedupe_results(list(results) + list(ddg_pool), candidate_limit * 3)
+                # 两个候选池先合并再排序，避免满额 Bing 池在排序前挤掉 DDG 新结果。
+                merged = _dedupe_results(list(results) + list(ddg_pool), candidate_limit * 6)
                 if len(merged) > len(results):
                     results = _relevance_rank(merged, query, candidate_limit * 3)
                     engine_name = "Bing+DuckDuckGo 合并重排"
@@ -2210,6 +2251,11 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
         results = []
         diagnostics.append("候选结果均未命中查询关键词，已丢弃；不能据此推断网页不存在")
     shown = results[:limit]
+    entities = _search_numeric_entities(query)
+    if shown and entities and not any(all(_entity_in_text(entity, ' '.join(map(str, item)))
+                                          for entity in entities) for item in shown):
+        diagnostics.append("结果未完整匹配查询中的版本号/年份（" + ', '.join(sorted(entities)) +
+                           "），可能是泛化结果；请调整关键词或用 site: 指定来源，并用 fetch_url 核验")
     lines = [f"[web_search] 查询: {query} | 共 {len(shown)} 条结果（{engine_name}，链接正文可用 fetch_url 抓取）"]
     if diagnostics:
         lines.append("[web_search] 提示: " + "；".join(diagnostics))
@@ -2367,7 +2413,7 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
         mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音）、
                          html=原始 HTML、tag=按真实元素抽取纯文本（排除脚本/样式）、regex=按原始响应正则抽取
         pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
-        tag:             mode=tag 时必填，简单标签选择器：div、div#id、div.class；不支持完整 CSS/XPath
+        tag:             mode=tag 时必填，简单选择器：div、div#id、div.class，可用逗号多选如 h2,p；不支持完整 CSS/XPath
         max_chars:       返回内容最大字符数（200-100000）；默认 8000
         timeout_seconds: 请求超时秒数（1-120），默认 30
         encoding:        指定响应编码（如 gbk）；留空自动判断
@@ -2391,7 +2437,7 @@ async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> 
     参数：
         query:       搜索关键词
         max_results: 最多返回条数（1-20），默认 8
-        engine:      搜索引擎：auto=Bing 失败/无结果时自动回退 DuckDuckGo（默认）、
+        engine:      搜索引擎：auto=Bing 失败/无结果或候选不足/弱相关时尝试 DuckDuckGo（默认）、
                      bing=仅用 Bing（失败即报错）、ddg=仅用 DuckDuckGo
     返回：
         编号结果列表，每条含标题、链接、摘要（已按相关性排序，头部标注实际使用的引擎）；
@@ -2399,7 +2445,7 @@ async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> 
     说明：
         max_results 只控制展示数量，候选池策略固定；site: 域名/路径会二次过滤。
         无 API Key（解析搜索引擎网页版）；验证码、访问受限或结构变化会提示失败。
-        相关性仅为关键词启发式，请核对原文，不把空结果当成网页不存在。
+        完整版本号/年份优先匹配；相关性仍为关键词启发式，请核对原文，不把空结果当成网页不存在。
     """
     return await asyncio.to_thread(_web_search_impl, query, max_results, engine)
 

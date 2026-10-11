@@ -332,6 +332,24 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.summary_text, "任务仍需继续；工具已返回关键结果。")
         self.assertEqual(result.compress_index, 1)
 
+    async def test_compaction_preserves_latest_native_todo_within_reported_budget(self):
+        from test_todo_context import exchange, assert_paired
+        plan = exchange("todo-state", "in_progress")
+        messages = [
+            {"role": "system", "content": "系统提示"},
+            {"role": "user", "content": "继续任务"},
+            *plan,
+            {"role": "assistant", "tool_calls": [{"id": "data", "function": {"name": "read_data", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "data", "content": "工具数据" * 4000},
+        ]
+        request = ChatLLMRequest(messages=[{"role": "user", "content": "继续任务"}], max_tokens=512)
+        result = await compaction.compact_active_round_context_if_needed(messages, request, settings=self._settings())
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.messages[-2:], plan)
+        self.assertEqual(result.after_tokens, compaction.estimate_send_context_tokens(result.messages, request.tools))
+        self.assertFalse(any(m.get("_todo_summary") for m in result.messages))
+        assert_paired(result.messages)
+
     async def test_single_round_compaction_emits_progress_events(self):
         large_result = "关键输出" * 4000
         messages = [

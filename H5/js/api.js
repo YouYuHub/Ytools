@@ -41,6 +41,21 @@ const api_url = localStorage.getItem("ytools-api-base")
     return res.json();
   }
 
+  function terminalSessionQuery(sessionId) {
+    if (!sessionId) throw new Error("后台终端需要指定当前会话");
+    return "?session_id=" + encodeURIComponent(sessionId);
+  }
+  function listTerminalJobs(sessionId, options) { return request("/terminal/jobs" + terminalSessionQuery(sessionId), options); }
+  function getTerminalJob(id, sessionId, options) {
+    return request("/terminal/jobs/" + encodeURIComponent(id) + terminalSessionQuery(sessionId), options);
+  }
+  function operateTerminalJob(id, operation, sessionId) {
+    return request("/terminal/jobs/" + encodeURIComponent(id) + "/" + operation + terminalSessionQuery(sessionId), { method: "POST" });
+  }
+  function terminalLogUrl(id, sessionId) {
+    return BASE + "/terminal/jobs/" + encodeURIComponent(id) + "/log/download" + terminalSessionQuery(sessionId);
+  }
+
   // XHR 的 upload 事件提供真实的已发送字节数；100% 后等待服务端解析/保存。
   function uploadRaw(path, file, onProgress, signal) {
     return new Promise(function (resolve, reject) {
@@ -557,7 +572,7 @@ const api_url = localStorage.getItem("ytools-api-base")
   /**
    * 更新子智能体交付保障重试配置
    * @param {{final_reply_max_attempts: number, stream_error_max_attempts: number, todo_remind_max: number}} config
-   *   final_reply/stream_error：0 或负数=不限制；todo_remind：0=关闭，负数=不限制（每次工具执行轮后额度重置）
+   *   final_reply/stream_error：0 或负数=不限制；todo_remind：0=关闭，负数=不限制（成功执行其他工具后额度重置，单纯更新计划不重置）
    */
   function updateSubAgentRetryConfig(config) {
     return request("/chat_config/sub_agent_retry", {
@@ -614,11 +629,12 @@ const api_url = localStorage.getItem("ytools-api-base")
    * 下一轮检查点（工具结果处理完毕后）取出并作为新一轮继续。
    * 返回 {ok: boolean}；ok=false 表示任务未运行（前端回退为普通发送）。
    */
-  async function injectMessage(sessionId, content) {
+  async function injectMessage(sessionId, content, options) {
     const res = await request("/inject_message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, content: content }),
+      body: JSON.stringify({ session_id: sessionId, content: content,
+        quotes: options && options.quotes, message_id: options && options.messageId }),
     });
     return res && typeof res === "object" ? res : { ok: false };
   }
@@ -627,11 +643,11 @@ const api_url = localStorage.getItem("ytools-api-base")
    * 撤回一条尚未消费的注入消息（消息引导提示行 ×）：
    * 按文本匹配从后端注入队列移除；已被消费时 {ok:false}（不可撤回）。
    */
-  async function cancelInjectMessage(sessionId, text) {
+  async function cancelInjectMessage(sessionId, text, messageId) {
     const res = await request("/cancel_inject_message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, text: text }),
+      body: JSON.stringify({ session_id: sessionId, text: text, message_id: messageId }),
     });
     return res && typeof res === "object" ? res : { ok: false };
   }
@@ -1023,6 +1039,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     uploadChatHistory,
     exportSessionsZip,
     previewImport,
+    listTerminalJobs, getTerminalJob, operateTerminalJob, terminalLogUrl,
     submitImport,
     listTools,
     getModels,

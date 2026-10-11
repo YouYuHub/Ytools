@@ -1,10 +1,12 @@
+from util.media_limits import limit_media_messages, get_media_limits
 # 标准库导入
 # import re
 import asyncio
+from pathlib import Path
 import copy
 import json
 import time
-# import uuid
+import uuid
 from collections import deque
 # import inspect
 from typing import Any, List, AsyncGenerator
@@ -44,6 +46,7 @@ from memory.quote_format import (
 )
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
+from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
@@ -62,6 +65,7 @@ from factory.agent_runtime.builtin_tools import (
     inject_builtin_tools,
     is_builtin_tool,
     model_tool_output_char_budget,
+    document_output_token_budget,
     resolve_default_command_shell,
     normalize_ask_questions,
     normalize_sub_agent_task,
@@ -115,7 +119,7 @@ from factory.agent_runtime.tool_executor import (
     normalize_tool_calls,
     prepare_tool_execution,
 )
-from factory.agent_runtime.text_tool_call import TextToolCallBuffer
+from factory.agent_runtime.text_tool_call import TextToolCallBuffer, text_tool_call_reminder
 from factory.agent_runtime.sub_agent import (
     SubAgentContext,
     load_sub_agent_limits,
@@ -292,62 +296,12 @@ def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
 
 
 def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
-    """用一条紧凑的任务状态 system 消息替换历史 todo 调用与结果。
+    """兼容入口：保留最近一次原生计划交互，不再创建 system 计划摘要。
 
-    关键约束：删除 todo 结果消息时，必须在声明处同步清除对应的 tool_calls——
-    只删结果、保留"声明了 todo_write 但无配对结果"的 assistant 消息会留下
-    悬空 tool_call，上游网关对该结构直接返回 400 空响应体（实测 opencode
-    网关 400 + body `0\\r\\n\\r\\n`），且重试同一 payload 必然全败。
+    todos 是旧调用方的兼容参数；模型计划状态以真实工具返回为准。
+    删除旧交互时同步清理声明与结果，避免悬空调用触发供应商 400。
     """
-    todo_call_ids = set()
-    compacted: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            compacted.append(message)
-            continue
-        if message.get("_todo_summary"):
-            continue
-        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            kept_calls = []
-            for tool_call in message["tool_calls"]:
-                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-                if function.get("name") == TODO_TOOL_NAME:
-                    if tool_call.get("id"):
-                        todo_call_ids.add(tool_call["id"])
-                else:
-                    kept_calls.append(tool_call)
-            if kept_calls:
-                message["tool_calls"] = kept_calls
-            else:
-                # 全部调用都是 todo：tool_calls 字段整体清除（连同配对结果一起
-                # 消失，保持消息序列自洽）；有正文时保留正文，无正文则丢弃整条
-                message.pop("tool_calls", None)
-                if not message.get("content"):
-                    continue
-        if (
-            message.get("role") == "tool"
-            and (message.get("_tool_name") == TODO_TOOL_NAME
-                 or message.get("tool_call_id") in todo_call_ids)
-        ):
-            continue
-        compacted.append(message)
-    if todos:
-        done_count = sum(1 for item in todos if item.get("status") == "done")
-        plan_complete = done_count == len(todos)
-        symbols = {"done": "✓", "in_progress": "→", "pending": "○"}
-        if plan_complete:
-            # 终态摘要：模型最后一次 todo 调用（全部 done）的"请汇总答复用户"
-            # 指令在下一轮会被本摘要替换——终态必须自带收官指令，否则后续
-            # 轮次只剩一列 ✓，模型无从判断计划已结束
-            lines = [
-                f"plan_complete=true；任务规划已全部完成（{done_count}/{len(todos)} 项）："
-                "请汇总执行结果直接答复用户；如无新的计划，无需再调用本工具。"
-            ]
-        else:
-            lines = [f"当前任务计划（已完成 {done_count}/{len(todos)} 项）："]
-        lines.extend(f"{symbols.get(item.get('status'), '○')} {item.get('content', '')}" for item in todos)
-        compacted.append({"role": "system", "content": "\n".join(lines), "_todo_summary": True})
-    messages[:] = compacted
+    TodoContext().sync(messages)
 
 
 # 当前工作路径为<{_format_tool_result(get_current_dir())}>
@@ -555,7 +509,7 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
     items, notices, error_reason = normalize_todo_items(
         raw_todos, prev_items=prev_items)
     if items is None:
-        return {"error": error_reason or "todos 参数无效"}, None
+        return {"success": False, "error": error_reason or "todos 参数无效"}, None
     # 模型偶尔在全部完成后再次提交同一计划，甚至把每项 id 全部换掉。
     # 内容和状态未变时保留原计划及稳定 id，避免重复写盘与无意义的状态变化。
     if prev_items and len(items) == len(prev_items) and all(
@@ -565,6 +519,7 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
     ):
         complete = all(item["status"] == "done" for item in prev_items)
         return {
+            "success": True,
             "message": (
                 "任务计划已全部完成且没有变化，请直接汇总结果答复用户，"
                 "无需再次调用 todo_write"
@@ -581,7 +536,9 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
     plan_complete = bool(items) and done_count == len(items)
     # 首次创建 vs 后续更新：给模型不同的语境反馈
     is_new_plan = not prev_items
-    if plan_complete:
+    if not items:
+        message = "任务计划已清空；请继续实际任务，简单任务无需重新建立计划。"
+    elif plan_complete:
         message = (
             f"任务规划全部完成（{done_count}/{len(items)} 项）："
             "请汇总执行结果直接答复用户；如无新的计划，无需再调用本工具"
@@ -597,6 +554,7 @@ async def _apply_session_todo(session_chat_memory, tool_args: Any) -> tuple[dict
             f"进行中 {in_progress_count} 项，待办 {pending_count} 项）"
         )
     result: dict[str, Any] = {
+        "success": True,
         "message": message,
         # 机器可读完成标记：模型无需解析 message 即可判断计划是否收官
         "plan_complete": plan_complete,
@@ -853,12 +811,12 @@ async def _run_chat_generation(
     # 从请求中获取 session_id
     session_id = getattr(tool_request, 'session_id', 'default')
     # 会话级模型选择：_meta.model_selection 按角色覆盖 → 全局默认；
-    # 失效覆盖（模型已从 models.json 删除）发 warning 并回退该角色全局默认。
+    # 失效覆盖发一次 warning，并将实际回退配置保存为新的会话快照。
     # ambient 覆盖仅在本 asyncio 任务上下文内生效（create_task 复制上下文，任务结束自动失效），
     # 任务内聊天/压缩模型与参数的读取（require_default_chat_config、get_role_selection 等）按会话生效
     try:
         from memory.chat_memory import resolve_session_model_selection
-        effective_model_selection, model_warnings = resolve_session_model_selection(session_id)
+        effective_model_selection, model_warnings = resolve_session_model_selection(session_id, repair_invalid=True)
     except Exception as selection_exc:
         effective_model_selection, model_warnings = None, [f"会话模型选择解析失败: {selection_exc}"]
     for model_warning in model_warnings:
@@ -1355,39 +1313,17 @@ async def _run_chat_generation(
                 messages[0]["content"] += file_manifest_suffix
         # 不在首轮或每轮自动发送原生文档。清单只提供文件索引；模型确需原文时
         # 调用 read_document(mode="native")，对应文件只在紧接着的一次请求中发送。
-        # 当前任务计划注入系统提示（跨轮感知；模型可用 todo_write 全量更新）。
-        # 终态（全部 done）文案必须「新任务感知」：该后缀每轮新任务都会随系统
-        # 提示注入，写"请汇总执行结果/无需再调用"是收官时对上一轮说的话，
-        # 跨轮残留会让模型面对新任务仍去"汇总旧结果"、并压制为新任务建计划的
-        # 意图——改为说明"上一计划已收官，新任务可新建计划覆盖"。
-        try:
-            session_todo = await session_chat_memory.get_session_todo()
-        except Exception:
-            session_todo = []
-        if session_todo:
-            todo_done_count = sum(
-                1 for item in session_todo if item.get("status") == "done"
-            )
-            todo_complete = todo_done_count == len(session_todo)
-            todo_lines = []
-            for item in session_todo:
-                mark = {"done": "[x]", "in_progress": "[>]"}.get(item.get("status"), "[ ]")
-                todo_lines.append(f"{mark} {item.get('content', '')}")
-            if todo_complete:
-                todo_suffix = (
-                    "\n上一任务规划已全部完成（"
-                    + f"{todo_done_count}/{len(session_todo)} 项，全部 [x]）：\n"
-                    + "\n".join(todo_lines)
-                    + "\n该计划已收官，无需对它做任何更新；"
-                    "若当前新任务需要多步骤跟踪，可调用 todo_write 新建计划"
-                    "（全量覆盖旧列表），否则直接执行新任务即可。"
-                )
-            else:
-                todo_suffix = (
-                    "\n当前任务计划（可调用 todo_write 全量更新，保持与最新进展同步）：\n"
-                    + "\n".join(todo_lines)
-                )
-            messages[0]["content"] += todo_suffix
+        # 当前计划由最近一次真实的 todo 调用/完整结果提供，不拼入系统提示。
+        # 跨轮历史已被摘要替换时，从落盘原始交互恢复该记录（遵守历史位置截断）。
+        todo_context = TodoContext()
+        if use_backend_history:
+            getter = getattr(session_chat_memory, "get_latest_todo_exchange", None)
+            if callable(getter):
+                try:
+                    todo_context = TodoContext(await getter())
+                except Exception as todo_history_error:
+                    logger.warning(f"最近计划交互恢复失败（保留现有请求记录）：{todo_history_error}")
+        todo_context.sync(messages)
         # P1：首次模型调用前的上下文预算检查。
         # 组装完系统提示/文件内容后，预估整个请求上下文（消息+工具定义）；
         # 超窗请求直接发往上游只会得到 400 或静默截断，这里先诊断并按需降级。
@@ -1554,23 +1490,33 @@ async def _run_chat_generation(
             injected_message = pop_injected() if callable(pop_injected) else None
             if not (isinstance(injected_message, dict) and injected_message.get("content")):
                 return False
+            todo_loop_guard.reset()
             # 新的用户消息到达：此前注入的原生文档数据转文本占位
             # （「[文档 名字]」）——原始文件仍在会话目录，模型可再次调用
             # read_document 原生读取或用 read_file 读文本
             retire_native_document_parts(messages)
-            inject_text = content_part_to_text(injected_message.get("content")).strip()
-            messages.append({
-                "role": "user",
-                "content": injected_message.get("content"),
-                "_internal": True,
-            })
-            await session_chat_memory.add_chat_history({
-                "role": "user",
-                "content": injected_message.get("content"),
-            })
+            raw_content = copy.deepcopy(injected_message.get("content"))
+            inject_text = content_part_to_text(raw_content, include_media_labels=False).strip()
+            quotes = normalize_quotes(injected_message.get("quotes"))
+            history_message = {"role": "user", "content": raw_content}
+            if quotes:
+                history_message["quotes"] = quotes
+            # 先按 media:// 引用保存原始消息，图片数据只进入模型运行时副本。
+            await session_chat_memory.add_chat_history(history_message)
+            model_message = {"role": "user", "content": copy.deepcopy(raw_content), "_internal": True}
+            current_task_media_references.extend(
+                ref for ref in collect_media_references([model_message])
+                if ref not in current_task_media_references
+            )
+            if quotes:
+                model_message["content"] = content_with_quotes(model_message["content"], quotes)
+            unresolved = resolve_message_media_refs(session_id, [model_message], vision_enabled=vision_enabled)
+            if unresolved:
+                logger.warning(f"引导消息有 {len(unresolved)} 个媒体引用解析失败")
+            messages.append(model_message)
             await _stream_emit(
                 stream,
-                f"data: {json.dumps({'event': 'message_injected', 'text': inject_text}, ensure_ascii=False)}\n\n",
+                f"data: {json.dumps({'event': 'message_injected', 'text': inject_text, 'content': raw_content, 'quotes': quotes, 'message_id': injected_message.get('message_id')}, ensure_ascii=False)}\n\n",
             )
             logger.info(f"已注入运行中用户消息（消息引导）: {inject_text[:80]}")
             return True
@@ -1584,6 +1530,7 @@ async def _run_chat_generation(
         # stream_truncated_retries 上限才终止任务（长任务不再被历史累计误杀）
         model_retries = 0
         text_tool_call_retries = 0
+        todo_loop_guard = TodoLoopGuard()
         while session_chat_memory.run_task:
             stream.set_round_start()
             # 每轮检查点：取出注入消息，本轮模型调用即可看到
@@ -1591,6 +1538,15 @@ async def _run_chat_generation(
                 await _consume_injected_message()
             except Exception as inject_error:
                 logger.warning(f"处理注入消息失败（跳过）: {inject_error}")
+            if todo_loop_guard.exhausted:
+                detail = todo_loop_guard.error_message
+                await session_chat_memory.add_chat_history({"role": "assistant", "error": detail})
+                await _stream_emit(stream, _sse_error_payload(detail))
+                session_chat_memory.run_task = False
+                break
+            tool_request.tools = todo_loop_guard.filter_tools(round_tools) or None
+            todo_context.sync(messages)
+            todo_loop_guard.update_context(messages)
             # 思考回传整形只作用于请求副本：运行时 messages 保留每轮模型原始
             # 输出，并按原值落盘。请求副本最多保留最新 assistant 的思考；
             # 最新工具调用本轮缺失时回退最近一次真实思考，旧 assistant 字段剥离。
@@ -1676,6 +1632,9 @@ async def _run_chat_generation(
                     if event is None:
                         await _stream_emit(stream, sse_chunk)
                         continue
+                    if event.get("warning"):
+                        await _stream_emit(stream, sse_chunk)
+                        continue
                     if event.get("stream_truncated"):
                         # 上游提前断开（EOF 未收到 finish_reason）：内容不完整。
                         # 置标记后跳出，走下方"截断续写重试"路径（先落盘已生成的
@@ -1690,6 +1649,11 @@ async def _run_chat_generation(
                     if event.get("error") is not None:
                         await _stream_emit(stream, sse_chunk)
                         if event.get("retrying"):
+                            if event.get("discard_tool_calls"):
+                                tool_calls.clear()
+                                finish_reason = None
+                                pending_finish_payload = None
+                                tool_phase_deadline = None
                             # 网络失败重试帧：ChatLLM 内部正在按配置自动重试，
                             # 只透传给前端提示，不终止任务；连续失败达到重试上限时
                             # 上游会改发 retrying=False 的终止性错误帧。
@@ -1775,7 +1739,8 @@ async def _run_chat_generation(
                             filtered_event["content"] = visible_content
                         else:
                             filtered_event.pop("content", None)
-                    await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
+                    if filtered_event:
+                        await _stream_emit(stream, f"data: {json.dumps(filtered_event, ensure_ascii=False)}\n\n")
             finally:
                 # 显式关闭上游响应流：超时/提前 break 时立即断开连接，
                 # 不让卡死的 SSE 连接残留在后台
@@ -1784,6 +1749,8 @@ async def _run_chat_generation(
                 except Exception:
                     pass
             held_content, text_tool_call_name = text_tool_call_buffer.finish()
+            if text_tool_call_name:
+                full_response = ""  # 即使同时有原生调用，也不把重复正文标记写入历史。
             if held_content:
                 await _stream_emit(
                     stream,
@@ -1852,14 +1819,7 @@ async def _run_chat_generation(
                     await _stream_emit(stream, _sse_error_payload(detail))
                     session_chat_memory.run_task = False
                     break
-                reminder = (
-                    "刚才的回复只有写在正文中的工具调用标记，系统没有执行它。"
-                    "请勿输出 <tool_call> 标签或工具调用 JSON。"
-                    "若任务已经完成，请直接用自然语言答复用户；"
-                    "确需使用工具时，请通过原生 tool_calls 发起调用。"
-                )
-                if text_tool_call_name == TODO_TOOL_NAME:
-                    reminder += "若计划已全部 done，不要再次调用 todo_write。"
+                reminder = text_tool_call_reminder(text_tool_call_name)
                 messages.append({"role": "user", "content": reminder, "_internal": True})
                 await _stream_emit(stream, f"data: {json.dumps({'warning': {'code': 'TEXT_TOOL_CALL_RETRY', 'message': '模型输出了无法执行的文本工具调用，正在要求其改为正常答复。'}}, ensure_ascii=False)}\n\n")
                 continue
@@ -1868,6 +1828,9 @@ async def _run_chat_generation(
             known_tool_names = list(round_tool_servers.keys())
             # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
             tool_calls = normalize_tool_calls(tool_calls, known_tool_names)
+            todo_blocked = todo_loop_guard.observe([
+                tc.get("function", {}).get("name", "") for tc in tool_calls
+            ])
             # 工具调用流式阶段超时且没积累出任何可用调用（首个增量都没有，
             # 或者调用结构损坏被归一化丢弃）：不终止任务，以内部消息提示
             # 模型重新发起工具调用（内部消息不落盘，与截断续写路径一致）
@@ -2189,7 +2152,7 @@ async def _run_chat_generation(
             ask_user_questions: list[dict[str, Any]] = []
             # 根据当前消息里仍保留的图片/音频部件去重；已回收的视频区间允许重读。
             # 待注入坐标含引用、质量、视频区间和去重键，注入时现场加载部件。
-            read_media_injected_refs = collect_injected_media_keys(messages)
+            read_media_injected_refs = collect_injected_media_keys(limit_media_messages(messages, chat_config_effective)[0])
             read_media_pending_parts: list[tuple[str, Any, Any, Any, str]] = []
             # read_document 原生分支待注入部件：按目标文件的 supportDocTypes
             # 声明选择；工具结果中的 base64 在下方仅加入下一次模型请求（内存）
@@ -2204,13 +2167,20 @@ async def _run_chat_generation(
                 1 for _, _, call_name, _ in parsed_tools if call_name == READ_MEDIA_NAME
             )
             read_media_calls_seen = 0
+            document_budget = document_output_token_budget(
+                model_config=chat_config_effective, messages=messages, tools=tool_request.tools,
+                tool_count=len(parsed_tools))
             for idx, tc, tn, ta in parsed_tools:
-                bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(),
+                bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(chat_config_effective),
+                                "_max_tokens": document_budget,
                                 "_default_shell": resolve_default_command_shell(session_id),
                                 "_session_id": session_id}
                 if tn == TODO_TOOL_NAME:
                     # 模型自我规划：校验并写入会话 todo（_meta.todo），随后推 SSE 给前端
-                    todo_result, todo_items = await _apply_session_todo(session_chat_memory, ta)
+                    if todo_blocked:
+                        todo_result, todo_items = todo_loop_guard.rejection(), None
+                    else:
+                        todo_result, todo_items = await _apply_session_todo(session_chat_memory, ta)
                     if todo_items is not None:
                         todo_updated = True
                     builtin_results.append({
@@ -2290,6 +2260,7 @@ async def _run_chat_generation(
                         session_id,
                         current_task_media_references,
                         already_injected=read_media_injected_refs,
+                        media_limits=get_media_limits(chat_config_effective),
                         vision_enabled=vision_enabled,
                     )
                     if read_media_result.get("ok"):
@@ -2342,7 +2313,10 @@ async def _run_chat_generation(
                             if request_mode == "native" or is_page_range:
                                 read_document_result = {"error": budget_error}
                             else:
-                                text_args = {**bounded_args, "mode": "text"}
+                                from factory.table_document import TABLE_EXTENSIONS
+                                fallback_mode = ("table" if Path(str(ta.get("filename") or "")).suffix.lower()
+                                                 in TABLE_EXTENSIONS else "text")
+                                text_args = {**bounded_args, "mode": fallback_mode}
                                 read_document_result = execute_read_document(
                                     text_args, session_id, support_doc_types=native_doc_types
                                 )
@@ -2582,8 +2556,7 @@ async def _run_chat_generation(
                     messages.append(tool_message)
                 if todo_updated:
                     try:
-                        latest_todos = await session_chat_memory.get_session_todo()
-                        _replace_todo_context(messages, latest_todos)
+                        todo_context.sync(messages)
                     except Exception as todo_compact_error:
                         logger.warning(f"todo 上下文归并失败：{todo_compact_error}")
                 if ask_user_pending and not oversized_abort:
@@ -3030,9 +3003,30 @@ async def inject_user_message(session_id: str, message: dict) -> dict:
     session_id = normalize_session_id(session_id)
     if _generation_use_worker():
         proxy = peek_worker_proxy(session_id)
-        if proxy is None or not proxy.inject_message(message or {}):
+        if proxy is None:
             return {"ok": False, "reason": "not_running"}
-        return {"ok": True}
+        loop = asyncio.get_running_loop()
+        acknowledged = loop.create_future()
+        request_id = uuid.uuid4().hex
+
+        def receive(event):
+            if event.get("type") != "injected" or event.get("request_id") != request_id:
+                return
+            def resolve():
+                if not acknowledged.done():
+                    acknowledged.set_result(bool(event.get("ok")))
+            loop.call_soon_threadsafe(resolve)
+
+        proxy.add_handler(receive)
+        try:
+            if not proxy.inject_message(message or {}, request_id=request_id):
+                return {"ok": False, "reason": "not_running"}
+            accepted = await asyncio.wait_for(acknowledged, timeout=5)
+            return {"ok": accepted, "reason": "" if accepted else "not_running"}
+        except asyncio.TimeoutError:
+            return {"ok": False, "reason": "ack_timeout"}
+        finally:
+            proxy.remove_handler(receive)
     stream = _get_session_stream(session_id)
     if stream is None or stream.done or not stream.is_running():
         return {"ok": False, "reason": "not_running"}
@@ -3040,22 +3034,43 @@ async def inject_user_message(session_id: str, message: dict) -> dict:
     return {"ok": True}
 
 
-async def cancel_injected_message(session_id: str, text: str) -> dict:
+async def cancel_injected_message(session_id: str, text: str, *, message_id: str = "") -> dict:
     """撤回一条尚未消费的运行中注入消息（消息引导提示行的 × 按钮）。
 
-    worker 模式：向会话 worker 发送 cancel_inject 命令，按文本匹配移除
-    注入队列中未消费的一条；inline 模式：直接从 _SessionStream 注入队列
+    worker 模式：发送 cancel_inject 命令并等待实际移除确认，优先按 ID、
+    兼容按正文匹配；inline 模式：直接从 _SessionStream 注入队列
     移除。消息已被生成循环取走（已消费）时返回 ok=False，前端提示不可撤回。
     """
     session_id = normalize_session_id(session_id)
     target = (text or "").strip()
-    if not target:
+    if not target and not message_id:
         return {"ok": False, "reason": "empty"}
     if _generation_use_worker():
         proxy = peek_worker_proxy(session_id)
-        if proxy is None or not proxy.cancel_injected_message(target):
+        if proxy is None:
             return {"ok": False, "reason": "not_running"}
-        return {"ok": True}
+        loop = asyncio.get_running_loop()
+        acknowledged = loop.create_future()
+        request_id = uuid.uuid4().hex
+
+        def receive(event):
+            if event.get("type") != "injected_cancelled" or event.get("request_id") != request_id:
+                return
+            def resolve():
+                if not acknowledged.done():
+                    acknowledged.set_result(bool(event.get("ok")))
+            loop.call_soon_threadsafe(resolve)
+
+        proxy.add_handler(receive)
+        try:
+            if not proxy.cancel_injected_message(target, message_id=message_id, request_id=request_id):
+                return {"ok": False, "reason": "not_running"}
+            removed = await asyncio.wait_for(acknowledged, timeout=5)
+            return {"ok": removed, "reason": "" if removed else "not_found"}
+        except asyncio.TimeoutError:
+            return {"ok": False, "reason": "ack_timeout"}
+        finally:
+            proxy.remove_handler(receive)
     stream = _get_session_stream(session_id)
     if stream is None:
         return {"ok": False, "reason": "not_running"}
@@ -3065,8 +3080,9 @@ async def cancel_injected_message(session_id: str, text: str) -> dict:
         item = stream.injected_messages.popleft()
         item_text = ""
         if isinstance(item, dict):
-            item_text = content_part_to_text(item.get("content")).strip()
-        if not removed and item_text == target:
+            item_text = content_part_to_text(item.get("content"), include_media_labels=False).strip()
+        matches = item.get("message_id") == message_id if message_id and isinstance(item, dict) else item_text == target
+        if not removed and matches:
             removed = True
             continue
         remaining.append(item)

@@ -64,6 +64,20 @@
     return uploadedMedia;
   }
 
+  // 引导与普通发送复用媒体上传和 content 构造，上传成功后仅投递 media:// 引用。
+  App.prepareSteerContent = async function (message) {
+    const media = message.media || [];
+    const needUpload = media.filter(function (m) { return m && !m.media_ref && m.file; });
+    if (needUpload.length) await uploadMediaFiles(message.sessionId, needUpload);
+    if (media.some(function (m) { return !m || !m.media_ref; })) {
+      throw new Error("部分附件上传失败，请重试；已上传的附件不会重复上传");
+    }
+    return {
+      content: buildUserContent(message.text || "", media),
+      quotes: QuoteUtils.quotesForRequest(message.quotes || []),
+    };
+  };
+
   // V2 文件版本链徽标刷新（防抖）：文件工具结果到达后延迟拉一次统计。
   // 仅文件写型工具才可能产生版本链变更（版本链 tool 角色=write_file/edit_file/
   // sub_agent.*）——搜索/命令/问答等工具结果不再触发 /file_diff/list 请求，
@@ -299,13 +313,15 @@
         // 末尾恰好在当前轮工具结果之后，在此插入气泡与后端 messages
         // 顺序一致；同时清除消息框上方的待注入提示
         sealTextBlocks();
-        App.clearInjectedPending(sessionId);
+        App.clearInjectedPending(sessionId, data.message_id);
         App.appendUserMessage(
-          typeof data.text === "string" ? data.text : "",
+          data.content || (typeof data.text === "string" ? data.text : ""),
           null,
           sessionId,
           null,
-          msg
+          msg,
+          null,
+          data.quotes || []
         );
         hasStage = true;
         App.rebuildQnav();
@@ -404,6 +420,22 @@
       // 网络失败重试帧：显示重试进度与可展开的原始错误；重试成功继续时
       // 上方条保留（审计可见），不自动移除。
       if (data.error && data.retrying) {
+        if (data.discard_tool_calls && activeToolBlocks) {
+          // 参数流中断：这些工具未执行，移除占位，下一次尝试从新参数开始。
+          activeToolBlocks.forEach(function (tb) {
+            if (tb.done || tb.dispatched || (tb.agentBlock && tb.agentBlock.agentId)) return;
+            tb.done = true;
+            tb.ui.wrap.remove();
+            if (tb.agentBlock && !tb.agentBlock.agentId) {
+              tb.agentBlock.done = true;
+              tb.agentBlock.ui.wrap.remove();
+              agentByCall.forEach(function (block, key) {
+                if (block === tb.agentBlock) agentByCall.delete(key);
+              });
+            }
+          });
+          activeToolBlocks = null;
+        }
         const attempt = Number(data.retry || 0);
         const maxAttempts = data.max_attempts != null ? Number(data.max_attempts) : null;
         const summary = "网络请求失败，正在重试 " + attempt +

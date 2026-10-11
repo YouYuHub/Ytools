@@ -141,6 +141,40 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
             await self.router.list_chat_models(role="unknown_role")
         self.assertEqual(ctx.exception.status_code, 400)
 
+    async def test_invalid_session_selection_reports_fallback_and_saves_visible_parameters(self):
+        import memory.chat_memory as cm
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as history_dir, patch.object(cm, "HISTORY_ROOT", Path(history_dir)), patch.object(cm, "LOCK_ROOT", Path(history_dir) / "lock"):
+            sid = "invalid_model_test"
+            manager = await cm.get_chat_memory_manager(sid)
+            try:
+                await self.router.select_active_chat_model(self.router.ChatModelSelection(
+                    provider="OpenCode Completions", model="Deepseek V4 Pro",
+                    parameter={"temperature": 0.6}, headers=[{"name": "X-Current", "value": "new"}],
+                ))
+                await manager.update_session_model_selection("chat_model", {
+                    "ownership_name": "OpenCode Completions", "model_name": "Gone",
+                    "parameter": {"temperature": 1.9}, "headers": [{"name": "X-Old", "value": "old"}],
+                })
+                response = await self.router.list_chat_models(session_id=sid)
+                body = json.loads(response.body)
+                self.assertTrue(body["role_info"]["selection_invalid"])
+                self.assertFalse(body["role_info"]["is_overridden"])
+                self.assertEqual(body["role_info"]["selection"]["model"], "Deepseek V4 Pro")
+                self.assertEqual(body["session_selection"]["chat_model"]["model_name"], "Gone")
+                response = await self.router.select_active_chat_model(self.router.ChatModelSelection(
+                    provider="OpenCode Completions", model="Deepseek V4 Pro", session_id=sid,
+                ))
+                body = json.loads(response.body)
+                self.assertIsNone(body["warning"])
+                self.assertEqual(body["role_info"]["effective_parameter"]["temperature"], 0.6)
+                self.assertEqual(body["role_info"]["effective_headers"], [{"name": "X-Current", "value": "new"}])
+                body = json.loads((await self.router.list_chat_models(session_id=sid)).body)
+                self.assertFalse(body["role_info"]["selection_invalid"])
+                self.assertTrue(body["role_info"]["is_overridden"])
+            finally:
+                await cm.cleanup_chat_memory_manager(sid)
+
     async def test_select_active_chat_model_updates_model_selection(self) -> None:
         response = await self.router.select_active_chat_model(
             self.router.ChatModelSelection(
@@ -165,6 +199,74 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         from env_manager import model_selection, get_role_selection
         self.assertEqual(model_selection["chat_model"]["model_name"], "Deepseek V4 Flash")
         self.assertEqual(get_role_selection("chat_model")["model_name"], "Deepseek V4 Flash")
+
+    async def test_session_model_and_parameters_reach_generation_request_after_global_changes(self):
+        import asyncio
+        import memory.chat_memory as cm
+        import env_manager
+        from unittest.mock import patch
+        from routers import chat_router
+        from chat.chat_llm import ChatLLM
+        from config import ChatLLMRequest
+        from test_todo_no_tools_regression import _run_case, _cleanup
+
+        with tempfile.TemporaryDirectory() as history_dir, patch.object(cm, "HISTORY_ROOT", Path(history_dir)), patch.object(cm, "LOCK_ROOT", Path(history_dir) / "lock"):
+            sid = "session_parameters_test"
+            try:
+                await self.router.select_active_chat_model(self.router.ChatModelSelection(
+                    provider="OpenCode Completions", model="Deepseek V4 Flash", session_id=sid,
+                    parameter={"temperature": 0.23, "top_p": 0.45, "presence_penalty": 0.12,
+                               "max_tokens": 2048, "reasoning_effort": "low", "extra_body": {"enable_thinking": False}},
+                ))
+                # 独立选择保存后全局改回另一模型、另一套参数，不能影响会话。
+                await self.router.select_active_chat_model(self.router.ChatModelSelection(
+                    provider="OpenCode Completions", model="Deepseek V4 Pro",
+                    parameter={"temperature": 1.4, "max_tokens": 8192, "reasoning_effort": "high"},
+                ))
+                captured = []
+
+                class FakeLLM:
+                    @staticmethod
+                    def chat_completions(*, request, **kwargs):
+                        config = ChatLLM._resolve_chat_config()
+                        captured.append(ChatLLM._build_request_payload(request, True, config["selected_model_id"]))
+
+                        async def generate():
+                            yield 'data: {"content": "你好！"}\n\n'
+                            yield 'data: [DONE]\n\n'
+                        return generate()
+
+                async def fake_server(request):
+                    # worker IPC 会经过全量 model_dump / Pydantic 反序列化。
+                    transported = ChatLLMRequest(**request.model_dump())
+                    await asyncio.create_task(_run_case(None, llm=FakeLLM, request_override=transported,
+                                                        resolve_config=env_manager.require_default_chat_config))
+                    yield b'data: [DONE]\n\n'
+
+                class FakeRequest:
+                    def __init__(self, overrides):
+                        self.overrides = overrides
+
+                    async def json(self):
+                        return {"session_id": sid, "messages": [{"role": "user", "content": "你好"}], **self.overrides}
+
+                with patch.object(chat_router, "tool_chat_server", fake_server):
+                    for overrides in ({}, {"temperature": 0.91}):
+                        response = await chat_router.chat_with_tool(FakeRequest(overrides))
+                        async for _ in response.body_iterator:
+                            pass
+                        actual = captured[-1]
+                        self.assertEqual(actual["model"], "deepseek-v4-flash")
+                        self.assertEqual(actual["temperature"], overrides.get("temperature", 0.23))
+                        self.assertEqual(actual["top_p"], 0.45)
+                        self.assertEqual(actual["presence_penalty"], 0.12)
+                        self.assertEqual(actual["max_tokens"], 2048)
+                        self.assertEqual(actual["reasoning_effort"], "low")
+                        self.assertFalse(actual["enable_thinking"])
+                self.assertEqual(env_manager.get_role_selection("chat_model")["model_name"], "Deepseek V4 Pro")
+            finally:
+                await cm.cleanup_chat_memory_manager(sid)
+                await asyncio.to_thread(_cleanup)
 
     async def test_apply_role_parameter_defaults_priority(self) -> None:
         from env_manager import apply_role_parameter_defaults

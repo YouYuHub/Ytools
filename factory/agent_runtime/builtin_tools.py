@@ -125,11 +125,31 @@ def is_builtin_tool(tool_name: str) -> bool:
     )
 
 
-def model_tool_output_char_budget() -> int:
+def model_tool_output_char_budget(model_config=None) -> int:
     """Reserve most of a small model window for the rest of the request."""
-    from factory.agent_runtime.chat_runtime import resolve_model_max_input_tokens
-    window = resolve_model_max_input_tokens(default=8192)
+    from factory.agent_runtime.chat_runtime import resolve_model_max_input_tokens, resolve_config_max_input_tokens
+    window = (resolve_config_max_input_tokens(model_config) if model_config is not None
+              else resolve_model_max_input_tokens(default=8192))
     return max(512, min(12000, window // 2))
+
+
+def document_output_token_budget(*, model_config=None, messages=None, tools=None, tool_count=1) -> int:
+    """Budget the complete parsed result, sharing remaining input space across a tool batch.
+
+    Use the effective model (including a child agent override), not its global default.
+    Leave 25% safety margin for tokenizer differences and 512 tokens for request framing.
+    The normal pre-send compaction check still handles other tools and native inputs.
+    """
+    from factory.agent_runtime.chat_runtime import (
+        estimate_send_context_tokens, resolve_config_max_input_tokens, resolve_model_max_input_tokens,
+    )
+    window = (resolve_config_max_input_tokens(model_config) if model_config is not None
+              else resolve_model_max_input_tokens(default=8192))
+    remaining = window - 512
+    if messages is not None:
+        remaining -= estimate_send_context_tokens(messages, tools)
+    shared = max(0, remaining) // max(1, tool_count)
+    return max(0, int(min(window // 4, shared) * 0.75))
 
 
 def resolve_default_command_shell(session_id: str | None = None) -> str:
@@ -143,7 +163,9 @@ TODO_TOOL_DEFINITION = {
       "name": TODO_TOOL_NAME,
       "description": (
           "维护多步骤任务计划；简单任务无需调用。每次提交完整列表（最多 20 项），"
-          "同时更新已完成和下一步状态。返回 plan_complete=true 后汇总答复。"
+          "仅在步骤或状态变化时更新，合并已完成和下一步状态；更新计划不等于执行任务，"
+          "不要连续重复调用。最新完整计划在工具结果 todos 中，不会另行嵌入系统提示词。"
+          "通过原生工具调用提交；返回 plan_complete=true 后汇总答复。"
       ),
       "parameters": {
         "type": "object",
@@ -548,11 +570,17 @@ def _is_probably_binary(data: bytes) -> bool:
 
 def _read_bytes_with_limit(path: Path, max_bytes: int) -> bytes:
     """按实际读取量限制文件，避免 stat 后文件增长绕过大小检查。"""
+    data = bytearray()
     with path.open("rb") as handle:
-        data = handle.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise ValueError(f"文件超过 {max_bytes // (1024 * 1024)} MiB 读取上限")
-    return data
+        while True:
+            # read(max_bytes + 1) can allocate the entire ceiling even for a tiny file.
+            chunk = handle.read(min(64 * 1024, max_bytes - len(data) + 1))
+            if not chunk:
+                break
+            if len(data) + len(chunk) > max_bytes:
+                raise ValueError(f"文件超过 {max_bytes // (1024 * 1024)} MiB 读取上限")
+            data.extend(chunk)
+    return bytes(data)
 
 
 def _display_path(path: Path) -> str:
@@ -777,6 +805,7 @@ def _build_edit_model_result(
         line in requested_new_lines for line in added_lines
     ):
         result["diff_omitted_reason"] = "duplicates_edit_request"
+        result["message"] = "编辑成功；diff 仅重复本次替换文本，已省略。修改位置和数量见 changed_range、stats。"
     elif diff_text:
         result["diff"] = diff_text
     else:
@@ -1210,6 +1239,16 @@ def _walk_entries(root: Path, max_depth: int):
             yield current_path / name, "file"
 
 
+def _iter_text_lines(text):
+    """Match str.splitlines() without allocating an object for every line at once."""
+    start = 0
+    for match in re.finditer(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]", text):
+        yield text[start:match.start()]
+        start = match.end()
+    if start < len(text):
+        yield text[start:]
+
+
 def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 read_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
     args = tool_args or {}
@@ -1232,8 +1271,21 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if _is_probably_binary(data):
         raise ValueError(f"{_display_path(path)} 疑似二进制文件（{len(data)} 字节），拒绝按文本读取")
     text, used_encoding = _decode_bytes_used(data, str(args.get("encoding") or ""))
-    lines = text.splitlines()
-    total = len(lines)
+    start = int(args.get("start_line", 1))
+    if start < 1:
+        raise ValueError("start_line 必须从 1 开始")
+    limit = int(args.get("limit", 200))
+    if not 1 <= limit <= _READ_FILE_MAX_LINES:
+        raise ValueError(f"limit 必须在 1-{_READ_FILE_MAX_LINES} 之间")
+    raw_end = int(args.get("end_line") or 0)
+    if "end_line" in args and "limit" in args:
+        raise ValueError("limit 与 end_line 不能同时指定")
+    requested_end = (raw_end if raw_end > 0 else float("inf")) if "end_line" in args else start + limit - 1
+    selected = []
+    total = 0
+    for total, line in enumerate(_iter_text_lines(text), 1):
+        if start <= total <= requested_end and len(selected) < _READ_FILE_MAX_LINES:
+            selected.append(line)
     if total == 0:
         return {
             "success": True,
@@ -1243,17 +1295,8 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "range_end": 0, "truncated": False, "has_more": False,
             "content_hash": _content_hash(text),
         }
-    start = int(args.get("start_line", 1))
-    if start < 1:
-        raise ValueError("start_line 必须从 1 开始")
-    limit = int(args.get("limit", 200))
-    if not 1 <= limit <= _READ_FILE_MAX_LINES:
-        raise ValueError(f"limit 必须在 1-{_READ_FILE_MAX_LINES} 之间")
     # end_line 仅为旧调用保留，不再暴露给模型；新调用统一使用 start_line + limit。
-    raw_end = int(args.get("end_line") or 0)
     if "end_line" in args:
-        if "limit" in args:
-            raise ValueError("limit 与 end_line 不能同时指定")
         end = total if raw_end <= 0 else min(raw_end, total)
     else:
         end = min(start + limit - 1, total)
@@ -1261,11 +1304,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"start_line={start} 超出文件总行数 {total}，无内容可读")
     if end < start:
         raise ValueError(f"end_line={raw_end} 小于 start_line={start}，无内容可读")
-    selected = lines[start - 1:end]
-    limited = False
-    if len(selected) > _READ_FILE_MAX_LINES:
-        selected = selected[:_READ_FILE_MAX_LINES]
-        limited = True
+    limited = end - start + 1 > _READ_FILE_MAX_LINES
     # 单行超长（如压缩过的大 JSON/日志）时按字符分块返回，避免头尾截断丢失中间内容
     if len(selected[0]) >= return_max_chars - 32:
         line_text = selected[0]
@@ -1449,7 +1488,8 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
             room = limit - len(blocks)
             block_group = _format_match_block(path, lines, hit_indexes, context)
             blocks.extend(block_group[:room])
-    header = (f"[search_files] 正则: {regex.pattern} | 目录: {_display_path(root)}"
+    search_label = "正则" if isregex else "文本"
+    header = (f"[search_files] {search_label}: {pattern} | 目录: {_display_path(root)}"
               f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
     if skipped_large:
         header += (
@@ -1491,12 +1531,68 @@ _READ_DOCUMENT_LOCAL_MAX_BYTES = 10 * 1024 * 1024
 _DOCUMENT_TEXT_CACHE_MAX_CHARS = 4 * 1024 * 1024
 _document_text_cache: OrderedDict[tuple[str, int, int], str] = OrderedDict()
 _document_text_cache_lock = Lock()
+_document_table_cache: OrderedDict[tuple[str, int, int], Any] = OrderedDict()
+_document_table_cache_lock = Lock()
+
+
+def _bounded_document_result(result, token_budget, *, render_table=None):
+    """Fit JSON metadata as well as content; preserve exact continuation positions."""
+    from factory.agent_runtime.chat_runtime import estimate_text_tokens
+    for _ in range(40):
+        if estimate_text_tokens(result) <= token_budget:
+            return result
+        content = result.get("content", "")
+        if not content:
+            break
+        size = int(len(content) * 0.75)
+        if render_table is not None:
+            try:
+                page = render_table(size)
+            except ValueError:
+                return {"error": "表头或单行超过当前模型剩余预算；请用 mode=text、offset/limit 分段读取，或先压缩上下文"}
+            result.pop("next_row", None)
+            result.pop("next_sheet", None)
+            result.update(page)
+            result["limit"] = size
+            result["message"] = "已按当前模型预算返回完整表格行并重复表头；继续用 next_row/start_row 或 next_sheet/sheet"
+        else:
+            result["content"] = content[:size]
+            end = result["offset"] + size
+            result.update(end_char=end, has_more=end < result["total_chars"])
+            result.pop("next_offset", None)
+            result.pop("next_start_char", None)
+            if result["has_more"]:
+                result.update(next_offset=end, next_start_char=end)
+            result["message"] = f"按当前模型预算返回字符 [{result['offset']}, {end})；继续用 offset={end}"
+    return {"error": "当前模型剩余上下文不足以返回文档内容；请先压缩上下文或减少同轮工具调用"}
+
+
+def _extract_document_table(path: Path, filename: str, data: bytes):
+    from factory.table_document import parse_table
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _document_table_cache_lock:
+        cached = _document_table_cache.get(key)
+        if cached is not None:
+            _document_table_cache.move_to_end(key)
+            return cached
+    document = parse_table(filename, data)
+    weight = lambda item: item.chars + item.cells * 16 + item.row_count * 32
+    if weight(document) <= _DOCUMENT_TEXT_CACHE_MAX_CHARS:
+        with _document_table_cache_lock:
+            _document_table_cache[key] = document
+            while (len(_document_table_cache) > 4 or
+                   sum(map(weight, _document_table_cache.values())) > _DOCUMENT_TEXT_CACHE_MAX_CHARS):
+                _document_table_cache.popitem(last=False)
+    return document
 
 
 def _extract_document_text(path: Path, filename: str, data: bytes) -> str:
     """缓存较小的解析文本；文件修改后由 mtime 与大小自动换键。"""
     from factory import file_factory
 
+    if len(data) > _READ_DOCUMENT_LOCAL_MAX_BYTES:
+        raise ValueError("文档超过文本解析上限 10 MiB；请拆分文件或用 read_file/终端筛选，原生输入使用独立字节配额")
     stat = path.stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     with _document_text_cache_lock:
@@ -1598,6 +1694,9 @@ READ_DOCUMENT_TOOL_DEFINITION = {
           "读取当前会话上传文件，或按明确提供的本地绝对/相对路径读取文档"
           "（PDF/Word/Excel/CSV/MD/TXT 等）。mode=auto 按目标扩展名和模型 supportDocTypes 选择读取方式，"
           "不以通用 vision 能力分流；"
+          "表格 CSV/TSV/XLS/XLSX 降级文本时自动返回 Markdown 表格，按行分页且每页重复表头；"
+          "Word DOCX 的 auto/text 保留正文段落及 Markdown 表格，按字符续读；"
+          "mode=table 可强制表格读取，续读使用 next_row/next_sheet；"
           "mode=text 使用 offset/limit 按字符读取（默认 10000，最大 20000，可能按模型窗口收紧）；"
           "原生 PDF 可用 page_start/page_count 读取 1 起始的页面范围（最多 20 页）。"
           "原生文件只在下一次模型请求中发送一次；之后需再次调用本工具查看原文。"
@@ -1611,8 +1710,8 @@ READ_DOCUMENT_TOOL_DEFINITION = {
           },
           "mode": {
             "type": "string",
-            "enum": ["auto", "text", "native"],
-            "description": "auto 按模型能力选择；text 返回解析文本；native 只发送原始文档",
+            "enum": ["auto", "text", "table", "native"],
+            "description": "auto 按能力选择，表格文本按行读取；table 强制 Markdown 表格；text 按字符读取；native 发送原文",
           },
           "offset": {
             "type": "integer",
@@ -1625,6 +1724,13 @@ READ_DOCUMENT_TOOL_DEFINITION = {
                 f"最大 {_READ_DOCUMENT_MAX_CHARS}）"
             ),
           },
+          "sheet": {"type": "string", "description": "表格工作表名称；默认第一个，返回 sheets 列出全部工作表"},
+          "header_row": {"type": "integer", "minimum": 0,
+                         "description": "表格表头行号，从 1 开始，默认 1；0 表示无表头，使用列 A/B 等且保留首行数据"},
+          "start_row": {"type": "integer", "minimum": 1,
+                        "description": "表格数据起始行号，从 1 开始；默认表头之后，续读用 next_row；与 offset 互斥"},
+          "row_limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                        "description": "表格最多读取的数据行数，默认 100，最多 200；同时受 limit 字符预算约束"},
           "page_start": {
             "type": "integer",
             "description": "原生 PDF 起始页码（从 1 开始）；与 page_count 同时指定",
@@ -1656,8 +1762,15 @@ def execute_read_document(
         return {"error": "filename 不能为空（传入会话文件名或明确的本地文档路径）"}
 
     mode = str(args.get("mode") or "auto").strip().lower()
-    if mode not in {"auto", "text", "native"}:
-        return {"error": "mode 只支持 auto、text 或 native"}
+    if mode not in {"auto", "text", "table", "native"}:
+        return {"error": "mode 只支持 auto、text、table 或 native"}
+    from factory.table_document import TABLE_EXTENSIONS, parse_table, table_page
+    has_table_args = any(key in args for key in ("sheet", "header_row", "start_row", "row_limit"))
+    has_offset = any(key in args for key in ("offset", "start_char"))
+    if has_table_args and mode in {"text", "native"}:
+        return {"error": "sheet/header_row/start_row/row_limit 仅用于 mode=auto 或 table"}
+    if (mode == "table" or has_table_args) and has_offset:
+        return {"error": "表格按行读取，不接受 offset/start_char；请用 start_row 或改为 mode=text"}
     has_text_range = any(
         key in args for key in ("offset", "limit", "start_char", "max_chars")
     )
@@ -1666,6 +1779,8 @@ def execute_read_document(
     if has_page_start != has_page_count:
         return {"error": "page_start 和 page_count 必须同时指定"}
     has_page_range = has_page_start and has_page_count
+    if has_page_range and (mode == "table" or has_table_args):
+        return {"error": "表格参数不能与 PDF 页面范围同时使用"}
     if has_text_range and has_page_range:
         return {"error": "字符 offset/limit 与 PDF page_start/page_count 不能同时使用"}
     if mode == "native" and has_text_range:
@@ -1684,7 +1799,8 @@ def execute_read_document(
         maximum=_READ_DOCUMENT_MAX_CHARS,
     )
     if args.get("_max_chars") is not None:
-        limit = min(limit, max(512, int(args["_max_chars"])))
+        limit = min(limit, max(1, int(args["_max_chars"])))
+    token_budget = max(0, int(args.get("_max_tokens", document_output_token_budget())))
 
     local_data: bytes | None = None
     local_parsing_deferred = False
@@ -1694,7 +1810,9 @@ def execute_read_document(
         return {"error": f"读取文件记录失败：{exc}"}
     if record is None:
         local_parsing_deferred = bool(
-            mode == "native" or (
+            mode == "native" or mode == "table" or (
+                mode == "auto" and Path(filename).suffix.lower() in TABLE_EXTENSIONS and not has_offset
+            ) or (
                 mode == "auto" and not has_text_range
                 and support_doc_types
                 and file_memory.document_supports_native(Path(filename).name, support_doc_types)
@@ -1741,7 +1859,7 @@ def execute_read_document(
             return None
 
     wants_native = mode == "native" or (
-        mode == "auto" and not has_text_range and (native_supported or has_page_range)
+        mode == "auto" and not has_text_range and not has_table_args and (native_supported or has_page_range)
     )
     if wants_native:
         if not native_supported:
@@ -1805,7 +1923,72 @@ def execute_read_document(
     else:
         native_fallback_note = ""
 
-    # 原生读取失败后才解析本地文件；截断入库的记录按需重解析。
+    # Table fallback reparses the original, so legacy records with lost headers recover too.
+    if token_budget < 128:
+        return {"error": "当前模型剩余上下文不足以读取文档；请先压缩上下文或减少同轮工具调用"}
+    table_note = ""
+    extension = Path(display_filename).suffix.lower()
+    wants_table = mode == "table" or has_table_args or (
+        mode == "auto" and extension in TABLE_EXTENSIONS and not has_offset
+    )
+    if wants_table:
+        if extension not in TABLE_EXTENSIONS:
+            if extension == ".docx":
+                return {"error": "Word 表格随正文返回为 Markdown；请移除 sheet/header_row/start_row/row_limit，使用 mode=text 或 auto，并按 offset/limit 续读"}
+            return {"error": "表格模式仅支持 CSV/TSV/XLS/XLSX；其他文档请用 mode=text 或 native"}
+        source_path = (Path(str(record.get("filename") or filename)) if local_data is not None else
+                       file_memory.resolve_document_path(session_id, stored_name) if stored_name else None)
+        try:
+            if source_path is not None:
+                raw = local_data if local_data is not None else _read_bytes_with_limit(source_path, _READ_DOCUMENT_LOCAL_MAX_BYTES)
+                document = _extract_document_table(source_path, display_filename, raw)
+            elif extension in {".csv", ".tsv"} and not record.get("content_truncated"):
+                document = parse_table(display_filename, str(record.get("content") or "").encode("utf-8"))
+                table_note = "原始文件不可用，按已保存文本重建表格；无法核对历史解析是否已丢失数据"
+            else:
+                raise FileNotFoundError("原始表格文件不可用，旧解析文本无法可靠恢复表头和列关系")
+            def table_int(name, default, minimum, maximum=None):
+                value = args.get(name, default)
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum or (maximum and value > maximum):
+                    raise ValueError(f"{name} 必须是 >= {minimum}" + (f" 且 <= {maximum}" if maximum else "") + " 的整数")
+                return value
+            header_row = table_int("header_row", 1, 0)
+            row_limit = table_int("row_limit", 100, 1, 200)
+            start_row = table_int("start_row", 1, 1) if "start_row" in args else None
+            sheet = args.get("sheet")
+            if sheet is not None and not isinstance(sheet, str):
+                raise ValueError("sheet 必须是工作表名称字符串")
+            result = table_page(document, sheet, header_row=header_row, start_row=start_row,
+                                row_limit=row_limit, max_chars=limit)
+            result.update(filename=record.get("filename") or filename, type=record.get("type") or extension[1:],
+                          mode="table", limit=limit, row_limit=row_limit, source_truncated=False)
+            message = f"已读取工作表 {result['sheet']}，数据行 {result['start_row']}-{result['end_row']}；每次重复表头"
+            if "next_row" in result:
+                message += f"；继续用 start_row={result['next_row']}、sheet={result['sheet']!r}"
+            elif "next_sheet" in result:
+                message += f"；还有工作表，继续用 sheet={result['next_sheet']!r}（移除 start_row）"
+            else:
+                message += "；当前读取结束"
+            if header_row:
+                message += f"；当前以第 {header_row} 行为表头，若无表头请设 header_row=0"
+            if table_note:
+                message += "；" + table_note
+            if native_fallback_note:
+                message += "；原生读取不可用，已回退表格文本：" + native_fallback_note
+            result["message"] = message
+            return _bounded_document_result(
+                result, token_budget, render_table=lambda size: table_page(
+                    document, sheet, header_row=header_row, start_row=start_row,
+                    row_limit=row_limit, max_chars=size))
+        except (ValueError, TypeError) as exc:
+            return {"error": str(exc)}
+        except Exception as exc:
+            if mode == "table" or has_table_args:
+                return {"error": f"表格解析失败：{exc}"}
+            table_note = f"表格结构化解析不可用，返回已有文本：{exc}"
+
+    # 原生读取失败后才解析本地文件；截断入库记录按需重解析。
+    # 旧 DOCX 记录可能只保存段落，即使未标记截断，也从原始文件恢复表格。
     if local_parsing_deferred and local_data is not None:
         local_path = Path(str(record.get("filename") or filename))
         try:
@@ -1815,20 +1998,25 @@ def execute_read_document(
             record["parse_error"] = str(exc)
     content = str(record.get("content") or "")
     source_truncated = bool(record.get("content_truncated"))
-    if source_truncated:
-        raw = load_original_bytes()
-        if raw is not None:
-            try:
-                source_path = (
-                    Path(str(record.get("filename") or filename)) if local_data is not None
-                    else file_memory.resolve_document_path(session_id, stored_name)
-                )
-                if source_path is None:
-                    raise FileNotFoundError("原始文档路径不可用")
-                content = _extract_document_text(source_path, display_filename, raw)
-                source_truncated = False
-            except Exception:
-                pass
+    parse_warning = ""
+    if source_truncated or (extension == ".docx" and local_data is None):
+        try:
+            source_path = (
+                Path(str(record.get("filename") or filename)) if local_data is not None
+                else file_memory.resolve_document_path(session_id, stored_name) if stored_name else None
+            )
+            if source_path is None:
+                raise FileNotFoundError("原始文档不可用，请重新上传文件")
+            raw = local_data if local_data is not None else _read_bytes_with_limit(source_path, _READ_DOCUMENT_LOCAL_MAX_BYTES)
+            content = _extract_document_text(source_path, display_filename, raw)
+            source_truncated = False
+            record["parse_failed"] = False
+        except Exception as exc:
+            parse_warning = f"原始文档重解析失败：{exc}"
+            if extension == ".docx":
+                parse_warning += "；仅返回已保存文本，旧记录可能缺失表格，不能据此认定没有表格"
+            if not content:
+                record.update(parse_failed=True, parse_error=parse_warning)
 
     total = len(content)
     if total == 0:
@@ -1841,10 +2029,14 @@ def execute_read_document(
             )
         message = empty_hint
         if source_truncated:
-            message += "；解析文本在入库时已截断，原始文件不可用，无法继续重解析"
+            message += "；解析文本在入库时已截断，原始文件未能重解析"
         if native_fallback_note:
             message += f"；原生文档不可用：{native_fallback_note}"
-        return {
+        if table_note:
+            message += "；" + table_note
+        if parse_warning:
+            message += "；" + parse_warning
+        result = {
             "filename": record.get("filename") or filename,
             "type": record.get("type") or "",
             "mode": "text",
@@ -1858,6 +2050,9 @@ def execute_read_document(
             "source_truncated": source_truncated,
             "message": message,
         }
+        if parse_warning:
+            result["parse_warning"] = parse_warning
+        return _bounded_document_result(result, token_budget)
 
     if offset >= total:
         return {
@@ -1877,9 +2072,13 @@ def execute_read_document(
         else f"已返回字符区间 [{offset}, {end})（当前可读取文本结束，共 {total} 字）"
     )
     if source_truncated:
-        message += "；原始文件不可用，解析文本在入库时已截断"
+        message += "；原始文件未能重解析，解析文本在入库时已截断"
     if native_fallback_note:
         message += f"；原生文档不可用，已回退到解析文本：{native_fallback_note}"
+    if table_note:
+        message += "；" + table_note
+    if parse_warning:
+        message += "；" + parse_warning
     result = {
         "filename": record.get("filename") or filename,
         "type": record.get("type") or "",
@@ -1900,7 +2099,9 @@ def execute_read_document(
     if source_truncated:
         result["content_truncated"] = True
         result["content_total_chars"] = record.get("content_total_chars")
-    return result
+    if parse_warning:
+        result["parse_warning"] = parse_warning
+    return _bounded_document_result(result, token_budget)
 
 
 # ------------------- read_media：读取图片/音频/视频（统一入口） -------------------
@@ -1942,11 +2143,13 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                 "按需读取 media:// 引用、本地路径或 http(s) 直链的图片、音频、视频。"
                 "每次最多 5 个来源，同一条回复只调用一次（重复调用仅首个会执行）；"
                 "多个来源合并到 references 列表。"
+                "还需遵守请求中的供应商媒体配额：上限为 1 时每轮只读一个，"
+                "上限为 0 时不能发送该类型；未发送项不代表已看过。"
                 "媒体数据作为下一次请求的多模态部件发送，工具结果只含读取状态。"
                 f"视频/动图每次最多读取 {max_seconds} 秒；start_time=end_time 可只探测元数据，"
                 "继续读取时使用上一段的结束时间。单请求仅保留一个视频片段，"
                 "此前视频画面会回收；如需回看，重新读取相同引用和区间。"
-                "超限或不支持的格式会返回原因；图片格式必要时自动转换。"
+                "动态 GIF 通常转换为视频，占视频配额；超限或不支持会返回原因。"
             ),
             "parameters": {
                 "type": "object",
@@ -1955,7 +2158,7 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                         "type": "array",
                         "description": (
                             "媒体来源列表（最多 5 个）：media:// 引用 / 本地文件路径 / "
-                            "http(s) 网络直链，可混用"
+                            "http(s) 网络直链，可混用；已知供应商配额更小时按该配额分轮读取"
                         ),
                         "items": {"type": "string"},
                         "maxItems": READ_MEDIA_MAX_ITEMS,
@@ -2482,6 +2685,7 @@ def execute_read_media(
     already_injected: set[str] | None = None,
     load_media=None,
     vision_enabled: bool | None = None,
+    media_limits: dict | None = None,
 ) -> dict[str, Any]:
     """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
 
@@ -2543,6 +2747,8 @@ def execute_read_media(
             skipped.append({"reference": reference, "reason": "limit_5_per_round"})
         allowed = allowed[:READ_MEDIA_MAX_ITEMS]
     loaded_items: list[dict[str, Any]] = []
+    media_limits = media_limits or {}
+    kind_counts: dict[str, int] = {}
     for reference in allowed:
         # 每个引用的去重键在注入时逐项计算（勿复用 allowed 构建循环的旧变量）
         injected_key = _media_injected_key(reference, start_time, end_time)
@@ -2569,6 +2775,16 @@ def execute_read_media(
             # 透传给模型，不计入成功读取
             skipped.append({"reference": reference, "reason": info["error"]})
             continue
+        kind = info.get("kind")
+        kind_limit = media_limits.get(kind)
+        total_limit = media_limits.get("total")
+        if (kind_limit is not None and kind_counts.get(kind, 0) >= kind_limit) or (
+            total_limit is not None and len(loaded_items) >= total_limit
+        ):
+            skipped.append({"reference": reference, "reason": "provider_media_limit",
+                            "message": f"当前供应商限制 {kind}≤{kind_limit}，总媒体≤{total_limit}；未注入该媒体。数量为 1 时请下一轮单独读取，数量为 0 时请更换模型。"})
+            continue
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
         loaded_items.append({
             "reference": reference,
             "injected_key": _media_injected_key(reference, start_time, end_time),
@@ -3504,14 +3720,30 @@ def _append_command_notes(text: str, notes: list) -> str:
 
 
 def _prune_old_bg_files() -> None:
-    """清理后台日志/WMI 中转临时文件中超过 24 小时的旧文件（忽略一切错误）。"""
+    """清理过期中转文件；未关闭的后台记录和仍运行的任务不按 24h 删除。"""
     try:
         cutoff = time.time() - 24 * 3600
+        protected = set()
+        for metadata_path in _BG_LOG_DIR.glob("bg_*.meta.json"):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                pid = int(metadata["pid"])
+                alive = _pid_alive_windows(pid) if os.name == "nt" else _pid_alive_posix(pid)
+                if not metadata.get("closed") or alive or float(metadata.get("closed_at") or 0) > cutoff:
+                    protected.add(metadata_path.name.removesuffix(".meta.json"))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
         # bg_=后台日志；fg_=前台命令 WMI 中转的临时文件；inline_=多行内联代码改写出的脚本
         patterns = ("bg_*", "fg_*", "inline_*")
         for pattern in patterns:
             for item in _BG_LOG_DIR.glob(pattern):
                 try:
+                    if item.suffix == ".lock":
+                        continue
+                    if any(item.name.startswith(base + ".") for base in protected):
+                        continue
+                    if pattern == "inline_*" and protected:
+                        continue
                     if item.stat().st_mtime < cutoff:
                         item.unlink()
                 except OSError:
@@ -3526,7 +3758,11 @@ def _pid_alive_windows(pid: int) -> bool:
     from ctypes import wintypes
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return False
@@ -3621,7 +3857,7 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         cmd 拥有【隐藏的】控制台 → 控制台程序正常工作 + 全程无可见窗口。✔
         （即资源管理器/VBS 启动思路：由 GUI 中介拉起，天然脱离受限 Job 与进程树）
 
-    文件三件套（均写入 _BG_LOG_DIR，24h 自动清理）：
+    文件三件套（均写入 _BG_LOG_DIR；前台旧文件 24h 清理，后台记录关闭后清理）：
       <prefix>_*.run.cmd   用户命令原文（仅 cmd 家族需要；其他 shell 用括号分组内联）
       <prefix>_*.cmd       启动器：环境注入 + cd + 执行命令并整体重定向到 out
       <prefix>_*.vbs       包装器：vbHide 运行启动器、等待结束、把退出码写入 done
@@ -3917,7 +4153,7 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
         # 新进程脱离本进程树与受限 Job，不受宿主"命令结束后清理进程树"影响
         info = _write_relay_script(command, cwd, shell_exe, shell_kind, shell_prefix, "bg")
         alive = _pid_alive_windows(info["pid"])
-        job_id = _save_command_job(info["pid"], info["out"], info["done"], shell_kind, cwd, session_id)
+        job_id = _save_command_job(info["pid"], info["out"], info["done"], shell_kind, cwd, session_id, command)
         return "\n".join([
             f"[run_command] 后台模式{'已启动' if alive else '已启动（进程状态未知，可能瞬间结束）'}"
             f" | shell={shell_kind} | pid={info['pid']} | job_id={job_id}",
@@ -3927,16 +4163,23 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
             f"终止建议: taskkill /PID {info['pid']} /T /F（必须带 /T 终止整棵进程树；"
             "只杀该 pid 会留下实际服务进程）",
         ])
-    # POSIX：setsid 分离 + 输出重定向到日志文件
+    # POSIX：独立进程组中的监督进程等待 shell 退出并写入完成标记。
     stamp = time.strftime("%Y%m%d_%H%M%S")
     base = f"bg_{stamp}_{next(_BG_NAME_SEQ) % 10000}_{os.getpid()}"
     out_path = _BG_LOG_DIR / f"{base}.out.txt"
-    with open(out_path, "ab") as log_file:
-        proc = subprocess.Popen(
-            [shell_exe, *shell_prefix, command],
-            stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=cwd, start_new_session=True)
-    job_id = _save_command_job(proc.pid, out_path, None, shell_kind, cwd, session_id)
+    done_path = _BG_LOG_DIR / f"{base}.done.txt"
+    spec_path = _BG_LOG_DIR / f"{base}.spec.json"
+    prefix = shell_prefix or ["-c"]
+    spec_path.write_text(json.dumps({"argv": [shell_exe, *prefix, command], "cwd": cwd,
+                                    "output": str(out_path), "done": str(done_path)}), encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).with_name("background_runner.py")), str(spec_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        cwd=cwd, start_new_session=True, env=_merged_child_env())
+    # Reap the supervisor while this worker lives; detached jobs also survive worker exit.
+    from threading import Thread
+    Thread(target=proc.wait, daemon=True).start()
+    job_id = _save_command_job(proc.pid, out_path, done_path, shell_kind, cwd, session_id, command)
     return "\n".join([
         f"[run_command] 后台模式已启动 | shell={shell_kind} | pid={proc.pid} | job_id={job_id}",
         f"输出文件: {_display_path(out_path)}（stdout+stderr 合并追加）",
@@ -3946,69 +4189,71 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
 
 
 def _save_command_job(pid: int, output_path: Path, done_path: Path | None, shell: str, cwd: str,
-                      session_id: str = "") -> str:
+                      session_id: str = "", command: str = "") -> str:
+    from factory.agent_runtime.command_jobs import write_metadata
+    from util.process_identity import process_identity
     job_id = output_path.name.removesuffix(".out.txt")
     metadata = {
         "job_id": job_id, "pid": pid, "output_path": str(output_path),
         "completion_path": str(done_path) if done_path else None,
         "shell": shell, "cwd": cwd, "created_at": time.time(), "stopped": False,
-        "session_id": session_id,
+        "session_id": session_id, "command": command, "process_identity": process_identity(pid),
+        "closed": False,
     }
-    (_BG_LOG_DIR / f"{job_id}.meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+    write_metadata(_BG_LOG_DIR / f"{job_id}.meta.json", metadata)
     return job_id
 
 
-def _command_job_action(action: str, job_id: str, session_id: str = "") -> dict[str, Any]:
-    if not re.fullmatch(r"bg_[A-Za-z0-9_]+", job_id):
-        raise ValueError("job_id 无效；请使用 background=true 返回的 job_id")
-    metadata_path = _BG_LOG_DIR / f"{job_id}.meta.json"
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"后台任务 {job_id} 不存在或记录已过期") from exc
-    if metadata.get("job_id") != job_id:
-        raise ValueError("后台任务记录无效")
-    if metadata.get("session_id") and metadata["session_id"] != session_id:
-        raise ValueError("后台任务不属于当前会话")
-    pid = int(metadata["pid"])
-    done_path = Path(metadata["completion_path"]) if metadata.get("completion_path") else None
-    output_path = Path(metadata["output_path"])
-    done = done_path is not None and done_path.exists()
-    running = _pid_alive_windows(pid) if os.name == "nt" else _pid_alive_posix(pid)
-    if action == "stop" and running and not done and not metadata.get("stopped"):
-        if os.name == "nt":
-            stopped = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
-                                     timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if stopped.returncode != 0:
-                raise ValueError(f"停止后台任务失败（taskkill exit={stopped.returncode}）")
-        else:
-            import signal
-            os.killpg(pid, signal.SIGTERM)
-        metadata["stopped"] = True
-        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-        running = False
-    exit_code = None
-    if done_path is not None and done_path.exists():
-        try:
-            exit_code = int(done_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pass
-    status = "stopped" if metadata.get("stopped") else "failed" if done and exit_code not in (None, 0) else "completed" if done else "running" if running else "unknown"
-    try:
-        with output_path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - 4096))
-            output_tail = _decode_command_bytes(handle.read(), candidates=list(_command_output_candidates()))
-    except OSError:
-        output_tail = ""
-    return {
-        "message": f"[run_command] job_id={job_id} | status={status} | exit={exit_code}",
-        "status": status, "job_id": job_id, "pid": pid, "exit_code": exit_code,
-        "output_path": _display_path(output_path), "output_tail": output_tail,
-        "completion_path": _display_path(done_path) if done_path else None,
-        "background": True,
-    }
+def _command_output_tail(output_path: Path, tail_lines: int, max_chars: int) -> tuple[str, bool]:
+    """Bound both disk reads and returned text; keep newest lines, not a partial prefix."""
+    import codecs
+    with output_path.open("rb") as handle:
+        prefix = handle.read(4)
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - 256 * 1024)
+        bom_encoding = unicode_bom(prefix)
+        if start and bom_encoding in ("utf-16", "utf-32"):
+            width = 2 if bom_encoding == "utf-16" else 4
+            start -= start % width
+        handle.seek(start)
+        raw = handle.read(256 * 1024 + 4)
+    if start and bom_encoding in ("utf-16", "utf-32"):
+        # A tail lacks the file BOM; retain its byte order when decoding.
+        width = 2 if bom_encoding == "utf-16" else 4
+        text = codecs.getincrementaldecoder(bom_encoding)(errors="replace").decode(prefix[:width] + raw, final=False)
+    else:
+        text = None
+        # A live writer may be between bytes of its last Unicode character.
+        # Defer that incomplete suffix until the next snapshot, without switching
+        # the valid UTF-8 prefix to a legacy encoding. A tail can also start mid-char.
+        for skip in range(min(4, len(raw)) if start else 1):
+            try:
+                codec = "utf-8-sig" if not start and bom_encoding == "utf-8-sig" else "utf-8"
+                text = codecs.getincrementaldecoder(codec)(errors="strict").decode(raw[skip:], final=False)
+                break
+            except UnicodeDecodeError:
+                pass
+        if text is None:
+            text = _decode_command_bytes(raw, candidates=list(_command_output_candidates()))
+    if start:
+        # Start may fall inside a multibyte character/line. Drop that partial line.
+        if '\n' in text:
+            text = text.partition('\n')[2]
+    lines = text.splitlines(keepends=True)
+    selected = ''.join(lines[-tail_lines:])
+    truncated = bool(start or len(lines) > tail_lines or len(selected) > max_chars)
+    return selected[-max_chars:], truncated
+
+
+def _command_job_action(action: str, job_id: str, session_id: str = "", *,
+                        tail_lines: int = 30, max_chars: int = 12000) -> dict[str, Any]:
+    from factory.agent_runtime.command_jobs import action as job_action
+    result = job_action(job_id, action, session_id, tail_lines=tail_lines, max_chars=max_chars)
+    # UI needs command/session metadata; repeated model polls only need status and output.
+    for key in ("command", "shell", "cwd", "session_id", "created_at", "can_stop"):
+        result.pop(key, None)
+    return result
 
 
 def _pid_alive_posix(pid: int) -> bool:
@@ -4215,7 +4460,11 @@ POLL_COMMAND_TOOL_DEFINITION = {
         "description": "查询 run_command(background=true) 启动的后台任务状态和最新输出。",
         "parameters": {
             "type": "object",
-            "properties": {"job_id": {"type": "string", "description": "run_command 返回的 job_id"}},
+            "properties": {
+                "job_id": {"type": "string", "description": "run_command 返回的 job_id"},
+                "tail_lines": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30,
+                               "description": "最近输出行数，默认30、最多200；受字符预算限制，截断时用 read_file 读取 output_path"},
+            },
             "required": ["job_id"],
         },
     },
@@ -4248,12 +4497,20 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
     if action in ("poll", "stop"):
         if any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background")):
             raise ValueError("poll/stop 仅接受 job_id；请移除执行命令专用参数")
+        tail_lines = args.get("tail_lines", 30)
+        if action == "stop" and "tail_lines" in args:
+            raise ValueError("stop 不接受 tail_lines；请在 poll_command 中使用")
+        if not isinstance(tail_lines, int) or isinstance(tail_lines, bool) or not 1 <= tail_lines <= 200:
+            raise ValueError("tail_lines 必须是 1-200 之间的整数")
         return _command_job_action(action, str(args.get("job_id") or "").strip(),
-                                   str(args.get("_session_id") or ""))
+                                   str(args.get("_session_id") or ""), tail_lines=tail_lines,
+                                   max_chars=max(512, min(12000, int(args.get("_max_chars") or 12000))))
     if action != "run":
         raise ValueError("action 仅支持 run、poll、stop")
     if "job_id" in args:
         raise ValueError("run 不接受 job_id；请使用 poll_command 或 stop_command")
+    if "tail_lines" in args:
+        raise ValueError("run 不接受 tail_lines；请在 poll_command 中使用")
     return _run_command_impl(
         args.get("command"),
         args.get("shell") or args.get("_default_shell") or "auto",

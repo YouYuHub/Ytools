@@ -52,7 +52,7 @@ python main.py
 - `ownership_name` 为供应商顶层键名，`model_name` 为 `models` 内的模型键名；`id` 为请求 API 时实际发送的模型 id（缺省时使用键名）。
 - `model_selection` 支持四个角色：`chat_model`（聊天）、`compaction_model`（上下文压缩）、`title_model`（会话标题）、`sub_agent_model`（子智能体）；其中 `compaction_model` 与 `sub_agent_model` 仅支持 chat-completions 协议。
 - 角色的 `parameter`（生成参数）按协议分桶存放（`chat_completions` / `messages` / `responses`），`headers` 为自定义请求头；两者均可省略，也可以直接在前端「参数」面板中修改（写入同一份配置）。
-- 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；在「配置工具」→「内置工具」中启用 `read_document` 后，工具会按目标文件扩展名选择原生或解析文本。文本支持 `offset` / `limit`，原生 PDF 支持页区间；原生文件只在工具调用后的下一次模型请求中发送一次。
+- 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；启用 `read_document` 后按目标扩展名选择读取方式。不支持原生表格的模型会获得保留表头和原始行号的 Markdown 表格，支持工作表选择和按行续读；文本支持 `offset` / `limit`，结果按当前模型预算分页。原生 PDF 支持页区间；原生文件只发送一次。XLSX/XLS 解析分别需要 `openpyxl`/`xlrd`，详见 [文档读取参数](docs/api_docs.md#内置-read_document-工具factoryagent_runtimebuiltin_toolspy)。
 - 内置文件工具按需勾选：`read_file` 有 64 MiB 读取上限，默认连续读取 200 行，并用 `next_start_line` 指示续读；`edit_file` 支持单处替换或 `edits` 列表一次完成多处替换，`expected_hash` 可校验读后变更；`write_file` 的新调用须明确指定 `mode=create|overwrite|append`，旧调用参数仍兼容；`search_files` 默认按普通文本搜索，正则需指定 `is_regex=true`。勾选 `run_command` 后，模型还可使用 `poll_command`、`stop_command` 管理后台任务；已有会话可在「配置工具」中选择默认 shell。`read_media` 对仍在上下文的图片避免重复注入，已回收的视频区间可以重新读取。
 - 修改保存后自动热重载生效，无需重启服务。
 
@@ -154,3 +154,7 @@ if __name__ == "__main__":
 ### 工具文本编码
 
 终端、文本/CSV 文档和网页读取的编码策略及旧编码用法见 [工具文本编码说明](docs/text_encoding.md)。PowerShell 子会话默认 UTF-8 读写项目文本；无 BOM 的旧编码文件需显式指定编码。
+
+### 供应商媒体限制
+
+支持在供应商或模型条目配置 `mediaLimits`，并针对明确的媒体数量报错自动降级。GIF 转换的视频也按视频配额处理，工具参数、分段读取及回传说明见 [read_media 使用说明](docs/read_media.md)，供应商示例配置见 [媒体限制说明](docs/media_limits.md)。

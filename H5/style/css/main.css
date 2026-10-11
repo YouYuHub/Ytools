@@ -7601,3 +7601,191 @@ html[data-theme=dark] .eh-del .eh-text {
   color: #ff9492;
   text-decoration-color: rgba(255, 148, 146, 0.5);
 }
+
+#terminalJobsBtn {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.composer:not(.grow) #terminalJobsBtn {
+  order: 1;
+}
+
+@container main-area (max-width: 445px) {
+  .composer.grow #terminalJobsBtn {
+    order: 1;
+  }
+}
+.terminal-count {
+  position: absolute;
+  top: -2px;
+  right: -3px;
+  min-width: 16px;
+  padding: 1px 3px;
+  border-radius: 10px;
+  font-size: 10px;
+  background: var(--text);
+  color: var(--bg);
+}
+
+.terminal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1600;
+  background: rgba(0, 0, 0, 0.4666666667);
+  display: flex;
+  justify-content: flex-end;
+  overscroll-behavior: contain;
+}
+
+.terminal-panel {
+  width: min(900px, 95vw);
+  height: 100%;
+  background: var(--bg-elevated);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-menu);
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.terminal-header, .terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.terminal-header h2 {
+  flex: 1;
+  font-size: 18px;
+  margin: 0;
+}
+
+.terminal-panel button, .terminal-panel a {
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: none;
+}
+
+.terminal-panel button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.terminal-panel .terminal-stop {
+  color: var(--danger);
+}
+
+.terminal-body {
+  display: flex;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  margin-top: 14px;
+}
+
+.terminal-list {
+  width: 210px;
+  flex-shrink: 0;
+  overflow: auto;
+}
+
+.terminal-list button {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.terminal-list button[aria-pressed=true] {
+  background: var(--bg-hover);
+  border-color: var(--text-secondary);
+}
+
+.terminal-list strong {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+
+.terminal-list span {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.terminal-detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.terminal-info {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22vh;
+  overflow: auto;
+}
+
+.terminal-output {
+  flex: 1;
+  min-height: 100px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 0;
+  font: 12px/1.6 var(--font-mono, monospace);
+}
+
+.terminal-notice {
+  font-size: 12px;
+  color: var(--text-secondary);
+  min-height: 18px;
+}
+
+.terminal-panel .terminal-follow {
+  font-size: 12px;
+}
+
+@media (max-width: 650px) {
+  .terminal-panel {
+    width: 100%;
+    padding: 12px;
+  }
+  .terminal-body {
+    flex-direction: column;
+  }
+  .terminal-list {
+    width: 100%;
+    max-height: 22vh;
+    display: flex;
+    gap: 6px;
+  }
+  .terminal-list button {
+    min-width: 160px;
+    width: 160px;
+  }
+  .terminal-detail {
+    min-height: 0;
+  }
+}

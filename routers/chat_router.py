@@ -205,7 +205,8 @@ async def inject_message(request: Request):
     任务运行中：把消息投递给会话 worker，生成循环在下一轮检查点（工具结果
     处理完毕后）取出并作为新一轮用户消息继续；任务未运行时返回 not_running，
     前端回退为普通发送。
-    请求体：{"session_id": str, "content": 多模态部件列表或字符串}
+    请求体：{"session_id": str, "content": 多模态部件列表或字符串,
+            "quotes": 可选引用数组, "message_id": 可选唯一 ID}
     """
     try:
         body = await request.json()
@@ -221,8 +222,20 @@ async def inject_message(request: Request):
         message_content = content
     else:
         raise HTTPException(status_code=400, detail="content 必须为非空字符串或多模态部件列表")
+    from memory.quote_format import normalize_quotes
+    try:
+        quotes = normalize_quotes((body or {}).get("quotes"), strict=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    message_id = str((body or {}).get("message_id") or "").strip()
+    if len(message_id) > 128:
+        raise HTTPException(status_code=400, detail="message_id 不能超过 128 字符")
     from factory.chat_factory import inject_user_message
-    result = await inject_user_message(session_id, {"role": "user", "content": message_content})
+    result = await inject_user_message(session_id, {
+        "role": "user", "content": message_content,
+        **({"quotes": quotes} if quotes else {}),
+        **({"message_id": message_id} if message_id else {}),
+    })
     if not result.get("ok"):
         return JSONResponse(content={"ok": False, "reason": result.get("reason", "not_running")})
     return JSONResponse(content={"ok": True})
@@ -232,8 +245,8 @@ async def inject_message(request: Request):
 async def cancel_inject_message(request: Request):
     """撤回一条尚未消费的运行中注入消息（消息引导提示行 ×）。
 
-    按文本匹配从注入队列移除；已被生成循环消费时返回 ok=False（不可撤回）。
-    请求体：{"session_id": str, "text": str}
+    优先按 ID 匹配（支持纯图片），兼容按正文匹配；已消费返回 ok=False。
+    请求体：{"session_id": str, "text": str?, "message_id": str?}
     """
     try:
         body = await request.json()
@@ -241,10 +254,11 @@ async def cancel_inject_message(request: Request):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON")
     session_id = normalize_session_id(str((body or {}).get("session_id") or "default"))
     text = str((body or {}).get("text") or "")
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="text 不能为空")
+    message_id = str((body or {}).get("message_id") or "").strip()
+    if not text.strip() and not message_id:
+        raise HTTPException(status_code=400, detail="text 或 message_id 不能为空")
     from factory.chat_factory import cancel_injected_message
-    result = await cancel_injected_message(session_id, text)
+    result = await cancel_injected_message(session_id, text, message_id=message_id)
     if not result.get("ok"):
         return JSONResponse(content={"ok": False, "reason": result.get("reason", "not_found")})
     return JSONResponse(content={"ok": True})

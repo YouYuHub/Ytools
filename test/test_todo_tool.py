@@ -231,32 +231,35 @@ class TodoApplyTests(unittest.TestCase):
         self.assertEqual(items, original)
         self.assertEqual(asyncio.run(self.manager.get_session_todo()), original)
 
-    def test_replace_todo_context_summary_terminal_state(self):
-        # 摘要终态回归：模型最后一次 todo 调用（全部 done）后，历史 todo
-        # 调用/结果被替换为摘要——终态摘要必须自带"全部完成+请汇总答复"
-        # 收官指令，否则下一轮摘要只剩一列 ✓，模型无从判断计划已结束
+    def test_replace_todo_context_retains_native_feedback_and_ids(self):
         from factory import chat_factory
+        plan = [{"id": "step-1", "content": "执行", "status": "pending"}]
+        feedback = {"message": "计划没有变化", "unchanged": True,
+                    "warnings": ["保留稳定 id"], "todos": plan}
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "t", "function": {"name": "todo_write"}}]},
+            {"role": "tool", "tool_call_id": "t", "content": json.dumps(feedback, ensure_ascii=False)},
+        ]
+        chat_factory._replace_todo_context(messages, plan)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(json.loads(messages[1]["content"]), feedback)
+        self.assertFalse(any(m.get("role") == "system" for m in messages))
 
+    def test_replace_todo_context_terminal_state_stays_in_tool_result(self):
+        from factory import chat_factory
+        plan = [{"id": "1", "content": "准备测试", "status": "done"}]
+        feedback = {"success": True, "message": "任务规划已全部完成，请汇总执行结果直接答复用户",
+                    "plan_complete": True, "todos": plan}
         messages = [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "tool_calls": [{
-                "id": "t1", "function": {"name": "todo_write", "arguments": "{}"}
-            }]},
-            {"role": "tool", "tool_call_id": "t1", "_tool_name": "todo_write", "content": "ok"},
+            {"role": "assistant", "tool_calls": [{"id": "t1", "function": {"name": "todo_write"}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": json.dumps(feedback, ensure_ascii=False)},
             {"role": "assistant", "content": "任务执行完毕"},
         ]
-        chat_factory._replace_todo_context(messages, [
-            {"content": "准备测试", "status": "done"},
-            {"content": "汇总结果", "status": "done"},
-        ])
-        # todo 调用与结果被替换，摘要追加在消息末尾（末尾指令靠近最新上下文）
-        self.assertEqual(len(messages), 3)
-        self.assertEqual(messages[1]["content"], "任务执行完毕")
-        summary = messages[2]["content"]
-        self.assertIn("任务规划已全部完成（2/2 项）", summary)
-        self.assertIn("汇总执行结果直接答复用户", summary)
-        self.assertIn("plan_complete=true", summary)
-        self.assertIn("✓ 汇总结果", summary)
+        chat_factory._replace_todo_context(messages, plan)
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(json.loads(messages[2]["content"]), feedback)
+        self.assertFalse(any(m.get("_todo_summary") for m in messages))
 
     def test_apply_session_todo_missing_id_inherits_prev(self):
         from factory import chat_factory
@@ -289,6 +292,18 @@ class TodoApplyTests(unittest.TestCase):
             self.manager, {"todos": "bad"}))
         self.assertIsNone(items)
         self.assertIn("todos 需要是对象数组", result["error"])
+        self.assertFalse(result["success"])
+
+    def test_clear_plan_reports_success_without_false_completion(self):
+        from factory import chat_factory
+
+        asyncio.run(self.manager.update_session_todo([{"id": "1", "content": "任务", "status": "pending"}]))
+        result, items = asyncio.run(chat_factory._apply_session_todo(self.manager, {"todos": []}))
+        self.assertTrue(result["success"])
+        self.assertFalse(result["plan_complete"])
+        self.assertIn("已清空", result["message"])
+        self.assertEqual(items, [])
+        self.assertEqual(asyncio.run(self.manager.get_session_todo()), [])
 
     def test_todo_sidecar_survives_meta_rewrites(self):
         """竞态回归：轮次收尾/压缩全量重写 _meta 后，todo 不得退回旧快照。
@@ -363,9 +378,9 @@ class TodoApplyTests(unittest.TestCase):
                 if message.get("tool_call_id") in pending:
                     pending.remove(message["tool_call_id"])
         self.assertEqual(pending, [])
-        # 正文保留、声明清除
+        # 正文保留，最近一次真实声明与结果完整保留
         self.assertEqual(messages[1]["content"], "我先更新计划。")
-        self.assertNotIn("tool_calls", messages[1])
+        self.assertIn("tool_calls", messages[1])
 
 
 if __name__ == "__main__":

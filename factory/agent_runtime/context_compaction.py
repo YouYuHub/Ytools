@@ -45,6 +45,7 @@ from memory.chat_history_format import (
 )
 from memory.chat_round_store import merge_usage_dict as _merge_usage_dict
 from memory.file_memory import content_part_to_text
+from .todo_runtime import latest_todo_exchanges
 # 相对导入
 from .chat_runtime import (
     estimate_messages_tokens,
@@ -1999,6 +2000,9 @@ async def compact_active_round_context_if_needed(
         message for message in active_messages
         if isinstance(message, dict) and message.get("role") == "user"
     ]
+    # 计划状态保留在真实工具返回中；把这组配对记录计入固定预算，
+    # 避免先压缩、请求前恢复计划后又把上下文推过目标。
+    preserved_todo_messages = latest_todo_exchanges(active_messages)
     if not preserved_user_messages:
         return RoundContextCompactionResult(
             messages=original_messages,
@@ -2047,6 +2051,7 @@ async def compact_active_round_context_if_needed(
         fixed_tokens = (
             estimate_send_context_tokens(retained_prefix, tool_request.tools)
             + estimate_send_context_tokens(preserved_user_messages)
+            + estimate_send_context_tokens(preserved_todo_messages)
         )
         remaining_target = max(1024, target_tokens - fixed_tokens - 64)
         summary_budget = max(1024, min(summary_budget, remaining_target))
@@ -2124,6 +2129,7 @@ async def compact_active_round_context_if_needed(
         + summary_messages
         + retained_prefix[leading_system_count:]
         + preserved_user_messages
+        + preserved_todo_messages
     )
     after_tokens = estimate_send_context_tokens(compacted_messages, tool_request.tools)
     merged_usage.update(cumulative_usage)

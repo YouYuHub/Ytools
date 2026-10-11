@@ -74,15 +74,15 @@ window.App = window.App || {};
     // 手动压缩的中止控制器：终止按钮点击时 abort 断开压缩 SSE 连接
     manualCompactAbort: null,
     // 流式期间的消息暂存：
-    // steerMessage = 消息引导（当前 SSE 流结束后立即作为新一轮发送；
-    //   同会话多次引导会以空行分隔合并为同一条消息，附件也并入该条）
+    // steerMessage = 注入不可用时的引导暂存（流结束后作为新一轮发送；
+    //   正常引导走后端检查点注入，附件先上传，按 ID 独立跟踪消费）
     // pendingQueue = 队列消息（当前任务完成后 FIFO 逐条自动发送，可累积多条）
     // 均为 { text, media } 结构；media 为待上传附件快照，空数组表示纯文本
     steerMessage: null,
     pendingQueue: [],
-    // 已提交后端、等待检查点消费的引导消息：{ sessionId, text }，
+    // 已提交后端、等待检查点消费的引导消息列表：{ id, sessionId, text, media, quotes }，
     // 在消息框上方展示；SSE message_injected（消费信号）到达时清除
-    injectedPending: null,
+    injectedPending: [],
     // 引导/队列按钮组当前展开的菜单归属："steer" | "queue" | ""（未展开）
     composerSendMode: "",
     // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，
@@ -103,9 +103,21 @@ window.App = window.App || {};
     audio: ["wav", "mp3", "m4a", "ogg", "flac"],
     video: ["mp4", "webm", "mov", "mkv"],
   };
-  // 与后端 file_factory.PARSER_BY_EXT 一致的可解析文档类型
+  // 与后端 file_factory.PARSER_BY_EXT / TEXT_FILE_EXTENSIONS 一致
   // （解析文本写入 file_memory，由后端注入系统提示词，与二进制媒体走不同通道）
-  const DOC_EXTENSIONS = ["txt", "md", "pdf", "docx", "doc", "csv", "xls", "xlsx"];
+  const DOC_EXTENSIONS = [
+    "pdf", "docx", "doc", "xls", "xlsx",
+    "txt", "md", "markdown", "rst", "log", "text", "me", "csv", "tsv", "json", "jsonl", "ndjson",
+    "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env", "gitignore", "gitattributes",
+    "editorconfig", "srt", "vtt", "ass", "tex", "bib", "html", "htm", "xhtml", "xml", "xsl", "xslt",
+    "css", "scss", "sass", "less", "styl", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "map", "svg",
+    "py", "pyi", "ipynb", "java", "kt", "kts", "scala", "groovy", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
+    "cs", "go", "rs", "swift", "m", "mm", "php", "rb", "pl", "pm", "lua", "r", "jl", "dart", "ex", "exs",
+    "erl", "hrl", "hs", "clj", "cljs", "el", "vim", "asm", "s", "f", "f90", "f95", "for", "pas", "d", "nim",
+    "zig", "v", "sol", "tcl", "awk", "sed", "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", "sql",
+    "graphql", "gql", "proto", "thrift", "cmake", "make", "mk", "gradle", "dockerfile", "containerfile",
+    "tf", "tfvars", "hcl", "nix", "diff", "patch", "po", "pot", "strings", "pem", "crt", "cer", "key", "pub", "asc", "lic", "license",
+  ];
   const MAX_DOC_FILE_SIZE = 10 * 1024 * 1024;
 
   function docKindOf(filename) {

@@ -16,6 +16,17 @@ def fetch(raw, mode='text', **kwargs):
 
 
 class FetchTests(unittest.TestCase):
+    def test_selector_union_in_source_order_without_overlapping_duplicates(self):
+        html = '<h2>标题</h2><div id=main><p>内部正文</p></div><p>末尾正文</p>'
+        result = fetch(html, 'tag', tag='p, h2, div#main, p')
+        self.assertTrue(result.endswith('标题\n----\n内部正文\n----\n末尾正文'))
+        self.assertEqual(result.count('内部正文'), 1)
+
+    def test_selector_union_rejects_empty_or_complex_selector(self):
+        for tag in ('p,', 'p, div > span', ',p', ','.join(['p'] * 21)):
+            with self.assertRaises(ValueError):
+                s._extract_tag_blocks('<p>正文</p>', tag)
+
     def test_real_nested_element_not_script_string(self):
         html = '<script>"<div id=main>假内容</div>"</script><div id=main class="one two">前<div>嵌套</div>后<script>假正文</script><style>假样式</style></div>'
         result = fetch(html, 'tag', tag='div#main.two')
@@ -99,6 +110,40 @@ class SearchTests(unittest.TestCase):
         with patch.object(s, '_http_request', return_value=('', 200, 'text/html', html.encode())):
             items = s._fetch_ddg_results('python', 20)
         self.assertEqual(items, [('Python 文档', 'https://example.org/?q=a%26b', 'Python 示例')])
+
+    def test_ddg_lite_fallback_parses_title_and_snippet(self):
+        html = '<a class="result-link other" href="https://docs.python.org/3.13/whatsnew/3.13.html">Python 3.13</a><td class="result-snippet">新特性 <b>说明</b></td>'
+        with patch.object(s, '_http_request', side_effect=[
+            ('', 202, 'text/html', b'challenge'), ('', 200, 'text/html', html.encode())
+        ]) as http:
+            items = s._fetch_ddg_results('Python 3.13 新特性', 20)
+        self.assertEqual(items[0][2], '新特性 说明')
+        self.assertEqual(http.call_count, 2)
+        self.assertIn('lite.duckduckgo.com', http.call_args.args[0])
+
+    def test_version_and_year_are_exact_ranking_priorities(self):
+        pool = [('Python Python docs download', 'https://python.org/docs/', 'Python download'),
+                ('Python 3.130', 'https://example.org/3.130', '2026'),
+                ('Release notes', 'https://example.org/3.13/', '2026 changes')]
+        ranked = s._relevance_rank(pool, 'Python 3.13 2026 新特性', 3)
+        self.assertEqual(ranked[0], pool[2])
+        self.assertFalse(s._entity_in_text('3.13', '3.130'))
+        self.assertFalse(s._entity_in_text('2026', '12026'))
+
+    def test_missing_version_warns_instead_of_claiming_precise_results(self):
+        pool = [('Python', 'https://python.org/', 'Python general information')]
+        with patch.object(s, '_fetch_bing_results', return_value=pool), patch.object(s, '_fetch_ddg_results', side_effect=ValueError('验证码')):
+            result = s._web_search_impl('Python 3.13 新特性', 5)
+        self.assertIn('结果未完整匹配', result)
+        self.assertIn('DuckDuckGo', result)
+
+    def test_full_bing_pool_does_not_exclude_specific_ddg_result(self):
+        pool = [('Python', f'https://example.org/{i}', 'general') for i in range(s._WEB_SEARCH_MAX_RESULTS * 3)]
+        precise = ('Python 3.13 新特性', 'https://docs.python.org/3.13/whatsnew/3.13.html', '介绍')
+        with patch.object(s, '_fetch_bing_results', return_value=pool), patch.object(s, '_fetch_ddg_results', return_value=[precise]):
+            result = s._web_search_impl('Python 3.13 新特性 介绍', 1)
+        self.assertIn(precise[1], result)
+        self.assertNotIn('https://example.org/0', result)
 
     def test_challenge_is_failure_not_zero_results(self):
         with patch.object(s, '_http_request', return_value=('', 202, 'text/html', b'<h1>Verify you are human</h1>')):

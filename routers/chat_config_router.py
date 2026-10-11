@@ -737,7 +737,7 @@ def _sub_agent_retry_config_payload() -> dict:
                 "0_or_negative": "不限制（仍受已启用的轮次/超时限制约束）",
             },
             "todo_remind_max": {
-                "positive": "收尾时 todo 未完成最多提醒 N 次（每次完整工具执行轮后额度重置）",
+                "positive": "收尾时 todo 未完成最多提醒 N 次（成功执行其他工具后额度重置，单纯更新计划不重置）",
                 "0": "关闭提醒（收尾即结束）",
                 "negative": "不限制提醒（仍受已启用的轮次/超时限制约束）",
             },
@@ -762,7 +762,7 @@ async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
 
     - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次子任务立即生效
     - final_reply / stream_error：0 或负数=不限制（仍受已启用的轮次/超时限制约束）
-    - todo_remind_max：0=关闭提醒，负数=不限制，正数=每工具轮后额度重置的提醒次数
+    - todo_remind_max：0=关闭提醒，负数=不限制，正数=成功执行其他工具后额度重置的提醒次数（单纯更新计划不重置）
     """
     update_env = {
         env_name: _parse_sub_agent_retry_value(
@@ -1193,7 +1193,9 @@ async def list_chat_models(role: str = "chat_model", session_id: str | None = No
     （compaction_model / sub_agent_model 只列 chat-completions 协议）。
 
     查询参数 `session_id`（可选）：携带时按「会话覆盖 → 全局默认」解析该会话的
-    生效模型选择，`role_info` 展示会话生效结果并附加 `is_overridden`；响应额外
+    生效模型选择，`role_info` 展示会话生效结果并附加 `is_overridden`（有效覆盖）
+    与 `selection_invalid`（失效覆盖）；GET 只读，失效回退在开始生成时固化。
+    响应额外
     返回 `session_selection`（会话覆盖值，未设置为 null）、`effective_selection`
     （全角色合并结果）与 `warning`（失效覆盖回退提示）。
 
@@ -1232,7 +1234,12 @@ async def list_chat_models(role: str = "chat_model", session_id: str | None = No
         } if override is not None else {}
         ambient_token = set_ambient_model_selection(effective_selection)
         try:
-            payload["role_info"] = _role_info_payload(role, is_overridden=bool(override_valid.get(role)))
+            role_override = override_valid.get(role)
+            selection_invalid = bool(role_override and env_manager.get_model_config(
+                role_override["ownership_name"], role_override["model_name"]
+            ) is None)
+            payload["role_info"] = _role_info_payload(role, is_overridden=bool(role_override) and not selection_invalid)
+            payload["role_info"]["selection_invalid"] = selection_invalid
         finally:
             reset_ambient_model_selection(ambient_token)
         payload.update({
@@ -1246,7 +1253,7 @@ async def list_chat_models(role: str = "chat_model", session_id: str | None = No
 
 @api_chat_config_router.post("/chat_config/models/select")
 async def select_active_chat_model(payload: ChatModelSelection):
-    """选择三种模型（chat/compaction/title）并配置参数。
+    """选择四种模型（chat/compaction/title/sub_agent）并配置参数。
 
     - 不携带 session_id（全局默认）：写入 models.json 顶层 `model_selection.<role>`
       （含 parameter），并同步内存，实时生效；
@@ -1255,7 +1262,7 @@ async def select_active_chat_model(payload: ChatModelSelection):
     - 先校验 models.json 目录中存在该组合（compaction_model 必须为 chat-completions 协议）
     - 不再写 .env 的 CHAT_OWNERSHIP_NANE / CHAT_MODEL_NAME
     - parameter 为全量替换语义；不传表示仅切换模型、参数保持不变
-      （会话级未传时：已有会话覆盖沿用其参数，首次覆盖沿用全局该角色的参数）
+      （会话级未传时：有效会话覆盖沿用其参数，首次/失效覆盖沿用全局该角色的参数）
     - 向后兼容：只传 provider/model（无 role/parameter）时等价于 role=chat_model 且参数不变
     """
     if payload.session_id and str(payload.session_id).strip():
@@ -1275,12 +1282,19 @@ async def select_active_chat_model(payload: ChatModelSelection):
                 message = f"会话 [{session_id}] {payload.role} 已恢复跟随全局默认模型"
             else:
                 existing = (await manager.get_session_model_selection()) or {}
-                inherit = (existing.get(payload.role) or {}).get("parameter")
+                existing_entry = existing.get(payload.role) or {}
+                # 失效覆盖展示的是全局回退值；保存同一模型时也应沿用展示的
+                # 生效参数/请求头，不能重新带入旧模型的隐藏参数。
+                if existing_entry and env_manager.get_model_config(
+                    existing_entry.get("ownership_name"), existing_entry.get("model_name")
+                ) is None:
+                    existing_entry = {}
+                inherit = existing_entry.get("parameter")
                 if inherit is None:
                     inherit = (env_manager.get_global_model_selection().get(payload.role) or {}).get("parameter")
                 # headers 沿用与 parameter 同一套继承语义：未传时沿用现有
                 # （会话级优先，否则全局该角色的），提供时全量替换（[] 清空）
-                inherit_headers = (existing.get(payload.role) or {}).get("headers")
+                inherit_headers = existing_entry.get("headers")
                 if inherit_headers is None:
                     inherit_headers = (env_manager.get_global_model_selection().get(payload.role) or {}).get("headers")
                 entry = build_model_selection_entry(

@@ -405,30 +405,33 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                     # 运行中注入用户消息（消息引导）：投递到当前适配器队列，
                     # 生成循环在下一轮检查点取出并作为新一轮继续
                     message = raw.get("message")
-                    if adapter is not None and isinstance(message, dict):
+                    if (adapter is not None and not adapter.done and current_task is not None
+                            and not current_task.done() and isinstance(message, dict)):
                         adapter.injected_messages.put(message)
-                        evt_queue.put({"type": "injected", "ok": True})
+                        evt_queue.put({"type": "injected", "ok": True, "request_id": raw.get("request_id")})
                     else:
-                        evt_queue.put({"type": "injected", "ok": False})
+                        evt_queue.put({"type": "injected", "ok": False, "request_id": raw.get("request_id")})
                 elif ctype == "cancel_inject":
                     # 撤回尚未消费的注入消息（前端提示行 ×）：按文本匹配移除
                     # 一条；已被生成循环取走（已消费）时回报 ok=False
                     target = str(raw.get("text") or "").strip()
+                    message_id = str(raw.get("message_id") or "").strip()
                     removed = False
-                    if adapter is not None and target:
+                    if adapter is not None and (target or message_id):
                         kept = []
                         while True:
                             try:
                                 item = adapter.injected_messages.get_nowait()
                             except queue.Empty:
                                 break
-                            if not removed and _injected_content_text(item) == target:
+                            matches = item.get("message_id") == message_id if message_id else _injected_content_text(item) == target
+                            if not removed and matches:
                                 removed = True
                                 continue
                             kept.append(item)
                         for item in kept:
                             adapter.injected_messages.put(item)
-                    evt_queue.put({"type": "injected_cancelled", "ok": removed})
+                    evt_queue.put({"type": "injected_cancelled", "ok": removed, "request_id": raw.get("request_id")})
                 elif ctype == "stop_sub_agent":
                     from factory.agent_runtime.sub_agent import request_sub_agent_stop
                     ok = request_sub_agent_stop(session_id, str(raw.get("agent_id") or ""))
@@ -677,16 +680,16 @@ class SessionWorkerProxy:
     def request_sub_agent_stop(self, agent_id: str, request_id: str) -> bool:
         return self._send({"type": "stop_sub_agent", "agent_id": agent_id, "request_id": request_id})
 
-    def inject_message(self, message: dict) -> bool:
+    def inject_message(self, message: dict, *, request_id: str = "") -> bool:
         """向运行中的生成任务注入一条用户消息（消息引导）。
 
         worker 未运行或无活动任务时返回 False（调用方回退为普通发送）。
         """
         if not self.is_alive() or not self.is_generation_running():
             return False
-        return self._send({"type": "inject", "message": message or {}})
+        return self._send({"type": "inject", "message": message or {}, "request_id": request_id})
 
-    def cancel_injected_message(self, text: str) -> bool:
+    def cancel_injected_message(self, text: str, *, message_id: str = "", request_id: str = "") -> bool:
         """撤回一条尚未消费的注入消息（按文本匹配）。
 
         发送即视为已受理（worker 内部按匹配结果移除）；worker 未运行或
@@ -694,7 +697,7 @@ class SessionWorkerProxy:
         """
         if not self.is_alive() or not self.is_generation_running():
             return False
-        return self._send({"type": "cancel_inject", "text": text})
+        return self._send({"type": "cancel_inject", "text": text, "message_id": message_id, "request_id": request_id})
 
     def shutdown(self, timeout: float = 8.0) -> None:
         """优雅关停：通知 worker 收尾后回收进程。"""

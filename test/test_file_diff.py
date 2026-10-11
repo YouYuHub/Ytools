@@ -152,6 +152,7 @@ def test_edit_file_result_contains_diff(tmp_path):
         "new_start_line": 1, "new_end_line": 1,
     }
     assert summary["diff_omitted_reason"] == "duplicates_edit_request"
+    assert "编辑成功" in summary["message"] and "已省略" in summary["message"]
     assert "_file_diff" in result and "diff" not in summary
 
 

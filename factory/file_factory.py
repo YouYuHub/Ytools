@@ -28,7 +28,6 @@ except Exception:
 # DOCX
 try:
     import docx
-    from docx import Document
 except Exception:
     docx = None
 
@@ -127,91 +126,19 @@ def _parse_pdf_with_pages(data: bytes) -> List[Dict]:
 
 
 def _parse_docx(data: bytes) -> str:
-    """
-    使用 python-docx 解析 DOCX 文件并提取所有文本
-    参数:
-        data: DOCX 文件的二进制数据
-    返回:
-        提取的完整文本内容 (已过滤控制字符)
-    异常:
-        RuntimeError: 当 python-docx 不可用时抛出
-    """
+    """解析 DOCX 正文：按原始顺序保留段落、Markdown 表格及嵌套表格。"""
     if docx is None:
         raise RuntimeError('python-docx not installed or unavailable')
     try:
-        with io.BytesIO(data) as bio:
-            doc = Document(bio)
-            texts = []
-            # 遍历所有段落提取文本
-            for p in doc.paragraphs:
-                try:
-                    # 获取段落文本
-                    para_text = p.text
-                    # 确保是字符串类型
-                    if para_text:
-                        # 过滤控制字符 (保留换行符和制表符)
-                        cleaned_text = ''.join(
-                            char for char in para_text 
-                            if ord(char) >= 32 or char in '\n\r\t'
-                        )
-                        # 只添加非空文本
-                        if cleaned_text.strip():
-                            texts.append(cleaned_text.strip())
-                except Exception as e:
-                    # 跳过有问题的段落
-                    logger.warning(f"警告：跳过段落解析错误 - {e}")
-                    continue
-            # 合并所有文本
-            return "\n\n".join(texts) if texts else ""
-    except Exception as e:
-        raise RuntimeError(f'DOCX 解析失败：{str(e)}')
+        from factory.word_document import extract_docx
+        return extract_docx(data)
+    except Exception as exc:
+        raise RuntimeError(f'DOCX 解析失败：{exc}') from exc
 
 
 def _parse_docx_with_pages(data: bytes) -> List[Dict]:
-    """
-    解析 DOCX 文件 (DOCX 本身没有页码概念，返回 None)
-    参数:
-        data: DOCX 文件的二进制数据
-    返回:
-        字典列表，每个字典包含:
-        - content: 文本内容 (已过滤控制字符)
-        - page_number: None (DOCX 无页码概念)
-    说明:
-        DOCX 文件没有物理页面概念，返回整个文档内容作为单个"页面"
-        已添加控制字符过滤，避免乱码问题
-    """
-    if docx is None:
-        raise RuntimeError('python-docx not installed or unavailable')
-    try:
-        with io.BytesIO(data) as bio:
-            doc = Document(bio)
-            texts = []
-            # 遍历所有段落提取文本
-            for p in doc.paragraphs:
-                try:
-                    para_text = p.text
-                    if para_text:
-                        # 过滤控制字符 (保留换行符和制表符)
-                        cleaned_text = ''.join(
-                            char for char in para_text 
-                            if ord(char) >= 32 or char in '\n\r\t'
-                        )
-                        if cleaned_text.strip():
-                            texts.append(cleaned_text.strip())
-                except Exception as e:
-                    logger.warning(f"警告：跳过段落解析错误 - {e}")
-                    continue
-            # 合并所有文本
-            content = "\n\n".join(texts) if texts else ""
-            # DOCX 文件没有页码概念，返回 None
-            return [{"content": content, "page_number": None}]
-    except Exception as e:
-        logger.warning(f"DOCX 分页解析失败：{e}，回退到简单模式")
-        try:
-            content = _parse_docx(data)
-            return [{"content": content, "page_number": None}]
-        except Exception:
-            return [{"content": "", "page_number": None}]
+    """DOCX 没有可靠物理页码，复用完整正文解析器，不遗漏表格。"""
+    return [{"content": _parse_docx(data), "page_number": None}]
 
 
 def _parse_doc(data: bytes) -> str:
@@ -294,15 +221,10 @@ def _parse_doc_with_pages(data: bytes) -> List[Dict]:
 
 
 def _parse_csv(data: bytes) -> str:
-    if pd is None:
-        raise RuntimeError('pandas not installed')
+    # CSV 本身就是结构化文本；保留首行、引号、空单元格与换行，避免推断
+    # header 后丢失表头，或把无表头文件的首条数据当作列名。
     text, _encoding = decode_text_bytes(data)
-    with io.StringIO(text) as bio:
-        df = pd.read_csv(bio, dtype=str, engine='python')
-        texts = []
-        for r in df.fillna('').astype(str).values:
-            texts.append(' '.join(r.tolist()))
-        return '\n'.join(texts)
+    return text
 
 
 def _parse_csv_with_pages(data: bytes) -> List[Dict]:
@@ -315,40 +237,17 @@ def _parse_csv_with_pages(data: bytes) -> List[Dict]:
 
 
 def _parse_excel(data: bytes) -> str:
-    if pd is None:
-        raise RuntimeError('pandas not installed')
-    with io.BytesIO(data) as bio:
-        bio.seek(0)
-        df = pd.read_excel(bio, sheet_name=None)
-        texts = []
-        for sheet, frame in df.items():
-            texts.append(f"Sheet: {sheet}")
-            for r in frame.fillna('').astype(str).values:
-                texts.append(' '.join(r.tolist()))
-        return '\n'.join(texts)
+    return "\n\n".join(page["content"] for page in _parse_excel_with_pages(data))
 
 
 def _parse_excel_with_pages(data: bytes) -> List[Dict]:
-    """
-    解析 Excel 文件，每个 sheet 作为一个"页面"
-    返回：包含 content 和 page_number 的字典列表
-    """
-    if pd is None:
-        raise RuntimeError('pandas not installed')
-    with io.BytesIO(data) as bio:
-        bio.seek(0)
-        df = pd.read_excel(bio, sheet_name=None)
-        pages = []
-        for i, (sheet, frame) in enumerate(df.items()):
-            texts = []
-            for r in frame.fillna('').astype(str).values:
-                texts.append(' '.join(r.tolist()))
-            content = f"Sheet: {sheet}\n" + '\n'.join(texts)
-            pages.append({
-                "content": content,
-                "page_number": i + 1  # 使用 sheet 索引作为页码
-            })
-        return pages if pages else [{"content": "", "page_number": None}]
+    """Preserve the first row and cell boundaries; each sheet is a Markdown table."""
+    from factory.table_document import parse_table, markdown_sheets
+    # XLS is an OLE compound file; XLSX is a ZIP archive.
+    filename = "document.xlsx" if data.startswith(b"PK") else "document.xls"
+    document = parse_table(filename, data)
+    return [{"content": content, "page_number": index}
+            for index, content in enumerate(markdown_sheets(document), 1)]
 
 
 def _parse_txt_with_pages(data: bytes, encoding: Optional[str] = 'utf-8') -> List[Dict]:
@@ -521,6 +420,9 @@ def extract_pages_from_bytes(filename: str, data: bytes) -> List[Dict]:
         return parser(data)
     except Exception as e:
         logger.warning(f"文件解析失败：{filename}, 错误：{e}")
+        # DOCX 是 ZIP/XML 二进制容器，不能把损坏或超限的文件解码成伪正文。
+        if os.path.splitext(filename.lower())[1] == '.docx':
+            raise
         # 尝试回退到简单文本解析
         try:
             text = _parse_txt(data)

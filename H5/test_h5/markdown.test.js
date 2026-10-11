@@ -10,6 +10,131 @@ try {
 } catch (_) { /* 无 katex：降级路径 */ }
 const Markdown = require(path.join(__dirname, "..", "js", "markdown.js"));
 
+// ---------- 代码围栏（历史消息 / 流式内容共用解析器） ----------
+
+function renderedCode(html) {
+  return Array.from(html.matchAll(/<pre><code(?: class="[^"]*")?>([\s\S]*?)<\/code><\/pre>/g),
+    match => Markdown.unescapeHtml(match[1]));
+}
+
+test("render: 代码围栏支持 0–3 空格缩进并保留源码自己的缩进", function () {
+  for (let indent = 0; indent <= 3; indent++) {
+    const prefix = " ".repeat(indent);
+    const html = Markdown.render("说明\n" + prefix + "```python\n" + prefix +
+      "if True:\n" + prefix + "    print('中文')\n\n" + prefix + "```\n结束");
+    assert.deepStrictEqual(renderedCode(html), ["if True:\n    print('中文')\n"], html);
+    assert.ok(html.includes('class="language-python"'), html);
+    assert.ok(html.endsWith("<p>结束</p></div>"), html);
+    assert.ok(!html.includes("```"), html);
+  }
+});
+
+test("render: Word 复测报告中列表下的缩进代码块完整显示且保留列表归属", function () {
+  const table = "[表格 1]\n| 原始行号 | 列 1 | 列 2 | 列 3 |\n" +
+    "| 1 | 姓名 | 分数 | 评价 |\n| 2 | Alice | 95 | 优秀 |\n| 3 | Bob | 87 | 良好 |";
+  const src = "- ✅ **Word 表格提取——修复成功！** 以下是返回结果：\n  ```\n" +
+    table.split("\n").map(line => "  " + line).join("\n") + "\n  ```\n- 下一项测试";
+  const html = Markdown.render(src);
+  assert.deepStrictEqual(renderedCode(html), [table], html);
+  assert.strictEqual((html.match(/<ul>/g) || []).length, 1, html);
+  assert.ok(html.includes('以下是返回结果：<div class="codeblock">'), html);
+  assert.ok(html.endsWith("</div></li><li>下一项测试</li></ul></div>"), html);
+  assert.ok(html.includes('class="copy-btn"'), html);
+  // 围栏中的表格示例保持源码，不进行第二次 Markdown 转换。
+  assert.ok(!html.includes("<table>"), html);
+  assert.ok(!html.includes("```"), html);
+});
+
+test("render: 有序列表代码块允许空行且不会中断后续编号", function () {
+  const html = Markdown.render("1. 执行命令\n\n   ```sh\n   echo hello\n   ```\n2. 验证结果");
+  assert.deepStrictEqual(renderedCode(html), ["echo hello"], html);
+  assert.strictEqual((html.match(/<ol>/g) || []).length, 1, html);
+  assert.ok(html.endsWith("</div></li><li>验证结果</li></ol></div>"), html);
+});
+
+test("render: 波浪线和长反引号围栏支持代码中嵌套 Markdown 示例", function () {
+  for (const marker of ["~~~~", "````"]) {
+    const source = "```python\nprint(1)\n```";
+    const html = Markdown.render(marker + "markdown\n" + source + "\n" + marker);
+    assert.deepStrictEqual(renderedCode(html), [source], html);
+    assert.strictEqual((html.match(/class="codeblock"/g) || []).length, 1, html);
+  }
+});
+
+test("render: 闭合围栏必须字符一致、长度足够且后面没有正文", function () {
+  const body = "first\n```\n~~~\n````not-a-close\nlast";
+  const html = Markdown.render("````text\n" + body + "\n `````  \n后续段落");
+  assert.deepStrictEqual(renderedCode(html), [body], html);
+  assert.ok(html.endsWith("<p>后续段落</p></div>"), html);
+});
+
+test("render: CRLF 和语言后的附加信息不影响代码块与语言识别", function () {
+  const html = Markdown.render("  ```javascript title=example\r\n  const n = 1;\r\n  ```\r\n后续");
+  assert.deepStrictEqual(renderedCode(html), ["const n = 1;"], html);
+  assert.ok(html.includes('class="language-javascript"'), html);
+  assert.ok(html.includes('class="codeblock-lang">javascript</span>'), html);
+  assert.ok(html.endsWith("<p>后续</p></div>"), html);
+});
+
+test("render: 普通代码块内的媒体标签、公式和表格原样保留", function () {
+  const code = '<image src="a.png"/>\n<video src="b.mp4"></video>\n' +
+    "$$x^2$$ $y_1$ \\(z_2\\)\n| a | b |\n|---|---|\n| 1 | 2 |\n**bold**";
+  const html = Markdown.render("  ~~~text\n" + code.split("\n").map(line => "  " + line).join("\n") + "\n  ~~~");
+  assert.deepStrictEqual(renderedCode(html), [code], html);
+  assert.ok(!html.includes("md-media"), html);
+  assert.ok(!html.includes("md-math"), html);
+  assert.ok(!html.includes("<table>"), html);
+  assert.ok(!html.includes("<strong>"), html);
+});
+
+test("render: 前面的跨行公式不会改变后续代码块的位置或丢失内容", function () {
+  const src = "$$\nx^2\n$$\n\n```text\nfirst\n\nend\n```\n" +
+    "\\[\ny_1\n\\]\n\n~~~python\nprint(2)\n~~~\n最后一段";
+  const html = Markdown.render(src);
+  assert.deepStrictEqual(renderedCode(html), ["first\n\nend", "print(2)"], html);
+  assert.strictEqual((html.match(/class="md-math md-math-display"/g) || []).length, 2, html);
+  assert.ok(html.indexOf("md-math-display") < html.indexOf("class=\"codeblock\""), html);
+  assert.ok(html.endsWith("<p>最后一段</p></div>"), html);
+});
+
+test("render: 跨越代码块的未闭合公式或媒体标签不能吞掉代码块", function () {
+  for (const [open, close] of [["$$", "$$"], ["\\[", "\\]"], ["\\(", "\\)"],
+    ['<image src="a.png">', "</image>"]]) {
+    const html = Markdown.render(open + "\n```text\ncode\n```\n" + close);
+    assert.deepStrictEqual(renderedCode(html), ["code"], html);
+    assert.ok(!html.includes("md-math"), html);
+    assert.ok(!html.includes("md-media"), html);
+  }
+});
+
+test("render: 流式缩进围栏在半截闭合时不丢失内容，完整闭合后恢复正文", function () {
+  const prefix = "段落\n  ```text\n  first\n  second\n";
+  for (const suffix of ["", "  `", "  ``"]) {
+    const html = Markdown.render(prefix + suffix);
+    assert.deepStrictEqual(renderedCode(html), ["first\nsecond\n" + suffix.trimStart()], html);
+  }
+  const html = Markdown.render(prefix + "  ```\n之后的段落");
+  assert.deepStrictEqual(renderedCode(html), ["first\nsecond"], html);
+  assert.ok(html.endsWith("<p>之后的段落</p></div>"), html);
+});
+
+test("render: 缩进的图表围栏仍在完整闭合后升级为原有控件", function () {
+  for (const [lang, code] of [["svg", '<svg viewBox="0 0 10 10"><rect width="10" height="10"/></svg>'],
+    ["mermaid", "graph TD\nA --> B"], ["canvas", "console.log(1);"]]) {
+    const prefix = "  ~~~" + lang + "\n" + code.split("\n").map(line => "  " + line).join("\n");
+    const streaming = Markdown.render(prefix);
+    assert.deepStrictEqual(renderedCode(streaming), [code], streaming);
+    assert.ok(!streaming.includes("md-svg-block"), streaming);
+    const complete = Markdown.render(prefix + "\n  ~~~");
+    assert.ok(complete.includes('data-svg-kind="' + lang + '"'), complete);
+    assert.ok(!complete.includes('class="codeblock"'), complete);
+  }
+});
+
+test("render: 非法的代码占位文本不导致解析异常", function () {
+  assert.doesNotThrow(() => Markdown.render("\u0004999\u0004"));
+});
+
 test("render: 表格单元格内的行内代码竖线不再切断分列", function () {
   const src = [
     "| # | 命令 | 结果 |",

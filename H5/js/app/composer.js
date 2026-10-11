@@ -154,48 +154,48 @@
       renderPendingOutbox();
       return;
     }
-    // 消息引导：纯文本走后端注入接口（下一轮检查点立即生效）；
-    // 多次引导按「空行分隔」合并为同一条用户消息，消费后只发送一次；
-    // 带附件/引用或注入不可用时回退本地暂存（流结束后作为一条消息派发）
+    // 文本、图片等媒体和引用都走检查点注入，逐条消费，避免合并与撤回之间的竞态。
     let injected = false;
-    if (!mediaSnapshot.length && !quoteSnapshot.length && state.sessionId) {
-      // 已有同会话待注入消息：把新输入拼接进去，消费时作为一条完整消息注入
-      const pending = state.injectedPending;
-      const hasPending = Boolean(pending && pending.sessionId === state.sessionId && pending.text);
-      const mergedText = hasPending ? pending.text + "\n\n" + text : text;
+    if (message.sessionId) {
+      message.id = "steer_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
       try {
-        const res = await API.injectMessage(state.sessionId, mergedText);
+        const payload = await App.prepareSteerContent(message);
+        // 先登记，再提交接口：SSE 消费事件可能先于 HTTP 响应到达。
+        state.injectedPending.push(message);
+        renderPendingOutbox();
+        const res = await API.injectMessage(message.sessionId, payload.content, {
+          quotes: payload.quotes, messageId: message.id,
+        });
         if (res && res.ok) {
-          if (hasPending) {
-            // 后端队列里的旧消息已被合并版取代：撤回旧的避免同内容重复注入
-            try { await API.cancelInjectMessage(state.sessionId, pending.text); } catch (_) { /* 撤回失败仅可能瞬时双条，下次检查点逐条消费不丢失 */ }
-          }
-          // 气泡等后端 SSE message_injected 事件（检查点消费）再插入
-          state.injectedPending = { sessionId: state.sessionId, text: mergedText };
-          renderPendingOutbox();
-          toast(hasPending
-            ? "引导内容已合并（空行分隔），消费时作为一条用户消息注入"
-            : "已注入为下一轮用户消息，模型将在本轮工具结果处理后看到");
+          toast("已提交引导，模型将在下一次请求前看到正文与附件");
           injected = true;
         }
-        // 任务未运行/注入失败：回退本地暂存（流结束后派发）
-      } catch (_) { /* 网络异常同样回退暂存 */ }
+      } catch (err) {
+        toast("引导提交失败：" + err.message + "；消息已保留供重试");
+      }
+      if (!injected) {
+        state.injectedPending = state.injectedPending.filter(function (m) { return m !== message; });
+      }
     }
-    if (injected) return;
+    if (injected) { renderPendingOutbox(); return; }
     // 本地暂存合并：同会话已有引导未派发时，新输入以空行拼进同一条、附件与
     // 引用一并并入（引用卡片按添加顺序拼接）
-    const prevSteer = (state.steerMessage && state.steerMessage.sessionId === state.sessionId)
+    const prevSteer = (state.steerMessage && state.steerMessage.sessionId === message.sessionId)
       ? state.steerMessage : null;
     state.steerMessage = {
       text: prevSteer && prevSteer.text ? prevSteer.text + "\n\n" + text : text,
       media: (prevSteer && prevSteer.media ? prevSteer.media : []).concat(mediaSnapshot),
       quotes: (prevSteer && prevSteer.quotes ? prevSteer.quotes : []).concat(quoteSnapshot),
-      sessionId: state.sessionId,
+      sessionId: message.sessionId,
     };
     toast(prevSteer
       ? "引导内容已合并（空行分隔），当前回复结束后一起发送"
       : "已设为消息引导，当前回复结束后立即发送");
     renderPendingOutbox();
+    // 上传期间任务可能已结束；此时立即走普通发送，不等下一次任务结束事件。
+    if (!state.streaming || state.streamingSession !== message.sessionId) {
+      await flushPendingMessages(message.sessionId);
+    }
   }
 
   /** 暂存指示器：仅显示属于当前会话的引导/队列条目，可移除并放回输入框。 */
@@ -210,7 +210,8 @@
         rows.push({ kind: "queue", label: "队列 " + (i + 1), message: m });
       }
     });
-    if (!rows.length && !state.injectedPending) {
+    const injectedHere = state.injectedPending.filter(function (m) { return m.sessionId === state.sessionId; });
+    if (!rows.length && !injectedHere.length) {
       pendingOutbox.classList.add("hidden");
       composer.classList.remove("has-outbox");
       return;
@@ -286,37 +287,35 @@
       item.appendChild(remove);
       pendingOutbox.appendChild(item);
     });
-    // 已提交后端、等待检查点消费的引导消息：可点 × 撤回（从后端注入
-    // 队列移除）并放回输入框最前；已被消费时后端拒绝，仅提示
-    if (state.injectedPending && state.injectedPending.sessionId === state.sessionId) {
+    // 以 ID 跟踪多条待消费消息，纯图片也能撤回，同文本消息互不混淆。
+    injectedHere.forEach(function (pending) {
       const item = el("div", "pending-outbox-item injected");
-      item.title = "已提交后端，将在本轮工具结果处理后注入上下文";
+      item.title = "已提交后端，将在下一次模型请求前注入上下文";
       item.appendChild(el("span", "pending-outbox-badge", "引导"));
-      item.appendChild(el("span", "pending-outbox-text", (state.injectedPending.text || "").trim() || "[图片/附件]"));
+      item.appendChild(el("span", "pending-outbox-text", (pending.text || "").trim() || "[图片/附件]"));
+      if (pending.media.length) item.appendChild(el("span", "pending-outbox-quotes", "附件 " + pending.media.length));
+      if (pending.quotes.length) item.appendChild(el("span", "pending-outbox-quotes", "引用 " + pending.quotes.length));
       const remove = el("button", "pending-outbox-remove", "×");
       remove.type = "button";
       remove.title = "撤回并放回输入框修改";
       remove.addEventListener("click", async function () {
-        const pending = state.injectedPending;
-        if (!pending) return;
         let cancelled = false;
         try {
-          const res = await API.cancelInjectMessage(pending.sessionId, pending.text);
+          const res = await API.cancelInjectMessage(pending.sessionId, pending.text, pending.id);
           cancelled = Boolean(res && res.ok);
         } catch (_) { /* 网络异常按撤回失败处理 */ }
         if (!cancelled) {
           toast("引导消息已被模型消费（或后端不可达），无法撤回");
           return;
         }
-        if (state.injectedPending === pending) {
-          state.injectedPending = null;
-          prependToInput(pending.text);
-          renderPendingOutbox();
+        if (state.injectedPending.includes(pending)) {
+          state.injectedPending = state.injectedPending.filter(function (m) { return m !== pending; });
+          cancelPendingMessage({ kind: "injected", message: pending });
         }
       });
       item.appendChild(remove);
       pendingOutbox.appendChild(item);
-    }
+    });
     pendingOutbox.classList.remove("hidden");
     composer.classList.add("has-outbox");
   }
@@ -330,11 +329,15 @@
 
   // 注入消费信号（chat.js 收到 message_injected SSE 时调用）：
   // 清除待注入提示；气泡由 chat.js 在该时机插入消息流正确位置
-  App.clearInjectedPending = function (sessionId) {
-    const pending = state.injectedPending;
-    if (!pending) return;
-    if (sessionId && pending.sessionId !== sessionId) return;
-    state.injectedPending = null;
+  App.clearInjectedPending = function (sessionId, messageId) {
+    const index = state.injectedPending.findIndex(function (pending) {
+      return (!sessionId || pending.sessionId === sessionId) && (!messageId || pending.id === messageId);
+    });
+    if (index < 0) return;
+    const pending = state.injectedPending.splice(index, 1)[0];
+    (pending.media || []).forEach(function (item) {
+      if (item.objUrl) { try { URL.revokeObjectURL(item.objUrl); } catch (_) {} item.objUrl = ""; }
+    });
     renderPendingOutbox();
   };
 
@@ -496,10 +499,14 @@
   });
 
   // ---------- 语音输入（Web Speech API，Chrome / Edge） ----------
-  // 点麦克风开始识别，识别文本实时写入输入框：以点击时的光标为插入点，
-  // 确认结果累积拼接、中间结果实时替换预览；再点麦克风（或切会话）停止。
-  // Chrome 的连续模式在长静默后会自动断开，未手动停止且无致命错误时自动
-  // 重启识别会话；连续空周期有限重试，避免无声时无限请求。
+  // 点麦克风开始听写，识别文本实时写入输入框：以点击时的光标为插入点，
+  // 当前周期的结果快照全量重建（final + interim 实时预览）、跨周期文本累积拼接。
+  // 持续监听直到用户点击停止或发送消息：Chrome 的连续模式在长静默/服务端
+  // 策略下会自行结束会话（onend），未手动停止时自动重启（短延迟续听、静默/
+  // 网络异常指数退避），静默期不会停止听写；用户编辑输入框（删除/修改文本）
+  // 也不中断听写——以编辑后的文本与光标为新插入点重锚定：跳过当前实例已
+  // 产生的全部结果（编辑前的语音文本不重放），后续新结果从下一索引继续累积。
+  // 编辑不重建识别实例（不调 start），避免 file:// 等场景下反复弹麦克风权限。
   let speechRec = null;
   let speechActive = false;
   let speechBase = "";
@@ -511,6 +518,14 @@
   let speechWriting = false;
   let speechRestartTimer = null;
   let speechEmptyRestarts = 0;
+  let speechNetworkErrors = 0;
+  let speechSkipCount = 0; // 重锚定后跳过的已消费结果数（编辑前结果不重放）
+  let speechResultCount = 0; // 当前实例已产生的结果总数（重锚定的跳过基准）
+  // 空周期保护上限：静默时每次会话结束记一个空周期（约 8s 一轮），
+  // 取宽松值（≈8 分钟无任何识别）避免长时间占用麦克风，正常听写不触发。
+  const SPEECH_MAX_EMPTY_RESTARTS = 60;
+  // 网络异常上限：网络抖动通常 1-2 次即恢复，连续多次才停止并提示。
+  const SPEECH_MAX_NETWORK_ERRORS = 5;
 
   function applySpeechText() {
     const before = speechBase + speechSep + speechCommitted + speechCycleText;
@@ -530,7 +545,7 @@
     refreshComposerButtons();
   }
 
-  // 默认立即隔离并取消识别，用于发送/切会话/手动编辑；保留已经显示的预览。
+  // 默认立即隔离并取消识别，用于发送/切会话/新对话；保留已经显示的预览。
   // 仅点击麦克风停止时允许浏览器完成最后一段，随后 onend 清理。
   function stopSpeechInput(finishLastResult) {
     speechActive = false;
@@ -553,10 +568,143 @@
     resetVoiceButton();
   }
 
+  // 用户编辑输入框（删除/修改文本）：不中断听写、也不重建识别实例——
+  // 以编辑后的文本与光标位置为新插入点重锚定，跳过当前实例已产生的全部
+  // 结果（编辑前的语音文本不重放、不覆盖用户修改），后续新结果从下一索引
+  // 继续累积；听写状态与按钮录音态保持不变。
+  function reanchorSpeech() {
+    if (!speechActive) return;
+    const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
+    const end = input.selectionEnd == null ? pos : input.selectionEnd;
+    speechBase = input.value.slice(0, pos);
+    speechTail = input.value.slice(end);
+    speechSep = speechBase && !/\s$/.test(speechBase) ? " " : "";
+    speechCommitted = "";
+    speechCycleText = "";
+    speechEmptyRestarts = 0;
+    speechLastWritten = input.value;
+    speechSkipCount = speechResultCount;
+  }
+
+  // 延迟重启识别会话（静默结束/启动失败共用）：连续触发时只保留最后一次
+  // 计划，避免反复重建实例。
+  function scheduleSpeechRestart(delay) {
+    if (!speechActive) return;
+    if (speechRestartTimer != null) clearTimeout(speechRestartTimer);
+    speechRestartTimer = setTimeout(function () {
+      speechRestartTimer = null;
+      if (!speechActive) return;
+      startSpeechSession();
+    }, delay);
+  }
+
   input.addEventListener("input", function () {
-    // 用户编辑优先：保留编辑后的全文，停止旧插入点的听写，避免覆盖/重复。
-    if (!speechWriting && speechRec) stopSpeechInput();
+    // 语音自身写回（speechWriting）忽略；用户编辑则重锚定继续监听。
+    if (!speechWriting && speechActive) reanchorSpeech();
   });
+
+  // 创建识别实例并开始识别（首次启动与静默结束后的自动重启共用）：
+  // 每次重启使用新实例——旧实例的迟到事件经 speechRec 比对全部丢弃，
+  // 不会把上一周期的结果写回输入框。用户编辑不重建实例（见 reanchorSpeech）。
+  function startSpeechSession() {
+    if (!speechActive) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      stopSpeechInput();
+      toast("当前浏览器不支持语音识别，请使用 Edge 或 Chrome");
+      return;
+    }
+    let rec;
+    try { rec = new SR(); }
+    catch (err) { stopSpeechInput(); toast("语音识别启动失败：" + (err && err.message || err)); return; }
+    speechRec = rec;
+    speechSkipCount = 0;
+    speechResultCount = 0;
+    rec.lang = "zh-CN";
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = function (event) {
+      if (speechRec !== rec) return;
+      speechResultCount = event.results.length;
+      if (input.value !== speechLastWritten) {
+        if (!speechActive) return; // 已停止：丢弃迟到结果
+        reanchorSpeech(); // 听写中：以当前文本与光标重锚定，继续监听
+        return;
+      }
+      // 本周期累计快照全量重建（重复 final 回调不会重复追加）；重锚定后
+      // 跳过已消费的旧结果，仅从新结果开始累积（编辑前文本不重放）。
+      speechCycleText = Array.from(event.results).slice(speechSkipCount).map(function (result) {
+        return result[0] && result[0].transcript || "";
+      }).join("");
+      if (speechCycleText) {
+        speechEmptyRestarts = 0;
+        speechNetworkErrors = 0;
+      }
+      applySpeechText();
+    };
+    rec.onerror = function (event) {
+      if (speechRec !== rec) return;
+      const err = event && event.error || "";
+      if (err === "no-speech") return; // 静默由 onend 自动重启处理。
+      if (err === "aborted") return; // 主动中断/浏览器中断：由 onend 决定重启。
+      if (err === "network") {
+        // 网络抖动：温和重试（由 onend 重启），连续多次失败才停止提示
+        speechNetworkErrors += 1;
+        if (speechNetworkErrors >= SPEECH_MAX_NETWORK_ERRORS) {
+          stopSpeechInput();
+          toast("语音识别服务网络异常，已停止录音；请检查网络后重新开始");
+        }
+        return;
+      }
+      const errors = {
+        "not-allowed": "麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问",
+        "service-not-allowed": "浏览器禁止使用语音识别服务，请检查浏览器设置",
+        "audio-capture": "无法访问麦克风，请检查设备连接及是否被其他程序占用",
+        "language-not-supported": "当前语音服务不支持中文识别",
+      };
+      stopSpeechInput();
+      toast(errors[err] || "语音识别出错：" + err);
+    };
+    rec.onend = function () {
+      if (speechRec !== rec) return;
+      if (!speechActive) {
+        speechRec = null;
+        speechLastWritten = null;
+        resetVoiceButton();
+        return;
+      }
+      // 周期结束后保留最后可见文本，重启时 results 索引从零开始。
+      if (speechCycleText) speechCommitted += speechCycleText;
+      else speechEmptyRestarts += 1;
+      speechCycleText = "";
+      if (speechEmptyRestarts >= SPEECH_MAX_EMPTY_RESTARTS) {
+        stopSpeechInput();
+        toast("长时间未识别到语音，已停止录音；可点击麦克风重新开始");
+        return;
+      }
+      // 正常结束短延迟快速续听；静默/网络异常时逐步增大延迟（最多 2s）
+      const backoff = speechEmptyRestarts + speechNetworkErrors;
+      scheduleSpeechRestart(backoff > 0 ? Math.min(2000, 200 * backoff) : 80);
+    };
+    try { rec.start(); }
+    catch (err) {
+      // 启动失败：短延迟重试（新建实例），连续失败达上限才彻底停止
+      speechRec = null;
+      speechEmptyRestarts += 1;
+      if (speechEmptyRestarts >= SPEECH_MAX_EMPTY_RESTARTS) {
+        stopSpeechInput();
+        toast("语音识别启动失败：" + (err && err.message || err));
+        return;
+      }
+      scheduleSpeechRestart(200 * Math.min(speechEmptyRestarts, 5));
+      return;
+    }
+    voiceBtn.classList.add("is-recording");
+    voiceBtn.title = "停止语音输入";
+    voiceBtn.setAttribute("aria-pressed", "true");
+    voiceBtn.setAttribute("aria-label", "停止语音输入");
+    refreshComposerButtons();
+  }
 
   function startSpeechInput() {
     if ((state.streaming && state.streamingSession === state.sessionId) ||
@@ -575,77 +723,10 @@
     speechCommitted = "";
     speechCycleText = "";
     speechEmptyRestarts = 0;
+    speechNetworkErrors = 0;
     speechLastWritten = input.value;
-    let rec;
-    try { rec = new SR(); }
-    catch (err) { toast("语音识别启动失败：" + (err && err.message || err)); return; }
-    speechRec = rec;
     speechActive = true;
-    rec.lang = "zh-CN";
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = function (event) {
-      if (speechRec !== rec) return;
-      if (input.value !== speechLastWritten) { stopSpeechInput(); return; }
-      // results 是本周期累计快照；全量重算，不能把重复 final 回调再次追加。
-      speechCycleText = Array.from(event.results).map(function (result) {
-        return result[0] && result[0].transcript || "";
-      }).join("");
-      if (speechCycleText) speechEmptyRestarts = 0;
-      applySpeechText();
-    };
-    rec.onerror = function (event) {
-      if (speechRec !== rec) return;
-      const err = event && event.error || "";
-      if (err === "no-speech") return; // 静默由 onend 有限重试处理。
-      const errors = {
-        "not-allowed": "麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问",
-        "service-not-allowed": "浏览器禁止使用语音识别服务，请检查浏览器设置",
-        "audio-capture": "无法访问麦克风，请检查设备连接及是否被其他程序占用",
-        "network": "语音识别服务网络异常，请检查网络后重新开始",
-        "language-not-supported": "当前语音服务不支持中文识别",
-      };
-      stopSpeechInput();
-      if (err !== "aborted") toast(errors[err] || "语音识别出错：" + err);
-    };
-    rec.onend = function () {
-      if (speechRec !== rec) return;
-      if (!speechActive) {
-        speechRec = null;
-        speechLastWritten = null;
-        resetVoiceButton();
-        return;
-      }
-      // 周期结束后保留最后可见文本，重启时 results 索引从零开始。
-      if (speechCycleText) speechCommitted += speechCycleText;
-      else speechEmptyRestarts += 1;
-      speechCycleText = "";
-      if (speechEmptyRestarts >= 5) {
-        stopSpeechInput();
-        toast("连续未识别到语音，已停止录音；可点击麦克风重新开始");
-        return;
-      }
-      speechRestartTimer = setTimeout(function () {
-        speechRestartTimer = null;
-        if (!speechActive || speechRec !== rec) return;
-        try { rec.start(); }
-        catch (err) {
-          stopSpeechInput();
-          toast("语音识别重启失败：" + (err && err.message || err));
-        }
-      }, Math.min(1500, 150 * (speechEmptyRestarts + 1)));
-    };
-    try { rec.start(); }
-    catch (err) {
-      stopSpeechInput();
-      toast("语音识别启动失败：" + (err && err.message || err));
-      return;
-    }
-    voiceBtn.classList.add("is-recording");
-    voiceBtn.title = "停止语音输入";
-    voiceBtn.setAttribute("aria-pressed", "true");
-    voiceBtn.setAttribute("aria-label", "停止语音输入");
-    refreshComposerButtons();
+    startSpeechSession();
   }
 
   voiceBtn.addEventListener("click", function () {

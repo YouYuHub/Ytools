@@ -13,7 +13,8 @@
  * - 显式 App.openSession 不受守卫影响（删除轮次重载等路径仍真实重载）
  * 说明：用最小 DOM 桩加载 sessions.js，通过行内 select 按钮的 click 监听
  * 观察 openSession 是否被触发（以 App.stopVoiceInput 调用计数为探针——
- * openSession 每次必调且 startNewChat 不调用）。
+ * openSession 每次必调；startNewChat 也会调用一次（新对话停止语音输入），
+ * 断言按此口径计数）。
  */
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -110,7 +111,7 @@ function loadSessionsModule() {
   global.SessionListUtils = require("../js/session_list_utils.js");
   global.HistoryParser = { parseHistory: function () { return { records: [], metaUsage: {} }; } };
 
-  const spies = { stopVoiceInput: 0, loadWorkDir: 0 };
+  const spies = { stopVoiceInput: 0, loadWorkDir: 0, terminalSessions: [] };
   global.API = {
     fetchSessionFile: function () { return Promise.resolve(""); },
     getSessionMeta: function () { return Promise.resolve({}); },
@@ -119,6 +120,7 @@ function loadSessionsModule() {
 
   const app = global.window.App;
   app.state = { sessionId: "", sessionRecency: {} };
+  app.terminalJobs = { noteSessionChanged: function () { spies.terminalSessions.push(app.state.sessionId); } };
   app.$ = function () { return makeNode("div"); };
   app.el = function (tag, cls, text) { return makeNode(tag, cls, text); };
   app.toast = function () {};
@@ -217,15 +219,24 @@ test("新会话首条消息（ensureSessionId）后视为就绪，点击跳过",
   assert.equal(env.spies.stopVoiceInput, 0, "刚发送的新会话不应因点击重载");
 });
 
+test("分配会话、切换会话和新对话都会通知后台终端同步归属", async function () {
+  const env = loadSessionsModule();
+  const id = env.app.ensureSessionId();
+  env.app.ensureSessionId(); // 没有重新分配 ID 时不重复通知。
+  await env.app.openSession("s-other");
+  env.app.startNewChat();
+  assert.deepEqual(env.spies.terminalSessions, [id, "s-other", null]);
+});
+
 test("startNewChat 清除就绪标记：再点旧会话可正常打开", async function () {
   const env = loadSessionsModule();
   await env.app.openSession("s-1");
   assert.equal(env.spies.stopVoiceInput, 1);
 
-  env.app.startNewChat();
+  env.app.startNewChat(); // 新对话也会停止语音输入（探针计数 +1）
   const item = env.app.buildSessionItem("s-1", "标题");
   selectButtonOf(item).emit("click");
-  assert.equal(env.spies.stopVoiceInput, 2, "新对话后点击旧会话应重新打开");
+  assert.equal(env.spies.stopVoiceInput, 3, "新对话后点击旧会话应重新打开");
 });
 
 test("markSessionViewReady（本地导入预览）后就绪，点击跳过", function () {

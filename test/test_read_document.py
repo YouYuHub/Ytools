@@ -144,7 +144,9 @@ class ReadDocumentExecutionTests(unittest.TestCase):
         result = execute_read_document(
             {"filename": "big.txt", "max_chars": 10 ** 9}, self.sid
         )
-        self.assertEqual(len(result["content"]), 20000)
+        self.assertLessEqual(len(result["content"]), 20000)
+        from factory.agent_runtime.chat_runtime import estimate_text_tokens
+        self.assertLessEqual(estimate_text_tokens(result), builtin_tools.document_output_token_budget())
 
     def test_missing_filename_error(self):
         result = execute_read_document({}, self.sid)

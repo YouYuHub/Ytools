@@ -43,9 +43,9 @@ def _dangling(messages):
 class ReplaceTodoContextDanglingTests(unittest.TestCase):
     """_replace_todo_context 悬空回归：只删结果、保留声明是 400 的根因。"""
 
-    def test_single_todo_with_content_clears_tool_calls(self):
+    def test_latest_todo_with_content_keeps_paired_tool_calls(self):
         # 真实现场：assistant（正文 + 单独一个 todo_write 调用）——归并后
-        # tool_calls 必须整体清除（连同配对结果一起消失），正文保留
+        # 最近一次真实交互完整保留，正文保留，不再生成额外的计划 system 消息
         messages = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "我先更新一下计划。", "tool_calls": [
@@ -59,18 +59,16 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"content": "步骤一", "status": "done"},
         ])
         self.assertEqual(_dangling(messages), [])
-        # 正文保留（有 content 不丢对话信息），声明已清除
+        # 正文、声明和配对结果均保留
         kept = [m for m in messages if m.get("role") == "assistant"]
         self.assertEqual(len(kept), 1)
-        self.assertNotIn("tool_calls", kept[0])
+        self.assertIn("tool_calls", kept[0])
         self.assertEqual(kept[0]["content"], "我先更新一下计划。")
-        # 配对结果也被删除
-        self.assertTrue(all(m.get("role") != "tool" for m in messages))
-        # 摘要仍在末尾
-        self.assertTrue(messages[-1].get("_todo_summary"))
+        self.assertEqual(messages[-1]["tool_call_id"], "call_todo_1")
+        self.assertFalse(any(m.get("_todo_summary") for m in messages))
 
-    def test_single_todo_without_content_drops_message(self):
-        # 无正文的纯 todo 调用：整条丢弃（现有行为，保持）
+    def test_latest_todo_without_content_keeps_native_pair(self):
+        # 无正文的最近计划调用仍保留完整配对
         messages = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "tool_calls": [
@@ -81,10 +79,10 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
         ]
         chat_factory._replace_todo_context(messages, [{"content": "x", "status": "done"}])
         self.assertEqual(_dangling(messages), [])
-        self.assertEqual([m["role"] for m in messages], ["user", "system"])
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
 
     def test_mixed_tool_calls_keeps_only_non_todo(self):
-        # 混合调用：todo 声明与结果被移除，其余声明保留且仍有配对结果
+        # 旧混合调用：todo 声明与结果被移除，其余声明和新 todo 均保持配对
         messages = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "查询并更新计划", "tool_calls": [
@@ -96,15 +94,19 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_todo_1",
              "_tool_name": "todo_write", "content": "ok"},
         ]
+        messages.extend([
+            {"role": "assistant", "tool_calls": [{"id": "new_todo", "function": {"name": "todo_write", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "new_todo", "_tool_name": "todo_write", "content": "ok"},
+        ])
         chat_factory._replace_todo_context(messages, [{"content": "x", "status": "done"}])
         self.assertEqual(_dangling(messages), [])
         assistant = messages[1]
         self.assertEqual(
             [tc["id"] for tc in assistant["tool_calls"]], ["call_search"],
         )
-        # search 的配对结果保留、todo 结果删除
+        # search 和最新 todo 的配对结果保留，旧 todo 结果删除
         tool_ids = [m.get("tool_call_id") for m in messages if m.get("role") == "tool"]
-        self.assertEqual(tool_ids, ["call_search"])
+        self.assertEqual(tool_ids, ["call_search", "new_todo"])
 
     def test_idempotent_repeat(self):
         # 重复执行（如两轮连续归并）：第二次执行不得产生新的悬空/异常
@@ -121,7 +123,7 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
         first_pass = [dict(m) for m in messages]
         chat_factory._replace_todo_context(messages, todos)
         self.assertEqual(_dangling(messages), [])
-        # 第二次执行：旧摘要被替换为新摘要，其余消息不变
+        # 第二次执行不会重复添加计划记录
         self.assertEqual(len(messages), len(first_pass))
 
 

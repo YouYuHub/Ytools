@@ -324,6 +324,67 @@ def _make_context(**overrides) -> "object":
     return ctx, emitted, stop
 
 
+class SubAgentTodoLoopTests(unittest.TestCase):
+    def _run(self, script, **limits):
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+        from chat.chat_llm import ChatLLM
+        from copy import deepcopy
+
+        fake, state = _fake_llm_script(script)
+        captured = []
+
+        def wrapped(*args, **kwargs):
+            captured.append(deepcopy(kwargs.get("request") or args[0]))
+            assert len(captured) <= len(script), "子任务仍在空转"
+            return fake(*args, **kwargs)
+
+        ctx, emitted = _make_retry_context(initial_todo=[])
+        ctx.max_rounds = 0  # 保护不能依赖用户配置的任务轮次上限
+        with mock.patch.object(ChatLLM, "chat_completions", wrapped), _retry_limits_patch(**limits):
+            runner = SubAgentRunner(ctx)
+            result = asyncio.run(runner.run())
+        return runner, result, captured, emitted
+
+    @staticmethod
+    def _todo(seq, content="实际工作", status="pending"):
+        return [_sse({"tool_calls": [{"index": 0, "id": f"t{seq}", "type": "function",
+                 "function": {"name": "todo_write", "arguments": json.dumps({"todos": [
+                     {"id": str(seq), "content": content, "status": status}
+                 ]}, ensure_ascii=False)}}]}),
+                _sse({"finish_reason": "tool_calls"}), "data: [DONE]\n\n"]
+
+    def test_repeated_plan_is_hidden_and_final_report_not_reminded(self):
+        runner, result, requests, events = self._run([
+            self._todo(1), self._todo(2), self._todo(3), FINAL_CHUNKS,
+        ])
+        self.assertEqual(result.status, "done")
+        self.assertEqual(len(requests), 4)
+        self.assertNotIn("todo_write", [t["function"]["name"] for t in requests[-1].tools or []])
+        self.assertEqual(runner.todo[0]["id"], "1")
+        self.assertEqual(len([e for phase, e in events if phase == "todo"]), 1)
+        self.assertEqual(runner._todo_remind_used, 0)
+
+    def test_stubborn_rewritten_plans_stop_with_progress_report(self):
+        runner, result, requests, events = self._run([
+            self._todo(i, content=f"任务{i}") for i in range(1, 7)
+        ])
+        self.assertEqual(len(requests), 5)
+        self.assertEqual(result.status, "error")
+        self.assertIn("已终止本次空转", result.final_reply)
+        self.assertEqual(runner.todo[0]["content"], "任务3")
+        results = [e for phase, e in events if phase == "tool_result"]
+        self.assertEqual(len(results), 5)
+        self.assertIn("TODO_LOOP_GUARD", results[-1]["result"])
+
+    def test_plan_updates_do_not_refresh_reminder_quota(self):
+        runner, result, requests, events = self._run([
+            self._todo(1), FINAL_CHUNKS, self._todo(2), FINAL_CHUNKS,
+        ], todo_remind_max=1)
+        self.assertEqual(result.status, "done")
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(runner._todo_remind_used, 1)
+
+
 class SubAgentRunnerTests(unittest.TestCase):
     def setUp(self):
         _cleanup_files()
@@ -706,8 +767,8 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(len(done_payloads), 1)
         self.assertEqual(done_payloads[0]["status"], "error")
 
-    def test_todo_remind_and_quota_reset_after_tool_round(self):
-        """todo 提醒（模型触碰过的计划）：未完成收尾被提醒 → 工具轮后额度重置 → 收尾可交付。"""
+    def test_todo_remind_not_reset_by_plan_update(self):
+        """未完成收尾被提醒，完成计划后可交付，但改计划不能刷新提醒额度。"""
         from chat.chat_llm import ChatLLM
         from factory.agent_runtime.sub_agent import SubAgentRunner
 
@@ -757,7 +818,7 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         self.assertIn("计划已完成", result.final_reply)
         # 第 1 轮模型触碰计划（todo_write pending）→ 第 2 轮未完成收尾被提醒
-        #（额度 1 次用掉）→ 第 3 轮工具执行标记完成后额度重置 → 第 4 轮收尾交付
+        #（额度 1 次用掉）→ 第 3 轮计划标记完成 → 第 4 轮收尾交付
         self.assertTrue(runner._todo_touched)
         notices = [p for ph, p in emitted if ph == "notice"]
         self.assertEqual(len(notices), 1)
@@ -768,8 +829,8 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
             m.get("_internal") and "未完成" in str(m.get("content"))
             for m in runner.messages
         ))
-        # 工具轮后提醒额度已重置（此后再无提醒）
-        self.assertEqual(runner._todo_remind_used, 0)
+        # 单纯改计划不会刷新额度；计划完成后自然不再触发提醒。
+        self.assertEqual(runner._todo_remind_used, 1)
 
     def test_todo_remind_respects_zero_limit(self):
         """todo 提醒额度 0：关闭提醒，直接收尾（done），不注入提醒消息。"""

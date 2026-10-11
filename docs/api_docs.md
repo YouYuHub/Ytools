@@ -38,7 +38,7 @@
 - `round_model`：本轮生效聊天模型 `{"round_model": {"provider": <供应商名>, "name": <models.json 模型配置名>, "id": <实际请求 API 的模型 id>}}`（与轮次 JSONL 的 `chat_round.model` 字段同源，字段缺失项省略；任务启动时确定，用户在任务进行中切换模型不改写本轮）。**唯一下发通道**：普通发送/编辑重发/回答插入三条路径均在提问落盘后推送一次——`round_started` 帧只在普通发送路径推送（编辑重发/回答插入没有该帧），模型名放那里会丢，故统一由本帧承载；前端据此在本轮 usage 行显示「模型 provider/name」。推送时同步记录到任务流（`live_round_model`），供回放标记携带（本帧位于回放起点之前，附接消费端收不到）
 - `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "question_quotes": <本轮引用快照，无引用时省略；旧后端无此字段>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>, "model": <本轮生效聊天模型，同 round_model；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览；引用卡片同源重建），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配（带引用时同时比较引用签名）；`model` 回填本轮 usage 行模型名
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
-- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划同时注入系统提示词供模型跨轮感知——终态注入收官提醒防止重复调用）
+- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划通过最近一次真实工具调用及完整结果供模型感知，不再嵌入系统提示词；终态工具结果提示收官）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
 - `context_compaction`：单轮工具轨迹被压缩后的状态，含 `{scope:"round", before_tokens, after_tokens, fallback, compress_index, block_count, usage}`；`usage` 为压缩模型调用返回的 token 统计（部分服务端不返回时为 null）；新模式 `block_count` 通常为 1 个累计摘要块；工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
 - `context_compaction`（**实时压缩事件**，开始/完成两个阶段，见下方"压缩事件格式"）：单轮与跨轮压缩均实时推送，**同一份 payload 同时落盘 JSONL 独立事件行**（`event="context_compaction"`），保证前端"加载历史"与"实时显示"字段完全一致
@@ -107,14 +107,15 @@
 - 返回: `{"running": bool, "session_id": "已规整的会话标识"}`
 
 ### POST /inject_message（运行中消息注入/引导）
-任务运行中把一条用户消息投递给会话 worker：生成循环在下一轮检查点（工具结果处理完毕后）取出该消息作为新一轮用户消息继续（steer 路径，前端"引导"输入框与队列条目使用）。任务未运行时返回 `not_running`，前端回退为普通发送。**带引用快照的引导消息不走本接口**——由前端本地暂存并随下次普通发送派发（见 docs/quote_selection.md）。
-- Body: `{"session_id": "default", "content": <非空字符串或多模态部件列表>}`
-- 返回: 成功 `{"ok": true}`；任务未运行 `{"ok": false, "reason": "not_running"}`；content 非法 400
+任务运行中把一条用户消息投递给会话 worker：生成循环在下一轮检查点（当前模型响应及工具结果处理完毕后）取出该消息，在下一次模型请求前加入上下文。文本、媒体附件和引用快照均支持；正在进行的模型请求不会被中断。媒体先通过上传接口获取 `media://` 引用，再投递此接口；检查点消费时解析为模型支持的图片/音视频部件（非视觉模型降级为引用占位）。JSONL 与 `message_injected` 事件保存原始引用，不含 base64。任务未运行时返回 `not_running`，前端回退普通发送；队列模式仍等待当前任务结束。
+- Body: `{"session_id": "default", "content": <非空字符串或多模态部件列表>, "quotes": <可选引用数组，限制同聊天接口>, "message_id": <可选唯一 ID，最多128字符>}`
+- 返回: 成功 `{"ok": true}`；任务未运行 `{"ok": false, "reason": "not_running"}`；worker 接收确认超时 `{"ok":false,"reason":"ack_timeout"}`；content/quotes 非法 400。worker 模式确认当前任务仍在运行并实际入队后才返回成功，避免上传期间任务已经结束却被误判为已注入。
+- 消费事件：`{"event":"message_injected","text":<正文>,"content":<原始字符串或媒体引用部件>,"quotes":[],"message_id":<ID或null>}`。前端据此显示图片和引用，并清除对应待消费条目。每条引导单独投递，按后端接收顺序消费；支持消费事件先于 HTTP 响应到达。
 
 ### POST /cancel_inject_message（撤回未消费的注入消息）
-按文本匹配从注入队列移除一条尚未被生成循环消费的消息（前端引导提示行的 × 按钮）。
-- Body: `{"session_id": "default", "text": <注入消息纯文本，非空>}`
-- 返回: 成功 `{"ok": true}`；已被消费或不存在 `{"ok": false, "reason": "not_found"}`；text 为空 400
+优先按 `message_id` 移除一条尚未消费的消息（支持纯图片与同文本多消息）；未传 ID 时兼容按正文文本匹配。worker 模式等待实际撤回确认后返回，前端仅成功撤回时恢复正文、附件与引用。
+- Body: `{"session_id": "default", "text": <可选纯文本>, "message_id": <可选消息ID>}`，二者至少提供一项。
+- 返回: 成功 `{"ok": true}`；已被消费或不存在 `{"ok": false, "reason": "not_found"}`；确认超时 `{"ok":false,"reason":"ack_timeout"}`；text 与 ID 均为空时 400。
 
 ## 2. 聊天历史 ChatHistory
 
@@ -273,7 +274,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /chat_config/work_dir | POST | Body `{session_id, work_dir}` | `{state, message, session_id, session_dir, effective_dir, warning, updated_at}`；设置/清除会话独立工作目录（写会话 `_meta.work_dir`）。`work_dir` 非空时校验目录存在（不存在 400）；空串/None 清除覆盖恢复跟随默认。对正在运行的任务不生效，下一轮生成任务开始时生效 |
 | /chat_config/history_compaction | GET | `session_id`（可选） | `{trigger_ratio, summary_budget_ratio, oversized_reject_factor, max_oversized_rejections, summary_total_budget, target_tokens, target_limits{min, max, window}, effective_summary_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
 | /chat_config/history_compaction | POST | Body 见下方完整策略；Query `session_id`（可选） | `{state, updated, config, memory_state}`；返回的 `config.effective_threshold` 同样支持会话口径 |
-| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present, support_doc_types}`；`support_doc_types` 为 supportDocTypes 归一化声明（原生文档输入扩展名列表，如 `[".pdf", ".docx"]`，未声明为 `[]`）；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`，响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示） |
+| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present, support_doc_types}`；`support_doc_types` 为 supportDocTypes 归一化声明（原生文档输入扩展名列表，如 `[".pdf", ".docx"]`，未声明为 `[]`）；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`（仅有效覆盖为 true）、`selection_invalid`（存储的覆盖模型已不存在），响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示；GET 只读，生成任务开始时将实际回退配置保存为新会话快照，仅首次修复告警；没有有效全局模型则清除失效角色覆盖；有效的其他角色选择保持不变） |
 | /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
@@ -286,11 +287,11 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；**空 `inputs` = 显式无工具模式（落盘空选择哨兵，不回退全局）**；仅 `clear=true` 清除会话覆盖恢复跟随全局；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 | /chat_config/network_retry | GET | - | `{max_attempts, defaults, semantics, env_names, memory_state}`；模型网络请求连续失败重试上限（.env `NETWORK_RETRY_MAX_ATTEMPTS`，默认 3） |
-| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。**覆盖范围**：连接失败/读超时/非 2xx/**HTTP 200 但整条响应流没有任何模型输出（空流）**、非流式 200 空响应（空 body/空 choices/空 message 字段）——空响应按同一计数纳入重试并重发同一 payload，`error_type=empty_response`；重试对所有模型角色（聊天/压缩/标题/子智能体）统一生效。**重试间隔固定 1 秒**（第 2 次及以后尝试前等待，不做配置）；发送前还会做**请求硬限制预检**（见下节），确定性超限请求不再进入重试 |
+| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。正数 N 允许首次请求之外重试 N 次。**覆盖范围**：连接失败/读超时/非 2xx/供应商流内错误帧（`error`、`event:error`、带失败状态或错误信息的 `message`）/HTTP 200 空流/非流式 200 空响应，均共享同一请求的失败计数。流内错误返回 `error_type=upstream_error_frame`；未产生正文时重发同一 payload，已产生正文时携带已输出前缀续写，并清除未完成工具调用，避免拼接无效参数。重试期间只推送 `retrying=true` 进度提示，不落盘最终错误；耗尽才返回 `retrying=false`、原始错误及重试统计并记录失败。对所有模型角色统一生效。**重试间隔固定 1 秒**，停止信号可以中止；确定性请求硬限制超限仍不重试（见下节） |
 | /chat_config/compaction_retry | GET | - | `{max_attempts, defaults, semantics{attempt, 0_or_negative, positive, retry_interval_seconds}, env_names, memory_state}`；上下文压缩调用失败重试上限（.env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）。一次"尝试"=一条完整"压缩模型→聊天模型"降级链（同源时本条链只有一次调用），链间隔固定 1 秒；达到次数抛 `ContextCompactionError` 终止当前任务 |
 | /chat_config/compaction_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次压缩调用立即生效；0 或负数=不限制（整条降级链一直重试直到手动停止） |
 | /chat_config/sub_agent_retry | GET | - | `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max, defaults, semantics, env_names, memory_state}`；子智能体交付保障重试配置（详见"子智能体（sub_agent）配置"节 §10.1） |
-| /chat_config/sub_agent_retry | POST | Body `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次子任务立即生效。`final_reply`/`stream_error`：0 或负数=不限制（仍受已启用的轮次/超时限制约束）；`todo_remind`：0=关闭提醒，负数=不限制（每次完整工具执行轮后额度重置） |
+| /chat_config/sub_agent_retry | POST | Body `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次子任务立即生效。`final_reply`/`stream_error`：0 或负数=不限制（仍受已启用的轮次/超时限制约束）；`todo_remind`：0=关闭提醒，负数=不限制（成功执行其他工具后额度重置，单纯更新计划不重置） |
 | /chat_config/retitle_setting | GET | `session_id`（必填） | `{state, session_id, enabled, exists, title_state: {title_generated, attempted}}`；读取会话「每条消息重新标题」开关（`_meta.retitle_each_message`，会话独立配置，未设置视为关闭）与标题生成状态概览 |
 | /chat_config/retitle_setting | POST | Body `{session_id, enabled}` | `{state, session_id, enabled, message}`；写入会话「每条消息重新标题」开关：开启时每轮任务收尾都重新生成标题（开启瞬间清除 `_title_state.attempted`），关闭时仅首轮生成一次；会话不存在返回 404 |
 | /chat_config/generate_title | POST | Body `{session_id(必填), question_text, model_preview, question_parts?}` | 前端触发的会话标题生成（详见下方"标题模型"节）：调标题模型生成并写回 `_meta.title`，结果同步返回（前端零轮询）；已生成过/失败标记/未配置标题模型时跳过并回显当前标题；会话不存在 404，生成失败 500 |
@@ -387,11 +388,23 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 **悬空来源与修复**（三层防护）：
 
-1. **todo 上下文归并**（`chat_factory._replace_todo_context`）：assistant（正文 + 单独一个 `todo_write` 调用）被归并时，旧实现只删除配对 tool 结果、保留 `tool_calls` 声明 → 悬空。现修复为：全部调用都是 todo 时整体清除 `tool_calls` 字段（有正文保留正文，无正文丢弃整条）。
+1. **todo 上下文归并**（`chat_factory._replace_todo_context`）：旧计划交互归并时，必须同步清理 assistant 的 `tool_calls` 声明与配对 tool 结果。当前实现保留最近一次真实计划交互，旧调用中全部都是 todo 时整体清除声明（有正文保留正文，无正文丢弃整条）；混合批仍保留其他工具的调用/结果对。
 2. **历史轮次构建**（`chat_history_format._round_entry_to_tool_result_context_messages`）：中断/停止的轮次（工具调用未执行完就断流）落盘后无结果；结果的声明不在本轮时不再错挂到最近调用（错挂会让真属主声明悬空）。构建末尾统一走悬空清理。
 3. **请求前统一防线**（`chat_runtime.sanitize_tool_call_pairing`）：`copy_for_request`（父循环与子智能体共用的请求副本入口）在返回前清理全部悬空声明——声明全部悬空时清除字段（有正文保留、无正文丢弃），部分悬空时仅剔除悬空项；无法判断的畸形声明（无 id/空 id）保留原样。该防线兜底一切历史遗留脏数据。
 
 另：子智能体执行侧对 `over_task` 声明生成配对结果、未知/未授权工具保留声明并给出拒绝结果（与父循环同契约），杜绝"结果无声明"的孤儿。防御性日志：清理发生时打印 `[WARNING] 请求前清理 N 个悬空 tool_call（无配对结果）`。
+
+### 计划工具连续空转保护
+
+`todo_write` 只维护计划，不代表执行了任务；仅在步骤或状态变化时提交完整列表。
+
+- 当前计划不再嵌入主系统提示词或额外的 system 计划快照。父、子任务保留最近一次真实 `todo_write` 调用及完整工具结果（`success`、`todos`、`plan_complete`、`message`、`unchanged`、`warnings`）；无效更新时同时保留上一份成功计划和最新纠错返回。旧计划调用从请求视图中归并，原始调用与结果仍完整落盘。
+- 任务内压缩后恢复保留的原生调用/结果对；跨轮摘要模式从原始历史恢复与侧车真源一致的最近计划交互。改写/插入历史消息仅使用目标位置之前的交互，不带入未来轮次。上一任务交互放在新用户指令之前；没有真实调用记录的旧侧车数据不伪造成工具调用。子任务的父级预置计划作为任务输入保留，模型实际更新后移除旧预置快照，以最新工具结果为准。
+- `@@TodoWrite@@{...}`、`<tool_calls><invoke ...>`、`<tool_call>{...}</tool_call>` 等整段正文标记不能执行。父、子任务隐藏这类标记，最多进行两次纠错重试，要求原生 `tool_calls` 或自然语言答复；仍失败则明确按错误收尾，不伪报成功。正常说明文字、行内引用和代码示例不作为调用执行。
+- 父、子任务各自计数：连续 **3 个工具轮只调用 `todo_write`** 后，从下一次请求的工具定义中暂时移除它，并提示模型执行其他工具、汇总结果或说明阻碍。改写 ID、措辞、状态不会绕过计数；同批多个计划调用算一个工具轮。
+- 调用其他工具（含混合批）后恢复计划工具；主任务收到运行中追加的用户指令、新任务启动时也重新计数。该保护不修改全局或会话工具选择。
+- 若模型无视暂停，仍连续调用计划工具，后续调用返回 `TODO_LOOP_GUARD` 拒绝结果，不覆盖计划；累计到 **5 个连续计划工具轮** 时结束空转并报告错误。子任务同时返回实际进展，未完成步骤不会被自动标为 done。
+- 子任务单纯改计划不再刷新“未完成提醒”额度；成功执行其他工具后才重置。计划工具暂停期间接受实际进展报告，不再催促模型调用已暂停的计划工具。
 
 ### 模型请求硬限制预检与重试间隔
 
@@ -421,14 +434,14 @@ SUB_AGENT_TIMEOUT_SECONDS=900   # 子任务整体超时（0=不限制），超�
 SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（完整轨迹始终在 JSONL 事件块）
 SUB_AGENT_FINAL_REPLY_RETRY_MAX=3  # 空收尾重试上限（0/负=不限制）；耗尽按 error 收尾，不再伪装 done
 SUB_AGENT_STREAM_ERROR_RETRY_MAX=3 # 流式调用错误断点续跑上限（0/负=不限制）
-SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关闭，负=不限制；每次工具执行轮后额度重置）
+SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关闭，负=不限制；成功执行其他工具后额度重置，单纯更新计划不重置）
 ```
 
 前端配置：「聊天设置」模态框新增三个输入项（子任务空收尾重试次数 / 子任务断流续跑次数 / 子任务计划未完成提醒次数），经 `GET/POST /chat_config/sub_agent_retry` 读写上述 env。
 
 **交付保障机制**（详见 docs/sub_agent_v1.md §10.1）：三项重试均为"注入内部消息让子模型继续"的语义——
 
-- **todo 未完成提醒**：收尾轮计划仍有 pending/in_progress 项时提醒继续；额度在每次完整工具执行轮后重置；给出有效最终回复即正常收尾、不再催促；
+- **todo 未完成提醒**：收尾轮计划仍有 pending/in_progress 项时提醒继续；额度在成功执行其他工具后重置，单纯更新计划不重置；给出有效最终回复即正常收尾、不再催促；
 - **空收尾重试**：最终回复为空（含仅思考输出）不算有效交付，要求重新交付；耗尽按 `error` 收尾并附进展说明（最后正文预览 + todo 状态），父级可据此重派——**消除旧版"done + （子智能体未输出有效内容）占位文本"的伪成功**；
 - **流错误断点续跑**：模型调用失败后从已有进度继续（工具轨迹/todo 都在上下文不丢失），耗尽才 error 收尾。
 
@@ -586,8 +599,11 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - `edit_file` 使用精确原文替换；单次编辑须同时传顶层 `old_string/new_string`，多处编辑只传 `edits` 列表；两种格式不可混用，全部验证成功后才写入。模型收到独立的紧凑结果：成功时含 `success/path/replacements/changed_range/stats/content_hash`；小型且非重复的变更会附带 `diff`，省略时用 `diff_omitted_reason` 说明，`diff_truncated` 表示返回 diff 是否被截断。大文件无法可靠计算统计时，`stats` 的行数为 `null`，不会伪报为 0。前端和 JSONL 的完整 diff 仍通过独立 `file_diff` 字段传递，不与模型结果混在一起。失败时含 `success=false/error`。复制 `read_file` 输出中连续完整的 `行号| 内容` 行时，首次匹配失败会识别行号并重试。多处匹配仍会拒绝，除非显式传 `replace_all=true`。布尔参数必须为 JSON 布尔值；`read_file` 显式指定错误编码时会报错，而不会把替换字符当成原文。
 - `changed_range` 给出编辑前、编辑后的行号范围；纯插入或删除时没有对应行的一侧为 `null`。批量编辑时该范围是所有改动的包络，因此可能包含未变的中间行；完整分段仍以独立前端 `file_diff` 为准。
 - `read_file`、`search_files`、`read_document` 的文本输出和 `run_command` 的前台输出，在模型调用链中会按当前模型窗口收紧；不足时按工具返回的行号、字符偏移或文件路径继续读取。
-- 选择 `run_command` 时，模型会同时看到 `run_command(command, ...)`、`poll_command(job_id)` 和 `stop_command(job_id)` 三个窄接口。`run_command(background=true)` 返回 `job_id`；后两者只能管理本工具创建的后台任务。旧 `run_command(action=poll|stop, job_id=...)` 调用仍可执行。结果包含可读 `message` 和结构化的 `status`、`exit_code`、`pid`、`output_path` 等字段；旧会话中的纯文本结果仍可显示。后台日志与任务记录保留约 24 小时。
+- `read_file` 保留 64 MiB 文件读取上限；底层按 64 KiB 分块读取并检查增长后的实际字节数，避免对小文件预分配整个上限。统计总行数时只保留本页最多 2000 行，不创建全文行列表；仍返回全文内容指纹及精确续读位置。原始字节和解码文本仍受文件上限约束，超大日志请用终端筛选。输出预算使用本会话或子任务实际生效模型的窗口。
+- 选择 `run_command` 时，模型会同时看到 `run_command(command, ...)`、`poll_command(job_id, tail_lines?)` 和 `stop_command(job_id)` 三个窄接口。`run_command(background=true)` 返回 `job_id`；后两者只能管理本工具创建的后台任务。旧 `run_command(action=poll|stop, job_id=...)` 调用仍可执行。结果包含可读 `message` 和结构化的 `status`、`exit_code`、`pid`、`output_path` 等字段；旧会话中的纯文本结果仍可显示。未关闭的后台记录及仍运行任务的日志持续保留；关闭后至少保留 24 小时，过期旧文件会在后续执行命令时清理。关闭记录不立即删除日志，以保留模型工具返回的文件引用。
+- `poll_command.tail_lines` 为 1–200 的整数，默认 30，返回最近的输出行；单次只读取末尾约 256 KiB，返回正文最多 12000 字符且可按模型窗口收紧，`output_truncated=true` 表示不是完整日志。完整日志仍保留在 `output_path`，可用 `read_file(start_line, limit)` 连续读取；此接口不提供字节偏移游标。`stop_command` 不接受 `tail_lines`。
 - 终端默认 shell 按平台统一选择：Windows 优先可用的 PowerShell，否则 cmd；Linux/macOS 使用 sh。工具调用可显式指定其他 `shell`。旧 `.env` 的 `RUN_COMMAND_DEFAULT_SHELL` 和会话 `_meta.run_command_shell` 不再生效；前端工具选择不再提供默认 shell 配置。旧 `GET /chat_config/run_command_shell` 兼容返回平台默认；旧 POST 返回 400 并提示在工具调用中指定 shell。
+- 页面提供本会话后台终端管理入口，仅在存在运行中任务时显示；模型停止、进程退出或用户关闭后自动移出列表。`/terminal/jobs` 列表、状态/输出、停止/关闭及日志下载接口均要求非空 `session_id` 查询参数并校验会话归属；详见 [后台终端管理](terminal_management.md)。该通道不依赖聊天 SSE，模型端 poll/stop 同样按会话归属校验。
 
 ### 上下文压缩策略
 
@@ -706,10 +722,19 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **文件清单**（`memory.file_memory.build_file_manifest_text`，随首条 system 消息注入）：普通文本口径的小文件（解析文本 ≤4000 字符）内联全文；大文件给开头节选。选中 `read_document` 时，清单会附读取提示；当前模型 `supportDocTypes` 命中的原生文档只显示文件索引和读取提示，不预先内联解析全文或上传原始文件，避免重复发送。未选中时不显示读取提示，原生候选回退为解析文本清单（小文件内联、大文件节选）；清单总预算 16000 字符，超出按「新文件优先」收缩；
 - **read_document 工具**（用户在「配置工具」→「内置工具」中显式勾选后才注入）：
   - `filename`（必填）：上传文件的原始文件名，或明确提供的本地文档路径；
-  - `mode`：`auto`（默认）、`text` 或 `native`。`auto` 按当前生效模型对**目标文件扩展名**的 `supportDocTypes` 声明选择：命中且原始文件可用时仅走原生文件输入；未命中时走解析文本。此分流不使用通用 `vision` 标志；图片视觉能力不等于文档原生能力；
-  - `offset` / `limit`：解析文本字符区间，`offset` 从 0 开始，默认 `offset=0`、`limit=10000`，单次 `limit` 上限 20000。`has_more=true` 时使用返回的 `next_offset` 继续；旧参数 `start_char` / `max_chars` 仍兼容。提供字符区间时 `auto` 自动使用文本模式；
+  - `mode`：`auto`（默认）、`text`、`table` 或 `native`。`auto` 按当前生效模型对**目标文件扩展名**的 `supportDocTypes` 声明选择原生输入；不支持原生输入的 CSV/TSV/XLS/XLSX 自动返回 Markdown 表格，其他类型返回解析文本。此分流不使用通用 `vision` 标志；图片视觉能力不等于文档原生能力；
+  - `offset` / `limit`：文本字符区间，`offset` 从 0 开始，默认 `offset=0`、`limit=10000`，单次 `limit` 上限 20000，并受当前模型预算收紧。`has_more=true` 时使用 `next_offset` 继续；旧参数 `start_char` / `max_chars` 兼容。`auto` 提供 offset 时走文本模式；只提供 limit 时表格仍按行读取，limit 限制表格字符数；
+  - `sheet` / `header_row` / `start_row` / `row_limit`：表格模式选择工作表（默认首表）、表头行（默认 1，0 表示无表头）、数据开始行（默认表头之后）、最多数据行（默认 100，上限 200）。使用这些参数可让 auto 强制解析表格，不与 offset 或 PDF 页区间混用。每页重复表头，包含原始行号，完整保留空单元格、引号内分隔符和换行（显示为 `<br>`）。标题为空时按列号补名称，重复标题不合并；
+  - 表格结果包含 `{mode: "table", format: "markdown_table", sheet, sheets, headers, header_row, total_rows, start_row, end_row, rows_returned, content, has_more, next_row?, next_sheet?}`。用 `start_row=next_row` 继续当前工作表；用 `sheet=next_sheet` 并移除 start_row 读取下一工作表。无表头文件须设 `header_row=0`，避免误将第一行数据视为标题；
   - `page_start` / `page_count`：原生 PDF 按物理页读取，页码从 1 开始，每次最多 20 页。服务端生成结构完整的页面子 PDF，再作为原生文档部件发送；只有当前模型声明支持 PDF 原生输入时可用。其他格式可用解析文本的 `offset` / `limit`；
   - 文本结果返回 `{filename, type, mode, total_chars, offset, limit, content, has_more, next_offset?, message}`。原生结果不附加解析文本，只返回文件引用和发送说明；工具返回前会剥离 base64 部件；
+  - 显式 `mode=text` 的 CSV/TSV 保留原始文本，按字符分页；Excel 上传解析也保留工作表和表头。表格工具优先重新读取保存的原始文件，因此旧 Excel 记录缺失表头时可恢复，历史落盘文本不改写。原始 Excel 不存在时不能可靠重建列关系，明确报错；
+  - Word `.docx` 的 `auto/text` 在不支持原生文件输入时，按正文顺序保留段落和 Markdown 表格。表格用中性的「列 1、列 2…」及「原始行号」标识，首行（包括真实表头）作为原始行保留，不猜测或丢弃首行；空单元格保留，多行内容显示为 `<br>`，横向/纵向合并位置标记为 `[合并至 R行C列]`。嵌套表格在父单元格留下引用，并在父表后单独输出完整内容及所在行列。Word 仍用 `offset/next_offset` 按字符续读（片段可能跨越表格行），不使用电子表格的 `sheet/start_row` 参数；
+  - 旧上传 DOCX 即使没有 `content_truncated` 标记，也优先从保存的原始文件重新解析，以恢复旧解析器遗漏的表格；使用有界缓存，历史解析记录不改写。原始文件缺失或重解析失败时，返回已保存文本并带 `parse_warning`，明确说明旧文本可能缺表，不能据此断定文档没有表格；
+  - DOCX 解析覆盖正文和单元格中的段落、表格及内容控件，不复刻字体/颜色/物理页码，也不提取页眉页脚、文本框或图片内文字。旧二进制 `.doc` 仍依赖 antiword/catdoc，表格布局不保证；需要结构化表格时先转为 `.docx`；
+  - Excel 使用 openpyxl（XLSX）或 xlrd（XLS）。公式读取已保存的缓存值；没有缓存时返回公式表达式并提示，服务端不重新计算。CSV/TSV 支持 BOM、UTF-8、常见中文编码和 CSV 引号语义；
+  - 大文件分两层限额：文本解析原始文件最多 10 MiB；表格最多每表 50000 行、1024 列，整文件 20 万行/单元格、4 Mi 字符、100 工作表。XLSX/DOCX 解压总量最多 128 MiB、单项最多 64 MiB，超限拒绝并建议拆分，不静默丢行。模型结果按生效模型窗口、当前上下文及同轮工具数量分配 token 预算，完整 JSON（含元数据）参与估算，预留安全余量；表格不截断行，文本保留精确续读偏移。预算不足时提示先压缩，发送前仍执行上下文预算检查。token 使用项目估算器，非供应商精确分词；原生文档使用独立字节/数量配额，不能由文件字节数保证 token 数；
+  - DOCX 正文解析另限最多 4 Mi 字符、20 万个表格网格单元格（含合并占位）、1024 列、1000 个表格、16 层表格嵌套；超限明确失败，不输出假装完整的缺表文本。分页解析入口与上传/工具读取共用此解析器；损坏或超限的 DOCX 不回退为 ZIP 字节乱码；
   - 原生模式不可用或文件超过单文件大小限制时，`mode=auto` 回退解析文本并说明原因；显式 `mode=native` 返回错误，不静默切换。显式 `mode=text` 始终读取解析文本；
   - 对本地路径，原生分支不预先执行文本解析；回退文本时才解析。文本分段读取复用按文件修改时间和大小键控的有界解析缓存，避免每个片段重复解析；
 - **超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
@@ -723,10 +748,14 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 - **发送节奏**：原生文件只随紧接着的一次模型请求发送。收到完整响应后，内存消息中的原生部件转为 `[文档 文件名]` 占位；仍需原文时模型再次调用 `read_document`。不会在首轮或后续每轮自动重复上传所有支持类型的文件。截断续写或工具调用流超时时暂时保留部件，供重试使用；
 - **分段与大小**：完整原生读取受 `NATIVE_DOC_MAX_BYTES` 单文件限制（默认 20MB）。原生 PDF 可用 `page_start` / `page_count` 选择最多 20 页并发送有效子 PDF；非 PDF 文档可用 `mode=text` 和 `offset` / `limit` 分段读取解析文本。PDF 页段目前仍要求源文件没有超过原生单文件大小限制；
 - **批次预算**（.env 可配、动态热生效）：同一次模型请求最多 `NATIVE_DOC_MAX_ITEMS` 个文件（默认 3），原生文件总量最多 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）。`mode=auto` 超预算时回退到文本模式；显式 native 或 PDF 页选段超预算时返回错误，模型可在下一次请求中单独读取；
+- **供应商数量配额**：`models.json` 的 `mediaLimits.document` 限制最终 API 请求中原生 `file` 部件数量，`total` 为文档与图片/音频/视频共享的总配额；不是 `read_media` 专属配置。它与上述服务端批次预算同时生效，解析文本不占配额。最终请求因供应商配额裁剪文档时不会自动回退解析文本，需要模型另行调用 `read_document(mode="text")`。详见 [多模态输入限制](media_limits.md#配置归属与文档工具的关系)；
 - **解析与回退**：上传时照常保存解析文本，供非原生模型、显式 `mode=text` 和自动回退使用。原生读取结果不附加解析文本，避免解析文本与原文件重复进入上下文；本地解析器缺失或解析失败但模型声明支持该类型时，上传仍成功，可通过原生读取查看；
 - **落盘**：原始文件字节保存在会话文件目录，供按需读取；原生 base64 部件只存在于内存请求消息中。`read_document` 工具结果、JSONL 及子智能体事件只保存文件引用、文件名、页码范围和一次性发送说明，不保存原生 base64。父循环与子智能体共用读取和清理逻辑（`memory/file_memory.py` 原生文档函数族）。
 
 ### 内置 read_media 工具（factory/agent_runtime/builtin_tools.py）
+
+详细参数、调用示例和回传链路见 [read_media 使用说明](read_media.md)；供应商/模型级 `mediaLimits` 完整示例见 [媒体类型与数量限制](media_limits.md)。
+
 模型可调用的媒体读取内置工具（「配置工具」→「内置工具」分组勾选 `read_media`），
 把媒体来源解析为 base64 回传给多模态模型，**本地/网络/用户上传统一入口**：
 
@@ -779,6 +808,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
   后续模型请求上下文（仅内存、不落盘历史），token 统计按多模态部件固定
   占位计费；加载失败时以占位文本告知模型；
 - **单次调用最多 5 个**（超出的引用标记 `limit_5_per_round` 跳过）；父任务同一条模型回复仅执行首次 `read_media` 调用。当前消息中仍保留的图片/音频部件按引用与区间去重；视频部件会在读取新片段时回收，随后可再次读取相同区间。子任务也使用相同的现存部件判定；只有待注入批次超过 5 个时才保留最近 5 个。
+
+- **供应商配额**：工具最多 5 个来源与 API 请求媒体配额是不同层次。整份请求（包括历史实际媒体）还受 `mediaLimits.total/image/video/audio/document` 限制；已知配额不足时跳过来源并返回原因，首次检测到明确数量错误时自动裁剪请求副本重试。模型须检查“未发送”提示，不能把加载成功等同于供应商已接收。模型级配额对象整份覆盖供应商级对象，未配置图片配额也不等于自动启用视觉能力。
 
 ## 7. Skills 提示词库 Prompts
 

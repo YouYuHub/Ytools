@@ -730,20 +730,65 @@ def resolve_session_tool_selection(
 
 def resolve_session_model_selection(
     session_id: str,
+    *,
+    repair_invalid: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """解析会话生效模型选择（惰性：只读，不落盘；返回全部角色的合并结果）。
+    """解析会话生效模型选择（默认只读；返回全部角色的合并结果）。
 
     解析顺序（按角色独立覆盖，全局默认兜底）：
     1. `_meta.model_selection` 中该角色的覆盖条目存在且模型仍在当前模型目录中 → 生效；
     2. 覆盖条目引用的模型已不存在 → 记录警告，该角色回退全局默认；
     3. 未覆盖的角色直接使用全局默认（models.json 顶层 model_selection）。
 
+    生成任务传 repair_invalid=True：将失效角色的实际回退配置保存为新的
+    会话快照，避免每轮重复告警。没有有效全局配置时清除该角色覆盖。
+    持有跨进程写锁后重新读取配置，只修复仍失效的角色，保留用户的新选择。
+
     Returns:
         ({role: {ownership_name, model_name, parameter, api_type}} 全角色合并结果, 警告消息列表)
     """
-    effective = _get_global_model_selection()
+    effective, warnings, invalid_roles = _resolve_model_selection_override(
+        read_session_meta_value(session_id, "model_selection")
+    )
+    if not repair_invalid or not invalid_roles:
+        return effective, warnings
+
+    file_path = _get_chat_history_file(normalize_session_id(session_id))
+    with cross_process_lock(LOCK_ROOT / f"{file_path.name}.lock"):
+        meta, entries = _load_meta_and_entries(file_path, session_id)
+        # 上次读取到加锁之间，配置接口可能已写入用户的新选择。
+        effective, warnings, invalid_roles = _resolve_model_selection_override(meta.get("model_selection"))
+        if not invalid_roles:
+            return effective, warnings
+        stored = dict(meta.get("model_selection") or {})
+        for role in invalid_roles:
+            fallback = effective.get(role) or {}
+            if (fallback.get("ownership_name") and fallback.get("model_name")
+                    and _get_model_config(fallback["ownership_name"], fallback["model_name"]) is not None):
+                stored[role] = copy.deepcopy(fallback)
+            else:
+                stored.pop(role, None)
+        if stored:
+            meta["model_selection"] = stored
+        else:
+            meta.pop("model_selection", None)
+        meta["updated_at"] = now_str()
+        try:
+            _write_meta_and_entries(file_path, meta, entries)
+        except OSError as exc:
+            logger.warning(f"会话失效模型回退配置保存失败（本轮继续使用回退配置）: {exc}")
+        else:
+            warnings = [warning + "（回退配置已保存）" for warning in warnings]
+    return effective, warnings
+
+
+def _resolve_model_selection_override(
+    override: Any,
+) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
+    """纯解析；失效角色列表同时用于回退快照修复。"""
+    effective = copy.deepcopy(_get_global_model_selection())
     warnings: list[str] = []
-    override = read_session_meta_value(session_id, "model_selection")
+    invalid_roles: list[str] = []
     normalized_override = _normalize_model_selection(override) if override is not None else {}
     for role in _MODEL_SELECTION_ROLES:
         entry = normalized_override.get(role) if isinstance(normalized_override, dict) else None
@@ -752,12 +797,13 @@ def resolve_session_model_selection(
         provider = entry.get("ownership_name")
         model = entry.get("model_name")
         if _get_model_config(provider, model) is None:
+            invalid_roles.append(role)
             warnings.append(
                 f"会话独立{role} 已失效（{provider} / {model} 不在当前模型目录中），已回退全局默认"
             )
             continue
         effective[role] = entry
-    return effective, warnings
+    return effective, warnings, invalid_roles
 
 
 # 摘要/历史格式化已迁移到 memory.chat_history_format，本文件仅保留调用入口
@@ -2512,6 +2558,34 @@ class ChatMemoryManager:
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             _write_meta_and_entries(self._file_path, meta, entries)
         return entries[-number:] if number > 0 else entries
+
+    async def get_latest_todo_exchange(self) -> list[dict[str, Any]]:
+        """读取最近真实计划交互，供摘要模式保留工具状态；不生成计划提示词。
+
+        编辑/插入只扫描目标位置之前的轮次，子任务内部计划不纳入父会话。
+        正常聊天时要求工具状态与侧车真源一致，避免恢复已清空或已替换的旧计划。
+        """
+        from factory.agent_runtime.todo_runtime import latest_todo_exchanges
+
+        _meta, entries = self._load_for_read()
+        rounds = [row for row in entries if row.get("event") == "chat_round"]
+        cutoff = self._history_cutoff_rounds
+        if cutoff is not None and cutoff >= 1:
+            rounds = rounds[:cutoff - 1]
+        current = await self.get_session_todo() if cutoff is None else None
+        for row in reversed(rounds):
+            # sub_agent 事件同样可能带 tool_calls，但没有顶层 role，不会被提取。
+            exchange = latest_todo_exchanges(row.get("events") or [])
+            for i in range(len(exchange) - 2, -1, -2):
+                try:
+                    result = json.loads(exchange[i + 1]["content"])
+                except (ValueError, TypeError):
+                    continue
+                if (isinstance(result, dict) and isinstance(result.get("todos"), list)
+                        and (current is None or result["todos"] == current)
+                        and not result.get("error") and result.get("success") is not False):
+                    return exchange[i:i + 2]
+        return []
 
     async def get_context_summary(self) -> dict[str, Any] | None:
         with self._write_guard():

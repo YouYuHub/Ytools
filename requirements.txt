@@ -26,5 +26,7 @@ imageio-ffmpeg
 PyMuPDF
 python-docx
 pandas
+openpyxl
+xlrd
 
 #################### optional end ####################

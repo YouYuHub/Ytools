@@ -136,6 +136,84 @@ def test_clear_chat_history_preserves_model_selection():
     print("PASS: clear_chat_history 保留 model_selection")
 
 
+def test_invalid_selection_repair_is_persisted_once_and_preserves_valid_roles():
+    import memory.chat_memory as cm
+    sid = _new_sid()
+    try:
+        manager = asyncio.run(get_chat_memory_manager(sid))
+        for role in ("chat_model", "compaction_model", "sub_agent_model"):
+            asyncio.run(manager.update_session_model_selection(role, {
+                "ownership_name": "P", "model_name": "Gone", "parameter": {"temperature": 1.8},
+            }))
+        asyncio.run(manager.update_session_model_selection("title_model", {
+            "ownership_name": "P", "model_name": "Valid", "parameter": {"temperature": 0.2},
+        }))
+        valid_title = read_session_meta_value(sid, "model_selection")["title_model"]
+        global_selection = {role: {
+            "ownership_name": "P", "model_name": "Fallback",
+            "parameter": {"chat_completions": {"temperature": 0.7}},
+            "api_type": "chat_completions", "headers": [],
+        } for role in ("chat_model", "compaction_model", "sub_agent_model", "title_model")}
+        with patch.object(cm, "_get_global_model_selection", return_value=global_selection), patch.object(
+            cm, "_get_model_config", side_effect=lambda p, m: {"name": m} if m in ("Fallback", "Valid") else None
+        ):
+            before = manager._file_path.read_bytes()
+            _, warnings = resolve_session_model_selection(sid)
+            assert len(warnings) == 3
+            assert manager._file_path.read_bytes() == before, "GET 解析应保持只读"
+            effective, warnings = resolve_session_model_selection(sid, repair_invalid=True)
+            assert len(warnings) == 3 and all("回退配置已保存" in w for w in warnings)
+            stored = read_session_meta_value(sid, "model_selection")
+            assert stored["title_model"] == valid_title
+            assert stored["chat_model"] == effective["chat_model"]
+            assert stored["chat_model"]["parameter"]["chat_completions"]["temperature"] == 0.7
+            after = manager._file_path.read_bytes()
+            assert resolve_session_model_selection(sid, repair_invalid=True)[1] == []
+            assert manager._file_path.read_bytes() == after, "再次解析不应写盘或重复警告"
+    finally:
+        _cleanup(sid)
+
+
+def test_invalid_selection_without_global_model_is_cleared():
+    import memory.chat_memory as cm
+    sid = _new_sid()
+    try:
+        manager = asyncio.run(get_chat_memory_manager(sid))
+        asyncio.run(manager.update_session_model_selection("sub_agent_model", {
+            "ownership_name": "P", "model_name": "Gone",
+        }))
+        with patch.object(cm, "_get_global_model_selection", return_value={}), patch.object(cm, "_get_model_config", return_value=None):
+            resolve_session_model_selection(sid, repair_invalid=True)
+            assert read_session_meta_value(sid, "model_selection") is None
+            assert resolve_session_model_selection(sid)[1] == []
+    finally:
+        _cleanup(sid)
+
+
+def test_selection_repair_rechecks_disk_and_preserves_concurrent_user_choice():
+    import memory.chat_memory as cm
+    sid = _new_sid()
+    try:
+        manager = asyncio.run(get_chat_memory_manager(sid))
+        asyncio.run(manager.update_session_model_selection("chat_model", {"ownership_name": "P", "model_name": "Gone"}))
+        original_read = cm.read_session_meta_value
+
+        def read_then_switch(*args):
+            stale = original_read(*args)
+            asyncio.run(manager.update_session_model_selection("chat_model", {"ownership_name": "P", "model_name": "NewChoice"}))
+            return stale
+
+        with patch.object(cm, "read_session_meta_value", side_effect=read_then_switch), patch.object(
+            cm, "_get_global_model_selection", return_value={"chat_model": {"ownership_name": "P", "model_name": "Fallback"}}
+        ), patch.object(cm, "_get_model_config", side_effect=lambda p, m: None if m == "Gone" else {"name": m}):
+            effective, warnings = resolve_session_model_selection(sid, repair_invalid=True)
+            assert effective["chat_model"]["model_name"] == "NewChoice"
+            assert warnings == []
+            assert original_read(sid, "model_selection")["chat_model"]["model_name"] == "NewChoice"
+    finally:
+        _cleanup(sid)
+
+
 def test_recompute_normalizes_model_selection():
     keep = _recompute_meta_from_entries("s", {"title": "t", "model_selection": {
         "chat_model": {"ownership_name": "P", "model_name": "M", "parameter": {}, "api_type": "chat_completions"},

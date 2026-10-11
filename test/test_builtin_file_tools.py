@@ -20,6 +20,30 @@ from factory.agent_runtime import builtin_tools as bt
 
 
 class BuiltinFileToolTests(unittest.TestCase):
+    def test_read_file_many_short_lines_has_bounded_line_buffer(self):
+        path = Path("many.txt")
+        path.write_text("abc\n" * 100000, encoding="utf-8")
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            result = bt.execute_read_file({"full_file_name": str(path), "start_line": 99990, "limit": 3})
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result["total_lines"], 100000)
+        self.assertEqual(result["range_start"], 99990)
+        self.assertEqual(result["range_end"], 99992)
+        # Full splitlines would allocate 100000 separate strings plus its pointer list.
+        self.assertLess(peak, 3 * 1024 * 1024)
+
+    def test_read_file_unicode_and_mixed_line_endings(self):
+        text = "a\r\nb\rc\n\n甲\u2028乙\x85最后\n"
+        path = Path("lines.txt")
+        path.write_bytes(text.encode("utf-8"))
+        result = bt.execute_read_file({"full_file_name": str(path), "show_line_numbers": False})
+        self.assertEqual(result["total_lines"], 7)
+        self.assertEqual(result["content"], "a\nb\nc\n\n甲\n乙\n最后")
+
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="builtin_file_ut_")
         self._old_cwd = os.getcwd()
@@ -501,6 +525,9 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertEqual(literal["total_matches"], 1)   # 仅字面行命中
         regex = bt.execute_search_files({"pattern": "a.c", "is_regex": True})
         self.assertEqual(regex["total_matches"], 2)     # 正则两行都命中
+        self.assertIn('文本: a.c', literal['message'])
+        self.assertNotIn('a\\.c', literal['message'])
+        self.assertIn('正则: a.c', regex['message'])
         self.assertEqual(bt.execute_search_files({"pattern": "a.c"})["total_matches"], 1)
         with self.assertRaisesRegex(ValueError, "布尔值"):
             bt.execute_search_files({"pattern": "a.c", "is_regex": "false"})

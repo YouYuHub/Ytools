@@ -39,7 +39,7 @@ _LOGGER_ROOT = "ytools"
 # 日志目录：项目根/log（以本文件位置推导，不依赖运行时 cwd——worker 会切换工作目录）
 _LOG_DIR = Path(__file__).resolve().parent.parent / "log"
 _ERROR_LOG_FILENAME = "error.log"
-_FILE_MAX_BYTES = 10 * 1024 * 1024   # 单文件上限 10MB
+_FILE_MAX_BYTES = 100 * 1024 * 1024   # 单文件上限 100MB
 _FILE_BACKUP_COUNT = 5               # 滚动保留 5 份历史
 
 _CONSOLE_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"

@@ -23,6 +23,46 @@ IS_WINDOWS = os.name == "nt"
 
 
 class BuiltinCommandToolTests(unittest.TestCase):
+    def test_poll_tail_lines_and_budget_leave_log_intact(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(bt, '_BG_LOG_DIR', Path(folder)):
+            path = Path(folder) / 'bg_tail.out.txt'
+            source = ''.join(f'第{i}行输出\n' for i in range(400))
+            path.write_bytes(source.encode())
+            job_id = bt._save_command_job(12345, path, None, 'powershell', folder, 'tail-session')
+            with patch.object(bt, '_pid_alive_windows', return_value=True), patch.object(bt, '_pid_alive_posix', return_value=True):
+                result = bt.try_execute_builtin_command_tool('poll_command', {'job_id': job_id, 'tail_lines': 3, '_session_id': 'tail-session'})
+                self.assertEqual(result['output_tail'], ''.join(f'第{i}行输出\n' for i in range(397, 400)))
+                self.assertTrue(result['output_truncated'])
+                limited = bt.execute_run_command({'action': 'poll', 'job_id': job_id, 'tail_lines': 200, '_session_id': 'tail-session', '_max_chars': 512})
+                self.assertLessEqual(len(limited['output_tail']), 512)
+                self.assertTrue(limited['output_tail'].endswith('第399行输出\n'))
+                self.assertEqual(path.read_bytes(), source.encode())
+                with self.assertRaisesRegex(ValueError, '不属于当前会话'):
+                    bt.execute_run_command({'action': 'poll', 'job_id': job_id, 'tail_lines': 3, '_session_id': 'other'})
+
+    def test_poll_rejects_invalid_tail_lines_before_job_access(self):
+        for value in (0, 201, True, 1.5, '3'):
+            result = bt.try_execute_builtin_command_tool('poll_command', {'job_id': 'bg_missing', 'tail_lines': value})
+            self.assertIn('1-200', result['error'])
+        for name in ('run_command', 'stop_command'):
+            result = bt.try_execute_builtin_command_tool(name, {'tail_lines': 3, 'job_id': 'bg_missing'} if name == 'stop_command' else {'tail_lines': 3, 'command': 'echo bad'})
+            self.assertIn('不接受 tail_lines', result['error'])
+
+    def test_tail_large_unicode_and_single_line_logs_are_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'tail.txt'
+            for encoding in ('utf-8', 'utf-16', 'utf-32'):
+                source = '汉字🙂' * 50000 + '\n最后一行中文\n'
+                path.write_bytes(source.encode(encoding))
+                text, truncated = bt._command_output_tail(path, 1, 12000)
+                self.assertEqual(text, '最后一行中文\n')
+                self.assertTrue(truncated)
+            path.write_bytes(('汉字🙂' * 50000).encode())
+            text, truncated = bt._command_output_tail(path, 1, 512)
+            self.assertTrue(text.endswith('汉字🙂'))
+            self.assertNotIn('�', text)
+            self.assertEqual(len(text), 512)
+            self.assertTrue(truncated)
     # ---------- 注入与名称注册 ----------
 
     def test_auto_shell_prefers_windows_powershell_and_falls_back_to_cmd(self):
@@ -137,7 +177,9 @@ class BuiltinCommandToolTests(unittest.TestCase):
 
     def test_background_job_can_be_polled_and_stopped(self):
         with tempfile.TemporaryDirectory() as folder:
-            with patch.object(bt, "_BG_LOG_DIR", Path(folder)):
+            with patch.object(bt, "_BG_LOG_DIR", Path(folder)), \
+                    patch("util.process_identity.process_identity", return_value="test:12345"), \
+                    patch("factory.agent_runtime.command_jobs.process_identity", return_value="test:12345"):
                 output = Path(folder) / "bg_test.out.txt"
                 output.write_text("progress", encoding="utf-8")
                 job_id = bt._save_command_job(12345, output, None, "cmd", folder, "session-a")

@@ -342,6 +342,10 @@
                                     <path d="M12 5v14M5 12h14" />
                                 </svg>
                             </button>
+                            <button class="composer-btn hidden" id="terminalJobsBtn" title="后台终端" aria-label="后台终端" aria-expanded="false" aria-controls="terminalJobsPanel">
+                                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/></svg>
+                                <span class="terminal-count" id="terminalJobsCount"></span>
+                            </button>
                             <div class="composer-bar-spacer"></div>
                             <button class="boost-btn" id="boostBtn" title="模型与参数设置">
                                 <svg class="icon" viewBox="0 0 24 24">
@@ -539,7 +543,7 @@
                         <input id="subAgentStreamErrorRetryMax" type="number" step="1">
                     </label>
                     <label class="chat-setting-field">
-                        <span>子任务计划未完成提醒次数<small>收尾时 todo 仍有未完成项则提醒继续（每次调用工具后额度重置）；0=关闭提醒，负数=不限制</small></span>
+                        <span>子任务计划未完成提醒次数<small>收尾时 todo 仍有未完成项则提醒继续（成功执行其他工具后额度重置，单纯更新计划不重置）；0=关闭提醒，负数=不限制</small></span>
                         <input id="subAgentTodoRemindMax" type="number" step="1">
                     </label>
                 </section>
@@ -904,6 +908,7 @@
     <script src="js/app/tools.js"></script>
     <script src="js/app/chat.js"></script>
     <script src="js/app/filehistory.js"></script>
+    <script src="js/app/terminals.js"></script>
     <script src="js/app.js"></script>
 </body>
 

@@ -8,6 +8,7 @@ class Node {
   appendChild(n) { if (n.parentNode) n.parentNode.removeChild(n); this.children.push(n); n.parentNode = this; }
   removeChild(n) { this.children.splice(this.children.indexOf(n), 1); n.parentNode = null; }
   replaceChild(n, old) { const i = this.children.indexOf(old); this.children[i] = n; n.parentNode = this; old.parentNode = null; }
+  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
 }
 function pipeline() {
   const source = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
@@ -18,6 +19,7 @@ function pipeline() {
   let navRefreshes = 0;
   const context = {
     state: { sessionId: 'session' }, stickToBottom() {}, pickTitlePreview() { return ''; },
+    el(kind) { return new Node(kind); },
     FormatUtils: { prettyJson: JSON.stringify },
     App: {
       clearInjectedPending() {},
@@ -97,4 +99,24 @@ test('运行中消费追加提问后立即刷新导航', () => {
   send({ event: 'message_injected', text: '追加提问' });
   assert.equal(root.children[0].kind, 'user');
   assert.equal(navRefreshes(), 1);
+});
+
+test('供应商重试移除未执行的参数占位，重试参数从头生成', () => {
+  const { root, cards, send } = pipeline();
+  send({ tool_calls: [{ index: 0, id: 'broken', function: { name: 'sub_agent', arguments: '{broken' } }] });
+  assert.equal(root.children[0].kind, 'agent');
+  send({ error: 'failed', retrying: true, retry: 1, discard_tool_calls: true });
+  assert.equal(root.children.some(n => n.kind === 'agent'), false);
+  send({ tool_calls: [{ index: 0, id: 'fresh', function: { name: 'sub_agent', arguments: '{"task":"new"}' } }] });
+  assert.equal(cards[1].input, '{"task":"new"}');
+  assert.equal(root.children.filter(n => n.kind === 'agent').length, 1);
+});
+
+test('后续请求重试不会移除已经派发的子任务卡片', () => {
+  const { root, send } = pipeline();
+  send({ tool_calls: [{ index: 0, id: 'a', function: { name: 'sub_agent', arguments: '{"task":"A"}' } }] });
+  send({ tool_start: { function_name: 'sub_agent', tool_call_id: 'a', arguments: { task: 'A' } } });
+  send({ event: 'sub_agent', phase: 'start', parent_tool_call_id: 'a', agent_id: 'agent_a' });
+  send({ error: 'failed', retrying: true, retry: 1, discard_tool_calls: true });
+  assert.equal(root.children.filter(n => n.kind === 'agent').length, 1);
 });

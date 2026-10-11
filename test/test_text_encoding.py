@@ -32,11 +32,26 @@ class TextEncodingTests(unittest.TestCase):
             self.assertEqual(ff.decode_text_bytes(bom + text.encode(encoding))[0], text)
 
     def test_csv_legacy_encoding_no_lossy_skip(self):
-        if ff.pd is None:
-            self.skipTest('pandas unavailable')
+        source = '名称,内容\n工具,中文说明\n'
         for encoding in ('gb18030', 'utf-16', 'utf-8-sig'):
-            result = ff._parse_csv('名称,内容\n工具,中文说明\n'.encode(encoding))
-            self.assertIn('工具 中文说明', result)
+            self.assertEqual(ff._parse_csv(source.encode(encoding)), source)
+
+    def test_csv_preserves_headers_quoted_fields_and_headerless_first_row(self):
+        for source in ('name,score,comment\r\nAlice,95,"优秀,稳定"\r\nBob,,"两行\n评价"\r\n',
+                       'Alice,95\nBob,87\n', ''):
+            with patch.object(ff, 'pd', None):
+                self.assertEqual(ff._parse_csv(source.encode()), source)
+                self.assertEqual(ff._parse_csv_with_pages(source.encode())[0]['content'], source)
+
+    def test_local_csv_document_pagination_includes_header(self):
+        source = 'name,score,comment\nAlice,95,优秀\nBob,87,良好\n'
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'data.csv'
+            path.write_bytes(source.encode())
+            with patch.object(bt.file_memory, 'find_file_memory_record', return_value=None):
+                first = bt.execute_read_document({'filename': str(path), 'mode': 'text', 'limit': 18}, 'csv-test')
+                remaining = bt.execute_read_document({'filename': str(path), 'mode': 'text', 'offset': first['next_offset']}, 'csv-test')
+        self.assertEqual(first['content'] + remaining['content'], source)
 
     def test_doc_converter_output_is_decoded_not_ignored(self):
         result = subprocess.CompletedProcess([], 0, '中文转换结果'.encode('gbk'), b'')

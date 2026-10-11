@@ -18,6 +18,7 @@
 # from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import json
 import re
 import time
@@ -29,6 +30,7 @@ from chat.chat_llm import ChatLLM
 from config import ChatLLMRequest
 from env_manager import (
     get_model_config,
+    require_default_chat_config,
     get_role_headers,
     get_role_parameter,
     get_role_selection,
@@ -54,6 +56,7 @@ from factory.agent_runtime.builtin_tools import (
     execute_read_document,
     load_any_media_model_part,
     model_tool_output_char_budget,
+    document_output_token_budget,
     resolve_default_command_shell,
     normalize_todo_items,
     retire_prior_video_parts,
@@ -82,12 +85,15 @@ from factory.agent_runtime.context_compaction import (
     resolve_oversized_result_token_threshold,
 )
 from factory.system_prompt import build_sub_agent_system_text
+from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext
+from factory.agent_runtime.text_tool_call import TextToolCallBuffer, text_tool_call_reminder
 from factory.agent_runtime.tool_executor import (
     execute_tool_round,
     normalize_tool_calls,
     prepare_tool_execution,
 )
 
+from util.media_limits import limit_media_messages, get_media_limits
 from util.logger import get_logger
 
 logger = get_logger("factory.agent_runtime.sub_agent")
@@ -204,7 +210,7 @@ def load_sub_agent_retry_limits() -> dict[str, int]:
       模型调用出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；
     - todo_remind_max：todo 未完成提醒上限（0=关闭，负=不限制）——
       只对「模型创建/更新过的计划」生效（父级预置但从未被触碰的计划
-      不拦截有效交付）；每次完整工具执行轮后额度重置。
+      不拦截有效交付）；成功执行其他工具后额度重置，单纯更新计划不重置。
 
     三项重试受已启用的轮次/超时限制约束；两项限制均为 0 时由用户手动停止。
     """
@@ -411,6 +417,7 @@ class SubAgentRunner:
                     "role": "user",
                     "content": todo_hint,
                     "_internal": True,
+                    "_todo_initial_hint": True,
                 })
         self.usage_accumulator = UsageAccumulator()
         self.rounds = 0
@@ -426,10 +433,13 @@ class SubAgentRunner:
         self._consecutive_oversized = 0
         # 交付保障重试计数（配置见 load_sub_agent_retry_limits）：
         # - 空收尾重试 / 流错误续跑：累计计数，耗尽按 error 收尾；
-        # - todo 提醒：每次完整工具执行轮后重置（工具轮后又"忘记"可再次提醒）
+        # - todo 提醒：执行其他工具后重置，单纯改写计划不获得新额度
         self._final_reply_retries_used = 0
         self._stream_error_retries_used = 0
         self._todo_remind_used = 0
+        self._todo_loop_guard = TodoLoopGuard()
+        self._todo_context = TodoContext()
+        self._text_tool_call_retries = 0
         # 计划是否被模型触碰过（成功调用 todo_write 即置位）：收尾提醒只
         # 约束「模型知情且维护过」的计划；父级预置但从未被触碰的计划属隐藏
         # 状态，不拦截有效交付（否则模型完成工作后会被迫补计划再重复交付）
@@ -469,7 +479,7 @@ class SubAgentRunner:
                 tool_def for tool_def in tools
                 if _tool_definition_name(tool_def) != READ_MEDIA_NAME
             ]
-        return tools
+        return self._todo_loop_guard.filter_tools(tools)
 
     # ----------------------------- 事件发射 -----------------------------
     async def _emit(self, phase: str, **fields: Any) -> None:
@@ -608,6 +618,11 @@ class SubAgentRunner:
         parameter（分桶后的生效参数）按字段覆盖。非标准参数（enable_thinking
         等）走 extra_body。
         """
+        if self._todo_touched:
+            # 预置计划是任务输入；模型维护计划后，以真实工具结果替换旧输入快照。
+            self.messages[:] = [m for m in self.messages if not m.get("_todo_initial_hint")]
+        self._todo_context.sync(self.messages)
+        self._todo_loop_guard.update_context(self.messages)
         request = ChatLLMRequest(
             messages=build_request_messages(copy_for_request(self.messages)),
             # 按模型可见性过滤后的工具（vision=false 时不含 read_media，
@@ -663,6 +678,7 @@ class SubAgentRunner:
         # 上游提前断开检测（EOF 未收到 finish_reason，ChatLLM 补发标记帧）：
         # 截断续写重试——落盘部分内容 + 内部消息让子模型继续（与父循环同语义）
         stream_truncated = False
+        text_buffer = TextToolCallBuffer()
         model_config, parameter = self._resolve_request_model_config()
         request = self._build_request(parameter)
         sse_iter = ChatLLM.chat_completions(
@@ -705,6 +721,10 @@ class SubAgentRunner:
                 if event.get("error") is not None:
                     # 重试帧只提示进度（子任务无法向用户提示），不终止
                     if event.get("retrying"):
+                        if event.get("discard_tool_calls"):
+                            tool_calls.clear()
+                            finish_reason = None
+                            tool_phase_deadline = None
                         continue
                     stream_error = event.get("error")
                     break
@@ -719,10 +739,12 @@ class SubAgentRunner:
                 function_call_delta = event.get("function_call")
                 if content:
                     full_response += content
-                    self._live_content = full_response
+                    visible = text_buffer.push(content)
                     # seq 与本轮 model_call/tool_* 对齐：前端按 seq 归位轮次，
                     # 避免 delta 先于 model_call 到达时轮次错位/重复分区
-                    await self._emit("delta", content_delta=content, seq=self._seq)
+                    if visible:
+                        self._live_content += visible
+                        await self._emit("delta", content_delta=visible, seq=self._seq)
                 if reasoning_content:
                     full_reasoning += reasoning_content
                     await self._emit("delta", reasoning_delta=reasoning_content, seq=self._seq)
@@ -737,9 +759,9 @@ class SubAgentRunner:
         except asyncio.CancelledError:
             # delta 只推 SSE；取消当前模型调用时补落盘已产生的完整片段，
             # 以免刷新后看不到停止前的正文/思考（未完成工具调用不执行）。
-            if full_response or full_reasoning:
+            if self._live_content or full_reasoning:
                 await self._emit(
-                    "model_call", seq=self._seq, content=full_response,
+                    "model_call", seq=self._seq, content=self._live_content,
                     reasoning_content=full_reasoning, tool_calls=[], finish_reason="cancelled",
                 )
             raise
@@ -748,8 +770,15 @@ class SubAgentRunner:
                 await sse_iter.aclose()
             except Exception:
                 pass
+        held_content, text_call_name = text_buffer.finish()
+        if held_content:
+            self._live_content += held_content
+            await self._emit("delta", content_delta=held_content, seq=self._seq)
+        if text_call_name:
+            full_response = ""  # 标记既不执行，也不作为子任务最终交付落盘。
         return {
             "full_response": full_response,
+            "text_tool_call_name": text_call_name,
             "full_reasoning": full_reasoning,
             "tool_calls": tool_calls,
             "finish_reason": finish_reason,
@@ -766,9 +795,17 @@ class SubAgentRunner:
         （index/tool_call/tool_name/tool_args/result/error）。
         """
         ctx = self.context
-        self.read_media_injected_refs = collect_injected_media_keys(self.messages)
+        try:
+            media_config, _ = self._resolve_request_model_config()
+            media_config = media_config or require_default_chat_config()
+        except Exception:
+            media_config = {}
+        self.read_media_injected_refs = collect_injected_media_keys(limit_media_messages(self.messages, media_config)[0])
         known_tool_names = list(ctx.tool_servers.keys())
         normalized = normalize_tool_calls(tool_calls, known_tool_names)
+        todo_blocked = self._todo_loop_guard.observe([
+            tc.get("function", {}).get("name", "") for tc in normalized
+        ])
         plan = prepare_tool_execution(normalized, known_tool_names)
         parsed_tools = [item for item in plan.parsed_tools if item[2] in ctx.tool_servers]
         blocked_tools = [item for item in plan.parsed_tools if item[2] not in ctx.tool_servers]
@@ -799,25 +836,40 @@ class SubAgentRunner:
             })
         builtin_results: list[tuple[int, dict, str, dict, Any]] = []
         external_tools: list[tuple[int, dict, str, dict]] = []
+        document_budget = document_output_token_budget(
+            model_config=media_config, messages=self.messages, tools=self._visible_tool_definitions(),
+            tool_count=len(parsed_tools))
         for idx, tc, tn, ta in parsed_tools:
             if tn == TODO_TOOL_NAME:
+                if todo_blocked:
+                    builtin_results.append((idx, tc, tn, ta, self._todo_loop_guard.rejection()))
+                    continue
                 prev_snapshot = list(self.todo)
                 items, notices, error_reason = normalize_todo_items(
                     ta.get("todos") if isinstance(ta, dict) else None,
                     prev_items=prev_snapshot,
                 )
                 if items is None:
-                    todo_result: dict[str, Any] = {"error": error_reason or "todos 参数无效"}
+                    todo_result: dict[str, Any] = {"success": False, "error": error_reason or "todos 参数无效"}
                 else:
+                    unchanged = bool(prev_snapshot) and len(items) == len(prev_snapshot) and all(
+                        item["content"] == prev.get("content") and item["status"] == prev.get("status")
+                        for item, prev in zip(items, prev_snapshot)
+                    )
+                    if unchanged:
+                        items = prev_snapshot  # 保留稳定 id，避免重复推送计划事件
                     self.todo = items
                     self._todo_touched = True
-                    await self._emit("todo", todos=items)
+                    if not unchanged:
+                        await self._emit("todo", todos=items)
                     done_count = sum(1 for item in items if item["status"] == "done")
                     in_progress_count = sum(1 for item in items if item["status"] == "in_progress")
                     pending_count = len(items) - done_count - in_progress_count
                     sub_plan_complete = bool(items) and done_count == len(items)
                     # 与父级 todo 结果同构：三态文案 + plan_complete 机器可读标记
-                    if sub_plan_complete:
+                    if not items:
+                        sub_message = "子任务计划已清空；请继续实际工作。"
+                    elif sub_plan_complete:
                         sub_message = (
                             f"子任务规划全部完成（{done_count}/{len(items)} 项）："
                             "请汇总执行结果作为最终回复返回父智能体；"
@@ -834,10 +886,16 @@ class SubAgentRunner:
                             f"进行中 {in_progress_count} 项，待办 {pending_count} 项）"
                         )
                     todo_result = {
+                        "success": True,
                         "message": sub_message,
                         "plan_complete": sub_plan_complete,
                         "todos": items,
                     }
+                    if unchanged:
+                        todo_result["unchanged"] = True
+                        todo_result["message"] = (
+                            "子任务计划没有变化，无需重复提交；请执行实际工作或汇总结果。"
+                        )
                     if notices:
                         todo_result["warnings"] = notices
                 builtin_results.append((idx, tc, tn, ta, todo_result))
@@ -882,6 +940,7 @@ class SubAgentRunner:
                         ctx.session_id,
                         self.task_media_references,
                         already_injected=self.read_media_injected_refs,
+                        media_limits=get_media_limits(media_config),
                         vision_enabled=self._vision_enabled,
                     )
                 if read_media_result.get("ok"):
@@ -909,7 +968,8 @@ class SubAgentRunner:
                 # 按子任务模型对此文件扩展名的 supportDocTypes 决定 auto 模式；
                 # 不依据 vision 标志。原生输入只进入下一次请求一次。
                 read_document_result = execute_read_document(
-                    {**ta, "_max_chars": model_tool_output_char_budget()}, ctx.session_id, support_doc_types=self._native_doc_types(),
+                    {**ta, "_max_chars": model_tool_output_char_budget(media_config), "_max_tokens": document_budget},
+                    ctx.session_id, support_doc_types=self._native_doc_types(),
                 )
                 native_block = (
                     read_document_result.get("native")
@@ -931,7 +991,11 @@ class SubAgentRunner:
                         if request_mode == "native" or is_page_range:
                             read_document_result = {"error": budget_error}
                         else:
-                            text_args = {**ta, "mode": "text", "_max_chars": model_tool_output_char_budget()}
+                            from factory.table_document import TABLE_EXTENSIONS
+                            fallback_mode = ("table" if Path(str(ta.get("filename") or "")).suffix.lower()
+                                             in TABLE_EXTENSIONS else "text")
+                            text_args = {**ta, "mode": fallback_mode, "_max_chars": model_tool_output_char_budget(media_config),
+                                         "_max_tokens": document_budget}
                             read_document_result = execute_read_document(
                                 text_args, ctx.session_id,
                                 support_doc_types=self._native_doc_types(),
@@ -946,7 +1010,7 @@ class SubAgentRunner:
                         self.native_doc_pending_bytes += native_size
                 builtin_results.append((idx, tc, tn, ta, read_document_result))
                 continue
-            bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(),
+            bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(media_config),
                             "_default_shell": resolve_default_command_shell(ctx.session_id),
                             "_session_id": ctx.session_id}
             file_tool_result = try_execute_builtin_file_tool(tn, bounded_args)
@@ -1067,6 +1131,13 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("stopped")
                 await self._emit_done("stopped", self._final_reply, None)
                 return self._make_result()
+            if self._todo_loop_guard.exhausted:
+                detail = self._todo_loop_guard.error_message
+                self._status = "error"
+                self._error = detail
+                self._final_reply = self._build_progress_reply("error", error=detail)
+                await self._emit_done("error", self._final_reply, detail)
+                return self._make_result()
             elapsed = time.monotonic() - self._started_monotonic
             if ctx.timeout_seconds > 0 and elapsed >= ctx.timeout_seconds:
                 self._status = "timeout"
@@ -1138,6 +1209,22 @@ class SubAgentRunner:
             tool_calls = call["tool_calls"]
             full_response = call["full_response"]
             full_reasoning = call["full_reasoning"]
+            text_call_name = call.get("text_tool_call_name")
+            if text_call_name and not tool_calls:
+                self._text_tool_call_retries += 1
+                if self._text_tool_call_retries > 2:
+                    detail = "模型连续输出文本形式的工具调用，无法执行；已停止本次子任务。"
+                    self._status = "error"
+                    self._error = detail
+                    self._final_reply = self._build_progress_reply("error", error=detail)
+                    await self._emit_done("error", self._final_reply, detail)
+                    return self._make_result()
+                self.messages.append({"role": "user", "_internal": True,
+                                      "content": text_tool_call_reminder(text_call_name)})
+                await self._emit("notice", message="模型输出了文本工具调用，正在要求其改用原生调用或正常答复。",
+                                 retry_kind="text_tool_call", seq=self._seq)
+                continue
+            self._text_tool_call_retries = 0
             # 工具调用流式阶段超时且无可用调用：以内部消息反馈子模型重试
             if call["tool_phase_timeout_hit"] and not tool_calls:
                 self.messages.append({
@@ -1241,14 +1328,14 @@ class SubAgentRunner:
                 # todo 提醒只对「模型创建/更新过的计划」生效（它知情、做出过
                 # 承诺）；父级预置但从未被触碰的计划是隐藏状态，不拦截有效
                 # 交付——否则模型完成工作后仍会被迫补计划再重复交付一遍。
-                # 提醒额度在每次完整工具执行轮后重置；空收尾/提醒都以内部
+                # 提醒额度仅在执行其他工具后重置；空收尾/提醒都以内部
                 # 消息推进，消耗 rounds，受已启用的轮次/超时限制约束。
                 pending_todo = [
                     item for item in self.todo
                     if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
                 ]
                 tr_limit = self._retry_limits["todo_remind_max"]
-                if pending_todo and self._todo_touched and (
+                if pending_todo and self._todo_touched and not self._todo_loop_guard.suspended and (
                     tr_limit < 0 or self._todo_remind_used < tr_limit
                 ):
                     self._todo_remind_used += 1
@@ -1427,9 +1514,11 @@ class SubAgentRunner:
                     "content": ret,
                     "_tool_name": tool_name,
                 })
-            # 本轮完整工具执行结束：todo 提醒额度重置——模型再次收尾时若计划
-            # 仍未完成可重新获得一次提醒（"调工具后忘记→再提醒"语义）
-            self._todo_remind_used = 0
+            # 只更新计划不算执行工作，不能借此无限刷新收尾提醒额度。
+            if any(r.get("tool_name") != TODO_TOOL_NAME and not r.get("error")
+                   and not (isinstance(r.get("result"), dict) and r["result"].get("error"))
+                   for r in tool_results):
+                self._todo_remind_used = 0
             # read_media 数据注入（子任务版）：按坐标现场加载媒体 base64 部件，
             # 作为 user 消息追加进 messages（仅内存，不落盘——任务文本里的
             # media:// 引用即子任务媒体台账）。加载失败的坐标以占位文本告知

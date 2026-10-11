@@ -17,6 +17,13 @@
     customHeadersRows, addHeaderRow
   } = App;
 
+  let panelVersion = 0;
+  let panelSessionId;
+
+  function isCurrentPanel(version, sessionId) {
+    return version === panelVersion && sessionId === (state.sessionId || undefined);
+  }
+
   // ---------- 模型与参数面板 ----------
   // 当前角色的配置快照（GET /chat_config/models?role=... 的 role_info / selection / models）
   function roleConfig() {
@@ -66,6 +73,7 @@
   function renderModelPicker() {
     // 面板草稿选中 = 服务端当前选择（仅初始化/切选项卡时重置；用户在列表中的选择保存在 selectedModelKey）
     state.selectedModelKey = currentModelKey(state.activeModelRole);
+    state.modelSelectionTouched = false;
     modelList.classList.add("hidden");
     updateModelPickerLabel();
   }
@@ -122,6 +130,8 @@
   function selectModelKey(key) {
     const switched = key !== state.selectedModelKey;
     state.selectedModelKey = key;
+    // 与全局当前模型相同也算明确选择，确认后建立会话独立配置。
+    state.modelSelectionTouched = true;
     updateModelPickerLabel();
     // 切换到不同模型后立即拉取一次 /chat_config/models，
     // 用服务端最新 max_output_tokens 校准“最大输出 token”：当前配置超过上限则压回上限，其余参数不动
@@ -130,7 +140,10 @@
 
   function refreshMaxTokensAfterSwitch(key) {
     const role = state.activeModelRole;
-    API.getModels(role, state.sessionId || undefined).then(function (data) {
+    const version = panelVersion;
+    const sessionId = panelSessionId;
+    API.getModels(role, sessionId).then(function (data) {
+      if (!isCurrentPanel(version, sessionId) || enhancePanel.classList.contains("hidden")) return;
       // 经单一入口写缓存：chat_model 角色顺带原子刷新状态条模型名，
       // 不再依赖"先赋值 state.modelConfigs 再手动调用刷新"的顺序约定
       if (role === "chat_model") App.setChatModelConfig(data);
@@ -139,6 +152,7 @@
       // 等待期间用户可能已切角色/换模型/关面板，过期结果不回填
       if (enhancePanel.classList.contains("hidden")) return;
       if (state.activeModelRole !== role || state.selectedModelKey !== key) return;
+      if (!isCurrentPanel(version, sessionId)) return;
       setupMaxTokensRange(Number(maxTokens.value));
       syncRangeOutputs();
     });
@@ -220,6 +234,7 @@
       enableThinking: enableThinking.checked,
       headers: collectHeaderRows(),
       dirty: state.modelParamDirty,
+      selectionTouched: state.modelSelectionTouched,
     };
   }
 
@@ -237,6 +252,7 @@
     syncRangeOutputs();
     updateModelPickerLabel();
     state.modelParamDirty = draft.dirty;
+    state.modelSelectionTouched = Boolean(draft.selectionTouched);
   }
 
   // ---------- 自定义请求头编辑器（键值两列，可增减行） ----------
@@ -303,9 +319,8 @@
     return param;
   }
 
-  async function loadModelConfigs() {
+  async function loadModelConfigs(version, sessionId) {
     // 会话级模型选择：携带当前会话加载生效配置（未设置会话时展示全局默认）
-    const sessionId = state.sessionId || undefined;
     const tasks = MODEL_ROLES.map(function (r) {
       return API.getModels(r.role, sessionId).then(
         function (data) { return { role: r.role, data: data, error: null }; },
@@ -313,6 +328,8 @@
       );
     });
     const results = await Promise.all(tasks);
+    // 旧面板/旧会话的在途响应不能回写当前缓存或状态栏。
+    if (!isCurrentPanel(version, sessionId)) return null;
     results.forEach(function (res) {
       state.modelConfigs[res.role] = res.error ? null : res.data;
       state.modelOverridden[res.role] = Boolean(
@@ -332,10 +349,12 @@
       enhanceHint.textContent = "部分模型配置加载失败，请检查后端服务";
       return;
     }
-    const base = "参数未修改时仅切换模型、保留原参数";
+    const base = "参数未修改时切换模型会保留原参数；保存后从下一次任务生效";
     let scopeTip;
     if (!state.sessionId) {
       scopeTip = "新对话中的修改将保存为全局默认";
+    } else if (roleConfig() && roleConfig().role_info && roleConfig().role_info.selection_invalid) {
+      scopeTip = "原会话模型已失效，当前显示全局回退模型；确定后保存当前选择";
     } else if (state.modelOverridden[state.activeModelRole]) {
       scopeTip = "当前为本会话独立模型选择，仅对本会话生效";
     } else {
@@ -349,7 +368,8 @@
     // 仅会话内且已设置覆盖时提供"清除会话覆盖"入口
     enhanceClearOverride.classList.toggle(
       "hidden",
-      !(state.sessionId && state.modelOverridden[state.activeModelRole])
+      !(state.sessionId && (state.modelOverridden[state.activeModelRole]
+        || (roleConfig() && roleConfig().role_info && roleConfig().role_info.selection_invalid)))
     );
   }
 
@@ -368,14 +388,23 @@
   }
 
   function openModelPanel() {
+    const version = ++panelVersion;
+    const sessionId = state.sessionId || undefined;
+    panelSessionId = sessionId;
     state.modelPanelDrafts = {};   // 每次打开都以服务端当前配置为基线
     // 先用缓存渲染，再异步刷新服务端配置
     initModelPanel();
-    loadModelConfigs().then(function (failed) {
-      if (enhancePanel.classList.contains("hidden")) return;
+    loadModelConfigs(version, sessionId).then(function (failed) {
+      if (!isCurrentPanel(version, sessionId) || enhancePanel.classList.contains("hidden")) return;
       state.modelLoadFailed = failed;
-      // 服务端最新配置到达：清掉打开瞬间的缓存基线草稿，以最新数据重建
-      state.modelPanelDrafts = {};
+      // 只刷新未编辑的缓存基线；加载期间修改过的各角色草稿必须保留。
+      saveRoleDraft(state.activeModelRole);
+      const edited = {};
+      Object.keys(drafts()).forEach(function (role) {
+        const draft = drafts()[role];
+        if (draft.dirty || draft.selectionTouched) edited[role] = draft;
+      });
+      state.modelPanelDrafts = edited;
       // initModelPanel 内会按加载结果刷新提示文案与"清除会话覆盖"按钮可见性
       initModelPanel();
     });
@@ -424,6 +453,7 @@
   });
 
   enhanceCancel.addEventListener("click", function () {
+    ++panelVersion;
     enhancePanel.classList.add("hidden");
     if (App.dockEnhancePanel) App.dockEnhancePanel();
   });
@@ -452,6 +482,10 @@
   enhanceReset.addEventListener("click", applyRoleDefaults);
 
   enhanceConfirm.addEventListener("click", async function () {
+    if (panelSessionId !== (state.sessionId || undefined)) {
+      toast("当前会话已切换，请重新打开参数面板后保存");
+      return;
+    }
     // 确认时先把当前页最新表单也写入草稿，再检查四个角色的草稿。
     // 页签切换只切换表单视图，未保存改动一直由 modelPanelDrafts 按角色持有。
     saveRoleDraft(state.activeModelRole);
@@ -461,15 +495,18 @@
       const draft = drafts()[role];
       if (!draft) continue;
       const key = String(draft.selectedModelKey || "");
-      const modelChanged = key !== currentModelKey(role);
-      const headersNow = JSON.stringify(Array.isArray(draft.headers) ? draft.headers : []);
       const cfg = state.modelConfigs[role];
+      // 服务端显示的是有效回退值，不能据此把修复失效覆盖判为“未变化”。
+      const invalidOverride = Boolean(state.sessionId && cfg && cfg.role_info && cfg.role_info.selection_invalid);
+      const modelChanged = key !== currentModelKey(role) || invalidOverride;
+      const headersNow = JSON.stringify(Array.isArray(draft.headers) ? draft.headers : []);
       const headersBefore = JSON.stringify(
         (cfg && cfg.role_info && cfg.role_info.effective_headers) || []
       );
       const headersChanged = headersNow !== headersBefore;
       const paramsChanged = Boolean(draft.dirty || headersChanged);
-      if (!modelChanged && !paramsChanged) continue;
+      const establishOverride = Boolean(state.sessionId && draft.selectionTouched && !state.modelOverridden[role]);
+      if (!modelChanged && !paramsChanged && !establishOverride) continue;
       if (!key) {
         toast("请先为「" + item.label + "」选择模型");
         return;
@@ -501,6 +538,7 @@
     enhancePanel.inert = true; // 保存请求期间冻结表单，避免快照之后的新编辑被关闭面板丢弃
     const saved = [];
     const sessionId = state.sessionId || undefined;
+    const version = ++panelVersion; // 保存期间使之前的读取失效。
     try {
       // 同一全局配置文件/会话元数据由多个角色共写，顺序提交避免并发覆盖。
       for (const change of changes) {
@@ -515,9 +553,11 @@
         );
         saved.push(change);
       }
+      if (!isCurrentPanel(version, sessionId)) return;
       enhancePanel.classList.add("hidden");
       if (App.dockEnhancePanel) App.dockEnhancePanel();
-      const failed = await loadModelConfigs();
+      const failed = await loadModelConfigs(version, sessionId);
+      if (!isCurrentPanel(version, sessionId)) return;
       state.modelLoadFailed = failed;
       state.modelPanelDrafts = {};   // 保存成功：服务端状态已变化，草稿基线作废
       toast("已保存：" + saved.map(function (item) { return item.label; }).join("、"));
@@ -539,20 +579,26 @@
   // 清除当前角色的会话独立模型选择，恢复跟随全局默认（仅会话内且已覆盖时可见）
   enhanceClearOverride.addEventListener("click", async function () {
     if (!state.sessionId) return;
+    if (panelSessionId !== state.sessionId) return;
+    const sessionId = state.sessionId;
+    const role = state.activeModelRole;
+    const version = ++panelVersion;
     enhanceClearOverride.disabled = true;
     try {
-      const res = await API.selectModel("", "", state.activeModelRole, null, state.sessionId, true);
+      const res = await API.selectModel("", "", role, null, sessionId, true);
+      if (!isCurrentPanel(version, sessionId)) return;
       toast(res.message || "已恢复跟随全局默认模型");
-      state.modelOverridden[state.activeModelRole] = false;
-      const data = await API.getModels(state.activeModelRole, state.sessionId);
+      state.modelOverridden[role] = false;
+      const data = await API.getModels(role, sessionId);
+      if (!isCurrentPanel(version, sessionId)) return;
       // 写缓存 + 状态条模型名原子更新（单一入口，chat_model 角色才影响状态条）
-      if (state.activeModelRole === "chat_model") App.setChatModelConfig(data);
-      else if (data) state.modelConfigs[state.activeModelRole] = data;
+      if (role === "chat_model") App.setChatModelConfig(data);
+      else if (data) state.modelConfigs[role] = data;
       state.modelLoadFailed = false;
-      if (state.modelPanelDrafts) delete state.modelPanelDrafts[state.activeModelRole];
+      if (state.modelPanelDrafts) delete state.modelPanelDrafts[role];
       initModelPanel();
-      if (state.activeModelRole === "chat_model") {
-        App.refreshContextTokenStats(state.sessionId);
+      if (role === "chat_model") {
+        App.refreshContextTokenStats(sessionId);
       }
     } catch (err) {
       toast("清除会话覆盖失败：" + err.message);

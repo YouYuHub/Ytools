@@ -987,6 +987,7 @@
   function ensureSessionId() {
     if (!state.sessionId) {
       state.sessionId = SessionUtils.sanitizeSessionId(SessionUtils.generateSessionId());
+      if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
       // 文件变更徽标事件驱动同步（替代旧 2s 轮询看门狗；未变化时零请求）
       if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     }
@@ -1001,8 +1002,11 @@
     sessionOpenSeq++;
     // 保存当前会话的输入草稿（文本+附件），再进入"待开始"状态
     App.saveSessionDraft();
+    // 新对话时结束进行中的语音输入（识别文本不能串写到新对话的输入框）
+    if (App.stopVoiceInput) App.stopVoiceInput();
     // 只进入"待开始"状态，不生成本地 ID；首次发送消息时才由 ensureSessionId() 分配
     state.sessionId = null;
+    if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     // 清空视图就绪跟踪：新对话不属于任何已打开会话
     readySessionId = "";
     loadingSessionId = "";
@@ -1061,6 +1065,7 @@
     if (App.stopVoiceInput) App.stopVoiceInput();
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
+    if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     // 视图就绪跟踪：加载期间同会话的重复点击被跳过；本次加载完成前旧的
     // 就绪标记失效（成功/空/异常分支各自落定最终状态）
     loadingSessionId = id;

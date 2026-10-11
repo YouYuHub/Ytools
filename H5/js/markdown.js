@@ -36,19 +36,23 @@
 
     // 块级 $$…$$（可跨行；贪婪配对，同段两个 $$ 之间为一段公式）
     text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (_m, tex) {
+      if (tex.includes(FENCE_PH)) return _m;
       return push(true, unescapeTagText(tex));
     });
     // 块级 \[…\]
     text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (_m, tex) {
+      if (tex.includes(FENCE_PH)) return _m;
       return push(true, unescapeTagText(tex));
     });
     // 行内 \(…\)
     text = text.replace(/\\\(([\s\S]+?)\\\)/g, function (_m, tex) {
+      if (tex.includes(FENCE_PH)) return _m;
       return push(false, unescapeTagText(tex));
     });
     // 行内 $…$：内部需含 LaTeX 特征（\命令、^、_、花括号包内容）才认作公式，
     // 避免「两个价格 $5 … $8」被误判；tex 内不允许换行（行内公式单行）
     text = text.replace(/\$([^$\n]+)\$/g, function (match, tex) {
+      if (tex.includes(FENCE_PH)) return match;
       const hasCommand = /\\[a-zA-Z]+/.test(tex);
       const hasScript = /[\^_]\{?[^{}\s]/.test(tex);
       if (!hasCommand && !hasScript) return match;
@@ -457,10 +461,44 @@
     });
   }
 
-  // SVG/Mermaid/Canvas 生成代码块（转义后形态）：```svg / ```mermaid / ```canvas，
-  // 块内是一份完整源码。栅栏遮蔽发生在媒体标签提取/块级解析之前；未闭合的半截
-  // 栅栏不处理（流式中间态按普通代码块展示，闭合后自动变控件）。
-  const MEDIA_FENCE_RE = /^```(svg|mermaid|canvas)\s*$/;
+  // 所有代码围栏共用一套规则：允许 0–3 个空格缩进、反引号/波浪线以及
+  // >=3 字符的围栏。结束围栏必须同字符、长度不小于开头且不带其他内容。
+  // 在媒体/公式提取之前整体保护源码，避免示例被渲染为图片或公式。
+  const FENCE_PH = "\u0004";
+  const FENCE_LINE_RE = /^([ \t]*)\u0004(\d+)\u0004[ \t]*$/;
+
+  function openingFence(line) {
+    const match = /^( {0,3})(`{3,}|~{3,})([^\n]*)$/.exec(line);
+    if (!match || (match[2][0] === "`" && match[3].includes("`"))) return null;
+    const info = match[3].trim();
+    return { indent: match[1].length, marker: match[2][0], length: match[2].length,
+      info: info, lang: info.split(/\s+/)[0] || "code" };
+  }
+
+  function closesFence(line, fence) {
+    const match = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+    return !!match && match[1][0] === fence.marker && match[1].length >= fence.length;
+  }
+
+  function extractFencedBlocks(text) {
+    const lines = text.split("\n"), blocks = [], output = [];
+    for (let i = 0; i < lines.length; i++) {
+      const fence = openingFence(lines[i]);
+      if (!fence) { output.push(lines[i]); continue; }
+      const prefix = " ".repeat(fence.indent), body = [];
+      i++;
+      while (i < lines.length && !closesFence(lines[i], fence)) {
+        // 只移除开头围栏引入的缩进；代码自身的额外缩进原样保留。
+        let remove = 0;
+        while (remove < fence.indent && lines[i][remove] === " ") remove++;
+        body.push(lines[i].slice(remove));
+        i++;
+      }
+      blocks.push({ ...fence, body: body, closed: i < lines.length });
+      output.push(prefix + FENCE_PH + (blocks.length - 1) + FENCE_PH);
+    }
+    return { text: output.join("\n"), blocks: blocks };
+  }
 
   function unescapeTagText(text) {
     return String(text)
@@ -532,81 +570,16 @@
     );
   }
 
-  // 提取全部伪标签为占位符：流式增量重渲染是纯函数，闭合后才成控件，
-  // 未闭合的半截标签按普通文本显示。
-  // 随后做 ```svg / ```mermaid 代码块栅栏遮蔽：块内文本置空，媒体标签提取/
-  // 块级解析都不会命中栅栏内内容，代码块解析按完整栅栏正常渲染（提取函数
-  // 只遮蔽并记录源码，双视图控件在块级代码块分支构建）。
+  // 代码围栏已整体提取，只把正文中的完整伪标签转成媒体控件。
+  // 流式中间态的未闭合标签仍按普通文本显示。
   function extractMediaTags(escapedText) {
     const widgets = [];
-    const fenceBlocks = [];  // 各媒体栅栏 {kind:"svg"|"mermaid", code}，文档顺序
     const text = escapedText.replace(MEDIA_TAG_RE, function (match, kind, attrText, _body) {
+      if (match.includes(FENCE_PH)) return match;
       widgets.push(buildMediaWidget(kind, parseMediaAttrs(attrText), unescapeTagText(match)));
       return MEDIA_PH_OPEN + (widgets.length - 1) + MEDIA_PH_OPEN;
     });
-    const lines = text.split("\n");
-    let fenceStart = -1;
-    let fenceKind = "";
-    let buf = [];
-    for (let li = 0; li <= lines.length; li++) {
-      const isEnd = li === lines.length;
-      const line = isEnd ? null : lines[li];
-      if (fenceStart < 0) {
-        if (!isEnd) {
-          const m = line.match(MEDIA_FENCE_RE);
-          if (m) {
-            fenceStart = li;
-            fenceKind = m[1].toLowerCase();
-            buf = [line];
-          }
-        }
-        continue;
-      }
-      if (isEnd) {
-        // 未闭合栅栏（流式中间态）：不遮蔽、不提取，整体按普通代码块展示；
-        // 栅栏闭合后（流结束或下一帧）才会升级为双视图控件
-        fenceStart = -1;
-        fenceKind = "";
-        buf = [];
-        continue;
-      }
-      if (/^```/.test(line)) {
-        // 栅栏收尾：闭合
-        buf.push(line);
-        const body = buf.slice(1, buf.length - 1);
-        let code = "";
-        if (fenceKind === "svg") {
-          // SVG：取第一个 <svg 行 → 最后一个 </svg> 行（栅栏内说明文字忽略）
-          let firstSvg = -1;
-          let lastSvgEnd = -1;
-          for (let k = 0; k < body.length; k++) {
-            if (firstSvg < 0 && body[k].indexOf("&lt;svg") !== -1) firstSvg = k;
-            if (body[k].indexOf("&lt;/svg&gt;") !== -1) lastSvgEnd = k;
-          }
-          if (firstSvg >= 0 && lastSvgEnd >= firstSvg) {
-            code = body.slice(firstSvg, lastSvgEnd + 1).join("\n");
-          }
-        } else {
-          // Mermaid / Canvas：取全部非空行（整体源码，去掉首尾空行）
-          let s = 0;
-          let e = body.length - 1;
-          while (s <= e && body[s].trim() === "") s++;
-          while (e >= s && body[e].trim() === "") e--;
-          if (s <= e) code = body.slice(s, e + 1).join("\n");
-        }
-        fenceBlocks.push({ kind: fenceKind, code: code });
-        for (let k = 0; k < buf.length; k++) {
-          // 首尾栅栏行保留，其余块内行遮蔽为空（不删行，保持行号对齐）
-          lines[fenceStart + k] = k === 0 || k === buf.length - 1 ? buf[k] : "";
-        }
-        fenceStart = -1;
-        fenceKind = "";
-        buf = [];
-        continue;
-      }
-      buf.push(line);
-    }
-    return { text: lines.join("\n"), widgets: widgets, fenceBlocks: fenceBlocks };
+    return { text: text, widgets: widgets };
   }
 
   function restoreMediaPlaceholders(html, widgets) {
@@ -819,104 +792,54 @@
     return "";
   }
 
-  // 代码栅栏内容遮蔽（供数学公式提取防误伤）：``` 围栏内的行临时替换为
-  // \u0004 重复串（控制字符，公式/媒体/块级解析都不会命中），提取完成后
-  // 按记录原样还原。返回待还原记录 [{idx, orig}]；流式未闭合栅栏遮到末尾。
-  function maskFenceLines(lines) {
-    const records = [];
-    let open = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (open < 0) {
-        if (/^```/.test(lines[i])) open = i;
-        continue;
+  function renderFencedBlock(block) {
+    const lang = block.lang, langKey = lang.toLowerCase(), body = block.body;
+    // 流式半截媒体围栏先显示普通代码，确实闭合后才变成 SVG/Mermaid/Canvas 控件。
+    if (block.closed && block.info === lang && ["svg", "mermaid", "canvas"].includes(langKey)) {
+      let code = "";
+      if (langKey === "svg") {
+        let first = body.findIndex(line => line.includes("&lt;svg")), last = -1;
+        for (let i = 0; i < body.length; i++) if (body[i].includes("&lt;/svg&gt;")) last = i;
+        if (first >= 0 && last >= first) code = body.slice(first, last + 1).join("\n");
+      } else {
+        code = body.join("\n").replace(/^\n+|\n+$/g, "");
       }
-      if (/^```/.test(lines[i])) {
-        for (let k = open + 1; k < i; k++) {
-          records.push({ idx: k, orig: lines[k] });
-          lines[k] = MATH_PH_OPEN === "\u0003" ? "\u0004".repeat(lines[k].length) : lines[k];
-        }
-        open = -1;
-      }
+      if (code.trim()) return buildFenceWidget(langKey, unescapeTagText(code));
     }
-    if (open >= 0) {
-      for (let k = open + 1; k < lines.length; k++) {
-        records.push({ idx: k, orig: lines[k] });
-        lines[k] = "\u0004".repeat(lines[k].length);
-      }
+    let prismLang = "";
+    if (langKey === "diff" || langKey === "patch") {
+      const inner = inferDiffLang(body);
+      prismLang = inner ? "diff-" + inner : "diff";
+    } else {
+      prismLang = LANG_MAP[langKey] || "";
     }
-    return records;
+    const cls = prismLang ? ' class="language-' + prismLang + '"' : "";
+    return '<div class="codeblock"><div class="codeblock-head">' +
+      '<span class="codeblock-lang">' + lang + "</span></div>" +
+      '<button class="copy-btn" type="button" aria-label="复制代码">' +
+      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' +
+      '<span class="copy-label">复制</span></button>' +
+      "<pre><code" + cls + ">" + body.join("\n") + "</code></pre></div>";
   }
 
   function render(src) {
-    const escaped = escapeHtml(String(src || ""));
-    const media = extractMediaTags(escaped);
-    let workText = media.text;
-    let math = { text: workText, items: [] };
-    // 数学公式提取：普通代码栅栏内容先遮蔽（防 $$…$$ 示例被误提取），
-    // 提取后按记录还原栅栏原文，块级解析拿到的是完整栅栏内容
-    const fenceLines = workText.split("\n");
-    const fenceRecords = maskFenceLines(fenceLines);
-    if (fenceRecords.length) {
-      math = mathExtract(fenceLines.join("\n"));
-      const restored = math.text.split("\n");
-      fenceRecords.forEach(function (r) { restored[r.idx] = r.orig; });
-      workText = restored.join("\n");
-    } else {
-      math = mathExtract(workText);
-      workText = math.text;
-    }
-    const text = workText;
+    const escaped = escapeHtml(String(src || "").replace(/\r\n?/g, "\n"));
+    const fences = extractFencedBlocks(escaped);
+    const media = extractMediaTags(fences.text);
+    const math = mathExtract(media.text);
+    const text = math.text;
     const lines = text.split("\n");
     const html = [];
     let i = 0;
-    let svgBlockIdx = 0;   // 已消费的 ```svg 栅栏序号（与 svgBlocks 文档顺序对应）
 
     while (i < lines.length) {
       const line = lines[i];
 
       // 代码块（带语言标题栏 + 复制按钮）
-      if (/^```/.test(line)) {
-        const lang = line.slice(3).trim() || "code";
-        const buf = [];
+      const fenceMatch = FENCE_LINE_RE.exec(line);
+      if (fenceMatch && fences.blocks[Number(fenceMatch[2])]) {
+        html.push(renderFencedBlock(fences.blocks[Number(fenceMatch[2])]));
         i++;
-        while (i < lines.length && !/^```/.test(lines[i])) {
-          buf.push(lines[i]);
-          i++;
-        }
-        i++; // 跳过结尾 ```
-        // SVG/Mermaid/Canvas 生成代码块：栅栏内文本已被置空遮蔽；源码取自
-        // fenceBlocks（与文档中媒体栅栏按序一一对应，空内容栅栏同样消费
-        // 序号），无完整内容时退回普通代码块展示
-        const langKey = lang.toLowerCase();
-        if (langKey === "svg" || langKey === "mermaid" || langKey === "canvas") {
-          if (svgBlockIdx < media.fenceBlocks.length) {
-            const block = media.fenceBlocks[svgBlockIdx++];
-            if (block.code) {
-              html.push(buildFenceWidget(block.kind, unescapeTagText(block.code)));
-              continue;
-            }
-          } else {
-            svgBlockIdx++;
-          }
-        }
-        // 决定 Prism 语言类：diff/patch 推断内层语言（diff-<lang>），其余按标签映射
-        let prismLang = "";
-        if (lang === "diff" || lang === "patch") {
-          const inner = inferDiffLang(buf);
-          prismLang = inner ? "diff-" + inner : "diff";
-        } else {
-          prismLang = LANG_MAP[lang.toLowerCase()] || "";
-        }
-        const cls = prismLang ? ' class="language-' + prismLang + '"' : "";
-        html.push(
-          '<div class="codeblock"><div class="codeblock-head">' +
-          '<span class="codeblock-lang">' + lang + "</span></div>" +
-          '<button class="copy-btn" type="button" aria-label="复制代码">' +
-          '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' +
-          '<span class="copy-label">复制</span>' +
-          "</button>" +
-          "<pre><code" + cls + ">" + buf.join("\n") + "</code></pre></div>"
-        );
         continue;
       }
 
@@ -963,25 +886,29 @@
         continue;
       }
 
-      // 无序列表
-      if (/^\s*[-*+]\s+/.test(line)) {
+      // 列表：缩进的代码围栏属于前一个列表项，保持编号和代码块的归属。
+      const listRE = /^\s*[-*+]\s+/.test(line) ? /^(\s*[-*+]\s+)(.*)$/ :
+        /^\s*\d+\.\s+/.test(line) ? /^(\s*\d+\.\s+)(.*)$/ : null;
+      if (listRE) {
+        const tag = /^\s*\d+\./.test(line) ? "ol" : "ul";
         const buf = [];
-        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-          buf.push("<li>" + renderInline(lines[i].replace(/^\s*[-*+]\s+/, "")) + "</li>");
+        while (i < lines.length && listRE.test(lines[i])) {
+          const item = listRE.exec(lines[i]);
+          let content = renderInline(item[2]);
           i++;
+          // 空行后紧接同一列表项的代码块也可归入；不吞掉无关段落。
+          while (i < lines.length) {
+            let next = i;
+            while (next < lines.length && lines[next].trim() === "") next++;
+            const continued = next < lines.length && FENCE_LINE_RE.exec(lines[next]);
+            const block = continued && fences.blocks[Number(continued[2])];
+            if (!block || continued[1].length < item[1].length) break;
+            content += renderFencedBlock(block);
+            i = next + 1;
+          }
+          buf.push("<li>" + content + "</li>");
         }
-        html.push("<ul>" + buf.join("") + "</ul>");
-        continue;
-      }
-
-      // 有序列表
-      if (/^\s*\d+\.\s+/.test(line)) {
-        const buf = [];
-        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-          buf.push("<li>" + renderInline(lines[i].replace(/^\s*\d+\.\s+/, "")) + "</li>");
-          i++;
-        }
-        html.push("<ol>" + buf.join("") + "</ol>");
+        html.push("<" + tag + ">" + buf.join("") + "</" + tag + ">");
         continue;
       }
 
@@ -999,7 +926,8 @@
       while (
         i < lines.length &&
         lines[i].trim() !== "" &&
-        !/^(#{1,4}\s|```|&gt;|\s*[-*+]\s|\s*\d+\.\s)/.test(lines[i]) &&
+        !/^(#{1,4}\s|&gt;|\s*[-*+]\s|\s*\d+\.\s)/.test(lines[i]) &&
+        !FENCE_LINE_RE.test(lines[i]) &&
         !isTableStart(lines, i)
       ) {
         buf.push(lines[i]);

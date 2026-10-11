@@ -45,7 +45,7 @@ DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 900      # 单个子任务整体超时秒数
 DEFAULT_SUB_AGENT_REPLY_MAX_CHARS = 30000    # 子任务最终回复返回父级前的截断保护（完整轨迹在 JSONL 块内）
 DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX = 3  # 子任务空收尾重试上限：最终回复为空时注入内部消息让子模型再次交付；0 或负数=不限制（一直重试，仍受已启用的轮次/超时限制约束）
 DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX = 3  # 子任务模型调用流式错误续跑上限：出错后注入内部消息从断点继续；0 或负数=不限制（仍受已启用的轮次/超时限制约束）
-DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 3        # 子任务 todo 未完成提醒上限（每次工具执行轮后额度重置）；0=关闭提醒，负数=不限制
+DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 3        # 子任务 todo 未完成提醒上限（成功执行其他工具后额度重置，单纯更新计划不重置）；0=关闭提醒，负数=不限制
 
 # 工具并发执行（前端聊天设置可调，GET/POST /chat_config/tool_concurrency）
 DEFAULT_ONE_TASK_MAX_WORKERS = 3             # 同一轮多个 MCP 工具调用并发执行的线程池大小（实际取值与工具数取较小者）
@@ -285,7 +285,7 @@ class SubAgentRetryConfig(BaseModel):
     )
     todo_remind_max: int = Field(
         DEFAULT_SUB_AGENT_TODO_REMIND_MAX,
-        description="子任务收尾时 todo 未完成提醒次数（每次完整工具执行轮后额度重置）；"
+        description="子任务收尾时 todo 未完成提醒次数（成功执行其他工具后额度重置，单纯更新计划不重置）；"
                     "0=关闭提醒，负数=不限制（仍受已启用的轮次/超时限制约束）",
     )
 
