@@ -352,6 +352,12 @@ def _is_valid_sub_agent_event(event: dict[str, Any]) -> bool:
 
 def _is_valid_event(event: Any) -> bool:
     """判断单条事件是否具备基本结构。允许事件缺少 timestamp（写入时回填）。"""
+    if isinstance(event, dict) and event.get("event") == "tool_approval":
+        return event.get("phase") in {"requested", "resolved", "completed"} and isinstance(event.get("approval"), dict) and isinstance(event["approval"].get("id"), str)
+    if isinstance(event, dict) and event.get("event") == "model_response":
+        return (event.get("protocol") == "responses"
+                and isinstance(event.get("response_id"), str)
+                and isinstance(event.get("record_ref"), str))
     if not isinstance(event, dict):
         return False
     role = event.get("role")

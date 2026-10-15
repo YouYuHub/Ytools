@@ -59,7 +59,7 @@ _MODEL_CONFIG_RESERVED_KEYS = frozenset({"variables", "runtime", "model_selectio
 _MODEL_CONFIG_INTERNAL_PROVIDER_KEYS = frozenset({
     "vendor", "apiKey", "apiType", "models", "url", "name",
     "toolCalling", "vision", "maxInputTokens", "maxOutputTokens",
-    "settings", "id", "description", "mediaLimits",
+    "settings", "id", "description", "mediaLimits", "messagesLimits",
 })
 
 
@@ -97,6 +97,14 @@ def _normalize_support_doc_types(raw: Any) -> list[str]:
         if text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _model_document_types(model, provider):
+    types = _normalize_support_doc_types(model.get("supportDocTypes"))
+    if str(model.get("apiType") or provider.get("apiType") or "").strip().casefold() == "messages":
+        from chat.protocols.messages_content import supported_document_types
+        return supported_document_types(types)
+    return types
 
 
 def _iter_provider_records(config: Any) -> list[dict[str, Any]]:
@@ -345,6 +353,12 @@ def get_model_config(provider_name: str | None = None, model_name: str | None = 
         model_item.get("supportDocTypes")
     )
     resolved_config.setdefault("apiType", "chat-completions")
+    if str(resolved_config["apiType"]).strip().casefold() == "messages":
+        from chat.protocols.messages_content import supported_document_types
+        resolved_config["support_doc_types"] = supported_document_types(resolved_config["support_doc_types"])
+    if str(resolved_config["apiType"]).strip().casefold() == "responses":
+        from chat.protocols.responses_content import supported_document_types
+        resolved_config["support_doc_types"] = supported_document_types(resolved_config["support_doc_types"])
     return resolved_config
 
 
@@ -389,7 +403,7 @@ def list_available_models() -> list[dict[str, Any]]:
     - provider_name: 顶层 provider 名称
     - model_name:   模型命名（models.json 中 models 字段的键名，即写入 .env CHAT_MODEL_NAME 的值）
     - model_id:     请求 API 时使用的模型 id（若未提供则用键名）
-    - api_type:     协议类型（chat-completions / messages）
+    - api_type:     协议类型（chat-completions / messages / responses）
     - url:          端点地址
     - vision / tool_calling / max_input_tokens / max_output_tokens: 模型能力
     - api_key_present: 是否配置了 API Key（不返回明文）
@@ -407,14 +421,15 @@ def list_available_models() -> list[dict[str, Any]]:
                 "provider_name": provider_name,
                 "model_name": model_name,
                 "model_id": model_id,
-                "api_type": str(provider.get("apiType") or "chat-completions"),
-                "url": _normalize_config_name(provider.get("url") or model.get("url")),
+                "api_type": str(model.get("apiType") or provider.get("apiType") or "chat-completions"),
+                "url": _normalize_config_name(model.get("url") or provider.get("url")),
                 "vision": bool(model.get("vision", False)),
                 "tool_calling": bool(model.get("toolCalling", False)),
                 "max_input_tokens": model.get("maxInputTokens") or model.get("max_input_tokens"),
                 "max_output_tokens": model.get("maxOutputTokens") or model.get("max_output_tokens"),
+                "parameter_capabilities": model.get("parameterCapabilities") or model.get("parameter_capabilities") or {},
                 # 原生文档输入能力（前端可据此提示"该类型将按原生文档发送"）
-                "support_doc_types": _normalize_support_doc_types(model.get("supportDocTypes")),
+                "support_doc_types": _model_document_types(model, provider),
                 "api_key_present": bool(isinstance(api_key, str) and api_key.strip()),
             })
     return records
@@ -430,8 +445,8 @@ def _default_model_selection() -> dict[str, dict[str, Any]]:
 
     sub_agent_model 为子智能体（sub_agent 工具派发的子任务）专用角色：
     - 全局/会话未配置（ownership_name/model_name 为空）时，子任务继承父级聊天模型；
-    - 配置后子任务模型调用使用该角色的端点与参数（apiType 必须为 chat-completions，
-      其他协议回退父级聊天模型并打印警告）。
+    - 配置后子任务模型调用使用该角色的端点与参数（支持 chat-completions / messages /
+      responses；模型不存在或协议不支持时回退父级聊天模型并打印警告）。
     """
     return {
         role: {"ownership_name": None, "model_name": None, "parameter": {}, "api_type": None, "headers": []}
@@ -527,15 +542,15 @@ def _normalize_model_selection(raw: Any) -> dict[str, dict[str, Any]]:
 
 
 def _backfill_selection_api_type() -> None:
-    """为内存中的模型选择补齐 api_type（已配置但缺失的，从 models.json 的 apiType 推导）。
+    """从当前模型目录推导内存选择的 api_type，替换缺失或过期缓存。
 
-    仅内存同步、不写盘；select 时保存的 api_type 优先。
+    仅内存同步，不写盘；模型级覆盖优先于 provider 配置。
     """
     global model_selection
     if not isinstance(model_selection, dict):
         return
     for role, entry in model_selection.items():
-        if not isinstance(entry, dict) or entry.get("api_type"):
+        if not isinstance(entry, dict):
             continue
         provider = entry.get("ownership_name")
         model = entry.get("model_name")
@@ -657,8 +672,12 @@ _CHAT_PARAMETER_FIELDS = (
     "extra_body",
     # 协议专属字段：messages 的 thinking、responses 的 max_output_tokens/instructions
     "thinking",
+    "output_config",
+    "stop_sequences",
     "max_output_tokens",
     "instructions",
+    "reasoning",
+    "text",
 )
 
 
@@ -669,9 +688,17 @@ def _parameter_from_buckets(buckets: Any, api_type: str | None) -> dict[str, Any
     """
     if not isinstance(buckets, dict) or not buckets:
         return {}
-    bucket = buckets.get(api_type or "chat_completions")
+    api_type = str(api_type or "chat_completions").casefold().replace("-", "_")
+    bucket = buckets.get(api_type)
     if isinstance(bucket, dict) and bucket:
         return dict(bucket)
+    if api_type == "messages":
+        # Only the common output budget may cross a protocol boundary.
+        common = buckets.get("chat_completions") or {}
+        return {"max_tokens": common["max_tokens"]} if common.get("max_tokens") is not None else {}
+    if api_type == "responses":
+        common = buckets.get("chat_completions") or {}
+        return {"max_output_tokens": common["max_tokens"]} if common.get("max_tokens") is not None else {}
     fallback = buckets.get("chat_completions")
     if isinstance(fallback, dict) and fallback:
         return dict(fallback)
@@ -688,7 +715,9 @@ def get_role_parameter(role: str = "chat_model") -> dict[str, Any]:
     返回新字典，调用方修改不影响全局状态。
     """
     selection = get_role_selection(role)
-    return _parameter_from_buckets(selection.get("parameter"), selection.get("api_type"))
+    config = get_model_config(selection.get("ownership_name"), selection.get("model_name")) if selection.get("ownership_name") and selection.get("model_name") else None
+    api_type = _derive_api_type(config) if config else selection.get("api_type")
+    return _parameter_from_buckets(selection.get("parameter"), api_type)
 
 
 def apply_role_parameter_defaults(body: dict[str, Any], role: str = "chat_model") -> dict[str, Any]:
@@ -786,8 +815,8 @@ def _resolve_selection_target(provider_name: str, model_name: str, role: str) ->
 
     供全局 select_chat_model 与会话级模型选择共用同一套校验规则。
     Raises:
-        ChatModelConfigurationError: 组合不存在，或角色要求的协议不匹配
-        （compaction_model / sub_agent_model 必须为 chat-completions 协议）
+        ChatModelConfigurationError: 组合不存在，或模型协议不受支持
+        （支持 chat-completions / messages / responses）
     """
     normalized_provider = _normalize_config_name(provider_name)
     normalized_model = _normalize_config_name(model_name)
@@ -798,10 +827,9 @@ def _resolve_selection_target(provider_name: str, model_name: str, role: str) ->
         raise ChatModelConfigurationError(
             f"当前模型目录中找不到模型：{normalized_provider} / {normalized_model}"
         )
-    if role in ("compaction_model", "sub_agent_model") and str(chat_config.get("apiType") or "chat-completions").casefold() != "chat-completions":
-        role_label = "压缩模型" if role == "compaction_model" else "子智能体模型"
+    if _derive_api_type(chat_config) not in {"chat_completions", "messages", "responses"}:
         raise ChatModelConfigurationError(
-            f"{role_label}必须为 chat-completions 协议，{normalized_model} 配置为 {chat_config.get('apiType')}"
+            f"当前角色支持 chat-completions/messages/responses，{normalized_model} 配置为 {chat_config.get('apiType')}"
         )
     return chat_config, _derive_api_type(chat_config)
 
@@ -811,7 +839,7 @@ def resolve_selection_target(provider_name: str, model_name: str, role: str) -> 
 
     供全局 select_chat_model 与会话级模型选择共用同一套校验规则（公开入口）。
     Raises:
-        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+        ChatModelConfigurationError: 组合不存在，或 compaction_model 不支持的协议
     """
     return _resolve_selection_target(provider_name, model_name, role)
 
@@ -833,7 +861,7 @@ def build_model_selection_entry(
     - headers 为 None 时沿用 inherit_headers（"仅切换模型、自定义头保持不变"）；
       提供时全量替换（空列表视为清空）。
     Raises:
-        ChatModelConfigurationError: 组合不存在，或 compaction_model 非 chat-completions 协议
+        ChatModelConfigurationError: 组合不存在，或 compaction_model 不支持的协议
     """
     chat_config, api_type = _resolve_selection_target(provider_name, model_name, role)
     buckets = dict(_normalize_parameter_buckets(inherit_parameter))
@@ -859,8 +887,8 @@ def select_chat_model(
 ) -> dict[str, Any]:
     """把模型选择写入 models.json 顶层 `model_selection` 键，并同步内存（实时生效）。
 
-    - role: chat_model / compaction_model / title_model（默认 chat_model）
-    - 校验 models.json 目录中存在该组合；compaction_model 必须为 chat-completions 协议
+    - role: chat_model / compaction_model / title_model / sub_agent_model（默认 chat_model）
+    - 校验 models.json 目录中存在该组合，且模型协议为 chat-completions / messages / responses
     - parameter: 该模型的默认生成参数（如 temperature/max_tokens 等）。按 api_type 分桶存储：
       写入该模型 api_type 对应的桶（如 messages 模型写入 parameter["messages"]），其它桶保留。
       parameter 传 None 时仅切换模型、参数桶不变（同协议切换沿用参数）。

@@ -17,6 +17,8 @@
 """
 # from __future__ import annotations
 
+from chat.protocols import supports_model, normalize_api_type
+from chat.protocols import native_store
 import asyncio
 from pathlib import Path
 import json
@@ -83,6 +85,7 @@ from factory.agent_runtime.context_compaction import (
     load_context_compaction_settings,
     make_oversized_result_preview,
     resolve_oversized_result_token_threshold,
+    compact_active_round_context_if_needed,
 )
 from factory.system_prompt import build_sub_agent_system_text
 from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext
@@ -129,6 +132,7 @@ class SubAgentContext:
     parent_vision_enabled: bool | None = None
     # V2 文件版本链：父级会话轮次号（子任务内文件工具入链标注 round 用）
     parent_round_number: int = 0
+    permission_runtime: Any = None
     # 取消令牌：要求本子任务停止时 set()
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
     # 单个子任务的用户停止，与父级停止/超时分别判定。
@@ -328,8 +332,7 @@ def resolve_sub_agent_vision_enabled(parent_vision_enabled: bool | None) -> bool
             chat_config = get_model_config(str(provider), str(model))
             if (
                 isinstance(chat_config, dict)
-                and str(chat_config.get("apiType") or "chat-completions").casefold()
-                == "chat-completions"
+                and supports_model(chat_config)
             ):
                 return bool(chat_config.get("vision", False))
     except Exception:
@@ -440,6 +443,27 @@ class SubAgentRunner:
         self._todo_loop_guard = TodoLoopGuard()
         self._todo_context = TodoContext()
         self._text_tool_call_retries = 0
+        self._responses_context = None
+        self._active_provider_state = None
+        self.permission_runtime = context.permission_runtime
+        self._permission_resume = None
+        self._permission_replaying = False
+        if self.permission_runtime:
+            from memory.permission_store import load_checkpoint
+            self._permission_resume = load_checkpoint(self.permission_runtime.id, context.agent_id)
+            if self._permission_resume:
+                self.messages = self._permission_resume["messages"][:-1]
+                self.rounds = self._permission_resume["rounds"] - 1
+                self._seq = self._permission_resume["seq"] - 1
+                self.start_emitted = True
+                self._responses_context = self._permission_resume.get("responses_context")
+                api_type = self._permission_resume.get("api_type", "chat-completions")
+                self._api_type, self._is_messages, self._is_responses = api_type, api_type == "messages", api_type == "responses"
+                self._active_provider_state = self._permission_resume["messages"][-1].get("provider_state")
+                self.todo = self._permission_resume.get("todo", self.todo)
+                self._started_monotonic -= self._permission_resume.get("active_seconds", 0)
+                for usage in self._permission_resume.get("usage", []):
+                    self.usage_accumulator.collect({"usage": usage})
         # 计划是否被模型触碰过（成功调用 todo_write 即置位）：收尾提醒只
         # 约束「模型知情且维护过」的计划；父级预置但从未被触碰的计划属隐藏
         # 状态，不拦截有效交付（否则模型完成工作后会被迫补计划再重复交付）
@@ -483,6 +507,12 @@ class SubAgentRunner:
 
     # ----------------------------- 事件发射 -----------------------------
     async def _emit(self, phase: str, **fields: Any) -> None:
+        if self._permission_replaying and phase == "model_call":
+            return
+        if self.permission_runtime and phase == "done":
+            from memory.permission_store import task
+            if task(self.permission_runtime.id)["state"] == "suspended":
+                return
         payload: dict[str, Any] = {
             "event": "sub_agent",
             "agent_id": self.context.agent_id,
@@ -555,8 +585,8 @@ class SubAgentRunner:
         """解析子任务模型配置（docs/sub_agent_v1.md §6.5 模型配置）。
 
         返回 (model_config | None, parameter)：
-        - model_selection.sub_agent_model 已配置且模型仍存在、协议为
-          chat-completions → (该角色配置, sub_agent_model 角色参数)；
+        - model_selection.sub_agent_model 已配置且模型仍存在、协议受支持
+          （chat-completions / messages / responses）→ (该角色配置, sub_agent_model 角色参数)；
         - 未配置/配置失效/协议不符 → (None, chat_model 角色参数)：
           model_config=None 使 ChatLLM 走父级聊天模型解析链（ambient 会话
           覆盖已由 asyncio 任务上下文自动继承），子任务与父级共用同一模型；
@@ -571,7 +601,7 @@ class SubAgentRunner:
         model = selection.get("model_name")
         if provider and model:
             chat_config = get_model_config(str(provider), str(model))
-            if chat_config is not None and str(chat_config.get("apiType") or "chat-completions").casefold() == "chat-completions":
+            if chat_config is not None and supports_model(chat_config):
                 try:
                     parameter = get_role_parameter("sub_agent_model") or {}
                 except Exception:
@@ -624,12 +654,14 @@ class SubAgentRunner:
         self._todo_context.sync(self.messages)
         self._todo_loop_guard.update_context(self.messages)
         request = ChatLLMRequest(
-            messages=build_request_messages(copy_for_request(self.messages)),
+            messages=build_request_messages(copy_for_request(self.messages, api_type=getattr(self, "_api_type", None) if getattr(self, "_api_type", None) in {"messages", "responses"} else None)),
             # 按模型可见性过滤后的工具（vision=false 时不含 read_media，
             # 请求里不出现该 schema，模型就无从知道并调用）
             tools=self._visible_tool_definitions() or None,
             session_id=self.context.session_id,
+            responses_context=self._responses_context,
         )
+        request.responses_context = self._responses_context
         # 临时核对子智能体上游实际 assistant 消息时启用：
         # log_upstream_assistant_messages(
         #     ChatLLM._serialize_messages(request.messages),
@@ -660,10 +692,21 @@ class SubAgentRunner:
         extra_body = parameter.get("extra_body")
         if isinstance(extra_body, dict) and extra_body:
             request.extra_body = dict(extra_body)
+        for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text"):
+            if parameter.get(key) is not None:
+                setattr(request, key, parameter[key])
         return request
 
     async def _model_call(self) -> dict[str, Any]:
         """一次流式模型调用；返回本轮聚合结果（正文/思考/工具调用/finish_reason）。"""
+        if self._permission_resume:
+            saved = self._permission_resume["messages"][-1]
+            self._permission_resume = None
+            self._permission_replaying = True
+            return {"full_response": saved.get("content", ""), "full_reasoning": saved.get("reasoning_content", ""),
+                    "tool_calls": saved.get("tool_calls", []), "provider_state": saved.get("provider_state"),
+                    "finish_reason": "tool_calls", "stream_error": None, "non_retryable": False,
+                    "tool_phase_timeout_hit": False, "stream_truncated": False, "text_tool_call_name": None}
         ctx = self.context
         full_response = ""
         self._live_content = ""
@@ -671,6 +714,8 @@ class SubAgentRunner:
         tool_calls: list[dict] = []
         finish_reason: str | None = None
         stream_error: Any = None
+        non_retryable = False
+        provider_state = None
         usage = self.usage_accumulator
         tool_call_stream_timeout = load_tool_call_stream_timeout()
         tool_phase_deadline: float | None = None
@@ -680,7 +725,49 @@ class SubAgentRunner:
         stream_truncated = False
         text_buffer = TextToolCallBuffer()
         model_config, parameter = self._resolve_request_model_config()
+        try:
+            actual_config = model_config or require_default_chat_config()
+        except Exception:
+            actual_config = {}
+        if self.permission_runtime:
+            self.permission_runtime.bind_config(ctx.agent_id, {"model": actual_config, "servers": ctx.tool_servers, "tools": ctx.tools})
+        self._api_type = normalize_api_type(actual_config.get("apiType"))
+        self._is_messages = self._api_type == "messages"
+        self._is_responses = self._api_type == "responses"
+        if self._is_responses and self._responses_context is None:
+            from .responses_context import start_turn
+            self._responses_context = start_turn(self.messages, scope="sub_agent:" + ctx.agent_id, start_index=0)
+        if self._is_responses:
+            self._responses_context["stop_checker"] = lambda: ctx.stop_requested()
         request = self._build_request(parameter)
+        request.wire_protocol = self._api_type
+        request.protocol_config = actual_config
+        if self._is_responses and self._active_provider_state:
+            from chat.protocols.responses_store import load_state
+            previous_compaction = (load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}).get("record_ref")
+            async def emit_compaction(payload):
+                if payload.get("phase") == "delta":
+                    return
+                await self._emit("notice", seq=self._seq,
+                    message=payload.get("message") or (payload.get("warning") or {}).get("message") or
+                        ("子任务上下文压缩：" + str(payload.get("phase") or "")),
+                    context_compaction=payload)
+            result = await compact_active_round_context_if_needed(self.messages, request, event_emitter=emit_compaction)
+            if result.triggered:
+                self.messages = result.messages
+                from .responses_context import mark_baseline
+                mark_baseline(self._responses_context, self.messages)
+                request = self._build_request(parameter)
+                request.wire_protocol, request.protocol_config = self._api_type, actual_config
+            if result.usage:
+                usage.collect({"id": "sub_compact_" + uuid.uuid4().hex, "usage": result.usage})
+            native = load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}
+            if native.get("phase") == "done" and native.get("record_ref") != previous_compaction and native.get("usage"):
+                values = native["usage"]
+                usage.collect({"id": native["record_ref"], "usage": {
+                    "prompt_tokens": values.get("input_tokens", 0),
+                    "completion_tokens": values.get("output_tokens", 0),
+                    "total_tokens": values.get("total_tokens", 0)}})
         sse_iter = ChatLLM.chat_completions(
             request=request,
             stream=True,
@@ -711,6 +798,23 @@ class SubAgentRunner:
                 event = parse_sse_event(sse_chunk)
                 if event is None:
                     continue
+                provider_state = event.pop("provider_state", None) or provider_state
+                response_record = event.pop("response_record", None)
+                if response_record:
+                    await ctx.emit_event({**response_record, "agent_id": ctx.agent_id,
+                                          "parent_tool_call_id": ctx.parent_tool_call_id})
+                preview = event.pop("tool_call_preview", None)
+                activity = event.pop("upstream_activity", False)
+                if (preview or (activity and tool_phase_deadline is not None)) and tool_call_stream_timeout > 0:
+                    tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                if preview or activity:
+                    continue
+                if event.get("context_window_exceeded"):
+                    event["error"] = "Messages 模型上下文窗口已用尽，请压缩历史后重试"
+                    event["non_retryable"] = True
+                if event.get("refusal") and not full_response:
+                    event["error"] = "Messages 模型拒绝了本次请求"
+                    event["non_retryable"] = True
                 if event.get("stream_truncated"):
                     # 上游提前断开（EOF 未收到 finish_reason）：置标记后跳出，
                     # 走下方"截断续写重试"路径，不按正常收尾处理
@@ -727,6 +831,7 @@ class SubAgentRunner:
                             tool_phase_deadline = None
                         continue
                     stream_error = event.get("error")
+                    non_retryable = bool(event.get("non_retryable"))
                     break
                 usage.collect(event)
                 if event.get("finish_reason") is not None:
@@ -783,6 +888,8 @@ class SubAgentRunner:
             "tool_calls": tool_calls,
             "finish_reason": finish_reason,
             "stream_error": stream_error,
+            "non_retryable": non_retryable,
+            "provider_state": provider_state,
             "tool_phase_timeout_hit": tool_phase_timeout_hit,
             "stream_truncated": stream_truncated,
         }
@@ -800,16 +907,38 @@ class SubAgentRunner:
             media_config = media_config or require_default_chat_config()
         except Exception:
             media_config = {}
+        if self.permission_runtime:
+            self.permission_runtime.bind_config(ctx.agent_id, {"model": media_config, "servers": ctx.tool_servers, "tools": ctx.tools})
         self.read_media_injected_refs = collect_injected_media_keys(limit_media_messages(self.messages, media_config)[0])
+        self._responses_media_calls = {}
         known_tool_names = list(ctx.tool_servers.keys())
-        normalized = normalize_tool_calls(tool_calls, known_tool_names)
+        normalized = tool_calls if getattr(self, "_is_messages", False) or getattr(self, "_is_responses", False) else normalize_tool_calls(tool_calls, known_tool_names)
         todo_blocked = self._todo_loop_guard.observe([
             tc.get("function", {}).get("name", "") for tc in normalized
         ])
         plan = prepare_tool_execution(normalized, known_tool_names)
         parsed_tools = [item for item in plan.parsed_tools if item[2] in ctx.tool_servers]
+        permission_results = []
+        if self.permission_runtime:
+            self.permission_runtime.save(ctx.agent_id, {
+                "messages": self.messages, "rounds": self.rounds, "seq": self._seq,
+                "parent_tool_call_id": ctx.parent_tool_call_id, "parent_round_number": ctx.parent_round_number,
+                "todo": self.todo, "api_type": getattr(self, "_api_type", "chat-completions"),
+                "active_seconds": max(0, time.monotonic() - self._started_monotonic - self.permission_runtime.paused_time(ctx.agent_id)),
+                "usage": list(self.usage_accumulator._usage_by_id.values()),
+                "responses_context": {key: value for key, value in (self._responses_context or {}).items() if key != "stop_checker"},
+            })
+            if getattr(self, "_is_responses", False) and self._active_provider_state:
+                from chat.protocols.responses_store import tool_result as saved_tool_result
+                from memory import permission_store
+                for _, cached_call, _, _ in parsed_tools:
+                    cached_result = saved_tool_result(ctx.session_id, self._active_provider_state, cached_call["id"])
+                    if cached_result and not permission_store.execution(self.permission_runtime.id, ctx.agent_id, cached_call["id"]):
+                        permission_store.completed(self.permission_runtime.id, ctx.agent_id, cached_call["id"], cached_result["content"])
+            parsed_tools, permission_results = await self.permission_runtime.authorize(
+                parsed_tools, ctx.tool_servers, ctx.tool_original_names, ctx.agent_id)
         blocked_tools = [item for item in plan.parsed_tools if item[2] not in ctx.tool_servers]
-        results: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = list(permission_results)
         # 未授权工具：立即拒绝（不推送 tool_start）
         for idx, tc, tn, ta in blocked_tools:
             results.append({
@@ -818,7 +947,7 @@ class SubAgentRunner:
                 "tool_name": tn,
                 "tool_args": ta,
                 "result": f"工具 {tn} 未在子任务工具列表中，禁止调用（子智能体不支持再派发子任务）",
-                "error": None,
+                "error": "unauthorized_tool",
             })
         # over_task 结束信号（prepare_tool_execution 会把它从 parsed_tools 分离，
         # 不进入执行）：执行侧不实际执行，但必须为声明生成配对结果——否则
@@ -834,12 +963,22 @@ class SubAgentRunner:
                 "result": "子任务已由模型宣布结束（over_task）。",
                 "error": None,
             })
-        builtin_results: list[tuple[int, dict, str, dict, Any]] = []
+        from .permission_runtime import DurableResults
+        builtin_results = DurableResults(self.permission_runtime, ctx.agent_id, tuples=True)
         external_tools: list[tuple[int, dict, str, dict]] = []
         document_budget = document_output_token_budget(
             model_config=media_config, messages=self.messages, tools=self._visible_tool_definitions(),
             tool_count=len(parsed_tools))
         for idx, tc, tn, ta in parsed_tools:
+            if self.permission_runtime:
+                self.permission_runtime.begin_call(ctx.agent_id, tc["id"])
+            await self._emit("tool_start", tool_call_id=tc.get("id", ""), function_name=tn, arguments=ta, seq=self._seq)
+            if getattr(self, "_is_responses", False) and self._active_provider_state:
+                from chat.protocols.responses_store import tool_result
+                cached = tool_result(ctx.session_id, self._active_provider_state, tc.get("id"))
+                if cached:
+                    builtin_results.append((idx, tc, tn, ta, cached["content"]))
+                    continue
             if tn == TODO_TOOL_NAME:
                 if todo_blocked:
                     builtin_results.append((idx, tc, tn, ta, self._todo_loop_guard.rejection()))
@@ -942,8 +1081,11 @@ class SubAgentRunner:
                         already_injected=self.read_media_injected_refs,
                         media_limits=get_media_limits(media_config),
                         vision_enabled=self._vision_enabled,
+                        api_type=getattr(self, "_api_type", None) if getattr(self, "_api_type", None) in {"messages", "responses"} else None,
                     )
                 if read_media_result.get("ok"):
+                    for loaded in read_media_result.get("loaded") or []:
+                        self._responses_media_calls[loaded.get("injected_key")] = tc.get("id")
                     self.read_media_injected_refs.update(
                         read_media_result.get("injected_references") or []
                     )
@@ -1006,7 +1148,10 @@ class SubAgentRunner:
                                     + f"；因原生文档批次预算限制，已回退解析文本：{budget_error}"
                                 )
                     else:
-                        self.native_doc_pending_parts.append(native_block["part"])
+                        part = dict(native_block["part"])
+                        if getattr(self, "_is_responses", False):
+                            part["_responses_call_id"] = tc.get("id")
+                        self.native_doc_pending_parts.append(part)
                         self.native_doc_pending_bytes += native_size
                 builtin_results.append((idx, tc, tn, ta, read_document_result))
                 continue
@@ -1026,15 +1171,6 @@ class SubAgentRunner:
                 builtin_results.append((idx, tc, tn, ta, command_result))
                 continue
             external_tools.append((idx, tc, tn, ta))
-        # tool_start 事件（内置 + 外部统一推送；被拦截的不推送）
-        for idx, tc, tn, ta in parsed_tools:
-            await self._emit(
-                "tool_start",
-                tool_call_id=tc.get("id", "") if isinstance(tc, dict) else "",
-                function_name=tn,
-                arguments=ta,
-                seq=self._seq,
-            )
         for idx, tc, tn, ta, result in builtin_results:
             results.append({
                 "index": idx, "tool_call": tc, "tool_name": tn,
@@ -1138,7 +1274,7 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("error", error=detail)
                 await self._emit_done("error", self._final_reply, detail)
                 return self._make_result()
-            elapsed = time.monotonic() - self._started_monotonic
+            elapsed = time.monotonic() - self._started_monotonic - (self.permission_runtime.paused_time(ctx.agent_id) if self.permission_runtime else 0)
             if ctx.timeout_seconds > 0 and elapsed >= ctx.timeout_seconds:
                 self._status = "timeout"
                 self._final_reply = self._build_progress_reply("timeout")
@@ -1167,7 +1303,7 @@ class SubAgentRunner:
                 # 让子模型从已有进度继续——工具轨迹/todo 都在上下文中不丢失；
                 # 0/负=不限制（仍受已启用的轮次/超时限制约束），耗尽才 error 收尾
                 se_limit = self._retry_limits["stream_error_max_attempts"]
-                if se_limit <= 0 or self._stream_error_retries_used < se_limit:
+                if not call.get("non_retryable") and (se_limit <= 0 or self._stream_error_retries_used < se_limit):
                     self._stream_error_retries_used += 1
                     se_label = str(se_limit) if se_limit > 0 else "∞"
                     logger.warning(f"子任务模型调用失败，断点续跑重试 "
@@ -1248,7 +1384,7 @@ class SubAgentRunner:
             # 保证下面 assistant 声明的 id 与 _execute_tool_round 产出的结果
             # 一一配对——上游对声明/结果严格校验，任何"结果无声明"的孤儿或
             # "声明无结果"的悬空都会触发 400 空响应体（父循环同款契约）。
-            normalized_tool_calls = normalize_tool_calls(
+            normalized_tool_calls = tool_calls if getattr(self, "_is_messages", False) or getattr(self, "_is_responses", False) else normalize_tool_calls(
                 tool_calls, list(ctx.tool_servers.keys())
             )
             # 构建带 tool_calls 的 assistant 消息。
@@ -1256,6 +1392,8 @@ class SubAgentRunner:
             # blocked 调用生成拒绝结果，若此处剔除就会形成孤儿结果 → 400。
             # 仅剔除连函数名都没有的结构损坏调用（执行侧同样跳过、不产生结果）。
             assistant_message: dict[str, Any] = {"role": "assistant"}
+            if call.get("provider_state"):
+                assistant_message["provider_state"] = call["provider_state"]
             if full_response:
                 assistant_message["content"] = full_response
             if full_reasoning:
@@ -1430,9 +1568,14 @@ class SubAgentRunner:
                 reasoning_content=full_reasoning or None,
                 content=assistant_message.get("content"),
                 tool_calls=formatted_tool_calls,
+                provider_state=call.get("provider_state"),
             )
             # 工具执行（传入与声明同一份归一化列表，保证 id 一一配对）
+            for native_call in normalized_tool_calls:
+                native_store.tool_started(ctx.session_id, call.get("provider_state"), native_call["id"])
+            self._active_provider_state = call.get("provider_state")
             tool_results = await self._execute_tool_round(normalized_tool_calls)
+            self._permission_replaying = False
             if not tool_results:
                 self.messages.append({
                     "role": "user",
@@ -1450,6 +1593,8 @@ class SubAgentRunner:
                     else json.dumps(tool_args, ensure_ascii=False)
                 )
                 ret = _format_result_text(tool_result["result"])
+                if self.permission_runtime:
+                    self.permission_runtime.finish_call(ctx.agent_id, tool_call_id, tool_result["result"])
                 # 超大结果拒绝：替换为反馈文案，引导子模型重新规划
                 if (
                     oversized_threshold > 0
@@ -1471,8 +1616,10 @@ class SubAgentRunner:
                         oversized_estimated_tokens=estimated_tokens,
                         seq=self._seq,
                     )
+                    native_store.tool_completed(ctx.session_id, call.get("provider_state"), tool_call_id, feedback, True)
                     self.messages.append({
                         "role": "tool",
+                        "tool_is_error": True,
                         "tool_call_id": tool_call_id,
                         "content": feedback,
                         "_tool_name": tool_name,
@@ -1492,11 +1639,20 @@ class SubAgentRunner:
                 # 内置文件工具的展示用 diff：随 tool_result 事件分发（JSONL+SSE），
                 # 模型上下文中的剥离已在 _format_result_text 完成
                 sub_raw_result = tool_result["result"]
+                if tool_result.get("_permission_cached") and isinstance(sub_raw_result, dict):
+                    if tool_name == READ_MEDIA_NAME and sub_raw_result.get("ok"):
+                        loaded = sub_raw_result.get("loaded") or []
+                        self.read_media_pending_parts.extend((item["reference"], item.get("quality"), item.get("start_time"), item.get("end_time"), item["injected_key"]) for item in loaded if item.get("reference"))
+                        self.read_media_injected_refs.update(sub_raw_result.get("injected_references") or [])
+                    if tool_name == READ_DOCUMENT_NAME and isinstance(sub_raw_result.get("native"), dict) and sub_raw_result["native"].get("part"):
+                        self.native_doc_pending_parts.append(sub_raw_result["native"]["part"])
+                    if tool_name == TODO_TOOL_NAME and isinstance(sub_raw_result.get("todos"), list):
+                        self.todo = sub_raw_result["todos"]
                 sub_file_diff = (
                     sub_raw_result.get("_file_diff") if isinstance(sub_raw_result, dict) else None
                 )
                 # V2 版本链：子任务内的文件工具变更同样入链（标注父轮次号）
-                if isinstance(sub_raw_result, dict) and "_file_history" in sub_raw_result:
+                if isinstance(sub_raw_result, dict) and "_file_history" in sub_raw_result and not tool_result.get("_permission_cached"):
                     self._record_file_history(sub_raw_result)
                 await self._emit(
                     "tool_result",
@@ -1508,8 +1664,11 @@ class SubAgentRunner:
                     **({"file_diff": sub_file_diff} if sub_file_diff else {}),
                     seq=self._seq,
                 )
+                tool_is_error = bool(tool_result.get("error") or (isinstance(sub_raw_result, dict) and sub_raw_result.get("error")))
+                native_store.tool_completed(ctx.session_id, call.get("provider_state"), tool_call_id, ret, tool_is_error)
                 self.messages.append({
                     "role": "tool",
+                    "tool_is_error": tool_is_error,
                     "tool_call_id": tool_call_id,
                     "content": ret,
                     "_tool_name": tool_name,
@@ -1532,6 +1691,7 @@ class SubAgentRunner:
                     info = load_any_media_model_part(
                         ctx.session_id, reference, quality=quality,
                         start_time=start_time, end_time=end_time,
+                        **({"api_type": self._api_type} if getattr(self, "_api_type", None) in {"messages", "responses"} else {}),
                     )
                     if info is not None and info.get("part") is not None:
                         media_parts.append(info["part"])
@@ -1546,6 +1706,10 @@ class SubAgentRunner:
                             "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
                         })
                 media_parts = cap_video_parts_in_batch(media_parts)
+                if getattr(self, "_is_responses", False):
+                    for pending, part in zip(self.read_media_pending_parts, media_parts):
+                        if isinstance(part, dict):
+                            part["_responses_call_id"] = self._responses_media_calls.get(pending[4])
                 retained_keys = [
                     key if isinstance(part, dict) and part.get("type") in {"image_url", "input_audio"} else None
                     for (_ref, _quality, _start, _end, key), part in zip(self.read_media_pending_parts, media_parts)
@@ -1697,6 +1861,11 @@ async def run_sub_agent_batch(
     semaphore = asyncio.Semaphore(limits["max_concurrent"])
 
     async def _run_one(context: SubAgentContext) -> dict[str, Any]:
+        if context.permission_runtime:
+            from memory.permission_store import load_checkpoint
+            completed_child = load_checkpoint(context.permission_runtime.id, "result:" + context.agent_id)
+            if completed_child:
+                return completed_child
         runner = SubAgentRunner(context)
         key = (context.session_id, context.agent_id)
         registered = (context, asyncio.current_task())
@@ -1719,7 +1888,8 @@ async def run_sub_agent_batch(
                     await runner._emit("notice", message="排队结束，子任务开始执行", queued=False)
                 if timeout > 0:
                     try:
-                        result = await asyncio.wait_for(runner.run(), timeout=timeout)
+                        from factory.agent_runtime.permission_runtime import run_with_active_timeout
+                        result = await run_with_active_timeout(runner, timeout)
                     except asyncio.TimeoutError:
                         # 硬兜底：Runner 卡死时其 CancelledError 处理器可能没能
                         # 完成 done 发射，这里补写（done_emitted 防重复）
@@ -1758,7 +1928,7 @@ async def run_sub_agent_batch(
                 result = runner._make_result()
             logger.info(f"子任务完成（agent_id={result.agent_id}, status={result.status}, "
                 f"rounds={result.rounds}）")
-            return {
+            output = {
                 "index": context.parent_tool_index,
                 "tool_call": tool_call,
                 "tool_name": SUB_AGENT_TOOL_NAME,
@@ -1772,6 +1942,10 @@ async def run_sub_agent_batch(
                     "usage_total": result.usage_total,
                 },
             }
+            if context.permission_runtime:
+                await context.permission_runtime.retire_agent(context.agent_id)
+                context.permission_runtime.save("result:" + context.agent_id, output)
+            return output
         except Exception as exc:  # 子任务异常不外溢（CancelledError 为 BaseException，不在其中）
             logger.warning(f"子任务异常（agent_id={context.agent_id}）: {exc}")
             return {

@@ -188,11 +188,11 @@ class ResolveTitleModelConfigTests(unittest.TestCase):
 
     def test_wrong_protocol(self):
         with mock.patch.object(title_generator, "get_role_selection", return_value={
-            "ownership_name": "P", "model_name": "M", "parameter": {}, "api_type": "messages",
-        }), mock.patch.object(title_generator, "get_model_config", return_value={"apiType": "messages"}):
+            "ownership_name": "P", "model_name": "M", "parameter": {}, "api_type": "responses",
+        }), mock.patch.object(title_generator, "get_model_config", return_value={"apiType": "unsupported"}):
             config, reason = title_generator.resolve_title_model_config()
         self.assertIsNone(config)
-        self.assertIn("chat-completions", reason)
+        self.assertIn("协议", reason)
 
 
 class MaybeGenerateSessionTitleTests(unittest.IsolatedAsyncioTestCase):

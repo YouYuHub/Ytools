@@ -55,7 +55,7 @@ class ChatRuntimeTests(unittest.TestCase):
         self.assertEqual(acc.count, 1)
         self.assertEqual(target["total_tokens"], 15)
 
-    def test_usage_accumulator_deduplicate_same_usage_across_different_ids(self):
+    def test_usage_accumulator_counts_same_usage_across_different_ids(self):
         acc = UsageAccumulator()
         first = {
             "id": "cmpl-1",
@@ -76,7 +76,7 @@ class ChatRuntimeTests(unittest.TestCase):
         acc.collect(first)
         acc.collect(second)
 
-        self.assertEqual(acc.count, 1)
+        self.assertEqual(acc.count, 2)
 
     def test_memory_manager_exposes_session_meta_interface(self):
         manager = ChatMemoryManager("meta_test_session")

@@ -4,7 +4,7 @@
  * 例如 localStorage.setItem('ytools-api-base', 'http://192.168.1.10:48621')
  */
 const api_url = localStorage.getItem("ytools-api-base")
-  || "http://127.0.0.1:48621";
+  || (typeof location !== "undefined" && /^https?:$/.test(location.protocol) && String(location.pathname).startsWith("/ui") ? location.origin : "http://127.0.0.1:48621");
 
 (function (global) {
   const BASE_KEY = "ytools-api-base";
@@ -19,7 +19,6 @@ const api_url = localStorage.getItem("ytools-api-base")
     }
   }
   const BASE = (storedBase || api_url).replace(/\/$/, "");
-
   async function request(path, options) {
     const res = await fetch(BASE + path, options);
     if (!res.ok) {
@@ -36,7 +35,9 @@ const api_url = localStorage.getItem("ytools-api-base")
           detail = body.detail || body.message || JSON.stringify(body);
         }
       } catch (_) { /* 忽略非 JSON 响应 */ }
-      throw new Error(detail);
+      const error = new Error(detail);
+      error.status = res.status;
+      throw error;
     }
     return res.json();
   }
@@ -182,6 +183,26 @@ const api_url = localStorage.getItem("ytools-api-base")
       return res.text();
     });
   }
+
+  function searchHistory(query, options) {
+    options = options || {};
+    const params = new URLSearchParams({ q: query, limit: String(options.limit || 40), offset: String(options.offset || 0) });
+    if (options.revision) params.set("revision", options.revision);
+    return request("/chat_history/search?" + params.toString(), { signal: options.signal });
+  }
+
+  function getPermissions(session) { return request("/chat_config/permissions" + (session ? "?session_id=" + encodeURIComponent(session) : "")); }
+  function setPermissions(mode, session) { return request("/chat_config/permissions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, session_id: session || null }) }); }
+  function pendingApprovals(session, ids) {
+    return request("/tool_approvals/pending?session_id=" + encodeURIComponent(session) +
+      (ids || []).slice(-200).map(id => "&approval_ids=" + encodeURIComponent(id)).join(""));
+  }
+  function decideApproval(approval, decision) { return request("/tool_approvals/" + encodeURIComponent(approval.id) + "/decision", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: approval.session_id, epoch: approval.epoch, decision }) }); }
+  function previewPermission(session, source) { return request("/tool_approvals/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session, source }) }); }
+  function cancelPermissionTask(taskId, session) { return request("/tool_approvals/tasks/" + encodeURIComponent(taskId) + "/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) }); }
+  function resumePermissionTask(taskId, session) { return request("/tool_approvals/tasks/" + encodeURIComponent(taskId) + "/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) }); }
+  function permissionMediaUrl(session, source, grant) { return BASE + "/permissions/media?session_id=" + encodeURIComponent(session || "default") + "&source=" + encodeURIComponent(source) + (grant ? "&grant=" + encodeURIComponent(grant) : ""); }
 
   function deleteSession(sessionId) {
     return request("/chat_history/delete_file?session_id=" + encodeURIComponent(sessionId), { method: "DELETE" });
@@ -1022,6 +1043,13 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   global.API = {
+    getResponsesState: function (sessionId) {
+      return request("/chat_context/responses_state?session_id=" + encodeURIComponent(sessionId));
+    },
+    rebuildResponsesContext: function (sessionId, source) {
+      return request("/chat_context/responses_rebuild?session_id=" + encodeURIComponent(sessionId) +
+        "&source=" + encodeURIComponent(source || "local"), { method: "POST" });
+    },
     BASE,
     listSessions,
     streamStatus,
@@ -1030,6 +1058,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     getContextTokenStats,
     updateSessionTitle,
     fetchSessionFile,
+    searchHistory,
+    getPermissions, setPermissions, pendingApprovals, decideApproval, previewPermission, permissionMediaUrl, cancelPermissionTask, resumePermissionTask,
     deleteSession,
     listSessionGroups,
     createSessionGroup,

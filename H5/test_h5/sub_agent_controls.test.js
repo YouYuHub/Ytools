@@ -78,6 +78,18 @@ test("用户折叠子任务后，后续增量和排队结束通知均保留折�
   assert.equal(ui.wrap.classList.contains("open"), true);
 });
 
+test("子任务审批已允许或拒绝后不再错误显示等待确认", () => {
+  for (const state of ['approved', 'denied']) {
+    const ui = buildControls([]);
+    ui.applyEvent({ phase: 'start', agent_id: 'child', task: '任务' });
+    const badge = ui.wrap.children[0].children[0].children[3];
+    ui.setApprovalWaiting({ state: 'pending' });
+    assert.equal(badge.textContent, '等待确认');
+    ui.setApprovalWaiting({ state, task_state: 'running' });
+    assert.equal(badge.textContent, '运行中');
+  }
+});
+
 
 test("委派参数默认折叠并保留在子任务卡片内，不被启动及计划事件清除", () => {
   const ui = buildControls([]);

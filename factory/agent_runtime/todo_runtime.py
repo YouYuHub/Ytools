@@ -55,6 +55,12 @@ class TodoContext:
         import copy
         import json
 
+        # Native pending tool exchanges must remain intact. The adapter replays
+        # their signed prefix, and validates every result before the next call.
+        if any(m.get("provider_state", {}).get("record_id") and m.get("tool_calls") for m in messages):
+            self.exchanges = latest_todo_exchanges(messages)
+            return
+
         present = {call.get("id") for message in messages
                    for call in message.get("tool_calls") or []}
         for index in range(0, len(self.exchanges), 2):

@@ -16,22 +16,33 @@ function pipeline() {
   const end = source.indexOf('\n  async function send(', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;
   const cards = [];
+  const tools = [];
+  const terminalNotices = [];
   let navRefreshes = 0;
   const context = {
     state: { sessionId: 'session' }, stickToBottom() {}, pickTitlePreview() { return ''; },
     el(kind) { return new Node(kind); },
     FormatUtils: { prettyJson: JSON.stringify },
+    FILE_BADGE_TOOLS: [],
     App: {
       clearInjectedPending() {},
       appendUserMessage(text, ts, sid, docs, container) { container.appendChild(new Node('user')); },
       rebuildQnav() { navRefreshes += 1; },
-      buildToolBlock() { return { wrap: new Node('tool'), setName() {}, beginStream() {}, addInputDelta() {}, setInputText() {}, finish() {} }; },
+      buildToolBlock() {
+        const tool = { wrap: new Node('tool'), setName() {}, beginStream() {}, addInputDelta() {}, setInputText() {}, setInput() {}, finish() { this.finished = true; },
+          executing() { this.started = true; }, bindPermission(identity) { this.identity = identity; } };
+        tools.push(tool); return tool;
+      },
+      applyToolResult(ui, name, result) { ui.result = result; },
+      permissions: { receive() {} },
+      terminalJobs: { noteToolResult(sid, name) { terminalNotices.push([sid, name]); } },
       buildSubAgentBlock(sid) {
         const card = { wrap: new Node('agent'), sid, input: '', events: [], done: false,
           setDispatchInput(value) { this.input = value; },
           applyEvent(evt) { this.events.push(evt); if (evt.phase === 'done') this.done = true; },
           markReturned() { this.returned = true; }, isDone() { return this.done; },
           finalizeInterrupted() { this.done = true; },
+          applyApproval(approval) { this.approval = approval; },
         };
         cards.push(card); return card;
       },
@@ -42,8 +53,63 @@ function pipeline() {
   vm.runInContext(source.slice(start, functionEnd), context);
   const root = new Node('root');
   const pipe = context.createStreamPipeline(root, 'session', {});
-  return { root, cards, navRefreshes: () => navRefreshes, send: data => pipe.handle({ data }) };
+  return { root, cards, tools, terminalNotices, navRefreshes: () => navRefreshes, send: data => pipe.handle({ data }) };
 }
+
+test('同名工具的审批、启动和逆序结果按调用 ID 配对，不重复建块', () => {
+  const { root, tools, send } = pipeline();
+  send({ tool_calls: [
+    { index: 0, id: 'a', function: { name: 'run_command', arguments: '{}' } },
+    { index: 1, id: 'b', function: { name: 'run_command', arguments: '{}' } },
+  ] });
+  for (const id of ['a', 'b']) send({ event: 'tool_approval', phase: 'requested', approval: { id: 'approval-' + id, agent_id: 'main', tool_call_id: id, tool: 'run_command', round: 1 } });
+  send({ tool_start: { function_name: 'run_command', tool_call_id: 'b' } });
+  send({ tool_return: { function_name: 'run_command', tool_call_id: 'b', result: 'B' } });
+  send({ tool_start: { function_name: 'run_command', tool_call_id: 'a' } });
+  send({ tool_return: { function_name: 'run_command', tool_call_id: 'a', result: 'A' } });
+  assert.equal(root.children.length, 2); assert.equal(tools.length, 2);
+  assert.equal(tools[0].result, 'A'); assert.equal(tools[1].result, 'B');
+});
+
+test('混合允许拒绝的同名命令，只启动允许项，拒绝和执行结果各归原工具块', () => {
+  for (const approved of ['a', 'b']) {
+    const { root, tools, send } = pipeline();
+    const rejected = approved === 'a' ? 'b' : 'a';
+    send({ tool_calls: ['a', 'b'].map((id, index) => ({ index, id, function: { name: 'run_command', arguments: '{}' } })) });
+    for (const id of ['a', 'b']) send({ event: 'tool_approval', phase: 'requested', approval: {
+      id: 'approval-' + id, agent_id: 'main', tool_call_id: id, tool: 'run_command', round: 1,
+    } });
+    send({ tool_return: { function_name: 'run_command', tool_call_id: rejected, result: 'PERMISSION_DENIED' } });
+    send({ tool_start: { function_name: 'run_command', tool_call_id: approved } });
+    send({ tool_return: { function_name: 'run_command', tool_call_id: approved, result: '命令完成' } });
+    assert.equal(root.children.length, 2); assert.equal(tools.length, 2);
+    assert.equal(tools[approved === 'a' ? 0 : 1].result, '命令完成');
+    assert.equal(tools[rejected === 'a' ? 0 : 1].result, 'PERMISSION_DENIED');
+    assert.equal(tools[rejected === 'a' ? 0 : 1].started, undefined);
+    assert.ok(tools.every(tool => tool.finished));
+  }
+});
+
+test('缺少子任务启动帧时审批补建子块，迟到启动仍复用对应派发', () => {
+  const { root, cards, send } = pipeline();
+  send({ event: 'tool_approval', phase: 'requested', approval: { id: 'approval', agent_id: 'child', parent_tool_call_id: 'dispatch', tool_call_id: 'call', tool: 'run_command' } });
+  send({ event: 'sub_agent', phase: 'start', agent_id: 'child', parent_tool_call_id: 'dispatch' });
+  assert.equal(root.children.length, 1); assert.equal(cards.length, 1); assert.equal(cards[0].approval.id, 'approval');
+});
+
+test('旧增量没有 ID 时审批认领原工具块，同名调用通过 index 区分', () => {
+  const { root, tools, send } = pipeline();
+  send({ tool_calls: [
+    { index: 0, function: { name: 'run_command', arguments: '{}' } },
+    { index: 1, function: { name: 'run_command', arguments: '{}' } },
+  ] });
+  for (const [index, id] of [[1, 'b'], [0, 'a']]) send({ event: 'tool_approval', phase: 'requested', approval: { agent_id: 'main', tool: 'run_command', tool_index: index, tool_call_id: id } });
+  assert.equal(root.children.length, 2); assert.equal(tools.length, 2);
+  assert.equal(tools[0].identity.toolCallId, 'a'); assert.equal(tools[1].identity.toolCallId, 'b');
+  send({ tool_return: { function_name: 'run_command', tool_call_id: 'b', result: 'B' } });
+  send({ tool_return: { function_name: 'run_command', tool_call_id: 'a', result: 'A' } });
+  assert.equal(tools.length, 2); assert.equal(tools[0].result, 'A'); assert.equal(tools[1].result, 'B');
+});
 test('并发委派流式参数、逆序启动、返回和下一批调用均复用对应卡片', () => {
   const { root, cards, send } = pipeline();
   send({ tool_calls: [
@@ -119,4 +185,13 @@ test('后续请求重试不会移除已经派发的子任务卡片', () => {
   send({ event: 'sub_agent', phase: 'start', parent_tool_call_id: 'a', agent_id: 'agent_a' });
   send({ error: 'failed', retrying: true, retry: 1, discard_tool_calls: true });
   assert.equal(root.children.filter(n => n.kind === 'agent').length, 1);
+});
+
+test('主流与子任务命令结果通知当前会话终端管理器，子任务其他事件不触发', () => {
+  const { send, terminalNotices } = pipeline();
+  send({ tool_return: { function_name: 'run_command', result: { background: true, job_id: 'bg_one' } } });
+  send({ event: 'sub_agent', phase: 'tool_result', agent_id: 'a', tool_name: 'stop_command', result: 'stopped' });
+  send({ event: 'sub_agent', phase: 'tool_result', agent_id: 'a', function_name: 'poll_command', result: 'running' });
+  send({ event: 'sub_agent', phase: 'tool_start', agent_id: 'a', function_name: 'run_command' });
+  assert.deepEqual(terminalNotices, [['session', 'run_command'], ['session', 'stop_command'], ['session', 'poll_command']]);
 });

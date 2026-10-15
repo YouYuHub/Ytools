@@ -1,6 +1,7 @@
 """网页工具正确性回归；响应固定，不依赖搜索引擎实时内容。"""
 import io
 import threading
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from email.message import Message
@@ -12,7 +13,7 @@ from mcp_server import sys_tools_server as s
 
 def fetch(raw, mode='text', **kwargs):
     with patch.object(s, '_http_request', return_value=('https://test.example/', 200, 'text/html; charset=utf-8', raw.encode())):
-        return s._fetch_url_impl('https://test.example/', mode, kwargs.get('pattern', ''), kwargs.get('tag', ''), kwargs.get('max_chars', 8000), 5, '', 'GET', '', None)
+        return s._fetch_url_impl('https://test.example/', mode, kwargs.get('pattern', ''), kwargs.get('tag', ''), kwargs.get('max_chars', 8000), 5, '', 'GET', '', None, kwargs.get('offset', 0))
 
 
 class FetchTests(unittest.TestCase):
@@ -58,6 +59,49 @@ class FetchTests(unittest.TestCase):
     def test_used_and_declared_encoding_are_reported(self):
         self.assertIn('实际编码: utf-8', fetch('<p>中文正文</p>'))
         self.assertIn('声明/推断编码: utf-8', fetch('<p>中文正文</p>'))
+
+    def test_fetch_pagination_uses_extracted_text_offsets(self):
+        raw = '<main>' + '0123456789' * 40 + '</main>'
+        first = fetch(raw, max_chars=200)
+        second = fetch(raw, max_chars=200, offset=200)
+        self.assertIn('next_offset=200', first)
+        self.assertIn('本次字符 [200, 400)', second)
+        self.assertTrue(first.endswith('0123456789' * 20))
+        self.assertTrue(second.endswith('0123456789' * 20))
+        self.assertNotIn('next_offset=', second)
+
+    def test_empty_dynamic_page_explains_static_extraction_limit(self):
+        result = fetch('<html><body><script>renderPage()</script></body></html>')
+        self.assertIn('没有提取到静态正文', result)
+        self.assertIn('JavaScript', result)
+
+    def test_incomplete_transfer_retains_partial_body_and_marks_it(self):
+        class Response:
+            status = 200
+            headers = {'Content-Type': 'text/html; charset=utf-8'}
+            def geturl(self): return 'https://test.example/'
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): raise IncompleteRead('<main>已收到正文</main>'.encode(), 100)
+        with patch.object(s, 'urlopen', return_value=Response()):
+            result = s._fetch_url_impl('https://test.example/', 'text', '', '', 8000, 5, '', 'GET', '', None)
+        self.assertIn('已收到正文', result)
+        self.assertIn('部分响应', result)
+        self.assertIn('IncompleteRead', result)
+
+    def test_short_content_length_is_not_presented_as_complete(self):
+        raw = b'<p>partial</p>'
+        class Response(io.BytesIO):
+            status = 200
+            headers = {'Content-Type': 'text/html', 'Content-Length': '100'}
+            def geturl(self): return 'https://test.example/'
+        with patch.object(s, 'urlopen', return_value=Response(raw)):
+            result = s._http_request('https://test.example/', allow_partial=True)
+        self.assertEqual(result[3], raw)
+        self.assertIn('Content-Length', result.partial_note)
+        with patch.object(s, 'urlopen', return_value=Response(raw)):
+            with self.assertRaisesRegex(ValueError, '未完整接收'):
+                s._http_request('https://test.example/')
 
     def test_http_error_retains_status_headers_and_body(self):
         headers = Message(); headers['Content-Type'] = 'text/html; charset=utf-8'; headers['Retry-After'] = '30'

@@ -57,7 +57,6 @@ class _FakeStream:
 
 class _MemoryStub:
     def __init__(self):
-        self.run_task = True
         self.records = []
         self.todos = []
 

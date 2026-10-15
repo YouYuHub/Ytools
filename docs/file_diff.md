@@ -30,7 +30,7 @@
 - `read_file` 返回 `content_hash`（全文指纹，可传给 `edit_file.expected_hash`）；
 - 完整 `_file_diff` 不进模型上下文，仅随 SSE 事件与 JSONL 落盘分发；edit_file 另生成精简的模型结果，小型且非重复的 diff 可按需附带；
 - 前端工具块输出区渲染彩色 diff 视图（实时 + 历史回放 + 子任务块三挂点）；
-- MCP sys_tools_server 版同名工具不受影响（返回纯文本，无 diff，前端自动回退）。
+- `sys_tools_server.py` 中同名文件工具已迁移到后端内置工具，MCP 注册块目前注释保留；外部 MCP 同名工具若仍由用户自行注册，则返回纯文本，前端回退普通渲染。
 
 ### 1.2 V1 明确不做（阶段 2 预留）——后续版本已陆续落地
 > 原「阶段 2 预留」的前三项（原子写入 / 版本校验 / history 版本快照）已分别在 V1.x 与 V2 实现；本表仅作历史记录。
@@ -213,14 +213,14 @@ tool-block 状态机配套：
 
 ## 7. 测试与验证
 
-`test/test_file_diff.py`（13 用例）：
+`test/test_file_diff.py`（当前 17 项）：
 - `_build_file_diff`：基础替换统计 / 文件头格式 / CRLF 归一化 / 新建全 `+` / 超限跳过 / unchanged；
 - `write_file`：新建 / 覆盖 / 追加三路径的 `_file_diff` 与 `content_hash`；
 - `edit_file`：成功携带 diff 与 hash（message 含「diff +1 -1 行」）；报错路径无 `_file_diff`；
 - `_format_result_text` / `_format_tool_result` 剥离 `_file_diff`（模型上下文无 diff）；
 - `read_file` 全文 `content_hash`。
 
-验证命令：`python -m pytest test/test_file_diff.py -q --no-header`；全量 `python -m pytest -q --no-header`（当前 468 passed）。
+验证命令：`python -m pytest test/test_file_diff.py -q --no-header`。全量测试数量会随测试文件、可选依赖和本地环境变化；不在本说明中固定记录通过数，请运行 `python -m pytest -q --no-header` 获取当前结果。
 
 ---
 
@@ -308,7 +308,7 @@ graph TD
 | GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed,kept}]}` |
 | GET | `/file_diff/content` | session_id, key, v?(缺省最新) | `{...,v,hash,role,tool,round,encoding,eol,kept,content(全文)}` |
 | GET | `/file_diff/total_diff` | session_id, key | `{key,display_path,baseline_v,current_v,kept,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` |
-| GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h?(仅 del/add 行有 h，ctx 行无)}],rows_total,hunks:[{index,old_start,old_count,new_start,new_count}],truncated,max_rows,diff,...统计}`（V2.2 全文视图，见 9.8） |
+| GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h?(仅 del/add 行有 h，ctx 行无)}],rows_total（未截断时为 `max(基线行数, 当前行数)`）,hunks:[{index,old_start,old_count,new_start,new_count}],truncated,max_rows,diff,...统计}`（V2.2 全文视图，见 9.8） |
 | GET | `/file_diff/change_diff` | session_id, key, v | `{...,v,prev_v,gen,role,tool,round,at,diff,lines_added,lines_removed}` |
 | POST | `/file_diff/hunk_undo` | body {session_id,key,hunk_index,until_hunk?} | `{ok,hunk,undone_count,total,version}`（追加 hunk_undo 版本并写回磁盘，不可恢复；until_hunk=True 撤回此处及之后） |
 | POST | `/file_diff/hunk_keep` | body {session_id,key,hunk_index,until_hunk?} | `{ok,version,new_gen,kept_hunk,kept_count,total}`（保留该块：其余还原为基线；开新代基线并写回磁盘；until_hunk=True 保留此处及之后） |
@@ -322,7 +322,7 @@ graph TD
 | POST | `/file_diff/revert_all` | body {session_id} | `{reverted_count,reverted:[{key,path,display_path,restored_to}],skipped:[...]}`（V2.4 批量撤回：逐文件回退到各自当前代基线并写回磁盘；错误隔离同上） |
 
 错误映射：KeyError→404、PermissionError→409（含"已保留封版"）、ValueError→400。
-hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上下文下相邻变更可能合并为一个 hunk。
+hunk 序号语义：使用 `SequenceMatcher` 得出的差异块顺序（0 起），是 `full_view`、`hunk_undo`、`hunk_keep` 共用的坐标系；不以 unified diff 的 `@@` 头编号为准。
 
 ### 9.5 轮次号（round）语义
 
@@ -354,7 +354,7 @@ hunk 序号语义：Total Diff 文本中 `@@` 头的顺序（0 起）；n=2 上�
 
 `test/test_file_history.py`（32 用例）：record 入链结构（baseline+tool 全文落盘）/ Total Diff=基线→当前（GPT 建议核心场景）/ 单次 diff / 幂等 unchanged / external 探测 / rollback to_round 与 baseline（磁盘写回验证）/ hunk undo 单块还原（含磁盘写回）/ until_hunk 区间撤/留 / 越界与空变更报错 / user_save 乐观锁冲突与成功 / keep 锁定+新代 / 超大文件不入链 / file_key 大小写稳定 / hunk 头解析 / full_view rows+hunks+截断 / cleanup 批量清理 / full_view.hunks 与接口坐标一致 / keep_all·revert_all 批量封版与批量回退（含错误隔离）。
 
-验证命令：`python -m pytest test/test_file_history.py -q --no-header`；全量（当前 539 passed，其中含 V1 的 13 用例）。
+验证命令：`python -m pytest test/test_file_history.py -q --no-header`。本节历史版本记录中的全量通过数不代表当前工作区结果；请运行当前测试命令获取实际结果。
 
 ### 9.8 V2.0 收敛范围与阶段 3 预留
 
@@ -407,6 +407,6 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **面板避让问题导航条**：顶栏展开面板 `right: 12px → 40px`——右侧问题导航条 qnav（`right:14px`、轨道虚线最宽 20px，最左缘约距右 38px）z-index 30 高于顶栏 26，空间重叠时导航条会画在面板上；面板右缘外移至距主区右缘约 56px、与轨道留 ~18px 间隙（移动端 qnav 隐藏，媒体查询内 `right:8px` 覆盖不变）；
 - **编辑器页主题切换**：顶栏新增下拉（跟随系统/浅色/深色），复用 `js/theme.js` ThemeManager（同一 `ytools-theme-preference` 偏好、`themechange` 事件、system 跟随 prefers-color-scheme）；页面 `<html data-theme="light">` 初值由 theme.js 首绘前按偏好覆盖，消除"编辑器页只有深色"的不可切换问题。
 
-阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 版本链原子写入（tmp+os.replace）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。
+阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 快照文本文件的原子写入（当前 JSON 元数据原子替换，但文本快照仍直接写目标文件）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。
 
 `read_file` 现已在读取前检查 64 MiB 上限，并在读取时再次限制字节数；模型调用链中的返回字符预算还会随当前模型窗口收紧。

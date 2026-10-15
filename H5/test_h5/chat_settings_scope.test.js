@@ -52,6 +52,15 @@ test('聊天设置加载、恢复和保存不改隐藏的回传配置，保留�
   await context.chatSettingsConfirm.events.click();
   assert.equal(saved.length, 16);
   assert.ok(!notices.some(text => text.includes('失败')));
+  const permissions = [];
+  context.App.permissions = { loadSettings: async () => permissions.push('load'), saveSettings: async () => permissions.push('save') };
+  await context.openChatSettings();
+  await context.chatSettingsConfirm.events.click();
+  assert.deepEqual(permissions, ['load', 'save']);
+  context.App.permissions.saveSettings = async () => { throw new Error('后端暂不可用'); };
+  await context.chatSettingsConfirm.events.click();
+  assert.equal(context.chatSettingsConfirm.disabled, false);
+  assert.ok(notices.some(text => text.includes('保存失败：后端暂不可用')));
   const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
   assert.ok(!html.includes('id="reasoningMaxLength"'));
   assert.ok(!html.includes('id="toolResultMaxLength"'));

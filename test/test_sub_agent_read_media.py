@@ -164,7 +164,7 @@ class ResolveSubAgentVisionTests(unittest.TestCase):
                 if role == "sub_agent_model" else {}
             )
             sa.get_model_config = lambda p, m: {
-                "vision": False, "apiType": "messages",
+                "vision": False, "apiType": "unsupported",
             }
             self.assertIs(resolve_sub_agent_vision_enabled(True), True)
         finally:

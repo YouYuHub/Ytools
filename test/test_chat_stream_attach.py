@@ -126,7 +126,7 @@ async def main():
     second = await collect_stream(cf.tool_chat_server(req4b))
     joined = "".join(second)
     assert any("[DONE]" in c for c in second), "新轮应以 [DONE] 结束"
-    assert "块" in joined, "新轮应真正生成内容（run_task 被重置）"
+    assert "块" in joined, "新任务应生成内容，不沿用旧任务停止信号"
     await asyncio.sleep(0.1)
     meta = await (await get_chat_memory_manager(sid)).get_session_meta()
     print("场景4 记录数:", meta["record_count"])

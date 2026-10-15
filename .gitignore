@@ -11,6 +11,7 @@ _tmp_*.txt
 _sec*.txt
 pytest_out.log
 setting/models.json
+setting/key-*.txt
 history_files/
 
 # Local secrets and transient files

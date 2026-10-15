@@ -13,9 +13,11 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-上传接口接收单文件 `application/octet-stream` 原始请求体，通过 `filename` 查询参数传文件名；多文件由前端逐个请求，无需 `python-multipart`。文档解析依赖在 `requirements.txt` 中列为可选项，按实际需要安装和验证。已知问题：`requirements.txt` 可选段中的 `docx` 包名有误（`docx` 是另一个无关包），实际应安装 `python-docx`。服务端口默认是 `48621`；启动后可访问 `http://127.0.0.1:48621/docs` 查看 API 文档。
+上传接口接收单文件 `application/octet-stream` 原始请求体，通过 `filename` 查询参数传文件名；多文件由前端逐个请求，无需 `python-multipart`。文档解析依赖在 `requirements.txt` 中列为可选项，按实际需要安装和验证；DOCX 解析所需的可选依赖名称是 `python-docx`。服务端口默认是 `48621`；启动后可访问 `http://127.0.0.1:48621/docs` 查看 API 文档。
 
-当前 `main.py` 的 `/` 返回 JSON，不提供 H5 页面。可以直接在 Edge 或 Chrome 中打开 `H5/index.html`；其他浏览器不保证全部功能正常；前端默认请求 `http://127.0.0.1:48621`。如后端使用其他地址，参见 [H5 前端说明](H5/README.md#2-指定后端地址)。
+`main.py` 的 `/` 返回 JSON，`/ui/` 提供 H5 页面。可直接打开 `http://127.0.0.1:48621/ui/`，或在 Edge、Chrome 中打开 `H5/index.html`；权限设置位于“＋ → 聊天设置 → 工具权限”，无需控制码；其他浏览器不保证全部功能正常。如后端使用其他地址，参见 [H5 前端说明](H5/README.md#2-指定后端地址)。
+
+工具权限默认“询问”，支持全局默认与每会话独立覆盖。启动命令、调用 MCP、内置工具访问工作目录外资源前需用户批准；“完全控制”保留原来的自由调用行为。等待确认时关闭服务，重启、重新配对后可在原会话继续或放弃；执行结果未知的工具不会自动重跑。详见 [权限使用与实现说明](docs/tool_permissions.md)。
 
 首次聊天前需先配置模型与工具（见下文）。不要把真实密钥、`.env`、会话历史或上传文件直接提交到公开仓库。
 
@@ -35,6 +37,10 @@ python main.py
         "id": "my-chat-model",
         "toolCalling": true,
         "vision": false,
+        "parameterCapabilities": {
+          "temperature": true,
+          "top_p": true
+        },
         "maxInputTokens": 128000,
         "maxOutputTokens": 8192
       }
@@ -50,11 +56,14 @@ python main.py
 ```
 
 - `ownership_name` 为供应商顶层键名，`model_name` 为 `models` 内的模型键名；`id` 为请求 API 时实际发送的模型 id（缺省时使用键名）。
-- `model_selection` 支持四个角色：`chat_model`（聊天）、`compaction_model`（上下文压缩）、`title_model`（会话标题）、`sub_agent_model`（子智能体）；其中 `compaction_model` 与 `sub_agent_model` 仅支持 chat-completions 协议。
+- `model_selection` 支持四个角色：`chat_model`（聊天）、`compaction_model`（上下文压缩）、`title_model`（会话标题）、`sub_agent_model`（子智能体）；角色选择校验支持 chat-completions、messages 和 responses，子智能体已可为该角色单独选模，协议行为以各角色的运行时适配为准。
+- 可选 `parameterCapabilities` 用于声明 Messages/Responses 模型不支持的原生参数（例如 `{"temperature": false, "top_p": false, "thinking_budget": false}`）；默认未声明的参数由供应商自行决定。服务端会再次过滤标记为 `false` 的字段，避免旧会话参数发到上游。
 - 角色的 `parameter`（生成参数）按协议分桶存放（`chat_completions` / `messages` / `responses`），`headers` 为自定义请求头；两者均可省略，也可以直接在前端「参数」面板中修改（写入同一份配置）。
 - 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；启用 `read_document` 后按目标扩展名选择读取方式。不支持原生表格的模型会获得保留表头和原始行号的 Markdown 表格，支持工作表选择和按行续读；文本支持 `offset` / `limit`，结果按当前模型预算分页。原生 PDF 支持页区间；原生文件只发送一次。XLSX/XLS 解析分别需要 `openpyxl`/`xlrd`，详见 [文档读取参数](docs/api_docs.md#内置-read_document-工具factoryagent_runtimebuiltin_toolspy)。
 - 内置文件工具按需勾选：`read_file` 有 64 MiB 读取上限，默认连续读取 200 行，并用 `next_start_line` 指示续读；`edit_file` 支持单处替换或 `edits` 列表一次完成多处替换，`expected_hash` 可校验读后变更；`write_file` 的新调用须明确指定 `mode=create|overwrite|append`，旧调用参数仍兼容；`search_files` 默认按普通文本搜索，正则需指定 `is_regex=true`。勾选 `run_command` 后，模型还可使用 `poll_command`、`stop_command` 管理后台任务；已有会话可在「配置工具」中选择默认 shell。`read_media` 对仍在上下文的图片避免重复注入，已回收的视频区间可以重新读取。
 - 修改保存后自动热重载生效，无需重启服务。
+
+Responses 使用 Python 标准库直接调用 HTTP/JSON/SSE，无需 OpenAI SDK；以 `store: true` 和 `previous_response_id` 增量续聊，支持本地摘要与官方压缩并行、一次重新同步、图片/文档工具及异常恢复。前端显示本地上下文，远端状态单独维护；详见 [Responses 使用说明](docs/responses_api_usage.md) 与 [适配方案](docs/responses_api_stateful_plan.md)。
 
 ## 开发 MCP 工具（setting/mcp_servers.json）
 
@@ -124,11 +133,11 @@ if __name__ == "__main__":
 
 后端测试位于 `test/`。安装 `pytest` 后，可在项目根目录运行 `python -m pytest test -q`；部分 `manual_*.py` 是需要外部服务或人工操作的脚本，不属于普通单元测试。前端测试位于 `H5/test_h5/`，在 `H5/` 目录执行 `npm test`。样式修改应编辑 `H5/style/scss/`，再按 [H5 文档](H5/README.md#4-scss-构建与测试)编译。
 
-专题文档：[API 接口说明](docs/api_docs.md) · [上下文压缩](docs/compact.md) · [文件 Diff 与历史版本链](docs/file_diff.md) · [子智能体](docs/sub_agent_v1.md) · [引用选中文本](docs/quote_selection.md)。
+专题文档：[API 接口说明](docs/api_docs.md) · [上下文压缩](docs/compact.md) · [文件 Diff 与历史版本链](docs/file_diff.md) · [子智能体](docs/sub_agent_v1.md) · [引用选中文本](docs/quote_selection.md) · [后台终端管理](docs/terminal_management.md) · [2026-10-12 会话问题修复记录](docs/session_fixes_2026-10-12.md)。
 
 ## 本地凭据配置
 
-克隆后将 `.env.example` 复制为 `.env`，并将 `setting/models.example.json` 复制为 `setting/models.json`，再在本机填写自己的凭据。真实配置文件已加入 Git 忽略规则，不应提交到仓库。
+复制 `.env.example` 为 `.env`，并将 `setting/models.example.json` 复制为 `setting/models.json`，再按本机环境填写配置。当前项目根目录没有 `.gitignore`；在提交前请自行核实忽略规则，确保不提交真实密钥、`.env`、`setting/models.json`、会话历史或上传文件。示例文件仅供结构参考，不应被当作生产凭据。
 
 注意：`env_manager.py` 支持 `enc:dpapi:` 前缀的 DPAPI 加密凭据，但解密仅在 Windows 上可用；非 Windows 环境加载时会按原样返回密文（无法解密），该格式不要在跨平台部署中使用。
 
@@ -138,18 +147,18 @@ if __name__ == "__main__":
 
 - 所有日志带时间戳、级别与原始消息（如 `[2026-01-01 12:00:00] [INFO] model: deepseek-v4.1-flash`）；
 - `debug` 时终端额外实时打印 SSE 流式增量数据（模型输出原样透传，便于排查协议问题）；
-- `error` 及以上级别追加写入项目根 `log/` 目录（不存在自动创建）的错误日志，记录完整文件路径、行号与函数名，单文件 10MB 滚动保留 5 份；
+- `error` 及以上级别追加写入项目根 `log/` 目录（不存在自动创建）的错误日志，记录完整文件路径、行号与函数名，单文件上限 100MiB，滚动保留 5 份；
 - `warning` 及以下只在终端输出，不写文件。SSE 推送给前端的告警文案不受该配置影响，保持原样。
 
 
 ### 前端语音输入
 
-点击麦克风可在光标或选区处输入中文语音，识别预览实时显示。有文字时可直接点击发送或按回车，发送前冻结当前可见文本并停止识别，迟到结果不会写回输入框。再次点击麦克风会正常结束识别并接收最后一段结果；修改输入框正文、切换会话或离开页面会取消旧识别。连续识别在断开后自动重启，连续五个周期未识别到内容则停止并提示。权限、设备和网络错误有独立提示。
+点击麦克风可在光标或选区处输入中文语音，识别文本实时写入输入框。有文字时可直接发送；发送、切换会话、新建对话或离开页面会取消当前识别，避免迟到结果写回。再次点击麦克风会正常结束识别并接收最后一段结果。用户编辑输入框不会中断听写，会以编辑后的文本和光标重锚定后续插入位置。连续识别在断开后自动重启；约 8 分钟（60 个空识别周期）始终没有识别结果时停止并提示，连续网络异常另有独立上限。权限、设备和网络错误有独立提示。
 
 语音功能使用浏览器 Web Speech API，不调用项目后端转写接口；是否可用及转写准确性取决于浏览器的语音服务。
 
 
-网页工具使用与限制见 [网页搜索与抓取说明](docs/web_tools.md)。
+网页工具使用与限制见 [网页搜索与抓取说明](docs/web_tools.md)；`run_command(background=true)` 创建的后台任务可在 H5 中查看、停止、关闭及下载日志，见[后台终端管理](docs/terminal_management.md)。
 
 ### 工具文本编码
 

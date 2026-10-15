@@ -475,8 +475,7 @@ async def get_local_file(request: Request, path: str, session_id: str = "default
     路径 src 解析出口（前端 markdown 渲染时把本地路径改写为本端点 URL）。
 
     path 支持两种取值：
-    - 绝对路径：全设备任意路径直接读取（授权控制后续通过用户授权机制实现，
-      当前不做限制）；
+    - 绝对路径：询问模式下，工作目录外/控制资源需要匹配会话及来源的读取票据；
     - 相对路径：按会话生效工作目录解析（_meta.work_dir → DEFAULT_CHAT_WORK_DIR
       → 进程 cwd），与模型/工具的相对路径语义一致。
 
@@ -491,6 +490,13 @@ async def get_local_file(request: Request, path: str, session_id: str = "default
         work_dir, _warning = resolve_session_work_dir(normalized)
         base_dir = Path(work_dir) if work_dir else Path.cwd()
         candidate = base_dir / raw
+    from memory.permission_store import policy
+    from factory.agent_runtime.permission_policy import inside, protected
+    from routers.permissions_auth import verify_ticket
+    work_dir, _ = resolve_session_work_dir(normalized)
+    if policy(normalized)["mode"] == "ask" and (not inside(candidate, work_dir or str(Path.cwd())) or protected(candidate)):
+        if not verify_ticket(request.query_params.get("grant", ""), normalized, str(candidate.resolve())):
+            raise HTTPException(status_code=403, detail="工作目录外文件需要用户确认，请通过权限面板申请")
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     return _file_response_with_range(request.headers, candidate, media_mime_type(candidate.name))

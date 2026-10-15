@@ -77,6 +77,9 @@ class Message(BaseModel):
     tool_call_id: Optional[str] = None  # 工具调用 ID（tool role 时必须）
     refusal: Optional[str] = None  # 拒绝内容
     reasoning_content: Optional[str] = None  # 思考内容
+    provider_state: Optional[dict[str, Any]] = Field(default=None, exclude=True)
+    context_item_id: Optional[str] = Field(default=None, exclude=True)
+    tool_is_error: Optional[bool] = Field(default=None, exclude=True)
     # 引用快照（结构化方案，见 docs/quote_selection.md）：用户消息携带
     # 被选中的会话原文，落盘保存、模型视图由 memory.quote_format 序列化为
     # <quote_list> 前置到问题正文；上游请求不含该自定义字段（请求构造时剥离）
@@ -88,6 +91,7 @@ class FunctionDefinition(BaseModel):
     name: str                          # 函数名称
     description: Optional[str] = None  # 函数描述
     parameters: Optional[dict] = None  # JSON Schema 格式的函数参数
+    strict: Optional[bool] = None      # 显式启用供应商支持的严格工具参数校验
 
 
 class ToolDefinition(BaseModel):
@@ -110,6 +114,16 @@ class ChatLLMRequest(BaseModel):
     timeout_drain: int = 120                    # 发送数据冲刷超时秒数
     # enable_thinking: Optional[bool] = None      # 是否启用思考模式，默认为 None（优先从 extra_body 读取）
     extra_body: Optional[dict[str, Any]] = None # 额外的请求体参数（用于传递非标准参数如 enable_thinking）
+    thinking: Optional[dict[str, Any]] = None
+    output_config: Optional[dict[str, Any]] = None
+    stop_sequences: Optional[List[str]] = None
+    max_output_tokens: Optional[int] = None
+    instructions: Optional[str] = None
+    reasoning: Optional[dict[str, Any]] = None
+    text: Optional[dict[str, Any]] = None
+    responses_context: Optional[dict[str, Any]] = Field(default=None, exclude=True)
+    wire_protocol: Optional[str] = Field(default=None, exclude=True)
+    protocol_config: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     parallel_tool_calls: Optional[bool] = True  # 是否允许并行工具调用
     # tool_choice: Optional[str | dict] = None    # 工具选择策略："none", "auto", "required", 或 {"type": "function", "function": {"name": "xxx"}}
     tool_choice: Optional[str | dict] = 'auto'  # 工具选择策略："none", "auto", "required", 或 {"type": "function", "function": {"name": "xxx"}}

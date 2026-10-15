@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+from chat.protocols import supports_model, normalize_api_type
 import asyncio
 import inspect
 from functools import partial
@@ -114,6 +115,7 @@ def build_title_content(
     question_parts: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
     vision_enabled: bool | None = None,
+    api_type: str | None = None,
 ) -> list[dict[str, Any]] | str:
     """组装标题请求的 user content（支持多模态）。
 
@@ -152,7 +154,8 @@ def build_title_content(
 
     try:
         resolved, unresolved = resolve_media_content_parts(
-            session_id, question_parts, vision_enabled=vision_enabled
+            session_id, question_parts, vision_enabled=vision_enabled,
+            **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
         )
     except Exception as exc:
         logger.warning(f"标题请求媒体解析失败（回退纯文本标题）: {exc}")
@@ -202,8 +205,8 @@ def resolve_title_model_config() -> tuple[dict[str, Any] | None, str]:
         return None, f"读取标题模型配置失败：{exc}"
     if config is None:
         return None, f"标题模型配置不存在（{provider} / {model}）"
-    if str(config.get("apiType") or "chat-completions").strip().casefold() != "chat-completions":
-        return None, f"标题模型必须为 chat-completions 协议（{model}）"
+    if not supports_model(config):
+        return None, f"标题模型协议暂不支持（{model}）"
     # 标题角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
     return inject_custom_headers_into_config(config, get_role_headers("title_model")), ""
 
@@ -254,6 +257,18 @@ def _build_title_request(source_content: Any, session_id: str | None) -> ChatLLM
     )
     if isinstance(extra_body, dict) and extra_body:
         request.extra_body = dict(extra_body)
+    config, _ = resolve_title_model_config()
+    if config and normalize_api_type(config.get("apiType")) in {"messages", "responses"}:
+        for key in ("temperature", "top_p", "presence_penalty", "reasoning_effort"):
+            if key not in parameter:
+                request.model_fields_set.discard(key)
+    if config and normalize_api_type(config.get("apiType")) == "responses":
+        import uuid
+        request.responses_context = {"scope": "title_model:" + uuid.uuid4().hex}
+        request.max_output_tokens = int(parameter.get("max_output_tokens") or max(512, request.max_tokens))
+    for key in ("thinking", "output_config", "stop_sequences", "instructions", "reasoning", "text"):
+        if parameter.get(key) is not None:
+            setattr(request, key, parameter[key])
     return request
 
 
@@ -304,6 +319,7 @@ async def maybe_generate_session_title(
         question_parts=question_parts,
         session_id=session_id,
         vision_enabled=vision_enabled,
+        api_type=normalize_api_type(config.get("apiType")),
     )
     request = _build_title_request(source_content, session_id)
     try:
@@ -325,6 +341,9 @@ async def maybe_generate_session_title(
         return None
     title = ""
     if isinstance(result, dict):
+        if result.get("refusal") or result.get("context_window_exceeded"):
+            logger.warning("Messages 标题响应拒绝请求或上下文窗口已用尽，保持旧标题")
+            return None
         title = _clean_title_text(result.get("content") or result.get("reasoning_content"))
     if not title:
         logger.warning("标题模型返回空内容（保持旧机制标题）")

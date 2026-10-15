@@ -117,8 +117,8 @@
     if (src.indexOf("media://") === 0) {
       return API.sessionMediaUrl(state.sessionId, src.slice("media://".length));
     }
-    if (/^(data:|https?:)/i.test(src)) return src;
-    return API.localFileUrl(state.sessionId, src);
+    if (/^data:/i.test(src)) return src;
+    return API.permissionMediaUrl(state.sessionId, src);
   }
 
   function openMediaPreviewForDocument(doc) {

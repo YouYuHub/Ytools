@@ -12,11 +12,12 @@ from threading import Lock
 _cache = OrderedDict()
 _lock = Lock()
 _TTL = 3600
-_PART_KINDS = {'image_url': 'image', 'video_url': 'video', 'input_audio': 'audio', 'file': 'document'}
+_PART_KINDS = {'image_url': 'image', 'image': 'image', 'video_url': 'video', 'input_audio': 'audio', 'file': 'document', 'input_file': 'document', 'document': 'document'}
 
 
 def _key(config):
-    return (config.get('url'), config.get('selected_provider_name'), config.get('selected_model_id'))
+    return (config.get('url'), config.get('selected_provider_name'), config.get('selected_model_id'),
+            str(config.get('apiType') or 'chat_completions').strip().casefold().replace('-', '_'))
 
 
 def get_media_limits(config):
@@ -27,6 +28,8 @@ def get_media_limits(config):
     configured = config.get('media_limits', config.get('mediaLimits', selected.get('mediaLimits', {})))
     limits = {k: v for k, v in configured.items() if k in {'total', *set(_PART_KINDS.values())}
               and isinstance(v, int) and not isinstance(v, bool) and v >= 0} if isinstance(configured, dict) else {}
+    if str(config.get('apiType') or '').strip().casefold() == 'messages':
+        limits.update(audio=0, video=0)
     with _lock:
         cached = _cache.get(_key(config))
         if cached and time.monotonic() - cached[0] < _TTL:
@@ -46,24 +49,39 @@ def limit_media_messages(messages, config):
         return messages, 0
     result = copy.deepcopy(messages)
     used = {}; total = 0; dropped = 0
-    for message in reversed(result):
-        content = message.get('content') if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
+    def limit_parts(content):
+        nonlocal total, dropped
         # Retain the first item of the newest read batch, rather than its last item.
         for index, part in enumerate(content):
             kind = _PART_KINDS.get(part.get('type')) if isinstance(part, dict) else None
-            if not kind:
+            if not isinstance(part, dict):
                 continue
-            if used.get(kind, 0) >= limits.get(kind, float('inf')) or total >= limits.get('total', float('inf')):
+            if kind and (used.get(kind, 0) >= limits.get(kind, float('inf')) or total >= limits.get('total', float('inf'))):
                 content[index] = {'type': 'text', 'text': f'[未发送 {kind}：当前模型的单次请求媒体配额已满或不支持该类型；需要时请单独重新读取，配额为 0 时需更换支持该类型的模型。]'}
                 dropped += 1
-            else:
+                continue
+            if kind:
                 used[kind] = used.get(kind, 0) + 1
                 total += 1
+            if part.get('type') == 'tool_result' and isinstance(part.get('content'), list):
+                limit_parts(part['content'])
+            elif part.get('type') == 'document':
+                source = part.get('source') or {}
+                if source.get('type') == 'content' and isinstance(source.get('content'), list):
+                    limit_parts(source['content'])
+
+    for message in reversed(result):
+        content = message.get('content') if isinstance(message, dict) else None
+        if isinstance(content, list):
+            limit_parts(content)
+    # A cached quota must not alter text-only retries, or repeatedly append the
+    # same notice to an already corrected request with partial response history.
+    if not total and not dropped:
+        return messages, 0
     note = '当前供应商/模型的单次请求媒体限制：' + '，'.join(f'{k}≤{v}' for k, v in limits.items())
     note += '。数量为 1 的类型请每次只读取一个；未发送内容不得当作已看过。新读取媒体可能替换旧媒体，请先记录已读取内容。'
-    result.append({'role': 'user', 'content': note})
+    if not any(message.get('content') == note for message in result if isinstance(message, dict)):
+        result.append({'role': 'user', 'content': note})
     return result, dropped
 
 

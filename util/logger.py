@@ -9,7 +9,7 @@
   未配置或非法时默认 ``info``；
 - 终端输出：配置级别及以上的日志带时间戳打印到 stderr；
 - 文件输出：**ERROR 及以上**追加写入项目根 ``log/error.log``（目录不存在自动创建，
-  RotatingFileHandler 滚动 10MB × 5 备份），格式含完整文件路径、行号与函数名；
+  RotatingFileHandler 滚动 100 MiB × 5 备份），格式含完整文件路径、行号与函数名；
 - DEBUG 专属：SSE 流式数据（模型增量输出）在 DEBUG 等级时以原始 ``print`` 形式
   实时打印到终端（不经日志格式化、不加时间戳，保真流式观感），见
   :func:`debug_stream_print`；

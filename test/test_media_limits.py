@@ -35,6 +35,21 @@ class MediaLimitTests(unittest.TestCase):
         self.assertEqual(result, messages)
         self.assertEqual(dropped, 0)
 
+    def test_quota_notice_is_idempotent_and_text_only_retry_is_unchanged(self):
+        config = dict(_model_config(), media_limits={'image': 1})
+        text = [{'role': 'user', 'content': 'request'}, {'role': 'assistant', 'content': 'prefix'},
+                {'role': 'user', 'content': 'resume'}]
+        self.assertEqual(m.limit_media_messages(text, config), (text, 0))
+        first, _ = m.limit_media_messages([{'role': 'user', 'content': [media('image')]}], config)
+        second, _ = m.limit_media_messages(first, config)
+        self.assertEqual(first, second)
+
+    def test_learned_limits_are_isolated_by_protocol(self):
+        chat_config = _model_config()
+        self.assertTrue(m.learn_media_limit(ERROR, request().model_dump()['messages'], chat_config))
+        messages_config = dict(chat_config, apiType='messages')
+        self.assertEqual(m.get_media_limits(messages_config), {'audio': 0, 'video': 0})
+
     def test_zero_video_does_not_remove_supported_images(self):
         messages = [{'role': 'user', 'content': [media('image'), media('video')]}]
         self.assertTrue(m.learn_media_limit(ERROR, messages, _model_config()))

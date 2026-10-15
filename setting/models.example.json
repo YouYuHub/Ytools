@@ -10,7 +10,7 @@
     "models": {
       "Qwen3.5 2B": {
         "id": "Qwen3.5-2B",
-        "url": "http://172.23.144.63:10001/v1",
+        "url": "http://YOUR_LOCAL_MODEL_HOST:10001/v1",
         "toolCalling": true,
         "vision": false,
         "supportDocTypes": null,
@@ -76,11 +76,18 @@
       "Claude Opus 4.8": {
         "id": "claude-opus-4-8",
         "url": "https://api.apiyi.com/v1",
+        "parameterCapabilities": {
+          "temperature": false,
+          "top_p": false,
+          "thinking_budget": false
+        },
         "toolCalling": true,
         "vision": true,
         "supportDocTypes": [
           ".pdf",
-          ".docx"
+          ".txt",
+          ".md",
+          ".csv"
         ],
         "maxInputTokens": 928000,
         "maxOutputTokens": 24000
@@ -269,21 +276,14 @@
           "max_tokens": 105984
         },
         "messages": {
-          "temperature": 0.7,
-          "top_p": 1,
-          "presence_penalty": 2,
-          "reasoning_effort": "medium",
-          "extra_body": {
-            "enable_thinking": true
-          },
-          "max_tokens": 65536
+          "max_tokens": 8192
         }
       },
       "api_type": "chat_completions",
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": " lolicon1314"
+          "value": "REPLACE_WITH_SESSION_ID"
         }
       ]
     },
@@ -300,13 +300,16 @@
             "enable_thinking": true
           },
           "max_tokens": 105984
+        },
+        "messages": {
+          "max_tokens": 4096
         }
       },
       "api_type": "chat_completions",
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "lolicon1314"
+          "value": "REPLACE_WITH_SESSION_ID"
         }
       ]
     },
@@ -323,13 +326,16 @@
             "enable_thinking": true
           },
           "max_tokens": 8192
+        },
+        "messages": {
+          "max_tokens": 64
         }
       },
       "api_type": "chat_completions",
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "lolicon1314"
+          "value": "REPLACE_WITH_SESSION_ID"
         }
       ]
     },
@@ -346,13 +352,16 @@
             "enable_thinking": true
           },
           "max_tokens": 105984
+        },
+        "messages": {
+          "max_tokens": 8192
         }
       },
       "api_type": "chat_completions",
       "headers": [
         {
           "name": "x-opencode-session",
-          "value": "lolicon1314"
+          "value": "REPLACE_WITH_SESSION_ID"
         }
       ]
     }

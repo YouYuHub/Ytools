@@ -1,6 +1,8 @@
 from util.media_limits import limit_media_messages, get_media_limits
 # 标准库导入
 # import re
+from chat.protocols import normalize_api_type
+from chat.protocols import native_store
 import asyncio
 from pathlib import Path
 import copy
@@ -46,7 +48,7 @@ from memory.quote_format import (
 )
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
-from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext
+from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext, latest_todo_exchanges
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
@@ -168,8 +170,8 @@ def _load_tool_call_stream_timeout(
     return value if value > 0 else 0.0
 
 
-def _copy_for_request(messages: List[dict]) -> List[dict]:
-    return copy_for_request(messages, limit=_load_reasoning_return_max_length())
+def _copy_for_request(messages: List[dict], api_type=None) -> List[dict]:
+    return copy_for_request(messages, limit=_load_reasoning_return_max_length(), api_type=api_type)
 
 
 def _format_tool_result(result: Any) -> str:
@@ -393,6 +395,7 @@ class _SessionStream:
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
         self.live_round_model: dict | None = None  # 本轮生效聊天模型（round_model 推送时记录，回放 marker 携带）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
+        self.stop_requested = False  # 仅属于这个生成任务，不存放在历史管理器中
         self.cond = asyncio.Condition()
         # 运行中注入的用户消息队列（消息引导，inline 模式）：inject 接口写入，
         # 生成循环每轮检查点经 pop_injected_message 取出；与 worker 模式的
@@ -482,7 +485,7 @@ async def _emit_compaction_event(
     round scope 事件归入当前 chat_round.events，session scope 仍为独立 JSONL 行。
     """
     await _stream_emit(stream, f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
-    if payload.get("phase") == "delta":
+    if payload.get("phase") == "delta" or payload.get("event") == "responses_compaction" or "warning" in payload:
         return
     try:
         add_event = getattr(session_chat_memory, "add_context_compaction_event", None)
@@ -603,6 +606,10 @@ async def _compact_task_context_if_needed(
     context_now = estimate_send_context_tokens(messages, tool_request.tools)
     if threshold <= 0 or context_now <= threshold:
         return None
+    if getattr(tool_request, "wire_protocol", None) == "responses":
+        # Include newly completed tool/media results in the frozen native window.
+        # The previous model request predates these results.
+        tool_request.messages = build_request_messages(copy_for_request(messages, api_type="responses"))
     round_start = _find_current_round_start(messages)
     active_messages = messages[round_start:] if round_start is not None else []
     system_message = messages[0] if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" else None
@@ -715,6 +722,16 @@ async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, 
     事件循环同步守卫块内写历史，禁止工作线程写历史——_write_guard 跨进程
     文件锁不可重入）。
     """
+    if payload.get("event") == "model_response" and payload.get("protocol") == "responses":
+        await session_chat_memory.add_chat_history(payload)
+        return
+    if payload.get("phase") == "tool_result":
+        pending = session_chat_memory._round_store.pending_round or {}
+        if any(event.get("event") == "sub_agent" and event.get("phase") == "tool_result"
+               and event.get("agent_id") == payload.get("agent_id")
+               and event.get("tool_call_id") == payload.get("tool_call_id")
+               for event in pending.get("events", [])):
+            return
     try:
         await session_chat_memory.add_sub_agent_event(payload)
     except Exception as persist_error:
@@ -722,7 +739,7 @@ async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, 
     try:
         await _stream_emit(
             stream,
-            f"data: {json.dumps({'event': 'sub_agent', **payload}, ensure_ascii=False)}\n\n",
+            f"data: {json.dumps({'event': 'sub_agent', **{k: v for k, v in payload.items() if k != 'provider_state'}}, ensure_ascii=False)}\n\n",
         )
     except Exception as sse_error:
         logger.warning(f"sub_agent 事件推送失败（phase={payload.get('phase')}）: {sse_error}")
@@ -774,8 +791,11 @@ def _build_sub_agent_contexts(
             if tool_name in round_tool_servers:
                 child_servers[tool_name] = round_tool_servers[tool_name]
                 child_original_names[tool_name] = (round_tool_original_names or {}).get(tool_name, tool_name)
+        from factory.agent_runtime.permission_runtime import CURRENT
+        runtime = CURRENT.get()
+        proposed_agent_id = new_agent_id(used_agent_ids)
         contexts.append(SubAgentContext(
-            agent_id=new_agent_id(used_agent_ids),
+            agent_id=runtime.child_id(tool_call_id, proposed_agent_id) if runtime else proposed_agent_id,
             parent_agent_id="main",
             parent_tool_call_id=tool_call_id,
             parent_tool_index=tool_index,
@@ -793,6 +813,7 @@ def _build_sub_agent_contexts(
             stop_checker=stop_checker,
             parent_vision_enabled=parent_vision_enabled,
             parent_round_number=parent_round_number,
+            permission_runtime=runtime,
         ))
         used_agent_ids.add(contexts[-1].agent_id)
     return contexts
@@ -806,10 +827,15 @@ def is_chat_stream_running(session_id: str) -> bool:
 async def _run_chat_generation(
     tool_request: ChatLLMRequest,
     stream: _SessionStream,
+    permission_resume_id: str | None = None,
 ) -> None:
     """后台独立任务：执行完整 Agent 生成循环，事件写入 stream 缓冲。"""
     # 从请求中获取 session_id
     session_id = getattr(tool_request, 'session_id', 'default')
+    permission_original_request = tool_request.model_dump(exclude_unset=True)
+    from factory.agent_runtime.permission_runtime import PermissionRuntime, replay_stream, DurableResults
+    from memory import permission_store
+    permission_resume = permission_store.load_checkpoint(permission_resume_id) if permission_resume_id else None
     # 会话级模型选择：_meta.model_selection 按角色覆盖 → 全局默认；
     # 失效覆盖发一次 warning，并将实际回退配置保存为新的会话快照。
     # ambient 覆盖仅在本 asyncio 任务上下文内生效（create_task 复制上下文，任务结束自动失效），
@@ -860,6 +886,11 @@ async def _run_chat_generation(
     else:
         vision_enabled = True
         native_doc_types = []
+    api_type = normalize_api_type((chat_config_effective or {}).get("apiType"))
+    is_messages = api_type == "messages"
+    is_responses = api_type == "responses"
+    tool_request.wire_protocol = api_type
+    tool_request.protocol_config = chat_config_effective
     if not vision_enabled:
         vision_warning_event = {
             "warning": {
@@ -1029,6 +1060,29 @@ async def _run_chat_generation(
     incoming_messages = list(messages)
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
+    stop_checker = lambda: bool(getattr(stream, "stop_requested", False) or getattr(stream, "user_stop_requested", False))  # noqa: E731
+    async def permission_emit(event):
+        await session_chat_memory.add_chat_history(event)
+        await _stream_emit(stream, "data: " + json.dumps(event, ensure_ascii=False) + "\n\n")
+    permission_runtime = PermissionRuntime(
+        session_id, permission_original_request,
+        permission_emit,
+        stop_checker, resume_id=permission_resume_id,
+    )
+    if permission_resume:
+        pending = permission_resume.get("pending_round")
+        try:
+            latest_pending = json.loads(session_chat_memory._pending_checkpoint_path.read_text(encoding="utf-8"))
+            if latest_pending.get("event") == "chat_round":
+                pending = latest_pending
+        except (OSError, ValueError):
+            pass
+        session_chat_memory._round_store.pending_round = pending
+    if not is_responses:
+        from chat.protocols.responses_store import load_state, invalidate
+        remote_state = load_state(session_id)
+        if remote_state.get("head_response_id") or remote_state.get("pending_compaction_ref") or remote_state.get("pending_request_ref"):
+            invalidate(session_id, "会话使用其他接口，之后按本地历史重新同步")
     # 编辑重发（target_round）：设置原地重跑目标轮次号。此后：
     # - 轮次收尾替换历史第 N 轮条目而非追加（add_chat_history / stop_current_round）；
     # - 上下文历史截到第 N-1 轮；被摘要覆盖的目标轮在替换落盘后以原文补充，
@@ -1066,14 +1120,23 @@ async def _run_chat_generation(
     except Exception as round_error:
         logger.warning(f"获取轮次号失败（版本链按 round=0 记录）: {round_error}")
         current_round_number = 0
-    # 新生成任务必须显式置回运行态：上一个被中断的任务可能在 finally 里置 False，
-    # 否则本次 while 首轮检查直接跳过，导致新轮空转不生成
-    session_chat_memory.run_task = True
-    # 父级停止信号（层级取消入口）：run_task=False → 父循环与全部子任务一起停止。
-    # 命名定义供模型调用 stop_checker 与 sub_agent 派发（_build_sub_agent_contexts）共享，
-    # 语义与原先内联 lambda 完全一致。
-    stop_checker = lambda: (not session_chat_memory.run_task)  # noqa: E731
+    # 父循环、模型请求、工具和子任务共享当前生成任务的停止信号。
+    if is_responses:
+        from .agent_runtime.responses_context import start_turn
+        from chat.protocols.responses_store import load_state, source_key, invalidate
+        # Pre-generation history compression covers the previous remote head,
+        # not the new question, which will first be sent by the normal call.
+        tool_request.responses_context = start_turn(incoming_messages, start_index=len(incoming_messages))
+        tool_request.responses_context["stop_checker"] = stop_checker
+        remote_state = load_state(session_id)
+        if request_target_round is not None or request_insert_round is not None:
+            invalidate(session_id, "历史编辑或插入，按有效前缀重新建立链")
+            await session_chat_memory.update_context_summary(None)
+        elif remote_state.get("source_key") and remote_state["source_key"] != source_key(chat_config_effective):
+            invalidate(session_id, "模型、端点或账户已变化，按本地上下文重新建立链")
+    permission_final_state = "failed"
     try:
+        permission_runtime.bind_config("main", {"model": chat_config_effective, "servers": round_tool_servers, "original_names": round_tool_original_names, "tools": round_tools})
         # 轮次开始事件：告知前端本轮的最终轮次号（普通发送=已收尾轮次数+1；
         # target_round/insert_round 已在上方单独推送，不再重复）。前端据此给
         # 本轮提问气泡就地补挂编辑/删除入口，不再依赖收尾整段重载（否则最后
@@ -1097,6 +1160,10 @@ async def _run_chat_generation(
                 removed_rounds = await session_chat_memory.truncate_rounds_for_reanswer()
                 if removed_rounds:
                     logger.info(f"覆盖式重新回答：已截断提问后的 {removed_rounds} 个旧轮次")
+                    if is_responses:
+                        from chat.protocols.responses_store import invalidate
+                        invalidate(session_id, "覆盖式重新回答已截断历史")
+                        await session_chat_memory.update_context_summary(None)
         except Exception as trunc_error:
             logger.warning(f"覆盖式回答截断失败（按追加处理）: {trunc_error}")
         # 普通发送：覆盖式截断可能已改变轮次计数，此刻计算并推送
@@ -1155,7 +1222,7 @@ async def _run_chat_generation(
                     + runtime_sys_text
                 ),
             })
-        if use_backend_history:
+        if use_backend_history and not permission_resume:
             try:
                 # 中断恢复：上次任务可能在压缩进行到一半时被终止（无 done 信号）。
                 # 压缩结果采用"完成后一次性写入"，中断不会留下半成品数据——
@@ -1184,13 +1251,13 @@ async def _run_chat_generation(
                 # 压缩模型与聊天模型均失败：终止任务，不回退到原始历史。
                 detail = f"上下文压缩失败，任务已终止：{exc}"
                 logger.error(f"{detail}")
-                session_chat_memory.run_task = False
+                stream.stop_requested = True
                 await _stream_emit(stream, _sse_error_payload(detail))
                 return
             except Exception as exc:
                 detail = f"上下文历史压缩失败，任务已终止：{exc}"
                 logger.error(f"{detail}")
-                session_chat_memory.run_task = False
+                stream.stop_requested = True
                 await _stream_emit(stream, _sse_error_payload(detail))
                 return
             backend_messages = await session_chat_memory.get_context_messages(
@@ -1227,7 +1294,8 @@ async def _run_chat_generation(
                 history_message["quotes"] = latest_user_quotes
             else:
                 history_message.pop("quotes", None)
-            await session_chat_memory.add_chat_history(history_message)
+            if not permission_resume:
+                await session_chat_memory.add_chat_history(history_message)
             if round_model:
                 # 本轮生效聊天模型（provider/name/id）：唯一下发通道。
                 # round_started 帧不再携带 model——该帧只在普通发送路径推送，
@@ -1285,7 +1353,8 @@ async def _run_chat_generation(
         # 带引用的文本占位（图片仅存档，不发图片数据）。
         try:
             unresolved_media = resolve_message_media_refs(
-                session_id, messages, vision_enabled=vision_enabled
+                session_id, messages, vision_enabled=vision_enabled,
+                **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
             )
             if unresolved_media:
                 logger.warning(f"{len(unresolved_media)} 个媒体引用解析失败（文件缺失或非法），"
@@ -1316,7 +1385,7 @@ async def _run_chat_generation(
         # 当前计划由最近一次真实的 todo 调用/完整结果提供，不拼入系统提示。
         # 跨轮历史已被摘要替换时，从落盘原始交互恢复该记录（遵守历史位置截断）。
         todo_context = TodoContext()
-        if use_backend_history:
+        if use_backend_history and not permission_resume:
             getter = getattr(session_chat_memory, "get_latest_todo_exchange", None)
             if callable(getter):
                 try:
@@ -1395,13 +1464,13 @@ async def _run_chat_generation(
                         # 压缩模型与聊天模型均失败：终止任务，不再走后续降级
                         detail = f"上下文压缩失败（聊天模型重试仍不可用），任务已终止：{exc}"
                         logger.error(f"{detail}")
-                        session_chat_memory.run_task = False
+                        stream.stop_requested = True
                         await _stream_emit(stream, _sse_error_payload(detail))
                         return
                     except Exception as exc:
                         detail = f"强制历史压缩失败，任务已终止：{exc}"
                         logger.error(f"{detail}")
-                        session_chat_memory.run_task = False
+                        stream.stop_requested = True
                         await _stream_emit(stream, _sse_error_payload(detail))
                         return
 
@@ -1510,7 +1579,8 @@ async def _run_chat_generation(
             )
             if quotes:
                 model_message["content"] = content_with_quotes(model_message["content"], quotes)
-            unresolved = resolve_message_media_refs(session_id, [model_message], vision_enabled=vision_enabled)
+            unresolved = resolve_message_media_refs(session_id, [model_message], vision_enabled=vision_enabled,
+                                                     **({"api_type": api_type} if api_type in {"messages", "responses"} else {}))
             if unresolved:
                 logger.warning(f"引导消息有 {len(unresolved)} 个媒体引用解析失败")
             messages.append(model_message)
@@ -1521,9 +1591,6 @@ async def _run_chat_generation(
             logger.info(f"已注入运行中用户消息（消息引导）: {inject_text[:80]}")
             return True
 
-        # run_task = True
-        # last_tool_ret = ""  # 上一次调用工具的返回值
-        # while run_task:
         # 上游提前断开（stream_truncated）的重试计数：单次请求内"连续"中断
         # 才累计——每轮正常完成的 API 调用会把计数归零（见下方清零点），
         # 重新发起请求（新轮次/续写重发）后重新计数；连续达到
@@ -1531,7 +1598,19 @@ async def _run_chat_generation(
         model_retries = 0
         text_tool_call_retries = 0
         todo_loop_guard = TodoLoopGuard()
-        while session_chat_memory.run_task:
+        if is_responses:
+            from .agent_runtime.responses_context import start_turn
+            start_index = next((i for i, m in enumerate(messages) if m is latest_user_message), None)
+            tool_request.responses_context = start_turn(messages, start_index=start_index)
+            tool_request.responses_context["stop_checker"] = stop_checker
+        if permission_resume:
+            messages = copy.deepcopy(permission_resume["messages"][:-1])
+            current_round_number = permission_resume.get("round", current_round_number)
+            if is_responses:
+                tool_request.responses_context = permission_resume.get("responses_context") or tool_request.responses_context
+                tool_request.responses_context["stop_checker"] = stop_checker
+        while not stop_checker():
+            permission_replaying = permission_resume is not None
             stream.set_round_start()
             # 每轮检查点：取出注入消息，本轮模型调用即可看到
             try:
@@ -1542,7 +1621,7 @@ async def _run_chat_generation(
                 detail = todo_loop_guard.error_message
                 await session_chat_memory.add_chat_history({"role": "assistant", "error": detail})
                 await _stream_emit(stream, _sse_error_payload(detail))
-                session_chat_memory.run_task = False
+                stream.stop_requested = True
                 break
             tool_request.tools = todo_loop_guard.filter_tools(round_tools) or None
             todo_context.sync(messages)
@@ -1558,6 +1637,7 @@ async def _run_chat_generation(
             # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
             full_response = ""
             full_reasoning = ""
+            provider_state = None
             finish_reason = None  # 追踪模型完成原因：stop（正常完成）、length（token 截断）、tool_calls（工具调用）
             pending_finish_payload: dict[str, Any] | None = None  # 延后发送 finish_reason，先发 usage 尾帧
             stream_error = None  # 追踪上游流式错误（与用户手动停止区分，避免误记为"停止任务"）
@@ -1566,7 +1646,7 @@ async def _run_chat_generation(
             text_tool_call_buffer = TextToolCallBuffer()
             usage_accumulator = UsageAccumulator()
             # 将整形后的请求副本附加到 tool_request；运行时 messages 保持原样。
-            tool_request.messages = build_request_messages(_copy_for_request(messages))
+            tool_request.messages = build_request_messages(_copy_for_request(messages, api_type if api_type in {"messages", "responses"} else None))
             # 临时核对上游实际 assistant 消息时启用：
             # log_upstream_assistant_messages(
             #     ChatLLM._serialize_messages(tool_request.messages),
@@ -1596,11 +1676,12 @@ async def _run_chat_generation(
             # 手动迭代 async generator（而非 async for）：需要对工具调用阶段
             # 施加"事件间隔"超时；超时/提前退出时显式 aclose 立即断开上游连接
             # print(f"[DEBUG] tool_request: {tool_request}")
-            sse_iter = ChatLLM.chat_completions(
+            sse_iter = (replay_stream(permission_resume) if permission_replaying else ChatLLM.chat_completions(
                 request = tool_request, # 传递完整的 ChatLLMRequest 对象（已包含 messages）
                 stream = True,
+                model_config = chat_config_effective,
                 stop_checker = stop_checker  # 父级停止信号（与 sub_agent 派发共享同一 closure）
-            ).__aiter__()
+            )).__aiter__()
             try:
                 while True:
                     if tool_phase_deadline is None or tool_call_stream_timeout <= 0:
@@ -1632,6 +1713,24 @@ async def _run_chat_generation(
                     if event is None:
                         await _stream_emit(stream, sse_chunk)
                         continue
+                    provider_state = event.pop("provider_state", None) or provider_state
+                    response_record = event.pop("response_record", None)
+                    if response_record:
+                        await session_chat_memory.add_chat_history(response_record)
+                    preview = event.pop("tool_call_preview", None)
+                    activity = event.pop("upstream_activity", False)
+                    if preview and tool_call_stream_timeout > 0:
+                        tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                    if activity and tool_phase_deadline is not None and tool_call_stream_timeout > 0:
+                        tool_phase_deadline = time.monotonic() + tool_call_stream_timeout
+                    if event.get("context_window_exceeded"):
+                        event["error"] = "Messages 模型上下文窗口已用尽，请压缩历史后重试"
+                    if event.get("refusal") and not full_response:
+                        event["error"] = "Messages 模型拒绝了本次请求"
+                    for private_key in ("response_complete", "replay_eligible", "stop_reason", "stop_sequence", "context_window_exceeded", "refusal"):
+                        event.pop(private_key, None)
+                    if preview or activity:
+                        continue
                     if event.get("warning"):
                         await _stream_emit(stream, sse_chunk)
                         continue
@@ -1641,13 +1740,13 @@ async def _run_chat_generation(
                         # 部分内容，再以内部消息提示模型继续），不按正常收尾处理
                         stream_truncated = True
                         break
-                    if event.get("done") or not session_chat_memory.run_task:
+                    if event.get("done") or stop_checker():
                         if pending_finish_payload is not None:
                             await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
                             pending_finish_payload = None
                         break
                     if event.get("error") is not None:
-                        await _stream_emit(stream, sse_chunk)
+                        await _stream_emit(stream, f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
                         if event.get("retrying"):
                             if event.get("discard_tool_calls"):
                                 tool_calls.clear()
@@ -1664,7 +1763,7 @@ async def _run_chat_generation(
                             continue
                         stream_error = event.get("error")
                         stream_error_meta = event if isinstance(event, dict) else {}
-                        session_chat_memory.run_task = False
+                        stream.stop_requested = True
                         break
                     # ChatLLM 做了统一处理，会单独发送 usage 事件（不带 finish_reason / choices）
                     # 只要本事件携带 usage 就尝试收集，后续由 completion_id/指纹去重
@@ -1732,7 +1831,7 @@ async def _run_chat_generation(
                         # fc_args = function_call_delta.get("arguments") or ""
                         # if fc_name or fc_args:
                         #     print(f"[STREAM] function_call += name:'{fc_name[:30]}', args_len:{len(fc_args)}", flush=True)
-                    # 过滤 tool_calls 中的 id 和 type 字段后再输出
+                    # 保留工具调用 ID，前端审批与结果必须复用原工具块。
                     filtered_event = _filter_tool_calls_fields(event)
                     if content:
                         if visible_content:
@@ -1799,7 +1898,7 @@ async def _run_chat_generation(
                 await session_chat_memory.add_chat_history(error_record)
                 break  # 任务因错误结束，退出循环
             # 模型回复过程中用户手动停止任务
-            if not session_chat_memory.run_task:
+            if stop_checker():
                 logger.info("停止任务")
                 # 记录 ai 生成的内容
                 if full_reasoning:
@@ -1817,7 +1916,7 @@ async def _run_chat_generation(
                     detail = "模型连续输出文本形式的工具调用，无法执行；请重试本次任务。"
                     await session_chat_memory.add_chat_history({"role": "assistant", "error": detail})
                     await _stream_emit(stream, _sse_error_payload(detail))
-                    session_chat_memory.run_task = False
+                    stream.stop_requested = True
                     break
                 reminder = text_tool_call_reminder(text_tool_call_name)
                 messages.append({"role": "user", "content": reminder, "_internal": True})
@@ -1827,7 +1926,7 @@ async def _run_chat_generation(
                 text_tool_call_retries = 0
             known_tool_names = list(round_tool_servers.keys())
             # 归一化工具调用，修复流式拼接异常（函数名/参数被连在一起）
-            tool_calls = normalize_tool_calls(tool_calls, known_tool_names)
+            tool_calls = tool_calls if is_messages or is_responses else normalize_tool_calls(tool_calls, known_tool_names)
             todo_blocked = todo_loop_guard.observe([
                 tc.get("function", {}).get("name", "") for tc in tool_calls
             ])
@@ -1878,7 +1977,7 @@ async def _run_chat_generation(
                             "max_attempts": stream_truncated_retries,
                         }
                         await session_chat_memory.add_chat_history(error_record)
-                        session_chat_memory.run_task = False
+                        stream.stop_requested = True
                         break
                     model_retries += 1
                     logger.warning(f"上游连接提前断开（未收到 finish_reason），截断续写重试 #{model_retries}")
@@ -1918,6 +2017,8 @@ async def _run_chat_generation(
                 if assistant_message is None and full_reasoning:
                     assistant_message = {"role": "assistant", "content": ""}
                 if assistant_message is not None:
+                    if provider_state:
+                        assistant_message["provider_state"] = provider_state
                     # 思考模型的最终回答同样落盘思考过程（SSE 已实时展示，
                     # JSONL 缺失会导致历史回放/审计看不到思考）。落盘永远
                     # 保存模型原始思考全文，不按回传长度裁剪——裁剪只是
@@ -1936,11 +2037,13 @@ async def _run_chat_generation(
                         continue
                 except Exception as inject_error:
                     logger.warning(f"处理注入消息失败（按任务结束处理）: {inject_error}")
-                session_chat_memory.run_task = False
+                stream.stop_requested = True
                 logger.info("本轮对话未返回工具调用，任务结束")
                 break
             # 构建包含 tool_calls 的 assistant 消息（符合 OpenAI API 规范）
             assistant_message = {"role": "assistant"}
+            if provider_state:
+                assistant_message["provider_state"] = provider_state
             if full_response:
                 assistant_message["content"] = full_response
             # 带 tool_calls 的 assistant 消息只记录本轮模型实际输出的思考；
@@ -1970,6 +2073,9 @@ async def _run_chat_generation(
                     }
                 }
                 formatted_tool_calls.append(formatted_tc)
+            if provider_state:
+                for native_call in formatted_tool_calls:
+                    native_store.tool_started(session_id, provider_state, native_call["id"])
             # 工具调用流式阶段超时（调用结构已完整/部分可用）：不执行工具，
             # 把本次调用按失败处理反馈模型并继续运行——assistant（tool_calls）
             # 消息与每个工具结果成对落盘，保持工具调用链契约完整，模型可
@@ -2002,7 +2108,7 @@ async def _run_chat_generation(
                             "content": timeout_message,
                             "_tool_name": timeout_tool_name,
                         })
-                        await _stream_emit(stream, f"data: {json.dumps({'tool_return': {'function_name': timeout_tool_name, 'arguments': timeout_arguments, 'result': timeout_message, 'timeout': True}}, ensure_ascii=False)}\n\n")
+                        await _stream_emit(stream, f"data: {json.dumps({'tool_return': {'function_name': timeout_tool_name, 'tool_call_id': timeout_call_id, 'arguments': timeout_arguments, 'result': timeout_message, 'timeout': True}}, ensure_ascii=False)}\n\n")
                 else:
                     # 部分调用连工具名都不完整：不写空 tool_calls 的 assistant
                     # 消息（回传上游会 400），改用内部消息提示模型重试
@@ -2023,7 +2129,9 @@ async def _run_chat_generation(
                 continue
             assistant_message["tool_calls"] = formatted_tool_calls
             messages.append(assistant_message)
-            await session_chat_memory.add_chat_history(assistant_message)
+            if not permission_replaying:
+                await session_chat_memory.add_chat_history(assistant_message)
+            permission_resume = None
             # 验证 tool_calls 的完整性
             # print(f"\n[DEBUG] 接收到 {len(tool_calls)} 个工具调用")
             # for i, tc in enumerate(tool_calls):
@@ -2053,6 +2161,7 @@ async def _run_chat_generation(
                 _, ot_tc, _, _ = plan.over_task_call
                 ot_id = ot_tc.get("id", "") if isinstance(ot_tc, dict) else ""
                 ot_ret = "任务已由模型宣布结束（over_task）。"
+                native_store.tool_completed(session_id, provider_state, ot_id, ot_ret)
                 await session_chat_memory.add_chat_history({
                     "role": "tool",
                     "tool_call_id": ot_id,
@@ -2081,6 +2190,7 @@ async def _run_chat_generation(
                         input_text={
                             "role": "tool",
                             "tool_call_id": blocked_tool_call_id,
+                            "tool_is_error": True,
                             "tool_name": blocked_tool_name,
                             "arguments": json.dumps(blocked_tool_args, ensure_ascii=False),
                             "result": blocked_ret,
@@ -2089,13 +2199,16 @@ async def _run_chat_generation(
                     blocked_tool_message = {
                         "role": "tool",
                         "tool_call_id": blocked_tool_call_id,
+                        "tool_is_error": True,
                         "content": blocked_ret,
                         "_tool_name": blocked_tool_name,
                     }
                     messages.append(blocked_tool_message)
+                    native_store.tool_completed(session_id, provider_state, blocked_tool_call_id, blocked_ret, True)
                     blocked_event = {
                         "tool_return": {
                             "function_name": blocked_tool_name,
+                            "tool_call_id": blocked_tool_call_id,
                             "arguments": blocked_tool_args,
                             "result": blocked_ret,
                             "blocked": True,
@@ -2111,7 +2224,7 @@ async def _run_chat_generation(
                 if assistant_message is not None:
                     messages.append(assistant_message)
                     await session_chat_memory.add_chat_history(assistant_message)
-                session_chat_memory.run_task = False
+                stream.stop_requested = True
                 break
             # 如果没有任何有效工具可执行，退出
             if not parsed_tools:
@@ -2119,6 +2232,22 @@ async def _run_chat_generation(
                 logger.warning("没有可执行的有效工具，退出循环")
                 break
             logger.info(f"准备执行 {len(parsed_tools)} 个工具")
+            permission_runtime.save("main", {
+                "messages": messages, "assistant": assistant_message,
+                "pending_round": session_chat_memory._round_store.snapshot_pending_round() if hasattr(session_chat_memory, "_round_store") else None,
+                "round": current_round_number,
+                "responses_context": {k: v for k, v in (tool_request.responses_context or {}).items() if k != "stop_checker"},
+                "tool_servers": round_tool_servers,
+            })
+            if is_responses and provider_state:
+                from chat.protocols.responses_store import tool_result as saved_tool_result
+                for _, cached_call, _, _ in parsed_tools:
+                    cached_result = saved_tool_result(session_id, provider_state, cached_call["id"])
+                    if cached_result and not permission_store.execution(permission_runtime.id, "main", cached_call["id"]):
+                        permission_store.completed(permission_runtime.id, "main", cached_call["id"], cached_result["content"])
+            parsed_tools, permission_results = await permission_runtime.authorize(
+                parsed_tools, round_tool_servers, round_tool_original_names,
+            )
             # 工具开始执行事件：参数已完整、即将调用。前端据此把对应工具块
             # 置为"执行中"，等待结果期间有可感知状态。内置工具（write_file/
             # edit_file/read_file/search_files/todo_write 等）与外部 MCP 工具
@@ -2144,7 +2273,7 @@ async def _run_chat_generation(
             except Exception as start_emit_error:
                 logger.warning(f"tool_start 事件推送失败: {start_emit_error}")
             # 内置工具与 MCP 工具分开执行
-            builtin_results = []
+            builtin_results = DurableResults(permission_runtime, "main", permission_results)
             external_parsed_tools = []
             sub_agent_calls: list[tuple[int, dict, str, list[dict] | None]] = []
             todo_updated = False
@@ -2171,6 +2300,15 @@ async def _run_chat_generation(
                 model_config=chat_config_effective, messages=messages, tools=tool_request.tools,
                 tool_count=len(parsed_tools))
             for idx, tc, tn, ta in parsed_tools:
+                permission_runtime.begin_call("main", tc["id"])
+                if is_responses and provider_state:
+                    from chat.protocols.responses_store import tool_result
+                    cached = tool_result(session_id, provider_state, tc.get("id"))
+                    if cached:
+                        builtin_results.append({"index": idx, "tool_call": tc, "tool_name": tn,
+                                                "tool_args": ta, "result": cached["content"],
+                                                "error": "cached_error" if cached.get("is_error") else None})
+                        continue
                 bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(chat_config_effective),
                                 "_max_tokens": document_budget,
                                 "_default_shell": resolve_default_command_shell(session_id),
@@ -2262,6 +2400,7 @@ async def _run_chat_generation(
                         already_injected=read_media_injected_refs,
                         media_limits=get_media_limits(chat_config_effective),
                         vision_enabled=vision_enabled,
+                        api_type=api_type if api_type in {"messages", "responses"} else None,
                     )
                     if read_media_result.get("ok"):
                         read_media_injected_refs.update(
@@ -2326,7 +2465,10 @@ async def _run_chat_generation(
                                         + f"；因原生文档批次预算限制，已回退解析文本：{budget_error}"
                                     )
                         else:
-                            native_doc_pending_parts.append(native_block["part"])
+                            part = dict(native_block["part"])
+                            if is_responses:
+                                part["_responses_call_id"] = tc.get("id")
+                            native_doc_pending_parts.append(part)
                             native_doc_pending_bytes += native_size
                     builtin_results.append({
                         "index": idx,
@@ -2452,11 +2594,21 @@ async def _run_chat_generation(
                     # _file_diff（内置文件工具的展示用 diff）不进模型上下文：
                     # _format_tool_result 已统一剥离，仅 JSONL 落盘与 SSE 事件中附带
                     raw_result = tool_result['result']
+                    if tool_result.get("_permission_cached") and isinstance(raw_result, dict):
+                        if tool_name == READ_MEDIA_NAME and raw_result.get("ok"):
+                            loaded = raw_result.get("loaded") or []
+                            read_media_pending_parts.extend((item["reference"], item.get("quality"), item.get("start_time"), item.get("end_time"), item["injected_key"]) for item in loaded if item.get("reference"))
+                            read_media_injected_refs.update(raw_result.get("injected_references") or [])
+                        if tool_name == READ_DOCUMENT_NAME and isinstance(raw_result.get("native"), dict) and raw_result["native"].get("part"):
+                            native_doc_pending_parts.append(raw_result["native"]["part"])
+                        if tool_name == TODO_TOOL_NAME and isinstance(raw_result.get("todos"), list):
+                            await session_chat_memory.update_todos(raw_result["todos"])
+                    permission_runtime.finish_call("main", tool_call_id, raw_result)
                     ret = _format_tool_result(raw_result)
                     file_diff = raw_result.get("_file_diff") if isinstance(raw_result, dict) else None
                     # V2 版本链：摘取 _file_history 入链数据（写前/写后全文）落链，
                     # 失败静默（前端展示仍有 file_diff 兜底）；round 号为当前进行中的轮次号
-                    if isinstance(raw_result, dict) and "_file_history" in raw_result:
+                    if isinstance(raw_result, dict) and "_file_history" in raw_result and not tool_result.get("_permission_cached"):
                         await _record_file_history(
                             session_id, tool_name, raw_result, current_round_number
                         )
@@ -2482,7 +2634,7 @@ async def _run_chat_generation(
                                 stream,
                                 f"data: {json.dumps({'content': oversized_feedback}, ensure_ascii=False)}\n\n",
                             )
-                            session_chat_memory.run_task = False
+                            stream.stop_requested = True
                             oversized_abort = True
                             break
                         # JSONL 记录：不落完整结果，落截断预览 + 拒绝信息（保留关键头尾）
@@ -2502,6 +2654,7 @@ async def _run_chat_generation(
                         oversized_event = {
                             "tool_return": {
                                 "function_name": tool_name,
+                                "tool_call_id": tool_call_id,
                                 "arguments": tool_args,
                                 "result": oversized_feedback,
                                 "oversized": True,
@@ -2509,8 +2662,11 @@ async def _run_chat_generation(
                         }
                         await _stream_emit(stream, f"data: {json.dumps(oversized_event, ensure_ascii=False)}\n\n")
                         # 以 tool role 添加超长反馈消息（符合 OpenAI API 规范），模型将看到并重新规划
+                        if provider_state:
+                            native_store.tool_completed(session_id, provider_state, tool_call_id, oversized_feedback, True)
                         messages.append({
                             "role": "tool",
+                            "tool_is_error": True,
                             "tool_call_id": tool_call_id,
                             "content": oversized_feedback,
                             "_tool_name": tool_name,
@@ -2526,14 +2682,18 @@ async def _run_chat_generation(
                         "arguments": json.dumps(tool_args, ensure_ascii=False),
                         "result": ret
                     }
+                    history_record["tool_is_error"] = bool(tool_result.get("error") or (isinstance(raw_result, dict) and raw_result.get("error")))
                     if file_diff:
                         # diff 落盘供历史回放渲染（history_parser 已透传该字段）
                         history_record["file_diff"] = file_diff
-                    await session_chat_memory.add_chat_history(input_text=history_record)
+                    if not any(event.get("role") == "tool" and event.get("tool_call_id") == tool_call_id
+                               for event in (getattr(getattr(session_chat_memory, "_round_store", None), "pending_round", None) or {}).get("events", [])):
+                        await session_chat_memory.add_chat_history(input_text=history_record)
                     # 发送工具调用结果到前端 SSE
                     tool_ret = {
                         "tool_return": {
                             "function_name": tool_name,
+                            "tool_call_id": tool_call_id,
                             "arguments": tool_args,
                             "result": ret
                         }
@@ -2553,6 +2713,11 @@ async def _run_chat_generation(
                         "content": ret,
                         "_tool_name": tool_name,
                     }
+                    if provider_state:
+                        is_error = bool(tool_result.get("error") or (isinstance(raw_result, dict) and raw_result.get("error")))
+                        tool_message["tool_is_error"] = is_error
+                        history_record["tool_is_error"] = is_error
+                        native_store.tool_completed(session_id, provider_state, tool_call_id, ret, is_error)
                     messages.append(tool_message)
                 if todo_updated:
                     try:
@@ -2571,8 +2736,8 @@ async def _run_chat_generation(
                     except Exception as ask_emit_error:
                         logger.warning(f"ask_user 事件推送失败: {ask_emit_error}")
                     # 本轮任务到此暂停：占位工具结果已落盘、消息契约完整，
-                    # 置 run_task=False 后循环正常退出（done 标记 + 收尾压缩）
-                    session_chat_memory.run_task = False
+                    # 置任务停止信号后循环正常退出（done 标记 + 收尾压缩）
+                    stream.stop_requested = True
                 if oversized_abort:
                     break
                 # read_media 数据注入：按坐标现场加载媒体 base64 部件，作为 user
@@ -2589,6 +2754,7 @@ async def _run_chat_generation(
                         info = load_any_media_model_part(
                             session_id, reference, quality=quality,
                             start_time=start_time, end_time=end_time,
+                            **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
                         )
                         if info is not None and info.get("part") is not None:
                             media_parts.append(info["part"])
@@ -2625,6 +2791,8 @@ async def _run_chat_generation(
                         "_internal": True,
                         "_media_injected_keys": retained_keys,
                     }
+                    if is_responses:
+                        media_message["tool_call_id"] = next((tc.get("id") for _, tc, name, _ in parsed_tools if name == READ_MEDIA_NAME), None)
                     messages.append(media_message)
                     read_media_pending_parts = []
                 # read_document 原生文档注入：工具结果中的原生部件作为 user 消息
@@ -2671,7 +2839,7 @@ async def _run_chat_generation(
                     # 因此与任务前/首调用压缩同策略——终止当前任务。
                     detail = f"任务内历史压缩失败（重试降级链已耗尽），任务已终止：{exc}"
                     logger.error(f"{detail}")
-                    session_chat_memory.run_task = False
+                    stream.stop_requested = True
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
@@ -2679,6 +2847,11 @@ async def _run_chat_generation(
                     rebuilt_messages = None
                 if rebuilt_messages is not None:
                     messages = rebuilt_messages
+                    if is_responses:
+                        from .agent_runtime.responses_context import mark_baseline
+                        mark_baseline(tool_request.responses_context, messages)
+                    native_store.reset_replay(messages)
+                    todo_context = TodoContext(latest_todo_exchanges(messages))
                     task_history_compacted = True
                 try:
                     current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
@@ -2687,6 +2860,7 @@ async def _run_chat_generation(
                         tool_request,
                         compression_index=current_tool_result_count,
                         event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload),
+                        responses_manager=session_chat_memory,
                         # 同一次阈值触发先压历史再压本轮工具轨迹；让两部分共享目标预算。
                         enforce_target=task_history_compacted,
                     )
@@ -2697,7 +2871,7 @@ async def _run_chat_generation(
                     # 收缩，下一批工具结果大概率超窗，终止当前任务而不是原样继续。
                     detail = f"单轮工具轨迹压缩失败（重试降级链已耗尽），任务已终止：{exc}"
                     logger.error(f"{detail}")
-                    session_chat_memory.run_task = False
+                    stream.stop_requested = True
                     await _stream_emit(stream, _sse_error_payload(detail))
                     return
                 except Exception as exc:
@@ -2705,10 +2879,16 @@ async def _run_chat_generation(
                     round_compaction = None
                 if round_compaction is not None and round_compaction.triggered:
                     messages = round_compaction.messages
+                    if is_responses:
+                        from .agent_runtime.responses_context import mark_baseline
+                        mark_baseline(tool_request.responses_context, messages)
+                    native_store.reset_replay(messages)
+                    todo_context = TodoContext(latest_todo_exchanges(messages))
                         # 单轮压缩的 start/done 已由 event_emitter 按实际发生顺序
                         # 写入当前 chat_round.events，不再重复保存顶层摘要状态。
         # 写入结束消息到文件
         await session_chat_memory.add_chat_history({"role": "assistant", "done": "[DONE]"})
+        permission_final_state = "completed"
         # 收尾压缩（trigger_reason="post"）已移除：任务结束时压缩会把刚完成的
         # 轮次并入摘要，模型下一轮只能看到摘要而非原文，编辑文件等需要精确
         # 内容的操作会因细节丢失而失准。历史统一在"任务开始时（auto）"与
@@ -2719,7 +2899,9 @@ async def _run_chat_generation(
         # 与生成流中的优雅停止路径同构；其余取消保持 interrupted 语义
         # （error 事件落盘，进程重启后同样可恢复）。
         try:
-            if getattr(stream, "user_stop_requested", False):
+            if getattr(stream, "permission_suspend", False):
+                permission_store.set_task_state(permission_runtime.id, "suspended")
+            elif getattr(stream, "user_stop_requested", False):
                 await session_chat_memory.stop_current_round()
             else:
                 await session_chat_memory.add_chat_history({
@@ -2738,11 +2920,10 @@ async def _run_chat_generation(
             pass
         raise ce
     finally:
-        # 清理工具管理内存（使用 session_id 隔离）
-        try:
-            session_chat_memory.run_task = False
-        except Exception:
-            pass
+        permission_state = permission_store.task(permission_runtime.id)
+        permission_runtime.close("suspended" if permission_state and permission_state["state"] == "suspended"
+                                 else "cancelled" if getattr(stream, "user_stop_requested", False) or (permission_state and permission_state["state"] == "cancelled") else permission_final_state)
+        stream.stop_requested = True
         # target_round / insert_round 兜底复位：正常路径由收尾替换/插入逻辑
         # 复位，异常路径下管理器缓存随 cleanup 销毁自然复位；这里显式兜底防
         # cleanup 失败残留到下一轮
@@ -2817,13 +2998,19 @@ async def _wait_worker_generation(proxy, stream) -> None:
         await stream.finish()
 
 
-async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest) -> bool:
+async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest, permission_resume_id=None) -> bool:
     """启动一次生成任务。
 
     worker 模式：把请求序列化派发给会话 worker（懒启动进程），并把等待任务
     挂到 stream.task；inline 模式：保持旧行为，在主进程内起 asyncio 任务。
     返回 False 表示启动失败（已向流内写入 error 事件）。
     """
+    if not permission_resume_id:
+        from memory.permission_store import resumable
+        if resumable(tool_request.session_id):
+            await _stream_emit(stream, _sse_error_payload("会话有待恢复的权限任务，请在权限面板继续审批或放弃该任务后再发送新问题"))
+            await stream.finish()
+            return False
     # 会话配置快照：首次正式开始任务时把当前全局默认（模型/工具/工作目录）
     # 固化为会话独立配置，此后该会话不再跟随全局设置变化（幂等，快照过即跳过）。
     try:
@@ -2835,7 +3022,9 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest)
         logger.warning(f"会话配置快照失败（不影响本轮对话）: {snapshot_error}")
     if proxy is not None:
         proxy.bind_stream(stream)
-        started = proxy.start_generation(tool_request.model_dump())
+        # Preserve explicit parameter selection across the process boundary.
+        # Serializing defaults would turn Chat-only defaults into native opts.
+        started = proxy.start_generation(tool_request.model_dump(exclude_unset=True), permission_resume_id=permission_resume_id) if permission_resume_id else proxy.start_generation(tool_request.model_dump(exclude_unset=True))
         if not started:
             await _stream_emit(
                 stream,
@@ -2845,8 +3034,29 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest)
             return False
         stream.task = asyncio.create_task(_wait_worker_generation(proxy, stream))
         return True
-    stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream))
+    stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream, permission_resume_id=permission_resume_id))
     return True
+
+
+async def resume_permission_task(task_id):
+    from memory.permission_store import task, load_checkpoint
+    saved = task(task_id)
+    checkpoint = load_checkpoint(task_id)
+    if not saved or not checkpoint:
+        raise ValueError("任务检查点不存在")
+    session = saved["session"]
+    proxy = get_worker_proxy(session) if _generation_use_worker() else None
+    if not proxy and str(Path.cwd().resolve()) != saved["data"]["root"]:
+        raise ValueError("原任务工作目录已变化，请恢复该目录后重试")
+    old = _get_session_stream(session)
+    if old and not old.done:
+        raise ValueError("会话已有活动任务，请停止后再恢复")
+    if proxy:
+        proxy.set_loop(asyncio.get_running_loop())
+    stream = _set_session_stream(session)
+    request = ChatLLMRequest(**saved["data"]["request"])
+    if not await _start_session_generation(proxy, stream, request, permission_resume_id=task_id):
+        raise ValueError("无法启动恢复任务")
 
 
 # 聊天 SSE 心跳间隔（秒）：生成任务长时间无增量输出（模型长思考/慢工具/
@@ -2898,8 +3108,7 @@ async def tool_chat_server(
         # 已存在生成任务且本次请求携带新用户消息：显式打断旧任务并等待其
         # 完全退出后再启动新任务。旧任务的收尾处理会以 error/interrupted
         # 事件收尾当前轮次并落盘已积累的工具调用/思考，避免新旧两个生成
-        # 循环交错写入同一 pending 轮次（仅靠 run_task 标记存在竞态窗口：
-        # 新任务会把标记置回 True，旧循环可能继续运行）。
+        # 循环交错写入同一 pending 轮次。
         # 新消息打断不是手动停止：先清掉可能残留的 user_stop_requested，
         # 保证旧任务按 interrupted 语义落盘。
         stream.user_stop_requested = False
@@ -2908,10 +3117,7 @@ async def tool_chat_server(
             await _wait_worker_idle(proxy)
         else:
             old_task = stream.task
-            try:
-                (await get_chat_memory_manager(session_id)).run_task = False
-            except Exception:
-                pass
+            stream.stop_requested = True
             if old_task is not None:
                 old_task.cancel()
                 try:
@@ -3090,14 +3296,32 @@ async def cancel_injected_message(session_id: str, text: str, *, message_id: str
     return {"ok": removed, "reason": "" if removed else "not_found"}
 
 
+async def _stop_saved_permission_tasks(session_id):
+    """停止后端重启后没有活跃生成流、但仍留有检查点的任务。"""
+    from memory import permission_store
+    from factory.agent_runtime.permission_runtime import close_pending_native
+    permission_store.pending(session_id)
+    with permission_store.database() as db:
+        ids = [row[0] for row in db.execute("SELECT id FROM tasks WHERE session=? AND state IN ('running','suspended') AND COALESCE(json_extract(data,'$.preview'),0)=0", (session_id,))]
+    for task_id in ids:
+        saved = permission_store.load_checkpoint(task_id)
+        if not saved:
+            continue
+        current = permission_store.task(task_id)
+        manager = await get_chat_memory_manager(session_id)
+        await manager.finish_saved_permission_round(saved.get("pending_round"), current["data"].get("request", {}).get("target_round"))
+        close_pending_native(task_id, session_id, "用户停止原任务")
+        permission_store.set_task_state(task_id, "cancelled")
+
+
 async def stop_chat_task(session_id):
     ''' 手动停止当前会话的聊天任务。
 
     worker 模式（默认）：向会话 worker 发送 stop 命令，worker 内置
-    run_task=False 并取消生成任务，事件经 IPC 回流收尾；随后确认 worker
+    置当前任务停止信号并取消生成任务，事件经 IPC 回流收尾；随后确认 worker
     已完全退出当前任务（超时则强制终止兜底）。
     inline 模式保持原两步停止：
-    1. 置 run_task=False：生成循环在下一次检查点（流式事件/工具结果处理）主动退出；
+    1. 置当前任务停止信号：生成循环在下一次检查点（流式事件/工具结果处理）主动退出；
     2. 取消后台生成任务（asyncio.Task.cancel）：工具执行已挪到工作线程，事件循环
        不再被阻塞，即使当前正卡在工具调用上，取消也能在 await 点生效并触发
        CancelledError 收尾（user_stop_requested 标记使其按"手动停止"落盘）。
@@ -3109,18 +3333,18 @@ async def stop_chat_task(session_id):
         stream = _get_session_stream(session_id)
         if stream is not None:
             stream.user_stop_requested = True
+            stream.stop_requested = True
         if proxy is not None:
             proxy.request_stop(reason="user")
             await _wait_worker_idle(proxy, timeout=15.0)
+        await _stop_saved_permission_tasks(session_id)
         return
-    try:
-        (await get_chat_memory_manager(session_id)).run_task = False
-    except Exception:
-        pass
     stream = _get_session_stream(session_id)
     if stream is None:
+        await _stop_saved_permission_tasks(session_id)
         return
     stream.user_stop_requested = True
+    stream.stop_requested = True
     task = stream.task
     if task is not None and not task.done():
         task.cancel()
@@ -3134,3 +3358,4 @@ async def stop_chat_task(session_id):
             pass
         except Exception as exc:
             logger.warning(f"停止会话任务时忽略后台异常: {exc}")
+    await _stop_saved_permission_tasks(session_id)

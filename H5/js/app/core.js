@@ -133,8 +133,6 @@ window.App = window.App || {};
   const sidebar = $("#sidebar");
   const scrim = $("#scrim");
   const sessionList = $("#sessionList");
-  const searchBox = $("#searchBox");
-  const searchInput = $("#searchInput");
   const tokenTotal = $("#tokenTotal");
   const sessionActionsBtn = $("#sessionActionsBtn");
   const sessionActionsMenu = $("#sessionActionsMenu");
@@ -175,6 +173,25 @@ window.App = window.App || {};
   const modelPicker = $("#modelPicker");
   const modelPickerLabel = $("#modelPickerLabel");
   const modelList = $("#modelList");
+  const chatParametersGroup = $("#chatParametersGroup");
+  const messagesParametersGroup = $("#messagesParametersGroup");
+  const responsesParametersGroup = $("#responsesParametersGroup");
+  const responsesEffort = $("#responsesEffort");
+  const responsesSummary = $("#responsesSummary");
+  const responsesVerbosity = $("#responsesVerbosity");
+  const responsesSampling = $("#responsesSampling");
+  const responsesTemperatureRow = $("#responsesTemperatureRow");
+  const responsesTemperature = $("#responsesTemperature");
+  const responsesTemperatureValue = $("#responsesTemperatureValue");
+  const responsesTopPRow = $("#responsesTopPRow");
+  const responsesTopP = $("#responsesTopP");
+  const responsesTopPValue = $("#responsesTopPValue");
+  const responsesInstructions = $("#responsesInstructions");
+  const responsesExtraBody = $("#responsesExtraBody");
+  const responsesStateHint = $("#responsesStateHint");
+  const responsesRebuildSource = $("#responsesRebuildSource");
+  const responsesRebuild = $("#responsesRebuild");
+
   const reasoningEffort = $("#reasoningEffort");
   const enableThinking = $("#enableThinking");
   const temperature = $("#temperature");
@@ -185,6 +202,20 @@ window.App = window.App || {};
   const topPValue = $("#topPValue");
   const presencePenalty = $("#presencePenalty");
   const presencePenaltyValue = $("#presencePenaltyValue");
+  const messagesTemperatureRow = $("#messagesTemperatureRow");
+  const messagesTemperature = $("#messagesTemperature");
+  const messagesTemperatureValue = $("#messagesTemperatureValue");
+  const messagesTopPRow = $("#messagesTopPRow");
+  const messagesTopP = $("#messagesTopP");
+  const messagesTopPValue = $("#messagesTopPValue");
+  const messagesThinkingMode = $("#messagesThinkingMode");
+  const messagesThinkingBudgetRow = $("#messagesThinkingBudgetRow");
+  const messagesThinkingBudget = $("#messagesThinkingBudget");
+  const messagesThinkingBudgetValue = $("#messagesThinkingBudgetValue");
+  const messagesThinkingHint = $("#messagesThinkingHint");
+  const messagesEffort = $("#messagesEffort");
+  const messagesStopSequences = $("#messagesStopSequences");
+  const messagesExtraBody = $("#messagesExtraBody");
   const enhanceCancel = $("#enhanceCancel");
   const enhanceConfirm = $("#enhanceConfirm");
   const enhanceReset = $("#enhanceReset");
@@ -273,12 +304,11 @@ window.App = window.App || {};
     sub_agent_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
   };
 
-  // 各 api_type 的“恢复默认”参数预设。后端暂未按协议细分适配，先按常见默认占位，
-  // 后续协议设计变化时只需调整对应协议桶（角色默认会覆盖协议预设）
+  // 各协议的恢复默认预设。Messages 留空采用供应商默认值。
   const API_TYPE_DEFAULT_PARAMS = {
     chat_completions: { temperature: 0.7, top_p: 1.0, presence_penalty: 2.0, reasoning_effort: "medium", enable_thinking: true },
     responses: { temperature: 1.0, top_p: 1.0, presence_penalty: 0.0, reasoning_effort: "medium", enable_thinking: true },
-    messages: { temperature: 1.0, top_p: 1.0, presence_penalty: 0.0, reasoning_effort: "medium", enable_thinking: false },
+    messages: {},
   };
 
   // 后端接口会返回同一份 defaults；这里仅作为后端暂不可用时的离线回退。
@@ -642,20 +672,6 @@ window.App = window.App || {};
   });
 
   // ---------- 会话搜索 ----------
-  $("#searchBtn").addEventListener("click", function () {
-    const willShow = !searchBox.classList.contains("show");
-    searchBox.classList.toggle("show");
-    // 打开：清空旧关键词并聚焦；收起：同样清空过滤——否则列表停留在
-    // "看不见的过滤态"（用户无从清除），多选分组视图也会残留搜索强制展开
-    searchInput.value = "";
-    filterSessions("");
-    if (willShow) searchInput.focus();
-  });
-
-  searchInput.addEventListener("input", function () {
-    filterSessions(searchInput.value.trim().toLowerCase());
-  });
-
   function filterSessions(keyword) {
     sessionList.querySelectorAll(".session-item").forEach(function (node) {
       const name = node.querySelector(".session-name").textContent.toLowerCase();
@@ -718,7 +734,7 @@ window.App = window.App || {};
   SESSION_TITLE_KEY, MODEL_ROLES, ROLE_DEFAULT_PARAMS,
   API_TYPE_DEFAULT_PARAMS, CHAT_SETTINGS_DEFAULTS, app,
   sidebar, scrim, sessionList,
-  searchBox, searchInput, tokenTotal,
+  tokenTotal,
   sessionActionsBtn, sessionActionsMenu, shareSessionItem,
   compactSessionItem, main, chatScroll,
   chatInner, input, composer,
@@ -732,9 +748,14 @@ window.App = window.App || {};
   mediaPreviewTitle, boostBtn, enhancePanel,
   enhanceClose, modelTabs, modelPicker,
   modelPickerLabel, modelList, reasoningEffort,
-  enableThinking, temperature, temperatureValue,
+responsesParametersGroup, responsesEffort, responsesSummary, responsesVerbosity, responsesSampling, responsesTemperatureRow, responsesTemperature, responsesTemperatureValue, responsesTopPRow, responsesTopP, responsesTopPValue, responsesInstructions, responsesExtraBody, responsesStateHint, responsesRebuildSource, responsesRebuild,
+  chatParametersGroup, messagesParametersGroup, enableThinking, temperature, temperatureValue,
   maxTokens, maxTokensValue, topP,
   topPValue, presencePenalty, presencePenaltyValue,
+  messagesTemperatureRow, messagesTemperature, messagesTemperatureValue,
+  messagesTopPRow, messagesTopP, messagesTopPValue, messagesThinkingMode,
+  messagesThinkingBudgetRow, messagesThinkingBudget, messagesThinkingBudgetValue, messagesThinkingHint,
+  messagesEffort, messagesStopSequences, messagesExtraBody,
   enhanceCancel, enhanceConfirm, enhanceReset,
   enhanceClearOverride, enhanceHint,
   customHeadersBox, customHeadersRows, addHeaderRow,

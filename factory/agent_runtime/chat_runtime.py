@@ -7,6 +7,7 @@
 契约等纯函数（原 chat_factory 私有实现迁入）：父循环与子任务循环共用同一
 批基建函数，避免两个 Agent Loop 各自演化（docs/sub_agent_v1.md §6.2）。
 """
+import copy
 import json
 import uuid
 from typing import Any, Dict, List
@@ -142,6 +143,18 @@ def _estimate_content_value_tokens(content: Any) -> int:
         if str(part.get("type") or "") == "text":
             total += estimate_text_tokens(part.get("text"))
             continue
+        if part.get("type") == "document":
+            source = part.get("source") or {}
+            total += estimate_text_tokens(part.get("title")) + estimate_text_tokens(part.get("context"))
+            if source.get("type") == "text":
+                total += estimate_text_tokens(source.get("data"))
+                continue
+            if source.get("type") == "content":
+                total += _estimate_content_value_tokens(source.get("content"))
+                continue
+        if part.get("type") == "tool_result":
+            total += _estimate_content_value_tokens(part.get("content"))
+            continue
         # 媒体部件：data URL / base64 / media:// 引用一律按固定占位计费
         total += MULTIMODAL_PART_PLACEHOLDER_TOKENS
     return total
@@ -211,8 +224,6 @@ class UsageAccumulator:
         if not isinstance(usage, dict):
             return
         usage_fingerprint = json.dumps(usage, ensure_ascii=False, sort_keys=True)
-        if usage_fingerprint in self._fingerprints:
-            return
         completion_id = event_payload.get("id")
         if completion_id is not None and str(completion_id).strip():
             lookup_id = str(completion_id)
@@ -222,6 +233,8 @@ class UsageAccumulator:
             self._fingerprints.add(usage_fingerprint)
             return
         generated_id = f"no_id_{len(self._usage_by_id) + 1}"
+        if usage_fingerprint in self._fingerprints:
+            return
         self._usage_by_id[generated_id] = usage
         self._fingerprints.add(usage_fingerprint)
 
@@ -257,7 +270,7 @@ def parse_sse_event(sse_chunk: str) -> dict[str, Any] | None:
 
 
 def filter_tool_calls_fields(event: dict[str, Any]) -> dict[str, Any]:
-    """过滤 tool_calls 中的 id 和 type 字段
+    """保留工具调用 ID，仅过滤无需展示的 type 字段。
     只处理 tool_calls 字段, 其他字段直接引用原对象以避免不必要的拷贝
     """
     if not isinstance(event, dict):
@@ -273,8 +286,8 @@ def filter_tool_calls_fields(event: dict[str, Any]) -> dict[str, Any]:
     filtered_tool_calls = []
     for tc in tool_calls:
         if isinstance(tc, dict):
-            # 创建新的工具调用对象,排除 id 和 type 字段
-            filtered_tc = {k: v for k, v in tc.items() if k not in ("id", "type")}
+            # 调用 ID 用于前端把参数、审批、启动及结果绑定到同一工具块。
+            filtered_tc = {k: v for k, v in tc.items() if k != "type"}
             filtered_tool_calls.append(filtered_tc)
         else:
             filtered_tool_calls.append(tc)
@@ -486,7 +499,7 @@ def sanitize_tool_call_pairing(messages: List[dict[str, Any]]) -> tuple[List[dic
         else:
             # 声明全部悬空：清除 tool_calls 字段；有正文保留，无正文丢弃整条
             clone.pop("tool_calls", None)
-            if clone.get("content"):
+            if clone.get("content") or clone.get("provider_state"):
                 result.append(clone)
     return result, removed
 
@@ -582,6 +595,7 @@ def copy_for_request(
     messages: List[dict[str, Any]],
     *,
     limit: int | None = None,
+    api_type: str | None = None,
 ) -> List[dict[str, Any]]:
     """构造发往上游的请求副本：思考整形 + 悬空 tool_call 清理 + 引用字段剥离。
 
@@ -594,6 +608,13 @@ def copy_for_request(
     content（memory.quote_format），这里兜底剥离 quotes 键——传给上游的
     消息只含标准字段（正常路径下运行时消息已剥离，此处防御异常调用方）。
     """
+    if api_type in {"messages", "responses"}:
+        if api_type == "responses":
+            from .responses_context import assign_ids
+            assign_ids(messages)
+        # Signed blocks live in the private replay store. Preserve references and
+        # incomplete pair evidence so the adapter can validate recovery itself.
+        return [_drop_quote_fields(copy.deepcopy(message)) for message in messages]
     shaped = _shape_reasoning_for_send(messages, limit)
     cleaned, removed = sanitize_tool_call_pairing(shaped)
     if removed:

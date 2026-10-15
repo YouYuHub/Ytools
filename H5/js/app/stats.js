@@ -234,17 +234,17 @@
     const toolTokens = Math.max(0, finiteNumber(stats.tool_definition_tokens, 0));
     const compressionCount = Math.max(0, finiteNumber(stats.context_compress_count, 0));
     contextTokenSummary.title = [
-      "模型上下文 token 估算",
+      "本地上下文 token 估算（远端 Responses 上下文单独管理）",
       "消息 " + FormatUtils.fmtNum(messageTokens) +
       " · 系统提示词 " + FormatUtils.fmtNum(systemTokens) +
       " · 工具定义 " + FormatUtils.fmtNum(toolTokens),
-      "请求上下文 " + FormatUtils.fmtNum(used) + " / " + FormatUtils.fmtNum(limit) +
+      "本地上下文 " + FormatUtils.fmtNum(used) + " / " + FormatUtils.fmtNum(limit) +
       "（" + formatContextPercent(ratio) + "）",
       recentCount ? "最近 " + recentCount + " 轮合计 " + FormatUtils.fmtNum(recentTokens) + " tokens" : "暂无可展开轮次",
       compressionCount ? "当前会话累计压缩 " + FormatUtils.fmtNum(compressionCount) + " 次" : "当前会话未发生压缩",
     ].join("\n");
     contextTokenStatus.setAttribute("aria-label",
-      "请求上下文 " + formatContextPercent(ratio) +
+      "本地上下文估算 " + formatContextPercent(ratio) +
       (roundsDetail ? "，" + roundsDetail : ""));
     contextTokenStatus.classList.toggle("is-warning", ratio >= 0.8 && ratio < 1);
     contextTokenStatus.classList.toggle("is-danger", ratio >= 1);

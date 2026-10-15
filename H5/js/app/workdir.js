@@ -28,6 +28,7 @@
   }
 
   function loadWorkDir() {
+    if (App.permissions) App.permissions.refresh();
     // 会话级目录：随会话切换刷新；新对话（无 sessionId）显示全局默认
     const sid = state.sessionId || "";
     API.getWorkDirConfig(sid || undefined).then(function (data) {

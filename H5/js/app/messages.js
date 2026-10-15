@@ -73,6 +73,12 @@
   // 配对队列 pendingTools/pendingCompactions 由调用方提供（主渲染与分段
   // 回灌各自持有一套，互不串扰）
   function renderOneRecordInto(container, rec, pendingTools, pendingCompactions) {
+    if (rec.kind === "approval") {
+      // 审批记录用于审计；可操作按钮由后端当前状态绑定到原工具块。
+      // 不再为同一调用创建独立的“执行确认”展示块。
+      if (App.permissions && App.permissions.track) App.permissions.track(rec.approval);
+      return;
+    }
     if (rec.kind === "user") {
       appendUserMessage(rec.content, rec.ts, null, null, container, rec.round, rec.quotes,
         rec.source_event_index);
@@ -98,7 +104,7 @@
     }
     if (rec.kind === "tool") {
       appendTimeInto(container, rec.ts);
-      const ui = buildToolBlock(rec.name);
+      const ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round });
       ui.setInput(FormatUtils.prettyJson(rec.args));
       container.appendChild(ui.wrap);
       // ask_user 历史记录附一张可点击的提问卡片：刷新后仍能重新打开回答窗口
@@ -111,14 +117,16 @@
     }
     if (rec.kind === "toolResult") {
       const queue = pendingTools[rec.name];
-      let ui = queue && queue.shift();
+      const index = queue && rec.tool_call_id ? queue.findIndex(ui => ui.toolCallId === rec.tool_call_id) : 0;
+      let ui = queue && index >= 0 ? queue.splice(index, 1)[0] : null;
       if (!ui) {
         appendTimeInto(container, rec.ts);
-        ui = buildToolBlock(rec.name);
+        ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round });
         ui.setInput(FormatUtils.prettyJson(rec.args));
         container.appendChild(ui.wrap);
       }
       applyToolResult(ui, rec.name, rec.result, rec.file_diff, rec.args);
+      if (Number.isInteger(rec.source_event_index)) ui.wrap.dataset.resultEvent = String(rec.source_event_index);
       ui.finish();
       return;
     }
@@ -131,10 +139,11 @@
       // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
       appendTimeInto(container, rec.started_at);
       const agentUi = buildSubAgentBlock();
-      agentUi.applyEvent({ phase: "start", task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit,
+      agentUi.applyEvent({ phase: "start", agent_id: rec.agent_id, round: rec.round, task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit,
         timeout_seconds: rec.timeout_seconds });
       if (rec.args) agentUi.setDispatchInput(rec.args);
       agentUi.hydrate(rec);
+      if (rec.agent_id) agentUi.wrap.dataset.agentId = rec.agent_id;
       if (rec.done_emitted) agentUi.markReturned(rec);
       container.appendChild(agentUi.wrap);
       return;
@@ -267,7 +276,10 @@
         if (rec.round == null) continue;
         for (let k = before; k < chatInner.childNodes.length; k += 1) {
           const node = chatInner.childNodes[k];
-          if (node.nodeType === 1) node.setAttribute("data-round", String(rec.round));
+          if (node.nodeType === 1) {
+            node.setAttribute("data-round", String(rec.round));
+            if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
+          }
         }
       }
       rendered += count;
@@ -382,7 +394,10 @@
       if (rec.round == null) return;
       for (let k = before; k < frag.childNodes.length; k += 1) {
         const node = frag.childNodes[k];
-        if (node.nodeType === 1) node.setAttribute("data-round", String(rec.round));
+        if (node.nodeType === 1) {
+          node.setAttribute("data-round", String(rec.round));
+          if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
+        }
       }
     });
     // 分段尾部未配对的工具块置完成态
@@ -1808,9 +1823,14 @@
   // 默认折叠，不自动展开（避免流式期间反复撑高页面）；用户点开即可看到
   // 逐帧流入的参数数据。上游把 arguments 整段一次性下发时（部分供应商
   // 不分片），由打字机揭示器按节奏逐步显示，模拟逐帧生成的观感。
-  function buildToolBlock(name) {
+  function buildToolBlock(name, identity) {
+    identity = Object.assign({ sessionId: state.sessionId, agentId: "main" }, identity);
     const wrap = el("div", "tool-block");
     const head = el("button", "tool-block-head");
+    head.type = "button";
+    const header = el("div", "tool-block-header");
+    const approvalHost = el("div", "permission-inline-actions");
+    approvalHost.hidden = true;
     const toolIconClass = "icon tool-block-tool-icon" +
       (App.isBuiltinToolName(name) ? " is-builtin-tool-icon" : "");
     const toolIcon = App.toolIconSvg(name, toolIconClass);
@@ -1910,7 +1930,9 @@
     // 展开态下双击主体区域即可折叠（展开仍走头部按钮）
     body.title = "双击折叠";
     body.addEventListener("dblclick", function () { wrap.classList.remove("open"); });
-    wrap.appendChild(head);
+    header.appendChild(head);
+    header.appendChild(approvalHost);
+    wrap.appendChild(header);
     wrap.appendChild(body);
 
     // 头部文件名：完整路径（相对路径按会话工作目录解析），一行放不下
@@ -1931,8 +1953,50 @@
       fileTag.hidden = false;
     }
 
-    return {
+    let waitingId = null;
+    let approvalOutput = "";
+    function approvalText(text) {
+      // A later tool result always wins over permission status/error text.
+      if (!outPre.textContent || ["执行中…", "(无输出)"].includes(outPre.textContent) || outPre.textContent === approvalOutput) {
+        outPre.textContent = text; approvalOutput = text;
+      }
+    }
+    const ui = {
       wrap: wrap,
+      approvalHost: approvalHost,
+      get toolCallId() { return identity.toolCallId; },
+      bindPermission: function (next) {
+        Object.assign(identity, next);
+        if (App.permissions && identity.toolCallId) App.permissions.bindTool(ui, identity);
+      },
+      setApprovalWaiting: function (approval, outcome) {
+        if (approval && approval.state === "denied" && approval.task_state !== "suspended") {
+          ui.finish();
+          approvalText("已拒绝，本次工具不会执行。");
+          return;
+        }
+        const id = approval && approval.id;
+        const changed = id !== waitingId;
+        waitingId = id;
+        wrap.classList.toggle("is-waiting", Boolean(approval));
+        if (approval) {
+          streaming = false; flushReveal(); wrap.classList.remove("is-streaming", "is-executing");
+          if (approval.args) ui.setInput(FormatUtils.prettyJson(approval.args));
+          if (changed || !approvalOutput) approvalText(approval.state === "pending" ? "等待你的允许或拒绝，本次工具尚未执行。" :
+            approval.state === "denied" ? "已拒绝，本次工具不会执行。" : "已允许，等待执行结果…");
+        } else if (outcome) {
+          if (["cancelled", "completed", "denied"].includes(outcome.state)) ui.finish();
+          const ended = outcome.task_state === "failed" ? "任务异常结束" : "任务已取消";
+          const text = outcome.state === "cancelled" ? (outcome.execution_state === "executing" ? ended + "，工具执行结果未知，请核对实际结果。" :
+            outcome.execution_state === "completed" ? ended + "，此工具已有执行记录，请重新加载会话查看结果。" : ended + "，本次工具未执行。") :
+            outcome.state === "invalidated" ? "审批已更新，请重新确认当前操作。" :
+            outcome.state === "approved" ? "已允许，等待执行结果…" :
+            outcome.state === "denied" ? "已拒绝，本次工具不会执行。" :
+            outcome.state === "completed" ? "本次工具调用已结束，请重新加载会话查看完整结果。" : "审批已失效，请重新加载会话查看任务状态。";
+          approvalText(text);
+        } else if (approvalOutput) approvalText("当前没有待确认的审批，请重新加载会话查看任务状态。");
+      },
+      setApprovalError: function (message) { approvalText("确认失败：" + message); },
       setFileTag: setFileTagValue,
       setName: updateToolIdentity,
       setInput: function (t) {
@@ -2025,14 +2089,17 @@
         streaming = false;
         flushReveal();
         wrap.classList.remove("is-streaming");
+        wrap.classList.remove("is-waiting");
         wrap.classList.add("is-executing");
         outPre.textContent = "执行中…";
       },
       finish: function () {
+        waitingId = null;
         streaming = false;
         flushReveal();
         wrap.classList.remove("is-streaming");
         wrap.classList.remove("is-executing");
+        wrap.classList.remove("is-waiting");
         const statusIcon = head.querySelector(".tool-status-icon");
         if (statusIcon) statusIcon.remove();
         if (!outPre.textContent || outPre.textContent === "执行中…") {
@@ -2040,6 +2107,8 @@
         }
       },
     };
+    ui.bindPermission(identity);
+    return ui;
   }
 
   // ---------- 展示用 diff 视图（write_file / edit_file 结果） ----------
@@ -2387,6 +2456,9 @@
     stopAgentBtn.hidden = true;
     header.appendChild(head);
     header.appendChild(stopAgentBtn);
+    const approvalHost = el("div", "permission-inline-actions");
+    approvalHost.hidden = true;
+    header.appendChild(approvalHost);
     wrap.appendChild(header);
     wrap.appendChild(body);
 
@@ -2409,6 +2481,12 @@
     let roundsLimit = null;
     let isDone = false;
     let agentId = "";
+    let parentRound = null;
+    let approvalWaiting = false;
+    let badgeBeforeApproval = "";
+    function bindPermissions() {
+      if (App.permissions && agentId) App.permissions.bindAgent(ui, { sessionId: agentSessionId, agentId: agentId, round: parentRound });
+    }
     let hasUserControlledExpansion = false;
     stopAgentBtn.addEventListener("click", async function () {
       if (!agentId || isDone || stopAgentBtn.disabled) return;
@@ -2541,7 +2619,7 @@
       }
       (evt.tool_calls || []).forEach(function (call) {
         const fn = call.function || {};
-        const entry = addToolLine(round, fn.name || call.name || "tool", fn.arguments || "", null);
+        const entry = findToolEntry(round, call.id) || addToolLine(round, fn.name || call.name || "tool", fn.arguments || "", null, call.id);
         // tool_calls 声明行登记：tool_start/tool_result 按 id 回填，避免重复建行
         if (call.id && !round.toolEntries.has(call.id)) round.toolEntries.set(call.id, entry);
       });
@@ -2561,8 +2639,8 @@
 
     /** 轮内工具行：复用主区 tool-block（头部折叠，主体=输入/输出），返回
      * 与主区一致的 ui 控制器（tool_start 标执行中 / tool_result 填结果）。 */
-    function addToolLine(round, name, argsText, resultText) {
-      const block = buildToolBlock(name);
+    function addToolLine(round, name, argsText, resultText, toolCallId) {
+      const block = buildToolBlock(name, { sessionId: agentSessionId, agentId: agentId, toolCallId: toolCallId, round: parentRound });
       if (argsText != null && argsText !== "") block.setInput(normalizeArgsText(argsText));
       if (resultText != null) block.setOutput(resultText);
       round.toolsWrap.appendChild(block.wrap);
@@ -2630,7 +2708,7 @@
         entry.executing();
         return;
       }
-      entry = addToolLine(round, evt.function_name || evt.tool_name || "tool", evt.arguments, null);
+      entry = addToolLine(round, evt.function_name || evt.tool_name || "tool", evt.arguments, null, toolCallId);
       entry.executing();
       if (toolCallId) round.toolEntries.set(toolCallId, entry);
     }
@@ -2640,7 +2718,7 @@
       const round = currentRoundBySeq(evt) || beginRound({ seq: evt.seq });
       let entry = findToolEntry(round, evt.tool_call_id);
       if (!entry) {
-        entry = addToolLine(round, evt.tool_name || "tool", evt.arguments, null);
+        entry = addToolLine(round, evt.tool_name || "tool", evt.arguments, null, evt.tool_call_id);
         if (evt.tool_call_id) round.toolEntries.set(evt.tool_call_id, entry);
       }
       entry.finish();
@@ -2733,8 +2811,30 @@
       if (info) bar.title = "子任务消耗 " + info;
     }
 
-    return {
+    const ui = {
       wrap: wrap,
+      approvalHost: approvalHost,
+      setApprovalWaiting: function (approval) {
+        const waiting = approval && (approval.state === "pending" || !approval.state || approval.task_state === "suspended");
+        if (!waiting && !approvalWaiting) return;
+        if (waiting && !approvalWaiting) badgeBeforeApproval = badge.textContent;
+        approvalWaiting = Boolean(waiting);
+        wrap.classList.toggle("is-waiting", approvalWaiting);
+        const next = waiting ? (approval.task_state === "suspended" ? "待恢复" : "等待确认") :
+          ["待恢复", "等待确认"].includes(badge.textContent) ? (isDone ? badgeBeforeApproval : "运行中") : badge.textContent;
+        if (badge.textContent !== next) badge.textContent = next;
+      },
+      applyApproval: function (approval) {
+        agentId = approval.agent_id; parentRound = approval.round || parentRound;
+        bindPermissions();
+        const round = currentRoundBySeq({ seq: approval.seq }) || beginRound({ seq: approval.seq });
+        let entry = findToolEntry(round, approval.tool_call_id);
+        if (!entry) {
+          entry = addToolLine(round, approval.tool, approval.args, null, approval.tool_call_id);
+          round.toolEntries.set(approval.tool_call_id, entry);
+        }
+        if (entry.bindPermission) entry.bindPermission({ sessionId: agentSessionId, agentId: agentId, toolCallId: approval.tool_call_id, round: parentRound });
+      },
       setDispatchInput: function (value) {
         dispatchText = typeof value === "string" ? value : JSON.stringify(value, null, 2);
         let parsed = null;
@@ -2749,6 +2849,8 @@
       applyEvent: function (evt) {
         if (!evt || typeof evt !== "object") return;
         if (evt.agent_id) agentId = evt.agent_id;
+        if (evt.round) parentRound = evt.round;
+        bindPermissions();
         if (agentId && !isDone) stopAgentBtn.hidden = false;
         const phase = evt.phase;
         if (phase === "start") {
@@ -2792,6 +2894,7 @@
       /** 历史回放：entries 逐条重放 + done 聚合字段。 */
       hydrate: function (record) {
         if (!record) return;
+        agentId = record.agent_id || agentId; parentRound = record.round || parentRound;
         (record.entries || []).forEach(function (entry) {
           const evt = Object.assign({}, entry, { phase: entry.phase });
           if (entry.phase === "model_call") {
@@ -2815,6 +2918,7 @@
           error: record.error || "",
           ended_at: record.ended_at,
         });
+        bindPermissions();
       },
       markReturned: markReturned,
       isDone: function () { return isDone; },
@@ -2823,6 +2927,7 @@
         if (!isDone) applyDone({ status: "interrupted" });
       },
     };
+    return ui;
 
     function applyEventTodo(evt) {
       todoItems = Array.isArray(evt.todos) ? evt.todos : todoItems;
@@ -4290,6 +4395,61 @@
     revealQuoteSource(target, quoteText);
   }
 
+  // Search hits carry the same physical event index as JSONL. Load older batches
+  // on demand, then reveal collapsed reasoning/tools before scrolling to text.
+  async function jumpToHistoryMatch(match, query, isCurrent) {
+    const round = Number(match.round_no);
+    if (!Number.isInteger(round) || round <= 0) return false;
+    const current = isCurrent || function () { return state.sessionId === match.session_id; };
+    if (!current()) return false;
+    // Cancel openSession's scheduled bottom correction and pause live follow.
+    if (App.pauseAutoScroll) App.pauseAutoScroll();
+    const snippet = match.snippets && match.snippets[0];
+    const anchorText = snippet ? Array.from(snippet.text || "").slice(snippet.start, snippet.end).join("") : query;
+    const selectors = match.role === "user" ? ".msg-user"
+      : match.role === "tool" ? ".tool-block"
+      : match.role === "sub_agent" ? ".agent-block"
+      : match.role === "compaction" ? ".compaction-bar"
+      : match.field === "reasoning_content" ? ".think-block"
+      : match.field === "error" ? ".notice-bar" : ".msg-assistant-body";
+    function findTarget() {
+      const nodes = Array.from(chatInner.querySelectorAll(selectors + '[data-round="' + round + '"]'));
+      if (!nodes.length) return null;
+      if (match.agent_id) {
+        const agent = nodes.find(function (node) { return node.dataset.agentId === match.agent_id; });
+        if (agent) return agent;
+        return null;
+      }
+      const event = match.event_index;
+      if (event != null) {
+        const exact = nodes.find(function (node) { return node.getAttribute("data-source-event") === String(event)
+          || node.getAttribute("data-result-event") === String(event); });
+        if (exact) return exact;
+        return null; // The exact event may still be in an unrendered older batch.
+      }
+      const wanted = String(anchorText || "").toLowerCase();
+      return nodes.find(function (node) { return String(node.textContent || "").toLowerCase().includes(wanted); }) || nodes[0];
+    }
+    let target = findTarget();
+    const records = loadOlderState.records;
+    const index = records && records.findIndex(function (rec) { return Number(rec.round) === round; });
+    while (!target && records && index >= 0 && loadOlderState.records === records && index < loadOlderState.start && current()) {
+      const previous = loadOlderState.start;
+      if (loadOlderState.loading) await new Promise(function (resolve) { window.setTimeout(resolve, 20); });
+      else await runOlderBatch();
+      if (!current()) return false;
+      target = findTarget();
+      if (loadOlderState.start === previous && !loadOlderState.loading) break;
+    }
+    if (!current()) return false;
+    if (!target) target = chatInner.querySelector('.msg-user[data-round="' + round + '"]');
+    if (!target) { toast("匹配记录可能已被编辑或删除，请重新搜索"); return false; }
+    if (target.matches(".think-block, .tool-block, .agent-block, .compaction-bar")) target.classList.add("open");
+    if (match.role === "sub_agent") target.querySelectorAll(".think-block, .tool-block").forEach(function (node) { node.classList.add("open"); });
+    revealQuoteSource(target, anchorText);
+    return true;
+  }
+
   function jumpToQuestion(i) {
     const target = qnavUsers[i];
     if (!target) return;
@@ -4430,6 +4590,7 @@
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
   App.jumpToQuoteSource = jumpToQuoteSource;
+  App.jumpToHistoryMatch = jumpToHistoryMatch;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
   App.renderPreservingWidgets = renderPreservingWidgets;
 })(window.App);

@@ -549,6 +549,62 @@ class BuiltinFileToolTests(unittest.TestCase):
         self.assertEqual(result["files_checked"], 1)
         self.assertEqual(result["total_matches"], 1)
 
+    def test_search_files_incomplete_zero_hits_cannot_claim_absence(self):
+        self._make_file("a.txt", "other\n")
+        self._make_file("b.txt", "target\n")
+        result = bt.execute_search_files({"pattern": "target", "max_scanned_files": 1})
+        self.assertFalse(result["scan_complete"])
+        self.assertTrue(result["message"].startswith("[扫描未完成"))
+        self.assertIn("不能判定不存在", result["message"])
+        self.assertNotIn("（无匹配结果）", result["message"])
+
+    def test_search_files_exclusions_can_be_overridden_or_targeted(self):
+        for name in ("history_files", "tmp", "vendor", ".hidden"):
+            Path(self._tmp, name).mkdir()
+            Path(self._tmp, name, "a.txt").write_text("hit\n", encoding="utf-8")
+        self._make_file("source.py", "hit\n")
+        self.assertEqual(bt.execute_search_files({"pattern": "hit"})["total_matches"], 1)
+        self.assertEqual(bt.execute_search_files({"pattern": "hit", "exclude_dirs": []})["total_matches"], 5)
+        self.assertEqual(bt.execute_search_files({"pattern": "hit", "dir_path": "history_files"})["total_matches"], 1)
+
+    def test_search_files_window_limit_preserves_scan_and_display_counts(self):
+        self._make_file("a.txt", ("hit " + "x" * 140 + "\n") * 30)
+        result = bt.execute_search_files({"pattern": "hit", "_max_chars": 512})
+        self.assertTrue(result["scan_complete"])
+        self.assertFalse(result["scan_truncated"])
+        self.assertTrue(result["output_truncated"])
+        self.assertLess(result["displayed_matches"], result["total_matches"])
+        self.assertEqual(result["total_matches"], 30)
+        self.assertIn(f"展示 {result['displayed_matches']}/30", result["message"])
+        self.assertLessEqual(len(result["message"]), 512)
+
+    def test_search_files_exact_block_limit_is_not_truncated(self):
+        self._make_file("a.txt", "hit\n")
+        result = bt.execute_search_files({"pattern": "hit", "max_results": 1})
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["displayed_matches"], 1)
+
+    def test_search_files_literal_alternation_hint_and_context_markers(self):
+        self._make_file("a.txt", "first\ngap\nsecond\n")
+        literal = bt.execute_search_files({"pattern": "first|second"})
+        self.assertIn("is_regex=true", literal["message"])
+        regex = bt.execute_search_files({"pattern": "first|second", "is_regex": True, "context_lines": 1})
+        self.assertEqual(regex["displayed_matches"], 2)
+        self.assertIn(" 2| gap", regex["message"])
+        self.assertNotIn(">2| gap", regex["message"])
+
+    def test_edit_file_large_diff_includes_bounded_actual_preview(self):
+        old = "old\n" * 200
+        new = "new\n" * 200
+        self._make_file("a.txt", old)
+        result = bt.execute_edit_file({"full_file_name": "a.txt", "old_string": old, "new_string": new})["_model_result"]
+        self.assertTrue(result["success"])
+        self.assertEqual(result["diff_omitted_reason"], "over_model_budget")
+        self.assertLessEqual(len(result["diff_preview"]), 700)
+        self.assertIn("@@", result["diff_preview"])
+        self.assertIn("-old", result["diff_preview"])
+        self.assertIn("+new", result["diff_preview"])
+
     def test_builtin_names_and_injection_for_new_tools(self):
         tools, servers = bt.inject_builtin_tools(
             [], {}, include_read_file=True, include_search_files=True

@@ -385,6 +385,12 @@
         const evt = orderedEvent.event;
         const eventIndex = orderedEvent.eventIndex;
         if (!evt || typeof evt !== "object") return;
+        if (evt.event === "tool_approval") {
+          const existing = records.find(record => record.kind === "approval" && record.approval.id === evt.approval.id);
+          if (existing) { existing.phase = evt.phase; existing.approval = evt.approval; }
+          else records.push({ kind: "approval", approval: evt.approval, phase: evt.phase, round: roundNo });
+          return;
+        }
         const ts = evt.timestamp || "";
 
         // 子任务事件块：按 agent_id 聚合（渲染顺序与 events 顺序一致）
@@ -417,7 +423,9 @@
         if (evt.role === "tool") {
           const toolRec = {
             kind: "toolResult",
+            source_event_index: eventIndex,
             name: evt.tool_name || "tool",
+            tool_call_id: evt.tool_call_id || "",
             args: evt.arguments || "",
             result: typeof evt.result === "string" ? evt.result : JSON.stringify(evt.result, null, 2),
             ts: ts,
@@ -446,7 +454,7 @@
           return;
         }
         if (typeof evt.reasoning_content === "string" && evt.reasoning_content.trim()) {
-          records.push({ kind: "think", content: evt.reasoning_content, ts: ts, round: roundNo });
+          records.push({ kind: "think", content: evt.reasoning_content, ts: ts, round: roundNo, source_event_index: eventIndex });
         }
         if (typeof evt.content === "string" && evt.content.trim() && !evt.done) {
           records.push({
@@ -470,7 +478,7 @@
               if (!existing) records.push(record);
               return;
             }
-            records.push({ kind: "tool", name: fn.name || call.name || "tool", args: fn.arguments || "", ts: ts, round: roundNo });
+            records.push({ kind: "tool", name: fn.name || call.name || "tool", tool_call_id: call.id || "", args: fn.arguments || "", ts: ts, round: roundNo, source_event_index: eventIndex });
           });
         }
       });

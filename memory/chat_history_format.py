@@ -462,6 +462,7 @@ def _round_entry_to_tool_result_context_messages(
     compression_content, compress_index = _round_compression_state(round_entry)
     skipped_ids, skipped_objects = _compressed_tool_call_keys(round_entry, compress_index)
     pending_text: list[str] = []
+    pending_state = None
     if compression_content:
         pending_text.append(f"【本轮工具压缩摘要】\n{compression_content}")
     tool_calls_by_id: dict[str, dict[str, Any]] = {}
@@ -473,10 +474,15 @@ def _round_entry_to_tool_result_context_messages(
             pending_text.append(text)
 
     def _flush_pending_text() -> None:
-        if not pending_text:
+        nonlocal pending_state
+        if not pending_text and not pending_state:
             return
-        messages.append({"role": "assistant", "content": "\n".join(pending_text)})
+        message = {"role": "assistant", "content": "\n".join(pending_text)}
+        if pending_state:
+            message["provider_state"] = pending_state
+        messages.append(message)
         pending_text.clear()
+        pending_state = None
 
     for event in events:
         if not isinstance(event, dict):
@@ -517,6 +523,7 @@ def _round_entry_to_tool_result_context_messages(
                 continue
             messages.append({
                 "role": "tool",
+                **({"tool_is_error": bool(event["tool_is_error"])} if "tool_is_error" in event else {}),
                 "tool_call_id": tool_call_id,
                 "content": _truncate_tool_result_text(content, max_tool_result_length),
             })
@@ -527,6 +534,8 @@ def _round_entry_to_tool_result_context_messages(
             continue
         if event.get("done") == "[DONE]" or event.get("error") is not None:
             continue
+        if event.get("provider_state"):
+            pending_state = ({"protocol": "messages", "reset": True} if compress_index > 0 else event["provider_state"])
         tool_calls = event.get("tool_calls")
         remaining_tool_calls = _filter_uncompressed_tool_calls(
             tool_calls,
@@ -553,6 +562,9 @@ def _round_entry_to_tool_result_context_messages(
             assistant_message["content"] = "\n".join(pending_text)
             pending_text.clear()
         assistant_message["tool_calls"] = formatted_tool_calls
+        if pending_state and len(remaining_tool_calls) == len(tool_calls):
+            assistant_message["provider_state"] = pending_state
+        pending_state = None
         messages.append(assistant_message)
         for formatted_call in formatted_tool_calls:
             call_id = formatted_call["id"]
@@ -1190,7 +1202,18 @@ def round_entry_to_context_messages(
     if not isinstance(events, list):
         return []
     if max_tool_result_length == 0:
-        return _round_entry_to_text_context_messages(round_entry)
+        messages = _round_entry_to_text_context_messages(round_entry)
+        references = [event["provider_state"] for event in events
+                      if isinstance(event, dict) and event.get("role") == "assistant" and event.get("provider_state")]
+        if references:
+            _, compress_index = _round_compression_state(round_entry)
+            state = {"protocol": "messages", "reset": True} if compress_index > 0 else references[-1]
+            target = next((message for message in reversed(messages) if message.get("role") == "assistant"), None)
+            if target is None:
+                target = {"role": "assistant", "content": ""}
+                messages.append(target)
+            target["provider_state"] = state
+        return messages
     return _round_entry_to_tool_result_context_messages(round_entry, max_tool_result_length)
 
 

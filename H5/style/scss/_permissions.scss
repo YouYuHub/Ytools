@@ -1,0 +1,32 @@
+#permissionSettings {
+  select, input { border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg); color: var(--text); padding: 7px 10px; font: inherit; max-width: 100%; }
+  button { border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 12px; font-size: 13px; }
+  [role=status] { font-size: 12px; color: var(--text-secondary); margin: 8px 0; overflow-wrap: anywhere; }
+}
+.tool-block-header { display: flex; align-items: center; flex-wrap: wrap; }
+.tool-block-header > .tool-block-head { width: auto; flex: 1; min-width: 0; }
+.permission-inline-actions { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 12px; margin-left: auto; }
+.permission-inline-actions[hidden] { display: none; }
+.permission-inline-group { display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.permission-inline-label { color: var(--text-secondary); overflow-wrap: anywhere; }
+.permission-inline-group button { border: 1px solid var(--border-strong); border-radius: 7px; font-size: 12px; padding: 5px 10px; white-space: nowrap; }
+.permission-approve { background: rgba(70,180,110,0.15); color: #58ba7e; }
+.permission-deny { background: rgba(230,100,100,0.1); color: #de8585; }
+.permission-inline-group button:disabled, .permission-actions button:disabled { opacity: 0.5; cursor: default; }
+.permission-inline-error { color: #de8585; max-width: 340px; overflow-wrap: anywhere; }
+.agent-header { flex-wrap: wrap; }
+.agent-header > .agent-head { order: 0; }
+.agent-header > .permission-inline-actions { order: 1; }
+.agent-header > .agent-stop { order: 2; }
+.tool-block.is-waiting .tool-status-icon { display: none; }
+.agent-block.is-waiting { border-color: var(--border-strong); }
+.agent-block.is-waiting .agent-title { color: var(--text-secondary); }
+.permission-card { border: 1px solid var(--border-strong); padding: 14px; border-radius: 12px; margin-top: 12px; }
+.permission-meta { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; margin-top: 6px; }
+.permission-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.permission-actions button { border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 12px; font-size: 13px; }
+@media (max-width: 600px) {
+  .permission-inline-actions { max-width: 100%; padding: 6px 8px; }
+  .permission-inline-label { max-width: 160px; }
+  #permissionSettings .chat-settings-row { flex-wrap: wrap; gap: 8px; }
+}

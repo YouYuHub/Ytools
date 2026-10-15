@@ -5,6 +5,7 @@
 """
 # from __future__ import annotations
 # 标准库
+from chat.protocols import supports_model, normalize_api_type
 import asyncio
 import inspect
 import json
@@ -431,14 +432,14 @@ def resolve_context_compaction_model_config(
 
     压缩模型统一由 models.json 顶层 `model_selection.compaction_model` 管理，
     不再从 .env 读取或写入（HISTORY_COMPACT_MODEL_PROVIDER/NAME 已弃用）。
-    配置的压缩模型在 models.json 中不存在、或协议不是 chat-completions 时，
-    回退为当前聊天模型（运行时仅支持 Chat Completions 协议）。
+    配置的压缩模型在 models.json 中不存在、或协议不支持时，
+    回退为当前聊天模型（运行时支持 Chat Completions / Messages）。
     """
     provider, model, _ = _compaction_model_from_selection()
     config = None
     if provider:
         candidate = get_model_config(provider, model)
-        if candidate is not None and str(candidate.get("apiType") or "chat-completions").strip().casefold() == "chat-completions":
+        if candidate is not None and supports_model(candidate):
             # 压缩角色的自定义请求头随配置注入（ChatLLM 构造 HTTP 时读取 _custom_headers）
             config = inject_custom_headers_into_config(candidate, get_role_headers("compaction_model"))
         else:
@@ -908,6 +909,8 @@ async def summarize_context_text(
             result = await result
         text = ""
         if isinstance(result, dict):
+            if result.get("refusal") or result.get("context_window_exceeded"):
+                raise RuntimeError("Messages 压缩响应拒绝请求或上下文窗口已用尽")
             text = _clean_summary_text(result.get("content") or result.get("reasoning_content"))
         if not text:
             raise RuntimeError("压缩模型返回了空内容")
@@ -935,38 +938,55 @@ async def summarize_context_text(
         reasoning_parts: list[str] = []
         usage: dict[str, Any] | None = None
         last_error = ""
-        async for chunk in generator:
-            frame = _sse_frame_payload(chunk)
-            if frame is None:
-                continue
-            if frame.get("done"):
-                break
-            error_text = frame.get("error")
-            if error_text:
-                if not frame.get("retry"):
-                    last_error = str(error_text)
-                continue
-            reasoning_chunk = frame.get("reasoning_content")
-            content_chunk = frame.get("content")
-            has_reasoning = isinstance(reasoning_chunk, str) and bool(reasoning_chunk)
-            has_content = isinstance(content_chunk, str) and bool(content_chunk)
-            if has_reasoning:
-                reasoning_parts.append(reasoning_chunk)
-            if has_content:
-                content_parts.append(content_chunk)
-            if (has_reasoning or has_content) and delta_emitter is not None:
-                delta_payload: dict[str, Any] = {}
+        messages_mode = normalize_api_type(config.get("apiType")) in {"messages", "responses"}
+        response_complete = False
+        try:
+            async for chunk in generator:
+                frame = _sse_frame_payload(chunk)
+                if frame is None:
+                    continue
+                if frame.get("done"):
+                    break
+                if messages_mode and frame.get("stream_truncated"):
+                    raise RuntimeError("Messages 压缩流提前断开，未完成的摘要不能替换历史")
+                if frame.get("response_complete"):
+                    response_complete = True
+                if messages_mode and (frame.get("refusal") or frame.get("context_window_exceeded")):
+                    raise RuntimeError("Messages 压缩响应拒绝请求或上下文窗口已用尽")
+                error_text = frame.get("error")
+                if error_text:
+                    if messages_mode and not frame.get("retrying"):
+                        raise RuntimeError(str(error_text))
+                    if not frame.get("retry"):
+                        last_error = str(error_text)
+                    continue
+                reasoning_chunk = frame.get("reasoning_content")
+                content_chunk = frame.get("content")
+                has_reasoning = isinstance(reasoning_chunk, str) and bool(reasoning_chunk)
+                has_content = isinstance(content_chunk, str) and bool(content_chunk)
                 if has_reasoning:
-                    delta_payload["reasoning_content"] = reasoning_chunk
+                    reasoning_parts.append(reasoning_chunk)
                 if has_content:
-                    delta_payload["content"] = content_chunk
-                try:
-                    await delta_emitter(delta_payload)
-                except Exception as exc:
-                    logger.warning(f"压缩增量事件推送失败：{exc}")
-            if isinstance(frame.get("usage"), dict):
-                usage = frame["usage"]
+                    content_parts.append(content_chunk)
+                if (has_reasoning or has_content) and delta_emitter is not None:
+                    delta_payload: dict[str, Any] = {}
+                    if has_reasoning:
+                        delta_payload["reasoning_content"] = reasoning_chunk
+                    if has_content:
+                        delta_payload["content"] = content_chunk
+                    try:
+                        await delta_emitter(delta_payload)
+                    except Exception as exc:
+                        logger.warning(f"压缩增量事件推送失败：{exc}")
+                if isinstance(frame.get("usage"), dict):
+                    usage = frame["usage"]
+        finally:
+            closer = getattr(generator, "aclose", None)
+            if closer is not None:
+                await closer()
         text = "".join(content_parts).strip()
+        if messages_mode and not response_complete:
+            raise RuntimeError("Messages 压缩响应未完整结束，摘要未提交")
         if not text:
             hint = f"（服务端错误：{last_error}）" if last_error else ""
             raise RuntimeError(f"压缩模型返回了空内容{hint}")
@@ -976,6 +996,24 @@ async def summarize_context_text(
         return text, usage
 
     async def _invoke(request: ChatLLMRequest, config: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        request = request.model_copy(deep=True)
+        # A fallback may use a different protocol. Resolve parameters for the
+        # actual model rather than leaking the compaction role's Chat defaults.
+        messages_mode = normalize_api_type(config.get('apiType')) in {'messages', 'responses'}
+        changed_protocol = normalize_api_type(config.get('apiType')) != normalize_api_type(model_config.get('apiType'))
+        if messages_mode or changed_protocol:
+            selected = get_role_selection("compaction_model")
+            same_role = (selected.get("ownership_name") == config.get("selected_provider_name")
+                         and selected.get("model_name") == config.get("selected_model_name"))
+            params = get_role_parameter("compaction_model" if same_role else "chat_model")
+            rebuilt = _build_summary_request(prompt, request.messages[-1].content,
+                                             request.max_tokens, request.session_id, parameter=params)
+            rebuilt.max_tokens = min(request.max_tokens, rebuilt.max_tokens)
+            if messages_mode:
+                for key in ('temperature', 'top_p', 'presence_penalty', 'reasoning_effort'):
+                    if key not in params:
+                        rebuilt.model_fields_set.discard(key)
+            request = rebuilt
         if delta_emitter is None:
             return await _invoke_non_stream(request, config)
         return await _invoke_stream(request, config)
@@ -1067,13 +1105,16 @@ def _build_summary_request(
     source: str,
     output_tokens: int,
     session_id: str | None,
+    *,
+    parameter: dict[str, Any] | None = None,
 ) -> ChatLLMRequest:
     """构造压缩摘要请求；模型选择配置的 parameter 覆盖内置默认参数。
 
     参数优先级：model_selection.compaction_model.parameter（按压缩模型 api_type 取桶）
     > 压缩内置默认值。
     """
-    parameter = get_role_parameter("compaction_model")
+    if parameter is None:
+        parameter = get_role_parameter("compaction_model")
 
     def _as_float(key: str, default: float) -> float:
         try:
@@ -1107,6 +1148,13 @@ def _build_summary_request(
     )
     if isinstance(extra_body, dict) and extra_body:
         request.extra_body = dict(extra_body)
+    import uuid
+    request.responses_context = {"scope": "compaction_model:" + uuid.uuid4().hex}
+    for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text"):
+        if parameter.get(key) is not None:
+            setattr(request, key, parameter[key])
+    if request.max_output_tokens is not None:
+        request.max_output_tokens = min(request.max_output_tokens, output_tokens)
     return request
 
 
@@ -1327,7 +1375,7 @@ def _make_cumulative_summary_state(
     }
 
 
-async def compact_session_history_if_needed(
+async def _compact_session_history_local(
     session_chat_memory,
     tool_request: ChatLLMRequest,
     *,
@@ -1924,7 +1972,7 @@ def _round_messages_to_compaction_text(
     return "\n\n".join(lines) or "本轮未能提取到可压缩的文本。"
 
 
-async def compact_active_round_context_if_needed(
+async def _compact_active_round_local(
     messages: list[dict[str, Any]],
     tool_request: ChatLLMRequest,
     *,
@@ -2192,3 +2240,39 @@ async def compact_active_round_context_if_needed(
         compress_index=resolved_compression_index,
         usage=merged_usage or summary_result.usage,
     )
+
+
+async def compact_session_history_if_needed(session_chat_memory, tool_request, **kwargs):
+    from .responses_compaction import coordinate
+    config = _wire_compaction_config(tool_request)
+    emitter = kwargs.pop("event_emitter", None)
+    async def local(emit):
+        return await _compact_session_history_local(session_chat_memory, tool_request, event_emitter=emit, **kwargs)
+    return await coordinate(local, tool_request, config, emitter=emitter,
+                            manual=kwargs.get("trigger_reason") == "manual", manager=session_chat_memory)
+
+
+async def compact_active_round_context_if_needed(messages, tool_request, **kwargs):
+    from .responses_compaction import coordinate
+    config = _wire_compaction_config(tool_request)
+    emitter = kwargs.pop("event_emitter", None)
+    manager = kwargs.pop("responses_manager", None)
+    if normalize_api_type(config.get("apiType")) == "responses":
+        from .chat_runtime import build_request_messages, copy_for_request
+        tool_request.messages = build_request_messages(copy_for_request(messages, api_type="responses"))
+    async def local(emit):
+        return await _compact_active_round_local(messages, tool_request, event_emitter=emit, **kwargs)
+    return await coordinate(local, tool_request, config, emitter=emitter, manager=manager)
+
+
+def _wire_compaction_config(request):
+    if request.protocol_config:
+        return request.protocol_config
+    if request.wire_protocol:
+        return {"apiType": request.wire_protocol}
+    try:
+        return require_default_chat_config()
+    except ChatModelConfigurationError:
+        # The local implementation resolves/validates its model only when a
+        # compaction is actually necessary, preserving existing lazy behavior.
+        return {}

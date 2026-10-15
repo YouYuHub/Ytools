@@ -3,6 +3,8 @@
 本文描述 `Ytools` 的上下文压缩体系：**什么时候压缩、压缩什么、压成什么样、模型最终看到什么**。
 压缩只替换"下一次发给模型的工作上下文"，原始对话永远完整保存在历史 JSONL 中（含工具原始输出、思考过程、媒体引用），前端回放不受压缩影响。
 
+Responses 同时保留本地摘要与远端原生压缩。独立 compact 或 `compaction_trigger` 的完整原生返回窗口在下一次生成时用于建立新有状态链，随后继续 ID 增量续聊；兼容平台返回 trigger 密文不代表旧 ID 链已裁剪。连续的历史/本轮本地压缩复用同一份远端结果，远端 usage 接近阈值时即使本地摘要很小也会触发原生压缩。详见 [Responses 使用说明](responses_api_usage.md) 与 [压缩续写修复](responses_compaction_2026-10-15.md)。
+
 核心实现分布：
 
 | 文件 | 职责 |
@@ -21,7 +23,7 @@
 
 - **原始数据不丢**：JSONL 中的轮次、工具结果、思考过程、`media://` 引用始终原样保留；压缩只影响发给模型的消息序列。
 - **摘要必须是普通文本**：压缩模型被要求输出按标题分段的中文备忘（不依赖 JSON mode / 结构化输出），解析失败也能整体降级为纯文本摘要。
-- **压缩模型可独立配置**：`models.json` 顶层 `model_selection.compaction_model`（仅支持 chat-completions 协议）；未配置或不可用时回退为当前聊天模型。
+- **压缩模型可独立配置**：`models.json` 顶层 `model_selection.compaction_model`；角色选择支持 Chat Completions、Messages 与 Responses，并按所选协议调用。未配置或不可用时回退为当前聊天模型。
 - **降级链与可配置重试**：一次"尝试"=一条完整降级链——压缩模型调用失败 → 换当前聊天模型重试一次（同一模型不重复尝试，本条链只有一次调用）。
   整条链失败时按 `COMPACTION_RETRY_MAX_ATTEMPTS`（默认 2，前端可配，0 或负数=一直重试）重复执行，链与链之间固定间隔 1 秒；重试耗尽抛
   `ContextCompactionError`。**所有"生成中"的压缩点（任务前压缩、首调用压缩、任务内自动压缩、单轮压缩）一律终止当前任务**，不做"节选降级"
@@ -40,7 +42,7 @@
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `HISTORY_COMPACT_TRIGGER_RATIO` | 0.8 | 压缩触发比例（上限 0.95）：决定**何时压** |
-| `HISTORY_COMPACT_SUMMARY_BUDGET_RATIO` | 0.2 | 累计摘要总预算占聊天窗口的比例（上限 0.5）：**摘要块自身的上限**（见下方说明） |
+| `HISTORY_COMPACT_SUMMARY_BUDGET_RATIO` | 0.2 | 累计摘要总预算占有效窗口 `min(聊天窗口, 压缩窗口)` 的比例（上限 0.5）：**摘要块自身的上限**（见下方说明） |
 | `HISTORY_COMPACT_TARGET_TOKENS` | 0 | **历史压缩目标（tokens）**：>0 时把"历史部分"压到该值以内（**压到多小**）；`0`=不设目标。**会被夹取到窗口派生的上下限内**（见 §2.3） |
 | `HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR` | 1.5 | 超大工具结果拒绝系数（`<=0` 关闭，上限 10） |
 | `HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS` | 3 | 连续超大拒绝达到该次数时终止任务 |
@@ -48,11 +50,10 @@
 | `HISTORY_TOOL_RESULT_RETURN_MAX_LENGTH` | -1 | 历史轮次单个工具结果回传长度：`0` 不回传、负数完整回传、正数截断到前 N 字符 |
 
 > **`HISTORY_COMPACT_KEEP_ROUNDS`（历史轮数窗口）已废弃**：历史规模不再按"保留最近 N 轮"限制，
-> 而由**触发阈值**（何时压）与**历史压缩目标**（压到多小）共同控制。环境变量与前端字段均已移除，
-> 旧 `.env` 中残留该键不会报错但不再生效。
+> 而由**触发阈值**（何时压）与**历史压缩目标**（压到多小）共同控制。前端的轮数设置项已移除；后端仍兼容读取并回显旧 `.env` 中的 `HISTORY_COMPACT_KEEP_ROUNDS`，但不再用它限制历史窗口。
 
 > **`summary_budget_ratio` 的准确语义**（常见误解澄清）：它**不是**"压缩后历史的总大小"，而是
-> **累计摘要块自身的上限**（`聊天窗口 × 比例`，如 528k × 0.15 = 79.2k）。压缩后的历史 = 累计摘要
+> **累计摘要块自身的上限**（`有效窗口 × 比例`，如 `min(528k, 500k) × 0.15 = 75k`）。压缩后的历史 = 累计摘要
 > + 保留的原始轮次，因此**压缩后历史的实际大小可以明显大于该预算**——被保留的最近若干轮原始
 > 对话不计入摘要预算。若希望"压缩后历史整体 ≤ 某个值"，请使用 `HISTORY_COMPACT_TARGET_TOKENS`
 > （压缩目标），它才是控制"压到多小"的开关。
@@ -65,7 +66,7 @@
 | 阈值 | 公式 | 用途 |
 | --- | --- | --- |
 | 上下文压缩阈值 | `max(1024, 有效窗口 × trigger_ratio)` | 跨轮压缩与单轮压缩共用；取两窗口较小者，保证摘要能同时放进两边上下文。决定**何时压** |
-| 摘要总预算 | `max(1024, 聊天窗口 × summary_budget_ratio)` | **累计摘要块自身**的输出上限；也是手动压缩的门槛/预算。不含保留的原始轮次 |
+| 摘要总预算 | `max(1024, 有效窗口 × summary_budget_ratio)` | **累计摘要块自身**的输出上限；也是手动压缩的门槛/预算。不含保留的原始轮次 |
 | 生效摘要预算 | 设了目标时 `max(1024, min(摘要总预算, 生效目标 × 0.6))`；未设目标时 = 摘要总预算 | 目标模式下收紧，给"保留的原始轮次"留出空间 |
 | 历史压缩目标 | `HISTORY_COMPACT_TARGET_TOKENS`，夹取到 `[下限, 上限]`（见 §2.3） | 把**历史部分整体**压到该值以内（含摘要 + 保留轮次）；与触发阈值解耦，决定**压到多小** |
 | 单段摘要输出上限 | `max(64, min(32768, 模型 maxOutputTokens, 输出预算, 批保真输出预算))` | 防止单段摘要无限膨胀；批保真预算见下 |
@@ -77,10 +78,10 @@
 
 - 有效窗口 = min(528k, 500k) = **500k tokens**
 - 压缩阈值 = max(1024, 500k × 0.8) = **400k tokens**
-- 摘要总预算 = max(1024, 528k × 0.15) = **79.2k tokens**
-- 生效摘要预算（设了目标）= min(79.2k, 60k × 0.6) = **36k tokens**
+- 摘要总预算 = max(1024, 500k × 0.15) = **75k tokens**
+- 生效摘要预算（设了目标）= min(75k, 60k × 0.6) = **36k tokens**
 - 历史压缩目标 = 60000，夹取区间 [40k, 200k]（有效窗口 500k ≥ 500k）→ 生效 **60k**
-- 批源预算 = min(500k × 0.9, 500k − 8192 − 4096, 79.2k × 12) = min(450k, 487.7k, 950.4k) = **450k tokens**
+- 批源预算 = min(500k × 0.9, 500k − 8192 − 4096, 75k × 12) = min(450k, 487.7k, 900k) = **450k tokens**（此处 8192 假设压缩模型配置了 `maxOutputTokens=8192`；未配置时受代码默认输出上限约束）
 - 超大拒绝阈值 = max(1024, 500k × 1.5) = **750k tokens**
 - 任务内动态历史预算（见 §4.2）= 阈值 − 系统提示 − 工具定义 − 当前轮轨迹 − 生效摘要预算 − 问题索引(10k) − 余量(阈值/32)
 
@@ -204,6 +205,10 @@ graph LR
 - …
 【重要文件】
 - …
+【保留事实】
+- …
+【工具状态】
+- …
 ```
 
 **保真问题索引**（`render_recent_questions_message`）渲染为（受 10k token 预算，超出从最旧丢弃，至少保留最新一条）：
@@ -271,9 +276,9 @@ graph LR
 
 `POST /chat_context/compact_manual?session_id=…&force=false&stream=false`：
 
-- 预算与门槛统一使用**摘要总预算**（窗口 × summary_budget_ratio）；
+- 预算与门槛统一使用**摘要总预算**（有效窗口 × summary_budget_ratio；有效窗口为 `min(聊天模型窗口, 压缩模型窗口)`）；
 - **下限守卫**：当前上下文估算（仅消息部分 `messages_tokens`）低于摘要总预算时压缩无收益（摘要可能不比原文小），直接拒绝并提示，例如：
-  > 当前上下文约 8,420 tokens，低于摘要预算 25,600 tokens（模型窗口 × 摘要预算比例 0.2），压缩无收益，已取消本次手动压缩。
+  > 当前上下文约 8,420 tokens，低于摘要预算 25,600 tokens（有效窗口 × 摘要预算比例 0.2），压缩无收益，已取消本次手动压缩。
 - `force=true` 跳过守卫；确认后 `force_all` 把**全部已完成轮次**归并为一个累计摘要；
 - `stream=true` 时以 SSE 返回与自动压缩同构的 `start/delta/done` 事件，结尾附加
   `{"event": "compaction_manual_result", compressed_rounds, stats, error}` 与 `[DONE]`；
@@ -343,7 +348,7 @@ graph LR
 | 尾部轮次上限 | 任务内路径不按轮数限制（`tail_rounds_limit=None`，历史轮次窗口已废弃），尾部保留量由预算/目标决定 |
 | 单批摘要输出 | `max(1024, min(摘要总预算, 本批源 ÷ 12))`，压缩比恒定 |
 
-**实测对比**（聊天窗口 528k / 压缩窗口 500k / 阈值 425k / 摘要总预算 79.2k；模拟脚本替换模型调用为记录器，其余走真实代码）：
+**历史实测对比**（聊天窗口 528k / 压缩窗口 500k / 阈值 425k；当前代码的有效窗口摘要总预算为 75k。原测试记录中的 79.2k 使用了旧的聊天窗口基数，仅供理解当时记录，不代表现行计算）：
 
 | 场景 | 改动前 | 改动后 |
 | --- | --- | --- |
@@ -522,7 +527,7 @@ graph LR
 `GET /chat_context/token_stats`（`get_context_token_stats`）返回请求上下文构成，前端上下文 Token 状态条使用：
 
 - `context_token_limit`（窗口）、`messages_tokens`、`system_prompt_tokens`、`tool_definition_tokens`、`request_context_tokens`、`estimated_budget_ratio`；
-- `rounds`: `{total, summarized, retained, max_rounds}`；
+- `rounds`: `{total, summarized, retained, max_rounds}`；`max_rounds=0` 表示不限制轮数，历史轮数窗口已废弃；
 - `history_context_mode`: `summary_only` / `legacy_raw`；
 - `has_context_summary`、`recent_questions_length/count`；
 - `context_compress_count`（会话累计压缩次数）、`history_compress_count`（其中跨轮次数）；

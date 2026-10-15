@@ -124,14 +124,14 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_list_chat_models_role_compaction_filters_protocol(self) -> None:
-        # compaction_model 只列出 chat-completions 协议模型，且带 compaction_status
+        # 四角色允许 Chat Completions / Messages，且压缩角色带状态。
         response = await self.router.list_chat_models(role="compaction_model")
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.body.decode("utf-8"))
         self.assertEqual(body["role"], "compaction_model")
         role_info = body["role_info"]
-        self.assertEqual(role_info["available_count"], 2)
-        self.assertTrue(all(m["api_type"] == "chat-completions" for m in role_info["available_models"]))
+        self.assertEqual(role_info["available_count"], 3)
+        self.assertEqual({m["api_type"] for m in role_info["available_models"]}, {"chat-completions", "messages"})
         self.assertIn("compaction_status", role_info)
         self.assertTrue(role_info["compaction_status"]["uses_active_chat_model"])
 

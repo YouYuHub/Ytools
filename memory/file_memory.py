@@ -81,6 +81,9 @@ _VISION_UNSAFE_IMAGE_EXTENSIONS = {".bmp", ".ico", ".tif", ".tiff"}
 # content 部件类型 -> 历史回放/压缩时的占位文案
 MEDIA_PART_LABELS = {
     "image_url": "[图片]",
+    "image": "[图片]",
+    "document": "[文档]",
+    "input_file": "[文档]",
     "input_audio": "[音频]",
     "video_url": "[视频]",
     # 原生文档部件（read_document 按 supportDocTypes 按需单次注入；完整响应后转占位）
@@ -1767,6 +1770,32 @@ MODEL_MEDIA_MAX_EDGE = 1568
 MODEL_MEDIA_DEFAULT_QUALITY = 85
 
 
+def _messages_image_model_part(path: Path, quality: int | None = None) -> dict[str, Any]:
+    """Messages accepts images, including the first GIF frame, but no audio/video."""
+    from chat.protocols.messages_content import prepare_image
+    from chat.protocols.errors import MessagesProtocolError
+
+    if media_kind(path.name) != "image":
+        return {"error": "Messages API 不支持原生音频/视频输入；read_media 仅可读取图片"}
+    try:
+        size = path.stat().st_size
+        if size > MEDIA_SEND_IMAGE_LIMIT_BYTES:
+            return {"error": f"图片超过读取上限 {MEDIA_SEND_IMAGE_LIMIT_BYTES // 1048576}MB，请压缩后重试"}
+        with Image.open(path) as probe:
+            needs_resize = max(probe.size) > 8000 or size > IMAGE_THUMBNAIL_THRESHOLD_BYTES or quality is not None
+            first_frame = getattr(probe, "is_animated", False)
+        source = prepare_image(path.read_bytes(), media_mime_type(path.name),
+                               max_edge=MODEL_MEDIA_MAX_EDGE if needs_resize else None,
+                               quality=MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality)
+        return {"part": {"type": "image_url", "image_url": {"url": _media_data_url(source["media_type"], source["data"])}},
+                "kind": "image", "mime": source["media_type"], "size": size,
+                "filename": path.name, "stored_name": path.name,
+                "downsampled": needs_resize, "quality": quality,
+                "converted": {"converted_kind": "image", "first_frame_only": True} if first_frame else None}
+    except (OSError, ValueError, MessagesProtocolError, Image.DecompressionBombError) as exc:
+        return {"error": "图片读取失败，未注入：" + str(exc)}
+
+
 def _media_model_part_from_path(
     path: Path,
     quality: int | None = None,
@@ -1774,6 +1803,7 @@ def _media_model_part_from_path(
     transcode_cache_dir: Path | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    api_type: str | None = None,
 ) -> dict[str, Any] | None:
     """按文件路径构建 read_media 模型部件（会话引用与 load_any 共用的加载内核）。
 
@@ -1795,6 +1825,10 @@ def _media_model_part_from_path(
     缺省时按会话媒体目录口径用第一个可用会话目录（避免缓存落进当前进程
     cwd），仅影响缓存位置、不影响数据。
     """
+    if api_type in {"messages", "responses"}:
+        if start_time is not None or end_time is not None:
+            return {"error": "Messages 图片读取不支持视频时间区间"}
+        return _messages_image_model_part(path, quality)
     kind = media_kind(path.name)
     mime = media_mime_type(path.name)
     suffix_lower = Path(path.name).suffix.lower()
@@ -1962,6 +1996,7 @@ def load_session_media_model_part(
     quality: int | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    api_type: str | None = None,
 ) -> dict[str, Any] | None:
     """为 read_media 内置工具加载一个会话媒体文件，返回可直接放入消息 content 的部件。
 
@@ -1976,6 +2011,7 @@ def load_session_media_model_part(
     return _media_model_part_from_path(
         path,
         quality,
+        api_type=api_type,
         thumb_cache_dir=_thumb_dir(session_id),
         transcode_cache_dir=_transcode_cache_dir(session_id),
         start_time=start_time,
@@ -2058,6 +2094,7 @@ def resolve_media_content_parts(
     session_id: str,
     content: Any,
     vision_enabled: bool | None = None,
+    api_type: str | None = None,
 ) -> tuple[Any, list[str]]:
     """把消息 content 列表里的 media:// 引用解析为上游 API 兼容格式。
 
@@ -2081,9 +2118,23 @@ def resolve_media_content_parts(
         if not isinstance(part, dict):
             resolved_parts.append(part)
             continue
+        if api_type in {"messages", "responses"}:
+            if part.get("type") in {"input_audio", "video_url"}:
+                resolved_parts.append({"type": "text", "text": "[未发送附件：Messages API 不支持原生音频/视频输入。]"})
+                continue
+            image = part.get("image_url")
+            reference = image.get("url") if isinstance(image, dict) else None
+            if vision_enabled is not False and _is_media_reference(reference):
+                info = load_session_media_model_part(session_id, reference, api_type=api_type)
+                if info and info.get("part"):
+                    resolved_parts.append(info["part"])
+                else:
+                    unresolved.append(reference)
+                    resolved_parts.append({"type": "text", "text": f"[图片 {reference} 未发送：{(info or {}).get('error') or '文件缺失或无法读取'}]"})
+                continue
         # 视觉降级：模型不支持视觉时媒体部件转文本占位（audio 不受影响），
         # 引用保留在占位文本中，模型可切支持视觉的模型后用 read_media 回读
-        if vision_enabled is False:
+        if vision_enabled is False and part.get("type") in {"image_url", "image", "video_url"}:
             media_label = _media_reference_label(part)
             if media_label is not None and str(part.get("type") or "") != "input_audio":
                 resolved_parts.append({"type": "text", "text": media_label})
@@ -2181,6 +2232,7 @@ def resolve_message_media_refs(
     session_id: str,
     messages: list[Any],
     vision_enabled: bool | None = None,
+    api_type: str | None = None,
 ) -> list[str]:
     """就地解析一组消息里的媒体引用（仅当前轮消息调用，历史轮次不解析）。
 
@@ -2196,7 +2248,7 @@ def resolve_message_media_refs(
         if not isinstance(content, list):
             continue
         resolved, unresolved = resolve_media_content_parts(
-            session_id, content, vision_enabled=vision_enabled
+            session_id, content, vision_enabled=vision_enabled, api_type=api_type
         )
         message["content"] = resolved
         unresolved_all.extend(unresolved)
@@ -2218,10 +2270,18 @@ def _media_reference_label(part: dict[str, Any]) -> str | None:
         return None
     # 原生文档部件：占位带上原始文件名（模型可据此 read_document 原生重读），
     # 数据本体（base64）不进入文本口径
-    if part_type == NATIVE_DOC_PART_TYPE:
+    if part_type in {NATIVE_DOC_PART_TYPE, "input_file"}:
         file_info = part.get("file")
         name = str(file_info.get("filename") or "").strip() if isinstance(file_info, dict) else ""
         return f"[{label.strip('[]')} {name}]" if name else label
+    if part_type == "document":
+        name = str(part.get("title") or "").strip()
+        source = part.get("source") or {}
+        if source.get("type") == "text":
+            return (f"[文档 {name}]\n" if name else "[文档]\n") + str(source.get("data") or "")
+        if source.get("type") == "content":
+            return (f"[文档 {name}]\n" if name else "[文档]\n") + content_part_to_text(source.get("content"))
+        return f"[文档 {name}]" if name else label
     reference: Any = None
     if part_type == "image_url":
         value = part.get("image_url")
@@ -2232,6 +2292,9 @@ def _media_reference_label(part: dict[str, Any]) -> str | None:
     elif part_type == "video_url":
         value = part.get("video_url")
         reference = value.get("url") if isinstance(value, dict) else None
+    elif part_type == "image":
+        value = part.get("source") or {}
+        reference = value.get("url") if value.get("type") == "url" else None
     text = str(reference or "").strip()
     if not text or text.startswith("data:"):
         return label

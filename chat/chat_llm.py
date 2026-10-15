@@ -171,6 +171,32 @@ def _estimate_payload_input_tokens(payload: dict[str, Any]) -> int:
         non_ascii_chars = len(text) - ascii_chars
         return max(1, ascii_chars // 4 + non_ascii_chars)
 
+    def _part_tokens(part):
+        if not isinstance(part, dict):
+            return _text_tokens(part)
+        kind = part.get("type")
+        if kind in {"image_url", "input_audio", "video_url", "file", "input_file", "image"}:
+            return _MULTIMODAL_PART_PLACEHOLDER_TOKENS
+        if kind == "document":
+            source = part.get("source") or {}
+            metadata_tokens = _text_tokens(part.get("title")) + _text_tokens(part.get("context"))
+            if source.get("type") == "text":
+                return _text_tokens(source.get("data")) + metadata_tokens
+            if source.get("type") == "content":
+                nested = source.get("content")
+                return metadata_tokens + (sum(_part_tokens(item) for item in nested) if isinstance(nested, list) else _text_tokens(nested))
+            return _MULTIMODAL_PART_PLACEHOLDER_TOKENS + metadata_tokens
+        if kind == "tool_result":
+            content = part.get("content")
+            return sum(_part_tokens(item) for item in content) if isinstance(content, list) else _text_tokens(content)
+        if kind == "text":
+            return _text_tokens(part.get("text"))
+        if kind == "thinking":
+            return _text_tokens(part.get("thinking"))
+        if kind == "redacted_thinking":
+            return 16
+        return _text_tokens(part)
+
     total = 0
     for message in payload.get("messages") or []:
         if not isinstance(message, dict):
@@ -180,12 +206,7 @@ def _estimate_payload_input_tokens(payload: dict[str, Any]) -> int:
             for part in content:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") in ("image_url", "input_audio"):
-                    total += _MULTIMODAL_PART_PLACEHOLDER_TOKENS
-                elif part.get("type") == "text":
-                    total += _text_tokens(part.get("text"))
-                else:
-                    total += _text_tokens(part)
+                total += _part_tokens(part)
         else:
             total += _text_tokens(content)
         tool_calls = message.get("tool_calls")
@@ -197,6 +218,8 @@ def _estimate_payload_input_tokens(payload: dict[str, Any]) -> int:
     tools = payload.get("tools")
     if tools:
         total += _text_tokens(tools)
+    if payload.get("system"):
+        total += _text_tokens(payload["system"])
     return total
 
 
@@ -318,11 +341,31 @@ class ChatLLM:
             raise ChatModelConfigurationError("已选择的模型 url 必须是有效的 http 或 https 地址")
         if not isinstance(model_name, str) or not model_name.strip():
             raise ChatModelConfigurationError("已选择的模型缺少 id 或 name 配置")
-        if api_type != "chat-completions":
+        if api_type.replace("-", "_") not in {"chat_completions", "messages", "responses"}:
             raise ChatModelConfigurationError(
-                f"当前聊天客户端仅支持 apiType=chat-completions，已选择模型配置为 {api_type!r}"
+                f"当前聊天客户端支持 chat-completions、messages 和 responses，已选择模型配置为 {api_type!r}"
             )
+        if not chat_config.get("selected_model_id"):
+            chat_config = dict(chat_config, selected_model_id=model_name)
         return chat_config
+
+    @staticmethod
+    def _messages_config(model_config=None):
+        try:
+            config = ChatLLM._resolve_chat_config(model_config)
+        except ChatModelConfigurationError:
+            # Existing Chat error reporting remains responsible for invalid config.
+            return None
+        return config if str(config.get("apiType") or "").strip().casefold() == "messages" else None
+
+    @staticmethod
+    def _protocol_client(model_config=None):
+        from .protocols import protocol_client
+        try:
+            config = ChatLLM._resolve_chat_config(model_config)
+        except ChatModelConfigurationError:
+            return None, None
+        return protocol_client(config), config
 
     @staticmethod
     def _resolve_active_chat_config() -> dict[str, Any]:
@@ -640,6 +683,10 @@ class ChatLLM:
         """
         if request is None:
             raise ValueError("request 参数不能为 None")
+        client, protocol_config = ChatLLM._protocol_client(model_config)
+        if client is not None:
+            yield from client.sync_stream(ChatLLM, request, protocol_config)
+            return
         timeout_connect, timeout_read, timeout_drain = ChatLLM._resolve_timeouts(request, 300, 1800, 120)
         last_step = "none"
         retry_count = 0
@@ -939,6 +986,15 @@ class ChatLLM:
         """
         if request is None:
             raise ValueError("request 参数不能为 None")
+        client, protocol_config = ChatLLM._protocol_client(model_config)
+        if client is not None:
+            upstream = client.async_stream(ChatLLM, request, protocol_config, stop_checker)
+            try:
+                async for chunk in upstream:
+                    yield chunk
+            finally:
+                await upstream.aclose()
+            return
         timeout_connect, timeout_read, timeout_drain = ChatLLM._resolve_timeouts(request, 300, 1800, 120)
         last_step = "none"
         retry_count = 0
@@ -1250,14 +1306,21 @@ class ChatLLM:
         if stream:
 
             async def _stream_generator():
-                async for chunk in ChatLLM.async_std_completions_sse(
+                upstream = ChatLLM.async_std_completions_sse(
                     request=request,
                     stop_checker=stop_checker,
                     model_config=model_config,
-                ):
-                    yield chunk
+                )
+                try:
+                    async for chunk in upstream:
+                        yield chunk
+                finally:
+                    await upstream.aclose()
 
             return _stream_generator()
+        client, protocol_config = ChatLLM._protocol_client(model_config)
+        if client is not None:
+            return client.nonstream(ChatLLM, request, protocol_config, stop_checker)
         chat_config = ChatLLM._resolve_chat_config(model_config)
         url = ChatLLM.confirm_completions_url(chat_config["url"])
         api_key = chat_config.get("apiKey") or "not-needed"

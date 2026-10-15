@@ -126,6 +126,7 @@ class _WorkerStreamAdapter:
         self._live_round_no = None
         self._live_round_model = None
         self.user_stop_requested = False
+        self.stop_requested = False
         self.done = False
         self._finish_sent = False
         # 运行中注入的用户消息队列（消息引导）：生成循环在每轮检查点取出，
@@ -262,6 +263,7 @@ async def _worker_generate(
     request_data: dict,
     adapter: _WorkerStreamAdapter,
     runtime_ollama_models: Any = None,
+    permission_resume_id: str | None = None,
 ) -> None:
     """worker 内执行一次完整生成任务：刷新环境 → 解析会话目录 → chdir → 生成循环。"""
     from config import PROJECT_ROOT as CONFIG_PROJECT_ROOT, ChatLLMRequest
@@ -285,6 +287,14 @@ async def _worker_generate(
     # 会话工作目录解析：_meta.work_dir 覆盖 → DEFAULT_CHAT_WORK_DIR 兜底；
     # 目录失效时发 warning 并回退，不终止任务
     effective_dir, warning = resolve_session_work_dir(session_id)
+    if permission_resume_id:
+        from memory.permission_store import task
+        saved_task = task(permission_resume_id)
+        if not saved_task or saved_task["session"] != session_id:
+            raise ValueError("恢复任务身份无效")
+        effective_dir = saved_task["data"]["root"]
+        if not Path(effective_dir).is_dir():
+            raise ValueError("原工作目录已失效，不能恢复执行")
     if warning:
         adapter.emit_event({
             "warning": {"code": "WORK_DIR_FALLBACK", "message": warning}
@@ -302,18 +312,13 @@ async def _worker_generate(
             })
     tool_request = ChatLLMRequest(**(request_data or {}))
     from factory.chat_factory import _run_chat_generation
-    await _run_chat_generation(tool_request, adapter)
+    await _run_chat_generation(tool_request, adapter, permission_resume_id=permission_resume_id)
 
 
 async def _interrupt_worker_task(session_id: str, current_task: "asyncio.Task | None", user_stop: bool) -> None:
     """打断 worker 内正在运行的生成任务（新消息打断/手动停止/关停共用）。"""
     if current_task is None or current_task.done():
         return
-    try:
-        from memory.chat_memory import get_chat_memory_manager
-        (await get_chat_memory_manager(session_id)).run_task = False
-    except Exception:
-        pass
     current_task.cancel()
     try:
         await current_task
@@ -382,6 +387,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         # 避免新旧两个生成循环交错写同一会话
                         if adapter is not None:
                             adapter.user_stop_requested = False
+                            adapter.stop_requested = True
                         await _interrupt_worker_task(session_id, current_task, user_stop=False)
                     adapter = _WorkerStreamAdapter(session_id, evt_queue)
                     evt_queue.put({"type": "task_started"})
@@ -391,6 +397,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                             raw.get("request") or {},
                             adapter,
                             raw.get("runtime_ollama_models"),
+                            raw.get("permission_resume_id"),
                         )
                     )
 
@@ -401,6 +408,9 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         _emit_uncaught_generate_error(task, _adapter)
 
                     current_task.add_done_callback(_on_generate_done)
+                elif ctype == "approval_decision":
+                    from factory.agent_runtime.permission_runtime import notify
+                    notify(str(raw.get("approval_id") or ""))
                 elif ctype == "inject":
                     # 运行中注入用户消息（消息引导）：投递到当前适配器队列，
                     # 生成循环在下一轮检查点取出并作为新一轮继续
@@ -444,10 +454,16 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         if adapter is not None:
                             # 手动停止按 stopped 语义落盘；打断按 interrupted 语义
                             adapter.user_stop_requested = (reason == "user")
+                            adapter.stop_requested = True
                         await _interrupt_worker_task(session_id, current_task, user_stop=(reason == "user"))
                     else:
                         evt_queue.put({"type": "task_done", "no_task": True})
                 elif ctype == "shutdown":
+                    if adapter is not None:
+                        adapter.permission_suspend = True
+                        adapter.stop_requested = True
+                    from memory.permission_store import suspend_session
+                    suspend_session(session_id)
                     if current_task is not None and not current_task.done():
                         if adapter is not None:
                             adapter.user_stop_requested = False
@@ -458,6 +474,17 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
             except Exception as exc:
                 logger.warning(f"worker 处理命令 {ctype!r} 失败: {exc}")
     finally:
+        if adapter is not None:
+            adapter.permission_suspend = True
+            adapter.stop_requested = True
+        from memory.permission_store import suspend_session
+        suspend_session(session_id)
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
+            try:
+                await current_task
+            except (asyncio.CancelledError, Exception):
+                pass
         evt_queue.put(None)  # 让 evt 写线程退出
 
 
@@ -657,7 +684,7 @@ class SessionWorkerProxy:
                 return False
             return _safe_send(conn, payload)
 
-    def start_generation(self, request_data: dict) -> bool:
+    def start_generation(self, request_data: dict, permission_resume_id: str | None = None) -> bool:
         """确保 worker 存活并发送 generate 命令。"""
         self._ensure_process()
         try:
@@ -670,6 +697,7 @@ class SessionWorkerProxy:
             "type": "generate",
             "request": request_data or {},
             "runtime_ollama_models": runtime_ollama_models,
+            "permission_resume_id": permission_resume_id,
         })
 
     def request_stop(self, reason: str = "user") -> bool:

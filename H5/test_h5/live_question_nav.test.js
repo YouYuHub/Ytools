@@ -31,7 +31,7 @@ for (const reused of [false, true]) test(`附接进行中的第三轮提问立�
   const context = {
     chatInner: root, qnav: new Node('qnav'), qnavRail: rail, qnavPanel: panel, QNAV_MAX_DASHES: 40,
     el: (tag, cls, text) => new Node(cls, text), updateQnavActive() {},
-    state: { sessionId: 'session' }, AbortController, scrollToBottom() {}, setEmpty() {},
+    state: { sessionId: 'session' }, AbortController, scrollToBottom() {}, stickToBottom() {}, setEmpty() {},
     createStreamPipeline() { return { handle() {}, setRoundModel() {}, finish() { return {}; } }; },
     setTimeout() {},
     App: {

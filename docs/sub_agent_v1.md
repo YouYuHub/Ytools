@@ -2,7 +2,7 @@
 
 > 版本：V1（2026-08 定稿；P0/P1 及 P2 大部分已实现，正文为现行实现描述）
 > 定位：作为实现与修改的**唯一依据文档**；实现偏差必须回写本文档。
-> 尚未实现：heartbeat 帧（P2 预留，当前代码无发射点）。V2 演进方向见第 14 节，V2 内容不在 V1 实现范围内（其中 parent_round_number 入链、sub_agent_model 独立角色、tool_original_names 协议名还原已提前落地）。
+> 尚未实现：heartbeat 帧（P2 预留，当前代码无发射点）。原 V2 规划中的 `parent_round_number` 入链、`sub_agent_model` 独立角色、`tool_original_names` 协议名还原及 `read_media` 媒体引用透传均已提前落地；详见第 14 节更新状态。
 
 ---
 
@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | 子智能体身份 | `agent_id = 父级 tool_call_id` | **独立 `agent_id`** + `parent_agent_id` + `parent_tool_call_id` 三字段 | 一次工具调用 ≠ 一个 Agent 实例；重试歧义、嵌套扩展、归组清晰 |
 | 2 | 运行态共享 | "in-process 嵌套，环境自动继承" | **SubAgentContext 显式数据类**：共享只读配置，隔离可变执行态 | 并发子任务不互踩；依赖显式化 |
-| 3 | 停止机制 | "共享 run_task 停止信号" | **层级取消（CancellationToken）**：父停→全部子停；子超时/失败→只停自己 | 停止语义可预期，UI 可展示 |
+| 3 | 停止机制 | "共享停止标记" | **层级取消（CancellationToken）**：父停→全部子停；子超时/失败→只停自己 | 停止语义可预期，UI 可展示 |
 | 4 | 代码组织 | "新建 sub_agent.py 精简循环（复制模式）" | **SubAgentRunner + 共享纯函数提取**，父/子共用同一批基建函数 | 防止两个 Loop 半年后漂移 |
 
 **关于 `agent_id` vs `tool_call_id` 的结论**（回答最初疑问）：
@@ -39,10 +39,10 @@ V1 只有单层子智能体、一次派发对应一个 tool_call，此时 `tool_
 | 项 | 说明 | V2 方向 |
 |---|---|---|
 | 嵌套派发 | 子智能体工具白名单**硬剔除** `sub_agent`；误调用返回 blocked 结果 | `SUB_AGENT_MAX_DEPTH` 配置 + parent_agent_id 链 |
-| 子任务独立模型选择 | 沿用父级 chat_model（ambient 解析），不做 per-subagent 模型 | SubAgentContext 增加 model_config 字段 |
+| 子任务独立模型选择 | 已实现独立 `sub_agent_model` 角色；未配置时沿用父级聊天模型，Runner 每次模型调用实时解析角色配置，不放入 SubAgentContext | 可继续完善模型级能力说明/测试；当前不支持嵌套派发时为孙任务独立选模 |
 | 子任务内 ask_user | 子无用户通道；不注入定义，意外调用由白名单拒绝 | 阻塞问题写回最终回复让父决策 |
-| 子任务内 read_media | 不注入（媒体部件依赖父轮上下文） | 透传 current_task_media_references |
-| 子任务独立压缩 | 单任务生命周期短，靠轮次上限+超大拒绝兜底 | 独立压缩配置 |
+| 子任务内 read_media | 已实现：从派发 task 中收集当前任务媒体引用，并按子任务生效模型的视觉能力注入 | 可继续扩展媒体策略；当前引用范围受 task 与 vision 能力限制 |
+| 子任务独立压缩 | Chat Completions/Messages 依赖轮次与超大结果限制；Responses 子任务已在活跃轮超窗时调用原生上下文压缩 | 可评估其他协议下的独立压缩策略 |
 | 子任务后台存活 | 子任务生命周期严格限制在父轮内，父轮结束/打断即终止 | 独立后台任务模型 |
 
 ---
@@ -126,7 +126,7 @@ class SubAgentContext:
 
     # 回调（父循环注入；子 Runner 不直接持有可变全局）
     emit_event: Callable[[dict], Awaitable[None]]   # JSONL 追加 + SSE 推送
-    stop_checker: Callable[[], bool]                # 父级停止信号查询（session.run_task）
+    stop_checker: Callable[[], bool]                # 父级生成任务停止信号查询（对应 stream/worker）
 
     # 取消令牌（层级取消的叶子）
     cancel_token: asyncio.Event       # set() = 本子任务被要求停止（父停/超时/轮次上限）
@@ -138,7 +138,7 @@ class SubAgentContext:
 |---|---|---|
 | `messages`（子任务消息序列） | Runner 实例属性 | 与父级 messages 完全独立 |
 | `todo`（子任务当前计划） | Runner 实例属性 | 只写进子事件块，**不写 `_meta.todo`** |
-| `usage` 累计 | Runner 实例属性（UsageAccumulator） | 收尾并入父轮 usage_total |
+| `usage` 累计 | Runner 实例属性（UsageAccumulator） | 写入子任务块的 `done.usage_total` 并在子任务块/引用处展示；不并入父轮 `usage_total` |
 | `rounds` / started_at | Runner 实例属性 | done 事件携带 |
 | 父级 messages / round_tools / stream 缓冲 | 父循环局部变量 | 子任务只通过 `emit_event` 回调写 SSE，不直接持有 `stream` |
 | `tool_registry.ALL_TOOLS / TOOL_MCP_SERVERS` | 全局只读缓存 | 派发时刻**快照进 context**（tools/tool_servers），子任务运行期间不回读全局 |
@@ -181,7 +181,7 @@ SUB_AGENT_TOOL_NAME = "sub_agent"
 = 父级本轮已启用工具（MCP + 内置工具）
   − sub_agent（硬剔除 → V1 禁嵌套）
   − ask_user（子任务没有用户交互通道；意外调用由白名单拦截）
-  − read_media（仅当实际子模型不支持视觉时剔除）
+  − read_media（当实际子模型不支持视觉时剔除；支持时仅透传派发 task 中收集到的当前轮媒体引用）
   = todo_write（保留，写入子任务私有 todo，见 7.2）
 ```
 
@@ -331,7 +331,7 @@ class SubAgentRunner:
 
 ### 7.1 JSONL 事件块格式（最终版）
 
-写入位置：当前 `chat_round.events` 内，独立事件条目，`event="sub_agent"`，按 `agent_id` 归组，追加式（适配 `.pending` 检查点逐事件快照）。
+写入位置：当前 `chat_round.events` 内，独立事件条目，`event="sub_agent"`，按 `agent_id` 归组，追加式（适配 `history_files/sidecars/<session>_chat.jsonl.pending` 检查点逐事件快照）。
 
 ```jsonc
 // —— start（派发）——
@@ -341,7 +341,7 @@ class SubAgentRunner:
  "task":"<子任务目标全文>",
  "todo":[{"id":"1","content":"...","status":"pending"}],      // 预置计划，可缺省（会注入子模型上下文，见 §10.1）
  "tools":["read_file","search_files"],                        // 实际注入的工具名列表
- "rounds_limit":40, "timeout_seconds":900,
+ "rounds_limit":40, "timeout_seconds":900, "queued":false,
  "timestamp":"YYYY-MM-DD HH:MM:SS"}
 
 // —— model_call（每轮模型调用收尾时整条落盘；delta 帧不落盘）——
@@ -352,12 +352,18 @@ class SubAgentRunner:
  "tool_calls":[{"id":"...","type":"function","function":{"name":"...","arguments":"{}"}}],
  "timestamp":"..."}
 
-// —— tool_start / tool_result（子任务自己的工具轨迹）——
+// —— tool_start（工具开始执行；字段名为 function_name）——
+{"event":"sub_agent", "agent_id":"agent_7f82c1a9", "parent_tool_call_id":"call_abc123",
+ "agent_index":0, "phase":"tool_start", "seq":1,
+ "tool_call_id":"call_def456", "function_name":"read_file", "arguments":"{}",
+ "timestamp":"..."}
+
+// —— tool_result（工具执行结果；超大结果可能仅保留 result_preview）——
 {"event":"sub_agent", "agent_id":"agent_7f82c1a9", "parent_tool_call_id":"call_abc123",
  "agent_index":0, "phase":"tool_result", "seq":1,
  "tool_call_id":"call_def456", "tool_name":"read_file",
- "arguments":"{}", "result":"<完整结果>",
- "oversized":false, "oversized_estimated_tokens":0,
+ "arguments":"{}", "result":"<完整结果>", "file_diff":null,
+ "oversized":false, "oversized_estimated_tokens":0, "result_preview":null,
  "timestamp":"..."}
 
 // —— todo（子任务私有计划更新）——
@@ -370,7 +376,7 @@ class SubAgentRunner:
 {"event":"sub_agent", "agent_id":"agent_7f82c1a9", "parent_tool_call_id":"call_abc123",
  "agent_index":0, "phase":"notice",
  "message":"todo 计划仍有 1 项未完成，已提醒子模型继续（第 1 次，上限 3）",
- "retry_kind":"todo_remind | final_reply | stream_error", "seq":2,
+ "retry_kind":"todo_remind | final_reply | stream_error | text_tool_call", "seq":2,
  "timestamp":"..."}
 
 // —— done（收尾，唯一收口）——
@@ -388,8 +394,8 @@ class SubAgentRunner:
 - 所有条目**不带 role 字段**（区别于消息类事件）；
 - `agent_index`、`parent_agent_id` 属冗余便利字段：前端不必逐条解析父调用链即可排序/命名；
 - `phase=delta` 仅实时 SSE 推送、**不落盘**（`heartbeat` 为 P2 预留未实现，同样设计为仅推流不落盘；与 `context_compaction` 的 delta 策略一致）；
-- `phase=notice` 落盘（历史回放可见，交付保障审计），`message` 必须为非空文案；
-- todo 校验失败（父给的 `todo` 参数不合法）时 start 事件缺省 todo 字段（不做 task 前告警行追加，仅在 worker 日志告警）。
+- `phase=notice` 落盘（历史回放可见），`message` 必须非空；`retry_kind` 可能缺省或为 null，已知类型含 `todo_remind`、`final_reply`、`stream_error`、`text_tool_call`，排队/压缩提示不一定属于重试；
+- todo 校验失败（父给的 `todo` 参数不合法）时 start 事件缺省 todo 字段（不做 task 前告警行追加，仅在 worker 日志告警）；start 事件还会带 `queued` 布尔值。
 
 ### 7.2 持久层改动清单（精确到函数）
 
@@ -401,7 +407,7 @@ class SubAgentRunner:
 | `memory/chat_history_format.py` | `round_entry_to_context_messages`（两模式）与 `round_entry_to_compaction_text` 循环开头统一：`if event.get("event") == "sub_agent": continue` | 历史重建/压缩输入**显式排除**子轨迹（text/tool_result 模式虽因无 role 天然跳过，compaction 渲染必须显式排除） |
 | `chat_round_store.current_tool_result_count()` | 无需改动（只数 role=tool） | 压缩游标不受子事件干扰 |
 | `_recompute_meta_from_entries` / user_questions | 无需改动 | 按轮次聚合，子事件无 role 不影响 |
-| `get_context_token_stats` | 实现时核对 round_tokens 统计口径：子轨迹不计入父上下文消息估算（不回传给模型），或单独分桶展示 | 避免统计虚高误导 |
+| `get_context_token_stats` | 已核实：`round_tokens` 由父上下文消息估算，子智能体事件在历史消息构建中被排除，不计入父轮估算；子任务用量仅保存在各自 `done.usage_total` | 避免统计虚高误导 |
 | `docs/chat_memory_template.json` | 追加 sub_agent 条目模板与本节内容同步 | 文档即格式 |
 
 ---
@@ -471,7 +477,7 @@ class SubAgentRunner:
 2. **空收尾重试**：`full_response` 为空（含"仅思考输出"场景）不算有效交付——注入内部消息让子模型再次交付；累计耗尽按 `error` 收尾，final_reply 为进展说明（带最后正文预览 + todo 状态），父级可据此重派或换路径；
 3. **流错误断点续跑**：模型调用 `stream_error`（ChatLLM 网络层重试耗尽后的最终失败）不再直接终止——已生成的部分内容进入 messages，注入内部消息让子模型从断点继续（已完成的工作不丢失）；累计耗尽才 error 收尾。
 
-约束：所有重试均以内部消息推进并消耗 rounds，受已启用的 `max_rounds`/`timeout_seconds` 限制约束；轮次上限与整体超时均为 0 时，由用户单独停止子任务或停止父任务。每次重试向父循环推送 `notice` phase 事件（SSE + JSONL 落盘，字段 `{message, retry_kind: final_reply|stream_error|todo_remind, seq}`），前端在子任务块内以浅色条目展示，历史回放可见。
+约束：所有重试均以内部消息推进并消耗 rounds，受已启用的 `max_rounds`/`timeout_seconds` 限制约束；轮次上限与整体超时均为 0 时，由用户单独停止子任务或停止父任务。重试/解析提示会向父循环推送并落盘 `notice` phase 事件；字段为 `{message, retry_kind?, seq?}`，`retry_kind` 可能为 `final_reply` / `stream_error` / `todo_remind` / `text_tool_call`，排队或压缩等提示可不带该字段。前端在子任务块内以浅色条目展示，历史回放可见。
 
 父、子任务另有独立的计划空转保护：连续 3 个工具轮仅调用 `todo_write` 后暂时隐藏该工具，引导执行其他工具或报告进展；其他工具调用后恢复。如果模型仍调用已暂停的计划工具，则拒绝更新；连续累计至 5 轮以 `error` 收尾并返回进展。暂停期间不再发送 todo 未完成提醒，避免强迫模型调用已暂停的工具。原计划保持实际状态。详见 api_docs「计划工具连续空转保护」。
 
@@ -524,19 +530,19 @@ class SubAgentRunner:
 
 - **P0 后端最小闭环**：共享函数提取（6.2）→ builtin_tools 定义/注入 → SubAgentContext + SubAgentRunner（不含 heartbeat）→ 父循环分发/gather/结果汇入 → round_store 校验放行 + record 方法 → done 块落盘 → pytest；
 - **P1 SSE + 前端**：事件帧 → chat.js 块聚合 → history_parser 回放 → 样式 → node --test；
-- **P2 增强**：heartbeat（未实现）、tool_start 补 id 细化、`get_context_token_stats` 口径核对、文档模板同步（chat_memory_template.json / api_docs.md / project_structure.md）。
+- **P2 状态**：heartbeat 仍未实现；tool_start 的 `tool_call_id` 与 `function_name` 已落地；`get_context_token_stats` 已排除子轨迹；事件模板与 API/项目结构文档需随当前格式同步维护。
 
 ---
 
-## 14. V2 展望（不在 V1 范围）
+## 14. 尚未落地的 V2 展望（已提前落地项另行标注）
 
 1. **嵌套派发**：`SUB_AGENT_MAX_DEPTH`；`parent_agent_id` 链启用（子任务的 agent_id 成为孙任务的 parent_agent_id）；SubAgentContext 增加自身深度与"本 Agent 已派发的子任务注册表"；前端块树形缩进。
-2. **per-subagent 模型**：SubAgentContext.model_config（派发参数可选指定，默认继承父）；models.json 角色扩展或派发参数直传。
+2. **per-subagent 模型**：独立 `sub_agent_model` 角色已实现，未配置时继承父模型；SubAgentContext 不包含 `model_config`，Runner 在每次模型调用时实时解析该角色。
 3. **父循环迁移到 AgentRunner**：`_run_chat_generation` 整体迁移为 `AgentRunner(MainContext)`——V1 提取的共享函数与 Runner 职责划分即为此铺路；迁移后 main/sub 仅差 context，彻底消除双 Loop。
 4. **子任务 ask_user 转发**：子阻塞问题经父转达用户（父决定何时问），回答经 task 增量注入。
 5. **子任务结构化结果**：final_reply 支持 JSON（status/conclusions/files/blocks），父级与前端引用更精准。
-6. **read_media 透传**与媒体降采样策略复用。
-7. **独立 usage 分桶**：`_meta.sub_agent_usage` 单独统计（V1 仅并入父轮 usage_total 并在块内展示）。
+6. **read_media 透传**已实现：按 task 收集当前轮 media:// 引用，并按实际子模型 vision 能力决定是否注入；可继续评估复用更完整的媒体转换策略。
+7. **独立 usage 汇总**：当前已在每个子任务块的 `done.usage_total` 分桶；`_meta.sub_agent_usage` 跨轮聚合尚未实现，且子任务 usage 不并入父轮 `usage_total`。
 
 
 ### 2026-09-30：全局限制与独立停止

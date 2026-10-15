@@ -294,18 +294,52 @@
         App.attachLiveRoundEntry(activeStream, data.round_started.round);
       }
 
-      // 事件不含 reasoning_content 字段 = 当前思考阶段已结束
-      const hasReasoning = typeof data.reasoning_content === "string" && data.reasoning_content;
-      if (!hasReasoning && curThink) {
-        curThink.done();
-        curThink = null;
-      }
+      // 空增量、心跳、签名活动和 usage 快照不构成文本阶段边界。
+      // 只在正文、有效工具调用或 completion 收尾时结束思考，避免一段思考
+      // 被这些控制帧拆成多个折叠框（两种模型协议共用此管线）。
 
       // 压缩事件不是普通文本/工具事件，单独渲染为可展开的状态块，
       // 并在完成后刷新一次上下文统计。兼容旧版后端的嵌套 payload。
+      if (data.event === "tool_approval") {
+        if (App.permissions) App.permissions.receive(data, sessionId);
+        const approval = data.approval;
+        if (data.phase === "requested" && approval && approval.agent_id !== "preview") {
+          sealTextBlocks();
+          if (approval.agent_id === "main") {
+            let tb = toolBlocks.find(t => t.callId === approval.tool_call_id);
+            if (!tb && activeToolBlocks && approval.tool_index != null) {
+              const candidate = activeToolBlocks.get(approval.tool_index);
+              if (candidate && !candidate.done && (!candidate.callId || candidate.callId === approval.tool_call_id)) tb = candidate;
+            }
+            // 兼容没有调用 ID 的旧模型增量；认领本轮未绑定的声明块。
+            if (!tb) tb = toolBlocks.find(t => !t.done && !t.callId && t.name === approval.tool);
+            if (!tb) {
+              tb = { ui: App.buildToolBlock(approval.tool, { sessionId: sessionId }), name: approval.tool, callId: approval.tool_call_id, done: false };
+              toolBlocks.push(tb); hasStage = true; appendStage(tb.ui.wrap);
+            }
+            tb.callId = approval.tool_call_id;
+            tb.name = approval.tool; tb.ui.setName(approval.tool);
+            if (tb.ui.bindPermission) tb.ui.bindPermission({ sessionId: sessionId, toolCallId: approval.tool_call_id, round: approval.round, taskId: approval.task_id });
+          } else {
+            let block = agentById.get(approval.agent_id) || agentByCall.get(approval.parent_tool_call_id);
+            if (!block) {
+              block = { ui: App.buildSubAgentBlock(sessionId), callId: approval.parent_tool_call_id || "", agentId: approval.agent_id, done: false };
+              agentBlocksAll.push(block); hasStage = true; appendStage(block.ui.wrap);
+              if (block.callId) agentByCall.set(block.callId, block);
+            }
+            agentById.set(approval.agent_id, block);
+            if (block.ui.applyApproval) block.ui.applyApproval(approval);
+          }
+        }
+        return;
+      }
       if (data.event === "todo") {
         // 模型通过 todo_write 更新了任务计划
         App.applySessionTodo(data.todos);
+        return;
+      }
+      if (data.event === "responses_compaction") {
+        if (state.sessionId === sessionId && App.refreshResponsesState) App.refreshResponsesState();
         return;
       }
       if (data.event === "message_injected") {
@@ -341,6 +375,9 @@
         return;
       }
       if (data.event === "sub_agent") {
+        if (data.phase === "tool_result" && App.terminalJobs && App.terminalJobs.noteToolResult) {
+          App.terminalJobs.noteToolResult(sessionId, data.tool_name || data.function_name);
+        }
         // 子任务事件：按 agent_id/父级 tool_call id 聚合到独立块
         //（思考/正文/工具轨迹/todo 都在块内，不进入父级通用渲染管线）
         handleSubAgentEvent(data);
@@ -461,6 +498,7 @@
         return;
       }
       if (data.error) {
+        sealTextBlocks();
         msg.appendChild(el("div", "notice-bar", "出错：" + data.error));
       }
       // 思考：每段独立一个块
@@ -483,9 +521,7 @@
       }
       // 回答：每段独立一个块
       if (typeof data.content === "string" && data.content) {
-        // 边界帧可能同帧混发 reasoning_content + content（上游透传原样转发）：
-        // 此时上面的"不含 reasoning 字段"检测不会收尾，必须在这里补 done()，
-        // 否则思考块停留在点点点态，直到整条流结束才恢复下拉箭头
+        // 正文到达才结束思考；兼容同帧 reasoning_content + content。
         if (curThink) curThink.done();
         curThink = null;
         if (!curAnswer) {
@@ -505,13 +541,13 @@
       // 工具调用增量：按 index 合并，参数 JSON 逐帧流式展示。
       // 模型生成 arguments（命令文本/文件内容等）的每个增量帧都会实时
       // 追加到工具块输入区并自动滚动；首次收到增量时自动展开该块。
-      if (Array.isArray(data.tool_calls)) {
+      if (Array.isArray(data.tool_calls) && data.tool_calls.length) {
         sealTextBlocks();
         if (!activeToolBlocks) activeToolBlocks = new Map();
         data.tool_calls.forEach(function (d) {
           const idx = d.index != null ? d.index : 0;
           if (!activeToolBlocks.has(idx)) {
-            const toolBlock = { ui: App.buildToolBlock(""), argsText: "", done: false };
+            const toolBlock = { ui: App.buildToolBlock("", { sessionId: sessionId }), argsText: "", done: false };
             activeToolBlocks.set(idx, toolBlock);
             toolBlocks.push(toolBlock);
             hasStage = true;
@@ -520,6 +556,7 @@
           const tb = activeToolBlocks.get(idx);
           const fn = d.function || {};
           if (d.id) tb.callId = d.id;
+          if (tb.ui.bindPermission && tb.callId) tb.ui.bindPermission({ sessionId: sessionId, toolCallId: tb.callId, round: activeStream.round });
           if (fn.name) tb.ui.setName(tb.name = fn.name);
           if (tb.name === "sub_agent") promoteAgentTool(tb, tb.callId);
 
@@ -540,6 +577,7 @@
       }
       // 工具开始执行：参数已完整、后端正在调用（等待结果阶段的可感知状态）
       if (data.tool_start && data.tool_start.function_name) {
+        sealTextBlocks();
         const ts = data.tool_start;
         // 子任务派发：预建子任务块（占位），后续 sub_agent 事件续用同一块；
         // 不进入普通工具气泡渲染
@@ -564,20 +602,26 @@
           return;
         }
         const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
-        let tb = activeBlocks.find(function (t) { return t && !t.done && t.name === ts.function_name; })
-          || activeBlocks.find(function (t) { return t && !t.done; });
+        let tb = ts.tool_call_id && toolBlocks.find(t => !t.done && t.callId === ts.tool_call_id);
+        tb = tb || activeBlocks.find(t => !t.done && (!ts.tool_call_id || !t.callId) && t.name === ts.function_name)
+          || activeBlocks.find(t => !t.done && (!ts.tool_call_id || !t.callId));
         if (!tb) {
-          tb = { ui: App.buildToolBlock(ts.function_name), argsText: "", done: false };
+          tb = { ui: App.buildToolBlock(ts.function_name, { sessionId: sessionId }), argsText: "", done: false };
           toolBlocks.push(tb);
           hasStage = true;
           appendStage(tb.ui.wrap);
         }
         tb.ui.setName(ts.function_name);
+        tb.name = ts.function_name; tb.callId = ts.tool_call_id || tb.callId;
+        if (tb.ui.bindPermission && tb.callId) tb.ui.bindPermission({ sessionId: sessionId, toolCallId: tb.callId, round: activeStream.round });
+        if (ts.arguments) tb.ui.setInput(FormatUtils.prettyJson(ts.arguments));
         tb.ui.executing();
       }
       // 工具结果：填充到对应块
       if (data.tool_return && data.tool_return.function_name) {
+        sealTextBlocks();
         const tr = data.tool_return;
+        if (App.terminalJobs && App.terminalJobs.noteToolResult) App.terminalJobs.noteToolResult(sessionId, tr.function_name);
         // 子任务最终回复：轨迹已由 sub_agent 事件渲染到子任务块，
         // 此处仅在块尾追加引用条；无块可挂时降级为普通工具块
         if (tr.function_name === "sub_agent") {
@@ -616,10 +660,11 @@
           return;
         }
         const activeBlocks = activeToolBlocks ? Array.from(activeToolBlocks.values()) : [];
-        let tb = activeBlocks.find(function (t) { return t && !t.done && t.name === tr.function_name; })
-          || activeBlocks.find(function (t) { return t && !t.done; });
+        let tb = tr.tool_call_id && toolBlocks.find(t => !t.done && t.callId === tr.tool_call_id);
+        tb = tb || activeBlocks.find(t => !t.done && (!tr.tool_call_id || !t.callId) && t.name === tr.function_name)
+          || activeBlocks.find(t => !t.done && (!tr.tool_call_id || !t.callId));
         if (!tb) {
-          tb = { ui: App.buildToolBlock(tr.function_name), argsText: "", done: false };
+          tb = { ui: App.buildToolBlock(tr.function_name, { sessionId: sessionId, toolCallId: tr.tool_call_id, round: activeStream.round }), argsText: "", done: false };
           toolBlocks.push(tb);
           hasStage = true;
           appendStage(tb.ui.wrap);
@@ -647,6 +692,9 @@
             scheduleFileChangesBadgeRefresh(sessionId);
           }
         }
+      }
+      if (data.finish_reason || data.response_complete || data.stream_truncated) {
+        sealTextBlocks();
       }
       // token 用量：每次 LLM 调用一份独立统计，按 completion id 去重后累加为本轮累计
       if (data.usage && typeof data.usage === "object") {
@@ -681,8 +729,7 @@
         // 流结束仍未触发标题：不足 100 字符以已有全文触发一次（有输出才触发）
         maybeTriggerTitle(sessionId, true);
         // 强制刷出未渲染的回答节流帧（收尾必须完整，不能丢最后 60ms 的字）
-        flushAnswerRender();
-        if (curAnswer) curAnswer.classList.remove("msg-cursor");
+        sealTextBlocks();
         msg.querySelectorAll(".think-block.is-streaming").forEach(function (think) {
           think.classList.remove("is-streaming");
         });
@@ -692,6 +739,7 @@
         agentBlocksAll.forEach(function (block) {
           if (block && !block.done) block.ui.finalizeInterrupted();
         });
+        if (App.permissions && App.permissions.syncPending) App.permissions.syncPending(sessionId);
         return {
           hasStage: hasStage,
           roundUsage: roundUsageAcc,
@@ -1175,7 +1223,9 @@
 
     const msg = el("div", "msg");
     chatInner.appendChild(msg);
-    scrollToBottom();
+    // A history-search jump may have paused following while streamStatus was
+    // in flight. Reconnecting must preserve that reading position.
+    stickToBottom();
     const activeStream = {
       sessionId: sessionId,
       userText: "",
@@ -1413,7 +1463,11 @@
     state.suppressFlushOnce = true;
     try {
       await API.stopChat(sessionId);
-    } catch (_) { /* 后端停止失败也继续本地清理（生成可能已自行结束） */ }
+    } catch (error) {
+      state.suppressFlushOnce = false;
+      App.toast("停止原任务失败：" + error.message);
+      return false;
+    }
     // 中止本地监听（后端任务已由 stopChat 收尾；abort 触发旧 send 的
     // finally 兜底清理，节点已脱管不会误删新内容）
     if (state.activeStream && state.activeStream.sessionId === sessionId) {
@@ -1447,9 +1501,12 @@
     if (!sessionId || !plan || !plan.round) return;
     // 会话正在生成：先经用户二次确认停止任务（再次提醒"任务正在进行"），
     // 停止收尾落盘后才允许删除轮次，随后按计划重发
-    if (state.streaming && state.streamingSession === sessionId) {
+    const pendingPermissions = await API.pendingApprovals(sessionId).catch(error => { App.toast("任务状态读取失败：" + error.message); return null; });
+    if (!pendingPermissions || state.sessionId !== sessionId) return;
+    const hasSavedTask = (pendingPermissions.tasks || []).length > 0 || (pendingPermissions.approvals || []).some(a => a.agent_id !== "preview");
+    if ((state.streaming && state.streamingSession === sessionId) || hasSavedTask) {
       const proceed = await requestStopRunningGeneration(sessionId);
-      if (!proceed) return;
+      if (!proceed || state.sessionId !== sessionId) return;
     }
     if (plan.mode === "insert") {
       App.exitUserMessageEdit(plan.msg);

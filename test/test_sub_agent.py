@@ -1070,7 +1070,7 @@ class SubAgentModelConfigTests(unittest.TestCase):
             param_mock.assert_any_call("sub_agent_model")
 
         # 协议不符 → 回退父级
-        model_cfg_bad = {"apiType": "messages", "url": "https://x/v1"}
+        model_cfg_bad = {"apiType": "unsupported", "url": "https://x/v1"}
         with (
             mock.patch(
                 "factory.agent_runtime.sub_agent.get_role_selection",

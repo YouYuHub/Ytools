@@ -128,6 +128,7 @@
     App.refreshComposerButtons();
     let ui = null;
     let sawStart = false;
+    let sawNativeDone = false;
     scrollToBottom();
     try {
       await API.compactContextStream(compactSessionId, function (evt) {
@@ -135,12 +136,22 @@
         const data = evt.data || {};
         // 用户切走后的压缩事件不渲染进其他会话视图；切回后由 done/统计刷新呈现
         const inCompactView = state.sessionId === compactSessionId;
+        if (data.event === "responses_compaction") {
+          if (inCompactView && App.refreshResponsesState) App.refreshResponsesState();
+          if (data.phase === "done") sawNativeDone = true;
+          if (data.phase === "error") toast("官方压缩未完成：" + (data.error || "请稍后重试"));
+          return;
+        }
+        if (data.warning) { toast(data.warning.message || "压缩部分完成"); return; }
+
         if (data.event === "compaction_manual_result") {
           const rounds = Number(data.compressed_rounds) || 0;
           if (data.error) {
             toast("手动压缩失败：" + data.error);
           } else if (rounds > 0) {
             toast("已将 " + rounds + " 个历史轮次纳入累计摘要");
+          } else if (sawNativeDone) {
+            toast("官方压缩已完成，本地保留现有摘要");
           } else if (!sawStart) {
             toast("没有新的历史轮次需要压缩（当前已是摘要模式）");
           }
@@ -191,11 +202,11 @@
         const message = String(err.message || "");
         const networkLike = /fetch|network|failed to|aborted|timed?\s?out|connection/i.test(message);
         toast(networkLike
-          ? "压缩连接中断，本次压缩已中止且未写入任何摘要；历史对话保持不变，可稍后重试"
+          ? "压缩连接中断，请刷新查看已保存结果，可重试未完成部分"
           : "手动压缩失败：" + message);
       } else {
         // 用户点击终止按钮主动中止：SSE 连接断开即取消，不弹网络错误提示
-        toast("已终止压缩：本次压缩未写入任何摘要，历史对话保持不变");
+        toast("已终止压缩，已保存的结果保留，可刷新查看");
       }
       // 连接异常中断且后端未推 aborted 时：本地把块标记为失败态
       // （原始对话不受影响；若后端实际已成功，刷新页面会按 done 记录回放）

@@ -32,6 +32,7 @@ import time
 import zlib
 from html import unescape
 from html.parser import HTMLParser
+from http.client import IncompleteRead
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -598,14 +599,15 @@ def _decompress_http_body(raw: bytes, wbits: int) -> bytes:
 
 
 class _HttpResult(tuple):
-    def __new__(cls, final_url, status, content_type, raw, headers):
+    def __new__(cls, final_url, status, content_type, raw, headers, partial_note=""):
         result = super().__new__(cls, (final_url, status, content_type, raw))
         result.headers = headers
+        result.partial_note = partial_note
         return result
 
 
 def _http_request(url: str, method: str = "GET", body: str = "", headers: Optional[dict] = None,
-                  timeout_seconds: float = 30.0) -> tuple:
+                  timeout_seconds: float = 30.0, allow_partial: bool = False) -> tuple:
     """执行 HTTP 请求，返回 (最终 URL, 状态码, Content-Type, 原始字节)。
     统一带浏览器头降低被站点拒绝的概率；显式 headers 合并到默认头之上。"""
     url = str(url).strip()
@@ -627,9 +629,36 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
         except HTTPError as exc:
             response = exc  # HTTP 错误仍有可读正文，使用同样的大小与解压保护。
         with response:
-            raw = response.read(_HTTP_MAX_TRANSFER_BYTES + 1)
+            chunks = []
+            transferred = 0
+            partial_note = ""
+            while transferred <= _HTTP_MAX_TRANSFER_BYTES:
+                try:
+                    chunk = response.read(min(65536, _HTTP_MAX_TRANSFER_BYTES + 1 - transferred))
+                except IncompleteRead as exc:
+                    chunks.append(exc.partial)
+                    transferred += len(exc.partial)
+                    partial_note = "传输中断（IncompleteRead）；仅保留已收到内容，不能据此判断网页无匹配"
+                    break
+                except (OSError, TimeoutError) as exc:
+                    if not transferred:
+                        raise
+                    partial_note = f"传输中断（{type(exc).__name__}）；仅保留已收到内容，不能据此判断网页无匹配"
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                transferred += len(chunk)
+            raw = b"".join(chunks)
             if len(raw) > _HTTP_MAX_TRANSFER_BYTES:
                 raise ValueError("网页响应超过 16 MiB 下载上限")
+            declared_length = response.headers.get("Content-Length", "")
+            if not partial_note and str(declared_length).isdigit() and len(raw) < int(declared_length):
+                partial_note = "响应短于 Content-Length；仅保留已收到内容，不能据此判断网页无匹配"
+            if partial_note and not allow_partial:
+                # Search engines must not silently treat an incomplete page as
+                # complete. Only fetch_url opts into explicitly marked partials.
+                raise ValueError("网页响应未完整接收：" + partial_note)
             content_type = response.headers.get("Content-Type", "")
             # 按响应头/魔数解压：gzip(1f 8b)、deflate(zlib 头 78 xx 或裸 deflate)
             encoding_header = (response.headers.get("Content-Encoding") or "").lower().strip()
@@ -645,7 +674,7 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
                             raw = _decompress_http_body(raw, -zlib.MAX_WBITS)
                 except (OSError, zlib.error):
                     pass  # 解压失败则按原样返回，交由上层按文本处理
-            return _HttpResult(response.geturl(), response.status, content_type, raw, dict(response.headers))
+            return _HttpResult(response.geturl(), response.status, content_type, raw, dict(response.headers), partial_note)
     except URLError as exc:
         raise ValueError(f"请求失败: {url}（{exc.reason}）") from exc
     except TimeoutError as exc:
@@ -1851,7 +1880,7 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background) -> 
 
 
 def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
-                    encoding, method, body, headers) -> str:
+                    encoding, method, body, headers, offset=0) -> str:
     mode = (mode or "text").lower()
     if mode not in ("text", "html", "tag", "regex"):
         raise ValueError("mode 仅支持 text/html/tag/regex")
@@ -1860,6 +1889,9 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     if mode == "regex" and not (pattern or "").strip():
         raise ValueError("mode=regex 时必须提供 pattern 参数")
     regex = None
+    offset = int(offset)
+    if offset < 0:
+        raise ValueError("offset 必须为非负字符偏移")
     if mode == "regex":
         try:
             regex = re.compile(str(pattern))
@@ -1870,7 +1902,7 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     except (TypeError, ValueError):
         timeout = 30.0
     response = _http_request(
-        url, method=method or "GET", body=body or "", headers=headers, timeout_seconds=timeout)
+        url, method=method or "GET", body=body or "", headers=headers, timeout_seconds=timeout, allow_partial=True)
     final_url, status, content_type, raw = response
     declared = _pick_web_charset(content_type, raw, "")
     html_text, charset = decode_text(raw, encoding, candidates=(declared, 'gb18030', 'big5'))
@@ -1903,15 +1935,19 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
         content = "\n".join(matches)
     limit = min(max(int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS, 200), 100000)
     original_len = len(content)
-    content = _truncate_text(content, limit, "网页内容过长已截断")
+    start = min(offset, original_len)
+    end = min(start + limit, original_len)
+    content = content[start:end]
     header = (f"[fetch_url] HTTP {status} | {str(final_url)}\n"
               f"[fetch_url] Content-Type: {content_type or '未知'} | 声明/推断编码: {declared} | 实际编码: {charset}"
-              f" | 原始 {len(raw)} 字节 | 提取后 {original_len} 字符")
+              f" | 原始 {len(raw)} 字节 | 提取后 {original_len} 字符 | 本次字符 [{start}, {end})")
     if extract_note:
         header += f" | 提取模式: {extract_note}"
     if title:
         header += f" | 标题: {title}"
     notes = []
+    if getattr(response, "partial_note", ""):
+        notes.append("部分响应：" + response.partial_note)
     if regex_truncated:
         notes.append(f"正则结果已截断：每条最多 {per_match_cap} 字符，最多 200 条；请收窄 pattern 或使用 tag/text")
     if status >= 400:
@@ -1919,12 +1955,16 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     for key, value in getattr(response, "headers", {}).items():
         if key.lower() in ("retry-after", "location"):
             notes.append(f"{key}: {value}")
-    if mode == "tag" and not content:
+    if mode == "tag" and not original_len:
         notes.append("目标标签未匹配或内容为空；可用 mode=html 核对真实标签与 id/class（不执行 JavaScript）")
-    if mode == "regex" and not content:
+    if mode == "regex" and not original_len:
         notes.append("正则没有匹配内容；匹配对象为原始响应文本，可用 mode=html 核对")
-    if original_len > limit:
-        notes.append(f"内容超过 max_chars={limit} 已截断；可用 pattern/tag 抽取更小范围或调大 max_chars")
+    if mode == "text" and not original_len:
+        notes.append("没有提取到静态正文；页面可能依赖 JavaScript、需要登录或被站点拦截。此工具不执行 JavaScript，请用 mode=html/tag 核对或改用正文/下载链接")
+    if offset >= original_len and offset:
+        notes.append("offset 已达到或超过提取文本末尾；没有后续内容")
+    if end < original_len:
+        notes.append(f"内容超过 max_chars={limit} 已截断；next_offset={end}，用同一 URL/模式和 offset={end} 继续读取（每次重新请求）；也可用 pattern/tag 缩小范围")
     if notes:
         header += "\n[fetch_url] " + "；".join(notes)
     return header + "\n" + (content if content else "（提取结果为空）")
@@ -2406,7 +2446,8 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
 @sys_mcp_server.tool()
 async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = "",
                     max_chars: int = 0, timeout_seconds: float = 30.0, encoding: str = "",
-                    method: str = "GET", body: str = "", headers: Optional[dict] = None) -> str:
+                    method: str = "GET", body: str = "", headers: Optional[dict] = None,
+                    offset: int = 0) -> str:
     """抓取网页或 HTTP 接口内容：支持纯文本提取、按标签/正则抽取，超长自动截断
     参数：
         url:             完整链接，仅支持 http/https
@@ -2415,6 +2456,7 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
         pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
         tag:             mode=tag 时必填，简单选择器：div、div#id、div.class，可用逗号多选如 h2,p；不支持完整 CSS/XPath
         max_chars:       返回内容最大字符数（200-100000）；默认 8000
+        offset:          提取后文本的起始字符偏移；按 next_offset 续读（每次重新请求，网页变化会影响位置）
         timeout_seconds: 请求超时秒数（1-120），默认 30
         encoding:        指定响应编码（如 gbk）；留空自动判断
         method:          HTTP 方法，默认 GET；POST 时配合 body 使用
@@ -2422,13 +2464,13 @@ async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = 
         headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}
     返回：
         头部（状态码/最终 URL/Content-Type/标题/长度）+ 提取的内容；内容过长会截断，
-        HTTP 4xx/5xx 保留状态码、错误正文及 Retry-After；网络故障仍报错。
+        HTTP 4xx/5xx 保留状态码、错误正文及 Retry-After；中途断流保留已收到内容并标记部分响应，无内容的网络故障仍报错。
         tag 返回纯文本，regex 保持原始匹配（包括脚本），并提示局部截断。
         不执行 JavaScript；网页太大时建议用 tag/regex 只抽取需要的部分
     """
     return await asyncio.to_thread(
         _fetch_url_impl, url, mode, pattern, tag, max_chars, timeout_seconds,
-        encoding, method, body, headers)
+        encoding, method, body, headers, offset)
 
 
 @sys_mcp_server.tool()

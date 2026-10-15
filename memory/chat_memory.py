@@ -415,6 +415,17 @@ def read_session_meta_value(session_id: str, key: str) -> Any:
     return None
 
 
+def update_responses_session_meta(session_id: str, state: dict[str, Any]) -> None:
+    """Mirror the private journal index without constructing/recovering a manager."""
+    path = _get_chat_history_file(session_id)
+    if not path.exists():
+        return
+    with cross_process_lock(LOCK_ROOT / (path.name + ".lock")):
+        meta, entries = _load_meta_and_entries(path, session_id)
+        meta["responses_state"] = dict(state)
+        _write_meta_and_entries(path, meta, entries)
+
+
 # ---------- 会话分组（分组注册表 + 会话归属） ----------
 # 归属真源：会话 JSONL 首行 _meta.group_id（None/缺失 = 未分组）。
 # 分组定义真源：history_files/session_groups.json（单文件小 JSON，跨进程锁 +
@@ -796,12 +807,14 @@ def _resolve_model_selection_override(
             continue
         provider = entry.get("ownership_name")
         model = entry.get("model_name")
-        if _get_model_config(provider, model) is None:
+        config = _get_model_config(provider, model)
+        if config is None:
             invalid_roles.append(role)
             warnings.append(
                 f"会话独立{role} 已失效（{provider} / {model} 不在当前模型目录中），已回退全局默认"
             )
             continue
+        entry["api_type"] = str(config.get("apiType") or "chat-completions").casefold().replace("-", "_")
         effective[role] = entry
     return effective, warnings, invalid_roles
 
@@ -1150,7 +1163,6 @@ class ChatMemoryManager:
 
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self._run_task = True
         self._lock = threading.Lock()
         self._file_path = _get_chat_history_file(session_id)
         self._round_store = ChatRoundStore(session_id)
@@ -1221,6 +1233,9 @@ class ChatMemoryManager:
         的窗口极小，且必须恰好是本主进程/另一 worker 才可能误判）；写者
         仍存活时说明轮次仍在生成，保留检查点交由真正的收尾逻辑处理。
         """
+        from memory.permission_store import has_restorable_round
+        if has_restorable_round(self.session_id):
+            return
         with self._write_guard():
             recovered = None
             try:
@@ -1286,17 +1301,6 @@ class ChatMemoryManager:
             if existing_user is not None and existing_user == recovered_user:
                 return True
         return False
-
-    @property
-    def run_task(self) -> bool:
-        return self._run_task
-
-    @run_task.setter
-    def run_task(self, value: bool) -> None:
-        """
-        优雅控制对话启停功能
-        """
-        self._run_task = value
 
     def set_target_round(self, target_round: int | None) -> None:
         """设置原地重跑目标轮次号（编辑重发：本轮回复替换历史第 N 轮）。
@@ -1386,7 +1390,52 @@ class ChatMemoryManager:
         with self._lock:
             if not self._file_path.exists():
                 return None
-            return self._file_path.read_text(encoding="utf-8")
+            text = self._file_path.read_text(encoding="utf-8")
+            pending = self._saved_permission_round()
+            if pending:
+                entries = [json.loads(line) for line in text.splitlines() if line.strip()]
+                if not self._round_already_recorded(entries, pending):
+                    text += ("" if text.endswith("\n") else "\n") + json.dumps(pending, ensure_ascii=False) + "\n"
+            return text
+
+    def _saved_permission_round(self) -> dict | None:
+        """历史显示与删除预演共用的待恢复轮次，只读检查点。"""
+        from memory import permission_store
+        with permission_store.database() as db:
+            row = db.execute("SELECT json_extract(c.data,'$.pending_round') FROM tasks t JOIN checkpoints c ON c.task=t.id WHERE t.session=? AND t.state IN ('running','suspended') AND c.agent='main' AND COALESCE(json_extract(t.data,'$.preview'),0)=0 ORDER BY t.updated DESC LIMIT 1", (self.session_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        pending = json.loads(row[0])
+        if not isinstance(pending, dict):
+            return None
+        try:
+            latest = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
+            if isinstance(latest, dict) and latest.get("started_at") == pending.get("started_at"):
+                pending = latest
+        except (OSError, ValueError):
+            pass
+        return pending if pending.get("event") == "chat_round" else None
+
+    async def finish_saved_permission_round(self, pending: dict, target_round=None) -> None:
+        """用户停止重启后遗留的任务：把已保存轨迹按 stopped 收尾。
+
+        由停止接口在确认活跃写者退出后调用；不能在只读历史/预演中收尾。
+        """
+        if not isinstance(pending, dict) or pending.get("event") != "chat_round":
+            return
+        with self._lock:
+            try:
+                latest = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
+                if isinstance(latest, dict) and latest.get("started_at") == pending.get("started_at"):
+                    pending = latest
+            except (OSError, ValueError):
+                pass
+            _, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if self._round_already_recorded(entries, pending):
+                return
+            self._round_store.pending_round = json.loads(json.dumps(pending, ensure_ascii=False))
+            self._target_round_number = target_round
+        await self.stop_current_round()
 
     @staticmethod
     def _user_event_signature(event: dict[str, Any]) -> Any:
@@ -1920,6 +1969,10 @@ class ChatMemoryManager:
 
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            if dry_run:
+                pending = self._saved_permission_round()
+                if pending and not self._round_already_recorded(entries, pending):
+                    entries.append(pending)
             round_positions = [
                 index for index, entry in enumerate(entries)
                 if isinstance(entry, dict) and entry.get("event") == "chat_round"
@@ -2028,6 +2081,12 @@ class ChatMemoryManager:
             meta["context_summary"] = _adjust_summary_for_deleted_rounds(
                 meta.get("context_summary"), deleted_round_numbers
             )
+            if meta.get("responses_state"):
+                from chat.protocols.responses_store import invalidate, public_state
+                remote = invalidate(self.session_id, "历史轮次已删除", mirror=False)
+                meta["responses_state"] = public_state(remote, include_ids=True)
+                meta["context_summary"] = None
+                meta["context_summary_raw_rounds"] = []
             meta = _recompute_meta_from_entries(self.session_id, meta, remaining_entries)
             _write_meta_and_entries(self._file_path, meta, remaining_entries)
             return {
@@ -3262,6 +3321,16 @@ class ChatMemoryManager:
             except OSError:
                 recorded_upload_id = None
         deleted_parts: list[str] = []
+        from chat.protocols.native_store import session_directory
+        native_directory = session_directory(session_id)
+        if native_directory.exists():
+            _delete_path_with_retry(native_directory, recursive=True)
+            deleted_parts.append("Messages 原生回放记录")
+        from chat.protocols.responses_store import session_directory as responses_directory
+        response_dir = responses_directory(session_id)
+        if response_dir.exists():
+            _delete_path_with_retry(response_dir, recursive=True)
+            deleted_parts.append("Responses 原生状态记录")
         # 1) 删除 jsonl 历史文件与其 pending 检查点/todo 计划/.bak 备份侧车
         #    （侧车统一在 sidecars/ 子目录，旧版残留同目录文件也一并清理）
         if chat_history_file.exists():
@@ -3454,6 +3523,17 @@ def _parse_jsonl_payload(raw_bytes: bytes) -> tuple[dict[str, Any] | None, list[
             skipped_lines += 1
             continue
         candidate_entries.append(round_entry)
+    # Imported projections cannot claim ownership of backend native snapshots.
+    def strip_references(value):
+        if isinstance(value, dict):
+            value.pop("provider_state", None)
+            for child in value.values():
+                strip_references(child)
+        elif isinstance(value, list):
+            for child in value:
+                strip_references(child)
+    strip_references(candidate_entries)
+    strip_references(base_meta)
     return base_meta, candidate_entries, total_lines, skipped_lines
 
 
@@ -3545,13 +3625,43 @@ def _export_session_payload(session_id: str) -> dict[str, Any] | None:
     return {
         "session_id": session_id,
         "filename": file_path.name,
-        "text": text,
+        "text": _portable_responses_history(text),
         "upload_dir_name": upload_dir_name if files else "",
         "files": files,
         "title": str(meta.get("title") or "") if isinstance(meta, dict) else "",
         "updated_at": str(meta.get("updated_at") or "") if isinstance(meta, dict) else "",
         "group_id": str(meta.get("group_id") or "").strip() if isinstance(meta, dict) else "",
     }
+
+
+def _portable_responses_history(text: str) -> str:
+    """Sharing carries local facts, without remote pointers or private journals."""
+    if '"responses_state"' not in text and '"responses"' not in text:
+        return text
+    def clean(value):
+        if isinstance(value, list):
+            return [clean(item) for item in value if not (
+                isinstance(item, dict) and item.get("event") == "model_response" and item.get("protocol") == "responses")]
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key in {"responses_state", "context_item_id"}:
+                    continue
+                if key in {"provider_state", "response_record"} and isinstance(item, dict) and item.get("protocol") == "responses":
+                    continue
+                result[key] = clean(item)
+            return result
+        return value
+    lines = []
+    for line in text.splitlines():
+        row = _safe_parse_jsonl_line(line)
+        if isinstance(row, dict):
+            if row.get("event") == "model_response" and row.get("protocol") == "responses":
+                continue
+            lines.append(json.dumps(clean(row), ensure_ascii=False))
+        else:
+            lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 def export_sessions_to_zip(session_ids: list[str]) -> tuple[bytes, str, list[str]]:
@@ -3815,6 +3925,10 @@ def _write_imported_session(
             # 不能证明摘要游标与导入轮次对应时，宁可下次重建，也不要静默跳过历史。
             merged_meta["context_summary"] = None
             merged_meta["context_summary_raw_rounds"] = []
+        had_responses = merged_meta.pop("responses_state", None)
+        from chat.protocols.responses_store import invalidate, session_directory
+        if had_responses or session_directory(actual_session_id).exists():
+            invalidate(actual_session_id, "导入历史后重新初始化", mirror=False)
         # 导入分组归属规整：包内 group_id 指向本地不存在的分组时清除（避免孤儿
         # 引用；zip 导入随后会按「组名」映射还原有效归属，jsonl 导入保持清除，
         # 本机回导（ID 仍存在）则原样保留）

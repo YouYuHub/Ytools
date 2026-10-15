@@ -8,11 +8,11 @@
 ## 一、目录结构（仅业务代码）
 ```
 agent_tool_sse/
-├── main.py                      # FastAPI 入口：init_path → 注册8个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 + Ollama 本地模型发现线程 + MCP 工具注册表预热线程 → uvicorn(48621)；当前未托管 H5 静态页面
+├── main.py                      # FastAPI 入口：init_path → 注册9个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 + Ollama 本地模型发现线程 + MCP 工具注册表预热线程 → uvicorn(48621)；当前未托管 H5 静态页面
 ├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH；原生文档注入与文本入库上限常量（DEFAULT_NATIVE_DOC_MAX_BYTES/DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES/DEFAULT_NATIVE_DOC_MAX_ITEMS/DEFAULT_FILE_TEXT_MAX_CHARS）
 ├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载；supportDocTypes 归一化为 support_doc_types（get_model_config / list_available_models 输出）
-├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp/pillow/imageio-ffmpeg，可选 PyMuPDF/docx/pandas；已知问题：docx 应为 python-docx）
-├── .env                         # 一些全局配置
+├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp/pillow/imageio-ffmpeg，可选 PyMuPDF/python-docx/pandas/openpyxl/xlrd；DOCX 解析依赖为 python-docx）
+├── .env                         # 本机配置与凭据；当前项目根目录未提供 .gitignore，提交前须显式排除
 ├── project_structure.md         # 本文档
 ├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
 ├── game/                        # 小实验：guess_number.py / snake.html
@@ -21,17 +21,26 @@ agent_tool_sse/
 │   ├── models.json              # 模型目录：provider→models（含 apiKey/url/能力），variables/runtime 全局变量，
 │   │                            #   顶层 model_selection（chat_model/compaction_model/title_model/sub_agent_model 角色选择）
 │   ├── mcp_servers.json         # MCP 服务器注册表：server_id → command/args + 顶层 inputs（工具选择默认，含 __builtin__ 内置工具）
-│   └── models.example.json      # models.json 示例模板（真实 models.json 不入库）
+│   └── models.example.json      # models.json 示例模板；真实配置包含凭据，当前根目录未提供 .gitignore
 │
 ├── chat/
-│   └── chat_llm.py              # ChatLLM：纯标准库 HTTP/1.1 + SSE 流式客户端（同步/异步/非流式）
+│   ├── chat_llm.py              # ChatLLM：Chat Completions 协议客户端与统一调用入口
+│   ├── messages_client.py       # Anthropic Messages 流式/非流式客户端
+│   ├── responses_client.py      # 有状态 Responses 客户端、重试、恢复与压缩调用
+│   ├── responses_transport.py   # 标准库 HTTP/JSON/SSE 传输
+│   └── protocols/               # Messages/Responses 请求、内容、错误与私有状态适配及存储
 │
 ├── factory/                     # 核心业务逻辑层
 │   ├── agent_runtime/           # Agent 编排所需的可复用运行时组件
+│   │   ├── background_runner.py # 后台 run_command 监督进程入口
+│   │   ├── command_jobs.py      # 按会话隔离的后台命令注册表、日志尾读和生命周期操作
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
 │   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）+ 保真批次策略（force_all 不做尾部保留、单批源吃满 0.9 窗口、压缩比恒定 12:1、批次诊断字段）+ 历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS，夹取到窗口派生上下限：<500k 时 8% 下限、≥500k 时 40k 下限、40% 上限；目标模式下摘要预算收紧为 min(预算, 目标×0.6) 并走"只保留核心内容"的精简提示词）
 │   │   ├── builtin_tools.py     # 本地内置工具（todo_write 任务计划、ask_user 向用户提问、文件读写检索、run_command 多 shell 命令执行、read_media 读取当前任务媒体、read_document 按需读取文档（offset/limit 文本区间、原生 PDF 页区间；按 supportDocTypes 逐文件选择原生或文本）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__；可选内置工具共 10 个，check_tool_exists 已移除）
+│   │   ├── responses_compaction.py # 本地可读摘要与 Responses 原生压缩协调
+│   │   ├── responses_context.py # Responses 增量输入队列、作用域、状态推进与重新同步
+│   │   ├── todo_runtime.py      # todo_write 运行时计划校验、归并与提示
 │   │   ├── tool_registry.py     # MCP 工具发现：并发探测、JSON Schema 过滤、探测结果 TTL 缓存（/tools/list 与发送路径共用，?refresh=1 强制重探）
 │   │   ├── title_generator.py   # 会话标题自动生成（title_model 角色：累计 100 字符触发、2s 防抖、提示词要求 ≤30 字、后端硬截断 40 字）
 │   │   ├── tool_executor.py     # 工具调用归一化、参数解析、线程池并发执行
@@ -40,6 +49,8 @@ agent_tool_sse/
 │   ├── system_prompt.py          # 系统提示词构建模块：工作路径+环境/工具规则（含文件工具选择优先级）+回传长度/工具超时等可变配置实时说明
 │   ├── chat_factory.py          # tool_chat_server 主循环、后台生成任务 + SSE 重连编排、首调用预算检查、超大结果拒绝、sub_agent 派发/并发/事件双写（JSONL+SSE）；原生文档接线（read_document 按需注入一次、完整响应后回收占位、工具结果剥离 base64）
 │   ├── file_factory.py          # 文件解析器（pdf/docx/doc/csv/xls/xlsx/txt/md）；文本类文件内核：TEXT_FILE_EXTENSIONS 白名单 / is_probably_binary 二进制嗅探 / decode_text_bytes 编码回退链（utf-8-sig→utf-8→gb18030→big5→latin-1）/ parse_text_file_bytes
+│   ├── table_document.py       # CSV/XLS/XLSX 表格读取与规范化
+│   ├── word_document.py        # DOCX 正文/表格解析
 │   ├── xlsx_export.py           # 纯标准库 xlsx 生成器（zipfile+XML 手拼 OOXML：表头加粗/数字原生/错误占位样式）
 │   └── md_table_export.py       # md 表格文本解析（与前端同语义：行内代码/转义竖线不切断分列、行内标记清理、链接取 URL）
 │
@@ -56,17 +67,23 @@ agent_tool_sse/
 │   ├── raw_upload.py            # application/octet-stream 原始请求体读取（媒体/文件上传共用：filename 查询参数、大小上限）
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度/网络重试/工具并发/视频读取上限/子智能体重试等配置；压缩失败重试 GET/POST /chat_config/compaction_retry；POST /chat_config/generate_title 会话标题自动生成
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
+│   ├── terminal_router.py       # 按 session_id 管理 run_command 后台任务的 /terminal/jobs/* API
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
 │   ├── file_router.py           # 文档上传解析（文本类扩展名+二进制嗅探、超限截断入库、原生文档标记）/媒体上传（视频600MB流式）/Range 读取
 │   ├── file_history_router.py   # 文件版本链与差异块操作接口（/file_diff/*）
 │   ├── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
-│   └── user_profile_router.py   # 访客用户显示名 GET/POST /user/profile（全局唯一，存项目 .env USER_NAME；账号/数据库体系落地前的过渡实现）
+│   ├── user_profile_router.py   # 访客用户显示名 GET/POST /user/profile（全局唯一，存项目 .env USER_NAME；账号/数据库体系落地前的过渡实现）
 │
 ├── prompt/                      # Skills 提示词库模块
 │   ├── prompt_manager.py        # md_files 目录初始化（空目录播种示例）、文件名规整与增删改查
 │   └── md_files/                # 用户自管理的可复用聊天提示词（Markdown，可前端编辑也可直接改文件）
 │
 ├── util/
+│   ├── atomic_json.py           # JSON 原子写入辅助
+│   ├── logger.py                # ytools 统一日志（ERROR 文件日志单文件上限 100MiB，保留 5 份）
+│   ├── media_limits.py          # 媒体数量配额、缓存及明确限制错误的自动降级
+│   ├── process_identity.py      # 跨平台进程身份校验
+│   ├── text_encoding.py         # 终端、文档与网页文本编码检测/解码
 │   ├── timestamp_utils.py       # 全仓统一时间戳格式
 │   ├── file_lock.py             # 跨进程文件锁（msvcrt/flock）：会话 JSONL 多进程写入互斥
 │   ├── config_watcher.py        # 配置文件热重载轮询线程（mcp_servers.json / models.json / 项目 .env，hash 比对 + 重载回调）
@@ -78,7 +95,7 @@ agent_tool_sse/
 │   ├── restart_tools_server.py  # 重启维护 MCP 服务器；当前缺少项目根 restart_helper.py，main.py 的服务快照写入亦被注释，不能按设计完成自动重启
 │   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）
 │
-├── H5/                          # 前端聊天界面（纯静态，由后端同端口静态托管或本地打开）
+├── H5/                          # 前端聊天界面（纯静态，本地打开；当前后端未托管静态页面）
 │   ├── README.md                # 前端使用说明
 │   ├── index.html               # 单页应用入口（Ytools；当前需独立打开）
 │   ├── editor.html              # 文件 Diff 独立编辑器页面
@@ -92,11 +109,12 @@ agent_tool_sse/
 │   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
 │   │                            #   session_utils.js / session_group_utils.js（会话分组纯逻辑：
 │   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
-│   │                            #   名称校验）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
+│   │                            #   名称校验）/ history_search.js（异步搜索状态）/
+│   │                            #   tool_approval_state.js（审批状态管理）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
 │   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app.js（入口）+
-│   │                            #   app/（19 个功能模块：core/sessions/session_groups/stats/workdir/
-│   │                            #   messages/history/compaction/builtin/user_profile/media/skills/composer/
-│   │                            #   model_panel/tools/chat/quotes/filehistory/editor；session_groups=侧边栏分组区
+│   │                            #   app/（22 个功能模块：core/quotes/sessions/history_search/session_groups/
+│   │                            #   stats/workdir/permissions/messages/history/compaction/builtin/
+│   │                            #   user_profile/media/skills/composer/model_panel/tools/chat/filehistory/editor/terminals；session_groups=侧边栏分组区
 │   │                            #   UI/交互；skills=提示词库可拖拽对话框；quotes=引用选区浮钮/
 │   │                            #   草稿卡片/气泡卡片；filehistory=文件版本链徽标与统计面板；
 │   │                            #   editor=文件 diff 编辑器页逻辑（editor.html）；
@@ -104,27 +122,44 @@ agent_tool_sse/
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
-│   └── test_h5/                 # 前端单元测试（format_utils/history_parser/markdown/quote_utils/
-│                                #   session_group_utils/session_list_utils/session_marquee/
-│                                #   session_open_guard/session_title_flow/session_utils/
-│                                #   stats_model_label/table_export/widget_reuse/zoom_utils/
-│                                #   file_history_sync，共 15 个，node --test）
+│   └── test_h5/                 # 35 个 node:test 测试文件；覆盖语音、历史搜索、权限审批、滚动、子智能体、后台终端等
 │
 ├── docs/
-│   ├── api_docs.md              # 全部 REST 接口出入参数说明（含 sub_agent SSE 事件格式、compaction_retry/network_retry 配置接口）
-│   ├── sub_agent_v1.md          # 子智能体（sub_agent 内置工具）V1 实现说明文档
+│   ├── api_docs.md              # REST 接口、内置工具、SSE 事件及配置说明
+│   ├── chat_memory_template.json # JSONL/会话元数据模板（须与现行格式保持同步）
+│   ├── compact.md               # 上下文压缩逻辑说明
+│   ├── file_diff.md             # 文件变更 Diff 与历史版本链
+│   ├── history_search.md        # 会话全文搜索接口、索引与前端行为
+│   ├── local_data_storage.md    # 本地历史、媒体、权限库与 sidecar 存储说明
+│   ├── media_limits.md          # 多模态媒体数量/类型配额及自动降级
+│   ├── messages_api_compatibility_plan.md # Messages 历史实施方案（以 usage 文档为准）
+│   ├── messages_api_parity_audit.md # Messages 功能对照与历史验证记录
+│   ├── messages_api_usage.md    # Messages API 当前使用说明
 │   ├── quote_selection.md       # 选中文本引用功能实现说明
-│   ├── file_diff.md             # 文件变更 Diff 与历史版本链说明
-│   ├── chat_memory_template.json # 聊天记忆 JSONL 模板（含 sub_agent 事件块模板与备注）
-│   └── compact.md               # 压缩逻辑说明文档（含压缩失败重试链、失败终止任务策略、拼接优先累计合并）
+│   ├── read_media.md            # read_media 工具使用与限制
+│   ├── responses_api_stateful_plan.md # Responses 历史设计方案（以 usage 文档为准）
+│   ├── responses_api_usage.md   # 有状态 Responses 当前使用说明
+│   ├── responses_compaction_2026-10-15.md # Responses 压缩后继续生成的故障排查记录
+│   ├── responses_recovery_2026-10-15.md # Responses 断流与重新同步排查记录
+│   ├── session_fixes_2026-10-12.md # 带日期的会话问题修复记录
+│   ├── sub_agent_v1.md          # 子智能体（sub_agent）实现说明
+│   ├── terminal_management.md   # 后台终端管理接口与页面行为
+│   ├── text_encoding.md         # 工具文本编码说明
+│   ├── tool_permissions.md      # 工具权限、审批及恢复使用说明
+│   ├── tool_permissions_plan.md # 工具权限设计记录（实际行为以使用说明为准）
+│   ├── tool_test_review_2026-10-06.md # 带日期的工具测试复核记录
+│   └── web_tools.md              # 网页搜索与抓取说明
 │
 ├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
 │                                 #   session_groups.json（会话分组注册表，含 collapsed/order；随分享包
 │                                 #   manifest v2 的 groups 携带，导入端按组名映射还原归属）
 │                                 #   上传记录目录 history_files/session_files/<session>/（upload 改名而来）：文件解析 JSON + media/ + files/ + file_diffs/
+│                                 #   state/permission_runtime.sqlite3：全局/会话权限、审批、任务恢复与执行台账；state/backups/ 为迁移备份
+│                                 #   sidecars/：会话 pending/todo/bak 等侧车与 history_search.sqlite3 搜索缓存；与权限数据库独立
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
-                                 #   test_context_compaction / test_chat_router / test_sub_agent /
+                                 #   test_context_compaction / test_chat_router / test_sub_agent / test_messages_api / test_responses_api /
+                                  #   test_terminal_jobs / test_file_history /
                                  #   test_quote_selection / test_user_profile_router / test_session_groups / test_native_document_support 等）
 ```
 
@@ -146,15 +181,15 @@ agent_tool_sse/
    ├─ ③ 工具白名单过滤：前端只允许传 tool_names，后端实时工具为唯一真相
    │     - 未注册工具名 → 忽略并发 warning 事件
    │     - 未选择工具 → 无工具模式继续
-   │     - 工具选择「内置工具」分组勾选的项按需注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 <session>_chat.jsonl.todo 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索；相对路径基于会话工作目录；edit_file 支持 expected_hash 校验，覆盖写与编辑使用临时文件替换；search_files 有扫描上限）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单次 ≤5；数据以 user 多模态部件注入后续请求、仅内存不落盘）、read_document（需在工具配置中勾选；未选中时不注入工具、清单展示解析文本；选中后支持 offset/limit 文本读取，以及按 supportDocTypes 原生读取）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
+   │     - 工具选择「内置工具」分组勾选的项按需注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 `history_files/sidecars/<session>_chat.jsonl.todo` 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索；相对路径基于会话工作目录；edit_file 支持 expected_hash 校验，覆盖写与编辑使用临时文件替换；search_files 有扫描上限）、run_command（勾选后同时注入 poll_command/stop_command 管理后台任务）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单次 ≤5；数据以 user 多模态部件注入后续请求、仅内存不落盘）、read_document（需在工具配置中勾选；未选中时不注入工具、清单展示解析文本；选中后支持 offset/limit 文本读取，以及按 supportDocTypes 原生读取）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
    ├─ ④ 上下文构建：
    │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS 为兼容参数；
-   │       历史轮数窗口已废弃，默认 0=不限轮数，摘要-only 模式不限制已完成历史回传；前端提供完整历史则跳过）
+   │       历史轮数窗口已废弃，`max_rounds=0` 表示不限制轮数，摘要-only 模式不限制已完成历史回传；前端提供完整历史则跳过）
    │     - 注入系统提示词（含当前工作路径、思考过程回传长度说明）+ 会话已上传文件解析内容
    │     - 首调用预算检查：历史+文件+当前请求+工具定义超模型窗口时，
    │       文件记忆先降级为约 1500 字符的文件索引（仅文件名/类型/大小，warning: CONTEXT_BUDGET_FILE_DOWNGRADED），
    │       仍超窗则推送 error 终止
-   ├─ ⑤ 流式请求循环（while session_chat_memory.run_task，按会话隔离停止）：
+   ├─ ⑤ 流式请求循环（检查当前生成任务的停止信号，按会话隔离）：
    │     ├─ ChatLLM 流式请求（stop_checker 支持手动停止）
    │     ├─ 解析 SSE：合并 tool_calls/function_call 增量（按 index 累加）、收集 usage、捕获 finish_reason
    │     ├─ 有工具调用 → normalize_tool_calls（修复流式拼接粘连）→ 拦截未授权工具
@@ -168,14 +203,14 @@ agent_tool_sse/
    ├─ ⑥ 上下文压缩：agent_runtime/context_compaction.py
    │     - 跨轮历史在统一流程中归并为一个累计摘要，所有历史问题独立保留最近 10k tokens
    │     - 单轮工具轨迹超过「min(聊天窗口,压缩窗口)×比例」阈值时，在下一次模型调用前压缩为累计摘要
-   │     - 压缩开始/完成事件实时推 SSE 并落盘 JSONL（字段一致）
+   │     - 压缩 start/done 事件实时推 SSE 并落盘：session 级作为独立 JSONL 事件行、round 级嵌入对应 `chat_round.events`；delta 仅实时推送、不落盘
    └─ ⑦ 清理会话管理器 → 输出 data: [DONE]
 ```
 
 **会话控制**：每个会话独立后台任务（`_SESSION_STREAMS` 注册表 + `_SessionStream` 有界环形事件缓冲）。
 - 首个请求启动 `asyncio.create_task` 生成循环；页面刷新/断线后重连只订阅缓冲，从当前轮起点回放（`replay` 标记 + 提问文本）；
 - 携带新用户消息的请求会平滑打断旧任务后重启；
-- `/stop_chat` 仅停止指定会话（`ChatMemoryManager.run_task` 按 session_id 隔离）；`GET /chat_stream/status` 供前端查询后台任务是否在跑。
+- `/stop_chat` 仅停止指定会话的实际生成任务；停止信号保存在对应 stream/worker 中。`GET /chat_stream/status` 按实际任务状态供前端查询后台任务是否在跑。
 
 ### 2. 文件上传流程（`routers/file_router.py`）
 ```
@@ -220,7 +255,7 @@ agent_tool_sse/
 ### 1. 聊天客户端（`chat/chat_llm.py`）
 - 纯标准库实现（socket + ssl），不依赖 openai SDK，支持 HTTP/1.1 chunked 传输解析（处理 UTF-8 被切断问题）
 - `chat_completions()` 统一入口：`stream=True` 返回异步生成器，`stream=False` 返回完整字典（供历史压缩用）
-- 模型配置热解析：每次请求从 models.json 解析当前选中模型，**连接失败自动无限重试**直到用户停止
+- 模型配置热解析：每次请求从 models.json 解析当前选中模型，按 `NETWORK_RETRY_MAX_ATTEMPTS` 有限重试（默认最多 3 次、固定 1 秒间隔）；设为 0 或负数才无限重试直到用户停止
 - `reasoning_effort` 无条件随请求下发（由 `apply_role_parameter_defaults` 按模型参数桶填充）
 - 统一输出 SSE 事件：content / reasoning_content / tool_calls / usage / finish_reason
 
@@ -230,7 +265,7 @@ agent_tool_sse/
 - **SSE 事件归一化**：流式 `tool_calls` 按 index 增量合并，兼容老模型 `function_call`；透传前过滤 id/type 字段
 - **usage 汇总**：`UsageAccumulator` 按 completion_id + 指纹去重，合并后挂到当前 chat_round
 - **首调用预算检查**：请求发起前估算「消息 + 工具定义」token，超当前模型窗口时优先把文件记忆降级为约 1500 字符的文件索引（仅文件名/类型/大小，发 warning 事件），仍超窗则发 error 并终止，避免上游 400/静默截断
-- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入。`todo_write` 模型自我规划（落盘侧车 `<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；系统提示终态注入收官提醒）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）。未知或未启用的工具调用由执行侧拒绝并返回配对工具结果。
+- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入。`todo_write` 模型自我规划（落盘侧车 `history_files/sidecars/<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；系统提示终态注入收官提醒）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）。未知或未启用的工具调用由执行侧拒绝并返回配对工具结果。
    - **上下文压缩**：由 `agent_runtime/context_compaction.py` 统一负责。压缩模型调用支持**流式接口**：传入 `event_emitter` 时以 `stream=True` 请求，模型思考/正文增量经 `phase="delta"` 事件（`reasoning_content`/`content` 与聊天 SSE 同名字段）实时推 SSE，delta 帧不落盘；done 事件携带 `summary_text` 最终累计摘要全文并随同一 payload 落盘 JSONL，前端刷新后可在压缩块回放摘要。跨轮历史与单轮工具轨迹达到「`min(聊天窗口,压缩窗口)×ratio`」时，使用压缩模型输出普通文本摘要，并归并为一个累计摘要块；已完成原始轮次只存储在 JSONL，不再回传给模型，全部历史原始用户问题保留最近 ≤10k tokens（`context_summary.recent_questions`），渲染为独立 system 消息；单次超大工具结果也会在下一次模型调用前触发；原始结果仍写入 JSONL 与 SSE。
 - **超大结果拒绝**：单次工具结果估算 token 超过 `min(聊天窗口,压缩窗口)×系数`（默认 1.5）时，结果不进入模型上下文，改写"输出过长，请重新考虑工具"反馈并让模型重新规划；JSONL 只落头尾节选预览（`result_preview`）。连续超长拒绝达到上限（默认 3）时终止任务并写入说明。
 - **错误处理**：上游流错误/用户停止/异常分别记录不同状态，避免误记；服务端取消（CancelledError）尽力落盘后重抛。worker 模式下生成任务逃逸异常与 worker 进程崩溃均可见化：补发同构 error SSE 帧、错误说明落盘 JSONL 并合成 task_done 收尾（`session_worker._emit_uncaught_generate_error` / reader 崩溃合成路径），不再出现"任务静默终止无任何提示"。
@@ -240,7 +275,7 @@ agent_tool_sse/
 - 执行器：
   - `normalize_tool_calls`：修复流式拼接粘连（多个工具名/多个 JSON 参数被连成一个字符串时自动拆分）
   - `prepare_tool_execution`：解析参数、提取 `over_task` 信号、标记解析错误
-  - `execute_tool_round`：线程池并发执行，pipe 类工具（setup_pipe/run_pipe_command/read_pipe_history）连接失败自动重试3次
+  - `execute_tool_round`：线程池并发执行，pipe 类工具（setup_pipe/run_pipe_command/read_pipe_output）连接失败不自动重试
 - **tool_call 配对契约**（上游严格校验：声明必有配对结果，违反即 400 空响应体）：
   - `chat_runtime.sanitize_tool_call_pairing`：请求前统一防线（挂在 `copy_for_request` 请求副本出口，父/子共用）——清理全部悬空声明（有正文保留正文、无正文丢弃整条；部分悬空仅剔除悬空项），畸形声明（无 id）保守保留；
   - 源头修复：`_replace_todo_context` 归并时同步清除 todo 声明；历史轮次构建清理中断轮次悬空、结果声明不匹配时不再错挂；子智能体对 `over_task`/未授权工具生成配对结果；
@@ -256,9 +291,9 @@ agent_tool_sse/
   - 首行 `_meta` 元数据（title/user_questions/usage/context_summary/record_count/completion_count/upload_id 等），追加时实时重算；`_meta` 不再含 session_id（会话标识以文件名为准）
   - `ChatRoundStore` 将散消息按 `chat_round` 事件聚合：`{event, question, events[], status, usage_total, completion_count}`；status 含 done/error/stopped/interrupted
   - 单轮工具上下文压缩状态随轮次保存为可选 `compress_blocks`（累计摘要块带覆盖游标）/`compress_content`/`compress_index`；活动期间写入 `_meta._active_round_compaction` 检查点，历史重建时跳过游标之前已摘要的工具轨迹
-  - 压缩 usage 分桶累计：单轮 `compress_usage`、跨轮 `_history_compress_usage`；压缩过程事件（start/done）以 `event="context_compaction"` 独立行落盘，与 SSE 推送同结构
-  - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；`run_task` 属性按会话控制对话启停
-  - 支持按轮次删除（`delete_rounds`，运行中会话 409 + .bak 备份）/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突自动追加时间戳另存）
+  - 压缩 usage 分桶累计：单轮 `compress_usage`、跨轮 `_history_compress_usage`；session 级压缩事件以 `event="context_compaction"` 独立行落盘；round 级事件嵌入所属 `chat_round.events`，两者均与 SSE 使用同一 payload
+  - 会话管理器注册表缓存 + 读写加锁（写用临时文件原子替换），保证线程安全；仅管理历史与上下文数据
+  - 支持按轮次删除（`delete_rounds`，运行中会话 409 + .bak 备份）/清空/下载、列表查询、标题更新（PUT /chat_history/title）、jsonl 导入（同名冲突按请求策略处理；ask 未附逐项决策时该单文件路径默认改名另存）
   - **多会话分享/导入**：`export_sessions_to_zip` 打包（各会话 jsonl + `session_files/<upload_id>/` 数据 + manifest.json）；`list_zip_sessions` 预检（不落盘，返回会话清单与本地冲突标记）；`import_sessions_from_zip` 两阶段提交（冲突策略 ask/overwrite/rename/skip，逐会话决策，另存时上传目录归属随新会话 ID 改名并回写 `_meta.upload_id`），路由见 `/chat_history/export_zip|import_preview|import_package`
 - **FileMemoryManager**（`history_files/session_files/<session>/<file>.json`）：每文件一 JSON，超限删最旧，支持文本摘要供 LLM 使用；上传目录名写入会话 `_meta.upload_id`，删除会话时连带清理（目录由 `history_files/upload/` 改名而来）。**原生文档内核**（`memory/file_memory.py`）：按 supportDocTypes 逐文件分流 / 原始字节→OpenAI `file` 部件 data URL / 原生 PDF 页段 / 单文件及同请求批次预算 / `retire_native_document_parts`（完整模型响应后把历史部件替换为「[文档 名字]」占位）；清单对原生候选只显示索引，避免重复注入解析全文
   - **chat_history_format.py**：摘要规范化/渲染（累计摘要与最近问题索引）、chat_round → 上下文消息；工具结果回传可配置（0=不回传、负数=全部、正数=截断前 N 字符）；带引用快照的轮次在用户消息前置 `<quote_list>`（模型视图，JSONL 原始历史不含标签）
@@ -277,7 +312,7 @@ agent_tool_sse/
 ### 7. 环境与模型配置（`env_manager.py`）
 - `.env` 支持 `${VAR}` 变量引用、`enc:dpapi:` Windows DPAPI 加密密钥解密
 - `models.json`：支持顶层 provider + 嵌套子 provider 扫描，`variables`/`runtime` 作为全局配置变量
-- **模型角色选择**：顶层 `model_selection` 键（chat_model/compaction_model/title_model/sub_agent_model），每项 `{ownership_name, model_name, parameter, api_type}`；`parameter` 按 api_type 分桶存储（chat_completions/messages/responses），取参回退链：当前 api_type 桶 → chat_completions 桶 → 任意非空桶 → 空；旧版扁平格式加载时自动迁移。`compaction_model`/`sub_agent_model` 强制 chat-completions 协议
+- **模型角色选择**：顶层 `model_selection` 键（chat_model/compaction_model/title_model/sub_agent_model），每项 `{ownership_name, model_name, parameter, api_type}`；`parameter` 按 api_type 分桶存储（chat_completions/messages/responses），取参回退链：当前 api_type 桶 → chat_completions 桶 → 任意非空桶 → 空；旧版扁平格式加载时自动迁移。四个角色的模型选择校验支持 chat-completions/messages/responses 协议
 - 模型选择三件套：`list_available_models`（扁平列表给前端）/ `get_current_model_selection` / `select_chat_model`（写 models.json + 同步内存）；`model_selection` 未配置 chat_model 时回退 .env 的 CHAT_OWNERSHIP_NANE/CHAT_MODEL_NAME
 - `apply_role_parameter_defaults`：请求体未显式提供的生成参数按选中模型的 parameter 自动填充
 - `set_env_vars`：写回 .env 并保持内存 env_vars 一致（防 hot-reload 覆盖）
@@ -310,9 +345,9 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 ### 9. H5 前端（`H5/`）
 - 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口
-- 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染；文档上传类型放宽——`core.js` 的 `DOC_EXTENSIONS` 与后端 `TEXT_FILE_EXTENSIONS` 对齐（约百余项文本/代码/配置扩展名，未知扩展名交后端二进制嗅探），命中当前模型 `supportDocTypes` 的文档仅在 `read_document` 调用后按需原生发送一次（vision 与文档能力分别判断）
+- 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染；文档上传类型放宽——`core.js` 的 `DOC_EXTENSIONS` 包含后端 `TEXT_FILE_EXTENSIONS`，另加 PDF、DOC/DOCX、XLS/XLSX 五种由专用解析器处理的扩展名，未知扩展名交后端二进制嗅探），命中当前模型 `supportDocTypes` 的文档仅在 `read_document` 调用后按需原生发送一次（vision 与文档能力分别判断）
 - **语音输入**：Web Speech API（Chrome/Edge）——点麦克风连续听写，识别文本以录音时光标为插入点实时写入输入框（确认结果累积、中间结果实时预览），长静默自动重启会话，再点停止；发送/切会话自动收尾，剪贴板无关、仅依赖浏览器在线语音服务
-- **会话标题跑马灯**：溢出标题 hover 300ms 后向左匀速滚动（约 80px/s）至末尾文本对齐右缘，滚动期间移除右缘渐隐遮罩，移出即复位
+- **会话标题跑马灯**：溢出标题 hover 250ms 后向左滚动（约 80px/s）至末尾文本对齐右缘，滚动期间移除右缘渐隐遮罩，移出即复位
 - **富媒体渲染**：模型输出的 ```svg（双视图：代码/图片 + 复制代码/复制图片）、```mermaid（懒加载 Mermaid.js 异步渲染，代码/图片双视图）、```canvas（**运行确认 + iframe 沙箱**：sandbox="allow-scripts" 隔离执行，postMessage 握手下发源码；沙箱包装 rAF/定时器统计待执行回调数——一次性绘制回传 canvas-done 快照，动画/游戏脚本进入"独活"模式保持运行态可交互（点击/键盘直接玩），console 逐行实时回传，截图随时索要当前帧，脚本自然收尾自动补发最终快照；⛶ 全屏作用于整个控件块，画布 object-fit:contain 等比缩放，全屏内按钮可用；```svg|mermaid|canvas 栅栏与媒体伪标签均独占一行不参与两列并排
 - 公式：KaTeX 0.18.7 本地 vendor（$…$、$$…$$、\(…\)、\[…\] 四种定界符；代码栅栏先遮蔽防误提取；价格文本防误判；无 katex 环境降级原文）
 - 图片视图自适应：SVG 按 viewBox 比例注入 aspect-ratio 内联样式，默认填满控件宽度（仅极竖长 >1.7 屏才按高度收窄），导出图片按实际渲染尺寸超采样 + contain 裁剪

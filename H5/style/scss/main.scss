@@ -9,6 +9,8 @@
 @use "prism";
 @use "composer";
 @use "components";
+@use "history_search";
+@use "permissions";
 @use "skills";
 @use "filehistory";
 @use "editor";

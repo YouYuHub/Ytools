@@ -7,7 +7,7 @@
 ## 当前策略
 
 - PowerShell / pwsh：前台直接执行和 Windows 中转脚本均设置控制台输入、输出及 `$OutputEncoding` 为 UTF-8。`Get-Content`、`Select-String`、`Set-Content`、`Add-Content`、`Out-File` 的子会话默认编码为 UTF-8；显式 `-Encoding` 优先。不修改系统设置或用户 profile。PowerShell 5.1 写 UTF-8 文件可能带 BOM。
-- 终端输出：BOM 优先识别 UTF-8、UTF-16、UTF-32；其余按行先严格尝试 UTF-8，再尝试系统 ANSI/OEM/控制台代码页和常见中文编码。支持不同行分别使用 UTF-8 与 GBK。合法 UTF-8 不再依据汉字“生僻程度”重新猜成 GBK。
+- 终端输出：若调用方显式指定 `encoding`，先按指定编码严格解码；否则先识别 BOM（UTF-32、UTF-8、UTF-16），无 BOM 时按行严格尝试 UTF-8，再尝试系统 ANSI/OEM/控制台代码页和常见中文编码。支持不同行分别使用 UTF-8 与 GBK。合法 UTF-8 不再依据汉字“生僻程度”重新猜成 GBK。
 - 文本及 CSV 文档：采用统一 BOM/UTF-8/常见中文编码回退，CSV 先解码再解析，不通过跳过坏行掩盖编码错误。带 Unicode BOM 的文本不再因含空字节被误判为二进制。
 - `.doc` 外部转换器：先收集原始字节再解码，不再以 `errors=ignore` 静默丢字。PDF、DOCX、Excel 的正文由各自格式解析库提取，不对已解析字符串猜测转码。
 - 网页抓取及两种搜索引擎：使用统一解码策略，参考 HTTP/meta 声明；BOM 和严格合法 UTF-8 优先。`fetch_url.encoding` 显式指定时优先采用该值。

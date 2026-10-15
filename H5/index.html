@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 
 <head>
@@ -8,7 +8,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js"></script>
-    <link rel="stylesheet" href="style/css/main.css">
+    <link rel="stylesheet" href="style/css/main.css?v=20261015-permissions-v4">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css">
 </head>
@@ -95,10 +95,6 @@
                         <span>删除</span>
                     </button>
                     <span class="bulk-count" id="bulkCount"></span>
-                </div>
-
-                <div class="search-box" id="searchBox">
-                    <input class="search-input" id="searchInput" type="text" placeholder="搜索会话...">
                 </div>
 
                 <!-- 分组区：「最近」上方；悬停 / 点击标题展开分组列表，+ 新建分组 -->
@@ -493,6 +489,14 @@
             </header>
             <div class="chat-settings-body">
                 <p class="chat-settings-note">数值设置均为全局配置，影响所有会话；压缩预算提示按当前会话模型窗口计算。“每条消息重新标题”仅对当前会话生效，切换开关立即保存。</p>
+                <section class="chat-settings-section" id="permissionSettings">
+                    <h3>工具权限</h3>
+                    <label class="chat-setting-field"><span>全局默认<small>未单独设置的会话使用此模式</small></span><select id="permissionGlobal"><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
+                    <label class="chat-setting-field"><span>当前会话<small>可独立配置，也可跟随全局</small></span><select id="permissionSession"><option value="">跟随全局</option><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
+                    <p class="chat-settings-note">权限选择点击「确定」后保存，从下一次任务生效。需要确认的操作在工具标题栏右侧显示「允许 / 拒绝」。</p>
+                    <div id="permissionStatus" role="status" aria-live="polite"></div>
+                    <div id="permissionRequests"></div>
+                </section>
                 <section class="chat-settings-section">
                     <h3>模型与工具配置</h3>
                     <div class="tool-retitle-row" id="settingsRetitleRow" hidden>
@@ -770,27 +774,68 @@
             </label>
             <div class="model-list hidden" id="modelList"></div>
             <label class="enhance-range">
-                <span><b>Temperature</b><output id="temperatureValue">0.7</output></span>
-                <input id="temperature" type="range" min="0" max="2" step="0.1" value="0.7">
-            </label>
-            <label class="enhance-range">
                 <span><b>最大输出 token</b><output id="maxTokensValue">8192</output></span>
                 <input id="maxTokens" type="range" min="256" max="131072" step="256">
             </label>
-            <label class="enhance-range">
-                <span><b>Top P</b><output id="topPValue">1</output></span>
-                <input id="topP" type="range" min="0" max="1" step="0.05" value="1">
-            </label>
-            <label class="enhance-range">
-                <span><b>Presence penalty</b><output id="presencePenaltyValue">2</output></span>
-                <input id="presencePenalty" type="range" min="-2" max="2" step="0.1" value="2">
-            </label>
-            <div class="enhance-row">
+            <div id="chatParametersGroup">
+                <label class="enhance-range" id="chatTemperatureRow">
+                    <span><b>Temperature</b><output id="temperatureValue">0.7</output></span>
+                    <input id="temperature" type="range" min="0" max="2" step="0.1" value="0.7">
+                </label>
+                <label class="enhance-range" id="chatTopPRow">
+                    <span><b>Top P</b><output id="topPValue">1</output></span>
+                    <input id="topP" type="range" min="0" max="1" step="0.05" value="1">
+                </label>
+                <label class="enhance-range" id="presencePenaltyRow">
+                    <span><b>Presence penalty</b><output id="presencePenaltyValue">2</output></span>
+                    <input id="presencePenalty" type="range" min="-2" max="2" step="0.1" value="2">
+                </label>
+                <div class="enhance-row">
+                    <label class="enhance-field">
+                        <span>思考深度</span>
+                        <select id="reasoningEffort">
+                            <option value="none">none</option>
+                            <option value="minimal">minimal</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                            <option value="xhigh">xhigh</option>
+                            <option value="max">max</option>
+                        </select>
+                    </label>
+                    <label class="enhance-check enhance-check-inline" title="通过 extra_body.enable_thinking 传递">
+                        <input type="checkbox" id="enableThinking">
+                        <span>启用 thinking</span>
+                    </label>
+                </div>
+            </div>
+            <section class="messages-parameters hidden" id="messagesParametersGroup" aria-label="Messages 参数">
+                <div class="messages-parameters-title">Messages 参数</div>
+                <label class="enhance-range" id="messagesTemperatureRow">
+                    <span><b>Temperature</b><output id="messagesTemperatureValue">0.7</output></span>
+                    <input id="messagesTemperature" type="range" min="0" max="1" step="0.05" value="0.7">
+                </label>
+                <label class="enhance-range" id="messagesTopPRow">
+                    <span><b>Top P</b><output id="messagesTopPValue">1</output></span>
+                    <input id="messagesTopP" type="range" min="0" max="1" step="0.05" value="1">
+                </label>
                 <label class="enhance-field">
-                    <span>思考深度</span>
-                    <select id="reasoningEffort">
-                        <option value="none">none</option>
-                        <option value="minimal">minimal</option>
+                    <span>Thinking</span>
+                    <select id="messagesThinkingMode">
+                        <option value="">使用供应商默认值</option>
+                        <option value="adaptive">Adaptive</option>
+                        <option value="enabled">Enabled（预算）</option>
+                    </select>
+                </label>
+                <small class="messages-thinking-hint hidden" id="messagesThinkingHint" role="note"></small>
+                <label class="enhance-range hidden" id="messagesThinkingBudgetRow">
+                    <span><b>Thinking budget token</b><output id="messagesThinkingBudgetValue">8192</output></span>
+                    <input id="messagesThinkingBudget" type="range" min="1024" max="65536" step="1024" value="8192">
+                </label>
+                <label class="enhance-field">
+                    <span>输出 effort</span>
+                    <select id="messagesEffort">
+                        <option value="">使用供应商默认值</option>
                         <option value="low">low</option>
                         <option value="medium">medium</option>
                         <option value="high">high</option>
@@ -798,11 +843,63 @@
                         <option value="max">max</option>
                     </select>
                 </label>
-                <label class="enhance-check enhance-check-inline" title="通过 extra_body.enable_thinking 传递">
-                    <input type="checkbox" id="enableThinking">
-                    <span>启用 thinking</span>
+                <label class="enhance-field messages-text-field">
+                    <span>停止序列</span>
+                    <textarea id="messagesStopSequences" rows="2" placeholder="每行一个停止序列"></textarea>
                 </label>
-            </div>
+                <details class="messages-advanced">
+                    <summary>高级供应商参数</summary>
+                    <label class="enhance-field messages-text-field">
+                        <span>extra_body（JSON 对象）</span>
+                        <textarea id="messagesExtraBody" rows="4" spellcheck="false" placeholder='{"metadata":{"user_id":"..."}}'></textarea>
+                    </label>
+                    <small>只填写当前供应商文档支持的扩展字段；标准参数请使用上方控件。</small>
+                </details>
+            </section>
+            <section class="messages-parameters hidden" id="responsesParametersGroup" aria-label="Responses 参数">
+                <div class="messages-parameters-title">Responses · 有状态续聊</div>
+                <label class="enhance-field"><span>推理深度</span>
+                    <select id="responsesEffort"><option value="">模型默认</option>
+                        <option value="none">none</option><option value="minimal">minimal</option>
+                        <option value="low">low</option><option value="medium">medium</option>
+                        <option value="high">high</option><option value="xhigh">xhigh</option>
+                        <option value="max">max</option></select>
+                </label>
+                <label class="enhance-field"><span>推理摘要</span>
+                    <select id="responsesSummary"><option value="">模型默认</option>
+                        <option value="auto">auto</option><option value="concise">concise</option>
+                        <option value="detailed">detailed</option></select>
+                </label>
+                <label class="enhance-field"><span>回复详略</span>
+                    <select id="responsesVerbosity"><option value="">模型默认</option>
+                        <option value="low">简洁</option><option value="medium">适中</option>
+                        <option value="high">详细</option></select>
+                </label>
+                <label class="enhance-check"><input type="checkbox" id="responsesSampling">
+                    <span>自定义采样参数（仅在模型支持时启用）</span></label>
+                <label class="enhance-range hidden" id="responsesTemperatureRow">
+                    <span><b>Temperature</b><output id="responsesTemperatureValue">1</output></span>
+                    <input id="responsesTemperature" type="range" min="0" max="2" step="0.05" value="1">
+                </label>
+                <label class="enhance-range hidden" id="responsesTopPRow">
+                    <span><b>Top P</b><output id="responsesTopPValue">1</output></span>
+                    <input id="responsesTopP" type="range" min="0" max="1" step="0.05" value="1">
+                </label>
+                <details class="messages-advanced"><summary>高级参数</summary>
+                    <label class="enhance-field messages-text-field"><span>附加 instructions</span>
+                        <textarea id="responsesInstructions" rows="3" placeholder="每次调用生效的附加说明"></textarea></label>
+                    <label class="enhance-field messages-text-field"><span>extra_body（JSON 对象）</span>
+                        <textarea id="responsesExtraBody" rows="4" spellcheck="false"></textarea></label>
+                </details>
+                <div class="responses-state-box">
+                    <small id="responsesStateHint">上下文显示以本地数据为准；远端按响应链续接。</small>
+                    <label class="enhance-field"><span>重新同步来源</span>
+                        <select id="responsesRebuildSource"><option value="local">当前本地上下文</option>
+                            <option value="native">原生恢复窗口</option><option value="raw">完整历史</option></select></label>
+                    <button id="responsesRebuild" type="button">准备重新同步</button>
+                    <small>下次发送时同步一次，然后恢复增量续聊。请先保存当前模型选择。</small>
+                </div>
+            </section>
             <div class="enhance-headers" id="customHeadersBox">
                 <div class="enhance-headers-head">
                     <span>自定义请求头</span>
@@ -840,9 +937,31 @@
         </section>
     </div>
 
+    <div class="history-search-modal hidden" id="historySearchModal" aria-hidden="true">
+        <div class="history-search-backdrop" id="historySearchBackdrop"></div>
+        <section class="history-search-dialog" role="dialog" aria-modal="true" aria-labelledby="historySearchTitle">
+            <div class="history-search-head">
+                <h2 id="historySearchTitle">搜索会话记录</h2>
+                <button class="icon-btn" id="historySearchClose" type="button" aria-label="关闭搜索">×</button>
+            </div>
+            <div class="history-search-input-wrap">
+                <input id="historySearchInput" type="search" maxlength="200" placeholder="搜索标题、文件名或聊天内容…"
+                    aria-label="搜索会话记录" aria-controls="historySearchResults" autocomplete="off">
+            </div>
+            <div class="history-search-status" id="historySearchStatus" role="status" aria-live="polite"></div>
+            <div class="history-search-results" id="historySearchResults" aria-busy="false"></div>
+            <div class="history-search-foot">
+                <span>Enter 立即搜索 · Esc 关闭</span>
+                <button id="historySearchRetry" type="button" hidden>重试</button>
+                <button id="historySearchMore" type="button" hidden>加载更多结果</button>
+            </div>
+        </section>
+    </div>
+
+
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script src="js/api.js"></script>
+    <script src="js/api.js?v=20261015-permissions-v4"></script>
     <script src="js/file_history_sync.js"></script>
     <script src="js/vendor/prism/prism-core.min.js"></script>
     <script src="js/vendor/prism/prism-clike.min.js"></script>
@@ -883,7 +1002,8 @@
     <script src="js/session_group_utils.js"></script>
     <script src="js/session_utils.js"></script>
     <script src="js/format_utils.js"></script>
-    <script src="js/history_parser.js"></script>
+    <script src="js/history_parser.js?v=20261015-permissions-v4"></script>
+    <script src="js/history_search.js"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script src="js/quote_utils.js"></script>
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
@@ -892,21 +1012,24 @@
     <script src="js/app/core.js"></script>
     <!-- 引用交互（选区浮钮/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script src="js/app/quotes.js"></script>
-    <script src="js/app/sessions.js"></script>
+    <script src="js/app/sessions.js?v=20261015-permissions-v4"></script>
+    <script src="js/app/history_search.js"></script>
     <script src="js/app/session_groups.js"></script>
     <script src="js/app/stats.js"></script>
     <script src="js/app/workdir.js"></script>
-    <script src="js/app/messages.js"></script>
+    <script src="js/tool_approval_state.js?v=20261015-permissions-v4"></script>
+    <script src="js/app/permissions.js?v=20261015-permissions-v4"></script>
+    <script src="js/app/messages.js?v=20261015-permissions-v4"></script>
     <script src="js/app/history.js"></script>
     <script src="js/app/compaction.js"></script>
     <script src="js/app/builtin.js"></script>
     <script src="js/app/user_profile.js"></script>
     <script src="js/app/media.js"></script>
     <script src="js/app/skills.js"></script>
-    <script src="js/app/composer.js"></script>
-    <script src="js/app/model_panel.js"></script>
+    <script src="js/app/composer.js?v=20261015-permissions-v4"></script>
+    <script src="js/app/model_panel.js?v=20261015-compaction-activation"></script>
     <script src="js/app/tools.js"></script>
-    <script src="js/app/chat.js"></script>
+    <script src="js/app/chat.js?v=20261015-permissions-v4"></script>
     <script src="js/app/filehistory.js"></script>
     <script src="js/app/terminals.js"></script>
     <script src="js/app.js"></script>

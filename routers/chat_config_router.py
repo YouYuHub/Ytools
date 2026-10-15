@@ -5,6 +5,7 @@ import sys
 from dataclasses import replace
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from chat.protocols import normalize_api_type
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -163,7 +164,7 @@ def _available_compaction_models() -> list[dict]:
     """仅暴露当前 ChatLLM 可调用的 Chat Completions 模型。"""
     return [
         model for model in list_available_models()
-        if str(model.get("api_type") or "").casefold() == "chat-completions"
+        if normalize_api_type(model.get("api_type")) in {"chat_completions", "messages", "responses"}
     ]
 
 
@@ -1144,7 +1145,7 @@ def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
     selection = env_manager.get_role_selection(role)
     models = list_available_models()
     if role in ("compaction_model", "sub_agent_model"):
-        available = [model for model in models if str(model.get("api_type") or "").casefold() == "chat-completions"]
+        available = [model for model in models if normalize_api_type(model.get("api_type")) in {"chat_completions", "messages", "responses"}]
     else:
         available = models
     if role == "chat_model":
@@ -1153,7 +1154,7 @@ def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
     else:
         provider, model = selection.get("ownership_name"), selection.get("model_name")
     api_type = selection.get("api_type")
-    if api_type is None and provider and model:
+    if provider and model:
         chat_config = env_manager.get_model_config(provider, model)
         api_type = env_manager._derive_api_type(chat_config) if chat_config is not None else None
     payload: dict[str, Any] = {
@@ -1190,7 +1191,7 @@ async def list_chat_models(role: str = "chat_model", session_id: str | None = No
     查询参数 `role`（chat_model / compaction_model / title_model / sub_agent_model，默认 chat_model）：
     `role_info` 返回该角色的当前选择（provider/model/api_type/parameter 分桶）、
     生效参数（effective_parameter，按回退链解析）与可选模型列表
-    （compaction_model / sub_agent_model 只列 chat-completions 协议）。
+    （compaction_model / sub_agent_model 列出 chat-completions、messages、responses 协议模型）。
 
     查询参数 `session_id`（可选）：携带时按「会话覆盖 → 全局默认」解析该会话的
     生效模型选择，`role_info` 展示会话生效结果并附加 `is_overridden`（有效覆盖）
@@ -1259,7 +1260,7 @@ async def select_active_chat_model(payload: ChatModelSelection):
       （含 parameter），并同步内存，实时生效；
     - 携带 session_id（会话级）：写入该会话 `_meta.model_selection.<role>`，
       不修改全局配置；`clear=true` 时清除该角色的会话覆盖、恢复跟随全局默认；
-    - 先校验 models.json 目录中存在该组合（compaction_model 必须为 chat-completions 协议）
+    - 先校验 models.json 目录中存在该组合，且协议为 chat-completions / messages / responses
     - 不再写 .env 的 CHAT_OWNERSHIP_NANE / CHAT_MODEL_NAME
     - parameter 为全量替换语义；不传表示仅切换模型、参数保持不变
       （会话级未传时：有效会话覆盖沿用其参数，首次/失效覆盖沿用全局该角色的参数）

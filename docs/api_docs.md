@@ -38,10 +38,10 @@
 - `round_model`：本轮生效聊天模型 `{"round_model": {"provider": <供应商名>, "name": <models.json 模型配置名>, "id": <实际请求 API 的模型 id>}}`（与轮次 JSONL 的 `chat_round.model` 字段同源，字段缺失项省略；任务启动时确定，用户在任务进行中切换模型不改写本轮）。**唯一下发通道**：普通发送/编辑重发/回答插入三条路径均在提问落盘后推送一次——`round_started` 帧只在普通发送路径推送（编辑重发/回答插入没有该帧），模型名放那里会丢，故统一由本帧承载；前端据此在本轮 usage 行显示「模型 provider/name」。推送时同步记录到任务流（`live_round_model`），供回放标记携带（本帧位于回放起点之前，附接消费端收不到）
 - `replay`（**回放标记**，附接/刷新重连时先于事件回放推送一帧）：`{"replay": true, "question_text": <本轮提问纯文本>, "question_parts": <提问原始 content 部件列表，多模态含 media:// 引用；纯文本归一为单个 text 部件，缺失字段表示旧后端>, "question_quotes": <本轮引用快照，无引用时省略；旧后端无此字段>, "round": <本轮最终轮次号，同 round_started；旧后端无此字段>, "model": <本轮生效聊天模型，同 round_model；旧后端无此字段>}`。前端据此补建"当前轮提问"气泡（多部件气泡重建、缩略图可预览；引用卡片同源重建），按 `round` 与历史提问气泡精确去重并补挂编辑入口；无 `round` 时回退提问文本匹配（带引用时同时比较引用签名）；`model` 回填本轮 usage 行模型名
 - `usage`：token 统计；`finish_reason`：结束原因（stop/length/tool_calls）
-- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `<session>_chat.jsonl.todo`，当前计划通过最近一次真实工具调用及完整结果供模型感知，不再嵌入系统提示词；终态工具结果提示收官）
+- `todo`：内置 `todo_write` 工具执行成功后的任务计划推送，`{"event":"todo","todos":[{id,content,status(pending|in_progress|done)}]}`（`id` 为步骤稳定标识；模型未携带时后端自动分配/继承自上一版计划，同一时间最多一个 `in_progress`，订阅会话元数据 `GET /chat_history/meta` 可读取 `todo` 同结构数据——**真源为侧车文件 `history_files/sidecars/<session>_chat.jsonl.todo`**，`get_session_meta` 会以侧车值合并返回，旧会话无侧车时回退 `_meta.todo`）；**工具结果三态反馈**：message 按首次创建 / 部分更新 / 全部完成给出不同提示（全部完成时附「请汇总执行结果直接答复用户，无需再调用本工具」），并携带机器可读 `plan_complete` 布尔标记，模型无需解析文案即可判断计划收官；工具描述同时引导「合并状态变更」减少调用次数（完成某步与启动下一步在同一次提交中完成）；启用方式：「配置工具」模态框首位的「内置工具」分组勾选 `todo_write`（伪服务 `__builtin__`，与 MCP 工具共用工具选择持久化，见"工具选择持久化"；后端按名称识别、本地执行并落盘侧车 `history_files/sidecars/<session>_chat.jsonl.todo`，当前计划通过最近一次真实工具调用及完整结果供模型感知，不再嵌入系统提示词；终态工具结果提示收官）
 - `ask_user`：内置 `ask_user` 工具被调用时推送，`{"event":"ask_user","questions":[{question, options[], multiple}]...}`；启用方式同上（「内置工具」分组勾选 `ask_user`）；前端弹出交互卡片（逐题点选选项或自由输入，`multiple=true` 的题目可同时选择多个选项、答案以顿号拼接；**每题作答后才能提交**），**用户提交回答后回答文本作为下一条用户消息发送**，开启新一轮生成。模型调用 `ask_user` 的当轮任务在推送后立即暂停收尾（工具结果为 `waiting_user` 占位），等待用户回答；同一轮并行多次 `ask_user` 调用的问题会合并展示。前端仅允许回答“最新提问”：提问卡片之后一旦出现普通用户消息（新任务）或更新的提问，该卡片转为过期仅可查看（点击提示）。**覆盖式重答**：对最新提问再次回答时，后端截断该提问轮之后的旧回答轮（`truncate_rounds_for_reanswer`，一个问题只保留一个答案轮次；提问后已开启普通新任务时不截断、按追加处理），前端同步清除提问卡片之后的旧回答显示后继续新轮次；会话仍在流式输出时不允许提交回答
-- `context_compaction`：单轮工具轨迹被压缩后的状态，含 `{scope:"round", before_tokens, after_tokens, fallback, compress_index, block_count, usage}`；`usage` 为压缩模型调用返回的 token 统计（部分服务端不返回时为 null）；新模式 `block_count` 通常为 1 个累计摘要块；工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
-- `context_compaction`（**实时压缩事件**，开始/完成两个阶段，见下方"压缩事件格式"）：单轮与跨轮压缩均实时推送，**同一份 payload 同时落盘 JSONL 独立事件行**（`event="context_compaction"`），保证前端"加载历史"与"实时显示"字段完全一致
+- `context_compaction`：压缩状态事件。单轮完成事件位于当前 `chat_round.events`，包含 `scope="round"`、`phase="done"`、`summary_text`、`before_tokens`、`after_tokens`、`token_limit`、`budget_scope`、`compress_index`、`block_count` 与 `compress_usage`；降级信息和 token 用量位于 `compress_usage` 内。工具原始输出仍已推送并保存，只会从后续模型请求上下文中替换为摘要
+- `context_compaction`（**实时压缩事件**，阶段见下方事件表）：单轮与跨轮压缩均实时推送；跨轮事件以 JSONL 独立事件行落盘，单轮事件嵌入所属 `chat_round.events`，SSE 与落盘 payload 字段一致
 
 #### 压缩事件格式（SSE 实时推送 = JSONL 落盘，字段一致）
 
@@ -52,7 +52,7 @@
 | 跨轮压缩开始 | `start` | `{"event":"context_compaction","scope":"session","phase":"start","role":"assistant","context_summary":<将压缩的旧轮次节选，≤800 tokens>}` |
 | 跨轮压缩完成 | `done` | `{"event":"context_compaction","scope":"session","phase":"done","role":"assistant","summary_text":<累计摘要全文>,"before_tokens":<触发时历史部分估算>,"after_tokens":<压缩后历史部分估算>,"token_limit":<本批预算（压缩批输入预算）>,"trigger_reason":<auto\|task\|first_call\|manual>,"trigger_context_tokens":<task/first_call 路径的真实触发规模（全量上下文），其余路径省略>,"trigger_threshold":<task/first_call 路径的真实触发阈值（单轮阈值/模型窗口），其余路径省略>,"summary_usage":{usage..., compressed_rounds, fallback, cumulative:true}}` |
 | 累计摘要更新 | `done` | `{"event":"context_compaction","scope":"round/session","phase":"done","summary_text":<累计摘要全文>,"...usage":{usage..., cumulative:true}}` |
-| 压缩中断标记 | `aborted` | `{"event":"context_compaction","scope":"round/session","phase":"aborted","role":"assistant","reason":"task_interrupted"}` |
+| 压缩中断标记 | `aborted` | `{"event":"context_compaction","scope":"round/session","phase":"aborted","role":"assistant","reason":"task_interrupted|compaction_failed","error?":<压缩失败时的错误说明>}` |
 
 - 推送顺序：**先推 SSE 帧、后落盘 JSONL**——实时显示优先，落盘失败（如 Windows 文件被搜索索引/杀软短暂占用）只打 WARN，不阻塞推送。
 - JSONL 落盘行在 `timestamp` 之外与 SSE payload 逐字段一致；该行不参与 `usage`/`user_questions`/`chat_round` 统计（仅 `record_count` 计数）。
@@ -80,19 +80,19 @@
 
 | 阶段 | payload 关键字段 |
 |---|---|
-| `start` | `{agent_id, parent_agent_id:"main", parent_tool_call_id, agent_index, task, todo?, tools[], rounds_limit, timeout_seconds}` |
+| `start` | `{agent_id, parent_agent_id:"main", parent_tool_call_id, agent_index, task, todo?, tools[], rounds_limit, timeout_seconds, queued?}`；`queued` 表示信号量排队状态 |
 | `delta` | `{agent_id, ..., reasoning_delta / content_delta}`（仅 SSE 实时推流，**不落盘**） |
 | `model_call` | `{agent_id, seq, reasoning_content, content, tool_calls[]}`（子任务本轮完整轨迹落盘） |
-| `tool_start` | `{agent_id, seq, tool_call_id, tool_name, arguments}` |
-| `tool_result` | `{agent_id, seq, tool_call_id, tool_name, arguments, result, oversized?}` |
+| `tool_start` | `{agent_id, seq, tool_call_id, function_name, arguments}` |
+| `tool_result` | `{agent_id, seq, tool_call_id, tool_name, arguments, result, file_diff?, oversized?, oversized_estimated_tokens?, result_preview?}`；`result_preview` 用于超大结果的历史预览 |
 | `todo` | `{agent_id, todos[]}`（子任务私有计划，只存事件块内） |
-| `notice` | `{agent_id, message, retry_kind: final_reply\|stream_error\|todo_remind, seq}`（交付保障重试提示，§10.1；落盘供历史回放） |
+| `notice` | `{agent_id, message, retry_kind?: final_reply\|stream_error\|todo_remind\|text_tool_call, seq?}`（重试或运行时提示；排队/压缩提示可能不含 `retry_kind`） |
 | `done` | `{agent_id, status, final_reply, rounds, usage_total, error, ended_at}`；status ∈ `done|error|stopped|interrupted|timeout|max_rounds` |
 
 - 身份模型：`agent_id`（`agent_<8hex>`，子智能体实例 ID，轮内唯一）与 `parent_tool_call_id`（父级 tool_call id，用于归属父轮与关联父级工具气泡）分离；同一父级 tool_call 一次重派不会复用旧 `agent_id`。
 - 并发与限额：父循环用 `asyncio.gather` 并发执行全部子任务，`SUB_AGENT_MAX_CONCURRENT`（默认 3）信号量限流；`SUB_AGENT_MAX_ROUNDS`（默认 40）与 `SUB_AGENT_TIMEOUT_SECONDS`（默认 900）均可在全局聊天设置调整，0=不限制；达到已启用限制时报告进展。`SUB_AGENT_REPLY_MAX_CHARS`（30000）保护父侧最终回复长度，完整轨迹在 JSONL 中保存。
 - 层级取消：父级停止（`/stop_chat`、新消息打断、worker 退出、上游错误）会取消全部子任务并补写 `done(stopped)`；子任务自身的超时/轮次上限/流错误只终止自己，不影响父任务与兄弟任务。子任务事件仅在事件循环的同步 `_write_guard()` 块内写历史（跨进程文件锁不可重入，禁止工作线程直写）。
-- 可见性：父级上下文只包含 `assistant(tool_calls=sub_agent)` 与 `role=tool(最终回复)`；子任务思考/正文/工具轨迹/todo 永不进入父模型上下文（历史重建与压缩文本渲染显式排除无 `role` 的 sub_agent 条目），父轮 `usage_total` 另行合并子任务 usage。
+- 可见性：父级上下文只包含 `assistant(tool_calls=sub_agent)` 与 `role=tool(最终回复)`；子任务思考/正文/工具轨迹/todo 永不进入父模型上下文（历史重建与压缩文本渲染显式排除无 `role` 的 sub_agent 条目），子任务 `usage_total` 仅记录并展示在子任务块/引用信息中，不并入父轮 `usage_total`。
 - 模型：子智能体使用独立角色 `sub_agent_model`（见"模型选择"，未配置时继承聊天模型）；子任务请求副本同样经过思考回传整形与参数填充。
 - 前端渲染：按 `agent_id` 聚合为独立子任务块（标题条 #序号·任务摘要·状态徽标 + 可折叠的思考/正文/工具轨迹/计划区），done 后折叠为摘要态；历史回放按 JSONL 中事件块原样重建；旧前端遇未知事件走默认分支忽略、降级为普通 `tool_return` 文本。
 
@@ -132,6 +132,7 @@
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
 | /chat_history/sessions | GET | - | 会话文件名列表 `["default_chat.jsonl", ...]` |
+| /chat_history/search | GET | q(1–200字符), limit(1–100,默认40), offset(默认0), revision? | 全部已保存会话的文字搜索；返回文件名、匹配片段与轮次/事件定位信息，详见 [会话全文搜索](history_search.md)。分页期间记录变化返回409，前端自动重新搜索 |
 | /chat_history/file | GET | session_id | 下载会话 JSONL 文件（首行 `_meta` 元数据） |
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
@@ -163,7 +164,7 @@
   - `dry_run`(默认 false)：预演——只返回明细不写盘不删文件；
   - `keep_media_refs`：清理时排除的媒体 stored_name（编辑重发时被编辑消息的复用附件）。
 - **返回**：dry_run 时 `{state: "planned", planned_rounds: [{round, question, status}], planned_files: {media_files, doc_files}}`；正式执行 `{state: "succeed", removed_rounds, planned_*, files_cleanup: {removed, failed}, meta_after, usage_after}`。
-- **一致性保障**：写盘前生成 `<历史文件>.bak` 侧车备份（覆盖式）；`context_summary` 不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置平移游标/块范围/问题编号三处锚点，摘要继续生效（见 compact.md §6）；meta（usage/user_questions/标题）按剩余条目重算。
+- **一致性保障**：写盘前在 `history_files/sidecars/<历史文件>.bak` 生成覆盖式侧车备份；`context_summary` 不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置平移游标/块范围/问题编号三处锚点，摘要继续生效（见 compact.md §6）；meta（usage/user_questions/标题）按剩余条目重算。
 
 **编辑重发两种模式的前端语义**：
 
@@ -215,7 +216,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
    - `groups[]` 为随包携带的分组定义 `[{id, name}]`（zip manifest v2；jsonl / 旧版 v1 包为空列表），前端弹窗据此提示「导入后按分组名自动还原归属」；
    - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析（含路径穿越防护）。
 2. `POST /chat_history/import_package?filename=<文件名>&conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（原始字节请求体，`application/octet-stream`）——**提交导入**：
-   - 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`（ask 且无逐项决策时该会话跳过，绝不静默改名/覆盖）；
+   - zip 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`；`ask` 且无逐项决策时该 zip 会话跳过。单个 `.jsonl` 导入另按路由兼容规则处理：没有逐项决策时 `ask` 缺省映射为 `rename`（改名另存），如需跳过须显式传 `decisions`；
    - 无冲突会话直接导入；zip 包同时落盘各会话的 `session_files/<upload_id>/` 数据；
    - 冲突「重命名」：会话 ID 追加时间戳另存，上传数据目录归属同步改名为新会话 ID，并回写首行 `_meta.upload_id`；「覆盖」：清空旧 jsonl 与旧上传目录后写入；
    - **分组归属还原**（逐会话独立于冲突决策）：包内会话带 `group_id` 且 manifest 提供对应分组名时，按组名映射——本地同名分组**复用**、缺失则**新建**，随后把会话归属改写到映射后的分组；包内无分组定义（v1 旧包 / 裸 zip / 单 jsonl）时，仅当本地已存在同 ID 分组（本机回导场景）才保留，否则清除（界面显示未分组）；
@@ -226,13 +227,15 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
 | /chat_context/token_stats | GET | session_id(默认"default"), max_rounds(可选，≤0 表示不限制轮次；省略时同 0；服务端上限 200), include_tools(默认false), tool_names(可重复，按已选工具过滤) | 见下方说明 |
+| /chat_context/responses_state | GET | `session_id`（必填） | `{session_id, responses_state}`；返回脱敏后的 Responses 主链状态，不返回原生输入或密文 |
+| /chat_context/responses_rebuild | POST | `session_id`（必填），`source=local|native|raw`（默认 local） | `{state, session_id, responses_state, message}`；只准备下次发送使用的恢复窗口，不即时调用模型；生成中 409，非 Responses 聊天模型或无效 source 返回 400 |
 | /chat_context/compact_manual | POST | session_id(默认"default"), force(默认false；为 true 时跳过下限守卫), stream(默认false) | stream=false: `{state, session_id, compressed_rounds, stats}`；stream=true: SSE 流（见下方说明）；上下文估算低于摘要预算且未 force 时拒绝（stream=false 返回 400 `{detail}`，stream=true 由结果帧 error 带回提示） |
 
 **POST /chat_context/compact_manual?stream=true（SSE 手动压缩）**
 
-手动确认后不再以当前 token 是否超过门槛决定是否执行，而是与自动跨轮流程统一：把全部已完成轮次纳入累计摘要，并重建全历史最近用户问题索引（最多 10k tokens）。累计摘要目标预算为 `聊天窗口 × summary_budget_ratio`；原始历史仍保存在 JSONL，但不再回传给模型。事件与聊天内自动压缩完全同构：
+手动确认后不再以当前 token 是否超过门槛决定是否执行，而是与自动跨轮流程统一：把全部已完成轮次纳入累计摘要，并重建全历史最近用户问题索引（最多 10k tokens）。累计摘要目标预算为 `有效窗口 × summary_budget_ratio`，其中有效窗口为 `min(聊天模型窗口, 压缩模型窗口)`；原始历史仍保存在 JSONL，但不再回传给模型。事件与聊天内自动压缩完全同构：
 
-- **下限守卫**：模型上下文估算（`token_stats.messages_tokens` 口径，仅消息部分）低于摘要总预算（`聊天窗口 × summary_budget_ratio`）时拒绝执行——摘要可能不比原文小，压缩无收益；提示形如"当前上下文约 X tokens，低于摘要预算 Y tokens（模型窗口 × 摘要预算比例 Z），压缩无收益，已取消本次手动压缩"。`force=true` 跳过该守卫
+- **下限守卫**：模型上下文估算（`token_stats.messages_tokens` 口径，仅消息部分）低于摘要总预算（`有效窗口 × summary_budget_ratio`，有效窗口为 `min(聊天模型窗口, 压缩模型窗口)`）时拒绝执行——摘要可能不比原文小，压缩无收益；提示形如"当前上下文约 X tokens，低于摘要预算 Y tokens（有效窗口 × 摘要预算比例 Z），压缩无收益，已取消本次手动压缩"。`force=true` 跳过该守卫
 - `{"event":"context_compaction","scope":"session","phase":"start","context_summary":...}`：待压缩内容预览
 - `{"event":"context_compaction","phase":"delta","reasoning_content"?:...,"content"?:...}`：压缩模型流式增量（仅实时推送，不落盘）
 - `{"event":"context_compaction","phase":"done","summary_text":<摘要全文>,"summary_usage":{...}}`：完成（summary_text 随同一 payload 落盘）
@@ -274,8 +277,8 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /chat_config/work_dir | POST | Body `{session_id, work_dir}` | `{state, message, session_id, session_dir, effective_dir, warning, updated_at}`；设置/清除会话独立工作目录（写会话 `_meta.work_dir`）。`work_dir` 非空时校验目录存在（不存在 400）；空串/None 清除覆盖恢复跟随默认。对正在运行的任务不生效，下一轮生成任务开始时生效 |
 | /chat_config/history_compaction | GET | `session_id`（可选） | `{trigger_ratio, summary_budget_ratio, oversized_reject_factor, max_oversized_rejections, summary_total_budget, target_tokens, target_limits{min, max, window}, effective_summary_budget, effective_threshold{value, chat_window, compaction_window, window, trigger_ratio, formula}, compaction_model, available_compaction_models[], defaults, env_names, memory_state}`；`effective_threshold` 的模型窗口按会话生效模型口径解析（与 token_stats 一致），不传 `session_id` 时为纯全局口径 |
 | /chat_config/history_compaction | POST | Body 见下方完整策略；Query `session_id`（可选） | `{state, updated, config, memory_state}`；返回的 `config.effective_threshold` 同样支持会话口径 |
-| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present, support_doc_types}`；`support_doc_types` 为 supportDocTypes 归一化声明（原生文档输入扩展名列表，如 `[".pdf", ".docx"]`，未声明为 `[]`）；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局三模型选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶）、`effective_parameter`（按回退链解析的生效参数）、`available_models`/`available_count`（可选模型，compaction_model 只列 chat-completions）、compaction 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`（仅有效覆盖为 true）、`selection_invalid`（存储的覆盖模型已不存在），响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示；GET 只读，生成任务开始时将实际回退配置保存为新会话快照，仅首次修复告警；没有有效全局模型则清除失效角色覆盖；有效的其他角色选择保持不变） |
-| /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在报 400（compaction_model 必须为 chat-completions 协议）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
+| /chat_config/models | GET | `role`（可选，默认 chat_model）、`session_id`（可选） | `{state, count, current, selection, models[], role, role_info}`；`models[]` 为扁平 `{provider_name, model_name, model_id, api_type, url, vision, tool_calling, max_input_tokens, max_output_tokens, api_key_present, support_doc_types}`；`support_doc_types` 为 supportDocTypes 归一化声明（原生文档输入扩展名列表，如 `[".pdf", ".docx"]`，未声明为 `[]`）；`model_name` 为 models.json 中 models 字段的键名（写入 model_selection 的值），`model_id` 为请求 API 使用的模型 id；`selection` 为全局四角色选择；`role_info` 为指定角色的详情：`selection`（provider/model/api_type/parameter 分桶/headers）、`effective_parameter`（按回退链解析的生效参数）、`effective_headers`（生效请求头）、`available_models`/`available_count`（可选模型；compaction_model 与 sub_agent_model 按实际协议支持列出 chat-completions/messages/responses）、`chat_model` 额外带 `vision`，`compaction_model` 额外带 `compaction_status`；携带 `session_id` 时 `role_info` 为该会话生效结果并附加 `is_overridden`（仅有效覆盖为 true）、`selection_invalid`（存储的覆盖模型已不存在），响应额外返回 `{session_id, session_selection, effective_selection, warning}`（`session_selection` 为会话 `_meta.model_selection` 覆盖值，未设置为 null；失效覆盖回退全局时 `warning` 给出提示；GET 只读，生成任务开始时将实际回退配置保存为新会话快照，仅首次修复告警；没有有效全局模型则清除失效角色覆盖；有效的其他角色选择保持不变） |
+| /chat_config/models/select | POST | Body `{provider, model, role?, parameter?, headers?, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, current, effective_parameter, selection}`；组合不存在或 `apiType` 不受支持时报 400；角色选择支持 chat-completions/messages/responses。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, warning, role, role_info}`；写入该会话 `_meta.model_selection.<role>`，不修改全局 models.json；`clear=true` 清除该角色会话覆盖恢复跟随全局（忽略 provider/model） |
 | /chat_config/context_return | GET | - | `{reasoning_max_length, tool_result_max_length, defaults, semantics, env_names, memory_state}` |
 | /chat_config/context_return | POST | Body `{reasoning_max_length, tool_result_max_length}`（整数，缺省时使用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存 env_vars，下次聊天立即生效 |
 | /chat_config/mcp_tools | GET | - | `{call_timeout_seconds, defaults, semantics, env_names, memory_state}`；读取 MCP 工具单次执行超时 |
@@ -287,7 +290,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 | /chat_config/tool_selection | GET | `session_id`（可选） | `{state, inputs, servers[], config_path, memory_state}`；每次以磁盘 mcp_servers.json 的 `inputs` 为准并同步内存（手工编辑文件后刷新页面即生效），未提及的已配置服务补 `[]`；`inputs` 可含内置工具伪服务键 `__builtin__`（值如 `["todo_write","ask_user"]`）；携带 `session_id` 时附加 `{session_id, session_selection, effective_selection, is_overridden, warning}`：`session_selection` 为会话 `_meta.tool_selection` 覆盖值（未设置为 null），`effective_selection` 为会话实际生效选择（会话覆盖 → 全局 `inputs`） |
 | /chat_config/tool_selection | POST | Body `{inputs: {服务名: [工具名...]}, session_id?, clear?}` | 不携带 `session_id`（全局默认）：`{state, message, updated, inputs, memory_state}`；服务名必须已在 `servers` 中配置或为内置工具伪服务 `__builtin__`（其余未知服务报 400）；全量替换语义，未提及的已配置服务保存为 `[]`，未提及的 `__builtin__` 不写入（= 未勾选内置工具）；实时更新内存并写回 mcp_servers.json（仅替换 `inputs` 键）。携带 `session_id`（会话级）：`{state, message, session_id, session_selection, effective_selection, is_overridden, updated_at}`；写入该会话 `_meta.tool_selection`，不修改全局 `inputs`；**空 `inputs` = 显式无工具模式（落盘空选择哨兵，不回退全局）**；仅 `clear=true` 清除会话覆盖恢复跟随全局；会话级不做未知服务校验（失效服务名在生成时自动忽略并告警） |
 | /chat_config/network_retry | GET | - | `{max_attempts, defaults, semantics, env_names, memory_state}`；模型网络请求连续失败重试上限（.env `NETWORK_RETRY_MAX_ATTEMPTS`，默认 3） |
-| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。正数 N 允许首次请求之外重试 N 次。**覆盖范围**：连接失败/读超时/非 2xx/供应商流内错误帧（`error`、`event:error`、带失败状态或错误信息的 `message`）/HTTP 200 空流/非流式 200 空响应，均共享同一请求的失败计数。流内错误返回 `error_type=upstream_error_frame`；未产生正文时重发同一 payload，已产生正文时携带已输出前缀续写，并清除未完成工具调用，避免拼接无效参数。重试期间只推送 `retrying=true` 进度提示，不落盘最终错误；耗尽才返回 `retrying=false`、原始错误及重试统计并记录失败。对所有模型角色统一生效。**重试间隔固定 1 秒**，停止信号可以中止；确定性请求硬限制超限仍不重试（见下节） |
+| /chat_config/network_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config}`；写回 .env 并同步内存，下一次模型请求立即生效；0 或负数=不限制（一直重试直到手动停止）。Chat Completions / Messages 中正数 N 表示首次请求之外最多重试 N 次；Responses 客户端将正数 N 作为总尝试次数上限（最多 N 次请求）。0 或负数表示不限制。**覆盖范围**：连接失败/读超时/非 2xx/供应商流内错误帧（`error`、`event:error`、带失败状态或错误信息的 `message`）/HTTP 200 空流/非流式 200 空响应，均共享同一请求的失败计数。流内错误返回 `error_type=upstream_error_frame`；未产生正文时重发同一 payload，已产生正文时携带已输出前缀续写，并清除未完成工具调用，避免拼接无效参数。重试期间只推送 `retrying=true` 进度提示，不落盘最终错误；耗尽才返回 `retrying=false`、原始错误及重试统计并记录失败。对所有模型角色统一生效；Responses 协议的正数重试次数按总尝试次数解释，详见 Responses 使用说明。**重试间隔固定 1 秒**，停止信号可以中止；确定性请求硬限制超限仍不重试（见下节） |
 | /chat_config/compaction_retry | GET | - | `{max_attempts, defaults, semantics{attempt, 0_or_negative, positive, retry_interval_seconds}, env_names, memory_state}`；上下文压缩调用失败重试上限（.env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）。一次"尝试"=一条完整"压缩模型→聊天模型"降级链（同源时本条链只有一次调用），链间隔固定 1 秒；达到次数抛 `ContextCompactionError` 终止当前任务 |
 | /chat_config/compaction_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次压缩调用立即生效；0 或负数=不限制（整条降级链一直重试直到手动停止） |
 | /chat_config/sub_agent_retry | GET | - | `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max, defaults, semantics, env_names, memory_state}`；子智能体交付保障重试配置（详见"子智能体（sub_agent）配置"节 §10.1） |
@@ -306,7 +309,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 生成任务默认运行在**每会话独立的 worker 进程**（`factory/session_worker.py`）：worker 在每次生成任务开始时解析会话生效目录并 `os.chdir`，因此系统提示词中的工作路径、MCP 工具子进程的默认目录、相对路径解析都随会话隔离；覆盖目录失效时向前端推送 `warning` 事件（`code=WORK_DIR_FALLBACK`）并回退默认目录，不终止任务。目录切换对正在运行的任务不生效，下一轮任务开始时生效。
 
 - `.env` 的 `CHAT_WORKER_MODE=inline` 可回退为旧版主进程内执行（目录语义退化为全局 cwd，仅供测试/故障兜底）；`CHAT_WORKER_IDLE_TIMEOUT_SECONDS` 控制 worker 空闲自退出时间（默认 900 秒，进程随用随建）；
-- 会话 JSONL 的写入方（worker 进程写轮次/压缩/usage，主进程写标题/删除/导入/上传记录）通过 `<session>_chat.jsonl.lock` 跨进程文件锁互斥，进程崩溃时由操作系统自动释放。
+- 会话 JSONL 的写入方（worker 进程写轮次/压缩/usage，主进程写标题/删除/导入/上传记录）通过 `history_files/lock/<session>_chat.jsonl.lock` 跨进程文件锁互斥，进程崩溃时由操作系统自动释放。
 
 ### 工具选择与会话隔离
 
@@ -322,7 +325,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 ### 模型选择与会话隔离
 
-模型选择（聊天/压缩/标题模型，角色集合随版本扩展）同样分两层，按角色独立解析「会话覆盖 → 全局默认」：
+模型选择（聊天/压缩/标题/子智能体四角色）同样分两层，按角色独立解析「会话覆盖 → 全局默认」：
 
 - **全局默认**：models.json 顶层 `model_selection` 键（不携带 `session_id` 的 `POST /chat_config/models/select` 修改），作为**新建会话前**选择模型时的默认值；
 - **会话级覆盖**：会话历史 JSONL 首行 `_meta.model_selection`（携带 `session_id` 的 select 修改，`clear=true` 清除角色覆盖），结构为 `{角色: {ownership_name, model_name, parameter, api_type}}`，仅存已覆盖的角色；未覆盖角色、清除后的角色跟随全局默认。
@@ -331,7 +334,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 - 聊天模型：`/chat_with_tool` 的参数默认值填充、生成任务内的模型解析（`require_default_chat_config`）、上下文窗口估算均按会话生效模型计算；
 - 压缩模型：跨轮/单轮压缩的模型与参数按会话生效选择解析（手动压缩接口 `/chat_context/compact_manual` 同样按会话生效）；
-- 标题模型：当前仅保存配置（标题生成暂未启用）；
+- 标题模型：H5 在 SSE 流中触发 `POST /chat_config/generate_title`；后端生成标题并同步返回，详细时机与失败标记见下方"标题模型"节；
 - 会话覆盖的模型已从 models.json 删除（手工编辑/热重载后）时，生成任务推送 `warning` 事件（`code=MODEL_SELECTION_FALLBACK`）并按角色回退全局默认，不终止任务；
 - 会话首次覆盖某角色且未传 parameter 时，沿用全局该角色的参数桶（"仅切换模型、参数保持不变"语义与全局一致）；清空会话历史时 `_meta.model_selection` 予以保留。
 
@@ -339,7 +342,7 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 
 ### 配置文件热重载（不依赖 uvicorn --reload）
 
-主进程内运行一个全局守护线程 `config-hot-reload`（`util/config_watcher.py`），按固定间隔轮询两个配置文件，与内存中的 sha256 hash 比对：
+主进程内运行一个全局守护线程 `config-hot-reload`（`util/config_watcher.py`），按固定间隔轮询三个配置文件，与内存中的 sha256 hash 比对：
 
 - `setting/mcp_servers.json`：hash 变化且 JSON 解析成功后，同步工具选择内存快照；仅当 `servers` 键内容变化时才重新探测 MCP 工具（更新 `tool_registry.ALL_TOOLS` 并刷新 `/tools/list` 探测缓存，见"工具列表缓存与预热"），只改 `inputs` 不触发昂贵的工具发现；
 - `setting/models.json`：hash 变化且解析成功后重载 `models_config` / `model_selection` / `setting_vars`（`env_manager.reload_models_config()`，不触碰 .env）。
@@ -554,8 +557,8 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 `POST /chat_config/models/select` 新增参数：
 
-- `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）/ `sub_agent_model`（子智能体）。`compaction_model` / `sub_agent_model` 必须为 `chat-completions` 协议。
-- `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议专属 `thinking`（messages）、`max_output_tokens / instructions`（responses）。
+- `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）/ `sub_agent_model`（子智能体）。模型角色选择支持 `chat-completions`、`messages` 与 `responses` 协议。
+- `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议字段 `thinking / output_config / stop_sequences`（messages）、`max_output_tokens / instructions / reasoning / text`（responses）。
 - `api_type`（只读回显，前端不传）：后端根据 models.json 中该模型的 `apiType` 自动确定，可选值 `chat_completions` / `messages` / `responses`（连字符归一为下划线、小写；`apiType` 缺失时默认 `chat_completions`）。
 - `headers`（可选）：该角色的**自定义请求头**，`[{"name": "x-foo", "value": "bar"}]` 列表形态（后端也接受 `{"x-foo": "bar"}` 键值字典的手工编辑形态）。持久化位置与 parameter 一致——全局默认存 models.json 顶层 `model_selection.<role>.headers`，会话级存 `_meta.model_selection.<role>.headers`（新会话首次任务开始时随 model_selection 整体快照一次）。继承语义与 parameter 相同：`null` 保持现有（"仅切换模型、自定义头不变"），提供时全量替换，`[]` 清空。**注入链**：请求上游时 ChatLLM 从模型配置的 `_custom_headers` 读取并拼入原始 HTTP 头（放在 Authorization 之后、Content-Length 之前；非法条目——空名/含冒号或空白/含 CRLF——在规范化阶段丢弃，防头部注入）；同名键后者覆盖前者。四个角色各自独立（聊天/压缩/标题/子智能体），聊天角色随 `require_default_chat_config` 注入，其余角色随各自模型解析处注入；原先硬编码的 `x-opencode-session` 已删除，opencode 等供应商需要的会话头改由该配置提供。
 - 向后兼容：只传 `{provider, model}` 等价于 `role=chat_model` 且参数与自定义头均不变。
@@ -566,11 +569,11 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 **压缩模型参数**：`model_selection.compaction_model.parameter`（按压缩模型 api_type 取桶）> 压缩内置默认值（temperature 0.2 / top_p 1.0 / presence_penalty 0.0 / reasoning_effort low / max_tokens 摘要长度预算）。未配置 `compaction_model` 时跟随当前聊天模型（参数仍用压缩配置或内置默认）。
 
-**子智能体模型**：`model_selection.sub_agent_model`（未配置时子智能体继承当前聊天模型——含 ambient 会话覆盖，经 asyncio 上下文自动传递；配置后使用该角色端点与 `parameter` 填充，协议必须为 `chat-completions`）。前端聊天设置面板新增「子智能体模型」选项卡（与聊天/压缩/标题模型同级），未选择时提示"子智能体继承聊天模型"。
+**子智能体模型**：`model_selection.sub_agent_model`（未配置时子智能体继承当前聊天模型——含 ambient 会话覆盖，经 asyncio 上下文自动传递；配置后使用该角色端点、对应协议适配器与 `parameter` 填充，协议支持 chat-completions/messages/responses）。前端聊天设置面板新增「子智能体模型」选项卡（与聊天/压缩/标题模型同级），未选择时提示"子智能体继承聊天模型"。
 
 **压缩模型优先级**：`model_selection.compaction_model`（未配置时跟随当前聊天模型）。压缩模型完全由 models.json 的 `model_selection` 管理，**不再从 `.env` 读取或写入**（`HISTORY_COMPACT_MODEL_PROVIDER/NAME` 已移除）。
 
-**标题模型**：`model_selection.title_model`（会话覆盖 → 全局默认，仅 chat-completions 协议）消费于**会话标题自动生成（前端驱动，与聊天主链路解耦）**：前端在 SSE 流内收集模型输出（思考/正文 delta），累计达 100 字符（思考/正文取较长者）即调 `POST /chat_config/generate_title`**一次**（流结束不足 100 字符时以已有全文触发）；请求携带【用户问题】（截 300 字）+【输出预览】+ 首问原始 content 部件（多模态）。后端调标题模型生成标题（提示词要求 ≤30 字，后端硬截断 40 字兜底）、写回会话首行 `_meta.title` 与 `_title_state` 标记（source/model/applied_at）并把标题**同步返回**——前端收到即替换侧栏标题，**零轮询**（不再轮询 `/chat_history/meta`）。**生成时机（会话独立配置 `retitle_each_message`，前端聊天设置弹窗开关）**：关闭（默认）时仅首个任务尝试一次；开启时每轮都重新生成（覆盖式，手动重命名后的标题也会被覆盖，属该开关显式语义）。**跳过条件**：已有 `title_generated`（首轮已生成/手动重命名过）或 `attempted`（失败标记）时接口直接回显当前标题、不调标题模型。**失败防重试**：一次调用失败（上游 4xx/5xx、空输出等）后写 `_title_state.attempted` 标记（含 `title_attempted_at`），之后轮次不再自动重试；需要重试时开启「每条消息重新标题」（开启瞬间清除 attempted）或手动重命名会话。接口内同会话 2s 防抖窗口防重复请求。未配置标题模型或调用失败时**保持旧机制标题**（首个用户问题前 40 字兜底），零行为变化。**多模态标题**：首问含图片/视频/音频时，标题模型支持视觉（该模型 vision=true）则媒体解析为 base64 一并送入（大图自动降采样，与聊天主链路同口径）；不支持视觉时媒体部件按 vision=false 同口径转为「[图片 media://x.png]」文本占位（不发 base64）。请求参数：标题模型 `parameter`（按 api_type 取桶）> 内置默认（temperature 0.3 / top_p 1.0 / presence_penalty 0.0 / max_tokens 64 / reasoning_effort low，无工具、非流式、不拼后端历史）。注意：所选标题模型需在其网关侧实际可用——部分网关按角色/工作区对模型做区域门控（如同 provider 下聊天模型可用而标题角色调用返回 403 RegionError），失败会打印可行动的 WARN 并保持旧机制标题，更换标题模型即可。**自定义请求头**：标题角色的 `headers` 配置（模型面板标题模型 tab）随配置注入上游请求（opencode 等需会话头的供应商在此配置）。
+**标题模型**：`model_selection.title_model`（会话覆盖 → 全局默认，支持 chat-completions/messages/responses）消费于**会话标题自动生成（前端驱动，与聊天主链路解耦）**：前端在 SSE 流内收集模型输出（思考/正文 delta），累计达 100 字符（思考/正文取较长者）即调 `POST /chat_config/generate_title`**一次**（流结束不足 100 字符时以已有全文触发）；请求携带【用户问题】（截 300 字）+【输出预览】+ 首问原始 content 部件（多模态）。后端调标题模型生成标题（提示词要求 ≤30 字，后端硬截断 40 字兜底）、写回会话首行 `_meta.title` 与 `_title_state` 标记（source/model/applied_at）并把标题**同步返回**——前端收到即替换侧栏标题，**零轮询**（不再轮询 `/chat_history/meta`）。**生成时机（会话独立配置 `retitle_each_message`，前端聊天设置弹窗开关）**：关闭（默认）时仅首个任务尝试一次；开启时每轮都重新生成（覆盖式，手动重命名后的标题也会被覆盖，属该开关显式语义）。**跳过条件**：已有 `title_generated`（首轮已生成/手动重命名过）或 `attempted`（失败标记）时接口直接回显当前标题、不调标题模型。**失败防重试**：一次调用失败（上游 4xx/5xx、空输出等）后写 `_title_state.attempted` 标记（含 `title_attempted_at`），之后轮次不再自动重试；需要重试时开启「每条消息重新标题」（开启瞬间清除 attempted）或手动重命名会话。接口内同会话 2s 防抖窗口防重复请求。未配置标题模型或调用失败时**保持旧机制标题**（首个用户问题前 40 字兜底），零行为变化。**多模态标题**：首问含图片/视频/音频时，标题模型支持视觉（该模型 vision=true）则媒体解析为 base64 一并送入（大图自动降采样，与聊天主链路同口径）；不支持视觉时媒体部件按 vision=false 同口径转为「[图片 media://x.png]」文本占位（不发 base64）。请求参数：标题模型 `parameter`（按 api_type 取桶）> 内置默认（temperature 0.3 / top_p 1.0 / presence_penalty 0.0 / max_tokens 64 / reasoning_effort low，无工具、非流式、不拼后端历史）。注意：所选标题模型需在其网关侧实际可用——部分网关按角色/工作区对模型做区域门控（如同 provider 下聊天模型可用而标题角色调用返回 403 RegionError），失败会打印可行动的 WARN 并保持旧机制标题，更换标题模型即可。**自定义请求头**：标题角色的 `headers` 配置（模型面板标题模型 tab）随配置注入上游请求（opencode 等需会话头的供应商在此配置）。
 
 ### 工具选择持久化（mcp_servers.json inputs + 会话 _meta.tool_selection）
 
@@ -621,11 +624,11 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 - `target_tokens`：历史压缩目标（tokens）；`>0` 时把历史整体压到该值以内（压低单次输入成本），`0`=不设目标。取值会被夹取到 `[下限, 上限]`：下限 = 有效窗口（min(聊天,压缩)窗口）< 500k 时取 窗口×8%，否则固定 40k；上限 = 有效窗口×40%。越界不报错，按边界值生效。
 - `trigger_ratio`：历史压缩触发比例，单轮和跨轮共用，范围为 $0 < r \le 0.95$；未使用强制摘要模式的调用按该比例判断。阈值 = `min(聊天模型窗口, 压缩模型窗口) × 该比例`；单轮触发时会先压缩此前可压缩的多轮历史，再压缩当前轮工具轨迹。
-- `summary_budget_ratio`（对应 env `HISTORY_COMPACT_SUMMARY_BUDGET_RATIO`，默认 0.2，上限 0.5）：累计摘要预算比例，**以聊天窗口为基数**。摘要总预算 = `聊天窗口 × 该比例`（100k × 20% = 20k）；新增摘要单次输出仍受压缩模型上限约束，最终归并为一个累计摘要块。
+- `summary_budget_ratio`（对应 env `HISTORY_COMPACT_SUMMARY_BUDGET_RATIO`，默认 0.2，上限 0.5）：累计摘要预算比例，**以有效窗口为基数**，有效窗口为 `min(聊天模型窗口, 压缩模型窗口)`。摘要总预算 = `max(1024, 有效窗口 × 该比例)`（两窗口均为 100k 时，100k × 20% = 20k）；新增摘要单次输出仍受压缩模型上限约束，最终归并为一个累计摘要块。
 - `oversized_reject_factor`（可选，对应 env `HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR`，默认 1.5）：单次工具结果的**拒绝阈值** = `min(聊天模型窗口, 压缩模型窗口) × 该系数`。当单个工具返回结果的估算 token 超过阈值时，该结果**不进入模型上下文**，后端改为给模型写入一条"输出过长，请重新考虑工具使用"的反馈（并提示缩小范围/加过滤参数），让模型重新规划；原始结果仅保留头尾节选到 JSONL（`result_preview` 字段），不落完整结果。填 `0` 关闭该保护。
 - `max_oversized_rejections`（可选，对应 env `HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS`，默认 3）：**连续**超长拒绝次数达到该值时终止当前任务（写入一条 assistant 说明消息并正常收尾）。
 
-> 说明：压缩模型**不再**由本接口配置。压缩模型选择统一由 `POST /chat_config/models/select`（`role=compaction_model`）管理；本接口请求体若带多余 `compaction_model` 字段会被忽略。压缩模型当前状态见 `GET /chat_config/models?role=compaction_model` 的 `role_info.compaction_status`（`available_compaction_models` 列出可选项，`effective` 为最终生效模型）。
+> 说明：压缩模型**不再**由本接口配置。压缩模型选择统一由 `POST /chat_config/models/select`（`role=compaction_model`）管理；本接口请求体若带多余 `compaction_model` 字段会被忽略。压缩模型当前状态见 `GET /chat_config/models?role=compaction_model` 返回的顶层 `available_compaction_models` 列出可选模型；`role_info.compaction_status.effective` 是最终生效模型。
 >
 > **压缩失败重试**由独立接口 `GET/POST /chat_config/compaction_retry` 管理（env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）：一次"尝试"=一条完整"压缩模型→聊天模型"降级链（压缩模型与聊天模型同源时本条链只有一次调用），整条链失败后固定间隔 1 秒再试；正数 N = 最多 N 条链，耗尽抛 `ContextCompactionError` **终止当前任务**（生成中的所有压缩点一致，避免带着未压缩的超长上下文继续对话导致下次超窗）；0 或负数 = 一直重试直到手动停止。
 
@@ -744,7 +747,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 
 只有当用户启用了 `read_document`、模型实际调用它，且目标文件扩展名命中 models.json 的 `supportDocTypes`（`GET /chat_config/models` 返回归一化字段 `support_doc_types`）时，才按需发送原生文档。`read_document` 未启用时不会进入工具 schema；它和 `vision` 图片/视频能力是相互独立的能力声明：
 
-- **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端适配层可转换其它协议；当前聊天客户端仅支持 `chat-completions` 协议）；
+- **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端已分别适配三种协议：Chat Completions 使用 `file` 部件，Messages 使用 `document`，Responses 使用 `input_file`）；
 - **发送节奏**：原生文件只随紧接着的一次模型请求发送。收到完整响应后，内存消息中的原生部件转为 `[文档 文件名]` 占位；仍需原文时模型再次调用 `read_document`。不会在首轮或后续每轮自动重复上传所有支持类型的文件。截断续写或工具调用流超时时暂时保留部件，供重试使用；
 - **分段与大小**：完整原生读取受 `NATIVE_DOC_MAX_BYTES` 单文件限制（默认 20MB）。原生 PDF 可用 `page_start` / `page_count` 选择最多 20 页并发送有效子 PDF；非 PDF 文档可用 `mode=text` 和 `offset` / `limit` 分段读取解析文本。PDF 页段目前仍要求源文件没有超过原生单文件大小限制；
 - **批次预算**（.env 可配、动态热生效）：同一次模型请求最多 `NATIVE_DOC_MAX_ITEMS` 个文件（默认 3），原生文件总量最多 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）。`mode=auto` 超预算时回退到文本模式；显式 native 或 PDF 页选段超预算时返回错误，模型可在下一次请求中单独读取；
@@ -952,3 +955,24 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
 轮次上限和整体超时均以 0 表示不限制；已派发子任务使用配置快照。停止、超时和轮次耗尽会发出 `sub_agent.done`（状态分别为 stopped/timeout/max_rounds），并向父智能体返回进展报告。单独停止不会结束父任务或其他子任务；已经提交到线程的工具可能继续完成，已执行文件修改不会回滚。
 
 编辑重发或删除历史轮次会一并清理其 `chat_round.events` 内的子智能体事件；前端回复容器统一带轮次标记，包括刷新重连复用历史用户气泡的情况，避免旧子任务块残留。
+
+## 工具权限与审批
+
+权限支持全局默认和会话覆盖：`ask` / `full_control`，会话 `null` 表示跟随全局；新任务固定模式及实际工作目录，设置改变从下个任务生效。
+
+| 路径 | 方法 | 请求/返回要点 |
+|---|---|---|
+| `/chat_config/permissions` | GET | 可选 `session_id`；返回 `global_mode/session_mode/mode/root` |
+| `/chat_config/permissions` | POST | `{mode, session_id?}`；会话 `mode:null` 清除覆盖 |
+| `/tool_approvals/pending` | GET | 必填 `session_id`；返回 `approvals` 和挂起的 `tasks` |
+| `/tool_approvals/{id}/decision` | POST | `{session_id, epoch, decision:"approve"|"deny"}`；恢复服务后旧代次不能放行新调用 |
+| `/tool_approvals/tasks/{id}/resume` | POST | `{session_id}`；恢复检查点，执行结果未知时 409 |
+| `/tool_approvals/tasks/{id}/cancel` | POST | `{session_id}`；放弃任务和审批，不回滚已经发生的工具效果 |
+| `/tool_approvals/preview` | POST | `{session_id, source}`；返回预览审批或绑定来源的短期票据 |
+| `/permissions/media` | GET | `session_id/source/grant?`；未经批准的外部来源 403，支持本地媒体 Range |
+
+按后续需求已移除权限控制码；上述接口无需 Bearer 认证，启动后直接访问 `/ui/`。审批决定仍校验会话、审批 ID 和执行代次。媒体仍使用绑定来源/会话的短期读取票据，内部签名密钥每次服务启动更换，用户无需配对。
+
+SSE 新增 `{event:"tool_approval",phase:"requested"|"resolved"|"cancelled",approval:{id,task_id,epoch,session_id,agent_id,tool_call_id,state,tool,args,paths,sources,root,reason,server,original_name,round,tool_index,seq?,parent_tool_call_id?,...}}`。`round` 为父会话轮次，子任务附带模型调用轮次 `seq` 及父派发调用 ID，用于绑定主工具、子任务内部工具与顶部的同步审批按钮。事件落在 `chat_round.events`，审批事件仅用于落盘审计，不单独生成展示块；刷新时从 pending 接口恢复原工具块上的有效按钮。原有正文和思考格式保留，`tool_return` 补充 `tool_call_id` 防止同名并发工具结果串位；拒绝生成带原 tool call ID 的配对错误结果。
+
+完整使用方法、存储和恢复边界见 [工具权限说明](tool_permissions.md)。

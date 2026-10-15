@@ -10,15 +10,139 @@
     state, el, toast, MODEL_ROLES,
     ROLE_DEFAULT_PARAMS, API_TYPE_DEFAULT_PARAMS, enhancePanel, modelTabs,
     modelPicker, modelPickerLabel, modelList, reasoningEffort,
-    enableThinking, temperature, temperatureValue, maxTokens,
+    enableThinking, chatParametersGroup, messagesParametersGroup, temperature, temperatureValue, maxTokens,
     maxTokensValue, topP, topPValue, presencePenalty,
-    presencePenaltyValue, enhanceCancel, enhanceConfirm, enhanceReset,
+    presencePenaltyValue, messagesTemperatureRow, messagesTemperature, messagesTemperatureValue,
+    messagesTopPRow, messagesTopP, messagesTopPValue, messagesThinkingMode,
+    messagesThinkingBudgetRow, messagesThinkingBudget, messagesThinkingBudgetValue, messagesThinkingHint,
+    messagesEffort, messagesStopSequences, messagesExtraBody,
+    enhanceCancel, enhanceConfirm, enhanceReset,
     enhanceClearOverride, enhanceHint,
     customHeadersRows, addHeaderRow
   } = App;
 
+  const responseControls = ["responsesParametersGroup", "responsesEffort", "responsesSummary", "responsesVerbosity", "responsesSampling", "responsesTemperatureRow", "responsesTemperature", "responsesTemperatureValue", "responsesTopPRow", "responsesTopP", "responsesTopPValue", "responsesInstructions", "responsesExtraBody", "responsesStateHint", "responsesRebuildSource", "responsesRebuild"];
+  const R = {};
+  responseControls.forEach(function (key) { R[key] = App[key] || el("div"); });
+
+  function isResponsesModel(model) {
+    return Boolean(model && String(model.api_type || "").toLowerCase() === "responses");
+  }
+  function responseParameters(role) {
+    const info = state.modelConfigs[role] && state.modelConfigs[role].role_info;
+    return cloneObject(info && info.selection && info.selection.parameter && info.selection.parameter.responses ||
+      info && info.selection && info.selection.api_type === "responses" && info.effective_parameter || {});
+  }
+  function renderResponsesFields(params) {
+    state.responsesParameterBase = cloneObject(params);
+    R.responsesEffort.value = params.reasoning && params.reasoning.effort || params.reasoning_effort || "";
+    R.responsesSummary.value = params.reasoning && params.reasoning.summary || "";
+    R.responsesVerbosity.value = params.text && params.text.verbosity || "";
+    R.responsesSampling.checked = params.temperature != null || params.top_p != null;
+    R.responsesTemperature.value = String(params.temperature != null ? params.temperature : 1);
+    R.responsesTopP.value = String(params.top_p != null ? params.top_p : 1);
+    R.responsesInstructions.value = params.instructions || "";
+    R.responsesExtraBody.value = params.extra_body ? JSON.stringify(params.extra_body, null, 2) : "";
+  }
+  function responsesDraft() {
+    const result = { base: cloneObject(state.responsesParameterBase) };
+    responseControls.forEach(function (key) { result[key] = R[key].value; });
+    result.responsesSampling = Boolean(R.responsesSampling.checked);
+    return result;
+  }
+  function restoreResponsesDraft(value) {
+    if (!value) { renderResponsesFields(responseParameters(state.activeModelRole)); return; }
+    state.responsesParameterBase = cloneObject(value.base);
+    responseControls.forEach(function (key) { if (value[key] != null) R[key].value = value[key]; });
+    R.responsesSampling.checked = Boolean(value.responsesSampling);
+  }
+  function responseParameterObject(draft, model) {
+    const value = draft || responsesDraft();
+    const params = cloneObject(value.base || {});
+    delete params.reasoning_effort;
+    delete params.max_tokens;
+    params.max_output_tokens = Number(draft ? draft.maxTokens : maxTokens.value);
+    const reasoning = Object.assign({}, params.reasoning || {});
+    if (value.responsesEffort) reasoning.effort = value.responsesEffort; else delete reasoning.effort;
+    if (value.responsesSummary) reasoning.summary = value.responsesSummary; else delete reasoning.summary;
+    if (Object.keys(reasoning).length) params.reasoning = reasoning; else delete params.reasoning;
+    const text = Object.assign({}, params.text || {});
+    if (value.responsesVerbosity) text.verbosity = value.responsesVerbosity; else delete text.verbosity;
+    if (Object.keys(text).length) params.text = text; else delete params.text;
+    delete params.temperature; delete params.top_p;
+    if (value.responsesSampling) {
+      if (supportsMessageParameter(model, "temperature")) params.temperature = Number(value.responsesTemperature);
+      if (supportsMessageParameter(model, "top_p")) params.top_p = Number(value.responsesTopP);
+    }
+    if (value.responsesInstructions) params.instructions = value.responsesInstructions; else delete params.instructions;
+    if (String(value.responsesExtraBody || "").trim()) {
+      const extra = JSON.parse(value.responsesExtraBody);
+      if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("extra_body 须为 JSON 对象");
+      params.extra_body = extra;
+    } else delete params.extra_body;
+    ["presence_penalty", "thinking", "output_config", "stop_sequences"].forEach(function (key) { delete params[key]; });
+    return params;
+  }
+  async function refreshResponsesState() {
+    const isMain = state.activeModelRole === "chat_model";
+    R.responsesRebuild.disabled = !isMain;
+    R.responsesRebuildSource.disabled = !isMain;
+    if (!isMain) {
+      R.responsesStateHint.textContent = "该角色按独立任务维护 Responses 会话；重新同步入口用于聊天主会话。";
+      return;
+    }
+    if (!state.sessionId || !API.getResponsesState) return;
+    const session = state.sessionId;
+    const role = state.activeModelRole;
+    try {
+      const data = await API.getResponsesState(session);
+      if (state.sessionId !== session || state.activeModelRole !== role) return;
+      const remote = data.responses_state || {};
+      const labels = { new: "尚未建立远端会话", ready: "远端增量续聊正常", request_pending: "请求正在进行",
+        recovery_required: "需要确认上次请求", rebuild_pending: "待下次发送重新同步", ready_to_rebase: "官方压缩完成，待下次发送启用", compacting: "正在压缩" };
+      let hint = labels[remote.status] || remote.status || "尚未建立远端会话";
+      if (remote.age_risk) hint += " · 长期会话建议准备重新同步";
+      const compressed = remote.last_compaction;
+      if (compressed && compressed.phase === "error") hint += " · 官方压缩未完成";
+      if (compressed && compressed.local_phase === "error") hint += " · 本地摘要未完成";
+      if (compressed && compressed.phase === "done") {
+        if (compressed.activation === "active") {
+          hint += " · 已从官方压缩窗口建立新链";
+          if (Number.isFinite(compressed.input_tokens_after)) hint += "（启用时输入 " + compressed.input_tokens_after.toLocaleString() + " tokens）";
+        } else if (compressed.mode === "trigger") {
+          hint += " · 压缩窗口待启用，下次发送自动建立新链";
+        }
+      }
+      R.responsesStateHint.textContent = hint + "。上下文显示以本地数据为准。";
+    } catch (error) {
+      if (state.sessionId === session && state.activeModelRole === role) R.responsesStateHint.textContent = "状态读取失败：" + error.message;
+    }
+  }
+  R.responsesRebuild.addEventListener("click", async function () {
+    if (state.activeModelRole !== "chat_model") { toast("请在聊天模型页重新同步主会话"); return; }
+    if (!state.sessionId) { toast("请先建立会话"); return; }
+    if (state.streaming || state.manualCompactRunning) { toast("请等待生成或压缩完成"); return; }
+    const session = state.sessionId;
+    try {
+      await API.rebuildResponsesContext(session, R.responsesRebuildSource.value || "local");
+      if (state.sessionId !== session) return;
+      toast("已准备上下文，下次发送时同步一次");
+      await refreshResponsesState();
+    } catch (error) { toast("重新同步失败：" + error.message); }
+  });
+  responseControls.filter(function (key) { return ["responsesEffort", "responsesSummary", "responsesVerbosity", "responsesInstructions", "responsesExtraBody", "responsesTemperature", "responsesTopP"].includes(key); }).forEach(function (key) {
+    R[key].addEventListener(key.includes("Temperature") || key.includes("TopP") || key.includes("Instructions") || key.includes("ExtraBody") ? "input" : "change", function () { markParamDirty(); syncRangeOutputs(); });
+  });
+  R.responsesSampling.addEventListener("change", function () { markParamDirty(); updateProtocolControls(); });
+  App.refreshResponsesState = refreshResponsesState;
+
   let panelVersion = 0;
   let panelSessionId;
+
+  // Messages 手动 thinking 预算约束（与 chat/protocols/messages.py 的发送前校验保持一致）
+  const THINKING_BUDGET_MIN = 1024;
+  const THINKING_BUDGET_STEP = 1024;
+  const THINKING_BUDGET_SLIDER_MAX = 65536;
 
   function isCurrentPanel(version, sessionId) {
     return version === panelVersion && sessionId === (state.sessionId || undefined);
@@ -133,6 +257,7 @@
     // 与全局当前模型相同也算明确选择，确认后建立会话独立配置。
     state.modelSelectionTouched = true;
     updateModelPickerLabel();
+    updateProtocolControls();
     // 切换到不同模型后立即拉取一次 /chat_config/models，
     // 用服务端最新 max_output_tokens 校准“最大输出 token”：当前配置超过上限则压回上限，其余参数不动
     if (switched) refreshMaxTokensAfterSwitch(key);
@@ -177,10 +302,126 @@
   }
 
   function syncRangeOutputs() {
+    syncManualBudgetRange(false);  // 先同步滑块上限再读取显示值：上限变小时浏览器可能下调 value
     temperatureValue.value = formatNumber(temperature.value);
     maxTokensValue.value = Number(maxTokens.value).toLocaleString("en-US");
     topPValue.value = formatNumber(topP.value);
     presencePenaltyValue.value = formatNumber(presencePenalty.value);
+    R.responsesTemperatureValue.value = formatNumber(R.responsesTemperature.value);
+    R.responsesTopPValue.value = formatNumber(R.responsesTopP.value);
+    messagesTemperatureValue.value = formatNumber(messagesTemperature.value);
+    messagesTopPValue.value = formatNumber(messagesTopP.value);
+    messagesThinkingBudgetValue.value = Number(messagesThinkingBudget.value).toLocaleString("en-US");
+    renderThinkingHint(modelInfoByKey(state.activeModelRole, state.selectedModelKey));
+  }
+
+  function cloneObject(value) {
+    return value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : {};
+  }
+
+  function isMessagesModel(model) {
+    return Boolean(model && String(model.api_type || "").toLowerCase().replace(/_/g, "-") === "messages");
+  }
+
+  function supportsMessageParameter(model, key) {
+    const caps = model && (model.parameter_capabilities || model.parameterCapabilities);
+    return !(caps && typeof caps === "object" && caps[key] === false);
+  }
+
+  function filterMessagesParameters(parameters, model) {
+    const filtered = cloneObject(parameters);
+    const caps = model && (model.parameter_capabilities || model.parameterCapabilities);
+    Object.keys(filtered).forEach(function (key) {
+      if (!supportsMessageParameter(model, key)) delete filtered[key];
+    });
+    if (caps && caps.thinking_budget === false && filtered.thinking && filtered.thinking.type === "enabled") {
+      delete filtered.thinking;
+    }
+    return filtered;
+  }
+
+  function renderMessagesFields(parameters, modelKey) {
+    const role = state.activeModelRole;
+    const model = modelInfoByKey(role, modelKey || state.selectedModelKey);
+    const native = filterMessagesParameters(parameters || {}, model);
+    messagesTemperature.value = String(native.temperature != null ? native.temperature : 0.7);
+    messagesTopP.value = String(native.top_p != null ? native.top_p : 1);
+    const thinking = native.thinking && typeof native.thinking === "object" ? native.thinking : {};
+    messagesThinkingMode.value = thinking.type === "adaptive" || thinking.type === "enabled" ? thinking.type : "";
+    messagesThinkingBudget.value = String(thinking.budget_tokens != null ? thinking.budget_tokens : 8192);
+    const output = native.output_config && typeof native.output_config === "object" ? native.output_config : {};
+    messagesEffort.value = output.effort || "";
+    messagesStopSequences.value = Array.isArray(native.stop_sequences) ? native.stop_sequences.join("\n") : "";
+    messagesExtraBody.value = native.extra_body && typeof native.extra_body === "object"
+      ? JSON.stringify(native.extra_body, null, 2) : "";
+    syncMessagesThinkingControls(model);
+    syncRangeOutputs();
+  }
+
+  function syncMessagesThinkingControls(model) {
+    const thinkingOption = messagesThinkingMode.querySelector && messagesThinkingMode.querySelector('option[value="enabled"]');
+    const budgetUnsupported = !supportsMessageParameter(model, "thinking_budget");
+    if (thinkingOption) thinkingOption.disabled = budgetUnsupported;
+    if (budgetUnsupported && messagesThinkingMode.value === "enabled") messagesThinkingMode.value = "";
+    messagesThinkingBudgetRow.classList.toggle("hidden", messagesThinkingMode.value !== "enabled" || budgetUnsupported);
+    syncManualBudgetRange(false);
+    renderThinkingHint(model);
+  }
+
+  // 手动预算上限：小于最大输出 token 的最大 1024 倍数，且不超过滑块上限
+  function manualBudgetLimit(maxOutput) {
+    if (!Number.isFinite(maxOutput)) return 0;
+    const cap = Math.floor((maxOutput - 1) / THINKING_BUDGET_STEP) * THINKING_BUDGET_STEP;
+    return Math.min(THINKING_BUDGET_SLIDER_MAX, cap);
+  }
+
+  // 滑块上限随最大输出 token 联动。clamp=true（用户调整最大输出 token）时，超出上限的预算下调到上限，
+  // 返回是否发生下调；调用方据此记为改动，保存时生效。
+  function syncManualBudgetRange(clamp) {
+    const limit = manualBudgetLimit(Number(maxTokens.value));
+    messagesThinkingBudget.max = String(Math.max(THINKING_BUDGET_MIN, limit));
+    if (!clamp || messagesThinkingMode.value !== "enabled" || limit < THINKING_BUDGET_MIN) return false;
+    if (Number(messagesThinkingBudget.value) <= limit) return false;
+    messagesThinkingBudget.value = String(limit);
+    return true;
+  }
+
+  // 说明 Thinking 当前可用性：模型不支持手动预算时给出原因；手动预算时给出可选范围
+  function renderThinkingHint(model) {
+    let text = "";
+    if (!supportsMessageParameter(model, "thinking_budget")) {
+      text = "该模型不支持手动思考预算，已禁用 Enabled。请选择 Adaptive，并用输出 effort 调节思考深度。";
+    } else if (messagesThinkingMode.value === "enabled") {
+      const max = Number(maxTokens.value);
+      const limit = manualBudgetLimit(max);
+      text = limit >= THINKING_BUDGET_MIN
+        ? "手动预算可选 " + THINKING_BUDGET_MIN.toLocaleString("en-US") + " – " + limit.toLocaleString("en-US") +
+          "（需小于最大输出 token " + max.toLocaleString("en-US") + "）"
+        : "最大输出 token 需大于 " + THINKING_BUDGET_MIN.toLocaleString("en-US") + " 才能使用手动预算";
+    }
+    messagesThinkingHint.textContent = text;
+    messagesThinkingHint.classList.toggle("hidden", !text);
+  }
+
+  // 发送前组合校验（与 chat/protocols/messages.py 一致）：保存时即给出可操作的提示，避免等到上游返回 400
+  function validateMessagesParameter(param) {
+    const thinking = param.thinking;
+    if (!thinking || typeof thinking !== "object") return;
+    if (thinking.type === "enabled") {
+      const budget = thinking.budget_tokens;
+      if (!Number.isInteger(budget) || budget < THINKING_BUDGET_MIN || budget >= param.max_tokens) {
+        throw new Error("手动 thinking 预算须为不小于 " + THINKING_BUDGET_MIN.toLocaleString("en-US") +
+          " 且小于最大输出 token（" + param.max_tokens.toLocaleString("en-US") + "）的整数，请调整预算或最大输出 token");
+      }
+    }
+    if (thinking.type === "enabled" || thinking.type === "adaptive") {
+      if (param.temperature !== undefined && param.temperature !== 1) {
+        throw new Error("开启 Thinking 时 Temperature 须为 1（供应商限制），请把 Temperature 调回 1 或关闭 Thinking");
+      }
+      if (param.top_p !== undefined && !(param.top_p >= 0.95 && param.top_p <= 1)) {
+        throw new Error("开启 Thinking 时 Top P 须在 0.95 到 1 之间（供应商限制），请调整或关闭 Thinking");
+      }
+    }
   }
 
   // 将服务端生效参数回填到表单（未配置时用角色内置默认）
@@ -203,8 +444,36 @@
     enableThinking.checked = extra.enable_thinking != null ? Boolean(extra.enable_thinking) : defaults.enable_thinking;
     // 自定义请求头按该角色生效值回填（会话覆盖 → 全局默认）
     renderHeaderRows(info && info.effective_headers);
+    renderResponsesFields(responseParameters(state.activeModelRole));
     syncRangeOutputs();
     state.modelParamDirty = false;
+    state.messagesParameterBase = nativeParameters(state.activeModelRole);
+    state.messagesParameterTouched = {};
+    state.messagesParametersReset = false;
+    renderMessagesFields(state.messagesParameterBase);
+    updateProtocolControls();
+  }
+
+  function updateProtocolControls() {
+    const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
+    const messages = isMessagesModel(model);
+    const responses = isResponsesModel(model);
+    chatParametersGroup.classList.toggle("hidden", messages || responses);
+    R.responsesParametersGroup.classList.toggle("hidden", !responses);
+    enhancePanel.classList.toggle("responses-mode", responses);
+    R.responsesTemperatureRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "temperature"));
+    R.responsesTopPRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "top_p"));
+    if (responses) refreshResponsesState();
+    messagesParametersGroup.classList.toggle("hidden", !messages);
+    enhancePanel.classList.toggle("messages-mode", messages);
+    syncMessagesThinkingControls(model);
+    [temperature, topP, presencePenalty, reasoningEffort, enableThinking].forEach(function (control) {
+      control.disabled = Boolean(messages || responses);
+      const row = control.closest && control.closest("label");
+      if (row) row.classList.toggle("hidden", Boolean(messages || responses));
+    });
+    messagesTemperatureRow.classList.toggle("hidden", !messages || !supportsMessageParameter(model, "temperature"));
+    messagesTopPRow.classList.toggle("hidden", !messages || !supportsMessageParameter(model, "top_p"));
   }
 
   function markParamDirty() {
@@ -232,6 +501,17 @@
       presencePenalty: presencePenalty.value,
       reasoningEffort: reasoningEffort.value,
       enableThinking: enableThinking.checked,
+      responses: responsesDraft(),
+      messagesParameterBase: cloneObject(state.messagesParameterBase),
+      messagesParameterTouched: Object.assign({}, state.messagesParameterTouched || {}),
+      messagesParametersReset: Boolean(state.messagesParametersReset),
+      messagesTemperature: messagesTemperature.value,
+      messagesTopP: messagesTopP.value,
+      messagesThinkingMode: messagesThinkingMode.value,
+      messagesThinkingBudget: messagesThinkingBudget.value,
+      messagesEffort: messagesEffort.value,
+      messagesStopSequences: messagesStopSequences.value,
+      messagesExtraBody: messagesExtraBody.value,
       headers: collectHeaderRows(),
       dirty: state.modelParamDirty,
       selectionTouched: state.modelSelectionTouched,
@@ -248,11 +528,24 @@
     presencePenalty.value = draft.presencePenalty;
     reasoningEffort.value = draft.reasoningEffort;
     enableThinking.checked = draft.enableThinking;
+    restoreResponsesDraft(draft.responses);
+    state.messagesParameterBase = cloneObject(draft.messagesParameterBase);
+    state.messagesParameterTouched = Object.assign({}, draft.messagesParameterTouched || {});
+    state.messagesParametersReset = Boolean(draft.messagesParametersReset);
+    messagesTemperature.value = draft.messagesTemperature || "0.7";
+    messagesTopP.value = draft.messagesTopP || "1";
+    messagesThinkingMode.value = draft.messagesThinkingMode || "";
+    messagesThinkingBudget.value = draft.messagesThinkingBudget || "8192";
+    messagesEffort.value = draft.messagesEffort || "";
+    messagesStopSequences.value = draft.messagesStopSequences || "";
+    messagesExtraBody.value = draft.messagesExtraBody || "";
+    messagesThinkingBudgetRow.classList.toggle("hidden", messagesThinkingMode.value !== "enabled");
     renderHeaderRows(draft.headers);
     syncRangeOutputs();
     updateModelPickerLabel();
     state.modelParamDirty = draft.dirty;
     state.modelSelectionTouched = Boolean(draft.selectionTouched);
+    updateProtocolControls();
   }
 
   // ---------- 自定义请求头编辑器（键值两列，可增减行） ----------
@@ -301,11 +594,71 @@
     return headers;
   }
 
+  function nativeParameters(role, modelKey) {
+    const cfg = state.modelConfigs[role];
+    const info = cfg && cfg.role_info;
+    const buckets = info && info.selection && info.selection.parameter;
+    const native = (buckets && buckets.messages) || (info && info.selection && String(info.selection.api_type).replace(/-/g, "_") === "messages" && info.effective_parameter) || {};
+    const params = {};
+    ["thinking", "output_config", "stop_sequences", "temperature", "top_p", "extra_body"].forEach(function (key) {
+      if (native[key] != null) params[key] = native[key];
+    });
+    return filterMessagesParameters(params, modelInfoByKey(role, modelKey || currentModelKey(role)));
+  }
+
   // 按角色草稿对应模型的 api_type 分桶组装 parameter（responses 协议用 max_output_tokens）
   function buildParameterObject(role, draft) {
     const modelKey = draft ? draft.selectedModelKey : state.selectedModelKey;
     const model = modelInfoByKey(role, modelKey);
     const apiType = model && model.api_type ? String(model.api_type).replace(/-/g, "_").toLowerCase() : "chat_completions";
+    if (apiType === "responses") return responseParameterObject(draft ? Object.assign({}, draft.responses, { maxTokens: draft.maxTokens }) : null, model);
+    if (apiType === "messages") {
+      const modelInfo = model;
+      const base = draft ? draft.messagesParameterBase : state.messagesParameterBase;
+      const touched = draft ? draft.messagesParameterTouched || {} : state.messagesParameterTouched || {};
+      const reset = draft ? draft.messagesParametersReset : state.messagesParametersReset;
+      const native = reset ? {} : filterMessagesParameters(base || nativeParameters(role), modelInfo);
+      const hasTouch = function (key) { return Boolean(touched[key]); };
+      const setValue = function (key, value) {
+        if (!supportsMessageParameter(modelInfo, key)) { delete native[key]; return; }
+        if (value == null) delete native[key]; else native[key] = value;
+      };
+      if (hasTouch("temperature")) setValue("temperature", Number(draft ? draft.messagesTemperature : messagesTemperature.value));
+      if (hasTouch("top_p")) setValue("top_p", Number(draft ? draft.messagesTopP : messagesTopP.value));
+      if (hasTouch("thinking")) {
+        const mode = draft ? draft.messagesThinkingMode : messagesThinkingMode.value;
+        if (mode === "adaptive") setValue("thinking", { type: "adaptive" });
+        else if (mode === "enabled") {
+          if (!supportsMessageParameter(modelInfo, "thinking_budget")) throw new Error("该模型声明不支持手动 thinking 预算（thinking_budget: false），请改用 Adaptive");
+          const budget = Number(draft ? draft.messagesThinkingBudget : messagesThinkingBudget.value);
+          setValue("thinking", { type: "enabled", budget_tokens: budget });
+        } else setValue("thinking", null);
+      }
+      if (hasTouch("output_config")) {
+        const effort = draft ? draft.messagesEffort : messagesEffort.value;
+        const output = Object.assign({}, native.output_config || {});
+        if (effort) output.effort = effort; else delete output.effort;
+        setValue("output_config", Object.keys(output).length ? output : null);
+      }
+      if (hasTouch("stop_sequences")) {
+        const text = draft ? draft.messagesStopSequences : messagesStopSequences.value;
+        const stops = String(text || "").split(/\r?\n/).map(function (item) { return item.trim(); }).filter(Boolean);
+        setValue("stop_sequences", stops.length ? stops : null);
+      }
+      if (hasTouch("extra_body")) {
+        const text = String(draft ? draft.messagesExtraBody : messagesExtraBody.value || "").trim();
+        let extra = null;
+        if (text) {
+          try { extra = JSON.parse(text); } catch (_) { throw new Error("extra_body 必须为合法 JSON"); }
+          if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("extra_body 须为 JSON 对象");
+        }
+        setValue("extra_body", extra);
+      }
+      const param = { max_tokens: Number(draft ? draft.maxTokens : maxTokens.value) };
+      Object.keys(native).forEach(function (key) { if (native[key] != null) param[key] = native[key]; });
+      validateMessagesParameter(param);
+      return param;
+    }
     const param = {
       temperature: Number(draft ? draft.temperature : temperature.value),
       top_p: Number(draft ? draft.topP : topP.value),
@@ -437,15 +790,33 @@
     modelList.classList.add("hidden");
   });
 
+  function touchMessagesParameter(key) {
+    if (!state.messagesParameterTouched) state.messagesParameterTouched = {};
+    state.messagesParameterTouched[key] = true;
+    markParamDirty();
+  }
+
   temperature.addEventListener("input", function () { markParamDirty(); syncRangeOutputs(); });
   maxTokens.addEventListener("input", function () {
     markParamDirty();
+    // 最大输出 token 调小到不再大于手动预算时，预算自动下调到合法上限，并记为改动（保存时生效）
+    if (syncManualBudgetRange(true)) touchMessagesParameter("thinking");
     syncRangeOutputs();
   });
   topP.addEventListener("input", function () { markParamDirty(); syncRangeOutputs(); });
   presencePenalty.addEventListener("input", function () { markParamDirty(); syncRangeOutputs(); });
   reasoningEffort.addEventListener("change", markParamDirty);
   enableThinking.addEventListener("change", markParamDirty);
+  messagesTemperature.addEventListener("input", function () { touchMessagesParameter("temperature"); syncRangeOutputs(); });
+  messagesTopP.addEventListener("input", function () { touchMessagesParameter("top_p"); syncRangeOutputs(); });
+  messagesThinkingMode.addEventListener("change", function () {
+    syncMessagesThinkingControls(modelInfoByKey(state.activeModelRole, state.selectedModelKey));
+    touchMessagesParameter("thinking");
+  });
+  messagesThinkingBudget.addEventListener("input", function () { touchMessagesParameter("thinking"); syncRangeOutputs(); });
+  messagesEffort.addEventListener("change", function () { touchMessagesParameter("output_config"); });
+  messagesStopSequences.addEventListener("input", function () { touchMessagesParameter("stop_sequences"); });
+  messagesExtraBody.addEventListener("input", function () { touchMessagesParameter("extra_body"); });
   // 自定义请求头：添加空行（输入/删除行时各自置 dirty）
   addHeaderRow.addEventListener("click", function () {
     addHeaderRowInputs("", "");
@@ -459,21 +830,30 @@
   });
 
   // 恢复默认：按选中模型的 api_type 取预设默认参数（角色默认覆盖协议默认），
-  // 后端暂未按 api_type 细分适配，预设先占位，后续随协议设计调整。
+  // Messages 清除显式可选参数，使用供应商默认值。
   // 自定义请求头不属于"参数默认"范畴，恢复默认不触碰
   function applyRoleDefaults() {
     const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
     const apiType = model && model.api_type
       ? String(model.api_type).replace(/-/g, "_").toLowerCase() : "chat_completions";
     const preset = API_TYPE_DEFAULT_PARAMS[apiType] || API_TYPE_DEFAULT_PARAMS.chat_completions;
-    const merged = Object.assign({}, preset, ROLE_DEFAULT_PARAMS[state.activeModelRole] || {});
+    const merged = Object.assign({}, preset, apiType === "messages" ? {} : ROLE_DEFAULT_PARAMS[state.activeModelRole] || {});
 
-    temperature.value = String(merged.temperature);
     setupMaxTokensRange(defaultMaxTokens(model));
-    topP.value = String(merged.top_p);
-    presencePenalty.value = String(merged.presence_penalty);
-    reasoningEffort.value = merged.reasoning_effort;
-    enableThinking.checked = merged.enable_thinking;
+    if (apiType !== "messages") {
+      temperature.value = String(merged.temperature);
+      topP.value = String(merged.top_p);
+      presencePenalty.value = String(merged.presence_penalty);
+      reasoningEffort.value = merged.reasoning_effort;
+      enableThinking.checked = merged.enable_thinking;
+    }
+    if (apiType === "responses") renderResponsesFields({});
+    if (apiType === "messages") {
+      state.messagesParameterBase = {};
+      state.messagesParameterTouched = {};
+      state.messagesParametersReset = true;
+      renderMessagesFields({}, state.selectedModelKey);
+    }
     syncRangeOutputs();
     state.modelParamDirty = true;
     toast("已恢复为 " + apiType + " 默认参数");
@@ -516,6 +896,13 @@
         toast("「" + item.label + "」的模型选择无效");
         return;
       }
+      let parameter = null;
+      try {
+        parameter = paramsChanged ? buildParameterObject(role, draft) : null;
+      } catch (error) {
+        toast("「" + item.label + "」参数无效：" + error.message);
+        return;
+      }
       changes.push({
         role: role,
         label: item.label,
@@ -523,7 +910,7 @@
         provider: key.slice(0, sep),
         model: key.slice(sep + 2),
         modelChanged: modelChanged,
-        parameter: paramsChanged ? buildParameterObject(role, draft) : null,
+        parameter: parameter,
         headers: headersChanged ? draft.headers : null,
       });
     }

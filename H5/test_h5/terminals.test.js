@@ -60,16 +60,17 @@ function setup(initial = [], sessionId = 's') {
     terminalLogUrl: (id, sid) => '/terminal/jobs/' + id + '/log/download?session_id=' + sid,
   };
   const timers = {};
-  const window = { API: api, App: { state: { sessionId }, toast() {} }, addEventListener() {} };
+  const window = { API: api, App: { state: { sessionId }, toast() {} }, listeners: {},
+    addEventListener(type, callback) { this.listeners[type] = callback; } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../js/app/terminals.js'), 'utf8'), {
     window, document, AbortController, setTimeout, clearTimeout,
-    setInterval(fn, ms) { timers[ms] = fn; return ms; }, clearInterval() {},
+    setInterval(fn, ms) { timers[ms] = fn; return ms; }, clearInterval(id) { delete timers[id]; },
   });
   function find(className, root = document.body) {
     if ((root.className || '').split(' ').includes(className)) return root;
     for (const node of root.children || []) { const found = find(className, node); if (found) return found; }
   }
-  return { state, app: window.App, timers, button, badge, document, find };
+  return { state, app: window.App, timers, button, badge, document, window, find };
 }
 function job(id, extra = {}) { return { job_id: id, command: '命令 ' + id, status: 'running', shell: 'sh', pid: 123,
   created_at: Date.now() / 1000, session_id: 's', cwd: '/', can_stop: true, ...extra }; }
@@ -80,7 +81,7 @@ test('只统计当前会话运行中的终端，过滤其他会话和结束记�
   assert.equal(ui.button.classList.contains('hidden'), true);
   ui.state.jobs = [job('bg_one'), job('bg_two', { session_id: 'other' }),
     ...['completed', 'failed', 'stopped', 'unknown'].map(status => job('bg_' + status, { status }))];
-  await ui.timers[3000]();
+  await ui.app.terminalJobs.noteToolResult('s', 'run_command');
   assert.equal(ui.button.classList.contains('hidden'), false);
   assert.equal(ui.badge.textContent, '1');
   assert.deepEqual(ui.state.lists, ['s', 's']);
@@ -210,6 +211,97 @@ test('短暂网络故障保留任务入口，隐藏页面暂停轮询', async ()
   ui.state.listError = new Error('offline'); await ui.timers[3000]();
   assert.equal(ui.button.classList.contains('hidden'), false);
   ui.document.hidden = true; ui.button.click(); await settle();
-  const count = ui.state.polls.length; await ui.timers[1000]();
+  ui.document.listeners.visibilitychange();
+  const count = ui.state.polls.length;
+  assert.equal(ui.timers[1000], undefined);
+  assert.equal(ui.timers[3000], undefined);
   assert.equal(ui.state.polls.length, count);
+});
+
+test('空会话检查一次后没有定时器，无关工具和其他会话不能唤醒轮询', async () => {
+  const ui = setup(); await settle();
+  assert.deepEqual(ui.state.lists, ['s']);
+  assert.deepEqual(Object.keys(ui.timers), []);
+  await ui.app.terminalJobs.noteToolResult('s', 'read_file');
+  await ui.app.terminalJobs.noteToolResult('other', 'run_command');
+  assert.deepEqual(ui.state.lists, ['s']);
+  const empty = setup([], null); await settle();
+  assert.deepEqual(Object.keys(empty.timers), []);
+  assert.deepEqual(empty.state.lists, []);
+});
+
+test('后台命令结果唤醒列表轮询，输出仅在面板展开时轮询', async () => {
+  const ui = setup(); await settle();
+  ui.state.jobs = [job('bg_one')];
+  await ui.app.terminalJobs.noteToolResult('s', 'run_command');
+  assert.ok(ui.timers[3000]);
+  assert.equal(ui.timers[1000], undefined);
+  ui.button.click(); await settle();
+  assert.ok(ui.timers[1000]);
+  ui.find('terminal-header').children[1].click();
+  assert.equal(ui.timers[1000], undefined);
+  assert.ok(ui.timers[3000]);
+  ui.state.jobs = [];
+  await ui.timers[3000]();
+  assert.deepEqual(Object.keys(ui.timers), []);
+  assert.equal(ui.button.classList.contains('hidden'), true);
+});
+
+test('停止或进程结束移除最后一个任务后立即停止两种轮询', async () => {
+  for (const path of ['stop', 'output', 'list']) {
+    const ui = setup([job('bg_one')]); await settle(); ui.button.click(); await settle();
+    if (path === 'stop') await ui.find('terminal-stop').click();
+    else {
+      ui.state.jobs[0].status = 'completed';
+      await ui.timers[path === 'output' ? 1000 : 3000]();
+    }
+    assert.deepEqual(Object.keys(ui.timers), [], path);
+  }
+});
+
+test('空闲状态重新聚焦发现新任务，隐藏与 bfcache 生命周期停用定时器', async () => {
+  const ui = setup(); await settle();
+  ui.state.jobs = [job('bg_one')];
+  await ui.window.listeners.focus(); await settle();
+  assert.ok(ui.timers[3000]);
+  ui.button.click(); await settle();
+  ui.document.hidden = true; ui.document.listeners.visibilitychange();
+  assert.deepEqual(Object.keys(ui.timers), []);
+  ui.document.hidden = false; ui.document.listeners.visibilitychange(); await settle();
+  assert.ok(ui.timers[1000]); assert.ok(ui.timers[3000]);
+  ui.window.listeners.pagehide();
+  assert.deepEqual(Object.keys(ui.timers), []);
+  ui.state.jobs = [];
+  ui.window.listeners.pageshow({ persisted: true }); await settle();
+  assert.deepEqual(Object.keys(ui.timers), []);
+  assert.equal(ui.button.classList.contains('hidden'), true);
+});
+
+test('空列表请求期间到达命令结果会合并成一次后续检查，不丢失新任务', async () => {
+  const ui = setup(); await settle();
+  let resolve;
+  ui.state.pendingList = new Promise(done => { resolve = done; });
+  const pending = ui.app.terminalJobs.refresh();
+  ui.state.jobs = [job('bg_one')];
+  ui.app.terminalJobs.noteToolResult('s', 'run_command');
+  ui.app.terminalJobs.noteToolResult('s', 'poll_command');
+  ui.state.pendingList = null;
+  resolve({ jobs: [] }); await pending; await settle();
+  assert.deepEqual(ui.state.lists, ['s', 's', 's']);
+  assert.equal(ui.badge.textContent, '1');
+  assert.ok(ui.timers[3000]);
+});
+
+test('没有已知任务的发现请求失败只重试两次，后续事件可重新恢复', async () => {
+  const ui = setup(); await settle();
+  ui.state.listError = new Error('offline');
+  await ui.app.terminalJobs.noteToolResult('s', 'run_command');
+  assert.ok(ui.timers[3000]);
+  await ui.timers[3000]();
+  await ui.timers[3000]();
+  assert.deepEqual(ui.state.lists, ['s', 's', 's', 's']);
+  assert.deepEqual(Object.keys(ui.timers), []);
+  ui.state.listError = null; ui.state.jobs = [job('bg_one')];
+  await ui.app.terminalJobs.noteToolResult('s', 'run_command');
+  assert.ok(ui.timers[3000]);
 });

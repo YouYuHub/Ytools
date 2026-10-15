@@ -1,4 +1,4 @@
-/** Current-session background terminals. Bounded logs, no chat stream dependency. */
+/** Current-session background terminals. Event-driven discovery and active-only polling. */
 (function () {
   "use strict";
   const button = document.getElementById("terminalJobsBtn");
@@ -9,6 +9,33 @@
   let jobs = [], selected = null, overlay = null, panel, list, info, output, notice, stop, closeJob, download, follow;
   let listBusy = false, outputBusy = false, actionBusy = false, disposed = false, generation = 0, mutation = 0, previousFocus;
   let scopeSession, listRequest = null, outputRequest = null;
+  let listTimer = null, outputTimer = null, refreshPending = false, needsRetry = false, retriesLeft = 0;
+
+  function syncPolling() {
+    const visible = !disposed && !document.hidden && Boolean(scopeSession);
+    const pollList = visible && (jobs.length > 0 || (needsRetry && retriesLeft > 0));
+    const pollOutput = visible && jobs.length > 0 && Boolean(overlay && selected);
+    if (pollList && listTimer === null) {
+      listTimer = setInterval(() => {
+        if (listBusy || actionBusy) return;
+        if (!jobs.length && needsRetry) retriesLeft--;
+        return refreshList();
+      }, 3000);
+    } else if (!pollList && listTimer !== null) {
+      clearInterval(listTimer); listTimer = null;
+    }
+    if (pollOutput && outputTimer === null) outputTimer = setInterval(refreshOutput, 1000);
+    else if (!pollOutput && outputTimer !== null) { clearInterval(outputTimer); outputTimer = null; }
+  }
+
+  // Discovery is event-driven while idle. Coalesce triggers during an in-flight
+  // request so a command created after an empty snapshot cannot be missed.
+  function requestListRefresh() {
+    syncScope();
+    refreshPending = true;
+    retriesLeft = 2; // Failed idle discovery gets two retries, then waits for an event.
+    return refreshList();
+  }
 
   function currentSession() { return window.App && window.App.state && window.App.state.sessionId || null; }
   function syncScope() {
@@ -18,10 +45,15 @@
     if (listRequest) listRequest.abort();
     if (outputRequest) outputRequest.abort();
     jobs = []; selected = null;
+    refreshPending = false; needsRetry = false; retriesLeft = 0;
     syncEntry();
     return true;
   }
-  function noteSessionChanged() { if (syncScope()) refreshList(); }
+  function noteSessionChanged() { if (syncScope()) requestListRefresh(); }
+  function noteToolResult(sessionId, name) {
+    if (!sessionId || sessionId !== currentSession()) return;
+    if (name === "run_command" || name === "poll_command" || name === "stop_command") return requestListRefresh();
+  }
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -56,12 +88,14 @@
       const plus = document.getElementById("plusBtn");
       if (plus) plus.focus();
     } else if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+    syncPolling();
   }
   function syncEntry() {
     button.classList.toggle("hidden", !jobs.length);
     badge.textContent = jobs.length > 99 ? "99+" : String(jobs.length);
     button.title = "本会话后台终端（" + jobs.length + " 个运行中）";
     if (!jobs.length) hidePanel();
+    syncPolling();
   }
   function removeJob(id) {
     mutation++;
@@ -110,30 +144,35 @@
     renderList();
     const job = jobs.find(item => item.job_id === id);
     if (job) setInfo(job);
+    syncPolling();
     refreshOutput();
   }
   async function refreshList() {
     syncScope();
     const sessionId = scopeSession;
-    if (!sessionId) return;
+    if (!sessionId) { refreshPending = false; syncPolling(); return; }
     if (disposed || listBusy || document.hidden || actionBusy) return;
     listBusy = true;
+    refreshPending = false;
     const version = mutation;
     try {
       const data = await timedRequest(options => api.listTerminalJobs(sessionId, options), "list");
       if (disposed || version !== mutation || sessionId !== currentSession()) return;
       // Also filter old server responses during an upgrade; never count finished/foreign jobs.
       jobs = (data.jobs || []).filter(job => job.session_id === sessionId && job.status === "running");
+      needsRetry = false;
       syncEntry();
       if (!overlay) return;
       if (!jobs.length) { hidePanel(); return; }
       if (!jobs.some(job => job.job_id === selected)) selectJob(jobs[0].job_id);
       else { renderList(); setInfo(jobs.find(job => job.job_id === selected)); }
     } catch (error) {
+      if (!disposed && version === mutation && sessionId === currentSession()) needsRetry = true;
       if (overlay && version === mutation && sessionId === currentSession()) notice.textContent = "无法更新终端列表：" + error.message;
     } finally {
       listBusy = false;
-      if (!disposed && (version !== mutation || sessionId !== currentSession())) refreshList();
+      syncPolling();
+      if (!disposed && (refreshPending || version !== mutation || sessionId !== currentSession())) refreshList();
     }
   }
   async function refreshOutput() {
@@ -179,7 +218,7 @@
     }
     finally {
       actionBusy = false;
-      await refreshList();
+      await requestListRefresh();
       await refreshOutput();
     }
   }
@@ -229,20 +268,25 @@
     selected = null;
     renderList();
     if (jobs.length) selectJob(jobs[0].job_id);
-    refreshList(); dismiss.focus();
+    requestListRefresh(); dismiss.focus();
   }
   button.addEventListener("click", showPanel);
-  if (window.App) window.App.terminalJobs = { noteSessionChanged, refresh: refreshList };
-  let listTimer = setInterval(refreshList, 3000);
-  let outputTimer = setInterval(refreshOutput, 1000);
-  document.addEventListener("visibilitychange", () => { refreshList(); refreshOutput(); });
-  window.addEventListener("pagehide", () => { disposed = true; clearInterval(listTimer); clearInterval(outputTimer); });
+  if (window.App) window.App.terminalJobs = { noteSessionChanged, noteToolResult, refresh: requestListRefresh };
+  document.addEventListener("visibilitychange", () => {
+    syncPolling();
+    if (!document.hidden) { requestListRefresh(); refreshOutput(); }
+  });
+  window.addEventListener("focus", () => { requestListRefresh(); refreshOutput(); });
+  window.addEventListener("pagehide", () => {
+    disposed = true; mutation++; generation++;
+    if (listRequest) listRequest.abort();
+    if (outputRequest) outputRequest.abort();
+    syncPolling();
+  });
   window.addEventListener("pageshow", event => {
     if (!event.persisted || !disposed) return;
     disposed = false;
-    listTimer = setInterval(refreshList, 3000);
-    outputTimer = setInterval(refreshOutput, 1000);
-    refreshList(); refreshOutput();
+    requestListRefresh(); refreshOutput();
   });
-  refreshList();
+  requestListRefresh();
 })();

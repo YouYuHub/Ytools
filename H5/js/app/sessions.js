@@ -604,9 +604,8 @@
    * 空关键词也调用（幂等）：同步清理多选视图的搜索强制展开类等状态。
    */
   function reapplySessionFilter() {
-    const box = $("#searchInput");
-    const keyword = box ? String(box.value || "").trim().toLowerCase() : "";
-    if (App.filterSessions) App.filterSessions(keyword);
+    // Full-history search owns a separate modal; keep the sidebar unfiltered.
+    if (App.filterSessions) App.filterSessions("");
   }
 
   function updateBulkBarState() {
@@ -1108,7 +1107,7 @@
     try {
       const text = await API.fetchSessionFile(id);
       // 等待期间用户已切到其他会话，丢弃过期响应，避免误覆盖
-      if (seq !== sessionOpenSeq) return;
+      if (seq !== sessionOpenSeq) return false;
       const parsed = HistoryParser.parseHistory(text);
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
       // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
@@ -1136,21 +1135,27 @@
       loadingSessionId = "";
       readySessionId = id;
     } catch (err) {
+      if (seq !== sessionOpenSeq) return false;
       state.hasConversation = false;
       state.importedHistoryText = null;
       App.refreshContextTokenStats(id);
       App.updateExportButton();
       setEmpty(!restoreActiveStream(id));
-      if (err.message !== "加载会话失败") toast("历史加载失败：" + err.message);
+      toast("历史加载失败：" + err.message);
       // 仅当本请求仍是最新一次打开时才落定就绪跟踪：加载失败不置就绪，
       // 允许再次点击重试（恢复旧行为）；过期响应不得清掉新加载的状态
       if (seq === sessionOpenSeq) {
         loadingSessionId = "";
         readySessionId = "";
       }
+      return false;
     }
     // 刷新后若同一会话仍有后台生成任务，自动附接续看
-    if (seq === sessionOpenSeq) App.maybeAttachRunningStream(id);
+    if (seq === sessionOpenSeq) {
+      if (App.permissions && App.permissions.syncPending) App.permissions.syncPending(id);
+      App.maybeAttachRunningStream(id);
+    }
+    return seq === sessionOpenSeq;
   }
 
   /**

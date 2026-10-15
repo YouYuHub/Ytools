@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+import threading
 from typing import Any, Optional, List
 import urllib.parse
 # fastapi 库导入
@@ -128,6 +129,14 @@ async def chat_with_tool(request: Request):
     直接 400 可读错误，不默默截断。旧请求无该字段时行为完全不变。
     """
     body = await request.json()
+    if isinstance(body, dict):
+        for key in ("responses_context", "wire_protocol", "protocol_config"):
+            body.pop(key, None)
+        for message in body.get("messages") or []:
+            if isinstance(message, dict):
+                message.pop("provider_state", None)
+                message.pop("tool_is_error", None)
+                message.pop("context_item_id", None)
     # 引用快照校验（仅校验不改写；规范化在生成任务内统一执行）
     _validate_request_quotes(body)
     # 会话级模型选择：参数默认值填充按会话生效的 chat_model parameter
@@ -273,7 +282,7 @@ async def chat_stream_status(session_id: str = "default"):
     """
     try:
         normalized_session_id = normalize_session_id(session_id)
-        running = is_chat_stream_running(normalized_session_id)
+        running = _session_generation_busy(normalized_session_id)
         return JSONResponse(content={"running": running, "session_id": normalized_session_id})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -293,6 +302,47 @@ async def list_chat_history_sessions():
         raise HTTPException(status_code=400, detail=str(e))
 
     
+@api_chat_router.get('/chat_history/search')
+async def search_chat_history(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(40, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    revision: Optional[str] = Query(None, max_length=64),
+):
+    """Literal, case-insensitive search of all persisted conversation records.
+
+    Work runs outside the event loop; disconnected/aborted browser requests stop
+    indexing/SQLite queries. Pagination is bound to an index/query snapshot.
+    """
+    from memory.history_search import search_history, SearchCancelled, SearchSnapshotChanged
+    cancel = threading.Event()
+    task = asyncio.create_task(asyncio.to_thread(
+        search_history, q, limit=limit, offset=offset, revision=revision, cancel=cancel,
+    ))
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=0.1)
+            if await request.is_disconnected():
+                cancel.set()
+                # Consume the worker's cancellation exception without delaying the response.
+                task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+                return Response(status_code=499)
+        return JSONResponse(content=task.result())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SearchSnapshotChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except SearchCancelled:
+        return Response(status_code=499)
+    except asyncio.CancelledError:
+        cancel.set()
+        task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="会话搜索暂时不可用，请重试")
+
+
 @api_chat_router.get('/chat_history/file')
 async def get_chat_history_file(session_id: str = "default"):
     """
@@ -373,10 +423,14 @@ async def delete_chat_history(session_id: str = "default"):
     """
     session_id = normalize_session_id(session_id)
     try:
+        from factory.chat_factory import stop_chat_task
+        await stop_chat_task(session_id)
         result = ChatMemoryManager.delete_chat_session_file(session_id)
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"删除会话文件失败: {e}")
     # 清理缓存的管理器实例，避免下次操作时重建已删除的目录/文件
+    from memory.permission_store import delete_session
+    delete_session(session_id)
     await cleanup_file_memory_manager(session_id)
     await cleanup_chat_memory_manager(session_id)
     return JSONResponse(content=result)
@@ -511,20 +565,13 @@ class DeleteRoundsRequest(BaseModel):
 def _session_generation_busy(session_id: str) -> bool:
     """判断会话生成任务是否正在运行（编辑删除属破坏性操作，运行中必须拒绝）。
 
-    双路径判断：worker 模式查进程代理的生成态；inline 模式查会话流任务；
-    ChatMemoryManager.run_task 作为兜底（inline 任务收尾时置 False）。
+    worker 模式查进程代理的生成态；inline/派发中的任务查会话流。
+    与前端状态接口使用同一判断；历史管理器不承载生成任务运行状态。
     """
     proxy = peek_worker_proxy(session_id)
     if proxy is not None and proxy.is_generation_running():
         return True
-    if is_chat_stream_running(session_id):
-        return True
-    try:
-        manager = get_chat_memory_manager(session_id)
-    except Exception:
-        return False
-    # run_task 在任务开始时置 True；主进程缓存实例的兜底判断
-    return bool(getattr(manager, "run_task", False))
+    return is_chat_stream_running(session_id)
 
 
 @api_chat_router.post("/chat_history/delete_rounds")
@@ -554,6 +601,14 @@ async def delete_chat_history_rounds(payload: DeleteRoundsRequest):
         )
     try:
         manager = await get_chat_memory_manager(session_id)
+        from memory.permission_store import has_restorable_round
+        if not payload.dry_run and has_restorable_round(session_id):
+            # 参数或轮次无效时，不得先停止用户尚未决定的原任务。
+            await manager.delete_rounds(start_round=payload.start_round, mode=payload.mode, delete_files=payload.delete_files,
+                                        dry_run=True, keep_media_refs=payload.keep_media_refs)
+            # 正式删除已由用户确认：先停止/收尾原任务，再按历史轮次删除。
+            # 预演只读检查点，不能取消任务或清除审批。
+            await stop_chat_task(session_id)
         result = await manager.delete_rounds(
             start_round=payload.start_round,
             mode=payload.mode,
@@ -981,6 +1036,83 @@ async def get_chat_context_token_stats(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@api_chat_router.get("/chat_context/responses_state")
+async def get_responses_state(session_id: str):
+    from chat.protocols.responses_store import load_state, public_state
+    session_id = normalize_session_id(session_id)
+    return {"session_id": session_id, "responses_state": public_state(load_state(session_id))}
+
+
+@api_chat_router.post("/chat_context/responses_rebuild")
+async def rebuild_responses_context(session_id: str, source: str = "local"):
+    from chat.protocols.responses_store import load_state, current_window, stage_rebuild, pending_request
+    from chat.protocols.responses_content import convert_messages
+    from memory.chat_history_format import round_entry_to_context_messages
+    if source not in {"local", "native", "raw"}:
+        raise HTTPException(400, "source 必须为 local、native 或 raw")
+    session_id = normalize_session_id(session_id)
+    if _session_generation_busy(session_id):
+        raise HTTPException(409, "请等待当前生成任务结束后重新同步")
+    manager = await get_chat_memory_manager(session_id)
+    try:
+        if source == "native":
+            remote = load_state(session_id)
+            items = current_window(session_id, remote)
+            pending = pending_request(session_id, "chat_model")
+            if pending:
+                payload = pending["payload"]
+                additions = [item for item in payload.get("input") or [] if item.get("type") != "compaction_trigger"]
+                items = [*items, *additions] if payload.get("previous_response_id") else additions
+            declared = {item["call_id"] for item in items if item.get("type") == "function_call"}
+            returned = {item["call_id"] for item in items if item.get("type") == "function_call_output"}
+            from chat.protocols.responses_store import load_record
+            head = load_record(session_id, {"protocol": "responses", "record_id": remote["head_record_id"]}) if remote.get("head_record_id") else None
+            for call_id in declared - returned:
+                result = (head or {}).get("tool_status", {}).get(call_id) or {}
+                if result.get("status") != "completed":
+                    raise ValueError("原生窗口含未确认的工具执行，请先核对实际效果，再选择当前本地上下文重新同步")
+                items.append({"type": "function_call_output", "call_id": call_id,
+                              "output": result.get("content") or ""})
+            if not items:
+                raise ValueError("当前会话没有可用原生恢复窗口")
+        else:
+            if source == "local":
+                messages = await manager.get_context_messages()
+            else:
+                _, entries = manager._load_for_read()
+                messages = []
+                for entry in entries:
+                    if entry.get("event") == "chat_round":
+                        messages.extend(round_entry_to_context_messages(entry, -1))
+            from memory.file_memory import resolve_message_media_refs
+            resolve_message_media_refs(session_id, messages, api_type="responses")
+            items = convert_messages(messages, session_id)
+        from env_manager import require_default_chat_config
+        selection, _ = resolve_session_model_selection(session_id)
+        token = set_ambient_model_selection(selection)
+        try:
+            config = require_default_chat_config()
+        finally:
+            reset_ambient_model_selection(token)
+        from chat.protocols import normalize_api_type
+        if normalize_api_type(config.get("apiType")) != "responses":
+            raise ValueError("请先选择 Responses 接口模型")
+        from chat.protocols.responses_store import source_key
+        existing = load_state(session_id)
+        if source == "native" and existing.get("source_key") and existing["source_key"] != source_key(config):
+            raise ValueError("原生窗口属于另一个模型或账户，请选择本地上下文或完整历史重新同步")
+        if not any(item.get("type") in {"reasoning", "compaction"} for item in items):
+            from factory.agent_runtime.chat_runtime import estimate_text_tokens
+            limit = config.get("maxInputTokens") or config.get("max_input_tokens")
+            if limit and estimate_text_tokens(items) >= int(limit):
+                raise ValueError("所选历史超出当前模型窗口，请先本地压缩或选择更大窗口模型")
+        state = stage_rebuild(session_id, items, source=source)
+        return {"state": "succeed", "session_id": session_id, "responses_state": state,
+                "message": "上下文已准备，下次发送时同步一次，此后继续增量续聊"}
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @api_chat_router.post('/chat_context/compact_manual')
 async def compact_chat_context_manual(
     session_id: str = "default",
@@ -1117,7 +1249,8 @@ async def _manual_compaction_event_stream(
     result: dict[str, Any] = {"compressed_rounds": 0, "stats": None, "error": None}
 
     async def emit(payload: dict[str, Any]) -> None:
-        if isinstance(payload, dict) and payload.get("phase") == "delta":
+        if isinstance(payload, dict) and (payload.get("phase") == "delta"
+                or payload.get("event") == "responses_compaction" or "warning" in payload):
             await queue.put(payload)
             return
         add_event = getattr(manager, "add_context_compaction_event", None)

@@ -846,6 +846,7 @@
     chatSettingsModal.setAttribute("aria-hidden", "false");
     chatSettingsConfirm.disabled = true;
     loadSettingsRetitle();
+    const permissionLoad = App.permissions ? App.permissions.loadSettings() : Promise.resolve();
     const results = await Promise.all([
       // 传 session_id：模型窗口按会话生效模型口径计算，与顶部 token 统计一致
       API.getHistoryCompactionConfig(state.sessionId).catch(function () { return null; }),
@@ -856,6 +857,7 @@
       API.getToolConcurrencyConfig().catch(function () { return null; }),
       API.getSubAgentRetryConfig().catch(function () { return null; }),
       API.getSubAgentLimitsConfig().catch(function () { return null; }),
+      permissionLoad,
     ]);
     chatSettingsConfirm.disabled = false;
     const comp = results[0];
@@ -1073,6 +1075,7 @@
       API.updateToolConcurrencyConfig(concConfig),
       API.updateSubAgentRetryConfig(subRetryConfig),
       API.updateSubAgentLimitsConfig(subLimitsConfig),
+      ...(App.permissions ? [App.permissions.saveSettings()] : []),
     ]);
     chatSettingsConfirm.disabled = false;
     const failed = results.filter(function (r) { return r.status === "rejected"; });
@@ -1137,6 +1140,7 @@
   App.fitEnhancePanel = fitEnhancePanel;
   App.dockEnhancePanel = dockEnhancePanel;
   App.closeChatSettings = closeChatSettings;
+  App.openChatSettings = openChatSettings;
   App.submitSteerOrQueue = submitSteerOrQueue;
   App.renderPendingOutbox = renderPendingOutbox;
   App.flushPendingMessages = flushPendingMessages;

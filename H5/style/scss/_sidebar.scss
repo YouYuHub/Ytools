@@ -273,30 +273,6 @@ body.sidebar-resizing {
     }
   }
 
-  // 搜索框
-  .search-box {
-    display: none;
-    margin: 0 12px 4px;
-
-    &.show {
-      display: block;
-    }
-
-    .search-input {
-      width: 100%;
-      padding: 8px 12px;
-      border: 1px solid var(--border-strong);
-      border-radius: var(--radius-sm);
-      background: var(--bg-elevated);
-      outline: none;
-      font-size: 14px;
-
-      &:focus {
-        border-color: var(--text-tertiary);
-      }
-    }
-  }
-
   // 「最近」标题栏：固定在滚动列表上方，右侧常驻「多选」入口（预留后续分组扩展）
   .session-head {
     display: flex;

@@ -21,6 +21,7 @@ import urllib.error
 import uuid
 from collections import OrderedDict
 from pathlib import Path
+from factory.agent_runtime.permission_runtime import guard_path, permission_urlopen
 from threading import Lock
 from typing import Any, Optional
 
@@ -795,6 +796,16 @@ def _build_edit_model_result(
     if len(diff_text) > _EDIT_MODEL_DIFF_MAX_CHARS:
         result["diff_truncated"] = True
         result["diff_omitted_reason"] = "over_model_budget"
+        # The full diff is retained separately for the UI. Keep an actual diff
+        # excerpt (including hunk location), rather than echoing requested edits
+        # which may have been normalized or applied in multiple places.
+        lines = diff_text.splitlines()
+        location = "\n".join(line for line in lines[:4] if line.startswith(("---", "+++", "@@")))[:200]
+        removed = [line for line in lines if line.startswith("-") and not line.startswith("---")]
+        added = [line for line in lines if line.startswith("+") and not line.startswith("+++")]
+        result["diff_preview"] = (location + "\n" + "\n".join(removed[:3])[:200] +
+                                  "\n" + "\n".join(added[:3])[:200] + "\n[仅展示部分修改行]")
+        result["message"] = "编辑成功；diff_preview 仅为实际修改的开头预览，完整 diff 已留给前端。可按 changed_range 用 read_file 核验。"
         return result
 
     removed_lines = [line[1:] for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---")]
@@ -894,6 +905,7 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if create_only and expected_hash:
         raise ValueError("create 模式不能同时指定 expected_hash")
     path = Path(full_file_name).expanduser().resolve()
+    guard_path(path)
     existed = path.exists()
     if create_only and existed:
         raise ValueError("FILE_ALREADY_EXISTS：create_only=true，原文件未修改")
@@ -1017,6 +1029,7 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if not full_file_name:
         raise ValueError("full_file_name 不能为空")
     path = Path(full_file_name).expanduser().resolve()
+    guard_path(path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"{path} 不存在或不是文件")
     size = path.stat().st_size
@@ -1156,6 +1169,7 @@ _SEARCH_DEFAULT_MAX_SCAN_SECONDS = 10.0
 _SKIP_DIR_NAMES = {
     ".git", ".idea", ".vscode", "__pycache__", "node_modules",
     ".venv", "venv", "env", "dist", "build",
+    "history_files", "tmp", "vendor",
 }
 
 READ_FILE_TOOL_DEFINITION = {
@@ -1189,7 +1203,10 @@ SEARCH_FILES_TOOL_DEFINITION = {
             "跨文件搜索文件内容（只搜索内容，不枚举文件名）；file_pattern 只筛选待搜索文件。"
             "需要按文件名查找或列出文件时，若已启用 run_command，请使用相应终端命令；否则说明当前工具无法枚举文件名。"
             "返回带行号上下文的匹配区块；"
-            "自动跳过二进制文件与 node_modules/.git 等目录，超限时返回部分结果并提示。"
+            "默认按普通文本匹配；例如 A|B 必须传 is_regex=true 才表示任选其一。"
+            "自动跳过二进制、隐藏目录、依赖/构建目录及 history_files/tmp/vendor；"
+            "可直接指定这些目录为 dir_path，或用 exclude_dirs 覆盖默认排除项。"
+            "超限时返回部分结果；scan_complete=false 或 scan_truncated=true 时不能判定目标不存在。"
         ),
         "parameters": {
             "type": "object",
@@ -1202,6 +1219,10 @@ SEARCH_FILES_TOOL_DEFINITION = {
                 "context_lines": {"type": "integer", "description": "每处匹配附带上下文行数（0-5）", "default": 0},
                 "max_results": {"type": "integer", "description": "最多返回的匹配区块数（1-200）", "default": 50},
                 "max_depth": {"type": "integer", "description": "递归深度，0=仅当前目录", "default": 6},
+                "max_scanned_files": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 3000, "description": "候选文件扫描上限；未扫完会标记部分结果"},
+                "max_scan_seconds": {"type": "number", "minimum": 0.1, "maximum": 120, "default": 10, "description": "扫描时间上限（秒）"},
+                "max_file_mb": {"type": "number", "default": 2, "description": "单文件读取上限 MB；0 使用硬上限 16MB；超限文件计为未读取"},
+                "exclude_dirs": {"type": "array", "items": {"type": "string"}, "description": "覆盖默认排除目录名，支持通配符；空数组表示包含隐藏/依赖目录（不跟随目录符号链接）"},
             },
             "required": ["pattern"],
         },
@@ -1220,17 +1241,29 @@ def _resolve_dir_path(dir_path: Any) -> Path:
     return candidate.resolve()
 
 
-def _walk_entries(root: Path, max_depth: int):
+def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, onpermission=None):
     """遍历目录树，yield (路径, "file"|"dir")。
     跳过隐藏目录与 _SKIP_DIR_NAMES 中的目录；max_depth 为相对 root 的深度上限（0=仅当前目录）。"""
     root_depth = len(root.parts)
-    for current, dir_names, file_names in os.walk(root):
+    exclusions = list(_SKIP_DIR_NAMES) + [".*"] if exclude_dirs is None else exclude_dirs
+    for current, dir_names, file_names in os.walk(root, onerror=onerror):
         current_path = Path(current)
+        if not guard_path(current_path, search=True):
+            if onpermission:
+                onpermission(current_path)
+            dir_names[:] = []
+            continue
         depth = len(current_path.parts) - root_depth
-        keep_dirs = sorted(
+        candidates = sorted(
             name for name in dir_names
-            if name not in _SKIP_DIR_NAMES and not name.startswith(".")
+            if not any(fnmatch.fnmatch(name.lower(), rule.lower()) for rule in exclusions)
         )
+        keep_dirs = []
+        for name in candidates:
+            if guard_path(current_path / name, search=True):
+                keep_dirs.append(name)
+            elif onpermission:
+                onpermission(current_path / name)
         for name in keep_dirs:
             yield current_path / name, "dir"
         # 深度用尽时剪枝，不再下钻（目录本身已在上面列出）
@@ -1257,6 +1290,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if not full_file_name:
         raise ValueError("full_file_name 不能为空")
     path = Path(full_file_name).expanduser()
+    guard_path(path)
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在")
     if not path.is_file():
@@ -1385,19 +1419,21 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
     """把（相邻+上下文合并后的）命中区间格式化为 "路径:行号" 区块。"""
     ranges = []
     for idx in hit_indexes:
-        if ranges and idx <= ranges[-1][1] + context + 1:
+        if ranges and idx <= ranges[-1][1] + 2 * context + 1:
             ranges[-1][1] = idx
         else:
             ranges.append([idx, idx])
     blocks = []
+    hits = set(hit_indexes)
     for start, end in ranges:
         low = max(0, start - context)
         high = min(len(lines) - 1, end + context)
         header = f"{_display_path(path)}:{start + 1}" + (f"-{end + 1}" if end != start else "")
         body = []
         for no in range(low, high + 1):
-            marker = ">" if start <= no <= end else " "
-            body.append(f"{marker}{no + 1}| {lines[no][:300]}")
+            marker = ">" if no in hits else " "
+            line = lines[no][:300] + ("…[长行请用 read_file 续读]" if len(lines[no]) > 300 else "")
+            body.append(f"{marker}{no + 1}| {line}")
         blocks.append(header + "\n" + "\n".join(body))
     return blocks
 
@@ -1406,10 +1442,11 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 search_files 实现：语义对齐 MCP 同名工具，返回纯文本结果。"""
     args = tool_args or {}
     return_max_chars = max(512, min(60000, int(args.get("_max_chars") or 60000)))
-    pattern = (str(args.get("pattern") or "")).strip()
+    pattern = str(args.get("pattern") or "")
     if not pattern:
         raise ValueError("pattern 不能为空")
     root = _resolve_dir_path(args.get("dir_path") or ".")
+    guard_path(root)
     flags = re.IGNORECASE if _optional_bool(args, "ignore_case") else 0
     # 键名兼容：schema 定义为 is_regex；旧实现误读 isregex 导致该参数被静默忽略
     is_regex_raw = args.get("is_regex")
@@ -1440,6 +1477,8 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     files_scanned = 0
     files_matched = 0
     skipped_large = 0
+    skipped_unreadable = 0
+    total_blocks = 0
     scan_truncated = False
     started_at = time.monotonic()
     try:
@@ -1454,8 +1493,20 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         max_depth = int(raw_depth) if raw_depth is not None else _SEARCH_DEFAULT_MAX_DEPTH
     except (TypeError, ValueError):
         max_depth = _SEARCH_DEFAULT_MAX_DEPTH
-    for path, kind in _walk_entries(root, max(0, max_depth)):
+    exclude_dirs = args.get("exclude_dirs")
+    if exclude_dirs is not None and (not isinstance(exclude_dirs, list) or
+            any(not isinstance(rule, str) or not rule for rule in exclude_dirs)):
+        raise ValueError("exclude_dirs 必须为目录名字符串数组")
+    walk_errors = []
+    permission_skips = []
+    for path, kind in _walk_entries(root, max(0, max_depth), exclude_dirs, walk_errors.append, permission_skips.append):
+        if time.monotonic() - started_at >= max_scan_seconds:
+            scan_truncated = True
+            break
         if kind != "file":
+            continue
+        if not guard_path(path, search=True):
+            permission_skips.append(path)
             continue
         if name_filter and not fnmatch.fnmatch(path.name, name_filter):
             continue
@@ -1473,6 +1524,7 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
             skipped_large += 1
             continue
         except OSError:
+            skipped_unreadable += 1
             continue
         if _is_probably_binary(data):
             continue
@@ -1484,30 +1536,62 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
             continue
         files_matched += 1
         total_matches += len(hit_indexes)
-        if len(blocks) < limit:
-            room = limit - len(blocks)
-            block_group = _format_match_block(path, lines, hit_indexes, context)
-            blocks.extend(block_group[:room])
+        block_group = _format_match_block(path, lines, hit_indexes, context)
+        total_blocks += len(block_group)
+        room = max(0, limit - len(blocks))
+        blocks.extend(block_group[:room])
     search_label = "正则" if isregex else "文本"
-    header = (f"[search_files] {search_label}: {pattern} | 目录: {_display_path(root)}"
-              f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
-    if skipped_large:
-        header += (
-            f" | 跳过 {skipped_large} 个超过 {effective_max_bytes / (1024 * 1024):g}MB 的文件"
-            "（可用 max_file_mb 调整，最高 16MB）"
-        )
+    skipped_unreadable += len(walk_errors)
+    skipped_permission = len(permission_skips)
+    scan_complete = not (scan_truncated or skipped_large or skipped_unreadable or skipped_permission)
+    warnings = []
     if scan_truncated:
-        header += " | 扫描达到文件数或时间上限，命中统计仅覆盖已扫描部分；请缩小目录或调整扫描上限"
-    if not blocks:
-        message = header + "\n（无匹配结果）"
-    else:
-        parts = [header] + blocks
-        if len(blocks) >= limit:
-            parts.append(f"[已达到 max_results={limit} 上限；可缩小目录/加 file_pattern 过滤或提高 max_results]")
-        message = "\n".join(parts)
-    if len(message) > return_max_chars:
-        message = message[:return_max_chars] + "\n[结果已按当前模型窗口截断；请缩小目录、文件范围或 max_results 后重试]"
-        scan_truncated = True
+        warnings.append("[扫描未完成：达到文件数或时间上限；统计仅覆盖已扫描部分，不能判定目标不存在。]")
+    if skipped_large:
+        warnings.append(f"[跳过 {skipped_large} 个超过 {effective_max_bytes / (1024 * 1024):g}MB 的文件（未读取）；可用 max_file_mb 调整，最高 16MB。]")
+    if skipped_unreadable:
+        warnings.append(f"[未读取 {skipped_unreadable} 个文件或目录（权限/读取失败）；结果不完整。]")
+    if skipped_permission:
+        warnings.append(f"[跳过 {skipped_permission} 个未经授权的路径；需要另行指定实际目标并确认后访问。]")
+    if not isregex and not total_matches and any(token in pattern for token in ("|", ".*", "\\d", "\\s")):
+        warnings.append("[当前按普通文本匹配；若 pattern 使用正则语法，请显式传 is_regex=true。]")
+    header = (f"[search_files] {search_label}: {pattern[:160]} | 目录: {_display_path(root)[:160]}"
+              f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
+    prefix = "\n".join(warnings + [header])
+    if len(prefix) > return_max_chars - 180:
+        header = f"[search_files] 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处；路径和表达式见返回字段。"
+        prefix = "\n".join(warnings + [header])
+    # Reserve the summary and continuation hint; trim on line boundaries so
+    # displayed hit counts remain truthful, even for one enormous match block.
+    room = max(0, return_max_chars - len(prefix) - 180)
+    shown = []
+    used = 0
+    output_truncated = False
+    for block in blocks:
+        if used + len(block) + 1 <= room:
+            shown.append(block)
+            used += len(block) + 1
+            continue
+        output_truncated = True
+        if not shown:
+            lines = []
+            for line in block.splitlines():
+                if used + len(line) + 1 > room:
+                    break
+                lines.append(line)
+                used += len(line) + 1
+            if len(lines) > 1:
+                shown.append("\n".join(lines))
+        break
+    displayed_matches = sum(line.startswith(">") for block in shown for line in block.splitlines())
+    result_limited = total_blocks > limit
+    summary = f"[展示 {displayed_matches}/{total_matches} 处命中，{len(shown)}/{total_blocks} 个区块；统计范围为已扫描文件。]"
+    parts = [prefix, summary] + shown
+    if result_limited or output_truncated:
+        parts.append(f"[结果展示已截断（max_results={limit} 或当前模型字符预算）；请缩小 dir_path/file_pattern，或按路径/行号用 read_file 读取。]")
+    elif not total_matches:
+        parts.append("（无匹配结果）" if scan_complete else "（已扫描部分无匹配；尚有未读取内容，不能判定不存在）")
+    message = "\n".join(parts)
     return {
         "success": True,
         "message": message,
@@ -1517,7 +1601,15 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         "files_checked": files_checked,
         "files_matched": files_matched,
         "total_matches": total_matches,
-        "truncated": len(blocks) >= limit or scan_truncated,
+        "displayed_matches": displayed_matches,
+        "displayed_blocks": len(shown),
+        "total_blocks": total_blocks,
+        "skipped_large": skipped_large,
+        "skipped_unreadable": skipped_unreadable,
+        "skipped_permission": skipped_permission,
+        "scan_complete": scan_complete,
+        "output_truncated": output_truncated or result_limited,
+        "truncated": not scan_complete or output_truncated or result_limited,
         "scan_truncated": scan_truncated,
     }
 
@@ -1613,6 +1705,7 @@ def _extract_document_text(path: Path, filename: str, data: bytes) -> str:
 def _load_local_document(filename: str, *, parse_text: bool = True) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
     """读取显式指定的本地文档并复用上传链路解析器。"""
     path = Path(filename).expanduser()
+    guard_path(path)
     if not path.is_absolute():
         path = Path.cwd() / path
     try:
@@ -2408,8 +2501,7 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
     - 返回 {ok, reference(media://), source_type, kind, mime, size, stored_name}
       或 {ok=False, error}。
 
-    用户授权确认逻辑预留：接入时在本函数入口（下载/读盘前）挂确认钩子，
-    当前按"工具由用户提供、无安全边界"策略直接放行。
+    由任务权限上下文检查实际读盘/下载目标，确认前不读取内容。
     """
     source_text = (source or "").strip()
     try:
@@ -2418,7 +2510,7 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
                 source_text,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
             )
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with permission_urlopen(request, timeout=30) as response:
                 status = getattr(response, "status", 200)
                 if not (200 <= int(status) < 300):
                     return {"ok": False, "error": f"网络媒体下载失败: {source_text}"}
@@ -2448,6 +2540,7 @@ def register_media_source(session_id: str, source: str, source_type: str) -> dic
         else:
             # 本地路径：相对路径按会话工作目录解析（worker 已 os.chdir）
             local_path = Path(source_text)
+            guard_path(local_path)
             if not local_path.is_file():
                 return {"ok": False, "error": f"本地媒体文件不存在: {source_text}"}
             with local_path.open("rb") as handle:
@@ -2493,7 +2586,7 @@ def _fetch_url_media_bytes(
     if max_bytes is None:
         max_bytes = _network_media_fetch_limit_bytes(source)
     req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with permission_urlopen(req, timeout=60) as resp:
         data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError(f"网络媒体超过下载上限（{max_bytes // (1024 * 1024)}MB）")
@@ -2517,6 +2610,7 @@ def load_any_media_model_part(
     quality: int | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    api_type: str | None = None,
 ) -> dict[str, Any] | None:
     """本地/网络/会话统一媒体加载入口（read_media 数据注入使用）。
 
@@ -2541,6 +2635,7 @@ def load_any_media_model_part(
         info = file_memory.load_session_media_model_part(
             session_id, source, quality=quality,
             start_time=start_time, end_time=end_time,
+            **({"api_type": "messages"} if api_type == "messages" else {}),
         )
         if info is None:
             return None
@@ -2550,6 +2645,10 @@ def load_any_media_model_part(
         name = Path(urlsplit(source).path).name or "remote_media"
         kind = file_memory.media_kind(name) or "image"
         mime = file_memory.media_mime_type(name) if file_memory.media_kind(name) else "image/jpeg"
+        if api_type == "messages" and kind != "image":
+            return {"error": "Messages API 不支持原生音频/视频输入", "source_type": "network", "source": source}
+        if api_type == "messages" and (start_time is not None or end_time is not None):
+            return {"error": "Messages 图片读取不支持视频时间区间", "source_type": "network", "source": source}
         part: dict[str, Any]
         if kind == "image":
             part = {"type": "image_url", "image_url": {"url": source}}
@@ -2565,15 +2664,18 @@ def load_any_media_model_part(
         # 转换失败（下载失败/ffmpeg 缺失/损坏文件）回退 URL 直传原行为
         suffix = Path(name).suffix.lower()
         if kind == "image" and (
-            suffix == ".gif" or suffix in file_memory._VISION_UNSAFE_IMAGE_EXTENSIONS
+            (suffix == ".gif" and api_type != "messages") or suffix in file_memory._VISION_UNSAFE_IMAGE_EXTENSIONS
         ):
             try:
-                data = _fetch_url_media_bytes(source, max_bytes=_network_media_fetch_limit_bytes(name))
+                data = _fetch_url_media_bytes(source, max_bytes=file_memory.MEDIA_SEND_IMAGE_LIMIT_BYTES if api_type == "messages" else _network_media_fetch_limit_bytes(name))
                 sniffed = file_memory._sniff_media_filename(data)
                 probe_name = (sniffed or name) if (suffix == ".gif" or not sniffed) else name
                 tmp_path = file_memory._transcode_cache_dir("network_media") / f"dl_{uuid.uuid4().hex[:8]}_{Path(probe_name).name}"
                 tmp_path.write_bytes(data)
                 try:
+                    if api_type == "messages":
+                        info = file_memory._messages_image_model_part(tmp_path, quality)
+                        return {**info, "source_type": "network", "source": source}
                     converted_result = file_memory._load_converted_media_base64(
                         file_memory._transcode_cache_dir("network_media"), tmp_path
                     )
@@ -2602,7 +2704,9 @@ def load_any_media_model_part(
                         "source_type": "network",
                         "source": source,
                     }
-            except Exception:
+            except Exception as exc:
+                if api_type == "messages":
+                    return {"error": "图片格式转换失败：" + str(exc), "source_type": "network", "source": source}
                 pass  # 转换链路任何失败都回退 URL 直传
         return {
             "part": part,
@@ -2615,13 +2719,17 @@ def load_any_media_model_part(
             "filename": name,
             "source_type": "network",
             "source": source,
+            **({"converted": {"converted_kind": "image", "first_frame_only": True}}
+               if api_type == "messages" and suffix == ".gif" else {}),
         }
     # 本地路径：直接读取真实位置（相对路径基于会话工作目录，worker 已 os.chdir）
     local_path = Path(source)
+    guard_path(local_path)
     if not local_path.is_file():
         return {"error": f"未找到，可能已删除: {source}", "source_type": "local", "source": source}
     info = file_memory._media_model_part_from_path(
-        local_path, quality, start_time=start_time, end_time=end_time
+        local_path, quality, start_time=start_time, end_time=end_time,
+        **({"api_type": "messages"} if api_type == "messages" else {}),
     )
     if info is None:
         return {"error": f"读取失败: {source}", "source_type": "local", "source": source}
@@ -2686,6 +2794,7 @@ def execute_read_media(
     load_media=None,
     vision_enabled: bool | None = None,
     media_limits: dict | None = None,
+    api_type: str | None = None,
 ) -> dict[str, Any]:
     """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
 
@@ -2726,6 +2835,9 @@ def execute_read_media(
     available = {str(item) for item in (available_references or [])}
     injected = {str(item) for item in (already_injected or set())}
     loader = load_media or load_any_media_model_part
+    if load_media is None and api_type == "messages":
+        from functools import partial
+        loader = partial(loader, api_type="messages")
     allowed, skipped = [], []
     for reference in references:
         # 本地/网络来源不做白名单拦截；media:// 引用在传入了边界集合时按旧语义过滤

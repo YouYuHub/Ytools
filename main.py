@@ -36,6 +36,8 @@ from routers.export_router import api_export_router
 from routers.file_history_router import api_file_history_router
 from routers.user_profile_router import api_user_profile_router
 from routers.terminal_router import api_terminal_router
+from routers.tool_approval_router import api_permission_router
+from fastapi.staticfiles import StaticFiles
 
 
 # FastAPI 实例化
@@ -103,6 +105,34 @@ app.include_router(api_export_router, tags=["Export"])
 app.include_router(api_file_history_router, tags=["FileDiffHistory"])
 app.include_router(api_user_profile_router, tags=["UserProfile"])
 app.include_router(api_terminal_router, tags=["Terminal"])
+app.include_router(api_permission_router, tags=["Permissions"])
+app.mount("/ui", StaticFiles(directory=str(PROJECT_ROOT / "H5"), html=True), name="ui")
+
+
+@app.on_event("startup")
+async def permission_ui_startup():
+    from memory.permission_store import prepare_database
+    await asyncio.to_thread(prepare_database)
+    print(f"聊天页面：http://127.0.0.1:{DEFAULT_SERVICE_PORT}/ui/", flush=True)
+
+
+@app.on_event("shutdown")
+async def permission_ui_shutdown():
+    from factory.session_worker import _WORKER_PROXIES
+    from memory.permission_store import suspend_session
+    for session, proxy in list(_WORKER_PROXIES.items()):
+        suspend_session(session)
+        await asyncio.to_thread(proxy.shutdown)
+    from factory.chat_factory import _SESSION_STREAMS
+    for session, stream in list(_SESSION_STREAMS.items()):
+        if stream.task is not None and not stream.task.done():
+            stream.permission_suspend = True
+            suspend_session(session)
+            stream.task.cancel()
+            try:
+                await stream.task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------
@@ -206,6 +236,7 @@ if __name__ == '__main__':
     # _write_service_state_snapshot()
     uvicorn.run(app='main:app',
         host=DEFAULT_SERVICE_HOST, port=DEFAULT_SERVICE_PORT,
+        timeout_graceful_shutdown=5,
         # reload=True, reload_dirs=[str(PROJECT_ROOT)],
         # reload_excludes=[
         #     # "mcp_server/*",     # 排除 generated 子目录
