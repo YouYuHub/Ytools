@@ -113,3 +113,55 @@ test("legacy content without a mapped block falls back to the round's question",
   assert.equal(await h.jump({ session_id: "s", round_no: 3, role: "tool" }, "deleted"), false);
   assert.equal(h.notices.length, 1);
 });
+
+test("subagent aggregation preserves physical event positions for repeated tool results", () => {
+  const parsed = parser.parseHistory(JSON.stringify({event:'chat_round',events:[
+    {role:'user',content:'Q'},
+    {event:'sub_agent',phase:'start',agent_id:'a',task:'task'},
+    {event:'sub_agent',phase:'model_call',agent_id:'a',seq:1,content:'text'},
+    {event:'sub_agent',phase:'tool_result',agent_id:'a',seq:1,tool_call_id:'x',result:'same'},
+    {event:'sub_agent',phase:'tool_result',agent_id:'a',seq:1,tool_call_id:'y',result:'same'},
+    {event:'sub_agent',phase:'done',agent_id:'a',final_reply:'done'},
+  ]}));
+  const agent = parsed.records.find(r=>r.kind==='agentBlock');
+  assert.equal(agent.source_event_index,1);
+  assert.deepEqual(agent.entries.map(e=>e.source_event_index),[2,3,4]);
+  assert.equal(agent.done_event_index,5);
+});
+
+test("subagent jump selects the exact nested result and opens its parent containers", async () => {
+  const agent=node('agent-block',1,1,'same'); agent.dataset.agentId='a';
+  const first=node('tool-block',1,2,'same'), second=node('tool-block',1,3,'same');
+  first.parentElement=agent;second.parentElement=agent;
+  const get = second.getAttribute;
+  second.getAttribute=k=>k==='data-agent-result-event'?'8':get(k);
+  const output=node('tool-io',1,8,'same');
+  second.querySelectorAll=()=>[node('tool-io',1,7,'{}'),output];
+  agent.querySelectorAll=()=>[first,second];
+  const h=harness([agent]);
+  await h.jump({session_id:'s',round_no:1,event_index:8,role:'sub_agent',field:'result',agent_id:'a'},'same');
+  assert.equal(h.revealed[0].target,output);
+  assert.equal(second.classes.has('open'),true);assert.equal(agent.classes.has('open'),true);
+  assert.equal(first.classes.has('open'),false);
+});
+
+function textAnchor(parts, snippet, needle) {
+  const nodes=parts.map(nodeValue=>({nodeValue,parentElement:{}}));
+  let cursor=0;
+  const context={NodeFilter:{SHOW_TEXT:4},quoteMatchText:s=>String(s||'').replace(/\s+/g,' ').trim(),
+    document:{createTreeWalker:()=>({nextNode:()=>nodes[cursor++]||null}),
+      createRange:()=>({setStart(node,offset){this.start=[nodes.indexOf(node),offset];},setEnd(node,offset){this.end=[nodes.indexOf(node),offset];}})}};
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('  function normalizedTextOffsets('),source.indexOf('  function revealQuoteSource(')),context);
+  return context.searchTextAnchor({},needle,snippet).range;
+}
+
+test("selected excerpt resolves the later occurrence across inline Markdown text nodes", () => {
+  const range=textAnchor(['前面也有心跳。','指定的心','跳出现在这里'],{text:'指定的心跳出现在这里',start:3,end:5},'心跳');
+  assert.deepEqual(range.start,[1,3]);assert.deepEqual(range.end,[2,1]);
+});
+
+test("snippet character offsets disambiguate repeated terms and Unicode emoji", () => {
+  const range=textAnchor(['🙂心跳，与后面的心跳不同'],{text:'🙂心跳，与后面的心跳不同',start:8,end:10},'心跳');
+  assert.deepEqual(range.start,[0,9]);assert.deepEqual(range.end,[0,11]);
+});

@@ -1318,6 +1318,13 @@ html[data-theme="dark"] {
   &:focus-within {
     z-index: 20;
   }
+
+  // 翻转态（JS 在下方空间不足时加 is-flipped）：浮层向上展开，
+  // hover 桥接区同步移到 tile 上方，保证鼠标移入浮层时不断 hover。
+  &.is-flipped::before {
+    top: auto;
+    bottom: 100%;
+  }
 }
 
 .msg-quote-card {
@@ -1372,7 +1379,10 @@ html[data-theme="dark"] {
   position: absolute;
   z-index: 30;
   top: calc(100% + 7px);
-  left: 0;
+  // 用户气泡右对齐：短消息时 tile 紧贴视口右边缘，浮层必须右对齐向左展开，
+  // 否则 left:0 向右展开 360px 会超出屏幕（JS 兜底见 quotes.js clampQuotePopover）。
+  right: 0;
+  left: auto;
   width: min(360px, calc(100vw - 40px));
   max-height: min(300px, 45vh);
   padding: 10px 12px;
@@ -1452,6 +1462,22 @@ html[data-theme="dark"] {
   display: block;
 }
 
+// 翻转态：消息靠近聊天区底部、下方放不下浮层时向上展开
+// （.bottom 输入区 absolute 盖在底部，z-index 高于浮层，只能避让）。
+.msg-quote-tile.is-flipped .msg-quote-popover {
+  top: auto;
+  bottom: calc(100% + 7px);
+}
+
+// 引用浮层从气泡顶部向下展开，会超出 .msg 盒子；.chat-inner > * 的
+// content-visibility:auto 自带 paint containment（等同 overflow:clip），
+// 会把超出部分裁掉。hover/聚焦整条用户消息时临时关闭，保证浮层完整显示
+// （浮层显示条件 tile:hover/focus 天然包含在内，平时仍保留性能优化）。
+.msg.msg-user:hover,
+.msg.msg-user:focus-within {
+  content-visibility: visible;
+}
+
 @container main-area (max-width: 420px) {
   .msg-user-attachment-blocks {
     --attachment-block-min-size: 18px;
@@ -1472,8 +1498,7 @@ html[data-theme="dark"] {
   }
 }
 
-.msg-user-text.quote-source-highlight,
-.msg-assistant-body.quote-source-highlight {
+.chat-inner .quote-source-highlight {
   border-radius: 8px;
   outline: 2px solid transparent;
   outline-offset: 4px;
@@ -1481,13 +1506,14 @@ html[data-theme="dark"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .msg-user-text.quote-source-highlight,
-  .msg-assistant-body.quote-source-highlight {
+  .chat-inner .quote-source-highlight {
     animation: none;
     background-color: var(--bg-active);
     outline-color: var(--accent);
   }
 }
+
+::highlight(history-search-hit) { background: #f5d36b; color: #16120a; }
 
 // 选区浮钮「引用到提问」：body 级 fixed 定位（视口坐标钳制），
 // 点击后把选区快照加入当前会话草稿；滚动时跟随选区重定位，Esc/点击别处时隐藏

@@ -14,7 +14,7 @@ function node() {
 function setup(invalid, sessionId = 's', options = {}) {
   const roles = ['chat_model', 'compaction_model', 'title_model', 'sub_agent_model'];
   const config = role => ({ models: [{ provider_name: 'P', model_name: 'Deepseek', max_output_tokens: 8192, api_type: options.protocol || 'chat-completions',
-      parameter_capabilities: options.parameterCapabilities || {} },
+      parameter_capabilities: options.parameterCapabilities || {}, responses_mode: options.responsesMode || 'stateful' },
       { provider_name: 'P', model_name: 'Other', max_output_tokens: 8192 }],
     role_info: { selection: { provider: 'P', model: 'Deepseek', api_type: options.protocol || 'chat_completions', parameter: options.parameters || {} }, selection_invalid: invalid && role === 'chat_model',
       is_overridden: Boolean(options.overridden),
@@ -24,23 +24,26 @@ function setup(invalid, sessionId = 's', options = {}) {
     ROLE_DEFAULT_PARAMS: { chat_model: { temperature: 0.7, top_p: 1, presence_penalty: 0, reasoning_effort: 'low', enable_thinking: true } },
     API_TYPE_DEFAULT_PARAMS: {}, toast() {}, renderChatModelLabel() {}, refreshContextTokenStats() {},
     el: () => node(), setChatModelConfig(data) { state.modelConfigs.chat_model = data; } };
-  for (const name of ['enhancePanel', 'modelTabs', 'modelPicker', 'modelPickerLabel', 'modelList', 'reasoningEffort',
+  for (const name of ['enhancePanel', 'enhanceBody', 'enhanceScope', 'enhanceClose', 'modelTabs', 'modelPicker', 'modelPickerLabel', 'modelList', 'reasoningEffort',
     'enableThinking', 'chatParametersGroup', 'messagesParametersGroup', 'temperature', 'temperatureValue', 'maxTokens', 'maxTokensValue', 'topP', 'topPValue',
     'presencePenalty', 'presencePenaltyValue', 'messagesTemperatureRow', 'messagesTemperature', 'messagesTemperatureValue',
     'messagesTopPRow', 'messagesTopP', 'messagesTopPValue', 'messagesThinkingMode', 'messagesThinkingBudgetRow',
     'messagesThinkingBudget', 'messagesThinkingBudgetValue', 'messagesThinkingHint', 'messagesEffort', 'messagesStopSequences', 'messagesExtraBody',
-    'responsesParametersGroup', 'responsesEffort', 'responsesSummary', 'responsesVerbosity', 'responsesSampling', 'responsesTemperatureRow', 'responsesTemperature', 'responsesTemperatureValue', 'responsesTopPRow', 'responsesTopP', 'responsesTopPValue', 'responsesInstructions', 'responsesExtraBody', 'responsesStateHint', 'responsesRebuildSource', 'responsesRebuild',
+    'responsesParametersGroup', 'responsesMode', 'responsesModeHint', 'responsesStatefulControls', 'responsesEffort', 'responsesSummary', 'responsesVerbosity', 'responsesSampling', 'responsesTemperatureRow', 'responsesTemperature', 'responsesTemperatureValue', 'responsesTopPRow', 'responsesTopP', 'responsesTopPValue', 'responsesInstructions', 'responsesExtraBody', 'responsesStateHint', 'responsesRebuildSource', 'responsesRebuild',
     'enhanceCancel', 'enhanceConfirm', 'enhanceReset', 'enhanceClearOverride',
     'enhanceHint', 'customHeadersRows', 'addHeaderRow']) app[name] = node();
   roles.forEach(role => { state.modelConfigs[role] = config(role); });
-  const calls = [];
+  const calls = [], modalEvents = [];
+  app.showModelPanelModal = () => { modalEvents.push('show'); app.enhancePanel.classList.remove('hidden'); };
+  app.hideModelPanelModal = () => modalEvents.push('hide');
   const context = { window: { App: app }, API: {
     async getModels(role, sid) { return options.getModels ? options.getModels(role, sid, config(role)) : config(role); },
     async selectModel(...args) { calls.push(args); invalid = false; },
-    async getResponsesState() { return { responses_state: options.responsesState || {} }; },
+    async getResponsesState() { return options.getResponsesState ? options.getResponsesState() : { responses_state: options.responsesState || {} }; },
+    async rebuildResponsesContext() { if (options.rebuildResponsesContext) return options.rebuildResponsesContext(); },
   } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../js/app/model_panel.js'), 'utf8'), context);
-  return { app, state, calls };
+  return { app, state, calls, modalEvents };
 }
 
 test('会话失效模型已显示为 Deepseek，确认仍保存当前选择', async () => {
@@ -338,4 +341,111 @@ test('Responses 跨角色草稿和恢复默认保留正确原生参数', async (
   assert.equal(chat.reasoning, undefined);
   const title = calls.find(call => call[2] === 'title_model')[3];
   assert.equal(title.reasoning.summary, 'auto');
+});
+
+test('Responses 无状态选项保存到当前角色，并禁用手动同步', async () => {
+  const { app, calls } = setup(false, 's', { protocol: 'responses' });
+  app.openModelPanel(); await tick();
+  app.responsesMode.value = 'stateless'; app.responsesMode.handlers.change();
+  assert.equal(app.responsesRebuild.disabled, true);
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), true);
+  assert.match(app.responsesModeHint.textContent, /当前选择：无状态兼容/);
+  assert.match(app.responsesStateHint.textContent, /每次发送当前本地上下文/);
+  tab(app, 'title_model');
+  app.responsesMode.value = 'stateful'; app.responsesMode.handlers.change();
+  tab(app, 'chat_model');
+  assert.equal(app.responsesMode.value, 'stateless');
+  await app.enhanceConfirm.handlers.click();
+  assert.equal(calls.find(call => call[2] === 'chat_model')[3].responses_mode, 'stateless');
+  assert.equal(calls.find(call => call[2] === 'title_model')[3].responses_mode, 'stateful');
+});
+
+test('Responses 模型默认无状态可被角色覆盖，恢复默认重新继承模型', async () => {
+  const { app, calls } = setup(false, 's', { protocol: 'responses', responsesMode: 'stateless' });
+  app.openModelPanel(); await tick();
+  assert.equal(app.responsesMode.value, '');
+  assert.equal(app.responsesRebuild.disabled, true);
+  app.responsesMode.value = 'stateful'; app.responsesMode.handlers.change();
+  await tick(); assert.equal(app.responsesRebuild.disabled, false);
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), false);
+  app.enhanceReset.handlers.click();
+  assert.equal(app.responsesMode.value, '');
+  assert.equal(app.responsesRebuild.disabled, true);
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), true);
+  assert.match(app.responsesModeHint.textContent, /跟随模型配置，当前为：无状态兼容/);
+  await app.enhanceConfirm.handlers.click();
+  assert.equal(calls[0][3].responses_mode, undefined);
+});
+
+test('全局面板切回有状态后清除无状态说明', async () => {
+  const { app } = setup(false, null, { protocol: 'responses' });
+  app.openModelPanel(); await tick();
+  app.responsesMode.value = 'stateless'; app.responsesMode.handlers.change();
+  assert.match(app.responsesStateHint.textContent, /无状态兼容/);
+  app.responsesMode.value = 'stateful'; app.responsesMode.handlers.change();
+  assert.match(app.responsesStateHint.textContent, /有状态续聊/);
+  assert.doesNotMatch(app.responsesStateHint.textContent, /无状态兼容/);
+});
+
+test('切换无状态后，迟到的远端状态不会覆盖当前说明', async () => {
+  const pending = [];
+  const { app } = setup(false, 's', { protocol: 'responses',
+    getResponsesState: () => new Promise(resolve => pending.push(resolve)) });
+  app.openModelPanel(); await tick();
+  assert.ok(pending.length > 0);
+  app.responsesMode.value = 'stateless'; app.responsesMode.handlers.change();
+  const hint = app.responsesStateHint.textContent;
+  pending.forEach(resolve => resolve({ responses_state: { status: 'recovery_required' } }));
+  await tick();
+  assert.equal(app.responsesStateHint.textContent, hint);
+  assert.equal(app.responsesRebuild.disabled, true);
+});
+
+test('有状态主会话显示同步控件，辅助角色隐藏，返回主会话恢复', async () => {
+  const { app } = setup(false, 's', { protocol: 'responses', responsesState: { status: 'ready', responses_mode: 'stateful' } });
+  app.openModelPanel(); await tick();
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), false);
+  assert.match(app.responsesModeHint.textContent, /跟随模型配置，当前为：有状态/);
+  assert.match(app.responsesStateHint.textContent, /下次仍尝试响应 ID 续接/);
+  assert.doesNotMatch(app.responsesStateHint.textContent, /增量续聊正常/);
+  tab(app, 'sub_agent_model');
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), true);
+  tab(app, 'chat_model'); await tick();
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), false);
+});
+
+test('无状态控件隐藏且点击处理器不会调用同步接口或查询远端状态', async () => {
+  let rebuilds = 0, queries = 0;
+  const { app } = setup(false, 's', { protocol: 'responses', responsesMode: 'stateless',
+    getResponsesState: () => { ++queries; return { responses_state: {} }; },
+    rebuildResponsesContext: () => { ++rebuilds; } });
+  app.openModelPanel(); await tick();
+  await app.responsesRebuild.handlers.click();
+  assert.equal(queries, 0);
+  assert.equal(rebuilds, 0);
+  assert.equal(app.responsesStatefulControls.classList.contains('hidden'), true);
+});
+
+test('上次无状态、当前选择有状态时，不把旧调用显示成有状态续接成功', async () => {
+  const { app } = setup(false, 's', { protocol: 'responses', responsesState: { status: 'ready', responses_mode: 'stateless' } });
+  app.openModelPanel(); await tick();
+  assert.match(app.responsesModeHint.textContent, /当前为：有状态/);
+  assert.match(app.responsesStateHint.textContent, /上次调用使用无状态模式/);
+});
+
+test('关闭/取消经统一模态框入口，保存期间不关闭；主体滚动与标题范围独立', async () => {
+  const { app, modalEvents } = setup(false, 's', { overridden: true });
+  app.openModelPanel(); await tick();
+  assert.equal(modalEvents[0], 'show');
+  assert.match(app.enhanceScope.textContent, /当前会话 · 独立配置/);
+  app.enhanceBody.scrollTop = 300;
+  tab(app, 'title_model');
+  assert.equal(app.enhanceBody.scrollTop, 0);
+  app.enhancePanel.inert = true;
+  app.enhanceCancel.handlers.click();
+  assert.equal(modalEvents.includes('hide'), false);
+  app.enhancePanel.inert = false;
+  app.enhanceClose.handlers.click();
+  assert.equal(modalEvents.at(-1), 'hide');
+  assert.equal(app.enhancePanel.classList.contains('hidden'), true);
 });

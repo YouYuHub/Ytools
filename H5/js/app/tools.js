@@ -12,7 +12,79 @@
     toolCollapseAll, toolRefresh, toolTip, hideToolTip,
     toolFollowGlobal
   } = App;
+  const confirmButton = $("#toolConfirm");
+  const cancelButton = $("#toolCancel");
+  const closeButton = $("#toolModalClose");
+  const scopeHint = $("#toolSelectionScope");
+  const content = $("#toolConfigContent");
+  const toolbar = toolModal.querySelector(".tool-modal-toolbar");
+  const collapsedServers = new Set();
   let pendingSelectionInputs = null;
+  let openVersion = 0;
+  let modalOpened = false;
+  let returnFocus = null;
+  let background = [];
+  let hadScrollLock = false;
+  let tooltipTimer = null;
+
+  function hideDescription() {
+    if (tooltipTimer !== null) { clearTimeout(tooltipTimer); tooltipTimer = null; }
+    hideToolTip();
+  }
+
+  function fitToolModal() {
+    if (!modalOpened) return;
+    const viewport = window.visualViewport;
+    toolModal.style.setProperty("--tool-viewport-height", (viewport ? viewport.height : window.innerHeight) + "px");
+    toolModal.style.setProperty("--tool-viewport-top", (viewport ? viewport.offsetTop : 0) + "px");
+  }
+
+  function setSaving(saving) {
+    App.toolModalSaving = saving;
+    toolModal.setAttribute("aria-busy", String(saving));
+    [confirmButton, cancelButton, closeButton, toolFollowGlobal, toolRefresh].filter(Boolean).forEach(function (button) { button.disabled = saving; });
+    content.inert = saving;
+    toolbar.inert = saving;
+  }
+
+  App.onToolModalClosed = function () {
+    openVersion++;
+    hideDescription();
+    if (!modalOpened) return;
+    modalOpened = false;
+    background.forEach(function (entry) { entry.node.inert = entry.before; });
+    background = [];
+    if (!hadScrollLock) document.body.classList.remove("tool-settings-open");
+    const target = returnFocus && returnFocus.isConnected && returnFocus.getClientRects().length ? returnFocus : App.plusBtn;
+    returnFocus = null;
+    if (target && !target.inert) target.focus({ preventScroll: true });
+  };
+  window.addEventListener("resize", fitToolModal);
+  content.addEventListener("scroll", hideDescription, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", fitToolModal);
+    window.visualViewport.addEventListener("scroll", fitToolModal);
+  }
+  toolModal.addEventListener("keydown", function (event) {
+    if (!modalOpened || event.isComposing) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      App.closeToolModal();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(toolModal.querySelectorAll("button, input, [tabindex]")).filter(function (node) {
+      return !node.disabled && node.tabIndex >= 0 && !node.closest("[inert]") && node.getClientRects().length;
+    });
+    if (!focusable.length) { event.preventDefault(); return; }
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !toolModal.contains(document.activeElement))) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || !toolModal.contains(document.activeElement))) {
+      event.preventDefault(); first.focus();
+    }
+  });
 
   // ---------- 工具选择 ----------
   function normalizeTool(rawTool) {
@@ -135,14 +207,14 @@
 
   // 按所属 MCP 服务分组当前选择（服务名 -> 工具名数组），交给后端持久化到 mcp_servers.json；
   // 内置工具归入伪服务 __builtin__（后端据此识别，见 factory/agent_runtime/builtin_tools.py）
-  function buildToolSelectionInputs() {
+  function buildToolSelectionInputs(selected) {
     const serverOf = new Map();
     state.tools.forEach(function (tool) {
       if (tool.serverId) serverOf.set(tool.name, tool.serverId);
     });
     const inputs = {};
     const builtinNames = [];
-    Array.from(state.selectedTools).sort().forEach(function (name) {
+    Array.from(selected).sort().forEach(function (name) {
       if (App.isBuiltinToolName(name)) {
         builtinNames.push(name);
         return;
@@ -156,38 +228,30 @@
     return inputs;
   }
 
-  async function saveToolSelection() {
-    try {
-      // 会话内选择写入该会话（_meta.tool_selection 覆盖快照，仅本会话生效）；
-      // 全取消勾选后保存 = 会话显式无工具模式（后端落空选择哨兵，不回退全局默认），
-      // 「恢复跟随全局默认」走下方独立的 toolFollowGlobal 按钮（clear 语义）；
-      // 新对话（尚未产生 sessionId）的选择写入全局默认（mcp_servers.json 的 inputs 键），
-      // 作为之后新建会话的默认工具——与工作路径"新会话前改默认"的语义一致
-      if (state.sessionId) {
-        await API.updateToolSelection(buildToolSelectionInputs(), state.sessionId);
-        state.toolSelectionOverridden = true;
-      } else {
-        await API.updateToolSelection(buildToolSelectionInputs());
-        state.toolSelectionOverridden = false;
-      }
-      updateToolSelectionHint();
-    } catch (err) {
-      toast("工具选择保存失败：" + err.message);
-    }
+  async function saveToolSelection(selected, sessionId) {
+    // 会话内写覆盖快照（全取消 = 显式无工具模式）；新对话写全局默认。
+    await API.updateToolSelection(buildToolSelectionInputs(selected), sessionId || undefined);
   }
 
   // 会话级「恢复跟随全局默认」：清除 _meta.tool_selection 覆盖（clear 语义），
   // 之后该会话重新跟随 mcp_servers.json 的全局 inputs；新对话无覆盖，不显示按钮
   async function followGlobalToolSelection() {
-    if (!state.sessionId) return;
+    if (!state.sessionId || App.toolModalSaving || toolRefresh.disabled) return;
+    const sessionId = state.sessionId;
+    setSaving(true);
     try {
-      await API.updateToolSelection({}, state.sessionId, true);
-      state.toolSelectionOverridden = false;
-      await loadToolSelection();
-      App.refreshContextTokenStats(state.sessionId);
+      await API.updateToolSelection({}, sessionId, true);
+      if (state.sessionId !== sessionId) return;
+      if (!await loadToolSelection()) throw new Error("设置已恢复，但读取默认工具失败，请稍后重试");
+      state.draftTools = new Set(state.selectedTools);
+      renderToolGroups();
+      App.refreshContextTokenStats(sessionId);
       toast("本会话已恢复跟随全局默认工具选择");
     } catch (err) {
       toast("恢复跟随全局失败：" + err.message);
+    } finally {
+      setSaving(false);
+      if (modalOpened) closeButton.focus({ preventScroll: true });
     }
   }
 
@@ -234,18 +298,22 @@
   // 会话级工具选择：随会话切换刷新；新对话（无 sessionId）加载全局默认
   function loadToolSelection() {
     const sid = state.sessionId || "";
-    API.getToolSelection(sid || undefined).then(function (data) {
-      if (sid && state.sessionId !== sid) return; // 等待期间已切换会话
+    return API.getToolSelection(sid || undefined).then(function (data) {
+      if ((state.sessionId || "") !== sid) return false; // 等待期间已切换会话
       const effective = (data && (data.effective_selection || data.inputs)) || {};
       applyToolSelectionInputs(effective);
       state.toolSelectionOverridden = Boolean(data && data.is_overridden);
       updateToolSelectionHint();
-    }).catch(function () { /* 加载失败保持本地状态 */ });
+      return true;
+    }).catch(function () { return false; /* 加载失败保持本地状态 */ });
   }
 
   // 模态框"已选 N 项"上悬浮提示当前是会话独立选择还是全局默认；
   // 「跟随全局」按钮仅在会话覆盖态显示（清除覆盖用，见 followGlobalToolSelection）
   function updateToolSelectionHint() {
+    if (scopeHint) scopeHint.textContent = !state.sessionId
+      ? "新会话默认 · 保存后用于后续新会话"
+      : state.toolSelectionOverridden ? "当前会话 · 独立工具选择" : "当前会话 · 正在跟随全局默认";
     if (toolFollowGlobal) {
       toolFollowGlobal.hidden = !state.toolSelectionOverridden;
     }
@@ -263,6 +331,12 @@
     const selectedCount = tools.filter(function (tool) { return state.draftTools.has(tool.name); }).length;
     checkbox.checked = tools.length > 0 && selectedCount === tools.length;
     checkbox.indeterminate = selectedCount > 0 && selectedCount < tools.length;
+    const group = checkbox.closest(".tool-group");
+    if (group) {
+      group.classList.toggle("has-selection", selectedCount > 0);
+      const count = group.querySelector(".tool-group-count");
+      if (count) { count.textContent = selectedCount + " / " + tools.length; count.title = "已选 " + selectedCount + " 项，共 " + tools.length + " 项"; }
+    }
   }
 
   function toggleDraftTool(name, checked) {
@@ -275,6 +349,7 @@
   }
 
   function renderToolGroups() {
+    hideDescription();
     toolGroups.innerHTML = "";
     const query = toolSearchInput.value.trim().toLowerCase();
     const groups = groupTools();
@@ -296,20 +371,25 @@
 
     order.forEach(function (serverId) {
       const allTools = groups.get(serverId) || [];
+      const serverMatches = query && (serverId + " " + serverLabel(serverId)).toLowerCase().includes(query);
       const visibleTools = allTools.filter(function (tool) {
-        return !query || tool.name.toLowerCase().includes(query)
-          || tool.originalName.toLowerCase().includes(query)
+        return !query || serverMatches || tool.name.toLowerCase().includes(query)
+          || String(tool.originalName || tool.name).toLowerCase().includes(query)
           || tool.description.toLowerCase().includes(query);
       });
-      if (query && !visibleTools.length) return;
+      if (query && !visibleTools.length && !serverMatches) return;
 
-      const group = el("section", "tool-group open");
+      const group = el("section", "tool-group");
+      group.dataset.serverId = serverId;
+      group.classList.toggle("open", Boolean(query) || !collapsedServers.has(serverId));
+      group.classList.toggle("has-error", state.failedServers.includes(serverId));
       const head = el("div", "tool-group-head");
       const groupCheck = document.createElement("input");
       groupCheck.type = "checkbox";
       groupCheck.className = "tool-group-check";
       groupCheck.title = "选择此服务下的全部工具";
-      updateGroupCheckbox(groupCheck, allTools);
+      groupCheck.setAttribute("aria-label", "选择“" + serverLabel(serverId) + "”的全部工具");
+      groupCheck.disabled = !allTools.length;
 
       const toggle = el("button", "tool-group-toggle");
       toggle.type = "button";
@@ -319,15 +399,23 @@
         '<span class="tool-group-title"><span class="tool-group-name"></span><span class="tool-group-id"></span></span>';
       toggle.querySelector(".tool-group-name").textContent = serverLabel(serverId);
       toggle.querySelector(".tool-group-id").textContent =
-        serverId === App.BUILTIN_SERVER_KEY ? "服务端本地执行"
-        : serverId === "__unassigned__" ? "" : serverId;
-      toggle.addEventListener("click", function () { group.classList.toggle("open"); });
+        serverId === App.BUILTIN_SERVER_KEY ? "内置 · 本机执行"
+        : state.failedServers.includes(serverId) ? "MCP · 连接失败"
+        : serverId === serverLabel(serverId) || serverId === "__unassigned__" ? "MCP 服务" : serverId;
+      toggle.setAttribute("aria-expanded", String(group.classList.contains("open")));
+      toggle.addEventListener("click", function () {
+        const opened = group.classList.toggle("open");
+        if (opened) collapsedServers.delete(serverId); else collapsedServers.add(serverId);
+        toggle.setAttribute("aria-expanded", String(opened));
+        updateCollapseAll();
+      });
 
       const count = el("span", "tool-group-count", allTools.length + " 项");
       head.appendChild(groupCheck);
       head.appendChild(toggle);
       head.appendChild(count);
       group.appendChild(head);
+      updateGroupCheckbox(groupCheck, allTools);
 
       const body = el("div", "tool-group-body");
       if (!allTools.length) {
@@ -335,20 +423,25 @@
       } else {
         visibleTools.forEach(function (tool) {
           const row = el("div", "tool-row");
+          row.dataset.toolName = tool.name;
           const checkbox = document.createElement("input");
           checkbox.type = "checkbox";
           checkbox.className = "tool-row-check";
           checkbox.checked = state.draftTools.has(tool.name);
+          checkbox.setAttribute("aria-label", "启用 " + (tool.originalName || tool.name));
+          row.classList.toggle("is-selected", checkbox.checked);
           checkbox.addEventListener("click", function (event) { event.stopPropagation(); });
           checkbox.addEventListener("change", function () {
             toggleDraftTool(tool.name, checkbox.checked);
+            checkbox.checked = state.draftTools.has(tool.name);
+            row.classList.toggle("is-selected", checkbox.checked);
             updateGroupCheckbox(groupCheck, allTools);
           });
 
           const iconClass = "icon tool-row-icon" +
             (App.isBuiltinToolName(tool.name) ? " is-builtin-tool-icon" : "");
           row.innerHTML = App.toolIconSvg(tool.name, iconClass) + '<span class="tool-row-info"><span class="tool-row-name"></span><span class="tool-row-description"></span></span>';
-          row.querySelector(".tool-row-name").textContent = tool.originalName;
+          row.querySelector(".tool-row-name").textContent = tool.originalName || tool.name;
           row.querySelector(".tool-row-name").title = tool.name !== tool.originalName
             ? "模型调用名：" + tool.name
             : tool.name;
@@ -356,7 +449,7 @@
           const rowVisionBlocked = visionBlocked && tool.name === "read_media";
           if (rowVisionBlocked) {
             checkbox.disabled = true;
-            row.style.opacity = "0.55";
+            row.classList.add("is-disabled");
             row.title = "当前模型不支持视觉（vision=false），read_media 不可用";
             row.querySelector(".tool-row-description").textContent =
               tool.description + "（当前模型不支持视觉，不可用）";
@@ -365,6 +458,7 @@
           }
           row.insertBefore(checkbox, row.firstChild);
           row.addEventListener("click", function () {
+            if (checkbox.disabled || App.toolModalSaving) return;
             checkbox.checked = !checkbox.checked;
             checkbox.dispatchEvent(new Event("change", { bubbles: true }));
           });
@@ -376,8 +470,10 @@
         allTools.forEach(function (tool) { toggleDraftTool(tool.name, groupCheck.checked); });
         updateGroupCheckbox(groupCheck, allTools);
         body.querySelectorAll(".tool-row-check").forEach(function (checkbox) {
-          const rowName = checkbox.closest(".tool-row").querySelector(".tool-row-name").textContent;
+          const row = checkbox.closest(".tool-row");
+          const rowName = row.dataset.toolName;
           checkbox.checked = state.draftTools.has(rowName);
+          row.classList.toggle("is-selected", checkbox.checked);
         });
       });
       group.appendChild(body);
@@ -388,30 +484,58 @@
       toolGroups.appendChild(el("div", "tool-modal-empty", "没有匹配的工具"));
     }
     updateToolSelected();
+    updateCollapseAll();
+  }
+
+  function updateCollapseAll() {
+    const groups = Array.from(toolGroups.querySelectorAll(".tool-group"));
+    const allOpen = groups.length > 0 && groups.every(function (group) { return group.classList.contains("open"); });
+    toolCollapseAll.textContent = allOpen ? "−" : "+";
+    toolCollapseAll.title = allOpen ? "折叠全部" : "展开全部";
+    toolCollapseAll.setAttribute("aria-label", toolCollapseAll.title);
+    toolCollapseAll.disabled = !groups.length;
   }
 
   async function openToolModal() {
+    if (App.toolModalSaving) return;
+    const version = ++openVersion;
+    const sessionId = state.sessionId;
+    const trigger = document.activeElement;
     // 打开弹窗时重新读取当前会话模型能力，避免一直沿用页面启动时缓存的
     // vision 值；等能力刷新完成后再渲染，防止旧 false 把 read_media 从草稿移除。
     await refreshChatModelConfig();
+    if (version !== openVersion || state.sessionId !== sessionId) return;
     state.draftTools = new Set(state.selectedTools);
     toolSearchInput.value = "";
     toolModal.classList.remove("hidden");
     toolModal.setAttribute("aria-hidden", "false");
+    updateToolSelectionHint();
     renderToolGroups();
-    setTimeout(function () { toolSearchInput.focus(); }, 0);
+    content.scrollTop = 0;
+    if (!modalOpened) {
+      modalOpened = true;
+      returnFocus = trigger;
+      background = Array.from(document.body.children).filter(function (node) {
+        return node !== toolModal && node !== toolTip && !["SCRIPT", "STYLE", "LINK"].includes(node.tagName);
+      }).map(function (node) { const before = node.inert; node.inert = true; return { node: node, before: before }; });
+      hadScrollLock = document.body.classList.contains("tool-settings-open");
+      document.body.classList.add("tool-settings-open");
+    }
+    fitToolModal();
+    // 手机不自动唤起键盘，让工具列表先占满可用空间。
+    (window.innerWidth <= 600 ? closeButton : toolSearchInput).focus({ preventScroll: true });
   }
 
   $("#toolSearchInput").addEventListener("input", renderToolGroups);
 
-  // 水平居中显示，垂直与工具行对齐；不跟随鼠标，内容超高时可在框内滚动
+  // 描述浮层优先放在工具行下方，避免遮住正在点击的复选框和工具行。
   function positionToolTip(row) {
     const rect = row.getBoundingClientRect();
     const w = toolTip.offsetWidth;
     const h = toolTip.offsetHeight;
     let left = (window.innerWidth - w) / 2;
-    let top = rect.top - 6;
-    if (top + h > window.innerHeight - 8) top = rect.bottom - h - 8;
+    let top = rect.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = rect.top - h - 8;
     if (left < 8) left = 8;
     if (top < 8) top = 8;
     toolTip.style.left = left + "px";
@@ -420,34 +544,46 @@
 
   // 事件委托：renderToolGroups 会重建行节点，绑定在容器上避免重复监听
   toolGroups.addEventListener("mouseover", function (e) {
+    if (window.innerWidth <= 600 || !window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
     const row = e.target.closest(".tool-row");
     if (!row) return;
+    if (e.relatedTarget && row.contains(e.relatedTarget)) return;
+    hideDescription();
     const desc = row.querySelector(".tool-row-description");
-    if (!desc || !desc.textContent.trim()) { hideToolTip(); return; }
-    toolTip.textContent = desc.textContent;
-    toolTip.style.display = "block";
-    positionToolTip(row);
+    if (!desc || !desc.textContent.trim()
+      || (desc.scrollWidth <= desc.clientWidth + 1 && desc.scrollHeight <= desc.clientHeight + 1)) return;
+    tooltipTimer = setTimeout(function () {
+      tooltipTimer = null;
+      if (!modalOpened || !row.isConnected) return;
+      toolTip.textContent = desc.textContent;
+      toolTip.style.display = "block";
+      positionToolTip(row);
+    }, 350);
   });
   toolGroups.addEventListener("mouseout", function (e) {
     const to = e.relatedTarget;
-    // 鼠标移入提示框或另一工具行时保持显示
+    // 移入提示框时保持显示；切换工具行由 mouseover 接管计时。
     if (to && ((to.closest && to.closest(".tool-row")) || toolTip.contains(to))) return;
-    hideToolTip();
+    hideDescription();
   });
   // 从提示框移回工具行保持显示，移出页面则隐藏
   toolTip.addEventListener("mouseout", function (e) {
     const to = e.relatedTarget;
     if (to && to.closest && to.closest(".tool-row")) return;
-    hideToolTip();
+    hideDescription();
   });
 
   toolRefresh.addEventListener("click", async function () {
     if (toolRefresh.disabled) return;
     toolRefresh.disabled = true;
     toolRefresh.classList.add("is-loading");
+    confirmButton.disabled = true;
+    if (toolFollowGlobal) toolFollowGlobal.disabled = true;
     const result = await loadTools(true);
     toolRefresh.disabled = false;
     toolRefresh.classList.remove("is-loading");
+    confirmButton.disabled = false;
+    if (toolFollowGlobal) toolFollowGlobal.disabled = false;
     toast(!result.success
       ? "工具列表更新失败"
       : result.modelConfigRefreshed
@@ -457,21 +593,43 @@
   $("#toolCollapseAll").addEventListener("click", function () {
     const groups = Array.from(toolGroups.querySelectorAll(".tool-group"));
     const shouldOpen = groups.some(function (group) { return !group.classList.contains("open"); });
-    groups.forEach(function (group) { group.classList.toggle("open", shouldOpen); });
-    toolCollapseAll.textContent = shouldOpen ? "−" : "+";
+    groups.forEach(function (group) {
+      group.classList.toggle("open", shouldOpen);
+      const serverId = group.dataset.serverId;
+      if (shouldOpen) collapsedServers.delete(serverId); else collapsedServers.add(serverId);
+      group.querySelector(".tool-group-toggle").setAttribute("aria-expanded", String(shouldOpen));
+    });
+    updateCollapseAll();
   });
-  $("#toolConfirm").addEventListener("click", async function () {
-    const savingForSession = Boolean(state.sessionId);
-    state.selectedTools = new Set(state.draftTools);
-    App.closeToolModal();
-    App.refreshContextTokenStats(state.sessionId);
-    toast(savingForSession
-      ? (state.selectedTools.size
-        ? "已保存本会话工具选择（" + state.selectedTools.size + " 项）"
-        : "已保存：本会话显式无工具模式（不跟随全局默认）")
-      : "已保存为新会话默认工具选择（" + state.selectedTools.size + " 项）");
-    await saveToolSelection();
+  confirmButton.addEventListener("click", async function () {
+    if (App.toolModalSaving || toolRefresh.disabled) return;
+    const sessionId = state.sessionId;
+    const selected = new Set(state.draftTools);
+    setSaving(true);
+    confirmButton.textContent = "保存中…";
+    let saved = false;
+    try {
+      await saveToolSelection(selected, sessionId);
+      saved = true;
+      if (state.sessionId === sessionId) {
+        state.selectedTools = selected;
+        state.toolSelectionOverridden = Boolean(sessionId);
+        updateToolSelectionHint();
+        App.refreshContextTokenStats(sessionId);
+      }
+      toast(sessionId
+        ? (selected.size ? "已保存本会话工具选择（" + selected.size + " 项）" : "已保存：本会话显式无工具模式（不跟随全局默认）")
+        : "已保存为新会话默认工具选择（" + selected.size + " 项）");
+    } catch (err) {
+      toast("工具选择保存失败：" + err.message);
+    } finally {
+      setSaving(false);
+      confirmButton.textContent = "确定";
+    }
+    if (saved) App.closeToolModal();
+    else if (modalOpened) confirmButton.focus({ preventScroll: true });
   });
+  cancelButton.addEventListener("click", function () { App.closeToolModal(); });
 
   // 「跟随全局」：仅会话覆盖态显示；清除本会话独立选择（含显式无工具模式），
   // 恢复跟随 mcp_servers.json 的全局默认

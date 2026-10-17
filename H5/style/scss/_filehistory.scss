@@ -36,10 +36,10 @@ $fh-del-text: #cf222e;
 .fh-panel {
   top: 44px;
   left: auto;
-  // 右缘避让右侧问题导航条 qnav（right:14px + 轨道 4px 内距 + 虚线最宽 20px，
-  // 最左缘约距右 38px）：面板挂在 .top-actions（距右 16px），right:40px 使
-  // 面板右缘距主区右缘约 56px，与 qnav 轨道留 ~18px 间隙，不再重叠遮挡
-  // （qnav z-index 30 高于顶栏 26，空间上不重叠才是正解）
+  // 右缘避让右侧问题导航条 qnav（right:14px + hover 涟漪最长 34px，
+  // 最左缘约距右 48px）：面板挂在 .top-actions（距右 16px），right:40px 使
+  // 面板右缘距主区右缘约 56px，与 qnav 轨道留 ~8px 间隙，不再重叠遮挡
+  // （顶栏 z-index 35 高于 qnav 30：即使面板与 qnav 展开列表重叠，文件面板也在上层）
   right: 40px;
   width: 420px;
   max-width: calc(100vw - 24px);

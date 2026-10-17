@@ -139,7 +139,7 @@
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
 | /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs}` | 见下方「按轮次号删除（用户消息编辑重发）」；生成任务运行中报 409 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
-| /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | zip 二进制下载；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；**manifest v2 随包携带分组定义**（groups），单会话无附件且无分组时仍回 jsonl 明文；详见下方「会话分享 / 导入」 |
+| /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | 始终返回 ZIP；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；manifest v3 携带分组和仅所选会话配置的权限 SQLite 快照；详见下方「会话分享 / 导入」 |
 | /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
 | /chat_history/import_package | POST | 见下方说明 | 见下方说明 |
 | /chat_history/groups | GET | - | `{groups: [{id, name, created_at, collapsed, order}], assignments: {session_id: group_id}}`；分组定义读 `history_files/session_groups.json`，归属扫描各会话首行 `_meta.group_id`（只读首行，损坏文件跳过） |
@@ -197,7 +197,9 @@
 ```
 <session>_chat.jsonl              # 会话历史（与 history_files 根一致；首行 _meta 携带 group_id 归属）
 session_files/<upload_id>/...     # 该会话在 session_files/ 下的全部上传数据（解析记录/media/files/file_diffs）
-manifest.json                     # {version: 2, exported_at, groups: [{id, name}],
+state/permission_runtime.sqlite3   # 仅所选会话权限配置，无全局/任务/审批数据
+manifest.json                     # {version: 3, exported_at, groups: [{id, name}],
+                                  #  permissions: {version: 1, filename: "state/permission_runtime.sqlite3"},
                                   #  sessions: [{session_id, filename, title, upload_id, group_id}]}
 ```
 
@@ -205,22 +207,23 @@ manifest.json                     # {version: 2, exported_at, groups: [{id, name
 - 不存在的会话列入响应头 `X-Skipped-Sessions`（URL 编码逗号分隔），全部不存在时报 400；
 - **分组随包**：manifest `groups` 为被导出会话实际引用的分组定义（未被引用的分组不随包）；
   导入端按「组名」映射还原归属（跨机器分组 ID 不同也能还原）。无归属会话 group_id 为空串。
-- 单会话快捷路径（返回 jsonl 明文）附加条件：该会话**不带分组归属**——带分组时回退 zip
-  以保证分组定义随包携带。
+- 单会话也始终打包 ZIP，确保会话权限随包；权限文件是独立过滤快照，不复制全局配置、任务、审批和执行台账，导入时不覆盖本地 SQLite。`NULL` 表示跟随接收端全局。
+- 聊天中的原生协议引用、远端状态、审批控制事件和模型自定义请求头不随包，正文、工具结果及本地摘要保留。
 
 **导入两阶段**（前端弹窗逐会话选择「覆盖 / 重命名另存 / 跳过」）：
 
 1. `POST /chat_history/import_preview?filename=<文件名>`（原始字节请求体，`application/octet-stream`；支持 .zip / .jsonl）——**预检不落盘**：
    - 返回 `{type(zip|jsonl), filename, total, sessions[], conflicts[], groups[]}`；
-   - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count, group_id, group_name}`；`exists=true` 表示本地已有同名会话（即冲突，列入 `conflicts`）；`group_name` 来自包内分组定义（旧包为空串）；
+   - `sessions[]` 每项 `{session_id, title, imported_rounds, skipped_lines, exists, media_count, group_id, group_name, permission_included, permission_mode}`；`exists=true` 表示同名冲突；`permission_included=true` 表示包内携带配置，`permission_mode=ask|full_control|null`，弹窗展示后由用户确认加载；
    - `groups[]` 为随包携带的分组定义 `[{id, name}]`（zip manifest v2；jsonl / 旧版 v1 包为空列表），前端弹窗据此提示「导入后按分组名自动还原归属」；
-   - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析（含路径穿越防护）。
+   - jsonl 按文件名解析会话 ID，zip 按 manifest + 包内 `*_chat.jsonl` 解析；只读校验权限快照和会话对应关系，声明的快照缺失或损坏时报 400，预检不修改本地权限。旧 v1/v2 ZIP、裸 ZIP 和 JSONL 继续兼容。
 2. `POST /chat_history/import_package?filename=<文件名>&conflict_strategy=ask&decisions={"<sid>":"overwrite|rename|skip"}`（原始字节请求体，`application/octet-stream`）——**提交导入**：
    - zip 冲突决策优先级：逐会话 `decisions` > 全局 `conflict_strategy`；`ask` 且无逐项决策时该 zip 会话跳过。单个 `.jsonl` 导入另按路由兼容规则处理：没有逐项决策时 `ask` 缺省映射为 `rename`（改名另存），如需跳过须显式传 `decisions`；
    - 无冲突会话直接导入；zip 包同时落盘各会话的 `session_files/<upload_id>/` 数据；
-   - 冲突「重命名」：会话 ID 追加时间戳另存，上传数据目录归属同步改名为新会话 ID，并回写首行 `_meta.upload_id`；「覆盖」：清空旧 jsonl 与旧上传目录后写入；
+   - 冲突「重命名」：会话 ID 追加时间戳另存，上传目录使用独立目录并回写 `_meta.upload_id`；「覆盖」：先写新附件，再发布历史与配置，成功后只清理不再被其他会话引用的旧目录；生成中或挂起任务的目标不能覆盖；
+   - 权限配置只合并到成功导入的最终会话 ID，重命名跟随新 ID、跳过不写入；`null` 清除目标会话覆盖，跟随本地全局。全局和其他会话不受影响；旧包/JSONL 不修改已有权限。不导入任务、审批、执行许可或私有协议侧车；
    - **分组归属还原**（逐会话独立于冲突决策）：包内会话带 `group_id` 且 manifest 提供对应分组名时，按组名映射——本地同名分组**复用**、缺失则**新建**，随后把会话归属改写到映射后的分组；包内无分组定义（v1 旧包 / 裸 zip / 单 jsonl）时，仅当本地已存在同 ID 分组（本机回导场景）才保留，否则清除（界面显示未分组）；
-   - 返回 `{state, imported[], skipped[], failed[]}`；`imported[]` 每项附 `group_id` / `group_name`（还原后的归属，未归入为空），单会话失败不阻断其他会话。
+   - 返回 `{state, imported[], skipped[], failed[]}`；`imported[]` 附 `group_id` / `group_name` 和 `permission_included` / `permission_mode`（携带配置时），单会话失败不阻断其他会话。详细规则见 [会话分享与权限迁移](session_sharing.md)。
 
 ## 3. 上下文 Context
 
@@ -558,8 +561,10 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 `POST /chat_config/models/select` 新增参数：
 
 - `role`（可选，默认 `chat_model`）：`chat_model`（聊天）/ `compaction_model`（压缩）/ `title_model`（标题）/ `sub_agent_model`（子智能体）。模型角色选择支持 `chat-completions`、`messages` 与 `responses` 协议。
-- `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议字段 `thinking / output_config / stop_sequences`（messages）、`max_output_tokens / instructions / reasoning / text`（responses）。
+- `parameter`（可选）：该模型的默认生成参数，**按 api_type 分桶存储**——只写入被选模型 `api_type` 对应的桶（如 messages 模型写入 `parameter["messages"]`），其它桶保留；`parameter` 传 `null` 时仅切换模型、参数桶不变（同协议切换沿用参数）。支持字段（三协议并集）：`temperature / max_tokens / top_p / presence_penalty / reasoning_effort / extra_body`，以及协议字段 `thinking / output_config / stop_sequences`（messages）、`max_output_tokens / instructions / reasoning / text / responses_mode`（responses）。
 - `api_type`（只读回显，前端不传）：后端根据 models.json 中该模型的 `apiType` 自动确定，可选值 `chat_completions` / `messages` / `responses`（连字符归一为下划线、小写；`apiType` 缺失时默认 `chat_completions`）。
+
+Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `stateless`；省略表示跟随模型/provider 的 `responsesMode`（默认 `stateful`）。`GET /chat_config/models` 的 `models[]` 新增 `responses_mode`，回显模型默认；角色实际覆盖从 `role_info.effective_parameter.responses_mode` 读取。聊天请求也可显式传 `responses_mode`，优先级高于角色默认，此字段不转发上游。有状态使用 `store: true` 和父响应 ID；无状态使用 `store: false`，每次回传有效本地历史及完整原生输出/工具结果，不携带父 ID、不查询断流响应，自动与手动压缩均只做本地摘要。`GET /chat_context/responses_state` 增加实际运行的 `responses_mode`；无状态 `has_remote_head/age_risk` 为 false，尚未启动任务时保存的角色选择与上次运行状态可能不同。具体网络策略和配置见 [Responses 使用说明](responses_api_usage.md)。
 - `headers`（可选）：该角色的**自定义请求头**，`[{"name": "x-foo", "value": "bar"}]` 列表形态（后端也接受 `{"x-foo": "bar"}` 键值字典的手工编辑形态）。持久化位置与 parameter 一致——全局默认存 models.json 顶层 `model_selection.<role>.headers`，会话级存 `_meta.model_selection.<role>.headers`（新会话首次任务开始时随 model_selection 整体快照一次）。继承语义与 parameter 相同：`null` 保持现有（"仅切换模型、自定义头不变"），提供时全量替换，`[]` 清空。**注入链**：请求上游时 ChatLLM 从模型配置的 `_custom_headers` 读取并拼入原始 HTTP 头（放在 Authorization 之后、Content-Length 之前；非法条目——空名/含冒号或空白/含 CRLF——在规范化阶段丢弃，防头部注入）；同名键后者覆盖前者。四个角色各自独立（聊天/压缩/标题/子智能体），聊天角色随 `require_default_chat_config` 注入，其余角色随各自模型解析处注入；原先硬编码的 `x-opencode-session` 已删除，opencode 等供应商需要的会话头改由该配置提供。
 - 向后兼容：只传 `{provider, model}` 等价于 `role=chat_model` 且参数与自定义头均不变。
 

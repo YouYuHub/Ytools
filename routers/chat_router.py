@@ -309,6 +309,8 @@ async def search_chat_history(
     limit: int = Query(40, ge=1, le=100),
     offset: int = Query(0, ge=0),
     revision: Optional[str] = Query(None, max_length=64),
+    include_internal: bool = False,
+    include_filenames: bool = False,
 ):
     """Literal, case-insensitive search of all persisted conversation records.
 
@@ -319,6 +321,7 @@ async def search_chat_history(
     cancel = threading.Event()
     task = asyncio.create_task(asyncio.to_thread(
         search_history, q, limit=limit, offset=offset, revision=revision, cancel=cancel,
+        include_internal=include_internal, include_filenames=include_filenames,
     ))
     try:
         while not task.done():
@@ -691,34 +694,12 @@ async def export_chat_sessions_zip(
     """
     把一个或多个会话打包为 zip 下载：每个会话一个 `<session>_chat.jsonl` +
     该会话在 session_files/ 下的全部上传数据（media/ 图片视频音频、files/ 文档、
-    thumbs/ 缩略图、diffs/ 文件版本链）+ manifest.json 清单。
-
-    单会话且该会话在 session_files/ 下没有任何附件数据、且不带分组归属时，
-    直接返回 jsonl 明文（media_type: application/x-ndjson，Content-Disposition
-    为 `<session_id>_chat.jsonl`）——前端按 Content-Type 区分落地方式；
-    有附件（目录非空）或带分组归属时打 zip（单会话 `<session_id>_chat.zip`，
-    manifest 携带 groups 分组定义）。
-    多会话始终打 zip（`ytools_sessions_<时间戳>.zip`）。
+    thumbs/ 缩略图、diffs/ 文件版本链）+ manifest.json 清单 +
+    state/permission_runtime.sqlite3（仅所选会话的权限配置）。
+    单会话也始终返回 ZIP，确保没有附件时仍携带权限快照；不导出全局权限、
+    活动任务、审批或恢复凭据。多会话文件名为 `ytools_sessions_<时间戳>.zip`。
     """
     ids = [sid.strip() for sid in (session_ids or "").split(",") if sid.strip()]
-    try:
-        # 单会话快捷路径：session_files 下无任何附件数据 → 只分享 jsonl 明文
-        if len(ids) == 1:
-            sid = normalize_session_id(ids[0])
-            payload = _export_single_session_payload_for_share(sid)
-            if payload is not None:
-                quoted = urllib.parse.quote(payload["filename"])
-                return Response(
-                    content=payload["text"].encode("utf-8"),
-                    media_type="application/x-ndjson",
-                    headers={
-                        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
-                    },
-                )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # 快捷路径失败回退 zip 打包流程
     try:
         zip_bytes, download_name, skipped = export_sessions_to_zip(ids)
     except ValueError as exc:
@@ -733,32 +714,6 @@ async def export_chat_sessions_zip(
     return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
 
-def _export_single_session_payload_for_share(session_id: str) -> dict[str, Any] | None:
-    """单会话分享判定：会话文件存在且 session_files 附件目录为空时返回 jsonl 明文数据。
-
-    附件目录判定与 _export_session_payload 同口径（目录名优先 _meta.upload_id）；
-    目录不存在或递归枚举无文件（media/files/thumbs/diffs 均为空）→ 仅 jsonl。
-    会话带分组归属（_meta.group_id）时同样返回 None 回退 zip——分组定义需随
-    包携带（manifest.groups），导入端才能按组名还原归属。
-    """
-    from memory.chat_memory import _export_session_payload, HISTORY_ROOT, _safe_session_id
-
-    payload = _export_session_payload(session_id)
-    if payload is None:
-        return None
-    upload_dir_name = (
-        _safe_session_id(payload["session_id"])
-        if not payload.get("upload_dir_name")
-        else payload["upload_dir_name"]
-    )
-    session_data_root = HISTORY_ROOT / "session_files" / upload_dir_name
-    has_files = session_data_root.is_dir() and any(session_data_root.rglob("*"))
-    has_group = bool(str(payload.get("group_id") or "").strip())
-    if has_files or has_group:
-        return None
-    return {"filename": payload["filename"], "text": payload["text"]}
-
-
 @api_chat_router.post('/chat_history/import_preview')
 async def preview_chat_import(
     request: Request,
@@ -768,7 +723,8 @@ async def preview_chat_import(
     导入预检（不落盘）：解析 zip/jsonl 并返回会话清单与本地冲突信息。
 
     - zip：逐会话返回 {session_id, title, imported_rounds, exists, media_count,
-      group_id, group_name}，并附随包分组定义 groups（manifest v2）；
+      group_id, group_name, permission_included, permission_mode}，附随包分组定义
+      groups；权限快照在预检时只读校验，不修改本地权限。
     - jsonl：按单会话解析（与 upload_chat_file 同一解析器），exists 标记本地同名会话。
     前端据 conflicts 弹出「覆盖 / 重命名」决策弹窗后调用 import_package 提交。
     """
@@ -838,6 +794,7 @@ async def import_chat_package(
     - zip 包：逐会话导入 jsonl + session_files 数据目录（冲突另存时同步改名
       上传目录归属并回写 _meta.upload_id）；分组归属按包内分组定义的「组名」
       映射还原（本地同名复用、缺失新建），导入结果附带 group_id / group_name；
+      权限快照仅合并成功导入的会话，重命名同步映射，跳过不写入；全局配置不变；
     - jsonl：单会话导入，冲突策略与 zip 相同（overwrite 覆盖 / rename 另存）。
     返回 {state, imported, skipped, failed} 汇总。
     """
@@ -1190,11 +1147,11 @@ async def compact_chat_context_manual(
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        tool_request = ChatLLMRequest(
-            messages=[],
-            session_id=session_id,
-            tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
-        )
+        tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
+            "messages": [],
+            "session_id": session_id,
+            "tools": list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
+        }))
         compressed_rounds = await compact_session_history_if_needed(
             manager,
             tool_request,
@@ -1273,11 +1230,11 @@ async def _manual_compaction_event_stream(
             if precheck_error:
                 result["error"] = precheck_error
                 return
-            tool_request = ChatLLMRequest(
-                messages=[],
-                session_id=session_id,
-                tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
-            )
+            tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
+                "messages": [],
+                "session_id": session_id,
+                "tools": list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
+            }))
             result["compressed_rounds"] = await compact_session_history_if_needed(
                 manager,
                 tool_request,

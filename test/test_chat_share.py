@@ -6,7 +6,7 @@
 - list_zip_sessions：预检清单与本地冲突标记（不落盘）
 - import_sessions_from_zip：create / rename / overwrite / skip 四种决策路径
   （含上传数据目录归属改名与 _meta.upload_id 回写）
-- 分组随包携带与还原（manifest v2）：导出携带 groups 定义、预检显示组名、
+- 分组随包携带与还原（导出 manifest v3，兼容 v1/v2）：groups 定义、预检显示组名、
   跨机导入按组名新建/复用、旧版 v1 包兼容、本机回导保留、冲突另存 + 还原并存、
   单会话分享带分组时回退 zip（SessionGroupShareTests，临时目录隔离）
 """
@@ -19,11 +19,21 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
+import pytest
 
 from memory import chat_memory as cm
 from memory import file_memory as fm
 _TEST_SESSION = "share_roundtrip_ut"
 _TEST_SESSION_B = "share_roundtrip_ut_b"
+
+
+@pytest.fixture(autouse=True)
+def isolated_share_history(tmp_path, monkeypatch):
+    root = tmp_path / "history"
+    monkeypatch.setattr(cm, "HISTORY_ROOT", root)
+    monkeypatch.setattr(cm, "LOCK_ROOT", root / "lock")
+    monkeypatch.setattr(cm, "_session_managers", {})
+    monkeypatch.setattr(fm, "HISTORY_ROOT", root / "session_files")
 
 
 def _make_round(question: str, reply: str) -> dict:
@@ -239,8 +249,8 @@ class SessionShareTests(unittest.TestCase):
         self.assertEqual(len(result["imported"]), 1)
         self.assertFalse(result["imported"][0]["collision"])
         self.assertEqual(result["imported"][0]["imported_rounds"], 1)
-        # 上传目录被清空后重写
-        data_dir = fm.HISTORY_ROOT / _TEST_SESSION
+        # 新附件先写独立目录，发布成功后回写目录归属并清理旧目录。
+        data_dir = fm.HISTORY_ROOT / result["imported"][0]["upload_dir_name"]
         self.assertTrue((data_dir / "media" / "replaced.png").exists())
         self.assertFalse((data_dir / "media" / "clip.png").exists())
 
@@ -296,7 +306,7 @@ def _meta_line(title: str, group_id: str = "") -> str:
 
 
 class SessionGroupShareTests(unittest.TestCase):
-    """分组随包携带与还原（manifest v2）——临时目录隔离，不触碰真实 history_files。"""
+    """分组随包携带与还原（v3，兼容 v1/v2）——临时目录隔离。"""
 
     SID_A = "grpshare_ut_a"
     SID_B = "grpshare_ut_b"
@@ -376,7 +386,7 @@ class SessionGroupShareTests(unittest.TestCase):
         zip_bytes, _name, _skipped = cm.export_sessions_to_zip([self.SID_A, self.SID_B])
         manifest = json.loads(
             zipfile.ZipFile(io.BytesIO(zip_bytes)).read("manifest.json").decode("utf-8"))
-        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["version"], 3)
         self.assertEqual(manifest["groups"], [{"id": g1["id"], "name": "工作"}])
         by_id = {s["session_id"]: s for s in manifest["sessions"]}
         self.assertEqual(by_id[self.SID_A]["group_id"], g1["id"])
@@ -501,19 +511,20 @@ class SessionGroupShareTests(unittest.TestCase):
         self.assertEqual(imported["group_name"], "工作")
 
     # ---------- 单会话分享快捷路径 ----------
-    def test_09_single_share_with_group_falls_back_to_zip(self):
-        from routers.chat_router import _export_single_session_payload_for_share
+    def test_09_single_share_with_group_returns_zip(self):
+        from routers.chat_router import export_chat_sessions_zip
         g1 = cm.create_session_group("工作")
         self._write_session(self.SID_A, g1["id"])
-        # 无附件但带分组 → 不走 jsonl 明文，回退 zip（分组定义需随包）
-        self.assertIsNone(_export_single_session_payload_for_share(self.SID_A))
+        response = asyncio.run(export_chat_sessions_zip(session_ids=self.SID_A))
+        self.assertEqual(response.media_type, "application/zip")
+        self.assertIn("state/permission_runtime.sqlite3", zipfile.ZipFile(io.BytesIO(response.body)).namelist())
 
-    def test_10_single_share_without_group_returns_jsonl(self):
-        from routers.chat_router import _export_single_session_payload_for_share
+    def test_10_single_share_without_group_still_returns_zip(self):
+        from routers.chat_router import export_chat_sessions_zip
         self._write_session(self.SID_A)
-        payload = _export_single_session_payload_for_share(self.SID_A)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload["filename"], f"{self.SID_A}_chat.jsonl")
+        response = asyncio.run(export_chat_sessions_zip(session_ids=self.SID_A))
+        self.assertEqual(response.media_type, "application/zip")
+        self.assertIn("state/permission_runtime.sqlite3", zipfile.ZipFile(io.BytesIO(response.body)).namelist())
 
 
 if __name__ == "__main__":

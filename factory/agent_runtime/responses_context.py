@@ -3,7 +3,7 @@ import copy
 import uuid
 
 from chat.protocols import responses_store
-from chat.protocols.responses import parameters
+from chat.protocols.responses import parameters, response_mode
 from chat.protocols.responses_content import convert_messages, native_input_items
 from chat.protocols.errors import ResponsesProtocolError
 
@@ -34,6 +34,9 @@ def _source(request):
     result = []
     for message in request.messages:
         raw = message.model_dump(exclude_none=True) if hasattr(message, "model_dump") else copy.deepcopy(message)
+        reference = getattr(message, "provider_state", None) if hasattr(message, "model_dump") else raw.get("provider_state")
+        if reference:
+            raw["provider_state"] = copy.deepcopy(reference)
         context_id = getattr(message, "context_item_id", None) if hasattr(message, "model_dump") else raw.get("context_item_id")
         if not context_id:
             context_id = uuid.uuid4().hex
@@ -54,9 +57,12 @@ def prepare(request, config, stream):
         request.responses_context = context
     scope = context.get("scope") or "chat_model"
     state = responses_store.load_state(request.session_id, scope)
+    mode = response_mode(request, config)
     identity = responses_store.source_key(config)
     if state.get("source_key") and state["source_key"] != identity:
         state = responses_store.invalidate(request.session_id, "模型、端点或账户配置已变化", scope)
+    if state.get("responses_mode", "stateful") != mode:
+        state = responses_store.invalidate(request.session_id, "Responses 上下文模式已切换", scope)
     if state.get("pending_request_ref"):
         raise ResponsesProtocolError("Responses 有未确认请求，请重新同步上下文后继续")
     payload = parameters(request, config, stream)
@@ -70,6 +76,12 @@ def prepare(request, config, stream):
         instructions.append(request.instructions)
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
+    if mode == "stateless":
+        payload["input"] = convert_messages(source, request.session_id, replay_config=config)
+        if not payload["input"]:
+            raise ResponsesProtocolError("Responses 请求没有有效的本地上下文")
+        context["initialized"] = True
+        return payload, [m["context_item_id"] for m in source], state
     seen = set(context.get("seen_ids") or [])
     deferred_ids = set(context.get("deferred_ids") or [])
     new_messages = [m for m in source if m["context_item_id"] not in seen | deferred_ids and m.get("role") != "assistant"]
@@ -112,6 +124,10 @@ def prepare(request, config, stream):
         new_ids = [m["context_item_id"] for m in source]
     if not payload.get("input"):
         raise ResponsesProtocolError("Responses 请求没有新的有效输入")
+    if payload.get("previous_response_id") and state.get("omit_encrypted_include_with_previous"):
+        payload["include"] = [item for item in payload.get("include", []) if item != "reasoning.encrypted_content"]
+        if not payload["include"]:
+            payload.pop("include")
     context["initialized"] = True
     return payload, new_ids, state
 

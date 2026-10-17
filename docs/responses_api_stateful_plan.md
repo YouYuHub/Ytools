@@ -1,5 +1,7 @@
 # 有状态 Responses API 适配方案
 
+2026-10-16 实现更新：现已增加可选无状态 Responses 兼容模式（`store: false`，每次发送有效本地上下文），用于不提供响应 ID 续接能力的模型。本文保留当初“仅有状态”的方案范围，以下“始终 store: true”等约束只描述有状态路径；当前行为以 [Responses 使用说明](responses_api_usage.md) 和 [无状态排查](responses_stateless_2026-10-16.md) 为准。
+
 日期：2026-10-13。状态：有状态 Responses 首版已实现，并已使用用户配置的 `gpt-6-luna` 完成真实调用验证。实际使用与兼容平台差异见 [Responses 使用说明](responses_api_usage.md)。本文保留原方案的设计依据；“建议”段落不表示每个可选扩展都已实现。
 
 实际实现（2026-10-14 更新）：三种调用入口共用协议工厂，Responses 传输已由 SDK 替换为 Python 标准库 HTTP/JSON/SSE，不再依赖 openai；远端请求始终 `store: true`。主聊天、子智能体、标题、可读摘要分别使用独立作用域。模型响应和请求以增量方式存入私有侧车，`_meta` 保存主链指针，轮次保存调用审计。前端继续接收应用 SSE；Responses 使用独立参数区域及亮浅粉色滑条。

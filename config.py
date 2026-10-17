@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 # 第三方库
-from typing import List, Optional, Any #, Union, Dict
+from typing import List, Optional, Any, Literal #, Union, Dict
 from pydantic import BaseModel, Field
 
 # 自定义的模块
@@ -121,6 +121,7 @@ class ChatLLMRequest(BaseModel):
     instructions: Optional[str] = None
     reasoning: Optional[dict[str, Any]] = None
     text: Optional[dict[str, Any]] = None
+    responses_mode: Optional[Literal["stateful", "stateless"]] = None
     responses_context: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     wire_protocol: Optional[str] = Field(default=None, exclude=True)
     protocol_config: Optional[dict[str, Any]] = Field(default=None, exclude=True)

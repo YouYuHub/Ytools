@@ -1150,7 +1150,7 @@ def _build_summary_request(
         request.extra_body = dict(extra_body)
     import uuid
     request.responses_context = {"scope": "compaction_model:" + uuid.uuid4().hex}
-    for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text"):
+    for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text", "responses_mode"):
         if parameter.get(key) is not None:
             setattr(request, key, parameter[key])
     if request.max_output_tokens is not None:

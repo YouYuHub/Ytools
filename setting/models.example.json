@@ -260,6 +260,28 @@
       }
     }
   },
+  "Responses Example": {
+    "vendor": "custom_endpoint",
+    "apiKey": "",
+    "apiType": "responses",
+    "url": "https://YOUR_RESPONSES_API_HOST/v1",
+    "models": {
+      "Stateful Responses": {
+        "id": "your-responses-model",
+        "responsesMode": "stateful",
+        "toolCalling": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 8192
+      },
+      "Stateless Responses": {
+        "id": "your-stateless-responses-model",
+        "responsesMode": "stateless",
+        "toolCalling": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 8192
+      }
+    }
+  },
   "model_selection": {
     "chat_model": {
       "ownership_name": "Qwen Completions",

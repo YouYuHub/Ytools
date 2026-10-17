@@ -428,6 +428,7 @@ def list_available_models() -> list[dict[str, Any]]:
                 "max_input_tokens": model.get("maxInputTokens") or model.get("max_input_tokens"),
                 "max_output_tokens": model.get("maxOutputTokens") or model.get("max_output_tokens"),
                 "parameter_capabilities": model.get("parameterCapabilities") or model.get("parameter_capabilities") or {},
+                "responses_mode": model.get("responsesMode") or provider.get("responsesMode") or "stateful",
                 # 原生文档输入能力（前端可据此提示"该类型将按原生文档发送"）
                 "support_doc_types": _model_document_types(model, provider),
                 "api_key_present": bool(isinstance(api_key, str) and api_key.strip()),
@@ -678,6 +679,7 @@ _CHAT_PARAMETER_FIELDS = (
     "instructions",
     "reasoning",
     "text",
+    "responses_mode",
 )
 
 

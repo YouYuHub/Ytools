@@ -665,7 +665,11 @@ def test_child_agent_uses_own_chain_and_does_not_repeat_write(journal, monkeypat
     assert len([payload for _, payload in events if payload.get("event") == "model_response"]) == 2
 
 
-def test_sync_nonstream_expired_parent_rebuilt_once(journal, monkeypatch):
+@pytest.mark.parametrize("message,status", [
+    ("previous_response_id not found", 404),
+    ("referenced response not found or expired", 400),
+])
+def test_sync_nonstream_expired_parent_rebuilt_once(journal, monkeypatch, message, status):
     commit(turn([{"role": "user", "content": "old fact"}]), answer("resp_old"))
     class Client:
         def __init__(self):
@@ -674,8 +678,8 @@ def test_sync_nonstream_expired_parent_rebuilt_once(journal, monkeypatch):
         def create(self, **kwargs):
             self.creates.append(kwargs)
             if len(self.creates) == 1:
-                exc = RuntimeError("previous_response_id not found")
-                exc.status_code = 404
+                exc = RuntimeError(message)
+                exc.status_code = status
                 raise exc
             return answer("resp_rebuilt")
         def close(self):

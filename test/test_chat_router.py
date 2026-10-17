@@ -45,11 +45,13 @@ class ChatRouterTests(unittest.TestCase):
             return manager
 
         async def fake_compact(_manager, _request, **kwargs):
+            self.assertEqual(_request.responses_mode, "stateless")
             captured.append(kwargs)
             return 1
 
         async def run():
             with patch.object(chat_router, "get_chat_memory_manager", get_manager), \
+                    patch("env_manager.get_role_parameter", return_value={"responses_mode": "stateless"}), \
                     patch.object(chat_router, "load_context_compaction_settings", return_value=_settings()), \
                     patch.object(chat_router, "resolve_summary_total_budget", return_value=1234), \
                     patch.object(chat_router, "compact_session_history_if_needed", fake_compact):

@@ -21,9 +21,11 @@
     customHeadersRows, addHeaderRow
   } = App;
 
-  const responseControls = ["responsesParametersGroup", "responsesEffort", "responsesSummary", "responsesVerbosity", "responsesSampling", "responsesTemperatureRow", "responsesTemperature", "responsesTemperatureValue", "responsesTopPRow", "responsesTopP", "responsesTopPValue", "responsesInstructions", "responsesExtraBody", "responsesStateHint", "responsesRebuildSource", "responsesRebuild"];
+  const responseControls = ["responsesParametersGroup", "responsesMode", "responsesEffort", "responsesSummary", "responsesVerbosity", "responsesSampling", "responsesTemperatureRow", "responsesTemperature", "responsesTemperatureValue", "responsesTopPRow", "responsesTopP", "responsesTopPValue", "responsesInstructions", "responsesExtraBody", "responsesStateHint", "responsesRebuildSource", "responsesRebuild"];
   const R = {};
+  let responsesStateVersion = 0;
   responseControls.forEach(function (key) { R[key] = App[key] || el("div"); });
+  ["responsesModeHint", "responsesStatefulControls"].forEach(function (key) { R[key] = App[key] || el("div"); });
 
   function isResponsesModel(model) {
     return Boolean(model && String(model.api_type || "").toLowerCase() === "responses");
@@ -35,6 +37,7 @@
   }
   function renderResponsesFields(params) {
     state.responsesParameterBase = cloneObject(params);
+    R.responsesMode.value = params.responses_mode || "";
     R.responsesEffort.value = params.reasoning && params.reasoning.effort || params.reasoning_effort || "";
     R.responsesSummary.value = params.reasoning && params.reasoning.summary || "";
     R.responsesVerbosity.value = params.text && params.text.verbosity || "";
@@ -61,6 +64,7 @@
     const params = cloneObject(value.base || {});
     delete params.reasoning_effort;
     delete params.max_tokens;
+    if (value.responsesMode) params.responses_mode = value.responsesMode; else delete params.responses_mode;
     params.max_output_tokens = Number(draft ? draft.maxTokens : maxTokens.value);
     const reasoning = Object.assign({}, params.reasoning || {});
     if (value.responsesEffort) reasoning.effort = value.responsesEffort; else delete reasoning.effort;
@@ -83,24 +87,42 @@
     ["presence_penalty", "thinking", "output_config", "stop_sequences"].forEach(function (key) { delete params[key]; });
     return params;
   }
+  function selectedResponsesMode() {
+    const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
+    return R.responsesMode.value || model && model.responses_mode || "stateful";
+  }
   async function refreshResponsesState() {
+    const version = ++responsesStateVersion;
     const isMain = state.activeModelRole === "chat_model";
-    R.responsesRebuild.disabled = !isMain;
-    R.responsesRebuildSource.disabled = !isMain;
+    const stateless = selectedResponsesMode() === "stateless";
+    const modeLabel = stateless ? "无状态兼容 · 每次发送上下文" : "有状态 · 响应 ID 续聊";
+    R.responsesModeHint.textContent = (R.responsesMode.value ? "当前选择：" : "跟随模型配置，当前为：") + modeLabel + "。保存后从下一次任务生效。";
+    R.responsesStatefulControls.classList.toggle("hidden", stateless || !isMain);
+    R.responsesRebuild.disabled = stateless || !isMain || !state.sessionId;
+    R.responsesRebuildSource.disabled = stateless || !isMain || !state.sessionId;
+    if (stateless) {
+      R.responsesStateHint.textContent = "无状态兼容：每次发送当前本地上下文，工具结果随历史回传；使用本地压缩，无需准备重新同步。";
+      return;
+    }
     if (!isMain) {
       R.responsesStateHint.textContent = "该角色按独立任务维护 Responses 会话；重新同步入口用于聊天主会话。";
       return;
     }
-    if (!state.sessionId || !API.getResponsesState) return;
+    if (!state.sessionId || !API.getResponsesState) {
+      R.responsesStateHint.textContent = "有状态续聊：首次发送时建立远端会话，之后通过响应 ID 发送新增输入。";
+      return;
+    }
     const session = state.sessionId;
     const role = state.activeModelRole;
     try {
       const data = await API.getResponsesState(session);
-      if (state.sessionId !== session || state.activeModelRole !== role) return;
+      if (version !== responsesStateVersion || state.sessionId !== session || state.activeModelRole !== role) return;
       const remote = data.responses_state || {};
-      const labels = { new: "尚未建立远端会话", ready: "远端增量续聊正常", request_pending: "请求正在进行",
+      const labels = { new: "尚未建立远端会话", ready: "上次请求已完成；下次仍尝试响应 ID 续接", request_pending: "请求正在进行",
         recovery_required: "需要确认上次请求", rebuild_pending: "待下次发送重新同步", ready_to_rebase: "官方压缩完成，待下次发送启用", compacting: "正在压缩" };
-      let hint = labels[remote.status] || remote.status || "尚未建立远端会话";
+      let hint = remote.responses_mode === "stateless"
+        ? "上次调用使用无状态模式；保存当前选择后，下次建立有状态链"
+        : labels[remote.status] || remote.status || "尚未建立远端会话";
       if (remote.age_risk) hint += " · 长期会话建议准备重新同步";
       const compressed = remote.last_compaction;
       if (compressed && compressed.phase === "error") hint += " · 官方压缩未完成";
@@ -115,10 +137,11 @@
       }
       R.responsesStateHint.textContent = hint + "。上下文显示以本地数据为准。";
     } catch (error) {
-      if (state.sessionId === session && state.activeModelRole === role) R.responsesStateHint.textContent = "状态读取失败：" + error.message;
+      if (version === responsesStateVersion && state.sessionId === session && state.activeModelRole === role) R.responsesStateHint.textContent = "状态读取失败：" + error.message;
     }
   }
   R.responsesRebuild.addEventListener("click", async function () {
+    if (selectedResponsesMode() === "stateless") { toast("无状态模式每次发送上下文，无需准备重新同步"); return; }
     if (state.activeModelRole !== "chat_model") { toast("请在聊天模型页重新同步主会话"); return; }
     if (!state.sessionId) { toast("请先建立会话"); return; }
     if (state.streaming || state.manualCompactRunning) { toast("请等待生成或压缩完成"); return; }
@@ -134,6 +157,7 @@
     R[key].addEventListener(key.includes("Temperature") || key.includes("TopP") || key.includes("Instructions") || key.includes("ExtraBody") ? "input" : "change", function () { markParamDirty(); syncRangeOutputs(); });
   });
   R.responsesSampling.addEventListener("change", function () { markParamDirty(); updateProtocolControls(); });
+  R.responsesMode.addEventListener("change", function () { markParamDirty(); updateProtocolControls(); });
   App.refreshResponsesState = refreshResponsesState;
 
   let panelVersion = 0;
@@ -464,6 +488,12 @@
     R.responsesTemperatureRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "temperature"));
     R.responsesTopPRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "top_p"));
     if (responses) refreshResponsesState();
+    else {
+      ++responsesStateVersion;
+      R.responsesStatefulControls.classList.add("hidden");
+      R.responsesRebuild.disabled = true;
+      R.responsesRebuildSource.disabled = true;
+    }
     messagesParametersGroup.classList.toggle("hidden", !messages);
     enhancePanel.classList.toggle("messages-mode", messages);
     syncMessagesThinkingControls(model);
@@ -698,6 +728,10 @@
 
   // 面板提示：区分"会话独立选择 / 跟随全局默认 / 新对话保存为全局默认"三种语义
   function updateModelPanelHint() {
+    if (App.enhanceScope) {
+      App.enhanceScope.textContent = !state.sessionId ? "全局默认 · 新对话使用"
+        : state.modelOverridden[state.activeModelRole] ? "当前会话 · 独立配置" : "当前会话 · 跟随全局，保存后独立生效";
+    }
     if (state.modelLoadFailed) {
       enhanceHint.textContent = "部分模型配置加载失败，请检查后端服务";
       return;
@@ -737,10 +771,11 @@
       saveRoleDraft(state.activeModelRole);  // 以服务端回填为初始草稿基线
     }
     updateModelPanelHint();
-    enhancePanel.scrollTop = 0;
+    (App.enhanceBody || enhancePanel).scrollTop = 0;
   }
 
   function openModelPanel() {
+    if (App.showModelPanelModal) App.showModelPanelModal();
     const version = ++panelVersion;
     const sessionId = state.sessionId || undefined;
     panelSessionId = sessionId;
@@ -823,11 +858,15 @@
     markParamDirty();
   });
 
-  enhanceCancel.addEventListener("click", function () {
+  function closeModelPanel() {
+    if (enhancePanel.inert) return; // 保存过程中不关闭或丢失待完成的配置。
     ++panelVersion;
+    ++responsesStateVersion;
     enhancePanel.classList.add("hidden");
-    if (App.dockEnhancePanel) App.dockEnhancePanel();
-  });
+    if (App.hideModelPanelModal) App.hideModelPanelModal();
+  }
+  enhanceCancel.addEventListener("click", closeModelPanel);
+  if (App.enhanceClose) App.enhanceClose.addEventListener("click", closeModelPanel);
 
   // 恢复默认：按选中模型的 api_type 取预设默认参数（角色默认覆盖协议默认），
   // Messages 清除显式可选参数，使用供应商默认值。
@@ -847,7 +886,7 @@
       reasoningEffort.value = merged.reasoning_effort;
       enableThinking.checked = merged.enable_thinking;
     }
-    if (apiType === "responses") renderResponsesFields({});
+    if (apiType === "responses") { renderResponsesFields({}); updateProtocolControls(); }
     if (apiType === "messages") {
       state.messagesParameterBase = {};
       state.messagesParameterTouched = {};
@@ -915,8 +954,7 @@
       });
     }
     if (!changes.length) {
-      enhancePanel.classList.add("hidden");
-      if (App.dockEnhancePanel) App.dockEnhancePanel();
+      closeModelPanel();
       toast("模型与参数均未变化");
       return;
     }
@@ -941,12 +979,13 @@
         saved.push(change);
       }
       if (!isCurrentPanel(version, sessionId)) return;
-      enhancePanel.classList.add("hidden");
-      if (App.dockEnhancePanel) App.dockEnhancePanel();
       const failed = await loadModelConfigs(version, sessionId);
       if (!isCurrentPanel(version, sessionId)) return;
       state.modelLoadFailed = failed;
       state.modelPanelDrafts = {};   // 保存成功：服务端状态已变化，草稿基线作废
+      enhancePanel.inert = wasInert;
+      enhancePanel.classList.add("hidden");
+      if (App.hideModelPanelModal) App.hideModelPanelModal();
       toast("已保存：" + saved.map(function (item) { return item.label; }).join("、"));
       // 仅聊天模型更换才影响 token 估算口径；其他角色不影响聊天上下文统计。
       if (saved.some(function (item) { return item.role === "chat_model" && item.modelChanged; })) {
@@ -997,4 +1036,5 @@
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.openModelPanel = openModelPanel;
+  App.closeModelPanel = closeModelPanel;
 })(window.App);

@@ -124,7 +124,7 @@ def content_parts(content, session_id=None, *, role="user"):
     return result
 
 
-def convert_messages(messages, session_id=None, *, delta=False):
+def convert_messages(messages, session_id=None, *, delta=False, replay_config=None):
     items = []
     outputs = {}
     for message in messages:
@@ -133,6 +133,18 @@ def convert_messages(messages, session_id=None, *, delta=False):
         if role == "assistant":
             if delta:
                 continue  # Its actual output already belongs to the remote response.
+            reference = getattr(message, "provider_state", None) or data.get("provider_state")
+            if (replay_config is not None and session_id and isinstance(reference, dict)
+                    and reference.get("protocol") == "responses" and reference.get("record_id")):
+                from . import responses_store
+                record = responses_store.load_record(session_id, reference)
+                original = responses_store.load_record(session_id, {"protocol": "responses", "record_id": record["request_ref"]}) if record and record.get("request_ref") else None
+                if original and original.get("source_key") == responses_store.source_key(replay_config):
+                    # Complete native output preserves encrypted reasoning,
+                    # assistant phase and function call IDs across tool loops.
+                    items.extend(native_input_items([part for part in record["response"].get("output") or []
+                        if part.get("type") != "reasoning" or part.get("encrypted_content")]))
+                    continue
             parts = content_parts(data.get("content"), session_id, role=role)
             if parts:
                 items.append({"type": "message", "role": "assistant", "content": parts})

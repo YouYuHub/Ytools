@@ -166,8 +166,15 @@ window.App = window.App || {};
   const mediaPreviewModal = $("#mediaPreviewModal");
   const mediaPreviewBody = $("#mediaPreviewBody");
   const mediaPreviewTitle = $("#mediaPreviewTitle");
+  const mediaPreviewZoom = $("#mediaPreviewZoom");
+  const mediaPreviewZoomIn = $("#mediaPreviewZoomIn");
+  const mediaPreviewZoomOut = $("#mediaPreviewZoomOut");
+  const mediaPreviewZoomLabel = $("#mediaPreviewZoomLabel");
   const boostBtn = $("#boostBtn");
   const enhancePanel = $("#enhancePanel");
+  const enhanceModal = $("#enhanceModal");
+  const enhanceBody = $("#enhanceBody");
+  const enhanceScope = $("#enhanceScope");
   const enhanceClose = $("#enhanceClose");
   const modelTabs = $("#modelTabs");
   const modelPicker = $("#modelPicker");
@@ -176,6 +183,9 @@ window.App = window.App || {};
   const chatParametersGroup = $("#chatParametersGroup");
   const messagesParametersGroup = $("#messagesParametersGroup");
   const responsesParametersGroup = $("#responsesParametersGroup");
+  const responsesMode = $("#responsesMode");
+  const responsesModeHint = $("#responsesModeHint");
+  const responsesStatefulControls = $("#responsesStatefulControls");
   const responsesEffort = $("#responsesEffort");
   const responsesSummary = $("#responsesSummary");
   const responsesVerbosity = $("#responsesVerbosity");
@@ -500,19 +510,17 @@ window.App = window.App || {};
   function closeMenus() {
     themeMenu.classList.add("hidden");
     plusMenu.classList.add("hidden");
-    enhancePanel.classList.add("hidden");
-    // 面板是 body 级浮层（打开时重挂到 body），关闭时挂回 .composer 原位；
-    // 经 App.* 运行期解引用（composer.js 后于本文件加载才定义该方法）
-    if (App.dockEnhancePanel) App.dockEnhancePanel();
     sessionActionsMenu.classList.add("hidden");
     queueMenu.classList.add("hidden");
     state.composerSendMode = "";
   }
 
   function closeToolModal() {
+    if (App.toolModalSaving) return;
     toolModal.classList.add("hidden");
     toolModal.setAttribute("aria-hidden", "true");
     hideToolTip();
+    if (App.onToolModalClosed) App.onToolModalClosed();
   }
 
   $("#profileCard").addEventListener("click", function (e) {
@@ -538,6 +546,10 @@ window.App = window.App || {};
   });
   document.addEventListener("keydown", function (e) {
     if (e.key === "Escape") {
+      if (!enhancePanel.classList.contains("hidden")) {
+        if (!e.isComposing && App.closeModelPanel) App.closeModelPanel();
+        return;
+      }
       // 编辑中的用户消息优先消费 Esc（编辑/确认弹窗与模态框可并存）
       if (document.querySelector(".msg.msg-user.is-editing")) {
         App.cancelAnyUserEdit();
@@ -554,10 +566,6 @@ window.App = window.App || {};
 
   $("#toolModalClose").addEventListener("click", closeToolModal);
   $("#toolModalBackdrop").addEventListener("click", closeToolModal);
-  enhanceClose.addEventListener("click", function () {
-    enhancePanel.classList.add("hidden");
-    if (App.dockEnhancePanel) App.dockEnhancePanel();
-  });
   // 跨模块的 App.* 方法必须经包装函数在点击时再解引用：core.js 先于行为
   // 模块（sessions.js 等）加载，此刻 App.closeDeleteModal 还是 undefined，
   // 直接注册 addEventListener(type, undefined) 会被静默忽略（拆分单文件
@@ -745,10 +753,11 @@ window.App = window.App || {};
   composerQuotes, composerAttachmentBlocks, syncComposerAttachmentBlocks, fitAttachmentBlockGrid,
   todoPanelHost, askModal, askQuestions,
   askSubmit, mediaPreviewModal, mediaPreviewBody,
-  mediaPreviewTitle, boostBtn, enhancePanel,
+  mediaPreviewTitle, mediaPreviewZoom, mediaPreviewZoomIn, mediaPreviewZoomOut,
+  mediaPreviewZoomLabel, boostBtn, enhancePanel, enhanceModal, enhanceBody, enhanceScope,
   enhanceClose, modelTabs, modelPicker,
   modelPickerLabel, modelList, reasoningEffort,
-responsesParametersGroup, responsesEffort, responsesSummary, responsesVerbosity, responsesSampling, responsesTemperatureRow, responsesTemperature, responsesTemperatureValue, responsesTopPRow, responsesTopP, responsesTopPValue, responsesInstructions, responsesExtraBody, responsesStateHint, responsesRebuildSource, responsesRebuild,
+responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulControls, responsesEffort, responsesSummary, responsesVerbosity, responsesSampling, responsesTemperatureRow, responsesTemperature, responsesTemperatureValue, responsesTopPRow, responsesTopP, responsesTopPValue, responsesInstructions, responsesExtraBody, responsesStateHint, responsesRebuildSource, responsesRebuild,
   chatParametersGroup, messagesParametersGroup, enableThinking, temperature, temperatureValue,
   maxTokens, maxTokensValue, topP,
   topPValue, presencePenalty, presencePenaltyValue,

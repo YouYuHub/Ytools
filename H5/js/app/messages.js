@@ -384,6 +384,7 @@
     while (anchorNode && anchorNode.classList.contains("qnav-load-older")) {
       anchorNode = anchorNode.nextElementSibling;
     }
+    const anchorTop = anchorNode ? anchorNode.getBoundingClientRect().top : null;
     const pendingTools = {}; // 本段内部配对用（与主渲染队列隔离）
     const pendingCompactions = {};
     const segment = loadOlderState.records.slice(targetStart, targetStart + count);
@@ -410,8 +411,8 @@
     // 插入把锚点（及其下方内容）下推：按锚点位移回拨 scrollTop，视口内
     // 阅读位置保持不变；content-visibility 下新内容进入视口附近即真实渲染
     if (anchorNode && anchorNode.parentNode === chatInner) {
-      const delta = anchorNode.getBoundingClientRect().top - chatScroll.getBoundingClientRect().top;
-      if (delta > 0) {
+      const delta = anchorNode.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(delta) > 0.5) {
         const prev = chatScroll.style.scrollBehavior;
         chatScroll.style.scrollBehavior = "auto";
         chatScroll.scrollTop += delta;
@@ -2909,6 +2910,18 @@
             const message = typeof entry.message === "string" ? entry.message : "";
             if (message) body.appendChild(el("div", "agent-notice", "↻ " + message));
           }
+          // Search uses the parent JSONL event index, even after entries are
+          // aggregated into one agent block and tool calls/results share a UI.
+          if (Number.isInteger(entry.source_event_index)) {
+            const round = findRound(entry.seq);
+            if (round && entry.phase === "model_call") {
+              round.thinkBlock.wrap.dataset.agentEvent = String(entry.source_event_index);
+              round.contentEl.dataset.agentEvent = String(entry.source_event_index);
+            } else if (round && (entry.phase === "tool_start" || entry.phase === "tool_result")) {
+              const tool = findToolEntry(round, entry.tool_call_id);
+              if (tool) tool.wrap.dataset[entry.phase === "tool_result" ? "agentResultEvent" : "agentEvent"] = String(entry.source_event_index);
+            }
+          }
         });
         applyDone({
           status: record.status || "interrupted",
@@ -2918,6 +2931,11 @@
           error: record.error || "",
           ended_at: record.ended_at,
         });
+        if (Number.isInteger(record.done_event_index)) {
+          body.querySelectorAll(".agent-final-reply, .agent-error-detail").forEach(function (node) {
+            node.dataset.agentEvent = String(record.done_event_index);
+          });
+        }
         bindPermissions();
       },
       markReturned: markReturned,
@@ -4126,6 +4144,16 @@
 
   // ---------- 右侧问题导航 ----------
   let qnavUsers = [];
+  let qnavRippleBound = false;
+
+  function clearQnavRipple() {
+    qnavRail.querySelectorAll(".qnav-dash").forEach(function (d) {
+      d.classList.remove("near-1", "near-2");
+    });
+    qnavPanel.querySelectorAll(".qnav-item").forEach(function (item) {
+      item.classList.remove("peek");
+    });
+  }
 
   function rebuildQnav() {
     qnavUsers = Array.from(chatInner.querySelectorAll(".msg-user"));
@@ -4143,6 +4171,7 @@
     // 第 j 条负责问题段 [floor(j*n/D), floor((j+1)*n/D))，点击跳到段首问题；
     // 问题数不超过上限时一一对应，行为与原先完全一致。面板列表仍列出全部问题。
     const dashCount = Math.min(QNAV_MAX_DASHES, total);
+    const dashes = [];
     for (let j = 0; j < dashCount; j++) {
       const start = Math.floor(j * total / dashCount);
       const end = Math.floor((j + 1) * total / dashCount);
@@ -4153,7 +4182,39 @@
       const dash = el("button", "qnav-dash");
       dash.title = text;
       dash.addEventListener("click", function () { jumpToQuestion(start); });
+      dashes.push(dash);
       qnavRail.appendChild(dash);
+    }
+    // hover 涟漪：所在条最长（CSS :hover），相邻按距离加 near-1/near-2 渐短；
+    // 联动面板段首问题项高亮 peek。dash 随 rail 重建而销毁，监听不泄漏。
+    dashes.forEach(function (dash, j) {
+      dash.addEventListener("mouseenter", function () {
+        dashes.forEach(function (other, k) {
+          const dist = Math.abs(k - j);
+          other.classList.remove("near-1", "near-2");
+          if (dist === 1) other.classList.add("near-1");
+          else if (dist === 2) other.classList.add("near-2");
+        });
+        const segStart = Math.floor(j * total / dashCount);
+        qnavPanel.querySelectorAll(".qnav-item").forEach(function (item, i) {
+          if (i === segStart) item.classList.add("peek");
+          else item.classList.remove("peek");
+        });
+      });
+    });
+    // rail/panel 是持久元素：以下监听只绑定一次，回调查实时 DOM（不闭包旧 dashes）
+    if (!qnavRippleBound) {
+      qnavRippleBound = true;
+      qnavRail.addEventListener("mouseleave", clearQnavRipple);
+      // 轨道空隙/内边距上移动：无选中，清除残留涟漪（面板照常展开，
+      // 只剩 active 当前位置高亮）；回到横条上由 mouseenter 重新点亮
+      qnavRail.addEventListener("mousemove", function (e) {
+        const target = e && e.target;
+        const onDash = target && target.closest ? target.closest(".qnav-dash") : null;
+        if (!onDash || !qnavRail.contains(onDash)) clearQnavRipple();
+      });
+      // 面板浏览时轨道不抢焦点：进入面板即清除涟漪与 peek
+      qnavPanel.addEventListener("mouseenter", clearQnavRipple);
     }
 
     qnavUsers.forEach(function (userEl, i) {
@@ -4169,6 +4230,7 @@
   // ---------- 从用户引用卡片定位到原文 ----------
   let highlightedQuoteNode = null;
   let quoteHighlightTimer = null;
+  let restoreSearchVisibility = null;
 
   function quoteMatchText(value) {
     return String(value == null ? "" : value)
@@ -4315,9 +4377,52 @@
     return null;
   }
 
-  function revealQuoteSource(target, quoteText) {
+  // Search snippets include surrounding text so repeated words can resolve to
+  // the selected occurrence, including text split across Markdown inline nodes.
+  function searchTextAnchor(target, quoteText, snippet) {
+    const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let node, raw = "";
+    while ((node = walker.nextNode())) {
+      nodes.push({ node: node, start: raw.length });
+      raw += node.nodeValue || "";
+    }
+    const mapped = normalizedTextOffsets(raw);
+    const needle = quoteMatchText(quoteText);
+    if (!needle) return null;
+    const snippetText = snippet && snippet.text || "";
+    const snippetMap = normalizedTextOffsets(snippetText);
+    const context = snippetMap.text;
+    const contextAt = context ? mapped.text.indexOf(context) : -1;
+    const offset = Array.from(snippetText).slice(0, snippet && snippet.start || 0).join("").length;
+    const relative = snippetMap.starts.findIndex(start => start >= offset);
+    const candidate = contextAt >= 0 && relative >= 0 ? contextAt + relative : -1;
+    const at = candidate >= 0 && mapped.text.slice(candidate, candidate + needle.length) === needle
+      ? candidate : mapped.text.indexOf(needle, contextAt >= 0 ? contextAt : 0);
+    if (at < 0) return null;
+    const start = mapped.starts[at], end = mapped.ends[at + needle.length - 1];
+    const first = nodes.find(item => item.start + item.node.nodeValue.length > start);
+    const last = nodes.find(item => item.start + item.node.nodeValue.length >= end);
+    if (!first || !last) return null;
+    const range = document.createRange();
+    range.setStart(first.node, start - first.start); range.setEnd(last.node, end - last.start);
+    return { range: range, node: first.node.parentElement };
+  }
+
+  function revealQuoteSource(target, quoteText, options) {
+    options = options || {};
     if (quoteHighlightTimer != null) window.clearTimeout(quoteHighlightTimer);
+    if (window.CSS && window.CSS.highlights) window.CSS.highlights.delete("history-search-hit");
+    if (restoreSearchVisibility) { restoreSearchVisibility(); restoreSearchVisibility = null; }
     if (highlightedQuoteNode) highlightedQuoteNode.classList.remove("quote-source-highlight");
+    if (options.search) {
+      // Materialize the selected offscreen lazy message before measuring text.
+      let root = target;
+      while (root.parentElement && root.parentElement !== chatInner) root = root.parentElement;
+      const previous = root.style.contentVisibility;
+      root.style.contentVisibility = "visible";
+      restoreSearchVisibility = function () { root.style.contentVisibility = previous; };
+    }
     highlightedQuoteNode = target;
     target.classList.remove("quote-source-highlight");
     // 重复点击同一引用时重播一次闪烁动画。
@@ -4327,8 +4432,45 @@
       if (highlightedQuoteNode) highlightedQuoteNode.classList.remove("quote-source-highlight");
       highlightedQuoteNode = null;
       quoteHighlightTimer = null;
+      if (window.CSS && window.CSS.highlights) window.CSS.highlights.delete("history-search-hit");
+      if (restoreSearchVisibility) { restoreSearchVisibility(); restoreSearchVisibility = null; }
     }, 1900);
 
+    if (options.search) {
+      const anchor = searchTextAnchor(target, quoteText, options.snippet);
+      if (anchor && window.CSS && window.CSS.highlights && window.Highlight) {
+        window.CSS.highlights.set("history-search-hit", new window.Highlight(anchor.range));
+      }
+      // A deep match can be thousands of pixels below a scrollable tool <pre>.
+      // Scroll those inner containers first; using its unclipped text rectangle
+      // directly for the chat scroller would clamp the jump to the session end.
+      for (let host = anchor && anchor.node; host && host !== chatScroll; host = host.parentElement) {
+        const style = window.getComputedStyle(host);
+        const rect = anchor.range.getBoundingClientRect(), box = host.getBoundingClientRect();
+        const behavior = host.style.scrollBehavior;
+        host.style.scrollBehavior = "auto";
+        if (/auto|scroll/.test(style.overflowY) && host.scrollHeight > host.clientHeight) {
+          host.scrollTop += rect.top - box.top - (host.clientHeight - rect.height) / 2;
+        }
+        if (/auto|scroll/.test(style.overflowX) && host.scrollWidth > host.clientWidth) {
+          host.scrollLeft += rect.left - box.left - (host.clientWidth - rect.width) / 2;
+        }
+        host.style.scrollBehavior = behavior;
+      }
+      function align() {
+        if (highlightedQuoteNode !== target || !target.isConnected || (options.isCurrent && !options.isCurrent())) return;
+        const rect = anchor ? anchor.range.getBoundingClientRect() : target.getBoundingClientRect();
+        const box = chatScroll.getBoundingClientRect();
+        const behavior = chatScroll.style.scrollBehavior;
+        chatScroll.style.scrollBehavior = "auto";
+        chatScroll.scrollTop += rect.top - box.top - (chatScroll.clientHeight - rect.height) / 2;
+        chatScroll.style.scrollBehavior = behavior;
+      }
+      align();
+      // One bounded correction after lazy neighbours acquire their real height.
+      window.requestAnimationFrame(align);
+      return;
+    }
     const targetRect = quoteTextAnchorRect(target, quoteText) || target.getBoundingClientRect();
     const scrollRect = chatScroll.getBoundingClientRect();
     const top = chatScroll.scrollTop + targetRect.top - scrollRect.top
@@ -4444,9 +4586,28 @@
     if (!current()) return false;
     if (!target) target = chatInner.querySelector('.msg-user[data-round="' + round + '"]');
     if (!target) { toast("匹配记录可能已被编辑或删除，请重新搜索"); return false; }
-    if (target.matches(".think-block, .tool-block, .agent-block, .compaction-bar")) target.classList.add("open");
-    if (match.role === "sub_agent") target.querySelectorAll(".think-block, .tool-block").forEach(function (node) { node.classList.add("open"); });
-    revealQuoteSource(target, anchorText);
+    if (match.role === "sub_agent") {
+      const selector = match.field === "reasoning_content" ? ".think-block" : match.field === "content" ? ".agent-content"
+        : match.field === "arguments" || match.field === "result" ? ".tool-block"
+          : match.field === "final_reply" ? ".agent-final-reply" : match.field === "task" ? ".agent-task" : "[data-agent-event]";
+      const nodes = Array.from(target.querySelectorAll(selector));
+      const exact = nodes.find(node => node.getAttribute("data-agent-event") === String(match.event_index)
+        || node.getAttribute("data-agent-result-event") === String(match.event_index));
+      if (!exact) target.querySelectorAll(".think-block, .tool-block").forEach(function (node) { node.classList.add("open"); });
+      target = exact || nodes.find(node => String(node.textContent || "").includes(snippet && snippet.text || anchorText)) || target;
+    }
+    for (let host = target; host && host !== chatInner; host = host.parentElement) {
+      if (host.matches(".think-block, .tool-block, .agent-block, .compaction-bar")) {
+        host.classList.add("open");
+        const head = host.querySelector && host.querySelector('[aria-expanded]');
+        if (head) head.setAttribute("aria-expanded", "true");
+      }
+    }
+    if (target.matches(".tool-block") && target.querySelectorAll) {
+      const io = target.querySelectorAll(".tool-io");
+      target = io[match.field === "arguments" ? 0 : 1] || target;
+    }
+    revealQuoteSource(target, anchorText, { search: true, snippet: snippet, isCurrent: current });
     return true;
   }
 

@@ -5,9 +5,10 @@
   const modal = $("#historySearchModal"), input = $("#historySearchInput");
   const results = $("#historySearchResults"), status = $("#historySearchStatus");
   const more = $("#historySearchMore"), retry = $("#historySearchRetry");
+  const internal = $("#historySearchInternal"), filenames = $("#historySearchFilenames");
   let composing = false, returnFocus = null, navigating = 0, renderedQuery = "";
   const labels = { user: "用户", assistant: "助手", tool: "工具", sub_agent: "子智能体", compaction: "压缩摘要", session: "会话" };
-  const fields = { reasoning_content: "思考", arguments: "工具参数", result: "工具结果", quote: "引用", error: "错误", filename: "文件名", title: "标题", task: "任务", final_reply: "最终回复" };
+  const fields = { content: "正文", reasoning_content: "思考", arguments: "工具参数", result: "工具结果", quote: "引用", error: "错误", filename: "文件名", title: "标题", task: "任务", final_reply: "最终回复", summary_text: "压缩摘要", compress_content: "压缩原文", todos: "计划" };
 
   function excerpt(snippet) {
     const wrap = el("div", "history-search-excerpt");
@@ -23,30 +24,30 @@
     renderedQuery = data.query;
     const busy = data.status === "pending" || data.status === "loading" || data.status === "more";
     results.setAttribute("aria-busy", String(busy));
-    if (data.status === "idle") status.textContent = "搜索所有已保存会话的标题、文件名和聊天记录";
+    if (data.status === "idle") status.textContent = "搜索所有已保存会话的" + (internal.checked ? "聊天内容、工具与内部记录" : "用户问题、主助手回答正文") + "和标题" + (filenames.checked ? "，包含会话文件名" : "");
     else if (data.status === "pending" || data.status === "loading") status.textContent = "正在搜索…首次搜索可能需要稍候";
     else if (data.status === "error") status.textContent = "搜索失败：" + data.error;
     else status.textContent = data.total ? data.total + " 条匹配 · " + data.session_count + " 个会话" : "没有找到匹配的会话记录";
     if (data.skipped_files || data.skipped_lines) status.textContent += " · 部分正在变化或损坏的记录已跳过，可重试";
     results.replaceChildren();
-    let group = null, previous = null;
     (data.results || []).forEach(function (match) {
-      if (previous !== match.session_id) {
-        group = el("section", "history-search-group");
-        group.appendChild(el("h3", "", match.title || match.session_id));
-        group.appendChild(el("div", "history-search-filename", match.filename));
-        results.appendChild(group);
-        previous = match.session_id;
-      }
       const button = el("button", "history-search-hit");
       button.type = "button";
       button.disabled = busy;
+      button.appendChild(el("div", "history-search-hit-title", match.title || match.session_id || "未命名会话"));
+      button.appendChild(el("div", "history-search-filename", match.filename || match.session_id + "_chat.jsonl"));
       button.appendChild(el("div", "history-search-hit-meta", (match.round_no ? "第 " + match.round_no + " 轮 · " : "")
         + (labels[match.role] || "记录") + (fields[match.field] ? " · " + fields[match.field] : "")
         + (match.timestamp ? " · " + match.timestamp : "")));
-      (match.snippets || []).forEach(function (snippet) { button.appendChild(excerpt(snippet)); });
-      button.addEventListener("click", function () { openMatch(match, data.query); });
-      group.appendChild(button);
+      (match.snippets || []).forEach(function (snippet, index) {
+        const node = excerpt(snippet); node.dataset.snippetIndex = String(index); button.appendChild(node);
+      });
+      button.addEventListener("click", function (event) {
+        const snippetNode = event.target.closest("[data-snippet-index]");
+        const snippet = snippetNode && match.snippets[Number(snippetNode.dataset.snippetIndex)];
+        openMatch(snippet ? Object.assign({}, match, { snippets: [snippet] }) : match, data.query);
+      });
+      results.appendChild(button);
     });
     results.scrollTop = scrollTop;
     more.hidden = data.next_offset == null;
@@ -55,6 +56,12 @@
     retry.hidden = data.status !== "error";
   }
   const controller = HistorySearch.createController(API.searchHistory, render);
+  function updateScope() {
+    input.placeholder = (internal.checked ? "搜索会话内容、标题" : "搜索问题、回答正文、标题") + (filenames.checked ? "或文件名…" : "…");
+    controller.setScope({ includeInternal: internal.checked, includeFilenames: filenames.checked }, composing);
+  }
+  internal.addEventListener("change", updateScope);
+  filenames.addEventListener("change", updateScope);
 
   function open() {
     returnFocus = document.activeElement;
@@ -74,13 +81,18 @@
   async function openMatch(match, query) {
     const mine = ++navigating;
     close();
-    const opened = await App.openSession(match.session_id);
-    if (opened === false || mine !== navigating || state.sessionId !== match.session_id) return;
-    if (match.round_no && App.jumpToHistoryMatch) {
-      await App.jumpToHistoryMatch(match, query, function () { return mine === navigating && state.sessionId === match.session_id; });
+    try {
+      const opened = await App.openSession(match.session_id);
+      if (opened === false || mine !== navigating || state.sessionId !== match.session_id) return;
+      if (match.round_no && App.jumpToHistoryMatch) {
+        await App.jumpToHistoryMatch(match, query, function () { return mine === navigating && state.sessionId === match.session_id; });
+      }
+    } catch (error) {
+      if (mine === navigating && App.toast) App.toast("定位搜索结果失败：" + (error.message || "请重新搜索"));
     }
   }
   $("#searchBtn").addEventListener("click", open);
+  $("#railSearch").addEventListener("click", open);
   $("#historySearchClose").addEventListener("click", close);
   $("#historySearchBackdrop").addEventListener("click", close);
   input.addEventListener("compositionstart", function () { composing = true; controller.update(input.value, true); });

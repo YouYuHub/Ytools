@@ -73,3 +73,36 @@ test("roundtrip: 倍率 <-> 百分比换算幂等（经 normalizePercent 归一�
     assert.equal(scale, s, "scale " + s);
   });
 });
+
+test("zoomAtPoint: 锚点缩放保持锚下图像点不动", function () {
+  // 中心 100,100，锚点 150,100（中心右侧 50px），1x -> 2x：
+  // 位移应为 -50（图像左移，锚下内容不动）
+  const r = ZoomUtils.zoomAtPoint(1, 2, 150, 100, 100, 100, 0, 0);
+  assert.equal(r.scale, 2);
+  assert.equal(r.tx, -50);
+  assert.equal(r.ty, 0);
+  // 逆向缩小回到 1x：位移归零
+  const back = ZoomUtils.zoomAtPoint(2, 0.5, 150, 100, 100, 100, r.tx, r.ty);
+  assert.equal(back.scale, 1);
+  assert.ok(Math.abs(back.tx) < 1e-9);
+  assert.ok(Math.abs(back.ty) < 1e-9);
+});
+
+test("zoomAtPoint: 中心缩放位移不变，越界钳制到档位边界", function () {
+  const c = ZoomUtils.zoomAtPoint(2, 1.5, null, null, 0, 0, 30, -20);
+  assert.equal(c.scale, 3);
+  assert.equal(c.tx, 30);
+  assert.equal(c.ty, -20);
+  assert.equal(ZoomUtils.zoomAtPoint(8, 2, null, null, 0, 0, 0, 0).scale, 8);
+  assert.equal(ZoomUtils.zoomAtPoint(0.5, 0.5, null, null, 0, 0, 0, 0).scale, 0.5);
+  assert.equal(ZoomUtils.zoomAtPoint(NaN, NaN, null, null, 0, 0, 0, 0).scale, 1);
+});
+
+test("clampPan: 边缘不超过容器中心，小图归零", function () {
+  // 1000px 图在 400px 容器中：半溢出 300
+  assert.deepEqual(ZoomUtils.clampPan(500, -500, 1000, 1000, 400, 400), { tx: 300, ty: -300 });
+  assert.deepEqual(ZoomUtils.clampPan(100, 100, 1000, 1000, 400, 400), { tx: 100, ty: 100 });
+  // 图小于容器：位移归零
+  assert.deepEqual(ZoomUtils.clampPan(100, 100, 200, 200, 400, 400), { tx: 0, ty: 0 });
+  assert.deepEqual(ZoomUtils.clampPan(NaN, NaN, 1000, 1000, 400, 400), { tx: 0, ty: 0 });
+});

@@ -266,7 +266,7 @@ def _build_title_request(source_content: Any, session_id: str | None) -> ChatLLM
         import uuid
         request.responses_context = {"scope": "title_model:" + uuid.uuid4().hex}
         request.max_output_tokens = int(parameter.get("max_output_tokens") or max(512, request.max_tokens))
-    for key in ("thinking", "output_config", "stop_sequences", "instructions", "reasoning", "text"):
+    for key in ("thinking", "output_config", "stop_sequences", "instructions", "reasoning", "text", "responses_mode"):
         if parameter.get(key) is not None:
             setattr(request, key, parameter[key])
     return request

@@ -5,11 +5,16 @@ import inspect
 from chat.protocols import normalize_api_type, responses_store
 from chat.responses_client import compact, remote_compaction_needed
 from config import ChatLLMRequest
+from chat.protocols.responses import response_mode
 
 
 async def coordinate(local_call, request, config, *, emitter=None, manual=False, manager=None):
     scope = (request.responses_context or {}).get("scope") or "chat_model"
     if normalize_api_type(config.get("apiType")) != "responses":
+        return await local_call(emitter)
+    if response_mode(request, config) == "stateless":
+        # The next request is rebuilt from the resulting local context, so
+        # no remote chain or remote compaction activation is required.
         return await local_call(emitter)
     state = responses_store.load_state(request.session_id, scope)
     if not state.get("head_response_id"):

@@ -63,7 +63,7 @@ python main.py
 - 内置文件工具按需勾选：`read_file` 有 64 MiB 读取上限，默认连续读取 200 行，并用 `next_start_line` 指示续读；`edit_file` 支持单处替换或 `edits` 列表一次完成多处替换，`expected_hash` 可校验读后变更；`write_file` 的新调用须明确指定 `mode=create|overwrite|append`，旧调用参数仍兼容；`search_files` 默认按普通文本搜索，正则需指定 `is_regex=true`。勾选 `run_command` 后，模型还可使用 `poll_command`、`stop_command` 管理后台任务；已有会话可在「配置工具」中选择默认 shell。`read_media` 对仍在上下文的图片避免重复注入，已回收的视频区间可以重新读取。
 - 修改保存后自动热重载生效，无需重启服务。
 
-Responses 使用 Python 标准库直接调用 HTTP/JSON/SSE，无需 OpenAI SDK；以 `store: true` 和 `previous_response_id` 增量续聊，支持本地摘要与官方压缩并行、一次重新同步、图片/文档工具及异常恢复。前端显示本地上下文，远端状态单独维护；详见 [Responses 使用说明](docs/responses_api_usage.md) 与 [适配方案](docs/responses_api_stateful_plan.md)。
+Responses 使用 Python 标准库直接调用 HTTP/JSON/SSE，无需 OpenAI SDK；默认以 `store: true` 和 `previous_response_id` 增量续聊，也可在模型参数面板选择“无状态兼容”，使用 `store: false` 每次发送有效本地上下文。支持图片/文档工具及异常处理；有状态并行保留本地摘要与官方压缩，无状态仅使用本地摘要。前端显示本地上下文；详见 [Responses 使用说明](docs/responses_api_usage.md)、[无状态兼容排查](docs/responses_stateless_2026-10-16.md) 与 [原有状态方案](docs/responses_api_stateful_plan.md)。
 
 ## 开发 MCP 工具（setting/mcp_servers.json）
 

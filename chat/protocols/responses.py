@@ -1,4 +1,4 @@
-"""Stateful Responses wire protocol and typed SSE assembly."""
+"""Responses wire protocol, context modes and typed SSE assembly."""
 import copy
 import json
 from urllib.parse import urlsplit, urlunsplit
@@ -19,8 +19,15 @@ def endpoint(url):
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
 
 
+def response_mode(request, config):
+    mode = getattr(request, "responses_mode", None) or config.get("responsesMode") or "stateful"
+    if mode not in {"stateful", "stateless"}:
+        raise ResponsesProtocolError("Responses 模式必须为 stateful 或 stateless")
+    return mode
+
+
 def parameters(request, config, stream):
-    result = {"model": config["selected_model_id"], "store": True, "stream": stream,
+    result = {"model": config["selected_model_id"], "store": response_mode(request, config) == "stateful", "stream": stream,
               "truncation": "disabled", "include": ["reasoning.encrypted_content"]}
     explicit = getattr(request, "model_fields_set", set())
     budget = request.max_output_tokens if request.max_output_tokens is not None else request.max_tokens
@@ -38,7 +45,7 @@ def parameters(request, config, stream):
     reserved = {"model", "store", "stream", "input", "instructions", "tools", "tool_choice",
                 "previous_response_id", "conversation", "max_tokens", "max_output_tokens",
                 "presence_penalty", "enable_thinking", "thinking", "output_config",
-                "stop", "stop_sequences", "stream_options", "context_management", "background"}
+                "stop", "stop_sequences", "stream_options", "context_management", "background", "responses_mode"}
     include = (request.extra_body or {}).get("include")
     if isinstance(include, list):
         result["include"] = list(dict.fromkeys([*result["include"], *include]))
@@ -72,12 +79,12 @@ def parameters(request, config, stream):
     return result
 
 
-def normalize_response(response):
+def normalize_response(response, *, require_stored=True):
     response_id = response.get("id")
     if not isinstance(response_id, str) or not response_id:
         raise ResponsesProtocolError("Responses 成功响应缺少 response.id")
-    if response.get("store") is False:
-        raise ResponsesProtocolError("平台未保存响应，本项目 Responses 模式要求有状态存储")
+    if require_stored and response.get("store") is False:
+        raise ResponsesProtocolError("平台未保存响应，请在模型参数中选择无状态 Responses 兼容模式")
     status = response.get("status")
     if status != "completed":
         detail = response.get("error") or response.get("incomplete_details") or {"status": status}
@@ -123,7 +130,8 @@ def normalize_response(response):
 
 
 class ResponsesStream:
-    def __init__(self):
+    def __init__(self, *, require_stored=True):
+        self.require_stored = require_stored
         self.response = None
         self.response_id = None
         self.content = ""
@@ -156,7 +164,7 @@ class ResponsesStream:
         if kind in {"response.completed", "response.failed", "response.incomplete"}:
             self.response = copy.deepcopy(event.get("response") or {})
             self.response_id = self.response.get("id") or self.response_id
-            normalized = normalize_response(self.response)
+            normalized = normalize_response(self.response, require_stored=self.require_stored)
             events = []
             for field, received in (("content", self.content), ("reasoning_content", self.reasoning)):
                 final = normalized.pop(field, "")

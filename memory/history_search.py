@@ -146,6 +146,7 @@ def _schema(db: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY, filename TEXT, round_no INTEGER, event_index INTEGER,
             role TEXT, field TEXT, text TEXT, search_text TEXT, timestamp TEXT, agent_id TEXT);
         CREATE INDEX IF NOT EXISTS documents_file ON documents(filename);
+        CREATE INDEX IF NOT EXISTS documents_scope ON documents(role,field);
     """)
     db.execute("INSERT OR REPLACE INTO settings VALUES ('version',?)", (str(_INDEX_VERSION),))
     db.execute("INSERT OR IGNORE INTO settings VALUES ('revision',?)", (uuid.uuid4().hex,))
@@ -227,7 +228,8 @@ def _snippets(text: str, query: str) -> list[dict]:
 
 def search_history(query: str, *, limit: int = 40, offset: int = 0,
                    revision: str | None = None, cancel: threading.Event | None = None,
-                   root: Path | None = None) -> dict:
+                   root: Path | None = None, include_internal: bool = False,
+                   include_filenames: bool = False) -> dict:
     from memory import chat_memory
     root = Path(root if root is not None else chat_memory.HISTORY_ROOT)
     query = query.strip()
@@ -247,12 +249,20 @@ def search_history(query: str, *, limit: int = 40, offset: int = 0,
         _schema(db)
         skipped_files = _sync(db, root, cancel)
         current = db.execute("SELECT value FROM settings WHERE key='revision'").fetchone()[0]
-        snapshot = hashlib.sha256((current + "\0" + query.casefold()).encode()).hexdigest()[:24]
+        scope = f"{int(include_internal)}:{int(include_filenames)}"
+        snapshot = hashlib.sha256((current + "\0" + query.casefold() + "\0" + scope).encode()).hexdigest()[:24]
         if revision and revision != snapshot:
             raise SearchSnapshotChanged("会话记录已变化，请重新搜索")
         needle = query.casefold()
         args = [needle]
-        source = "FROM documents d JOIN sessions s ON s.filename=d.filename WHERE instr(d.search_text,?) > 0"
+        # Apply scope inside SQLite, before counting/paging. The role/field index
+        # keeps the default query from scanning large tool/reasoning bodies.
+        categories = ["(d.role='session' AND d.field='title')"]
+        categories.append("d.role!='session'" if include_internal else "(d.role IN ('user','assistant') AND d.field='content')")
+        if include_filenames:
+            categories.append("(d.role='session' AND d.field='filename')")
+        source = ("FROM documents d JOIN sessions s ON s.filename=d.filename WHERE ("
+                  + " OR ".join(categories) + ") AND instr(d.search_text,?) > 0")
         # Scan normalized text once; never sort/copy large message bodies just
         # to paginate. Only the selected page reads the original display text.
         matches = db.execute("SELECT d.id,s.filename " + source
@@ -269,6 +279,7 @@ def search_history(query: str, *, limit: int = 40, offset: int = 0,
                            | {"id": row["id"], "snippets": snippets})
         skipped_lines = db.execute("SELECT coalesce(sum(skipped),0) FROM sessions").fetchone()[0]
         return {"query": query, "results": results, "total": total, "session_count": session_count,
+                "include_internal": include_internal, "include_filenames": include_filenames,
                 "offset": offset, "next_offset": offset + len(results) if offset + len(results) < total else None,
                 "revision": snapshot, "skipped_files": skipped_files, "skipped_lines": skipped_lines}
     except sqlite3.OperationalError:

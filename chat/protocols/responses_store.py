@@ -141,9 +141,9 @@ def _mirror(session_id, state):
 
 def public_state(state, *, include_ids=False):
     keys = ("version", "scope", "status", "generation", "chain_epoch", "created_at", "compact_strategy",
-            "head_created_at", "chain_started_at", "last_compaction", "rebuild_source", "error")
+            "head_created_at", "chain_started_at", "last_compaction", "rebuild_source", "error", "responses_mode")
     result = {key: copy.deepcopy(state[key]) for key in keys if key in state}
-    result["has_remote_head"] = bool(state.get("head_response_id"))
+    result["has_remote_head"] = bool(state.get("head_response_id")) and state.get("responses_mode") != "stateless"
     result["has_compacted_window"] = bool(state.get("pending_compaction_ref"))
     if include_ids:
         for key in ("head_response_id", "head_record_id", "pending_request_ref",
@@ -151,7 +151,7 @@ def public_state(state, *, include_ids=False):
             if key in state:
                 result[key] = state[key]
     started = state.get("chain_started_at") or state.get("head_created_at")
-    result["age_risk"] = bool(started and time.time() - started >= 20 * 86400)
+    result["age_risk"] = bool(started and time.time() - started >= 20 * 86400) and state.get("responses_mode") != "stateless"
     return result
 
 
@@ -163,7 +163,7 @@ def invalidate(session_id, reason, scope="chat_model", *, source="local", mirror
                      pending_compaction_ref=None, rebuild_source=source, error=reason,
                      chain_epoch=uuid.uuid4().hex)
         state.pop("compaction_lease", None)
-        for key in ("source_key", "compact_strategy", "last_compaction", "chain_started_at", "head_created_at"):
+        for key in ("source_key", "compact_strategy", "last_compaction", "chain_started_at", "head_created_at", "responses_mode", "omit_encrypted_include_with_previous"):
             state.pop(key, None)
         _write(_state_path(session_id, scope), state)
     if mirror:
@@ -193,10 +193,19 @@ def begin_request(session_id, scope, payload, config, input_ids, context_revisio
                   "parent_record_ref": state.get("head_record_id") if expected_head else None,
                   "response_id": None, "status": "planned"}
         _write(_record_path(session_id, record_id), record)
-        state.update(pending_request_ref=record_id, status="request_pending")
+        state.update(pending_request_ref=record_id, status="request_pending",
+                     responses_mode="stateless" if payload.get("store") is False else "stateful")
         _write(_state_path(session_id, scope), state)
     _mirror(session_id, state)
     return record
+
+
+def omit_encrypted_include_with_previous(session_id, scope):
+    with _guard(session_id, scope):
+        state = load_state(session_id, scope)
+        state["omit_encrypted_include_with_previous"] = True
+        _write(_state_path(session_id, scope), state)
+    return state
 
 
 def note_response_id(session_id, record, response_id):

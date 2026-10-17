@@ -1024,8 +1024,7 @@
     if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     state.hasConversation = false;
     state.importedHistoryText = null;
-    enhancePanel.classList.add("hidden");
-    if (App.dockEnhancePanel) App.dockEnhancePanel(); // body 级浮层挂回 .composer 原位
+    if (App.closeModelPanel) App.closeModelPanel();
     chatInner.innerHTML = "";
     setEmpty(true);
     App.setSessionTotalTokens(0);

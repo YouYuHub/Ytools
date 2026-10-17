@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -12,6 +13,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "history_files" / "state"
 DATABASE_NAME = "permission_runtime.sqlite3"
+SHARE_DATABASE_PATH = "state/permission_runtime.sqlite3"
+SHARE_DATABASE_MAX_BYTES = 2 * 1024 * 1024
+SHARE_FORMAT = "ytools.session-permissions"
 _migration_lock = threading.Lock()
 
 
@@ -145,6 +149,105 @@ def set_policy(mode, session=None):
         else:
             db.execute("INSERT OR REPLACE INTO policies VALUES(?,?)", (scope, mode))
     return policy(session)
+
+
+def export_session_policies(sessions):
+    """Build a standalone SQLite snapshot of selected overrides, including inherit.
+
+    Read committed rows rather than copying the live file: WAL contents are
+    included, while global policy, requests, checkpoints and grants stay local.
+    """
+    sessions = list(dict.fromkeys(sessions))
+    scopes = ["session:" + session for session in sessions]
+    with database() as db:
+        modes = dict(db.execute(
+            "SELECT scope,mode FROM policies WHERE scope IN (" + ",".join("?" for _ in scopes) + ")",
+            scopes,
+        ).fetchall()) if scopes else {}
+    with tempfile.TemporaryDirectory(prefix="ytools-permissions-") as scratch:
+        path = Path(scratch) / DATABASE_NAME
+        db = sqlite3.connect(path)
+        try:
+            with db:
+                db.execute("CREATE TABLE share_metadata(format TEXT NOT NULL, version INTEGER NOT NULL)")
+                db.execute("INSERT INTO share_metadata VALUES(?,1)", (SHARE_FORMAT,))
+                db.execute("CREATE TABLE policies(scope TEXT PRIMARY KEY, mode TEXT)")
+                for scope in scopes:
+                    mode = modes.get(scope)
+                    if mode not in {None, "ask", "full_control"}:
+                        raise ValueError("会话权限配置无效，无法分享")
+                    db.execute("INSERT INTO policies VALUES(?,?)", (scope, mode))
+        finally:
+            db.close()
+        return path.read_bytes()
+
+
+def read_shared_policies(raw, sessions):
+    """Validate an untrusted snapshot in isolation; never attach or replace it.
+
+    Every packaged session has a row. NULL means inherit the receiver's global
+    policy, and an override is mapped to the final imported session ID later.
+    """
+    if not raw or len(raw) > SHARE_DATABASE_MAX_BYTES or not raw.startswith(b"SQLite format 3\0"):
+        raise ValueError("分享包权限数据库无效或超过大小限制")
+    expected = {"session:" + session for session in sessions}
+    try:
+        with tempfile.TemporaryDirectory(prefix="ytools-permissions-read-") as scratch:
+            path = Path(scratch) / DATABASE_NAME
+            path.write_bytes(raw)
+            db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("PRAGMA trusted_schema=OFF")
+                # Bound work even for deliberately malformed SQLite schemas.
+                budget = 1000
+                def progress():
+                    nonlocal budget
+                    budget -= 1
+                    return budget <= 0
+                db.set_progress_handler(progress, 1000)
+                objects = db.execute("SELECT type,name,sql FROM sqlite_master").fetchall()
+                tables = {name for kind, name, sql in objects if kind == "table"}
+                if tables != {"policies", "share_metadata"} or any(
+                    kind not in {"table", "index"} or (kind == "index" and sql is not None)
+                    or (kind == "table" and "virtual" in (sql or "").lower())
+                    for kind, name, sql in objects
+                ):
+                    raise ValueError("分享包权限库只能包含会话配置")
+                if db.execute("SELECT format,version FROM share_metadata LIMIT 2").fetchall() != [(SHARE_FORMAT, 1)]:
+                    raise ValueError("分享包权限数据库版本不支持")
+                rows = db.execute("SELECT scope,mode FROM policies LIMIT ?", (len(expected) + 1,)).fetchall()
+                if len(rows) != len(expected) or {scope for scope, _ in rows} != expected:
+                    raise ValueError("分享包权限配置与会话清单不一致")
+                result = {}
+                for scope, mode in rows:
+                    if mode not in {None, "ask", "full_control"}:
+                        raise ValueError("分享包包含无效的会话权限模式")
+                    result[scope[len("session:"):]] = mode
+                return result
+            finally:
+                db.close()
+    except sqlite3.Error as error:
+        raise ValueError("分享包权限数据库损坏或格式不受支持") from error
+
+
+def assert_session_importable(session):
+    """Replacing history must not leave a resumable task for the old history."""
+    with database() as db:
+        active = db.execute("SELECT 1 FROM tasks WHERE session=? AND state IN ('running','suspended') LIMIT 1", (session,)).fetchone()
+    if active:
+        raise ValueError("该会话仍有运行或挂起的任务，请先停止或放弃任务后再覆盖导入")
+
+
+def merge_shared_policy(session, mode):
+    """Merge one validated override; never touch the global or other sessions."""
+    if not session or mode not in {None, "ask", "full_control"}:
+        raise ValueError("分享包会话权限配置无效")
+    with database() as db:
+        if mode is None:
+            db.execute("DELETE FROM policies WHERE scope=?", ("session:" + session,))
+        else:
+            db.execute("INSERT OR REPLACE INTO policies VALUES(?,?)", ("session:" + session, mode))
 
 
 def task(task_id):

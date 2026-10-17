@@ -68,3 +68,34 @@ test("Enter flushes immediately; network errors remain retryable", async () => {
   h.requests[1].resolve(result("query", [1])); await sleep(1); assert.equal(h.state().status, "ready");
   h.controller.close();
 });
+
+test("scope changes abort old pagination, reset counts, and reject late results", async () => {
+  const h=harness();h.controller.open('hit');await sleep(10);
+  assert.equal(h.requests[0].options.includeInternal,false);
+  assert.equal(h.requests[0].options.includeFilenames,false);
+  h.requests[0].resolve(result('hit',[1],1));await sleep(1);
+  h.controller.more();
+  h.controller.setScope({includeInternal:true,includeFilenames:false});
+  assert.equal(h.requests[1].options.signal.aborted,true);
+  assert.equal(h.state().total,0);assert.equal(h.state().next_offset,null);
+  h.requests[1].resolve(result('hit',['stale']));await sleep(10);
+  assert.deepEqual(h.state().results,[]);
+  assert.equal(h.requests[2].options.offset,0);assert.equal(h.requests[2].options.revision,null);
+  assert.equal(h.requests[2].options.includeInternal,true);
+  h.requests[2].resolve(result('hit',[2],1));await sleep(1);
+  h.controller.more();assert.equal(h.requests[3].options.includeInternal,true);
+  h.controller.setScope({includeInternal:false,includeFilenames:true});await sleep(10);
+  assert.equal(h.requests[4].options.includeInternal,false);assert.equal(h.requests[4].options.includeFilenames,true);
+  h.requests[4].resolve(result('hit',[3]));await sleep(1);
+  assert.deepEqual(h.state().results.map(r=>r.id),[3]);h.controller.close();
+});
+
+test("scope switches respect Chinese IME composition and survive closing/reopening", async () => {
+  const h=harness();h.controller.open('');h.controller.update('中',true);
+  h.controller.setScope({includeInternal:true},true);await sleep(10);
+  assert.equal(h.requests.length,0);
+  h.controller.update('中文');await sleep(10);
+  assert.equal(h.requests[0].query,'中文');assert.equal(h.requests[0].options.includeInternal,true);
+  h.controller.close();h.controller.open('中文');await sleep(10);
+  assert.equal(h.requests[1].options.includeInternal,true);h.controller.close();
+});

@@ -1,4 +1,4 @@
-"""Stateful Responses orchestration; HTTP transport uses the standard library."""
+"""Responses orchestration; HTTP transport uses the standard library."""
 import asyncio
 import copy
 import hashlib
@@ -10,7 +10,7 @@ from email.utils import parsedate_to_datetime
 from datetime import timezone
 
 from .protocols import responses_store
-from .protocols.responses import endpoint, normalize_response, ResponsesStream
+from .protocols.responses import endpoint, normalize_response, ResponsesStream, response_mode
 from .protocols.responses_content import native_input_items
 from .protocols.errors import ResponsesProtocolError, ResponsesUpstreamError
 from .responses_transport import AsyncClient, SyncClient, Stopped
@@ -117,8 +117,30 @@ def _retryable(exc):
 def _parent_missing(exc):
     status = getattr(exc, "status_code", None)
     detail = str(exc).lower()
-    return status in {400, 404} and ("previous_response" in detail or "previous response" in detail) and any(
+    return status in {400, 404} and ("previous_response" in detail or "previous response" in detail or "referenced response" in detail) and any(
         text in detail for text in ("not found", "not_found", "does not exist", "expired", "不存在"))
+
+
+def _include_conflict(payload, exc):
+    detail = str(exc).lower()
+    return (getattr(exc, "status_code", None) == 400 and payload.get("previous_response_id")
+            and "reasoning.encrypted_content" in payload.get("include", [])
+            and "reasoning.encrypted_content" in detail and "previous_response_id" in detail
+            and any(text in detail for text in ("cannot be used", "not supported", "不能同时")))
+
+
+def _adjust_include(request, payload, record, exc):
+    responses_store.abandon_request(request.session_id, record, exc)
+    state = responses_store.omit_encrypted_include_with_previous(request.session_id, record["scope"])
+    payload = copy.deepcopy(payload)
+    payload["include"] = [value for value in payload.get("include", []) if value != "reasoning.encrypted_content"]
+    if not payload["include"]:
+        payload.pop("include")
+    return payload, state
+
+
+def _stateless_interrupted(exc):
+    return ResponsesProtocolError("无状态 Responses 响应中断，平台无法通过响应 ID 查询恢复；未完成响应中的工具不会执行，可再次发送继续。详情：" + error_detail(exc))
 
 
 def _rebase(payload, session_id, state):
@@ -135,7 +157,7 @@ def _rebase(payload, session_id, state):
 
 
 def _commit(request, record, response):
-    normalized = normalize_response(response)
+    normalized = normalize_response(response, require_stored=record["payload"].get("store") is not False)
     reference = responses_store.commit_response(request.session_id, record, response)
     from factory.agent_runtime.responses_context import committed
     committed(request, record["input_ids"])
@@ -206,6 +228,10 @@ async def _recover_pending(transport, client, query, request, config, stop):
     pending = responses_store.pending_request(request.session_id, scope)
     if pending is None:
         return None
+    if response_mode(request, config) == "stateless" or (pending.get("payload") or {}).get("store") is False:
+        responses_store.abandon_request(request.session_id, pending, "无状态请求无法查询恢复")
+        responses_store.invalidate(request.session_id, "无状态请求无法查询恢复，使用已确认的本地上下文", scope)
+        return "上次未完成的响应不会执行工具，将从本地上下文继续"
     if pending.get("source_key") != responses_store.source_key(config):
         responses_store.invalidate(request.session_id, "账户或模型已变化", scope)
         return "已按当前模型准备重新建立会话"
@@ -243,7 +269,8 @@ async def async_stream(transport, request, config, stop=None):
     client, query = _client(config, request, asynchronous=True)
     _stop_client(client, stop)
     payload, ids, state, record = None, None, None, None
-    assembly = ResponsesStream()
+    stateless = response_mode(request, config) == "stateless"
+    assembly = ResponsesStream(require_stored=not stateless)
     maximum, attempt, rebuilt = _maximum(), 0, False
     try:
         recovered = await _recover_pending(transport, client, query, request, config, stop)
@@ -306,24 +333,31 @@ async def async_stream(transport, request, config, stop=None):
                 raise ConnectionError("Responses 流提前结束，正在确认远端响应")
             except asyncio.CancelledError:
                 if record:
-                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=bool(assembly.response_id))
+                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=bool(assembly.response_id) and not stateless)
                 raise
             except Exception as exc:
                 if record and operation != "retrieve":
                     responses_store.note_request_failure(request.session_id, record, operation, exc, error_detail(exc))
-                if not rebuilt and _parent_missing(exc):
+                if not assembly.response_id and record and _include_conflict(payload, exc):
+                    payload, state = _adjust_include(request, payload, record, exc)
+                    record, assembly = None, ResponsesStream(require_stored=not stateless)
+                    yield _sse({"warning": {"code": "RESPONSES_INCLUDE_COMPAT", "message": "有状态兼容：已移除平台拒绝的推理密文返回选项，保留响应 ID 继续；未切换为无状态"}})
+                    continue
+                if not rebuilt and payload.get("previous_response_id") and _parent_missing(exc):
                     responses_store.abandon_request(request.session_id, record, exc)
                     payload = _rebase(payload, request.session_id, state)
                     record, rebuilt, assembly = None, True, ResponsesStream()
-                    yield _sse({"warning": {"code": "RESPONSES_REBUILT", "message": "远端响应已失效，使用本地原生窗口重新建立会话"}})
+                    yield _sse({"warning": {"code": "RESPONSES_REBUILT", "message": "有状态续接失败：本次回传本地原生上下文重建响应链，仍为有状态模式；若反复出现，请选择“无状态兼容”"}})
                     continue
                 attempt += 1
+                if stateless and (assembly.response_id or assembly.content or assembly.reasoning) and _retryable(exc):
+                    exc = _stateless_interrupted(exc)
                 retrying = _retryable(exc) and (maximum <= 0 or attempt < maximum)
                 if isinstance(exc, ResponsesUpstreamError) and exc.response:
                     record["terminal_response"] = exc.response
                 if not retrying and record:
                     responses_store.abandon_request(request.session_id, record, exc,
-                                                    unknown=bool(assembly.response_id) and not isinstance(exc, ResponsesUpstreamError))
+                                                    unknown=bool(assembly.response_id) and not stateless and not isinstance(exc, ResponsesUpstreamError))
                 yield _sse(_failure(exc, attempt, maximum, retrying))
                 if not retrying:
                     yield "data: [DONE]\n\n"
@@ -354,13 +388,16 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
     client, query = _client(config, request)
     _stop_client(client, stop)
     record = None
-    assembly = ResponsesStream()
+    stateless = response_mode(request, config) == "stateless"
+    assembly = ResponsesStream(require_stored=not stateless)
     maximum, attempt, rebuilt = _maximum(), 0, False
     try:
         scope = (request.responses_context or {}).get("scope") or "chat_model"
         pending = responses_store.pending_request(request.session_id, scope)
         if pending:
-            if pending.get("source_key") != responses_store.source_key(config) or not pending.get("response_id"):
+            if stateless or (pending.get("payload") or {}).get("store") is False or pending.get("source_key") != responses_store.source_key(config) or not pending.get("response_id"):
+                if stateless or (pending.get("payload") or {}).get("store") is False:
+                    responses_store.abandon_request(request.session_id, pending, "无状态请求无法查询恢复")
                 responses_store.invalidate(request.session_id, "上次请求无法查询，按当前本地事实恢复", scope)
             else:
                 try:
@@ -391,7 +428,7 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
                     operation = "stream"
                     for raw in upstream:
                         if stop and stop():
-                            responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=bool(assembly.response_id))
+                            responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=bool(assembly.response_id) and not stateless)
                             return
                         wire = _dump(raw)
                         if wire.get("type") == "response.created":
@@ -408,7 +445,7 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
                     response = _dump(client.responses.create(**_kwargs(client.responses.create, payload, query)))
                     responses_store.note_response_id(request.session_id, record, response.get("id"))
                 if stop and stop():
-                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=True)
+                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=not stateless)
                     return
                 recovery_events = []
                 if stream:
@@ -424,21 +461,27 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
                 return
             except Stopped:
                 if record:
-                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=True)
+                    responses_store.abandon_request(request.session_id, record, "任务已停止", unknown=not stateless)
                 return
             except Exception as exc:
                 if record and operation != "retrieve":
                     responses_store.note_request_failure(request.session_id, record, operation, exc, error_detail(exc))
-                if not rebuilt and _parent_missing(exc):
+                if not assembly.response_id and record and _include_conflict(payload, exc):
+                    payload, state = _adjust_include(request, payload, record, exc)
+                    record, assembly = None, ResponsesStream(require_stored=not stateless)
+                    continue
+                if not rebuilt and payload.get("previous_response_id") and _parent_missing(exc):
                     responses_store.abandon_request(request.session_id, record, exc)
                     payload = _rebase(payload, request.session_id, state)
                     record, rebuilt, assembly = None, True, ResponsesStream()
                     continue
                 attempt += 1
+                if stateless and (assembly.response_id or assembly.content or assembly.reasoning) and _retryable(exc):
+                    exc = _stateless_interrupted(exc)
                 retrying = _retryable(exc) and (maximum <= 0 or attempt < maximum)
                 if not retrying and record:
                     responses_store.abandon_request(request.session_id, record, exc,
-                                                    unknown=bool(assembly.response_id) and not isinstance(exc, ResponsesUpstreamError))
+                                                    unknown=bool(assembly.response_id) and not stateless and not isinstance(exc, ResponsesUpstreamError))
                 yield _failure(exc, attempt, maximum, retrying)
                 if not retrying:
                     return
@@ -476,6 +519,8 @@ def nonstream(transport, request, config, stop=None):
 
 
 async def compact(request, config, *, scope="chat_model", stop=None):
+    if response_mode(request, config) == "stateless":
+        raise ResponsesProtocolError("无状态 Responses 使用本地上下文压缩，无需压缩远端响应链")
     from chat.chat_llm import ChatLLM
     state = responses_store.load_state(request.session_id, scope)
     if state.get("pending_request_ref"):

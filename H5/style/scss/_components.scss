@@ -271,48 +271,6 @@
       }
     }
 
-    .tool-selected {
-      flex-shrink: 0;
-      padding: 7px 12px;
-      border-radius: var(--radius-sm);
-      background: var(--bg-active);
-      color: var(--text-secondary);
-      font-size: 14px;
-      white-space: nowrap;
-    }
-
-    .tool-confirm {
-      flex-shrink: 0;
-      height: 38px;
-      padding: 0 18px;
-      border-radius: var(--radius-sm);
-      background: #0b84d8;
-      color: #ffffff;
-      font-size: 15px;
-      font-weight: 600;
-
-      &:hover {
-        background: #096fb7;
-      }
-    }
-
-    // 「跟随全局」按钮（会话覆盖态显示）：弱化视觉，与确定按钮并排
-    .tool-follow-global {
-      flex-shrink: 0;
-      height: 38px;
-      padding: 0 14px;
-      border: 1px solid var(--border-strong);
-      border-radius: var(--radius-sm);
-      background: transparent;
-      color: var(--text-secondary);
-      font-size: 13px;
-      cursor: pointer;
-
-      &:hover {
-        color: var(--text);
-        border-color: var(--text-tertiary);
-      }
-    }
   }
 
   .tool-modal-desc {
@@ -519,20 +477,150 @@
 
   @media (max-width: 680px) {
     padding: 8px;
+  }
+}
 
-    // 写全路径以匹配基础规则的优先级（基础规则嵌套在 toolbar 内）
-    .tool-modal-toolbar {
-      flex-wrap: wrap;
-    }
+// 仅用于「配置工具」，不影响共用 tool-modal 的聊天设置和提问弹窗。
+body.tool-settings-open { overflow: hidden; }
+.tool-config-modal {
+  inset: auto;
+  top: var(--tool-viewport-top, 0px);
+  left: 0;
+  width: 100%;
+  height: var(--tool-viewport-height, 100dvh);
+  padding: 16px;
+  overscroll-behavior: contain;
 
-    .tool-modal-toolbar .tool-search {
-      order: 2;
-      flex-basis: calc(100% - 46px);
-    }
+  .tool-config-dialog {
+    width: min(820px, 100%);
+    height: auto;
+    max-height: min(740px, 100%);
+    min-height: 0;
+    min-width: 0;
+  }
 
-    .tool-modal-toolbar .tool-selected {
-      margin-left: 46px;
+  .tool-modal-head {
+    flex: 0 0 auto;
+    gap: 10px;
+    min-height: 0;
+    padding: 10px 16px 8px;
+
+    h2 { margin: 0; text-align: left; font-size: 16px; line-height: 1.4; }
+    .icon-btn { width: 40px; height: 40px; flex-shrink: 0; }
+  }
+  .tool-config-heading { flex: 1; min-width: 0; }
+  .tool-config-heading small { display: block; font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
+  .tool-selected {
+    flex-shrink: 0;
+    padding: 4px 9px;
+    border: 1px solid color-mix(in srgb, #0b84d8 20%, var(--border));
+    border-radius: 20px;
+    background: color-mix(in srgb, #0b84d8 8%, transparent);
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .tool-modal-toolbar {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    padding: 0 16px 12px;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-strong);
+
+    .tool-search {
+      order: 0;
+      flex: 1 1 auto;
+      height: 40px;
+      border-color: var(--border-strong);
+      background: var(--bg-code);
+      &:focus-within { border-color: #0b84d8; box-shadow: 0 0 0 2px color-mix(in srgb, #0b84d8 12%, transparent); }
+      input { font-size: 14px; }
     }
+    .tool-refresh, .tool-collapse-all { flex: 0 0 40px; width: 40px; height: 40px; background: var(--bg-code); }
+  }
+
+  .tool-config-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 12px 16px 16px;
+    @include panel-scrollbar;
+  }
+  .tool-config-note { margin-bottom: 12px; color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }
+  .tool-groups {
+    overflow: visible;
+    padding: 0;
+
+    .tool-group {
+      border-color: var(--border-strong);
+      border-radius: 12px;
+      &.has-selection { border-color: color-mix(in srgb, #0b84d8 28%, var(--border-strong)); }
+      .tool-group-head { min-height: 56px; gap: 10px; padding: 0 12px; background: var(--bg-code); }
+      &:hover .tool-group-head, &.open .tool-group-head { background: color-mix(in srgb, var(--bg-elevated) 94%, var(--text)); }
+      .tool-group-toggle { min-height: 56px; height: auto; gap: 10px; padding: 6px 0; }
+      .tool-group-icon { width: 28px; height: 28px; padding: 5px; border-radius: 8px; background: color-mix(in srgb, #0b84d8 8%, transparent); color: #0b84d8; }
+      .tool-group-arrow { width: 14px; height: 14px; color: var(--text-tertiary); }
+      .tool-group-name { font-weight: 500; }
+      .tool-group-id { font-family: var(--font); font-size: 11px; }
+      .tool-group-count { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
+      &.has-selection .tool-group-count { color: var(--text-secondary); }
+      &.has-error .tool-group-id { color: var(--danger); }
+      .tool-row { align-items: center; min-height: 34px; gap: 8px; padding: 5px 12px; cursor: pointer; }
+      .tool-row + .tool-row { border-top: 1px solid var(--border); }
+      .tool-row.is-selected { background: color-mix(in srgb, #0b84d8 5%, transparent); }
+      .tool-row:hover { background: var(--bg-hover); }
+      .tool-row.is-disabled { opacity: 0.55; cursor: not-allowed; }
+      .tool-row-check { margin-top: 0; }
+      .tool-row-icon { width: 20px; height: 20px; }
+      .tool-row-info { display: flex; align-items: center; flex: 1; gap: 12px; }
+      .tool-row-name { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tool-row-description {
+        display: block; flex: 1 1 0; min-width: 0; margin-top: 0;
+        font-size: 12px; line-height: 1.5; white-space: nowrap; text-overflow: ellipsis;
+      }
+    }
+  }
+
+  .tool-config-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 0 0 auto;
+    gap: 8px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--border-strong);
+    button { min-height: 38px; padding: 7px 14px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font-size: 13px; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .tool-follow-global { color: var(--text-secondary); }
+    .tool-cancel:hover, .tool-follow-global:hover { background: var(--bg-hover); }
+    .tool-confirm { min-width: 76px; border-color: #0b84d8; background: #0b84d8; color: #fff; font-weight: 500; }
+    .tool-confirm:hover { background: #096fb7; }
+  }
+  .tool-config-actions { display: flex; flex-shrink: 0; gap: 8px; margin-left: auto; }
+  button:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+
+  @media (max-width: 600px) {
+    padding: 0;
+    .tool-config-dialog { width: 100%; height: 100%; max-height: 100%; border: 0; border-radius: 0; }
+    .tool-modal-head { padding: max(8px, env(safe-area-inset-top)) 12px 8px; gap: 8px; }
+    .tool-modal-toolbar { padding: 0 12px 10px; }
+    .tool-modal-toolbar .tool-search { height: 44px; }
+    .tool-modal-toolbar .tool-search input { font-size: 16px; }
+    .tool-modal-toolbar .tool-refresh, .tool-modal-toolbar .tool-collapse-all { height: 44px; }
+    .tool-config-content { padding: 10px 12px 14px; }
+    .tool-groups .tool-group {
+      .tool-group-head { gap: 8px; padding: 0 10px; }
+      .tool-group-toggle { gap: 7px; }
+      .tool-group-icon { display: none; }
+      .tool-row { min-height: 40px; padding: 5px 10px; }
+      .tool-row-info { gap: 8px; }
+      .tool-row-name { max-width: 55%; }
+      .tool-row-icon { width: 18px; height: 18px; margin-top: 0; }
+    }
+    .tool-config-foot { padding: 6px 12px max(6px, env(safe-area-inset-bottom)); }
+    .tool-config-foot button { min-height: 44px; padding: 8px 12px; }
   }
 }
 
@@ -640,26 +728,64 @@
     position: relative;
     display: flex;
     flex-direction: column;
-    align-items: flex-end;
-    gap: 5px;
-    padding: 10px 4px;
+    align-items: stretch;
+    // 条之间零间隙：热区无缝拼接，鼠标移动时始终在某条热区内，
+    // 涟漪波峰跟随鼠标平滑过渡（此前 gap 空隙会触发清除→重建闪烁）
+    gap: 0;
+    padding: 6px 4px;
+    // 加宽 hover 热区（线右对齐，变长向左伸，不顶出右边界）
+    width: 40px;
   }
 
+  // 热区块：8px 高无缝拼接（视觉节奏与原来 3px 线 + 5px gap 一致），
+  // 线用 ::after 画并垂直居中，热区比原来大 2.7 倍更好命中
   .qnav-dash {
-    width: 14px;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--text-tertiary);
-    opacity: 0.45;
-    transition: opacity 0.15s ease, width 0.15s ease;
+    width: 100%;
+    height: 8px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    cursor: pointer;
+
+    &::after {
+      content: "";
+      display: block;
+      width: 14px;
+      height: 3px;
+      border-radius: 2px;
+      background: var(--text-tertiary);
+      opacity: 0.45;
+      transition: opacity 0.15s ease, width 0.15s ease, background-color 0.15s ease;
+    }
   }
 
-  &:hover .qnav-dash {
+  &:hover .qnav-dash::after {
     opacity: 0.9;
   }
 
-  .qnav-dash.active {
+  .qnav-dash.active::after {
     width: 20px;
+    opacity: 1;
+    background: var(--text);
+  }
+
+  // hover 涟漪：相邻按距离渐短（JS 加 near-1/near-2）。规则顺序 active → near →
+  // :hover，同优先级下后胜出，保证鼠标所在的条永远最长。
+  .qnav-dash.near-1::after {
+    width: 26px;
+    opacity: 0.85;
+  }
+
+  .qnav-dash.near-2::after {
+    width: 20px;
+    opacity: 0.7;
+  }
+
+  .qnav-dash:hover::after {
+    width: 34px;
     opacity: 1;
     background: var(--text);
   }
@@ -689,6 +815,7 @@
 
   .qnav-item {
     display: block;
+    position: relative;
     width: 100%;
     text-align: left;
     padding: 9px 12px;
@@ -700,7 +827,9 @@
     white-space: nowrap;
     transition: background-color 0.12s ease, color 0.12s ease;
 
-    &:hover {
+    // peek：导航条 hover 联动高亮（JS 加类）；放 active 之前，当前位置优先
+    &:hover,
+    &.peek {
       background: var(--bg-hover);
       color: var(--text);
     }
@@ -708,6 +837,19 @@
     &.active {
       background: var(--bg-active);
       color: var(--text);
+
+      // 当前位置标识：左侧 accent 竖条，与 hover/peek 的纯底色一眼可分
+      &::before {
+        content: "";
+        position: absolute;
+        left: 3px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 3px;
+        height: 1em;
+        border-radius: 2px;
+        background: var(--accent);
+      }
     }
   }
 
@@ -716,22 +858,35 @@
   }
 }
 
-// ---------- 增强参数面板 ----------
-// body 级浮层（index.html 中挂在 .bottom 之外）：position fixed 由
-// .body-flyout 提供，JS 打开时按"参数"按钮视口坐标内联 top/bottom/left
-// （composer.js placeEnhancePanel）。脱离 .bottom 堆叠上下文后 z-index
-// 才能压过顶栏 .topbar（26）——否则累计 token 描述会盖住面板（同坐标系：110 > 26）。
+// ---------- 模型参数模态框 ----------
+body.model-settings-open { overflow: hidden; }
+.enhance-modal {
+  position: fixed;
+  z-index: 160;
+  top: var(--model-viewport-top, 0px);
+  left: 0;
+  width: 100%;
+  height: var(--model-viewport-height, 100dvh);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.48);
+  overscroll-behavior: contain;
+}
 .enhance-panel {
-  z-index: 110;
-  max-height: calc(100vh - 96px);
-  overflow-y: auto;
-  padding: 12px 14px;
+  width: min(900px, 100%);
+  height: min(820px, 100%);
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg-elevated);
-  border: 1px solid var(--border-strong);
+  border: 1px solid color-mix(in srgb, #0b84d8 30%, var(--border-strong));
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-menu);
-
-  @include panel-scrollbar;
 
   &.messages-mode {
     border-color: color-mix(in srgb, #22c55e 45%, var(--border-strong));
@@ -743,6 +898,7 @@
     .model-tab.active {
       border-color: color-mix(in srgb, #22c55e 48%, var(--border-strong));
     }
+    #enhanceConfirm { background: #22c55e; border-color: #22c55e; color: #082b16; }
   }
 
   .enhance-head,
@@ -755,28 +911,45 @@
 
   .enhance-head {
     justify-content: space-between;
-    margin-bottom: 8px;
-
-    strong {
-      font-size: 15px;
-    }
+    flex: 0 0 auto;
+    gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
 
     .icon-btn {
-      width: 28px;
-      height: 28px;
+      width: 40px;
+      height: 40px;
+      flex-shrink: 0;
     }
   }
 
-  // 三个模型角色的选项卡（水平布局）
+  // 保留对话框的无障碍名称，避免可见大标题占用表单高度。
+  .enhance-title {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  // 四个模型角色与关闭按钮共用一行。
   .model-tabs {
     display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
     gap: 6px;
-    margin: 4px 0 10px;
+    margin: 0;
+    padding: 0;
   }
 
   .model-tab {
     flex: 1;
-    padding: 7px 0;
+    min-width: 0;
+    min-height: 40px;
+    padding: 9px 4px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
@@ -801,8 +974,24 @@
   .enhance-body {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    padding: 12px 16px 16px;
+    gap: 8px;
+    @include panel-scrollbar;
+
+    // 由表单容器滚动，不能把可独立滚动的模型列表压缩至只剩边框。
+    > * { flex-shrink: 0; }
   }
+
+  .enhance-scope { color: var(--text-secondary); font-size: 12px; line-height: 1.4; }
+  .enhance-hint { color: var(--text-tertiary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+  .enhance-headers-details { margin-top: 6px; }
+  .enhance-headers-details > summary { font-size: 13px; }
 
   .messages-parameters {
     display: flex;
@@ -1146,42 +1335,24 @@
   }
 
   .enhance-foot {
-    justify-content: space-between;
+    justify-content: flex-end;
     align-items: center;
     gap: 8px;
-    margin-top: 6px;
-    padding-top: 10px;
+    flex: 0 0 auto;
+    margin-top: 0;
+    padding: 8px 16px;
     border-top: 1px solid var(--border);
     color: var(--text-tertiary);
     font-size: 11px;
-    // 窄屏放不下时换行，避免左（恢复默认）右（取消/确定）两块重叠
-    flex-wrap: wrap;
-
-    .enhance-foot-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-      flex: 1 1 auto;
-      flex-wrap: wrap;
-
-      #enhanceHint {
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-    }
-
     .enhance-actions {
       display: flex;
       gap: 8px;
-      // 窄屏时整组不收缩，放不下就随 foot 换行
       flex-shrink: 0;
 
       button {
         min-width: 64px;
-        padding: 6px 14px;
+        min-height: 36px;
+        padding: 8px 18px;
         border: 1px solid var(--border-strong);
         border-radius: var(--radius-sm);
         font-size: 13px;
@@ -1199,11 +1370,19 @@
     }
   }
 
+  .enhance-secondary-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
   // "恢复默认参数"与"清除会话模型覆盖"共用同一套轻量按钮样式
   #enhanceReset,
   #enhanceClearOverride {
     flex-shrink: 0;
-    padding: 3px 10px;
+    min-height: 36px;
+    padding: 7px 10px;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
     background: transparent;
@@ -1234,55 +1413,143 @@
   }
 }
 
-// 空态向下弹出改由 JS 在 placeEnhancePanel 内计算（原 CSS 方案
-// .app.empty .enhance-panel { top:... } 已随面板提升 body 级失效删除）
+@media (max-width: 600px) {
+  .enhance-modal { padding: 0; }
+  .enhance-panel {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+    border: 0;
+
+    .enhance-head { padding: max(8px, env(safe-area-inset-top)) 8px 8px; }
+    .model-tabs { gap: 4px; }
+    .model-tab { font-size: clamp(12px, 3.3vw, 13px); min-height: 40px; padding: 8px 2px; white-space: nowrap; }
+    .enhance-body { padding: 10px 12px 16px; gap: 8px; }
+    .enhance-field { flex-direction: column; align-items: stretch; gap: 7px; }
+    .enhance-field select, .model-picker {
+      width: 100%; max-width: none; min-height: 44px; font-size: 16px;
+    }
+    .messages-text-field textarea { width: 100%; min-width: 0; min-height: 100px; font-size: 16px; }
+    .enhance-range { padding: 7px 0; }
+    .enhance-range input { min-height: 32px; }
+    .enhance-row { gap: 8px; }
+    .enhance-check { min-height: 44px; }
+    .enhance-headers .enhance-header-row {
+      grid-template-columns: minmax(0, 1fr) 36px;
+      input { grid-column: 1; min-height: 44px; font-size: 16px; }
+      .enhance-header-remove { grid-column: 2; grid-row: 1 / span 2; width: 36px; height: 44px; }
+    }
+    .enhance-headers-head button, .responses-state-box button { min-height: 40px; }
+    .enhance-foot {
+      padding: 6px 12px max(6px, env(safe-area-inset-bottom));
+    }
+    .enhance-foot .enhance-actions { display: grid; width: 100%; grid-template-columns: 1fr 1fr; }
+    .enhance-foot .enhance-actions button { min-height: 44px; }
+  }
+}
 
 // ---------- 聊天设置模态框（元素同时带 .tool-modal-dialog 基础样式） ----------
-.chat-settings-dialog {
-  width: min(560px, 100%);
+body.chat-settings-open { overflow: hidden; }
+.chat-settings-modal {
+  inset: auto;
+  top: var(--settings-viewport-top, 0px);
+  left: 0;
+  width: 100%;
+  height: var(--settings-viewport-height, 100dvh);
+  padding: 16px;
+  overscroll-behavior: contain;
+
+  .chat-settings-dialog {
+    width: min(760px, 100%);
+    height: min(700px, 100%);
+    max-height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .tool-modal-head {
+    flex: 0 0 auto;
+    min-height: 0;
+    padding: 10px 20px 8px;
+    gap: 12px;
+
+    h2 { margin: 0; text-align: left; font-size: 16px; line-height: 1.5; }
+    .icon-btn { flex-shrink: 0; width: 40px; height: 40px; }
+  }
+  .chat-settings-heading { flex: 1; min-width: 0; }
+  .chat-settings-heading small { display: block; color: var(--text-secondary); font-size: 11px; }
+
+  .chat-settings-tabs {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 4px;
+    padding: 0 20px 10px;
+    border-bottom: 1px solid var(--border-strong);
+    overflow-x: auto;
+
+    button {
+      flex: 1 0 auto;
+      min-height: 36px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-size: 13px;
+      white-space: nowrap;
+      &:hover { background: var(--bg-hover); color: var(--text); }
+      &[aria-selected="true"] { background: color-mix(in srgb, #0b84d8 10%, var(--bg-elevated)); color: #0b84d8; font-weight: 600; }
+    }
+  }
 
   .chat-settings-body {
-    flex: 1;
+    flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
-    padding: 4px 18px 14px;
+    overscroll-behavior: contain;
+    padding: 16px 20px 20px;
+    @include panel-scrollbar;
   }
 
   .chat-settings-section {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 10px 14px;
-
-    & + .chat-settings-section {
-      margin-top: 10px;
-    }
+    min-width: 0;
+    &[hidden] { display: none; }
 
     // 「每条消息重新标题」开关行（自 toolModal 迁入；去掉工具弹窗的贴边距）
     .tool-retitle-row {
-      margin: 2px 0 10px;
+      &[hidden] { display: none; }
+      margin: 0 0 8px;
+      padding: 10px 12px;
+      flex-wrap: wrap;
+      gap: 4px 12px;
+      .tool-retitle-label { white-space: normal; min-height: 28px; }
+      .tool-retitle-status { flex-basis: 100%; padding-left: 24px; white-space: normal; }
+      .tool-retitle-label > span small { display: block; font-size: 11px; color: var(--text-secondary); font-weight: 400; }
+      input { accent-color: #0b84d8; width: 16px; height: 16px; flex-shrink: 0; }
     }
 
     h3 {
       font-size: 14px;
       font-weight: 600;
-      margin-bottom: 4px;
+      margin: 0;
     }
   }
+
+  .chat-settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+  .chat-settings-badge { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border-strong); border-radius: 20px; color: var(--text-secondary); white-space: nowrap; }
+  .chat-settings-intro { color: var(--text-secondary); font-size: 12px; line-height: 1.6; margin: 0 0 12px; }
 
   .chat-setting-field {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    margin: 7px 0;
-    padding: 10px 12px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
+    margin: 0;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
     font-size: 13px;
-    color: var(--text-secondary);
+    color: var(--text);
 
     &:focus-within {
-      border-color: #0b84d8;
+      > span { color: var(--text); }
     }
 
     > span {
@@ -1291,16 +1558,18 @@
 
       small {
         display: block;
-        color: var(--text-tertiary);
-        font-size: 11px;
-        line-height: 1.4;
+        margin-top: 3px;
+        color: var(--text-secondary);
+        font-size: 12px;
+        line-height: 1.5;
       }
     }
 
-    input {
+    input, select {
       flex-shrink: 0;
-      width: 130px;
-      padding: 5px 8px;
+      width: 124px;
+      min-height: 36px;
+      padding: 6px 10px;
       border: 1px solid var(--border-strong);
       border-radius: var(--radius-sm);
       background: var(--bg-code);
@@ -1311,23 +1580,19 @@
 
       &:focus {
         border-color: #0b84d8;
+        box-shadow: 0 0 0 2px color-mix(in srgb, #0b84d8 12%, transparent);
       }
+      &:disabled { opacity: 0.55; cursor: not-allowed; }
     }
   }
-
-  // 有效压缩阈值提示行（触发比例字段下方，独占一行）：
-  // 对齐字段描述 small 的弱化视觉，避免浏览器默认 <p> 16px 大字；
-  // 上方字段的底 padding 用 :has 邻接压缩，避免「描述小字 → 提示行」间距过大
-  .chat-setting-field:has(+ .chat-settings-threshold-hint) {
-    padding-bottom: 2px;
-  }
+  #permissionSettings select { width: 140px; background: var(--bg-code); }
 
   .chat-settings-threshold-hint {
-    margin: 0 0 6px;
-    padding: 3px 10px;
+    margin: 6px 0;
+    padding: 6px 10px;
     border-radius: var(--radius-sm);
     background: var(--bg-code);
-    color: var(--text-tertiary);
+    color: var(--text-secondary);
     font-size: 11px;
     line-height: 1.5;
   }
@@ -1335,25 +1600,30 @@
   .chat-settings-note {
     margin-top: 8px;
     padding-top: 8px;
-    border-top: 1px dashed var(--border);
     font-size: 12px;
-    color: var(--text-tertiary);
+    line-height: 1.6;
+    color: var(--text-secondary);
   }
+  #permissionStatus:empty, #permissionRequests:empty { display: none; }
 
   .chat-settings-foot {
     display: flex;
+    flex: 0 0 auto;
+    align-items: center;
     justify-content: flex-start;
     gap: 8px;
-    padding: 12px 18px;
-    border-top: 1px solid var(--border);
+    padding: 8px 20px;
+    border-top: 1px solid var(--border-strong);
 
     button {
       min-width: 72px;
+      min-height: 38px;
       padding: 7px 16px;
       border-radius: var(--radius-sm);
       font-size: 13px;
       cursor: pointer;
     }
+    button:disabled { opacity: 0.6; cursor: wait; }
   }
 
   .chat-settings-reset {
@@ -1392,6 +1662,27 @@
       opacity: 0.6;
       cursor: wait;
     }
+  }
+  button:focus-visible, [role="tabpanel"]:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+
+  @media (max-width: 600px) {
+    padding: 0;
+    .chat-settings-dialog { width: 100%; height: 100%; border: 0; border-radius: 0; }
+    .tool-modal-head { padding: max(6px, env(safe-area-inset-top)) 12px 6px; }
+    .chat-settings-heading small { display: none; }
+    .chat-settings-tabs { padding: 0 12px 8px; gap: 2px; }
+    .chat-settings-tabs button { min-height: 44px; padding: 8px 9px; }
+    .chat-settings-body { padding: 12px; }
+    .chat-setting-field { gap: 10px; padding: 10px 0; }
+    .chat-setting-field input, .chat-setting-field select { width: 104px; min-height: 44px; font-size: 16px; }
+    #permissionSettings select { width: 120px; font-size: 16px; }
+    .chat-settings-foot { padding: 6px 12px max(6px, env(safe-area-inset-bottom)); }
+    .chat-settings-foot button { min-width: 0; min-height: 44px; padding: 8px 12px; }
+  }
+  @media (max-width: 380px) {
+    .chat-setting-field { flex-wrap: wrap; gap: 6px; }
+    .chat-setting-field > span { flex-basis: 100%; }
+    .chat-setting-field input, #permissionSettings select { width: 100%; }
   }
 }
 
@@ -1646,6 +1937,58 @@
   }
 }
 
+// 预览缩放工具栏（仅图片/视频显示）：− / 百分比（点击重置）/ +
+.media-preview-zoom {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+}
+
+.media-preview-zoom-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    background: var(--bg-active);
+    color: var(--text);
+  }
+
+  &:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+}
+
+.media-preview-zoom-label {
+  min-width: 46px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--bg-active);
+    color: var(--text);
+  }
+}
+
 .media-preview-body {
   display: flex;
   align-items: center;
@@ -1653,11 +1996,19 @@
   overflow: auto;
   padding: 14px;
 
+  // 可缩放态（图片/视频）：transform 溢出不产生滚动条，拖动时禁选文本
+  &.is-zoomable {
+    overflow: hidden;
+    user-select: none;
+  }
+
   img.media-preview-image {
     max-width: 86vw;
     max-height: 78vh;
     object-fit: contain;
     border-radius: 8px;
+    // 缩放过渡：按钮/滚轮/双击时平滑；拖动时由 is-dragging 关闭保证跟手
+    transition: transform 0.12s ease;
   }
 
   video.media-preview-video {
@@ -1665,6 +2016,14 @@
     max-height: 78vh;
     border-radius: 8px;
     background: #000;
+    transition: transform 0.12s ease;
+  }
+
+  &.is-dragging {
+    img.media-preview-image,
+    video.media-preview-video {
+      transition: none;
+    }
   }
 
   iframe.media-preview-frame {
@@ -1875,18 +2234,10 @@
 }
 
 // 弹层锚定触发按钮时的固定定位覆盖：由 JS 在打开时计算视口坐标并内联
-// top/bottom/left（见 composer.js placeAbove / placeEnhancePanel）。
+// top/bottom/left（见 composer.js placeAbove）。
 // 必须放在 .menu（position:absolute）之后才能赢得级联。
 .fixed-flyout {
   position: fixed;
-}
-
-// body 级浮层基础定位（.bottom 内下拉改挂 body 时复用，如 enhance-panel）：
-// 脱离局部堆叠上下文，让面板自身 z-index 直接与顶栏/全屏模态框同坐标系比较；
-// 最终坐标仍由 JS 内联 top/bottom/left 控制，这里只提供 fixed + auto 内边距复位
-.body-flyout {
-  position: fixed;
-  inset: auto;
 }
 
 // ---------- ask_user 卡片再答：三选确认弹层（更新该轮 / 删除之后所有 / 取消） ----------
@@ -1964,7 +2315,63 @@
   &:hover { opacity: 0.9; }
 }
 
-.enhance-panel.responses-mode input[type="range"] { accent-color: #ff85b5; }
-.responses-state-box { display: grid; gap: 0.75rem; margin-top: 1rem; padding: 1rem; border: 1px solid #6664; border-radius: 12px; }
-.responses-state-box small { color: #999; line-height: 1.6; }
+// Responses shares the parameter layout with Messages, but owns its pink palette.
+// Mix with the active theme so pink text remains readable in light and dark modes.
+.enhance-panel.responses-mode {
+  --responses-accent: #ff85b5;
+  --responses-text: color-mix(in srgb, var(--responses-accent) 55%, var(--text));
+  --responses-muted: color-mix(in srgb, var(--responses-accent) 30%, var(--text-secondary));
+  background: color-mix(in srgb, var(--responses-accent) 6%, var(--bg-elevated));
+  border-color: color-mix(in srgb, var(--responses-accent) 45%, var(--border-strong));
+  color: var(--responses-text);
+
+  .messages-parameters {
+    background: color-mix(in srgb, var(--responses-accent) 7%, var(--bg-code));
+    border-color: color-mix(in srgb, var(--responses-accent) 35%, var(--border-strong));
+  }
+
+  .messages-parameters-title,
+  .enhance-head strong,
+  .enhance-field > span,
+  .enhance-range b,
+  .enhance-range output,
+  .enhance-check > span,
+  .messages-advanced > summary { color: var(--responses-text); }
+
+  input[type="range"], input[type="checkbox"] { accent-color: var(--responses-accent); }
+
+  .model-tab.active {
+    background: color-mix(in srgb, var(--responses-accent) 12%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--responses-accent) 48%, var(--border-strong));
+    color: var(--responses-text);
+  }
+
+  .model-picker,
+  .enhance-field select,
+  .messages-text-field textarea {
+    background: color-mix(in srgb, var(--responses-accent) 4%, var(--bg-code));
+    border-color: color-mix(in srgb, var(--responses-accent) 25%, var(--border-strong));
+    color: var(--responses-text);
+  }
+
+  .responses-state-box {
+    background: color-mix(in srgb, var(--responses-accent) 4%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--responses-accent) 25%, var(--border-strong));
+  }
+
+  .responses-mode-hint,
+  .responses-state-box small { color: var(--responses-muted); }
+
+  #enhanceConfirm {
+    background: var(--responses-accent);
+    border-color: var(--responses-accent);
+    color: #351321;
+  }
+}
+
+.responses-mode-hint { font-size: 11px; line-height: 1.6; }
+.responses-state-box, .responses-stateful-controls { display: grid; gap: 0.75rem; }
+.responses-state-box { margin-top: 1rem; padding: 1rem; border: 1px solid var(--border-strong); border-radius: 12px; }
+.responses-state-box small { color: var(--text-secondary); line-height: 1.6; }
 .responses-state-box button { justify-self: start; padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ff85b577; background: #ff85b518; color: inherit; cursor: pointer; }
+.responses-state-box button:disabled { opacity: 0.5; cursor: default; }

@@ -8,7 +8,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js"></script>
-    <link rel="stylesheet" href="style/css/main.css?v=20261015-permissions-v4">
+    <link rel="stylesheet" href="style/css/main.css?v=20261017-search-scope">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css">
 </head>
@@ -27,6 +27,12 @@
                         <path
                             d="M13.5 3.5H8a4.5 4.5 0 0 0-4.5 4.5v8a4.5 4.5 0 0 0 4.5 4.5h8a4.5 4.5 0 0 0 4.5-4.5V10" />
                         <path d="m12.1 11.9 8-8a1.56 1.56 0 0 1 2.2-2.2L14.3 9.7l-1.3 1.2L12 12Z" />
+                    </svg>
+                </button>
+                <button class="rail-btn" id="railSearch" type="button" title="搜索会话" aria-label="搜索会话" aria-haspopup="dialog" aria-controls="historySearchModal">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <circle cx="11" cy="11" r="7" />
+                        <path d="m21 21-4.3-4.3" />
                     </svg>
                 </button>
                 <button class="rail-btn" id="railChats" title="历史会话">
@@ -425,40 +431,50 @@
         </main>
     </div>
 
-    <div class="tool-modal hidden" id="toolModal" aria-hidden="true">
+    <div class="tool-modal tool-config-modal hidden" id="toolModal" aria-hidden="true">
         <div class="tool-modal-backdrop" id="toolModalBackdrop"></div>
-        <section class="tool-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="toolModalTitle">
+        <section class="tool-modal-dialog tool-config-dialog" role="dialog" aria-modal="true" aria-labelledby="toolModalTitle">
             <header class="tool-modal-head">
-                <h2 id="toolModalTitle">配置工具</h2>
-                <button class="icon-btn" id="toolModalClose" title="关闭">
+                <div class="tool-config-heading">
+                    <h2 id="toolModalTitle">配置工具</h2>
+                    <small id="toolSelectionScope">选择模型可调用的工具</small>
+                </div>
+                <span class="tool-selected" id="toolSelected" aria-live="polite">已选 0 项</span>
+                <button class="icon-btn" id="toolModalClose" type="button" title="关闭" aria-label="关闭配置工具">
                     <svg class="icon" viewBox="0 0 24 24">
                         <path d="M6 6l12 12M18 6 6 18" />
                     </svg>
                 </button>
             </header>
             <div class="tool-modal-toolbar">
-                <button class="tool-collapse-all" id="toolCollapseAll" title="折叠全部">−</button>
-                <button class="tool-refresh" id="toolRefresh" title="更新全部工具">
+                <label class="tool-search">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <circle cx="11" cy="11" r="7" />
+                        <path d="m21 21-4.3-4.3" />
+                    </svg>
+                    <input id="toolSearchInput" type="search" placeholder="搜索工具或服务…" aria-label="搜索工具名称、描述或服务">
+                </label>
+                <button class="tool-refresh" id="toolRefresh" type="button" title="刷新工具与模型能力" aria-label="刷新工具与模型能力">
                     <svg class="icon" viewBox="0 0 24 24">
                         <path d="M20 11a8 8 0 0 0-14.7-4L4 9" />
                         <path d="M4 4v5h5M4 13a8 8 0 0 0 14.7 4L20 15" />
                         <path d="M20 20v-5h-5" />
                     </svg>
                 </button>
-                <label class="tool-search">
-                    <svg class="icon" viewBox="0 0 24 24">
-                        <circle cx="11" cy="11" r="7" />
-                        <path d="m21 21-4.3-4.3" />
-                    </svg>
-                    <input id="toolSearchInput" type="search" placeholder="选择可用于聊天的工具。">
-                </label>
-                <span class="tool-selected" id="toolSelected">已选 0 项</span>
+                <button class="tool-collapse-all" id="toolCollapseAll" type="button" title="折叠全部" aria-label="折叠全部">−</button>
+            </div>
+            <div class="tool-config-content" id="toolConfigContent">
+                <p class="tool-config-note">内置工具在本机执行，MCP 工具由对应服务提供。</p>
+                <div class="tool-groups" id="toolGroups"></div>
+            </div>
+            <footer class="tool-config-foot">
                 <button class="tool-follow-global" id="toolFollowGlobal" type="button" hidden
                     title="清除本会话独立选择，恢复跟随全局默认工具">跟随全局</button>
-                <button class="tool-confirm" id="toolConfirm">确定</button>
-            </div>
-            <p class="tool-modal-desc">“内置工具”由服务端本地执行；会话内保存仅对本会话生效，新对话中保存将更新全局默认。</p>
-            <div class="tool-groups" id="toolGroups"></div>
+                <div class="tool-config-actions">
+                    <button class="tool-cancel" id="toolCancel" type="button">取消</button>
+                    <button class="tool-confirm" id="toolConfirm" type="button">确定</button>
+                </div>
+            </footer>
         </section>
     </div>
 
@@ -469,40 +485,55 @@
         <div class="media-preview-dialog" role="dialog" aria-modal="true">
             <header class="media-preview-head">
                 <span class="media-preview-title" id="mediaPreviewTitle"></span>
+                <div class="media-preview-zoom hidden" id="mediaPreviewZoom">
+                    <button class="media-preview-zoom-btn" id="mediaPreviewZoomOut" title="缩小（Ctrl+-）" type="button">−</button>
+                    <button class="media-preview-zoom-label" id="mediaPreviewZoomLabel" title="重置为适应窗口（Ctrl+0）" type="button">100%</button>
+                    <button class="media-preview-zoom-btn" id="mediaPreviewZoomIn" title="放大（Ctrl++）" type="button">+</button>
+                </div>
                 <button class="media-preview-close" id="mediaPreviewClose" title="关闭">✕</button>
             </header>
             <div class="media-preview-body" id="mediaPreviewBody"></div>
         </div>
     </div>
 
-    <div class="tool-modal hidden" id="chatSettingsModal" aria-hidden="true">
+    <div class="tool-modal chat-settings-modal hidden" id="chatSettingsModal" aria-hidden="true">
         <div class="tool-modal-backdrop" id="chatSettingsBackdrop"></div>
         <section class="tool-modal-dialog chat-settings-dialog" role="dialog" aria-modal="true"
             aria-labelledby="chatSettingsTitle">
             <header class="tool-modal-head">
-                <h2 id="chatSettingsTitle">聊天设置</h2>
-                <button class="icon-btn" id="chatSettingsClose" title="关闭">
-                    <svg class="icon" viewBox="0 0 24 24">
+                <div class="chat-settings-heading">
+                    <h2 id="chatSettingsTitle">聊天设置</h2>
+                    <small>管理任务行为与上下文</small>
+                </div>
+                <button class="icon-btn" id="chatSettingsClose" type="button" title="关闭" aria-label="关闭聊天设置">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
                         <path d="M6 6l12 12M18 6 6 18" />
                     </svg>
                 </button>
             </header>
+            <nav class="chat-settings-tabs" role="tablist" aria-label="设置分类">
+                <button id="chatSettingsGeneralTab" type="button" role="tab" aria-selected="true" aria-controls="chatSettingsGeneral">常规</button>
+                <button id="chatSettingsPermissionsTab" type="button" role="tab" aria-selected="false" aria-controls="permissionSettings" tabindex="-1">工具权限</button>
+                <button id="chatSettingsAgentsTab" type="button" role="tab" aria-selected="false" aria-controls="chatSettingsAgents" tabindex="-1">子智能体</button>
+                <button id="chatSettingsCompactionTab" type="button" role="tab" aria-selected="false" aria-controls="chatSettingsCompaction" tabindex="-1">历史压缩</button>
+            </nav>
             <div class="chat-settings-body">
-                <p class="chat-settings-note">数值设置均为全局配置，影响所有会话；压缩预算提示按当前会话模型窗口计算。“每条消息重新标题”仅对当前会话生效，切换开关立即保存。</p>
-                <section class="chat-settings-section" id="permissionSettings">
-                    <h3>工具权限</h3>
+                <section class="chat-settings-section" id="permissionSettings" role="tabpanel" aria-labelledby="chatSettingsPermissionsTab" tabindex="0" hidden>
+                    <div class="chat-settings-section-head"><h3>工具权限</h3><span class="chat-settings-badge">全局 / 当前会话</span></div>
+                    <p class="chat-settings-intro">询问模式下，执行命令、访问工作目录外的路径或调用 MCP 工具前需要确认；完全控制模式下，模型可自由使用工具。</p>
                     <label class="chat-setting-field"><span>全局默认<small>未单独设置的会话使用此模式</small></span><select id="permissionGlobal"><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
                     <label class="chat-setting-field"><span>当前会话<small>可独立配置，也可跟随全局</small></span><select id="permissionSession"><option value="">跟随全局</option><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
                     <p class="chat-settings-note">权限选择点击「确定」后保存，从下一次任务生效。需要确认的操作在工具标题栏右侧显示「允许 / 拒绝」。</p>
                     <div id="permissionStatus" role="status" aria-live="polite"></div>
                     <div id="permissionRequests"></div>
                 </section>
-                <section class="chat-settings-section">
-                    <h3>模型与工具配置</h3>
+                <section class="chat-settings-section" id="chatSettingsGeneral" role="tabpanel" aria-labelledby="chatSettingsGeneralTab" tabindex="0">
+                    <div class="chat-settings-section-head"><h3>模型与工具配置</h3><span class="chat-settings-badge">全局</span></div>
+                    <p class="chat-settings-intro">数值设置对所有会话生效，点击「确定」保存。</p>
                     <div class="tool-retitle-row" id="settingsRetitleRow" hidden>
                         <label class="tool-retitle-label" title="开启后本会话每条消息发送完成都会重新生成会话标题；关闭则仅首个任务尝试一次">
                             <input type="checkbox" id="settingsRetitleToggle">
-                            <span>每条消息重新标题（仅本会话）</span>
+                            <span>每条消息重新标题（仅本会话）<small>切换后立即保存</small></span>
                         </label>
                         <span class="tool-retitle-status" id="settingsRetitleStatus"></span>
                     </div>
@@ -523,9 +554,9 @@
                         <input id="mcpToolWorkers" type="number" min="1" step="1">
                     </label>
                 </section>
-                <section class="chat-settings-section">
-                    <h3>子智能体（全局）</h3>
-                    <p class="chat-settings-note">保存后用于后续聊天任务；正在运行的子任务沿用派发时的限制。每个子任务可单独停止，停止或达到限制时会向父智能体返回进展报告。</p>
+                <section class="chat-settings-section" id="chatSettingsAgents" role="tabpanel" aria-labelledby="chatSettingsAgentsTab" tabindex="0" hidden>
+                    <div class="chat-settings-section-head"><h3>子智能体</h3><span class="chat-settings-badge">全局</span></div>
+                    <p class="chat-settings-intro">保存后用于后续任务，运行中的子任务沿用原限制。停止或达到限制时会向父智能体返回进展报告。</p>
                     <label class="chat-setting-field">
                         <span>模型调用轮次上限<small>单个子任务最多调用模型的次数；0=不限制</small></span>
                         <input id="subAgentMaxRounds" type="number" min="0" step="1">
@@ -551,8 +582,9 @@
                         <input id="subAgentTodoRemindMax" type="number" step="1">
                     </label>
                 </section>
-                <section class="chat-settings-section">
-                    <h3>历史压缩策略（全局）</h3>
+                <section class="chat-settings-section" id="chatSettingsCompaction" role="tabpanel" aria-labelledby="chatSettingsCompactionTab" tabindex="0" hidden>
+                    <div class="chat-settings-section-head"><h3>历史压缩策略</h3><span class="chat-settings-badge">全局</span></div>
+                    <p class="chat-settings-intro">预算提示按当前会话的模型窗口计算，本地与远程上下文处理沿用所选接口的策略。</p>
                     <label class="chat-setting-field">
                         <span>触发比例<small>历史上下文达到压缩阈值时触发压缩；阈值=两模型窗口较小者×该比例</small></span>
                         <input id="triggerRatio" type="number" min="0.01" max="0.95" step="0.01">
@@ -580,7 +612,7 @@
                         <span>压缩失败重试次数<small>每次尝试=一条"压缩模型→聊天模型"完整降级链；达到次数终止任务；负数/0=不限制（一直重试）</small></span>
                         <input id="compactionRetryMaxAttempts" type="number" step="1">
                     </label>
-                    <p class="chat-settings-note">压缩模型请在「参数」面板的「压缩模型」选项卡中选择（该字段已由 /chat_config/models/select 接管）。</p>
+                    <p class="chat-settings-note">压缩模型可在「参数 → 压缩模型」中选择。</p>
                 </section>
             </div>
             <div class="chat-settings-foot">
@@ -743,26 +775,25 @@
         </section>
     </div>
 
-    <!-- 模型与参数设置面板：body 级浮层（fixed 定位由 JS 锚定"参数"按钮）。
-         不放在 .bottom 内是因为顶栏 .topbar（z:26）与底部 .bottom（z:25）是两个
-         平级堆叠上下文，面板 z-index 再高也压不过顶栏文字（累计 token 描述遮挡问题）；
-         提升 body 级后 z-index 与全屏模态框在同一坐标系参与比较 -->
-    <div class="enhance-panel body-flyout hidden" id="enhancePanel">
-        <div class="enhance-head">
-            <strong>模型与参数设置</strong>
-            <button class="icon-btn" id="enhanceClose" title="关闭">
+    <!-- 桌面居中、手机全屏；角色/关闭与确认栏固定，仅表单区域滚动。 -->
+    <div class="enhance-modal hidden" id="enhanceModal" aria-hidden="true">
+    <section class="enhance-panel hidden" id="enhancePanel" role="dialog" aria-modal="true" aria-labelledby="enhanceTitle">
+        <header class="enhance-head">
+            <strong class="enhance-title" id="enhanceTitle">模型与参数设置</strong>
+            <div class="model-tabs" id="modelTabs">
+                <button class="model-tab active" type="button" data-role="chat_model">聊天模型</button>
+                <button class="model-tab" type="button" data-role="compaction_model">压缩模型</button>
+                <button class="model-tab" type="button" data-role="title_model">标题模型</button>
+                <button class="model-tab" type="button" data-role="sub_agent_model">子智能体</button>
+            </div>
+            <button class="icon-btn" id="enhanceClose" type="button" title="关闭" aria-label="关闭模型与参数设置">
                 <svg class="icon" viewBox="0 0 24 24">
                     <path d="M6 6l12 12M18 6 6 18" />
                 </svg>
             </button>
-        </div>
-        <div class="model-tabs" id="modelTabs">
-            <button class="model-tab active" type="button" data-role="chat_model">聊天模型</button>
-            <button class="model-tab" type="button" data-role="compaction_model">压缩模型</button>
-            <button class="model-tab" type="button" data-role="title_model">标题模型</button>
-            <button class="model-tab" type="button" data-role="sub_agent_model">子智能体</button>
-        </div>
-        <div class="enhance-body">
+        </header>
+        <div class="enhance-body" id="enhanceBody">
+            <small class="enhance-scope" id="enhanceScope">当前会话配置</small>
             <label class="enhance-field">
                 <span>选择模型</span>
                 <button class="model-picker" id="modelPicker" type="button">
@@ -857,7 +888,13 @@
                 </details>
             </section>
             <section class="messages-parameters hidden" id="responsesParametersGroup" aria-label="Responses 参数">
-                <div class="messages-parameters-title">Responses · 有状态续聊</div>
+                <div class="messages-parameters-title">Responses · 上下文管理</div>
+                <label class="enhance-field"><span>上下文模式</span>
+                    <select id="responsesMode"><option value="">跟随模型配置</option>
+                        <option value="stateful">有状态 · 响应 ID 续聊</option>
+                        <option value="stateless">无状态兼容 · 每次发送上下文</option></select>
+                </label>
+                <small id="responsesModeHint" class="responses-mode-hint" aria-live="polite"></small>
                 <label class="enhance-field"><span>推理深度</span>
                     <select id="responsesEffort"><option value="">模型默认</option>
                         <option value="none">none</option><option value="minimal">minimal</option>
@@ -892,14 +929,18 @@
                         <textarea id="responsesExtraBody" rows="4" spellcheck="false"></textarea></label>
                 </details>
                 <div class="responses-state-box">
-                    <small id="responsesStateHint">上下文显示以本地数据为准；远端按响应链续接。</small>
-                    <label class="enhance-field"><span>重新同步来源</span>
-                        <select id="responsesRebuildSource"><option value="local">当前本地上下文</option>
-                            <option value="native">原生恢复窗口</option><option value="raw">完整历史</option></select></label>
-                    <button id="responsesRebuild" type="button">准备重新同步</button>
-                    <small>下次发送时同步一次，然后恢复增量续聊。请先保存当前模型选择。</small>
+                    <small id="responsesStateHint" aria-live="polite">上下文显示以本地数据为准。</small>
+                    <div id="responsesStatefulControls" class="responses-stateful-controls hidden">
+                        <label class="enhance-field"><span>重新同步来源</span>
+                            <select id="responsesRebuildSource"><option value="local">当前本地上下文</option>
+                                <option value="native">原生恢复窗口</option><option value="raw">完整历史</option></select></label>
+                        <button id="responsesRebuild" type="button">准备重新同步</button>
+                        <small>仅用于有状态主会话：下次回传一次上下文建立新链，之后继续尝试响应 ID 续聊。不会切换为无状态；请先保存模型选择。</small>
+                    </div>
                 </div>
             </section>
+            <details class="messages-advanced enhance-headers-details">
+            <summary>自定义请求头</summary>
             <div class="enhance-headers" id="customHeadersBox">
                 <div class="enhance-headers-head">
                     <span>自定义请求头</span>
@@ -908,19 +949,21 @@
                 <div class="enhance-headers-rows" id="customHeadersRows"></div>
                 <div class="enhance-headers-tip">随该角色的模型选择保存；请求上游时随原始 HTTP 头注入（如供应商要求的会话/签名头）。同名键后者覆盖前者。</div>
             </div>
-        </div>
-        <div class="enhance-foot">
-            <div class="enhance-foot-left">
+            </details>
+            <div class="enhance-secondary-actions">
                 <button id="enhanceReset" type="button">恢复默认</button>
                 <button id="enhanceClearOverride" type="button" class="hidden"
                     title="清除本会话的独立模型选择，恢复跟随全局默认">清除会话覆盖</button>
-                <span id="enhanceHint">参数未修改时仅切换模型、保留原参数</span>
             </div>
+            <small class="enhance-hint" id="enhanceHint">参数未修改时仅切换模型、保留原参数</small>
+        </div>
+        <footer class="enhance-foot">
             <div class="enhance-actions">
                 <button id="enhanceCancel" type="button">取消</button>
                 <button id="enhanceConfirm" type="button">确定</button>
             </div>
-        </div>
+        </footer>
+    </section>
     </div>
 
     <!-- V2.3 文件 diff 编辑器已迁移至独立页 editor.html（面板点击新窗口打开）；
@@ -945,8 +988,12 @@
                 <button class="icon-btn" id="historySearchClose" type="button" aria-label="关闭搜索">×</button>
             </div>
             <div class="history-search-input-wrap">
-                <input id="historySearchInput" type="search" maxlength="200" placeholder="搜索标题、文件名或聊天内容…"
+                <input id="historySearchInput" type="search" maxlength="200" placeholder="搜索问题、回答正文或标题…"
                     aria-label="搜索会话记录" aria-controls="historySearchResults" autocomplete="off">
+            </div>
+            <div class="history-search-scope" role="group" aria-label="搜索范围">
+                <label><input id="historySearchInternal" type="checkbox">包含工具与内部记录</label>
+                <label title="额外匹配会话 JSONL 文件名；结果卡片始终显示文件名"><input id="historySearchFilenames" type="checkbox">匹配会话文件名</label>
             </div>
             <div class="history-search-status" id="historySearchStatus" role="status" aria-live="polite"></div>
             <div class="history-search-results" id="historySearchResults" aria-busy="false"></div>
@@ -961,7 +1008,7 @@
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script src="js/api.js?v=20261015-permissions-v4"></script>
+    <script src="js/api.js?v=20261017-search-scope"></script>
     <script src="js/file_history_sync.js"></script>
     <script src="js/vendor/prism/prism-core.min.js"></script>
     <script src="js/vendor/prism/prism-clike.min.js"></script>
@@ -1002,33 +1049,35 @@
     <script src="js/session_group_utils.js"></script>
     <script src="js/session_utils.js"></script>
     <script src="js/format_utils.js"></script>
-    <script src="js/history_parser.js?v=20261015-permissions-v4"></script>
-    <script src="js/history_search.js"></script>
+    <script src="js/history_parser.js?v=20261017-search-location"></script>
+    <script src="js/history_search.js?v=20261017-search-scope"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script src="js/quote_utils.js"></script>
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script src="js/app/core.js"></script>
+    <script src="js/app/core.js?v=20261016-tool-modal"></script>
     <!-- 引用交互（选区浮钮/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script src="js/app/quotes.js"></script>
-    <script src="js/app/sessions.js?v=20261015-permissions-v4"></script>
-    <script src="js/app/history_search.js"></script>
+    <script src="js/app/sessions.js?v=20261016-model-modal"></script>
+    <script src="js/app/history_search.js?v=20261017-search-scope"></script>
     <script src="js/app/session_groups.js"></script>
     <script src="js/app/stats.js"></script>
     <script src="js/app/workdir.js"></script>
     <script src="js/tool_approval_state.js?v=20261015-permissions-v4"></script>
     <script src="js/app/permissions.js?v=20261015-permissions-v4"></script>
-    <script src="js/app/messages.js?v=20261015-permissions-v4"></script>
+    <script src="js/app/messages.js?v=20261017-search-location"></script>
     <script src="js/app/history.js"></script>
     <script src="js/app/compaction.js"></script>
     <script src="js/app/builtin.js"></script>
     <script src="js/app/user_profile.js"></script>
     <script src="js/app/media.js"></script>
     <script src="js/app/skills.js"></script>
-    <script src="js/app/composer.js?v=20261015-permissions-v4"></script>
-    <script src="js/app/model_panel.js?v=20261015-compaction-activation"></script>
-    <script src="js/app/tools.js"></script>
+    <script src="js/app/composer.js?v=20261016-chat-settings"></script>
+    <script src="js/app/chat_settings_modal.js?v=20261016-chat-settings"></script>
+    <script src="js/app/model_panel_modal.js"></script>
+    <script src="js/app/model_panel.js?v=20261016-model-modal"></script>
+    <script src="js/app/tools.js?v=20261016-tool-compact-rows"></script>
     <script src="js/app/chat.js?v=20261015-permissions-v4"></script>
     <script src="js/app/filehistory.js"></script>
     <script src="js/app/terminals.js"></script>

@@ -187,6 +187,8 @@ const api_url = localStorage.getItem("ytools-api-base")
   function searchHistory(query, options) {
     options = options || {};
     const params = new URLSearchParams({ q: query, limit: String(options.limit || 40), offset: String(options.offset || 0) });
+    params.set("include_internal", String(Boolean(options.includeInternal)));
+    params.set("include_filenames", String(Boolean(options.includeFilenames)));
     if (options.revision) params.set("revision", options.revision);
     return request("/chat_history/search?" + params.toString(), { signal: options.signal });
   }

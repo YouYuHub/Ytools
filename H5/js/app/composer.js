@@ -416,7 +416,7 @@
   // ---------- 弹层锚定工具（"+"功能菜单等仍留在 .composer 内的下拉复用） ----------
   // 锚定触发按钮而非容器：多行输入时 composer 变高，CSS 的 bottom: calc(100%+8px)
   // 会把弹层推到容器另一端甚至推出视口；打开时按按钮的视口坐标 fixed 定位，
-  // 与容器高度彻底解耦（enhance-panel 浮层已提升 body 级，见下方 placeEnhancePanel）。
+  // 与容器高度彻底解耦。
   function placeAbove(el, anchor) {
     const r = anchor.getBoundingClientRect();
     el.classList.add("fixed-flyout");
@@ -426,75 +426,14 @@
     el.style.right = "auto";
   }
 
-  // 参数面板已提升 body 级浮层（见 index.html / _components.scss）：打开时临时
-  // 重挂到 document.body，脱离 .bottom（25）的堆叠上下文后，面板 z-index(110)
-  // 才能压过顶栏 .topbar（26）——否则顶栏累计 token 描述文字会盖住面板。
-  // 关闭时挂回 .composer 原位（首个子节点），保持 DOM 结构与开发调试直观。
-  const enhanceDock = enhancePanel.parentNode || document.body;
-
-  function floatEnhancePanel() {
-    if (enhancePanel.parentNode === document.body) return;
-    document.body.appendChild(enhancePanel);
-  }
-
-  function dockEnhancePanel() {
-    if (enhancePanel.parentNode === enhanceDock) return;
-    enhanceDock.insertBefore(enhancePanel, enhanceDock.firstChild);
-  }
-
-  // 参数面板垂直锚定参数按钮（空态向下展开/聊天态向上展开），水平保持与 composer 同宽对齐
-  function placeEnhancePanel() {
-    const empty = app.classList.contains("empty");
-    const btnRect = boostBtn.getBoundingClientRect();
-    const composerRect = composer.getBoundingClientRect();
-    floatEnhancePanel();
-    enhancePanel.style.left = Math.max(8, composerRect.left) + "px";
-    enhancePanel.style.width = composerRect.width + "px";
-    enhancePanel.style.right = "auto";
-    if (empty) {
-      enhancePanel.style.top = (btnRect.bottom + 8) + "px";
-      enhancePanel.style.bottom = "auto";
-    } else {
-      enhancePanel.style.top = "auto";
-      enhancePanel.style.bottom = (window.innerHeight - btnRect.top + 8) + "px";
-    }
-  }
-
-  function fitEnhancePanel() {
-    placeEnhancePanel();
-    const gap = 8;
-    const empty = app.classList.contains("empty");
-    // 面板定位锚点是 .composer（输入框）而非 composer-wrap（wrap 还含输入框
-    // 上方状态栏 / 下方建议行），按面板自身渲染位置推算才能贴满可视区：
-    // 空态向下展开用锚定的 top，聊天态向上展开用锚定的 bottom
-    const panelRect = enhancePanel.getBoundingClientRect();
-    const height = empty
-      ? Math.max(120, window.innerHeight - panelRect.top - gap)
-      : Math.max(200, panelRect.bottom - gap);
-    enhancePanel.style.maxHeight = height + "px";
-  }
-
-  function toggleEnhancePanel() {
-    const opening = enhancePanel.classList.contains("hidden");
-    plusMenu.classList.add("hidden");
-    if (opening) {
-      // 先显示再 fit（fit 量取面板矩形，隐藏态 rect 为 0）；两者同任务同步执行，
-      // 浏览器在任务结束后才绘制，不存在"先在默认位置闪一帧"的问题
-      enhancePanel.classList.remove("hidden");
-      fitEnhancePanel();
-      App.openModelPanel();
-    } else {
-      enhancePanel.classList.add("hidden");
-      dockEnhancePanel();
-    }
-  }
-
+  // 参数设置使用独立模态框，空白页和聊天页共用同一布局。
   boostBtn.addEventListener("click", function (event) {
     event.stopPropagation();
-    toggleEnhancePanel();
+    plusMenu.classList.add("hidden");
+    if (enhancePanel.classList.contains("hidden")) App.openModelPanel();
+    else App.closeModelPanel();
   });
   window.addEventListener("resize", function () {
-    if (!enhancePanel.classList.contains("hidden")) fitEnhancePanel();
     if (!plusMenu.classList.contains("hidden")) placeAbove(plusMenu, plusBtn);
   });
 
@@ -784,8 +723,11 @@
   });
 
   function closeChatSettings() {
+    if (App.chatSettingsSaving) return;
+    App.chatSettingsLoadVersion = (App.chatSettingsLoadVersion || 0) + 1;
     chatSettingsModal.classList.add("hidden");
     chatSettingsModal.setAttribute("aria-hidden", "true");
+    if (App.hideChatSettingsModal) App.hideChatSettingsModal();
   }
 
   // 两个接口同属“聊天设置”，共用一组确定/取消：打开时并行加载，确定时并行提交
@@ -842,8 +784,12 @@
   }
 
   async function openChatSettings() {
+    if (App.chatSettingsSaving) return;
+    const version = App.chatSettingsLoadVersion = (App.chatSettingsLoadVersion || 0) + 1;
+    const sid = state.sessionId;
     chatSettingsModal.classList.remove("hidden");
     chatSettingsModal.setAttribute("aria-hidden", "false");
+    if (App.showChatSettingsModal) App.showChatSettingsModal();
     chatSettingsConfirm.disabled = true;
     loadSettingsRetitle();
     const permissionLoad = App.permissions ? App.permissions.loadSettings() : Promise.resolve();
@@ -859,6 +805,7 @@
       API.getSubAgentLimitsConfig().catch(function () { return null; }),
       permissionLoad,
     ]);
+    if (version !== App.chatSettingsLoadVersion || state.sessionId !== sid) return;
     chatSettingsConfirm.disabled = false;
     const comp = results[0];
     const mcp = results[1];
@@ -1028,6 +975,7 @@
   }
 
   chatSettingsConfirm.addEventListener("click", async function () {
+    if (chatSettingsConfirm.disabled || App.chatSettingsSaving) return;
     const compConfig = {
       trigger_ratio: readSettingNumber(triggerRatio),
       summary_budget_ratio: readSettingNumber(summaryBudgetRatio),
@@ -1063,9 +1011,11 @@
     const invalid = collectInvalidChatSettings(compConfig, mcpConfig, retryConfig, compRetryConfig, videoLimitConfig, concConfig, subRetryConfig, subLimitsConfig);
     if (invalid.length) {
       toast("请填写有效数值：" + invalid.join("、"));
+      if (App.revealInvalidChatSetting) App.revealInvalidChatSetting(invalid[0]);
       return;
     }
     chatSettingsConfirm.disabled = true;
+    if (App.setChatSettingsBusy) App.setChatSettingsBusy(true);
     const results = await Promise.allSettled([
       API.updateHistoryCompactionConfig(compConfig, state.sessionId),
       API.updateMcpToolConfig(mcpConfig),
@@ -1078,6 +1028,7 @@
       ...(App.permissions ? [App.permissions.saveSettings()] : []),
     ]);
     chatSettingsConfirm.disabled = false;
+    if (App.setChatSettingsBusy) App.setChatSettingsBusy(false);
     const failed = results.filter(function (r) { return r.status === "rejected"; });
     if (failed.length === 0) {
       App.refreshContextTokenStats(state.sessionId);
@@ -1137,8 +1088,6 @@
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.refreshComposerButtons = refreshComposerButtons;
   App.autosize = autosize;
-  App.fitEnhancePanel = fitEnhancePanel;
-  App.dockEnhancePanel = dockEnhancePanel;
   App.closeChatSettings = closeChatSettings;
   App.openChatSettings = openChatSettings;
   App.submitSteerOrQueue = submitSteerOrQueue;

@@ -184,7 +184,7 @@
    * start 新建块；其余按 agent_id 追加到最近一块；done 收尾。
    * 块记录保持在其 start 事件出现的位置（时间顺序不变）。
    */
-  function foldSubAgentEvent(records, evt, openBlocks) {
+  function foldSubAgentEvent(records, evt, openBlocks, eventIndex) {
     const agentId = evt.agent_id || "";
     if (evt.phase === "start") {
       const existing = evt.parent_tool_call_id && records.find(function (record) {
@@ -194,6 +194,7 @@
       if (existing) Object.assign(record, subAgentRecord(evt));
       else records.push(record);
       openBlocks[agentId] = record;
+      record.source_event_index = eventIndex;
       return;
     }
     const block = openBlocks[agentId] || null;
@@ -206,12 +207,14 @@
       block.error = typeof evt.error === "string" ? evt.error : "";
       block.ended_at = evt.ended_at || evt.timestamp || "";
       block.done_emitted = true;
+      block.done_event_index = eventIndex;
       delete openBlocks[agentId];
       return;
     }
     // delta 仅实时推流（JSONL 白名单本就不含，防御式跳过）
     if (evt.phase === "delta" || evt.phase === "heartbeat") return;
     block.entries.push({
+      source_event_index: eventIndex,
       phase: evt.phase,
       seq: evt.seq != null ? Number(evt.seq) : null,
       reasoning_content: typeof evt.reasoning_content === "string" ? evt.reasoning_content : "",
@@ -395,7 +398,7 @@
 
         // 子任务事件块：按 agent_id 聚合（渲染顺序与 events 顺序一致）
         if (evt.event === "sub_agent") {
-          foldSubAgentEvent(records, evt, openBlocks);
+          foldSubAgentEvent(records, evt, openBlocks, eventIndex);
           return;
         }
 

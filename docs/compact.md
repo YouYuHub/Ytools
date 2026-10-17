@@ -3,7 +3,7 @@
 本文描述 `Ytools` 的上下文压缩体系：**什么时候压缩、压缩什么、压成什么样、模型最终看到什么**。
 压缩只替换"下一次发给模型的工作上下文"，原始对话永远完整保存在历史 JSONL 中（含工具原始输出、思考过程、媒体引用），前端回放不受压缩影响。
 
-Responses 同时保留本地摘要与远端原生压缩。独立 compact 或 `compaction_trigger` 的完整原生返回窗口在下一次生成时用于建立新有状态链，随后继续 ID 增量续聊；兼容平台返回 trigger 密文不代表旧 ID 链已裁剪。连续的历史/本轮本地压缩复用同一份远端结果，远端 usage 接近阈值时即使本地摘要很小也会触发原生压缩。详见 [Responses 使用说明](responses_api_usage.md) 与 [压缩续写修复](responses_compaction_2026-10-15.md)。
+Responses 的有状态模式同时保留本地摘要与远端原生压缩。独立 compact 或 `compaction_trigger` 的完整原生返回窗口在下一次生成时用于建立新有状态链，随后继续 ID 增量续聊；兼容平台返回 trigger 密文不代表旧 ID 链已裁剪。连续的历史/本轮本地压缩复用同一份远端结果，远端 usage 接近阈值时即使本地摘要很小也会触发原生压缩。无状态兼容模式（`responses_mode: stateless`）的自动、任务内与手动压缩均只生成本地摘要，下次发送摘要后的有效上下文，不调用远端 compact/trigger。详见 [Responses 使用说明](responses_api_usage.md) 与 [压缩续写修复](responses_compaction_2026-10-15.md)。
 
 核心实现分布：
 

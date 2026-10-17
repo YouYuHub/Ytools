@@ -10,8 +10,7 @@
   overflow: hidden;
 
   // ---------- 空态：输入条垂直居中（ChatGPT 首页形态） ----------
-  // （enhance-panel 已提升 body 级，空态向下弹出坐标由 composer.js
-  //   placeEnhancePanel 计算）
+  // 参数设置为独立模态框，不依赖空态输入条的位置。
   &.empty {
     .chat-scroll {
       display: none;
@@ -77,6 +76,15 @@
       padding: 60px 16px var(--chat-bottom-padding, 48px);
     }
   }
+
+  // qnav 显示时给聊天区右侧留出悬浮导航空间（常态指示条最宽 20px +
+  // right 14px = 最左缘距右 34px，44px 留白零遮挡；hover 涟漪最长 34px
+  // 是临时态，允许轻微覆盖）。桌面端生效，移动端导航隐藏不留白。
+  @media (min-width: 767px) {
+    &:has(> .qnav:not(.hidden)) .chat-inner {
+      padding-right: 44px;
+    }
+  }
 }
 
 // ---------- 顶栏 ----------
@@ -85,8 +93,9 @@
   top: 0;
   right: 0;
   left: 0;
-  // 高于底部输入区 .bottom（25）：顶栏下拉面板（文件变更统计等）不被输入区遮挡
-  z-index: 26;
+  // 高于底部输入区 .bottom（25）与右侧问题导航 .qnav（30）：顶栏下拉面板
+  // （文件变更统计等）不被输入区遮挡，也不被 qnav 展开的问题列表盖住
+  z-index: 35;
   display: flex;
   align-items: center;
   gap: 8px;

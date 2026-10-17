@@ -293,6 +293,57 @@
   }
 
   // ---------- 气泡引用卡片（历史回放 / 实时发送共用） ----------
+  /**
+   * 浮层视口钳制（与 CSS 默认展开方向互补）：
+   * - 垂直：默认向下展开；消息靠近聊天区底部、下方放不下（会被 .chat-scroll
+   *   裁剪 / .bottom 输入区盖住）且上方空间更大时，加 is-flipped 向上翻转；
+   *   展开侧依然放不下完整浮层时限高走内部滚动，保证整体可见。
+   * - 水平：CSS 默认 right:0 向左展开，解决短消息右溢出；反向极端情况
+   *   （气泡很宽、tile 靠左）下左边缘溢出则向右平移（不超过右边界）。
+   * 调用时机是 CSS :hover/:focus-within 已匹配后的下一帧，浮层已可测量。
+   */
+  function clampQuotePopover(tile, popover) {
+    tile.classList.remove("is-flipped");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxHeight = "";
+    if (!popover.getBoundingClientRect) return;
+    const rect = popover.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return; // 尚未显示，无需钳制
+    const margin = 8;
+    if (chatScroll && chatScroll.getBoundingClientRect && tile.getBoundingClientRect) {
+      const scrollRect = chatScroll.getBoundingClientRect();
+      const tileRect = tile.getBoundingClientRect();
+      const gap = 7; // 浮层与 tile 的间距（与 CSS top/bottom 的 7px 对齐）
+      const spaceBelow = scrollRect.bottom - margin - tileRect.bottom - gap;
+      const spaceAbove = tileRect.top - scrollRect.top - margin - gap;
+      if (rect.height > spaceBelow && spaceAbove > spaceBelow) {
+        tile.classList.add("is-flipped");
+        if (rect.height > spaceAbove && spaceAbove > 80) {
+          popover.style.maxHeight = Math.floor(spaceAbove) + "px";
+        }
+      } else if (rect.height > spaceBelow && spaceBelow > 80) {
+        popover.style.maxHeight = Math.floor(spaceBelow) + "px";
+      }
+    }
+    // 翻转只改变垂直位置，不影响水平 left/right，直接用同一份 rect 钳制。
+    const overflowLeft = margin - rect.left;
+    if (overflowLeft <= 0) return;
+    const maxShift = (window.innerWidth - margin) - rect.right;
+    const shift = Math.min(overflowLeft, Math.max(0, maxShift));
+    if (shift <= 0) return;
+    // offsetParent 即 tile（position:relative），offsetLeft 相对 tile 计算。
+    popover.style.left = (popover.offsetLeft + shift) + "px";
+    popover.style.right = "auto";
+  }
+
+  function resetQuotePopover(tile, popover) {
+    tile.classList.remove("is-flipped");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxHeight = "";
+  }
+
   /** 构造用户气泡中的引用卡片列表；无有效引用返回 null。 */
   function buildQuoteList(quotes) {
     const normalized = QuoteUtils.normalizeQuotes(quotes);
@@ -331,6 +382,19 @@
     });
     tile.appendChild(trigger);
     tile.appendChild(popover);
+    // 浮层显示后做一次视口钳制（rAF 等 CSS :hover/:focus-within 生效后再测量）；
+    // 隐藏时清除内联位移，恢复 CSS 默认右对齐。
+    tile.addEventListener("mouseenter", function () {
+      window.requestAnimationFrame(function () { clampQuotePopover(tile, popover); });
+    });
+    tile.addEventListener("focusin", function () {
+      window.requestAnimationFrame(function () { clampQuotePopover(tile, popover); });
+    });
+    tile.addEventListener("mouseleave", function () { resetQuotePopover(tile, popover); });
+    tile.addEventListener("focusout", function (e) {
+      if (e.relatedTarget && tile.contains(e.relatedTarget)) return;
+      resetQuotePopover(tile, popover);
+    });
     wrap.appendChild(tile);
     return wrap;
   }

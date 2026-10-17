@@ -692,7 +692,7 @@ class SubAgentRunner:
         extra_body = parameter.get("extra_body")
         if isinstance(extra_body, dict) and extra_body:
             request.extra_body = dict(extra_body)
-        for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text"):
+        for key in ("thinking", "output_config", "stop_sequences", "max_output_tokens", "instructions", "reasoning", "text", "responses_mode"):
             if parameter.get(key) is not None:
                 setattr(request, key, parameter[key])
         return request

@@ -41,9 +41,8 @@
 
   /**
    * 分享当前会话：统一走 /chat_history/export_zip——
-   * 后端在「单会话且 session_files 下无附件数据」时直接回 jsonl 明文，
-   * 有附件（media/图片视频音频、files/文档、diffs/版本链等）时打 zip。
-   * 按 Content-Type 分流落地：zip → blob 下载；jsonl → 文本下载。
+   * 后端统一返回 ZIP，包含会话、附件、分组和所选会话的权限配置快照。
+   * 保留 jsonl 响应兼容旧服务；未落盘的本地预览仍只能下载原 JSONL。
    */
   async function downloadSession(sessionId) {
     sessionId = SessionUtils.sanitizeSessionId(sessionId);
@@ -82,7 +81,7 @@
         link.click();
         link.remove();
         setTimeout(function () { URL.revokeObjectURL(url); }, 0);
-        toast("已打包分享（含附件/分组数据）：" + name);
+        toast("已打包分享（含附件、分组和会话权限）：" + name);
       } else {
         downloadText(name, await res.text());
       }
@@ -186,6 +185,9 @@
       importConflictHint.textContent = "包内 " + preview.total + " 个会话" + groupNote
         + (conflicts.length ? "，其中 " + conflicts.length + " 个与本地同名：" : "，均可直接导入：");
     }
+    if (preview.sessions.some(function (s) { return s.permission_included; })) {
+      importConflictHint.textContent += " 确认后还原所导入会话的权限；本地全局设置和其他会话不变。";
+    }
     preview.sessions.forEach(function (s) {
       const isConflict = s.exists;
       const row = document.createElement("div");
@@ -203,6 +205,8 @@
       if (s.imported_rounds != null) bits.push(s.imported_rounds + " 轮");
       if (s.media_count) bits.push(s.media_count + " 个媒体文件");
       if (s.group_name) bits.push("分组：" + s.group_name);
+      if (s.permission_included) bits.push("权限：" + (s.permission_mode === "full_control"
+        ? "完全控制" : s.permission_mode === "ask" ? "询问" : "跟随本地全局设置"));
       if (isConflict) bits.push("本地已存在同名会话");
       info.textContent = bits.join(" · ") || (isConflict ? "本地已存在同名会话" : "新会话");
       main.appendChild(title);
@@ -264,6 +268,7 @@
       // 打开最后一个导入成功的会话（多选导入时通常就是最新项）
       const last = importedList[importedList.length - 1];
       await App.openSession(SessionUtils.sanitizeSessionId(last.session_id));
+      if (App.permissions && App.permissions.refresh) await App.permissions.refresh();
       const collisionCount = importedList.filter(function (r) { return r.collision; }).length;
       const groupedCount = importedList.filter(function (r) { return r.group_name; }).length;
       let msg = "已导入 " + importedList.length + " 个会话";

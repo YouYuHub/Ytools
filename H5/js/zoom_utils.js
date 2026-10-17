@@ -77,6 +77,41 @@
     return dir > 0 ? percent < MAX_PERCENT : percent > MIN_PERCENT;
   }
 
+  // ---------- 预览弹窗平移缩放（pan/zoom）几何 ----------
+  // 约定与 media.js 的 transform 写法对应：translate(tx,ty) scale(s)，
+  // 位移取屏幕像素（不受倍率影响），缩放中心为容器中心。
+
+  // 以锚点为中心的缩放：返回 {scale, tx, ty}。
+  // (ax,ay) 锚点（鼠标）在容器中的坐标，(cx,cy) 容器中心，
+  // (tx1,ty1) 当前位移；min/max 为倍率边界（缺省 0.5~8，与档位对齐）。
+  // 锚点传 null 时以中心缩放（位移不变）。
+  function zoomAtPoint(scale1, factor, ax, ay, cx, cy, tx1, ty1, min, max) {
+    const lo = Number.isFinite(min) && min > 0 ? min : MIN_PERCENT / 100;
+    const hi = Number.isFinite(max) && max > lo ? max : MAX_PERCENT / 100;
+    const s1 = Number.isFinite(scale1) && scale1 > 0 ? scale1 : 1;
+    const f = Number.isFinite(factor) && factor > 0 ? factor : 1;
+    const s2 = Math.max(lo, Math.min(hi, s1 * f));
+    const x1 = Number.isFinite(tx1) ? tx1 : 0;
+    const y1 = Number.isFinite(ty1) ? ty1 : 0;
+    if (s2 === s1 || ax == null || ay == null) return { scale: s2, tx: x1, ty: y1 };
+    // 保持锚点下的图像点不动：T2 = T1 + (A - C - T1) * (1 - s2/s1)
+    const k = 1 - s2 / s1;
+    return { scale: s2, tx: x1 + (ax - cx - x1) * k, ty: y1 + (ay - cy - y1) * k };
+  }
+
+  // 位移钳制：图像边缘不超过容器中心（拖不出视野）；
+  // 图像小于容器时位移归零。返回 {tx, ty}。
+  function clampPan(tx, ty, scaledW, scaledH, contW, contH) {
+    const maxTx = Math.max(0, (scaledW - contW) / 2);
+    const maxTy = Math.max(0, (scaledH - contH) / 2);
+    const x = Number.isFinite(tx) ? tx : 0;
+    const y = Number.isFinite(ty) ? ty : 0;
+    return {
+      tx: Math.min(maxTx, Math.max(-maxTx, x)),
+      ty: Math.min(maxTy, Math.max(-maxTy, y)),
+    };
+  }
+
   return {
     ZOOM_STEPS: ZOOM_STEPS,
     MIN_PERCENT: MIN_PERCENT,
@@ -87,5 +122,7 @@
     normalizeScale: normalizeScale,
     stepScale: stepScale,
     canStep: canStep,
+    zoomAtPoint: zoomAtPoint,
+    clampPan: clampPan,
   };
 });

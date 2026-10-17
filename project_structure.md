@@ -131,6 +131,7 @@ agent_tool_sse/
 │   ├── file_diff.md             # 文件变更 Diff 与历史版本链
 │   ├── history_search.md        # 会话全文搜索接口、索引与前端行为
 │   ├── local_data_storage.md    # 本地历史、媒体、权限库与 sidecar 存储说明
+│   ├── session_sharing.md       # ZIP v3、会话权限 SQLite 快照、冲突合并与失败恢复
 │   ├── media_limits.md          # 多模态媒体数量/类型配额及自动降级
 │   ├── messages_api_compatibility_plan.md # Messages 历史实施方案（以 usage 文档为准）
 │   ├── messages_api_parity_audit.md # Messages 功能对照与历史验证记录
@@ -357,6 +358,8 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 ### 10. API 接口总览
 > 完整出入参数说明见 `docs/api_docs.md`，在线文档见 `/docs`
+
+2026-10-16 Responses 补充：`test/test_responses_stateless.py` 覆盖可选无状态模式，`docs/responses_stateless_2026-10-16.md` 记录 Muse Spark 实测与排查。`responsesMode`（模型/provider）及 `responses_mode`（请求/角色）控制 ID 续聊或全量本地上下文回传；原有有状态模式与传输不变。详细行为见 `docs/responses_api_usage.md`。
 
 ---
 

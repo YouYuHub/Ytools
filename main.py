@@ -233,8 +233,11 @@ _prewarm_tool_registry()
 
 if __name__ == '__main__':
     import uvicorn
+    from pathlib import Path
+
     # _write_service_state_snapshot()
-    uvicorn.run(app='main:app',
+    setup_file = Path(__file__).stem
+    uvicorn.run(app=f'{setup_file}:app',
         host=DEFAULT_SERVICE_HOST, port=DEFAULT_SERVICE_PORT,
         timeout_graceful_shutdown=5,
         # reload=True, reload_dirs=[str(PROJECT_ROOT)],

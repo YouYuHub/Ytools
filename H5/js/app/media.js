@@ -11,7 +11,8 @@
     composerAttachments, composer, input, MAX_PENDING_MEDIA,
     syncComposerAttachmentBlocks,
     MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS, mediaPreviewModal, mediaPreviewBody,
-    mediaPreviewTitle
+    mediaPreviewTitle, mediaPreviewZoom, mediaPreviewZoomIn, mediaPreviewZoomOut,
+    mediaPreviewZoomLabel
   } = App;
 
   // ---------- 媒体/文档预览模态框 ----------
@@ -37,6 +38,9 @@
       media.removeAttribute("src");
       try { media.load(); } catch (_) { /* ignore */ }
     });
+    resetPreviewZoom();
+    mediaPreviewZoom.classList.add("hidden");
+    mediaPreviewBody.classList.remove("is-zoomable");
     mediaPreviewBody.innerHTML = "";
     mediaPreviewTitle.textContent = "";
     mediaPreviewModal.classList.add("hidden");
@@ -47,6 +51,11 @@
     const type = options.type || "download";
     mediaPreviewTitle.textContent = options.title || "";
     mediaPreviewBody.innerHTML = "";
+    // 图片/视频启用缩放工具栏；每次打开新媒体都从适应窗口开始
+    const zoomable = type === "image" || type === "video";
+    mediaPreviewZoom.classList.toggle("hidden", !zoomable);
+    mediaPreviewBody.classList.toggle("is-zoomable", zoomable);
+    resetPreviewZoom();
     if (type === "image") {
       const img = el("img", "media-preview-image");
       img.src = options.src;
@@ -98,6 +107,134 @@
     mediaPreviewModal.setAttribute("aria-hidden", "false");
   }
 
+  // ---------- 预览缩放（图片/视频 pan & zoom） ----------
+  // transform 写法 translate(tx,ty) scale(s)：位移取屏幕像素（不受倍率影响），
+  // 缩放中心为容器中心；档位/几何计算复用 ZoomUtils（与站内三控件一致）。
+  const ZoomUtils = window.ZoomUtils;
+  const previewZoom = { scale: 1, tx: 0, ty: 0 };
+  let previewZoomDrag = null;
+  // 视频原生控制条高度：底部该区域内不劫持 mousedown/dblclick，留给控制条
+  const PREVIEW_VIDEO_CONTROLS_ZONE = 48;
+
+  function previewZoomTarget() {
+    return mediaPreviewBody.querySelector("img.media-preview-image, video.media-preview-video");
+  }
+
+  function applyPreviewZoom() {
+    mediaPreviewZoomLabel.textContent = ZoomUtils.percentFromScale(previewZoom.scale) + "%";
+    mediaPreviewZoomIn.disabled = !ZoomUtils.canStep(previewZoom.scale, +1);
+    mediaPreviewZoomOut.disabled = !ZoomUtils.canStep(previewZoom.scale, -1);
+    const target = previewZoomTarget();
+    if (!target) return;
+    target.style.transform = "translate(" + previewZoom.tx + "px, " + previewZoom.ty + "px) scale(" + previewZoom.scale + ")";
+    target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
+  }
+
+  function clampPreviewZoomPan() {
+    const target = previewZoomTarget();
+    if (!target || !target.getBoundingClientRect) return;
+    const rect = target.getBoundingClientRect();
+    const bodyRect = mediaPreviewBody.getBoundingClientRect();
+    // 布局盒不受 transform 影响：当前盒 / scale 反推未缩放尺寸
+    const baseW = rect.width / previewZoom.scale;
+    const baseH = rect.height / previewZoom.scale;
+    const clamped = ZoomUtils.clampPan(previewZoom.tx, previewZoom.ty,
+      baseW * previewZoom.scale, baseH * previewZoom.scale,
+      bodyRect.width, bodyRect.height);
+    previewZoom.tx = clamped.tx;
+    previewZoom.ty = clamped.ty;
+  }
+
+  // 以锚点（client 坐标）为中心缩放；锚点 null 表示中心缩放
+  function previewZoomBy(factor, clientX, clientY) {
+    if (!previewZoomTarget()) return;
+    let ax = null, ay = null, cx = 0, cy = 0;
+    if (clientX != null && clientY != null) {
+      const bodyRect = mediaPreviewBody.getBoundingClientRect();
+      ax = clientX - bodyRect.left;
+      ay = clientY - bodyRect.top;
+      cx = bodyRect.width / 2;
+      cy = bodyRect.height / 2;
+    }
+    const next = ZoomUtils.zoomAtPoint(previewZoom.scale, factor, ax, ay, cx, cy,
+      previewZoom.tx, previewZoom.ty);
+    previewZoom.scale = next.scale;
+    previewZoom.tx = next.tx;
+    previewZoom.ty = next.ty;
+    clampPreviewZoomPan();
+    applyPreviewZoom();
+  }
+
+  function previewZoomStep(dir) {
+    previewZoomBy(ZoomUtils.stepScale(previewZoom.scale, dir) / previewZoom.scale, null, null);
+  }
+
+  function resetPreviewZoom() {
+    previewZoom.scale = 1;
+    previewZoom.tx = 0;
+    previewZoom.ty = 0;
+    previewZoomDrag = null;
+    mediaPreviewBody.classList.remove("is-dragging");
+    const target = previewZoomTarget();
+    if (target) {
+      target.style.transform = "";
+      target.style.cursor = "";
+    }
+    applyPreviewZoom();
+  }
+
+  function previewInVideoControlsZone(target, clientY) {
+    if (!target || target.tagName !== "VIDEO" || !target.getBoundingClientRect) return false;
+    return clientY > target.getBoundingClientRect().bottom - PREVIEW_VIDEO_CONTROLS_ZONE;
+  }
+
+  mediaPreviewZoomIn.addEventListener("click", function () { previewZoomStep(+1); });
+  mediaPreviewZoomOut.addEventListener("click", function () { previewZoomStep(-1); });
+  mediaPreviewZoomLabel.addEventListener("click", resetPreviewZoom);
+
+  // Ctrl+滚轮：以鼠标位置为中心缩放；普通滚轮不拦截（文本预览仍可滚动）
+  mediaPreviewBody.addEventListener("wheel", function (e) {
+    if (!e.ctrlKey && !e.metaKey) return;
+    if (!previewZoomTarget()) return;
+    e.preventDefault();
+    previewZoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
+  }, { passive: false });
+
+  // 双击：在 2x 与适应窗口之间切换（以点击点为中心放大）
+  mediaPreviewBody.addEventListener("dblclick", function (e) {
+    const target = previewZoomTarget();
+    if (!target || e.target !== target) return;
+    if (previewInVideoControlsZone(target, e.clientY)) return;
+    if (previewZoom.scale > 1.01) resetPreviewZoom();
+    else previewZoomBy(2 / previewZoom.scale, e.clientX, e.clientY);
+  });
+
+  // 放大后按住拖动：document 级 move/up，移出弹窗也能继续拖
+  mediaPreviewBody.addEventListener("mousedown", function (e) {
+    if (e.button !== 0 || previewZoomDrag) return;
+    const target = previewZoomTarget();
+    if (!target || e.target !== target || previewZoom.scale <= 1) return;
+    if (previewInVideoControlsZone(target, e.clientY)) return;
+    previewZoomDrag = { x: e.clientX, y: e.clientY, tx: previewZoom.tx, ty: previewZoom.ty };
+    mediaPreviewBody.classList.add("is-dragging");
+    target.style.cursor = "grabbing";
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", function (e) {
+    if (!previewZoomDrag) return;
+    previewZoom.tx = previewZoomDrag.tx + (e.clientX - previewZoomDrag.x);
+    previewZoom.ty = previewZoomDrag.ty + (e.clientY - previewZoomDrag.y);
+    clampPreviewZoomPan();
+    applyPreviewZoom();
+  });
+  document.addEventListener("mouseup", function () {
+    if (!previewZoomDrag) return;
+    previewZoomDrag = null;
+    mediaPreviewBody.classList.remove("is-dragging");
+    const target = previewZoomTarget();
+    if (target) target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
+  });
+
   // media:// 引用 / data: / http(s) → 可访问的资源 URL
   function resolveMediaSrc(mediaRef, sessionId) {
     if (typeof mediaRef !== "string" || !mediaRef) return null;
@@ -135,7 +272,23 @@
   $("#mediaPreviewClose").addEventListener("click", closeMediaPreview);
   $("#mediaPreviewBackdrop").addEventListener("click", closeMediaPreview);
   document.addEventListener("keydown", function (e) {
-    if (e.key === "Escape" && !mediaPreviewModal.classList.contains("hidden")) closeMediaPreview();
+    if (mediaPreviewModal.classList.contains("hidden")) return;
+    if (e.key === "Escape") {
+      closeMediaPreview();
+      return;
+    }
+    // 预览缩放快捷键（仅弹窗打开时）：Ctrl+加/减步进，Ctrl+0 重置
+    if (!e.ctrlKey && !e.metaKey) return;
+    if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      previewZoomStep(+1);
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      previewZoomStep(-1);
+    } else if (e.key === "0") {
+      e.preventDefault();
+      resetPreviewZoom();
+    }
   });
 
   // ---------- 待发送媒体附件（粘贴/选择） ----------
