@@ -139,7 +139,9 @@
     }
     try {
       const text = await file.text();
-      const parsed = HistoryParser.parseHistory(text);
+      const parsed = await (typeof HistoryParseAsync !== "undefined"
+        ? HistoryParseAsync.parse(text)
+        : HistoryParser.parseHistory(text));
       if (!parsed.records.length) {
         toast("未找到可显示的会话记录");
         return;
@@ -429,6 +431,7 @@
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.updateExportButton = updateExportButton;
   App.downloadSession = downloadSession;
+  App.openHistoryPicker = openHistoryPicker;
   App.loadSessionFiles = loadSessionFiles;
   // 导入冲突弹窗的关闭入口（core.js 的 Esc / 背景点击经此调用）
   App.closeImportConflict = closeImportConflictFn;

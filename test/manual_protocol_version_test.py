@@ -15,9 +15,9 @@ import subprocess
 import sys
 import threading
 
-EXE_MY = r"C:\Users\Administrator\MyMcp\PipeIpcMCP.exe"
 EXE_PROJ = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "mcp_server", "PipeIpcMCP.exe")
+EXE_MY = os.environ.get("PIPE_IPC_MCP_EXE", EXE_PROJ)
 
 KNOWN_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
 META_KEY = "io.modelcontextprotocol/protocolVersion"

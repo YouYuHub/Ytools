@@ -8,10 +8,12 @@ test('聊天设置加载、恢复和保存不改隐藏的回传配置，保留�
   const source = fs.readFileSync(path.join(__dirname, '../js/app/composer.js'), 'utf8');
   const core = fs.readFileSync(path.join(__dirname, '../js/app/core.js'), 'utf8');
   const saved = [], loaded = [], notices = [];
+  let speechLoads = 0;
   const node = () => ({ value: '', events: {}, classList: { remove() {} }, setAttribute() {},
     addEventListener(event, fn) { this.events[event] = fn; } });
   const context = { state: { sessionId: 'test-session' }, API: {}, App: { refreshContextTokenStats() {} },
     toast: text => notices.push(text), loadSettingsRetitle() {}, closeChatSettings() {},
+    loadSpeechInputSettings() { speechLoads++; },
   };
   for (const name of ['chatSettingsModal', 'chatSettingsConfirm', 'chatSettingsReset', 'chatSettingsCancel',
     'chatSettingsClose', 'chatSettingsBackdrop', 'toolCallTimeoutSeconds', 'networkRetryMaxAttempts',
@@ -37,6 +39,7 @@ test('聊天设置加载、恢复和保存不改隐藏的回传配置，保留�
   vm.runInContext(core.slice(core.indexOf('  const CHAT_SETTINGS_DEFAULTS ='), core.indexOf('  function readTitleOverrides')), context);
   vm.runInContext(source.slice(source.indexOf('  async function openChatSettings()'), source.indexOf('  // ---------- 每会话独立的输入草稿')), context);
   await context.openChatSettings();
+  assert.equal(speechLoads, 1, '打开设置会重新同步语种，但不混入数值配置的保存/恢复流程');
   assert.equal(loaded.length, 8);
   assert.equal(context.toolCallTimeoutSeconds.value, 123);
   assert.equal(context.subAgentTimeoutSeconds.value, 456);

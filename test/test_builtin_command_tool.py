@@ -63,6 +63,11 @@ class BuiltinCommandToolTests(unittest.TestCase):
             self.assertNotIn('�', text)
             self.assertEqual(len(text), 512)
             self.assertTrue(truncated)
+            path.write_bytes((('汉字🙂' * 50000) + '\n').encode())
+            text, truncated = bt._command_output_tail(path, 4, 512)
+            self.assertTrue(text.endswith('汉字🙂\n'))
+            self.assertTrue(text)
+            self.assertTrue(truncated)
     # ---------- 注入与名称注册 ----------
 
     def test_auto_shell_prefers_windows_powershell_and_falls_back_to_cmd(self):
@@ -349,12 +354,90 @@ class BuiltinCommandToolTests(unittest.TestCase):
 
     def test_simple_filter_parse_and_local_fallback(self):
         self.assertEqual(bt._parse_simple_filter("tail -20"), ("tail", 20))
+        self.assertEqual(bt._parse_simple_filter("tail -4 2>&1"), ("tail", 4))
         self.assertEqual(bt._parse_simple_filter("head -n 5"), ("head", 5))
         self.assertIsNone(bt._parse_simple_filter("tail -f"))
         text = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
         self.assertEqual(bt._apply_local_line_filter(text, "tail", 2), "line9\nline10\n")
         self.assertEqual(bt._apply_local_line_filter(text, "head", 2), "line1\nline2\n")
 
+
+    def test_powershell_simple_filters_use_native_pipeline(self):
+        command, notes = bt._guard_powershell_pipeline("'a | b' | tail -4")
+        self.assertEqual(command, "'a | b' | Select-Object -Last 4")
+        self.assertTrue(notes)
+        command, _ = bt._guard_powershell_pipeline("1..10 | head -n 3")
+        self.assertEqual(command, "1..10 | Select-Object -First 3")
+        command, _ = bt._guard_powershell_pipeline("1..10 | tail -n 4 | Out-String")
+        self.assertEqual(command, "1..10 | Select-Object -Last 4 | Out-String")
+        command, _ = bt._guard_powershell_pipeline("1..10 | tail -4 2>&1; Write-Output done")
+        self.assertEqual(command, "1..10 | Select-Object -Last 4 2>&1; Write-Output done")
+        self.assertEqual(bt._guard_powershell_pipeline("Write-Output a`|tail -4"), ("Write-Output a`|tail -4", []))
+        self.assertEqual(bt._guard_powershell_pipeline("1..10 | tail -f"), ("1..10 | tail -f", []))
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 管道执行用例仅 Windows 验证")
+    def test_powershell_tail_preserves_large_upstream_output(self):
+        command = f'& "{sys.executable}" -c "[print(i) for i in range(5000)]" 2>&1 | tail -4'
+        result = bt.execute_run_command({
+            "command": command, "shell": "powershell", "timeout_seconds": 30,
+            "_structured_output": True,
+        })
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"].splitlines(), ["4996", "4997", "4998", "4999"])
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 管道执行用例仅 Windows 验证")
+    def test_powershell_tail_before_another_stage_and_redirection(self):
+        source = f'& "{sys.executable}" -c "[print(i) for i in range(5000)]" 2>&1'
+        for suffix in ("tail -4 | Out-String", "tail -4 2>&1"):
+            with self.subTest(suffix=suffix):
+                result = bt.execute_run_command({
+                    "command": f"{source} | {suffix}", "shell": "powershell",
+                    "timeout_seconds": 30, "_structured_output": True,
+                })
+                self.assertEqual(result["exit_code"], 0)
+                self.assertEqual(result["stdout"].strip().splitlines(), ["4996", "4997", "4998", "4999"])
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 直连执行用例仅 Windows 验证")
+    def test_powershell_direct_fallback_preserves_upstream_exit_code(self):
+        command = f'& "{sys.executable}" -c "import sys; print(\'marker\'); sys.exit(7)" 2>&1 | tail -4'
+        with patch.object(bt, "_write_relay_script", side_effect=RuntimeError("force direct")):
+            result = bt.execute_run_command({
+                "command": command, "shell": "powershell", "timeout_seconds": 30,
+                "_structured_output": True,
+            })
+        self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["stdout"].strip(), "marker")
+
+    @unittest.skipUnless(IS_WINDOWS, "cmd 管道执行用例仅 Windows 验证")
+    def test_cmd_local_filters_handle_large_output_file(self):
+        source = f'"{sys.executable}" -c "[print(str(i).zfill(5) + \'x\'*1024) for i in range(2000)]"'
+        for filter_name, expected in (
+            ("tail", ["01996", "01997", "01998", "01999"]),
+            ("head", ["00000", "00001", "00002", "00003"]),
+        ):
+            with self.subTest(filter_name=filter_name), \
+                    patch.object(bt, "_resolve_filter_path", return_value=""), \
+                    patch.object(bt, "_find_working_filter", return_value=None):
+                result = bt.execute_run_command({
+                    "command": f"{source} | {filter_name} -4", "shell": "cmd",
+                    "timeout_seconds": 30, "_structured_output": True,
+                })
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual([line[:5] for line in result["stdout"].splitlines()], expected)
+            if filter_name == "tail":
+                self.assertIn("完整输出文件末尾", result["message"])
+
+    @unittest.skipUnless(IS_WINDOWS, "cmd 管道执行用例仅 Windows 验证")
+    def test_cmd_unavailable_filter_rejects_unsafe_background_and_middle_stage(self):
+        with patch.object(bt, "_resolve_filter_path", return_value=""), \
+                patch.object(bt, "_find_working_filter", return_value=None):
+            with self.assertRaisesRegex(ValueError, "命令未执行"):
+                bt.execute_run_command({"command": "echo a | tail -4", "shell": "cmd", "background": True})
+            with self.assertRaisesRegex(ValueError, "管道中间"):
+                bt._guard_cmd_pipeline("echo a | tail -4 | findstr a")
+            command, local_filter, _ = bt._guard_cmd_pipeline("echo a | tail -4 2>&1")
+            self.assertEqual(command, "echo a")
+            self.assertEqual(local_filter, ("tail", 4))
 
 if __name__ == "__main__":
     unittest.main()

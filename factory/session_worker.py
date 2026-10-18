@@ -125,6 +125,7 @@ class _WorkerStreamAdapter:
         self._question_quotes = None
         self._live_round_no = None
         self._live_round_model = None
+        self._live_round_usage_total = None
         self.user_stop_requested = False
         self.stop_requested = False
         self.done = False
@@ -213,6 +214,16 @@ class _WorkerStreamAdapter:
             } or None
         self._live_round_model = normalized
         self._evt_queue.put({"type": "live_round_model", "model": normalized})
+
+    @property
+    def live_round_usage_total(self):
+        return self._live_round_usage_total
+
+    @live_round_usage_total.setter
+    def live_round_usage_total(self, value) -> None:
+        normalized = dict(value) if isinstance(value, dict) and value else None
+        self._live_round_usage_total = normalized
+        self._evt_queue.put({"type": "live_round_usage_total", "usage": normalized})
 
     def emit(self, chunk: str) -> None:
         if isinstance(chunk, str) and chunk:
@@ -485,6 +496,8 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                 await current_task
             except (asyncio.CancelledError, Exception):
                 pass
+        from util.mcp_client import close_persistent_mcp_clients
+        await asyncio.to_thread(close_persistent_mcp_clients)
         evt_queue.put(None)  # 让 evt 写线程退出
 
 
@@ -857,6 +870,12 @@ def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], No
             # 本轮生效聊天模型：附接回放 marker 携带 model 字段用
             try:
                 stream.live_round_model = evt.get("model")
+            except Exception:
+                pass
+        elif evt_type == "live_round_usage_total":
+            # 缓冲区截断时仍能在附接 marker 中提供最新的整轮绝对用量。
+            try:
+                stream.live_round_usage_total = evt.get("usage")
             except Exception:
                 pass
         elif evt_type == "task_done":

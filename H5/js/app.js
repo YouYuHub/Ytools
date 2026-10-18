@@ -51,13 +51,13 @@
     loadWorkDir();
     // 全局显示名（.env USER_NAME）：首屏拉取一次，点击侧边栏名字可改
     if (App.loadUserProfile) App.loadUserProfile();
+    if (App.loadSpeechInputSettings) App.loadSpeechInputSettings();
     migrateLegacyBuiltinFlags();
-    // 支持 ?session=xxx 直达会话；目标会话不存在时（如默认 default 已删除）直接新建对话
+    // List loading and initial navigation are independent. A lightweight lookup
+    // validates the target without waiting for every sidebar row to render.
     const target = new URLSearchParams(location.search).get("session") || "default";
-    loadSessions().then(function () {
-      if (sessionList.querySelector('[data-session="' + target + '"]')) openSession(target);
-      else startNewChat();
-    });
+    loadSessions();
+    App.openInitialSession(target);
   }
 
   init();

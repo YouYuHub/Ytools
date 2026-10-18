@@ -13,6 +13,9 @@ from urllib.parse import quote
 
 # 自定义模块导入
 from factory.md_table_export import parse_md_table, matrix_to_xlsx_bytes
+from util.logger import get_logger
+
+logger = get_logger("routers.export_router")
 
 # 创建 API 路由器实例
 api_export_router = APIRouter(prefix="/export")
@@ -49,8 +52,9 @@ async def export_table_xlsx(payload: TableExportRequest) -> Response:
         xlsx_bytes, row_count, col_count = matrix_to_xlsx_bytes(parsed)
     except ValueError as value_error:
         raise HTTPException(status_code=422, detail=str(value_error))
-    except Exception as build_error:
-        raise HTTPException(status_code=500, detail=f"xlsx 生成失败: {build_error}")
+    except Exception:
+        logger.exception("xlsx 生成失败")
+        raise HTTPException(status_code=500, detail="xlsx 生成失败")
 
     filename = (payload.filename or "table") + ".xlsx"
     return Response(

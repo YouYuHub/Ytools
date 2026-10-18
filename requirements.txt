@@ -1,32 +1,33 @@
-#################### necessary start ####################
-# Web 框架和服务器
+#################### required dependencies start ####################
+# Web framework and server
 fastapi
 uvicorn
 
-# 数据验证
+# Data validation
 pydantic
 
-# MCP协议（Model Context Protocol）；可选，但是使用必备
+# MCP (Model Context Protocol); optional for general use, required for MCP features
 mcp
 
-# 图片格式转化，多模态模型上传图片的格式转化使用
+# Image format conversion for uploading images to multimodal models
 pillow
 
-# gif 动图转 H.264 MP4：自带各平台静态 ffmpeg 二进制（含 libx264），
-# 用户机器未安装系统 ffmpeg 时作为回退执行体——装了 requirements 即无需
-# 额外配置 ffmpeg（系统 PATH 的 ffmpeg 优先使用）
+# Convert animated GIFs to H.264 MP4. Includes static ffmpeg binaries for each
+# platform (with libx264), used as a fallback when system ffmpeg is unavailable.
+# Installing requirements is sufficient; no additional ffmpeg setup is needed.
+# System ffmpeg on PATH takes precedence.
 imageio-ffmpeg
 
-#################### necessary end ###################
+#################### required dependencies end ####################
 
 
 
-#################### optional start ####################
-# 文档解析
+#################### optional dependencies start ####################
+# Document parsing
 PyMuPDF
 python-docx
 pandas
 openpyxl
 xlrd
 
-#################### optional end ####################
+#################### optional dependencies end ####################

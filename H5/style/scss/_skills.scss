@@ -1,4 +1,4 @@
-// Skills 提示词库：可拖拽对话框（左侧文件列表 + 右侧预览/编辑分栏）
+// Skills 提示词库：桌面端可拖拽分栏，手机端列表与正文切换
 // 结构与视觉语言对齐 .tool-modal（bg-elevated / border-strong / shadow-menu），
 // z-index 略低于工具弹窗，二者不会同时打开。
 
@@ -60,6 +60,10 @@
       margin-left: auto;
       width: 30px;
       height: 30px;
+    }
+
+    .skills-back {
+      display: none;
     }
   }
 
@@ -468,23 +472,127 @@
   }
 
   @media (max-width: 768px) {
-    padding: 8px;
+    padding: 0;
 
     .skills-dialog {
-      height: calc(100vh - 16px);
+      position: relative !important;
+      top: auto !important;
+      left: auto !important;
+      margin: 0 !important;
+      width: 100%;
+      height: 100dvh;
+      border: 0;
+      border-radius: 0;
     }
 
-    // 窄屏关掉拖拽语义：列表收窄，编辑区保持「工具栏 + 编辑器」上下结构
+    // 手机端一次展示列表或正文，避免分栏把正文挤成逐字换行。
     .skills-head {
       cursor: default;
+      touch-action: auto;
+      min-height: 52px;
+      padding: 8px 12px;
+
+      .skills-back {
+        display: none;
+        margin-left: 0;
+        width: 34px;
+        height: 34px;
+      }
+
+      strong {
+        font-size: 16px;
+      }
+    }
+
+    .skills-body,
+    .skills-main,
+    .skills-side {
+      min-width: 0;
     }
 
     .skills-side {
-      flex-basis: 132px;
+      flex: 1 1 auto;
+      width: 100%;
+      border-right: 0;
+
+      .skills-side-head {
+        padding: 12px 16px 8px;
+        font-size: 13px;
+      }
+
+      .skills-list {
+        padding: 4px 10px 16px;
+
+        .skills-file-item {
+          padding: 10px 12px;
+
+          .skills-file-name { font-size: 14px; }
+          .skills-file-meta { font-size: 11px; }
+        }
+      }
+    }
+
+    .skills-main {
+      display: none;
+      width: 100%;
+    }
+
+    .skills-dialog.mobile-detail {
+      .skills-side { display: none; }
+      .skills-main { display: flex; }
+      .skills-head .skills-back { display: flex; }
+    }
+
+    .skills-toolbar {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      padding: 8px 12px;
+
+      .skills-file-name,
+      .skills-rename-input {
+        grid-column: 1;
+        font-size: 13px;
+      }
+
+      .skills-rename-btn {
+        grid-column: 2;
+        justify-self: end;
+      }
+
+      .skills-tabs {
+        grid-column: 1 / -1;
+        width: 100%;
+
+        .skills-tab { flex: 1; }
+      }
+
+      .skills-act {
+        min-width: 0;
+        padding: 7px 5px;
+        font-size: 12px;
+      }
+    }
+
+    .skills-preview {
+      padding: 12px 16px 24px;
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+
+      h1 { font-size: 1.5em; }
+      h2 { font-size: 1.3em; }
+      h3 { font-size: 1.15em; }
+      pre { max-width: 100%; overflow-x: auto; }
     }
 
     .skills-md-bar {
       padding: 4px 8px;
+    }
+
+    .skills-editor {
+      padding: 12px 14px 20px;
+      font-size: 13px;
     }
   }
 }

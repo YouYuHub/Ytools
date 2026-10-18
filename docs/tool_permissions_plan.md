@@ -82,7 +82,7 @@
   "generation_id": "gen-random-id",
   "worker_instance_id": "worker-random-id",
   "permission_mode": "ask",
-  "workspace_root": "C:/Users/Administrator/Desktop/VsTest",
+  "workspace_root": "C:/example/workspace",
   "policy_revision": 7
 }
 ```
@@ -227,7 +227,7 @@ inline 模式使用同一接口的本地实现，不能只支持 worker 模式�
     "reason": "command_execution",
     "command": "python -m pytest test/test_example.py -q",
     "shell": "powershell",
-    "cwd": "C:/Users/Administrator/Desktop/VsTest",
+    "cwd": "C:/example/workspace",
     "background": false,
     "state": "pending"
   }

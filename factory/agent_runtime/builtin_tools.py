@@ -512,13 +512,13 @@ WRITE_FILE_TOOL_DEFINITION = {
         "parameters": {
             "type": "object",
             "properties": {
-                "full_file_name": {"type": "string", "description": "文件路径；相对路径基于会话工作目录"},
+                "path": {"type": "string", "description": "文件路径；相对路径基于会话工作目录"},
                 "content": {"type": "string", "description": "要写入的完整内容（覆盖模式会清空原内容）", "maxLength": _WRITE_EDIT_MAX_CHARS},
                 "encoding": {"type": "string", "description": "文件编码；新文件默认 utf-8，追加已有文件时自动识别"},
                 "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "description": "写入模式；新建用 create，覆盖已有文件须明确使用 overwrite"},
                 "expected_hash": {"type": "string", "description": "可选：read_file 返回的全文 content_hash，内容变化时拒绝写入"},
             },
-            "required": ["full_file_name", "content", "mode"],
+            "required": ["path", "content", "mode"],
         },
     },
 }
@@ -535,20 +535,20 @@ EDIT_FILE_TOOL_DEFINITION = {
         "parameters": {
             "type": "object",
             "properties": {
-                "full_file_name": {"type": "string", "description": "文件路径"},
+                "path": {"type": "string", "description": "文件路径"},
                 "old_string": {"type": "string", "description": "单次替换格式：要替换的原文，必须与文件内容完全一致；须与 new_string 一起提供，且不可与 edits 同用", "maxLength": _WRITE_EDIT_MAX_CHARS},
                 "new_string": {"type": "string", "description": "单次替换格式：替换后的内容；空串表示删除 old_string；须与 old_string 一起提供，且不可与 edits 同用", "maxLength": _WRITE_EDIT_MAX_CHARS},
                 "replace_all": {"type": "boolean", "description": "仅用于顶层 old_string/new_string 格式；匹配多处时是否全部替换，默认 false；使用 edits 时在对应项设置", "default": False},
                 "encoding": {"type": "string", "description": "指定文件编码（如 gbk）；留空按 BOM、UTF-8 和常见本地编码自动识别", "default": ""},
                 "expected_hash": {"type": "string", "description": "可选：read_file 返回的全文 content_hash，内容变化时拒绝编辑"},
                 "edits": {"type": "array", "minItems": 1, "maxItems": 100,
-                          "description": "多处替换格式：按顺序执行的替换项；只传 edits，不要同时传顶层 old_string/new_string/replace_all；全部验证通过后一次写入",
+                          "description": "多处替换格式：按顺序执行的替换项，后项在前项替换后的文本上匹配；只传 edits，不要同时传顶层 old_string/new_string/replace_all；全部验证通过后一次写入，任一项失败则文件不改动",
                           "items": {"type": "object", "properties": {
                               "old_string": {"type": "string"}, "new_string": {"type": "string"},
                               "replace_all": {"type": "boolean", "default": False}},
                               "required": ["old_string", "new_string"]}},
             },
-            "required": ["full_file_name"],
+            "required": ["path"],
         },
     },
 }
@@ -875,11 +875,21 @@ def _optional_bool(args: dict[str, Any], key: str, default: bool = False) -> boo
     return value
 
 
+def _tool_path(tool_args: dict[str, Any] | None) -> str:
+    """读取文件路径参数：新名 path，兼容旧名 full_file_name（旧历史/旧客户端）。
+
+    schema 只暴露 path；旧工具调用（JSONL 历史、重放）沿用 full_file_name，
+    执行层与权限规划层统一经本函数读取，保证新旧调用都能执行。
+    """
+    args = tool_args or {}
+    return str(args.get("path") or args.get("full_file_name") or "").strip()
+
+
 def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 write_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
-    full_file_name = str((tool_args or {}).get("full_file_name") or "").strip()
-    if not full_file_name:
-        raise ValueError("full_file_name 不能为空")
+    file_path = _tool_path(tool_args)
+    if not file_path:
+        raise ValueError("path 不能为空")
     content = tool_args.get("content")
     if not isinstance(content, str):
         raise ValueError("content 必须为字符串")
@@ -904,7 +914,7 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     expected_hash = str(tool_args.get("expected_hash") or "").strip()
     if create_only and expected_hash:
         raise ValueError("create 模式不能同时指定 expected_hash")
-    path = Path(full_file_name).expanduser().resolve()
+    path = Path(file_path).expanduser().resolve()
     guard_path(path)
     existed = path.exists()
     if create_only and existed:
@@ -1025,10 +1035,10 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("old_string/new_string 超过 2 MiB 上限")
         _optional_bool(edit, "replace_all")
     encoding = str(args.get("encoding") or "").strip()
-    full_file_name = str(args.get("full_file_name") or "").strip()
-    if not full_file_name:
-        raise ValueError("full_file_name 不能为空")
-    path = Path(full_file_name).expanduser().resolve()
+    file_path = _tool_path(args)
+    if not file_path:
+        raise ValueError("path 不能为空")
+    path = Path(file_path).expanduser().resolve()
     guard_path(path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"{path} 不存在或不是文件")
@@ -1183,14 +1193,14 @@ READ_FILE_TOOL_DEFINITION = {
         "parameters": {
             "type": "object",
             "properties": {
-                "full_file_name": {"type": "string", "description": "文件路径；相对路径基于会话工作目录；传入目录会报错"},
+                "path": {"type": "string", "description": "文件路径；相对路径基于会话工作目录；传入目录会报错"},
                 "start_line": {"type": "integer", "description": "起始行（从 1 开始）", "default": 1},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "本次最多读取的连续行数", "default": 200},
                 "encoding": {"type": "string", "description": "指定文件编码（如 utf-8、gbk）；留空按 BOM、UTF-8 和常见本地编码自动识别", "default": ""},
                 "show_line_numbers": {"type": "boolean", "description": "是否带 \"行号| 内容\" 前缀显示，默认 true；行号可用于后续 edit_file 定位", "default": True},
                 "char_offset": {"type": "integer", "description": "仅单行超长时使用的字符偏移（按返回的 next_char_offset 续读）", "default": 0},
             },
-            "required": ["full_file_name"],
+            "required": ["path"],
         },
     },
 }
@@ -1205,7 +1215,7 @@ SEARCH_FILES_TOOL_DEFINITION = {
             "返回带行号上下文的匹配区块；"
             "默认按普通文本匹配；例如 A|B 必须传 is_regex=true 才表示任选其一。"
             "自动跳过二进制、隐藏目录、依赖/构建目录及 history_files/tmp/vendor；"
-            "可直接指定这些目录为 dir_path，或用 exclude_dirs 覆盖默认排除项。"
+            "可直接指定这些目录为 dir_path，或用 no_default_excludes 关闭默认排除后扫描。"
             "超限时返回部分结果；scan_complete=false 或 scan_truncated=true 时不能判定目标不存在。"
         ),
         "parameters": {
@@ -1222,7 +1232,8 @@ SEARCH_FILES_TOOL_DEFINITION = {
                 "max_scanned_files": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 3000, "description": "候选文件扫描上限；未扫完会标记部分结果"},
                 "max_scan_seconds": {"type": "number", "minimum": 0.1, "maximum": 120, "default": 10, "description": "扫描时间上限（秒）"},
                 "max_file_mb": {"type": "number", "default": 2, "description": "单文件读取上限 MB；0 使用硬上限 16MB；超限文件计为未读取"},
-                "exclude_dirs": {"type": "array", "items": {"type": "string"}, "description": "覆盖默认排除目录名，支持通配符；空数组表示包含隐藏/依赖目录（不跟随目录符号链接）"},
+                "exclude_dirs": {"type": "array", "items": {"type": "string"}, "description": "追加到默认排除的目录名，支持通配符（不跟随目录符号链接）"},
+                "no_default_excludes": {"type": "boolean", "default": False, "description": "true 时关闭默认排除（隐藏/依赖/构建目录也会被扫描），只应用 exclude_dirs；默认 false"},
             },
             "required": ["pattern"],
         },
@@ -1241,11 +1252,18 @@ def _resolve_dir_path(dir_path: Any) -> Path:
     return candidate.resolve()
 
 
-def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, onpermission=None):
+def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, onpermission=None,
+                 no_default_excludes: bool = False):
     """遍历目录树，yield (路径, "file"|"dir")。
-    跳过隐藏目录与 _SKIP_DIR_NAMES 中的目录；max_depth 为相对 root 的深度上限（0=仅当前目录）。"""
+    exclude_dirs 追加到默认排除（隐藏目录与 _SKIP_DIR_NAMES）之后；
+    no_default_excludes=True 时关闭默认排除，只应用 exclude_dirs。
+    max_depth 为相对 root 的深度上限（0=仅当前目录）。"""
     root_depth = len(root.parts)
-    exclusions = list(_SKIP_DIR_NAMES) + [".*"] if exclude_dirs is None else exclude_dirs
+    user_rules = list(exclude_dirs) if exclude_dirs else []
+    if no_default_excludes:
+        exclusions = user_rules
+    else:
+        exclusions = list(_SKIP_DIR_NAMES) + [".*"] + user_rules
     for current, dir_names, file_names in os.walk(root, onerror=onerror):
         current_path = Path(current)
         if not guard_path(current_path, search=True):
@@ -1286,10 +1304,10 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 read_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
     args = tool_args or {}
     return_max_chars = max(512, min(_READ_FILE_MAX_CHARS, int(args.get("_max_chars") or _READ_FILE_MAX_CHARS)))
-    full_file_name = str(args.get("full_file_name") or "").strip()
-    if not full_file_name:
-        raise ValueError("full_file_name 不能为空")
-    path = Path(full_file_name).expanduser()
+    file_path = _tool_path(args)
+    if not file_path:
+        raise ValueError("path 不能为空")
+    path = Path(file_path).expanduser()
     guard_path(path)
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在")
@@ -1497,9 +1515,14 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     if exclude_dirs is not None and (not isinstance(exclude_dirs, list) or
             any(not isinstance(rule, str) or not rule for rule in exclude_dirs)):
         raise ValueError("exclude_dirs 必须为目录名字符串数组")
+    no_default_excludes = bool(args.get("no_default_excludes", False))
+    # 兼容旧语义：显式空数组曾表示关闭默认排除
+    if exclude_dirs == []:
+        no_default_excludes = True
     walk_errors = []
     permission_skips = []
-    for path, kind in _walk_entries(root, max(0, max_depth), exclude_dirs, walk_errors.append, permission_skips.append):
+    for path, kind in _walk_entries(root, max(0, max_depth), exclude_dirs, walk_errors.append,
+                                    permission_skips.append, no_default_excludes):
         if time.monotonic() - started_at >= max_scan_seconds:
             scan_truncated = True
             break
@@ -2939,7 +2962,7 @@ def execute_read_media(
 # - 解码辅助改名为 _decode_command_bytes_used / _decode_command_bytes，避免与
 #   本模块文件工具使用的简化版 _decode_bytes_used 混淆；
 # - 复用本模块已有的 _resolve_dir_path / _display_path。
-# 原 MCP 侧注册块已在 sys_tools_server.py 中注释保留（回滚时取消注释即可）。
+# 旧 MCP 文件中的同名实现已移除；当前内置实现为唯一维护点。
 
 # 前台 stdout 截断上限（防止超大输出撑爆模型上下文；超限时完整输出落盘）
 _RUN_COMMAND_MAX_CHARS = 12000
@@ -3323,9 +3346,13 @@ _CMD_INTERNAL_COMMANDS = frozenset({
     "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time",
     "title", "type", "ver", "verify", "vol",
 })
-# 仅含行数参数的 tail/head（如 `tail -20`、`head -n 5`）
+# 仅含行数参数的 tail/head（如 `tail -20`、`head -n 5`），允许末尾流合并重定向
 _SIMPLE_FILTER_RE = re.compile(
-    r"^\s*(tail|head)\s+(?:(?:-n)\s*(\d+)|-(\d+))\s*$", re.IGNORECASE)
+    r"^\s*(tail|head)\s+(?:(?:-n)\s*(\d+)|-(\d+))"
+    r"(?P<redirections>(?:\s+\d?>&\d+)*)\s*$", re.IGNORECASE)
+_POWERSHELL_FILTER_RE = re.compile(
+    r"^\s*(?P<tool>tail|head)\s+(?:(?:-n)\s*(?P<n1>\d+)|-(?P<n2>\d+))"
+    r"(?P<redirections>(?:\s+\d?>&\d+)*)(?=\s*(?:;|\r?\n|#|$))", re.IGNORECASE)
 # 内联代码执行入口：python -c / node -e / node --eval
 _INLINE_CODE_RE = re.compile(
     r"(?P<interp>(?:^|[\s&|(])(?:python|python3|py|node)(?:\.exe)?)"
@@ -3358,8 +3385,8 @@ def _cmd_env_path_dirs() -> list:
     return [item.strip().strip('"') for item in raw.split(os.pathsep) if item.strip()]
 
 
-def _split_top_level_pipes(command: str, quote_chars: tuple = ('"',)) -> list:
-    """按顶层 `|` 切分命令（跳过引号内与 `^` 转义后的 `|`）。"""
+def _split_top_level_pipes(command: str, quote_chars: tuple = ('"',), escape_char: str = "^") -> list:
+    """按顶层 `|` 切分命令（跳过引号内与 shell 转义后的 `|`）。"""
     segments: list = []
     current: list = []
     quote = None
@@ -3369,7 +3396,7 @@ def _split_top_level_pipes(command: str, quote_chars: tuple = ('"',)) -> list:
             current.append(char)
             escaped = False
             continue
-        if char == "^":
+        if char == escape_char:
             current.append(char)
             escaped = True
             continue
@@ -3507,42 +3534,81 @@ def _apply_local_line_filter(text: str, kind: str, count: int) -> str:
 
 
 def _guard_cmd_pipeline(command: str):
-    """cmd 家族管道兜底：处理末尾的简单 `| tail -N` / `| head -N` 段。
+    """cmd 管道兜底：处理简单 `| tail -N` / `| head -N` 段。
 
     返回 (新命令, 本地过滤说明或 None, 提示列表)：
-    - 过滤器可用（管道形式探测通过）：命令原样返回；
+    - 过滤器可用（管道形式探测通过）：保留原命令；
     - 当前命中的实现不可用、但 PATH 中存在可用实现：替换为可用实现的绝对路径；
-    - 均不可用：去掉该管道段，改由本工具在 Python 侧取头/尾 N 行（输出不丢）。
+    - 末段均不可用：去掉该管道段，由本工具在 Python 侧取头/尾 N 行；
+    - 中间段均不可用：拒绝执行，避免已知会静默丢输出的程序运行。
     """
     if "|" not in command:
         return command, None, []
     segments = _split_top_level_pipes(command)
     if len(segments) < 2:
         return command, None, []
-    parsed = _parse_simple_filter(segments[-1])
-    if parsed is None:
-        return command, None, []
-    tool, count = parsed
-    args = f"-{count}"
-    current_path = _resolve_filter_path(tool)
-    if current_path and _pipe_filter_works(tool, args, current_path):
-        return command, None, []
-    alternative = _find_working_filter(tool, args, current_path)
-    head = "|".join(segments[:-1]).rstrip()
-    if alternative:
-        return (
-            f'{head} | "{alternative}" {args}',
-            None,
-            [f"检测到 `{tool}` 当前命中的实现（{current_path or '未找到'}）不是可用的管道过滤器，"
-             f"已自动改用 {alternative}（输出不再丢失）"],
+    notes = []
+    for index in range(1, len(segments)):
+        parsed = _parse_simple_filter(segments[index])
+        if parsed is None:
+            continue
+        tool, count = parsed
+        args = f"-{count}"
+        current_path = _resolve_filter_path(tool)
+        if current_path and _pipe_filter_works(tool, args, current_path):
+            continue
+        alternative = _find_working_filter(tool, args, current_path)
+        if alternative:
+            redirections = _SIMPLE_FILTER_RE.match(segments[index]).group("redirections")
+            segments[index] = f' "{alternative}" {args}{redirections}'
+            notes.append(
+                f"检测到 `{tool}` 当前命中的实现（{current_path or '未找到'}）不是可用的管道过滤器，"
+                f"已自动改用 {alternative}（输出不再丢失）")
+            continue
+        if index != len(segments) - 1:
+            raise ValueError(
+                f"管道中间的 `{tool}` 没有可用实现（{current_path or '未找到'}），"
+                "无法安全执行；请改用 shell=powershell/pwsh/bash，或把过滤器放在管道末尾")
+        head = "|".join(segments[:-1]).rstrip()
+        notes.append(
+            f"检测到 `{tool}` 不可用（{current_path or '未找到'}），"
+            f"已由 run_command 在本地实现 `| {tool} -{count}`（取"
+            f"{'末尾' if tool == 'tail' else '开头'} {count} 行；如需原生过滤请安装可用实现或改用 shell=bash）")
+        return head, (tool, count), notes
+    return "|".join(segments), None, notes
+
+
+def _guard_powershell_pipeline(command: str) -> tuple[str, list[str]]:
+    """用 PowerShell 原生命令处理末尾的简单 tail/head 管道。
+
+    Windows PATH 中可能存在不能可靠消费大量管道输入的 tail.exe；PowerShell
+    会把 `tail -4` 解析为该外部程序，导致上游有输出但整条管道静默返回。
+    只替换明确的行数过滤器，保留其它 tail/head 用法的原始语义。
+    """
+    if "|" not in command:
+        return command, []
+    segments = _split_top_level_pipes(command, quote_chars=('"', "'"), escape_char="`")
+    if len(segments) < 2:
+        return command, []
+    notes = []
+    for index in range(1, len(segments)):
+        match = _POWERSHELL_FILTER_RE.match(segments[index])
+        if match is None:
+            continue
+        tool = match.group("tool").lower()
+        count = int(match.group("n1") or match.group("n2"))
+        if count <= 0:
+            continue
+        direction = "Last" if tool == "tail" else "First"
+        segments[index] = (
+            segments[index][:match.start("tool")]
+            + f"Select-Object -{direction} {count}"
+            + match.group("redirections")
+            + segments[index][match.end():]
         )
-    return (
-        head,
-        (tool, count),
-        [f"检测到 `{tool}` 不可用（{current_path or '未找到'}），"
-         f"已由 run_command 在本地实现 `| {tool} -{count}`（取"
-         f"{'末尾' if tool == 'tail' else '开头'} {count} 行；如需原生过滤请安装可用实现或改用 shell=bash）"],
-    )
+        notes.append(
+            f"PowerShell 管道中的 `{tool}` 已改用 Select-Object -{direction} {count}，避免 PATH 中同名程序静默丢失输出")
+    return "|".join(segments), notes
 
 
 def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
@@ -4148,7 +4214,10 @@ def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
         argv = [shell_exe, "/c", command]
     else:
         if shell_kind in ("powershell", "pwsh"):
-            command = powershell_text_prelude() + command
+            # 与隐藏中转脚本保持一致：管道末段是 Select-Object 等 cmdlet 时，
+            # PowerShell -Command 可能只返回 0/1，丢失上游原生程序的退出码。
+            command = (powershell_text_prelude() + command
+                       + "\nif ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\n")
         argv = [shell_exe, *shell_prefix, command]
     popen_kwargs = dict(
         stdin=subprocess.DEVNULL, cwd=cwd,
@@ -4348,11 +4417,11 @@ def _command_output_tail(output_path: Path, tail_lines: int, max_chars: int) -> 
                 pass
         if text is None:
             text = _decode_command_bytes(raw, candidates=list(_command_output_candidates()))
-    if start:
-        # Start may fall inside a multibyte character/line. Drop that partial line.
-        if '\n' in text:
-            text = text.partition('\n')[2]
     lines = text.splitlines(keepends=True)
+    if start and len(lines) > tail_lines:
+        # 起点可能落在一行中间；只有后面已有足够完整行时才丢掉它。
+        # 最后一行若长于读取窗口且以换行结束，盲目按首个换行裁剪会把结果清空。
+        lines = lines[1:]
     selected = ''.join(lines[-tail_lines:])
     truncated = bool(start or len(lines) > tail_lines or len(selected) > max_chars)
     return selected[-max_chars:], truncated
@@ -4416,16 +4485,20 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
     else:
         raise ValueError("同一命令中的内联代码改写次数过多，命令未执行；请写入脚本后运行")
     # ② 管道过滤器兜底：PATH 里可能命中"非管道过滤器"实现（实测宝塔 tail.exe），
-    #    在管道中提前退出且不转发输出 → 整条管道静默无输出；此处探测并替换/本地兜底
+    #    在管道中提前退出且不转发输出 → 整条管道静默无输出。
+    #    cmd 探测并替换/本地兜底；PowerShell 直接使用原生 Select-Object。
     local_filter = None
     if shell_kind == "cmd":
         command, local_filter, pipe_notes = _guard_cmd_pipeline(command)
         guard_notes = guard_notes + pipe_notes
         if local_filter is not None and background:
-            # 后台模式无法对输出做本地过滤：回退为"提示 + 保持原命令"，避免静默丢结果
-            guard_notes.append(
-                "后台模式不支持本地 tail/head 兜底：如输出为空，请改用前台执行或安装可用的 tail/head 实现")
-            local_filter = None
+            raise ValueError(
+                "后台模式没有可用的 tail/head 管道过滤器，命令未执行；"
+                "请直接运行上游命令，再用 poll_command 的 tail_lines 读取末尾输出，"
+                "或安装可用的过滤器")
+    elif shell_kind in ("powershell", "pwsh"):
+        command, pipe_notes = _guard_powershell_pipeline(command)
+        guard_notes = guard_notes + pipe_notes
     work_text = str(work_dir or "").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
     if background:
@@ -4440,12 +4513,24 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
             "输出包含替换字符 �；可能是子进程读取源文件时已替换原始字节，"
             "也可能是输出编码无法可靠识别。请核对原文件编码或原始字节，勿据此判断文本原貌"
         )
-    # 本地 tail/head 兜底：预览超限时不把残缺输出误当成完整输出过滤
-    if local_filter is not None and relay_info and relay_info.get("output_truncated"):
-        guard_notes.append("输出预览超过上限，未应用本地 tail/head 兜底；请读取完整输出文件")
-        local_filter = None
     if local_filter is not None:
-        stdout_text = _apply_local_line_filter(stdout_text, local_filter[0], local_filter[1])
+        kind, count = local_filter
+        if relay_info and relay_info.get("output_truncated") and kind == "tail":
+            # 前台只预读输出文件的开头；tail 必须从完整文件末尾读取。
+            out_path = relay_info.get("out")
+            if out_path:
+                try:
+                    stdout_text, _ = _command_output_tail(Path(out_path), count, output_limit)
+                    stdout_text = stdout_text.replace("\r\n", "\n")
+                    guard_notes.append("输出预览超过上限，已从完整输出文件末尾提取 tail 结果")
+                except OSError:
+                    guard_notes.append("无法读取完整输出文件末尾，tail 结果不完整；请读取完整输出文件")
+            else:
+                guard_notes.append("完整输出文件不可用，tail 结果不完整")
+        else:
+            if relay_info and relay_info.get("output_truncated") and kind == "head" and stdout_text.count("\n") < count:
+                guard_notes.append("输出预览超过上限，head 结果可能不完整；请读取完整输出文件")
+            stdout_text = _apply_local_line_filter(stdout_text, kind, count)
     raw_stdout, raw_stderr = stdout_text, stderr_text
     keep_streams = False
     more_hint = ""

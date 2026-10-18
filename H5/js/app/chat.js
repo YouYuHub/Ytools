@@ -139,6 +139,9 @@
     const usageByCompletion = new Map();
     const usageWithoutId = new Map();
     let roundUsageAcc = null;
+    let roundUsageBaseline = null;
+    let roundUsageAbsolute = null;
+    let hasAuthoritativeRoundUsage = false;
     let roundModel = activeStream.model || null;
     // 标题生成（前端驱动）：流内累计思考/正文 delta，达 TITLE_PREVIEW_CHARS
     // 时由 maybeTriggerTitle 发起一次标题请求（聊天主链路不再感知标题任务）
@@ -146,7 +149,110 @@
     let titleContent = "";
     let titleTriggered = false;
 
+    // 附接回放去重窗口：replay marker（带 replay_end_supported）打开、
+    // replay_end 帧关闭。窗口内的正文/思考先暂存、seal 时与同轮历史节点
+    // 比对（命中则丢弃）；工具按 callId 直接收养历史卡。窗口外一切照旧，
+    // 绝不误删正常重复内容。无轮次号/缺 helper 时退化为普通路径。
+    let replayWindow = false;
+    let stagingAnswer = null; // { el, text } 未挂载的暂存正文块
+    let stagingThink = null; // 未建块的暂存思考文本
+    const replayDedup = typeof StreamReplayDedup !== "undefined" ? StreamReplayDedup : null;
+    const replayTextMatcher = replayDedup ? replayDedup.createSequentialMatcher() : null;
+    const replayThinkMatcher = replayDedup ? replayDedup.createSequentialMatcher() : null;
+    function replayRound() {
+      const round = activeStream && activeStream.round;
+      return typeof round === "number" && round > 0 ? round : null;
+    }
+    function stagingActive() {
+      return replayWindow && replayRound() != null && replayDedup != null;
+    }
+    // 同 callId 的历史工具卡收养：复用其 ui 控制器（结果/审批归位到原卡），
+    // 不在 DOM 新建重复卡。历史没有（被裁剪过）则返回 null 走正常新建。
+    function adoptHistoryToolBlock(callId) {
+      if (!callId || !replayDedup) return null;
+      const wrap = replayDedup.findHistoryToolWrap(chatInner, msg, callId);
+      const ui = wrap && wrap._toolBlockUi;
+      if (!wrap || !ui) return null;
+      const adopted = toolBlocks.find(t => t.ui === ui);
+      if (adopted) return adopted;
+      const tb = { ui: ui, name: "", callId: callId, argsText: "", done: false, adopted: true };
+      toolBlocks.push(tb);
+      return tb;
+    }
+    function matchHistoryText(source) {
+      const round = replayRound();
+      if (round == null || !replayTextMatcher) return null;
+      const candidates = replayDedup.collectHistoryTexts(chatInner, msg, round);
+      return replayTextMatcher.match(candidates, function (node) {
+        return replayDedup.renderedSourceEquals(Markdown, el, source, node.textContent);
+      });
+    }
+    function matchHistoryThink(source) {
+      const round = replayRound();
+      if (round == null || !replayThinkMatcher) return null;
+      const candidates = replayDedup.collectHistoryThinks(chatInner, msg, round);
+      const wanted = String(source || "").trim();
+      return replayThinkMatcher.match(candidates, function (node) {
+        return (node.textContent || "").trim() === wanted;
+      });
+    }
+    function finalizeThinkStaging() {
+      if (stagingThink == null) return;
+      const text = stagingThink;
+      stagingThink = null;
+      if (!matchHistoryThink(text)) {
+        const ui = App.buildThinkBlock();
+        ui.setText(text);
+        ui.done();
+        hasStage = true;
+        appendStage(ui.wrap);
+      }
+    }
+    function finalizeAnswerStaging() {
+      if (!stagingAnswer) return;
+      const staged = stagingAnswer;
+      stagingAnswer = null;
+      if (!matchHistoryText(staged.text)) {
+        hasStage = true;
+        appendStage(staged.el);
+        staged.el.classList.remove("msg-cursor");
+        App.renderPreservingWidgets(staged.el, Markdown.render(staged.text));
+        App.highlightCodeBlocks(staged.el);
+        App.updateCodeblockCopyButtons();
+      }
+    }
+    function finalizeStagingAsReplay() {
+      finalizeThinkStaging();
+      finalizeAnswerStaging();
+    }
+    function flushStagingAsLive() {
+      // 窗口关闭时还有未 seal 的暂存（回放中途转实时，如正文流到一半）：
+      // 直接挂载并转为实时块继续追加，不丢内容。
+      if (stagingThink != null) {
+        curThink = App.buildThinkBlock();
+        curThink.setText(stagingThink);
+        curThink.streaming();
+        stagingThink = null;
+        hasStage = true;
+        appendStage(curThink.wrap);
+      }
+      if (stagingAnswer) {
+        curAnswer = stagingAnswer.el;
+        answerText = stagingAnswer.text;
+        stagingAnswer = null;
+        hasStage = true;
+        appendStage(curAnswer);
+        scheduleAnswerRender();
+      }
+    }
+    function setReplayWindow(open) {
+      const next = Boolean(open);
+      if (replayWindow && !next) flushStagingAsLive();
+      replayWindow = next;
+    }
+
     function sealTextBlocks() {
+      finalizeStagingAsReplay();
       if (curThink) curThink.done();
       if (curAnswer) curAnswer.classList.remove("msg-cursor");
       flushAnswerRender();
@@ -156,19 +262,76 @@
 
     function appendStage(node) {
       msg.appendChild(node);
-      if (usageLine) msg.appendChild(usageLine);
+      if (usageLine && usageLine.textContent) msg.appendChild(usageLine);
     }
 
     function ensureUsageLine() {
+      // 刷新后先回放 JSONL，再附接仍在运行的 SSE。历史回放已为本轮画过
+      // usage 行；收养它并继续更新，避免附接流在新 msg 中再画一行。
+      const round = activeStream.round;
+      if (Number.isInteger(round) && round > 0 && state.sessionId === sessionId && msg.parentNode === chatInner) {
+        const historical = chatInner.querySelector('.round-usage[data-round="' + round + '"]');
+        if (historical && historical !== usageLine) {
+          if (usageLine) usageLine.remove();
+          usageLine = historical;
+          retainUsageBaseline(historical._roundUsageSnapshot);
+          if (!roundModel && historical._roundModelSnapshot) roundModel = historical._roundModelSnapshot;
+        }
+      }
       if (!usageLine) usageLine = el("div", "round-usage");
+      if (Number.isInteger(round) && round > 0) usageLine.dataset.round = String(round);
       return usageLine;
     }
 
     function renderRoundSummary() {
-      const summary = FormatUtils.roundSummaryText(roundUsageAcc, roundModel);
-      if (!summary) return;
-      ensureUsageLine().textContent = summary;
-      msg.appendChild(usageLine);
+      const line = ensureUsageLine();
+      const summary = FormatUtils.roundSummaryText(displayRoundUsage(), roundModel);
+      if (!summary) {
+        // 编辑重发附接时，JSONL 可能仍保留旧轮的 usage 行；marker 的
+        // 空绝对值明确表示新轮尚无用量，不能继续显示旧数字。
+        if (hasAuthoritativeRoundUsage) {
+          line.textContent = "";
+          line.remove();
+        }
+        return;
+      }
+      line.textContent = summary;
+      msg.appendChild(line);
+    }
+
+    function usageTokenCount(usage) {
+      if (!usage || typeof usage !== "object") return 0;
+      const total = Number(usage.total_tokens);
+      if (Number.isFinite(total) && total >= 0) return total;
+      return (Number(usage.prompt_tokens) || 0) + (Number(usage.completion_tokens) || 0);
+    }
+
+    function retainUsageBaseline(usage) {
+      if (!usage || typeof usage !== "object") return;
+      if (!roundUsageBaseline || usageTokenCount(usage) >= usageTokenCount(roundUsageBaseline)) {
+        roundUsageBaseline = usage;
+      }
+    }
+
+    function displayRoundUsage() {
+      // 新后端发送的是本轮绝对累计值；它比逐条 SSE usage 重算可靠，
+      // 尤其是刷新后环形回放缓冲已丢失早期 completion 的时候。
+      if (hasAuthoritativeRoundUsage) return roundUsageAbsolute;
+      return roundUsageBaseline && usageTokenCount(roundUsageBaseline) > usageTokenCount(roundUsageAcc)
+        ? roundUsageBaseline : roundUsageAcc;
+    }
+
+    function setRoundUsageBaseline(usage) {
+      if (!usage || typeof usage !== "object") return;
+      hasAuthoritativeRoundUsage = true;
+      // 附接 marker 先给当前快照，回放缓冲随后可能送来更早的绝对值；
+      // 只接受不小于当前值的快照。历史行可能属于尚未提交的编辑旧轮，
+      // 有服务端绝对值时不再以历史数字作为下限。
+      if (!roundUsageAbsolute || usageTokenCount(usage) >= usageTokenCount(roundUsageAbsolute)) {
+        roundUsageAbsolute = usage;
+      }
+      activeStream.usage = displayRoundUsage();
+      renderRoundSummary();
     }
 
     function accumulateUsage(target, delta) {
@@ -206,7 +369,7 @@
         usageWithoutId.set(usageKey, usage);
       }
       roundUsageAcc = rebuildRoundUsage();
-      activeStream.usage = roundUsageAcc;
+      activeStream.usage = displayRoundUsage();
       renderRoundSummary();
       return true;
     }
@@ -281,6 +444,10 @@
       if (evt.type === "done") return;
       const data = evt.data || {};
 
+      if (data.round_usage_total && typeof data.round_usage_total === "object") {
+        setRoundUsageBaseline(data.round_usage_total);
+      }
+
       // 本轮生效聊天模型：唯一下发通道为 round_model 帧（三条发送路径均推送；
       // round_started 帧只带轮次号，不再冗余携带 model）
       if (data.round_model) setRoundModel(data.round_model);
@@ -291,6 +458,7 @@
       // 的历史裁剪/去重按轮次精确匹配（编辑重发路径 send() 已提前打标）
       if (data.round_started && typeof data.round_started.round === "number") {
         if (activeStream.round == null) activeStream.round = data.round_started.round;
+        if (usageLine) ensureUsageLine();
         App.attachLiveRoundEntry(activeStream, data.round_started.round);
       }
 
@@ -313,6 +481,7 @@
             }
             // 兼容没有调用 ID 的旧模型增量；认领本轮未绑定的声明块。
             if (!tb) tb = toolBlocks.find(t => !t.done && !t.callId && t.name === approval.tool);
+            if (!tb && approval.tool_call_id) tb = adoptHistoryToolBlock(approval.tool_call_id);
             if (!tb) {
               tb = { ui: App.buildToolBlock(approval.tool, { sessionId: sessionId }), name: approval.tool, callId: approval.tool_call_id, done: false };
               toolBlocks.push(tb); hasStage = true; appendStage(tb.ui.wrap);
@@ -503,7 +672,12 @@
       }
       // 思考：每段独立一个块
       if (typeof data.reasoning_content === "string" && data.reasoning_content) {
-        if (curAnswer) {
+        if (stagingActive()) {
+          finalizeAnswerStaging();
+          stagingThink = (stagingThink || "") + data.reasoning_content;
+          titleReasoning += data.reasoning_content;
+        } else {
+          if (curAnswer) {
           curAnswer.classList.remove("msg-cursor");
           // 置空前刷出该段挂起的节流渲染帧（answerText 此时仍是本段的，
           // flush 会把最后一批增量落进 DOM；此后 curAnswer=null 跳过后续渲染）
@@ -518,13 +692,22 @@
         }
         curThink.add(data.reasoning_content);
         titleReasoning += data.reasoning_content;
+        }
       }
       // 回答：每段独立一个块
       if (typeof data.content === "string" && data.content) {
-        // 正文到达才结束思考；兼容同帧 reasoning_content + content。
-        if (curThink) curThink.done();
-        curThink = null;
-        if (!curAnswer) {
+        // 正文到达即结束思考；兼容同帧 reasoning_content + content。
+        if (stagingActive()) {
+          finalizeThinkStaging();
+          if (!stagingAnswer) {
+            stagingAnswer = { el: el("div", "msg-assistant-body msg-cursor"), text: "" };
+          }
+          stagingAnswer.text += data.content;
+          titleContent += data.content;
+        } else {
+          if (curThink) curThink.done();
+          curThink = null;
+          if (!curAnswer) {
           curAnswer = el("div", "msg-assistant-body msg-cursor");
           answerText = "";
           // 上一段挂起帧已在 reasoning 分支/sealTextBlocks 的置空前 flush，
@@ -537,6 +720,7 @@
         // Markdown.render + 高亮 + 重建，高速模型逐帧 delta 不再逐帧全量重排
         scheduleAnswerRender();
         titleContent += data.content;
+        }
       }
       // 工具调用增量：按 index 合并，参数 JSON 逐帧流式展示。
       // 模型生成 arguments（命令文本/文件内容等）的每个增量帧都会实时
@@ -547,11 +731,14 @@
         data.tool_calls.forEach(function (d) {
           const idx = d.index != null ? d.index : 0;
           if (!activeToolBlocks.has(idx)) {
-            const toolBlock = { ui: App.buildToolBlock("", { sessionId: sessionId }), argsText: "", done: false };
+            let toolBlock = d.id ? adoptHistoryToolBlock(d.id) : null;
+            if (!toolBlock) {
+              toolBlock = { ui: App.buildToolBlock("", { sessionId: sessionId }), argsText: "", done: false };
+              toolBlocks.push(toolBlock);
+              hasStage = true;
+              appendStage(toolBlock.ui.wrap);
+            }
             activeToolBlocks.set(idx, toolBlock);
-            toolBlocks.push(toolBlock);
-            hasStage = true;
-            appendStage(toolBlock.ui.wrap);
           }
           const tb = activeToolBlocks.get(idx);
           const fn = d.function || {};
@@ -560,17 +747,20 @@
           if (fn.name) tb.ui.setName(tb.name = fn.name);
           if (tb.name === "sub_agent") promoteAgentTool(tb, tb.callId);
 
-          // 首个参数数据到达：进入流式展示态（自动展开 + 执行中样式）
-          if (!tb.agentBlock && !tb.streamStarted && fn.arguments) {
+          // 首个参数数据到达：进入流式展示态（自动展开 + 执行中样式）。
+          // 收养的历史卡参数已完整展示，跳过 beginStream（会清空输入/输出）。
+          if (!tb.adopted && !tb.agentBlock && !tb.streamStarted && fn.arguments) {
             tb.streamStarted = true;
             tb.ui.beginStream();
           }
           if (typeof fn.arguments === "string" && fn.arguments) {
             tb.argsText += fn.arguments;
-            if (!tb.agentBlock) tb.ui.addInputDelta(fn.arguments);
+            // 收养卡的参数显示以历史为准：重放增量只累计文本用于派发，
+            // 不再向输入区追加（否则与已展示的完整参数重复）。
+            if (!tb.adopted && !tb.agentBlock) tb.ui.addInputDelta(fn.arguments);
           } else if (fn.arguments && typeof fn.arguments === "object") {
             tb.argsText = JSON.stringify(fn.arguments, null, 2);
-            if (!tb.agentBlock) tb.ui.setInputText(tb.argsText);
+            if (!tb.adopted && !tb.agentBlock) tb.ui.setInputText(tb.argsText);
           }
           if (tb.agentBlock) tb.agentBlock.ui.setDispatchInput(tb.argsText);
         });
@@ -605,6 +795,9 @@
         let tb = ts.tool_call_id && toolBlocks.find(t => !t.done && t.callId === ts.tool_call_id);
         tb = tb || activeBlocks.find(t => !t.done && (!ts.tool_call_id || !t.callId) && t.name === ts.function_name)
           || activeBlocks.find(t => !t.done && (!ts.tool_call_id || !t.callId));
+        if (!tb) {
+          tb = ts.tool_call_id ? adoptHistoryToolBlock(ts.tool_call_id) : null;
+        }
         if (!tb) {
           tb = { ui: App.buildToolBlock(ts.function_name, { sessionId: sessionId }), argsText: "", done: false };
           toolBlocks.push(tb);
@@ -663,6 +856,9 @@
         let tb = tr.tool_call_id && toolBlocks.find(t => !t.done && t.callId === tr.tool_call_id);
         tb = tb || activeBlocks.find(t => !t.done && (!tr.tool_call_id || !t.callId) && t.name === tr.function_name)
           || activeBlocks.find(t => !t.done && (!tr.tool_call_id || !t.callId));
+        if (!tb) {
+          tb = tr.tool_call_id ? adoptHistoryToolBlock(tr.tool_call_id) : null;
+        }
         if (!tb) {
           tb = { ui: App.buildToolBlock(tr.function_name, { sessionId: sessionId, toolCallId: tr.tool_call_id, round: activeStream.round }), argsText: "", done: false };
           toolBlocks.push(tb);
@@ -723,7 +919,12 @@
       handle: handle,
       // 附接回放 marker.model → 本轮展示模型（与 round_model 帧同一入口）
       setRoundModel: setRoundModel,
+      setRoundUsageBaseline: setRoundUsageBaseline,
+      // 回放去重窗口开关：附接 marker 打开、replay_end 关闭
+      setReplayWindow: setReplayWindow,
       finish: function () {
+        // 先关闭去重窗口：未 seal 的暂存按实时落定，不丢内容
+        setReplayWindow(false);
         // 流结束时仍未收到消费信号：清除待注入提示（避免停止/异常时残留）
         App.clearInjectedPending(sessionId);
         // 流结束仍未触发标题：不足 100 字符以已有全文触发一次（有输出才触发）
@@ -740,6 +941,8 @@
           if (block && !block.done) block.ui.finalizeInterrupted();
         });
         if (App.permissions && App.permissions.syncPending) App.permissions.syncPending(sessionId);
+        // 全部命中历史（收养/丢弃）且无其它内容时，移除空回复容器，避免空白占位
+        if (!msg.children.length && msg.parentNode) msg.parentNode.removeChild(msg);
         return {
           hasStage: hasStage,
           roundUsage: roundUsageAcc,
@@ -954,6 +1157,7 @@
       // 引用随输入框一起清空（快照已进本轮消息，失败重发由气泡上的编辑入口承担）
       App.clearPendingQuotes();
       input.value = "";
+      if (App.closeSlashCommands) App.closeSlashCommands();
     }
     App.autosize();
     App.refreshComposerButtons();
@@ -1247,8 +1451,16 @@
         { session_id: sessionId, messages: [] },
         function (evt) {
           const data = evt.data || {};
+          if (data && data.replay_end) {
+            // 回放耗尽：此后均为实时帧，关闭去重窗口
+            pipe.setReplayWindow(false);
+            return;
+          }
           if (data && data.replay) {
             sawReplay = true;
+            // 新后端随 marker 声明回放结束标记支持：打开去重窗口，窗口内
+            // 的正文/思考/工具调用先与历史已渲染节点匹配（命中则收养/丢弃）
+            pipe.setReplayWindow(Boolean(data.replay_end_supported));
             // 本轮最终轮次号（后端 round_started 推送时同步记录、随 marker 下发）：
             // 历史裁剪/去重/补挂编辑入口统一按轮次精确匹配——同文本历史提问
             // 不再被误判成本轮、多模态（部件数组）提问也能命中
@@ -1279,6 +1491,7 @@
             }
             // 本轮生效聊天模型（round_model 帧在回放起点之前，消费端收不到，
             // 随 marker 下发）：usage 行模型名文案的数据源
+            if (data.round_usage_total) pipe.setRoundUsageBaseline(data.round_usage_total);
             if (data.model) pipe.setRoundModel(data.model);
             if (activeStream.userText || parts) {
               // 历史文件已落盘时可能已经渲染过本轮提问（生成中刷新，提问事件

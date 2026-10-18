@@ -22,9 +22,6 @@
       display: none;
     }
 
-    .sidebar-resize-handle {
-      display: none;
-    }
   }
 
   .sidebar-resize-handle {
@@ -757,12 +754,6 @@ body.sidebar-resizing {
       }
     }
 
-    // 主题菜单从用户卡片上方弹出
-    .theme-menu {
-      bottom: calc(100% + 6px);
-      left: 12px;
-      right: 12px;
-    }
   }
 }
 

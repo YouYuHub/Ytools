@@ -134,8 +134,11 @@
       return;
     }
     const done = todos.filter(function (item) { return item.status === "done"; }).length;
-    const toggle = el("button", "todo-toggle" + (state.todoPanelOpen ? " open" : ""),
-      "📋 计划 " + done + "/" + todos.length);
+    const toggle = el("button", "todo-toggle" + (state.todoPanelOpen ? " open" : ""));
+    toggle.appendChild(el("span", "todo-icon", "📋"));
+    toggle.appendChild(el("span", "todo-label", "计划"));
+    toggle.appendChild(el("span", "todo-progress", done + "/" + todos.length));
+    toggle.setAttribute("aria-label", "任务计划 " + done + "/" + todos.length + "，点击展开或收起");
     // el() 走 textContent（安全文本），SVG 需按 HTML 插入才会渲染
     toggle.insertAdjacentHTML("beforeend",
       '<svg class="icon todo-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>');

@@ -134,6 +134,8 @@ window.App = window.App || {};
   const scrim = $("#scrim");
   const sessionList = $("#sessionList");
   const tokenTotal = $("#tokenTotal");
+  const sessionMenuUsage = $("#sessionMenuUsage");
+  const sessionMenuUsageValues = $("#sessionMenuUsageValues");
   const sessionActionsBtn = $("#sessionActionsBtn");
   const sessionActionsMenu = $("#sessionActionsMenu");
   const shareSessionItem = $("#shareSessionItem");
@@ -250,7 +252,6 @@ window.App = window.App || {};
   const historyFileInput = $("#historyFileInput");
   const fileChips = $("#fileChips");
   const toolChips = $("#toolChips");
-  const themeMenu = $("#themeMenu");
   const profileName = $("#profileName");
   const profileSub = $("#profileSub");
   const scrollBottomBtn = $("#scrollBottomBtn");
@@ -493,22 +494,12 @@ window.App = window.App || {};
   function refreshThemeUI() {
     const pref = ThemeManager.getPreference();
     profileSub.textContent = THEME_LABEL[pref];
-    themeMenu.querySelectorAll(".menu-item").forEach(function (item) {
-      item.classList.toggle("selected", item.dataset.value === pref);
-    });
   }
 
-  themeMenu.querySelectorAll(".menu-item").forEach(function (item) {
-    item.addEventListener("click", function () {
-      ThemeManager.setPreference(item.dataset.value);
-      closeMenus();
-    });
-  });
   document.addEventListener("themechange", refreshThemeUI);
 
   // ---------- 菜单开关 ----------
   function closeMenus() {
-    themeMenu.classList.add("hidden");
     plusMenu.classList.add("hidden");
     sessionActionsMenu.classList.add("hidden");
     queueMenu.classList.add("hidden");
@@ -525,8 +516,7 @@ window.App = window.App || {};
 
   $("#profileCard").addEventListener("click", function (e) {
     e.stopPropagation();
-    plusMenu.classList.add("hidden");
-    themeMenu.classList.toggle("hidden");
+    if (App.openThemePicker) App.openThemePicker();
   });
   document.addEventListener("click", function (e) {
     // composedPath 在事件派发时定格：面板内点击即使处理过程中 DOM 被增删
@@ -534,7 +524,7 @@ window.App = window.App || {};
     // 不会误触发"点击面板外部"的收起逻辑
     const clickPath = typeof e.composedPath === "function" ? e.composedPath() : null;
     const inEnhancePanel = clickPath ? clickPath.includes(enhancePanel) : enhancePanel.contains(e.target);
-    if (!themeMenu.contains(e.target) && !plusMenu.contains(e.target) && !inEnhancePanel &&
+    if (!plusMenu.contains(e.target) && !inEnhancePanel &&
       !sessionActionsMenu.contains(e.target) && !queueMenu.contains(e.target) &&
       e.target !== plusBtn && e.target !== boostBtn &&
       !sessionActionsBtn.contains(e.target)) {
@@ -587,6 +577,7 @@ window.App = window.App || {};
   let sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
   let sidebarResizePointer = null;
   let sidebarResizeStartWidth = SIDEBAR_DEFAULT_WIDTH;
+  let sidebarResizeStartCollapsed = false;
 
   try {
     const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
@@ -603,12 +594,23 @@ window.App = window.App || {};
     return Math.max(SIDEBAR_MIN_WIDTH, Math.min(sidebarWidthLimit(), Math.round(width)));
   }
 
+  function sidebarRailWidth() {
+    return parseFloat(getComputedStyle(sidebar).getPropertyValue("--rail-width")) || 50;
+  }
+
+  function sidebarCollapseThreshold() {
+    // 常用宽度在约半宽处切换；超宽侧栏的阈值封顶，避免拖很远才能重新展开。
+    return Math.max(sidebarRailWidth() + 32, Math.min(180, sidebarPreferredWidth / 2));
+  }
+
   function applySidebarWidth() {
     const width = clampSidebarWidth(sidebarPreferredWidth);
+    const collapsed = sidebar.classList.contains("collapsed");
     document.documentElement.style.setProperty("--sidebar-width", width + "px");
+    sidebarResizeHandle.setAttribute("aria-valuemin", String(sidebarRailWidth()));
     sidebarResizeHandle.setAttribute("aria-valuemax", String(sidebarWidthLimit()));
-    sidebarResizeHandle.setAttribute("aria-valuenow", String(width));
-    sidebarResizeHandle.setAttribute("aria-valuetext", width + " 像素");
+    sidebarResizeHandle.setAttribute("aria-valuenow", String(collapsed ? sidebarRailWidth() : width));
+    sidebarResizeHandle.setAttribute("aria-valuetext", collapsed ? "已收起" : width + " 像素");
   }
 
   function saveSidebarWidth() {
@@ -617,26 +619,48 @@ window.App = window.App || {};
 
   function finishSidebarResize(commit) {
     if (sidebarResizePointer === null) return;
-    if (!commit) sidebarPreferredWidth = sidebarResizeStartWidth;
+    const pointerId = sidebarResizePointer;
+    if (!commit) {
+      sidebarPreferredWidth = sidebarResizeStartWidth;
+      setSidebarCollapsed(sidebarResizeStartCollapsed);
+    }
     sidebarResizePointer = null;
     document.body.classList.remove("sidebar-resizing");
+    if (sidebarResizeHandle.hasPointerCapture && sidebarResizeHandle.hasPointerCapture(pointerId)) {
+      sidebarResizeHandle.releasePointerCapture(pointerId);
+    }
     applySidebarWidth();
     if (commit) saveSidebarWidth();
   }
 
   applySidebarWidth();
-  window.addEventListener("resize", applySidebarWidth);
+  window.addEventListener("resize", function () {
+    if (isMobile()) finishSidebarResize(true);
+    applySidebarWidth();
+  });
   sidebarResizeHandle.addEventListener("pointerdown", function (event) {
-    if (sidebarResizePointer !== null || event.button !== 0 || isMobile() || sidebar.classList.contains("collapsed")) return;
+    if (sidebarResizePointer !== null || event.button !== 0 || isMobile()) return;
     event.preventDefault();
     sidebarResizePointer = event.pointerId;
     sidebarResizeStartWidth = sidebarPreferredWidth;
+    sidebarResizeStartCollapsed = sidebar.classList.contains("collapsed");
+    if (sidebarResizeHandle.setPointerCapture) sidebarResizeHandle.setPointerCapture(event.pointerId);
     document.body.classList.add("sidebar-resizing");
   });
   window.addEventListener("pointermove", function (event) {
     if (event.pointerId !== sidebarResizePointer) return;
-    sidebarPreferredWidth = clampSidebarWidth(event.clientX - sidebar.getBoundingClientRect().left - 1);
-    applySidebarWidth();
+    const width = event.clientX - sidebar.getBoundingClientRect().left - 1;
+    const threshold = sidebarCollapseThreshold();
+    // 迟滞 8px，防止指针停在阈值附近时侧栏来回闪烁。
+    if (sidebar.classList.contains("collapsed")) {
+      if (width >= threshold + 8) setSidebarCollapsed(false);
+    } else if (width <= threshold - 8) {
+      setSidebarCollapsed(true);
+    }
+    if (!sidebar.classList.contains("collapsed")) {
+      sidebarPreferredWidth = clampSidebarWidth(width);
+      applySidebarWidth();
+    }
   });
   window.addEventListener("pointerup", function (event) {
     if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
@@ -645,20 +669,30 @@ window.App = window.App || {};
     if (event.pointerId === sidebarResizePointer) finishSidebarResize(false);
   });
   window.addEventListener("blur", function () { finishSidebarResize(true); });
+  sidebarResizeHandle.addEventListener("lostpointercapture", function (event) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
+  });
   sidebarResizeHandle.addEventListener("keydown", function (event) {
     let width = clampSidebarWidth(sidebarPreferredWidth);
-    if (event.key === "ArrowLeft") width -= event.shiftKey ? 40 : 16;
-    else if (event.key === "ArrowRight") width += event.shiftKey ? 40 : 16;
-    else if (event.key === "Home") width = SIDEBAR_MIN_WIDTH;
-    else if (event.key === "End") width = sidebarWidthLimit();
-    else return;
+    const collapsed = sidebar.classList.contains("collapsed");
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
+    if (collapsed && event.key === "ArrowLeft") return;
+    if (event.key === "Home" || (event.key === "ArrowLeft" && !collapsed && width <= SIDEBAR_MIN_WIDTH)) {
+      setSidebarCollapsed(true);
+      return;
+    }
+    if (event.key === "ArrowLeft" && !collapsed) width -= event.shiftKey ? 40 : 16;
+    else if (event.key === "ArrowRight" && !collapsed) width += event.shiftKey ? 40 : 16;
+    else if (event.key === "End") width = sidebarWidthLimit();
+    setSidebarCollapsed(false);
     sidebarPreferredWidth = clampSidebarWidth(width);
     applySidebarWidth();
     saveSidebarWidth();
   });
   sidebarResizeHandle.addEventListener("dblclick", function () {
     sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
+    setSidebarCollapsed(false);
     applySidebarWidth();
     saveSidebarWidth();
   });
@@ -666,6 +700,7 @@ window.App = window.App || {};
   function setSidebarCollapsed(collapsed) {
     sidebar.classList.toggle("collapsed", collapsed);
     scrim.classList.toggle("show", isMobile() && !collapsed);
+    applySidebarWidth();
   }
 
   $("#sidebarToggle").addEventListener("click", function () { setSidebarCollapsed(true); });
@@ -676,7 +711,7 @@ window.App = window.App || {};
 
   $("#railAvatar").addEventListener("click", function () {
     setSidebarCollapsed(false);
-    themeMenu.classList.remove("hidden");
+    if (App.openThemePicker) App.openThemePicker();
   });
 
   // ---------- 会话搜索 ----------
@@ -710,7 +745,11 @@ window.App = window.App || {};
 
 
   // 引用与附件使用 display:contents 子槽，必须同步外层容器显隐。
-  function fitAttachmentBlockGrid(container) {
+  // fit 幂等：列数按可用宽度重算；不可测时（历史回放先拼 detached
+  // fragment，clientWidth 为 0）延迟到下一帧重试，最多 5 次；超出两行的
+  // 部分折叠进 +N 展开块（display:none，不占网格单元；不用 overflow 裁剪，
+  // 避免引用浮层被夹断）。
+  function fitAttachmentBlockGrid(container, retries) {
     if (!container) return;
     const tiles = container.querySelectorAll(
       ".composer-quotes-tile, .media-chip, .doc-chip, .msg-quote-tile, .msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-doc"
@@ -718,10 +757,51 @@ window.App = window.App || {};
     if (!tiles.length) return;
     const style = getComputedStyle(container);
     const available = container.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+    if (!(available > 0) && (retries || 0) < 5 && typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(function () { fitAttachmentBlockGrid(container, (retries || 0) + 1); });
+      return;
+    }
     const gap = parseFloat(style.columnGap) || 6;
     const columns = Math.min(tiles.length, Math.max(1, Math.floor((available + gap) / (52 + gap))));
     container.style.setProperty("--attachment-block-columns", String(columns));
     container.style.setProperty("--attachment-block-size", "52px");
+    fitAttachmentBlockOverflow(container, tiles, columns);
+  }
+
+  // 两行封顶：可见单元 = min(总数, 列数×2)；超出时最后一个单元换成 +N
+  // 展开块（点击展开全部，再点收起）。重复调用幂等。
+  function fitAttachmentBlockOverflow(container, tiles, columns) {
+    const expanded = Boolean(container.dataset && container.dataset.attachmentExpanded === "1");
+    const capacity = Math.max(1, columns) * 2;
+    let moreTile = container._attachmentMoreTile || null;
+    if (tiles.length <= capacity) {
+      if (moreTile) moreTile.hidden = true;
+      if (container.dataset) delete container.dataset.attachmentExpanded;
+      tiles.forEach(function (t) { t.hidden = false; });
+      return;
+    }
+    if (!moreTile) {
+      moreTile = el("button", "attachment-more-tile");
+      moreTile.type = "button";
+      moreTile.addEventListener("click", function () {
+        if (container.dataset.attachmentExpanded === "1") delete container.dataset.attachmentExpanded;
+        else container.dataset.attachmentExpanded = "1";
+        fitAttachmentBlockGrid(container);
+      });
+      container._attachmentMoreTile = moreTile;
+      container.appendChild(moreTile);
+    }
+    moreTile.hidden = false;
+    if (expanded) {
+      moreTile.textContent = "收起";
+      moreTile.setAttribute("aria-label", "收起附件，只显示两行");
+      tiles.forEach(function (t) { t.hidden = false; });
+    } else {
+      const visibleCount = capacity - 1;
+      moreTile.textContent = "+" + (tiles.length - visibleCount);
+      moreTile.setAttribute("aria-label", "展开全部 " + tiles.length + " 个附件");
+      tiles.forEach(function (t, i) { t.hidden = i >= visibleCount; });
+    }
   }
 
   function syncComposerAttachmentBlocks() {
@@ -742,7 +822,7 @@ window.App = window.App || {};
   SESSION_TITLE_KEY, MODEL_ROLES, ROLE_DEFAULT_PARAMS,
   API_TYPE_DEFAULT_PARAMS, CHAT_SETTINGS_DEFAULTS, app,
   sidebar, scrim, sessionList,
-  tokenTotal,
+  tokenTotal, sessionMenuUsage, sessionMenuUsageValues,
   sessionActionsBtn, sessionActionsMenu, shareSessionItem,
   compactSessionItem, main, chatScroll,
   chatInner, input, composer,
@@ -772,7 +852,7 @@ responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulCon
   plusBtn, plusMenu, toolModal, toolGroups,
   toolSearchInput, toolSelected, toolCollapseAll,
   toolRefresh, toolFollowGlobal, fileInput, historyFileInput,
-  fileChips, toolChips, themeMenu,
+  fileChips, toolChips,
   profileName, profileSub, scrollBottomBtn, qnav,
   qnavRail, qnavPanel, toastWrap,
   deleteModal, deleteModalBackdrop, deleteCancel,
@@ -795,4 +875,28 @@ responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulCon
   readTitleOverrides, docKindOf, hideToolTip,
   toolTip
   });
+
+  // 附件网格跟随缩放/窗口变化重算列数：只在 chatInner 宽度变化时重算
+  // （流式高度变化频繁，过滤掉避免抖动），rAF 节流合并。位于导出区
+  // 之后，不在单测切片范围内。
+  (function observeAttachmentGridResize() {
+    if (typeof ResizeObserver === "undefined" || !chatInner) return;
+    let lastWidth = 0;
+    let queued = false;
+    new ResizeObserver(function () {
+      const width = chatInner.clientWidth || 0;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      if (queued) return;
+      queued = true;
+      const defer = typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame : function (fn) { return setTimeout(fn, 16); };
+      defer(function () {
+        queued = false;
+        chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(function (c) {
+          fitAttachmentBlockGrid(c);
+        });
+      });
+    }).observe(chatInner);
+  })();
 })(window.App);

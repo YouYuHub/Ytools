@@ -10,7 +10,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EXE = r"C:\Users\Administrator\MyMcp\PipeIpcMCP.exe"
+EXE = os.environ.get("PIPE_IPC_MCP_EXE", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "mcp_server", "PipeIpcMCP.exe",
+))
 
 
 def print_exc_group(e, indent="  "):

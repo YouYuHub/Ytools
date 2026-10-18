@@ -6,7 +6,7 @@ const vm = require('node:vm');
 
 class Node {
   constructor(tag, cls, text) {
-    this.tagName = tag; this.children = []; this.textContent = text || ''; this.fields = new Map();
+    this.tagName = tag; this.children = []; this.textContent = text || ''; this.fields = new Map(); this.dataset = {};
     const classes = new Set((cls || '').split(' '));
     this.classList = { add: (...xs) => xs.forEach(x => classes.add(x)), remove: (...xs) => xs.forEach(x => classes.delete(x)),
       contains: x => classes.has(x), toggle: (x, on) => (on === undefined ? !classes.has(x) : on) ? classes.add(x) : classes.delete(x) };

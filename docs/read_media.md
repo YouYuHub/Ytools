@@ -28,7 +28,7 @@
 ```json
 {
   "references": [
-    "C:/Users/Administrator/Pictures/example.png",
+    "C:/example/images/photo.png",
     "https://example.com/example.jpg"
   ],
   "quality": 85

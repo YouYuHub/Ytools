@@ -14,6 +14,17 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self) -> None:
+        import copy
+
+        import env_manager
+
+        # 快照 env 全局量：teardown 按快照恢复，避免把真实 models.json/.env
+        # 載入全局后泄漏给后续测试（压缩等测试会按全局默认 apiType 决策）。
+        self._env_snapshot = {
+            name: copy.deepcopy(getattr(env_manager, name, None))
+            for name in ("env_file", "env_vars", "setting_file", "models_config",
+                         "mcp_config", "model_selection", "setting_vars")
+        }
         from config import PROJECT_ROOT as original_root
         from routers import chat_config_router
         self.router = chat_config_router
@@ -99,7 +110,9 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         from routers import chat_config_router
         import importlib
         importlib.reload(chat_config_router)
-        init_path(self._repo_root)
+        import env_manager
+        for name, value in self._env_snapshot.items():
+            setattr(env_manager, name, value)
         self._temp_dir.cleanup()
 
     async def test_list_chat_models_returns_providers_and_current(self) -> None:

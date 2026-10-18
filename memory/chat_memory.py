@@ -1163,8 +1163,9 @@ def _delete_path_with_retry(path: Path, *, recursive: bool = False, attempts: in
 class ChatMemoryManager:
     """工具调用历史管理器 - 持久化到文件，支持多会话隔离"""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, read_only: bool = False):
         self.session_id = session_id
+        self._read_only = read_only
         self._lock = threading.Lock()
         self._file_path = _get_chat_history_file(session_id)
         self._round_store = ChatRoundStore(session_id)
@@ -1176,6 +1177,11 @@ class ChatMemoryManager:
         self._insert_round_number: int | None = None
         # 历史构建截断点（原地重跑时上下文只取第 N-1 轮及以前）
         self._history_cutoff_rounds: int | None = None
+        if read_only:
+            if not self._file_path.is_file():
+                raise FileNotFoundError(self._file_path)
+            # 历史查询不执行迁移、恢复或元数据重写，也不占用管理器缓存。
+            return
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         # 仅在文件缺失时 touch：touch 对已存在的文件也会刷新 mtime，
         # 服务重启后逐会话实例化会平白搅动所有历史文件的修改时间；
@@ -1201,7 +1207,8 @@ class ChatMemoryManager:
         服务启动时由 _migrate_legacy_sidecar_files 一次性搬迁；文件仍被
         占用等迁移失败场景下旧位置可能仍有残留，读取类路径做旧位置回退。
         """
-        return _sidecar_dir() / (self._file_path.name + suffix)
+        directory = HISTORY_ROOT / "sidecars" if self._read_only else _sidecar_dir()
+        return directory / (self._file_path.name + suffix)
 
     @property
     def _meta_lock_path(self) -> Path:
@@ -4250,6 +4257,24 @@ def _safe_parse_jsonl_line(line: str) -> Any:
 # 会话管理器注册表（用于缓存不同 session_id 的管理器实例）
 _session_managers: dict[str, ChatMemoryManager] = {}
 _session_lock = threading.Lock()
+_SESSION_MANAGER_MAX_CACHED = 128
+
+
+def _evict_idle_session_managers(keep_id: str) -> None:
+    """按访问顺序淘汰空闲实例；进行中的轮次及编辑状态保留。"""
+    if len(_session_managers) <= _SESSION_MANAGER_MAX_CACHED:
+        return
+    for old_id, old_manager in tuple(_session_managers.items()):
+        if len(_session_managers) <= _SESSION_MANAGER_MAX_CACHED:
+            break
+        if old_id == keep_id:
+            continue
+        if (old_manager._round_store.pending_round is not None
+                or old_manager._target_round_number is not None
+                or old_manager._insert_round_number is not None
+                or old_manager._history_cutoff_rounds is not None):
+            continue
+        del _session_managers[old_id]
 
 
 async def get_chat_memory_manager(session_id: str) -> ChatMemoryManager:
@@ -4261,9 +4286,27 @@ async def get_chat_memory_manager(session_id: str) -> ChatMemoryManager:
         ChatMemoryManager实例
     """
     with _session_lock:
-        if session_id not in _session_managers:
-            _session_managers[session_id] = ChatMemoryManager(session_id)
-        return _session_managers[session_id]
+        manager = _session_managers.pop(session_id, None)
+        if manager is None:
+            manager = ChatMemoryManager(session_id)
+        _session_managers[session_id] = manager
+        _evict_idle_session_managers(session_id)
+        return manager
+
+
+async def get_existing_chat_memory_manager(session_id: str) -> ChatMemoryManager | None:
+    """只读查询已有会话，不创建文件、锁文件或长期缓存项。"""
+    session_id = normalize_session_id(session_id)
+    with _session_lock:
+        cached = _session_managers.get(session_id)
+        if cached is not None:
+            if cached._file_path.is_file():
+                return cached
+            del _session_managers[session_id]
+    try:
+        return ChatMemoryManager(session_id, read_only=True)
+    except FileNotFoundError:
+        return None
 
 
 def chat_memory_file_exists(session_id: str) -> bool:

@@ -1,0 +1,9 @@
+{
+  "name": "ytools-browser-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned Playwright MCP runtime for Ytools browser tools",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}

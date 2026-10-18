@@ -9,10 +9,10 @@
   const {
     state, toast, $, closeMenus, el,
     updateScrollBottomOffset, input, composer, composerWrap,
-    sendBtn, voiceBtn, stopBtn, app,
+    sendBtn, voiceBtn, stopBtn, scrollBottomBtn, app,
     stopGroup, stopMenuBtn, queueMenu, pendingOutbox,
     enhancePanel, plusMenu, plusBtn, boostBtn,
-    themeMenu, fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
+    fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
     chatSettingsBackdrop, chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
     chatSettingsReset, toolCallTimeoutSeconds,
     networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers, subAgentMaxConcurrent, triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint,
@@ -27,6 +27,7 @@
     const hasText = input.value.trim() !== "" || state.pendingMedia.length > 0;
     // 按钮只反映“当前会话”的任务状态，其他会话在后台流式不影响本会话的发送/停止按钮
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
+    scrollBottomBtn.classList.toggle("is-generating", currentStreaming);
     // 手动压缩进行中：发送会打断压缩任务并交错写入会话历史，隐藏发送入口
     // （键盘发送由 send() 内的同名守卫拦截）；终止按钮接管，点击可中止压缩。
     // 压缩期间引导/队列也不可用：必须等压缩完成后才能发消息。
@@ -34,9 +35,8 @@
     const compacting = state.manualCompactRunning && state.manualCompactSession === state.sessionId;
     // 运行中组合按钮：仅当前会话流式/压缩时显示；上拉钮只在流式（非压缩）时可用
     const showStopGroup = currentStreaming || compacting;
-    // 语音录音中：识别文本实时写入输入框（hasText 为真），麦克风按钮保持显示
-    // 并进入录音态（再点停止），发送按钮隐藏避免边录边发
-    // 有文本时语音钮不隐藏：与发送钮并排（边打字边听写，或补充录入），
+    // 语音录音中：识别文本实时写入输入框，麦克风保持显示并进入录音态。
+    // 有文本时语音钮不隐藏：与发送钮并排，可继续补充录入，
     // 仅当前会话流式/压缩时随发送钮一起让位给停止钮
     composer.classList.toggle("has-text", hasText);
     sendBtn.classList.toggle("hidden", !hasText || currentStreaming || compacting);
@@ -104,11 +104,11 @@
 
   input.addEventListener("input", autosize);
   input.addEventListener("keydown", function (e) {
-    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing || speechComposing || e.keyCode === 229) return;
     e.preventDefault();
     // 回车发送前先结束录音（录音中写入的文本随消息发出，避免发送后
     // 识别结果继续写回已清空的输入框）
-    if (typeof stopSpeechInput === "function" && speechActive) stopSpeechInput();
+    if (typeof stopSpeechInput === "function" && speechRec) stopSpeechInput();
     // 流式进行中（当前会话、非压缩）：Enter=消息引导，Alt+Enter=加入队列
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
     const compactingHere = state.manualCompactRunning &&
@@ -147,6 +147,7 @@
     App.renderComposerAttachments();
     App.renderComposerQuotes();
     input.value = "";
+    if (App.closeSlashCommands) App.closeSlashCommands();
     App.autosize();
     if (mode === "queue") {
       state.pendingQueue.push(message);
@@ -439,38 +440,210 @@
 
   // ---------- 语音输入（Web Speech API，Chrome / Edge） ----------
   // 点麦克风开始听写，识别文本实时写入输入框：以点击时的光标为插入点，
-  // 当前周期的结果快照全量重建（final + interim 实时预览）、跨周期文本累积拼接。
-  // 持续监听直到用户点击停止或发送消息：Chrome 的连续模式在长静默/服务端
-  // 策略下会自行结束会话（onend），未手动停止时自动重启（短延迟续听、静默/
-  // 网络异常指数退避），静默期不会停止听写；用户编辑输入框（删除/修改文本）
-  // 也不中断听写——以编辑后的文本与光标为新插入点重锚定：跳过当前实例已
-  // 产生的全部结果（编辑前的语音文本不重放），后续新结果从下一索引继续累积。
-  // 编辑不重建识别实例（不调 start），避免 file:// 等场景下反复弹麦克风权限。
+  // 每次结果快照全量重建（final + interim），避免重复追加。只清理语音片段
+  // 内汉字之间的水平空格，不修改手动输入的文本、英文词间空格和换行。
+  // 手动编辑时重定位插入点，输入法组合期间只缓存识别结果，避免打断候选词。
+  // 点击麦克风建立听写意图；服务自然断开时用新实例续听，错误、主动停止、
+  // 页面隐藏和发送消息均结束该意图。continuous 只控制单次连接内的结果。
   let speechRec = null;
   let speechActive = false;
   let speechBase = "";
   let speechTail = "";
-  let speechSep = "";
-  let speechCommitted = ""; // 已结束的识别周期
-  let speechCycleText = ""; // 当前周期完整结果快照（final + interim）
+  let speechSelected = "";
   let speechLastWritten = null;
   let speechWriting = false;
-  let speechRestartTimer = null;
-  let speechEmptyRestarts = 0;
-  let speechNetworkErrors = 0;
-  let speechSkipCount = 0; // 重锚定后跳过的已消费结果数（编辑前结果不重放）
-  let speechResultCount = 0; // 当前实例已产生的结果总数（重锚定的跳过基准）
-  // 空周期保护上限：静默时每次会话结束记一个空周期（约 8s 一轮），
-  // 取宽松值（≈8 分钟无任何识别）避免长时间占用麦克风，正常听写不触发。
-  const SPEECH_MAX_EMPTY_RESTARTS = 60;
-  // 网络异常上限：网络抖动通常 1-2 次即恢复，连续多次才停止并提示。
-  const SPEECH_MAX_NETWORK_ERRORS = 5;
+  let speechLastSelectionStart = 0;
+  let speechLastSelectionEnd = 0;
+  let speechFollowCaret = true;
+  let speechResults = []; // 已显示过的完整结果快照
+  let speechConsumed = []; // 手动编辑前冻结的语音前缀，之后不重放
+  let speechEditBaseline = null;
+  let speechPendingResults = null;
+  let speechComposing = false;
+  let speechEditing = false;
+  let speechEditTimer = null;
+  let speechEnded = false; // 自然结束时，仍可在输入法提交后写入已缓存的结果
+  let speechStarting = false;
+  let speechStartRequested = false;
+  let speechStartTimer = null;
+  let speechReleaseTimer = null;
+  let speechResumeTimer = null;
+  let speechEmptyResumes = 0;
+  let speechResumeEditChecks = 0;
+  let speechResumeNoticeShown = false;
+  const speechClosing = new Set(); // abort/stop 返回不代表音频服务已释放，须等待 end。
+  const SPEECH_START_TIMEOUT_MS = 30000;
+  const SPEECH_RELEASE_TIMEOUT_MS = 2000;
+  const SPEECH_RESUME_DELAY_MS = 300;
+  const SPEECH_MAX_EMPTY_RESUMES = 2;
+  const speechLanguages = window.SpeechLanguage;
+  const speechLanguageSelect = document.getElementById("speechLanguage");
+  const voiceLanguageBadge = document.getElementById("voiceLanguageBadge");
+  const speechLanguageStatus = document.getElementById("speechLanguageStatus");
+  const speechMigrationKey = speechLanguages.STORAGE_KEY + "-migrated";
+  let speechDeferredLanguage = null;
+  let speechConfigVersion = 0;
+  let speechConfigSaving = false;
+  let speechMigrationDone = false;
+  let speechLegacyLanguage = null;
+  let speechLanguage = speechLanguages.DEFAULT_LANGUAGE;
+  try {
+    speechLanguage = speechLanguages.read(window.localStorage);
+    const legacy = window.localStorage.getItem(speechLanguages.STORAGE_KEY);
+    if (legacy && speechLanguages.get(legacy).code === legacy) speechLegacyLanguage = legacy;
+    speechMigrationDone = window.localStorage.getItem(speechMigrationKey) === "1";
+  } catch (_) { /* 缓存被禁用时使用默认，再从后端同步 */ }
 
-  function applySpeechText() {
-    const before = speechBase + speechSep + speechCommitted + speechCycleText;
-    input.value = before + speechTail;
+  function normalizeSpeechText(text) {
+    return speechLanguages.normalize(text, speechLanguage);
+  }
+
+  function speechSeparator(left, right) {
+    return speechLanguages.separator(left, right, speechLanguage);
+  }
+
+  function syncSpeechLanguageUI() {
+    const language = speechLanguages.get(speechActive ? speechLanguage : speechDeferredLanguage || speechLanguage);
+    if (speechLanguageSelect) speechLanguageSelect.value = speechDeferredLanguage || speechLanguage;
+    if (voiceLanguageBadge) voiceLanguageBadge.textContent = language.badge;
+    const action = speechStartRequested ? "等待上次语音结束，点击取消"
+      : speechStarting ? "正在启动语音输入，点击取消" : speechActive ? "停止语音输入" : "语音输入";
+    voiceBtn.title = action + " · " + language.label + "（在聊天设置中切换语言）";
+    voiceBtn.setAttribute("aria-pressed", String(speechActive));
+    voiceBtn.setAttribute("aria-busy", String(speechStarting || speechStartRequested));
+    voiceBtn.setAttribute("data-speech-state", speechStartRequested ? "waiting" : speechStarting ? "starting" : speechActive ? "listening" : "idle");
+    voiceBtn.setAttribute("aria-label", action + " · " + language.label);
+  }
+
+  function setSpeechConfigStatus(message) {
+    if (speechLanguageStatus) speechLanguageStatus.textContent = message;
+  }
+
+  function cacheSpeechLanguage(language) {
+    try { return speechLanguages.save(window.localStorage, language); }
+    catch (_) { return false; }
+  }
+
+  function markSpeechMigrated() {
+    speechMigrationDone = true;
+    try { window.localStorage.setItem(speechMigrationKey, "1"); } catch (_) { /* 缓存可选 */ }
+  }
+
+  async function speechConfigRequest(method, ...args) {
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, 8000);
+    try {
+      const data = await API[method](...args, { signal: controller.signal });
+      if (!data || typeof data.language !== "string" || speechLanguages.get(data.language).code !== data.language) {
+        throw new Error("后端返回了无效的语音语言配置");
+      }
+      return data;
+    } finally { clearTimeout(timer); }
+  }
+
+  function adoptSpeechConfig(data) {
+    // 正在识别的实例及其临时/输入法结果始终使用启动时的语言规则。
+    if (speechActive || speechRec || speechEditing || speechComposing) {
+      speechDeferredLanguage = data.language === speechLanguage ? null : data.language;
+    } else {
+      speechLanguage = data.language;
+      speechDeferredLanguage = null;
+    }
+    cacheSpeechLanguage(data.language);
+    if (data.persisted) markSpeechMigrated();
+    syncSpeechLanguageUI();
+  }
+
+  async function loadSpeechInputSettings() {
+    if (speechConfigSaving) return;
+    if (typeof API === "undefined" || !API.getSpeechInputConfig) {
+      setSpeechConfigStatus("后端暂未提供语言配置，当前使用浏览器缓存");
+      return;
+    }
+    const version = ++speechConfigVersion;
+    setSpeechConfigStatus("正在同步项目默认语种…");
+    try {
+      let data = await speechConfigRequest("getSpeechInputConfig");
+      if (version !== speechConfigVersion) return;
+      // 旧浏览器只可填补未配置的后端，不能覆盖其他浏览器已经保存的值。
+      if (!data.persisted && !speechMigrationDone && speechLegacyLanguage) {
+        data = await speechConfigRequest("updateSpeechInputConfig", speechLegacyLanguage, true);
+        if (version !== speechConfigVersion) return;
+      }
+      adoptSpeechConfig(data);
+      setSpeechConfigStatus(speechDeferredLanguage
+        ? "已同步项目默认；当前听写保持原语种，下次启动生效"
+        : data.persisted ? "已从项目 .env 同步；清除浏览器网站数据后仍可恢复"
+          : "项目未设置语种，使用默认普通话；选择后会保存到 .env");
+    } catch (_) {
+      if (version === speechConfigVersion) {
+        setSpeechConfigStatus("后端配置暂不可用，使用浏览器缓存；重新打开设置可再次同步");
+      }
+    }
+  }
+
+  async function saveSpeechInputLanguage(next) {
+    if (speechConfigSaving) { syncSpeechLanguageUI(); return; }
+    if (next === (speechDeferredLanguage || speechLanguage)) return;
+    ++speechConfigVersion; // 较晚返回的初始化读取不得覆盖用户刚刚选择的值。
+    const wasActive = speechActive;
+    stopSpeechInput();
+    if (typeof API === "undefined" || !API.updateSpeechInputConfig) {
+      speechLanguage = next;
+      speechDeferredLanguage = null;
+      const saved = cacheSpeechLanguage(next);
+      syncSpeechLanguageUI();
+      setSpeechConfigStatus("后端不支持保存语言，当前仅保存于浏览器");
+      if (!saved) toast("语音语言已用于本页，浏览器未能保存偏好");
+      else if (wasActive) toast("已切换语音语言，请点击麦克风继续；草稿已保留");
+      return;
+    }
+    speechConfigSaving = true;
+    if (speechLanguageSelect) speechLanguageSelect.disabled = true;
+    setSpeechConfigStatus("正在保存到项目 .env…");
+    try {
+      const data = await speechConfigRequest("updateSpeechInputConfig", next, false);
+      adoptSpeechConfig(data);
+      setSpeechConfigStatus(speechDeferredLanguage
+        ? "已保存到项目 .env；下次启动听写时使用新语种"
+        : "已保存到项目 .env，所有浏览器共用默认语种");
+      if (wasActive) toast("语音语言已保存，请点击麦克风继续；草稿已保留");
+    } catch (error) {
+      syncSpeechLanguageUI();
+      const message = error && error.name === "AbortError" ? "保存超时" : "保存未确认成功";
+      setSpeechConfigStatus(message + "，仍使用原语种；可重新选择或重新打开设置核对后端状态");
+      toast("语音语言" + message + "，请检查后端连接后重试");
+    } finally {
+      speechConfigSaving = false;
+      if (speechLanguageSelect) speechLanguageSelect.disabled = false;
+    }
+  }
+
+  function applySpeechText(text) {
+    const selectionStart = input.selectionStart == null ? input.value.length : input.selectionStart;
+    const selectionEnd = input.selectionEnd == null ? selectionStart : input.selectionEnd;
+    const selectionDirection = input.selectionDirection;
+    // 点击、方向键和选区操作只改变光标，不结束听写。识别仍更新开启时的
+    // 语音片段；用户移动过光标后保留其选区，不再每次把光标拉回语音末尾。
+    if (selectionStart !== speechLastSelectionStart || selectionEnd !== speechLastSelectionEnd) speechFollowCaret = false;
+    const oldEnd = input.value.length - speechTail.length;
+    const before = speechBase + speechSeparator(speechBase, text) + text;
+    const next = text ? before + speechSeparator(text, speechTail) + speechTail : speechBase + speechSelected + speechTail;
+    if (input.value !== next) input.value = next;
     speechLastWritten = input.value;
-    input.setSelectionRange(before.length, before.length);
+    if (speechFollowCaret) {
+      input.setSelectionRange(text ? before.length : speechBase.length, text ? before.length : speechBase.length + speechSelected.length);
+    } else {
+      const newEnd = next.length - speechTail.length;
+      const mapSelection = function (pos) {
+        if (pos <= speechBase.length) return pos;
+        if (pos >= oldEnd) return pos + newEnd - oldEnd;
+        return Math.min(pos, newEnd);
+      };
+      input.setSelectionRange(mapSelection(selectionStart), mapSelection(selectionEnd), selectionDirection);
+    }
+    speechLastSelectionStart = input.selectionStart;
+    speechLastSelectionEnd = input.selectionEnd;
     speechWriting = true;
     try { input.dispatchEvent(new Event("input", { bubbles: true })); }
     finally { speechWriting = false; }
@@ -478,28 +651,44 @@
 
   function resetVoiceButton() {
     voiceBtn.classList.remove("is-recording");
-    voiceBtn.title = "语音输入";
-    voiceBtn.setAttribute("aria-pressed", "false");
-    voiceBtn.setAttribute("aria-label", "语音输入");
+    voiceBtn.classList.remove("is-starting");
+    syncSpeechLanguageUI();
     refreshComposerButtons();
   }
 
-  // 默认立即隔离并取消识别，用于发送/切会话/新对话；保留已经显示的预览。
-  // 仅点击麦克风停止时允许浏览器完成最后一段，随后 onend 清理。
+  // 默认先隔离旧实例，再取消识别，迟到事件不能覆盖手动编辑或另一会话。
+  // 仅点麦克风停止允许收尾最后一段；随后编辑/发送仍立即隔离收尾事件。
   function stopSpeechInput(finishLastResult) {
+    // 用户在组合输入中停止/发送时，保留输入法文本，不再收尾改写。
+    if (speechComposing || speechEditing) finishLastResult = false;
     speechActive = false;
-    if (speechRestartTimer != null) clearTimeout(speechRestartTimer);
-    speechRestartTimer = null;
+    speechStarting = false;
+    speechStartRequested = false;
+    if (speechStartTimer != null) clearTimeout(speechStartTimer);
+    if (speechReleaseTimer != null) clearTimeout(speechReleaseTimer);
+    if (speechResumeTimer != null) clearTimeout(speechResumeTimer);
+    speechStartTimer = null;
+    speechReleaseTimer = null;
+    speechResumeTimer = null;
     const rec = speechRec;
     if (!finishLastResult) {
       speechRec = null;
       speechLastWritten = null;
+      if (speechEditTimer != null) clearTimeout(speechEditTimer);
+      speechEditTimer = null;
+      speechEditBaseline = null;
+      speechPendingResults = null;
+      speechComposing = false;
+      speechEditing = false;
+      speechEnded = false;
     }
     if (rec) {
+      speechClosing.add(rec);
       try {
         if (finishLastResult) rec.stop();
         else rec.abort();
       } catch (_) {
+        speechClosing.delete(rec);
         speechRec = null;
         speechLastWritten = null;
       }
@@ -507,46 +696,137 @@
     resetVoiceButton();
   }
 
-  // 用户编辑输入框（删除/修改文本）：不中断听写、也不重建识别实例——
-  // 以编辑后的文本与光标位置为新插入点重锚定，跳过当前实例已产生的全部
-  // 结果（编辑前的语音文本不重放、不覆盖用户修改），后续新结果从下一索引
-  // 继续累积；听写状态与按钮录音态保持不变。
-  function reanchorSpeech() {
-    if (!speechActive) return;
+  function releaseSpeechSession(rec) {
+    speechClosing.delete(rec);
+    if (!speechStartRequested || speechClosing.size) return;
+    speechStartRequested = false;
+    if (speechReleaseTimer != null) clearTimeout(speechReleaseTimer);
+    speechReleaseTimer = null;
+    if (!speechActive || document.hidden) { stopSpeechInput(); return; }
+    // 仅兑现仍有效的启动请求；旧识别器的迟到事件不会接管新会话。
+    startSpeechSession();
+  }
+
+  function scheduleSpeechResume() {
+    if (!speechActive || document.hidden) { stopSpeechInput(); return; }
+    speechResumeTimer = setTimeout(function () {
+      speechResumeTimer = null;
+      if (!speechActive) return;
+      if (document.hidden ||
+          (state.streaming && state.streamingSession === state.sessionId) ||
+          (state.manualCompactRunning && state.manualCompactSession === state.sessionId)) {
+        stopSpeechInput();
+        return;
+      }
+      if (speechComposing || speechEditing) {
+        // 等输入法完成提交与编辑回写，再以最新草稿和光标为新片段锚点。
+        if (++speechResumeEditChecks > 40) {
+          stopSpeechInput();
+          toast("输入法尚未完成提交，听写已暂停；草稿已保留，可点击麦克风继续");
+          return;
+        }
+        scheduleSpeechResume();
+        return;
+      }
+      speechResumeEditChecks = 0;
+      startSpeechInput(true);
+    }, SPEECH_RESUME_DELAY_MS);
+  }
+
+  function writeSpeechResults(results) {
+    speechResults = results;
+    const text = results.map(function (part, index) {
+      if (index >= speechConsumed.length) return part;
+      const consumed = normalizeSpeechText(speechConsumed[index]);
+      const current = normalizeSpeechText(part);
+      if (!consumed) return part;
+      // 编辑前已显示的部分成为普通草稿，后续只接入新增后缀。引擎若改写
+      // 已冻结的临时前缀，忽略该条修订，避免覆盖用户编辑或重放旧语音。
+      return current.startsWith(consumed) ? current.slice(consumed.length) : "";
+    }).join("");
+    applySpeechText(normalizeSpeechText(text));
+  }
+
+  function flushSpeechEdit() {
+    if (speechComposing || speechEditBaseline == null) return;
+    if (speechEditTimer != null) clearTimeout(speechEditTimer);
+    speechEditTimer = null;
     const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
     const end = input.selectionEnd == null ? pos : input.selectionEnd;
     speechBase = input.value.slice(0, pos);
     speechTail = input.value.slice(end);
-    speechSep = speechBase && !/\s$/.test(speechBase) ? " " : "";
-    speechCommitted = "";
-    speechCycleText = "";
-    speechEmptyRestarts = 0;
+    speechSelected = input.value.slice(pos, end);
+    speechLastSelectionStart = pos;
+    speechLastSelectionEnd = end;
+    speechFollowCaret = true;
     speechLastWritten = input.value;
-    speechSkipCount = speechResultCount;
+    speechConsumed = speechEditBaseline;
+    speechEditBaseline = null;
+    speechEditing = false;
+    const pending = speechPendingResults;
+    speechPendingResults = null;
+    writeSpeechResults(pending || speechResults);
+    if (speechEnded) {
+      speechEnded = false;
+      speechLastWritten = null;
+    }
   }
 
-  // 延迟重启识别会话（静默结束/启动失败共用）：连续触发时只保留最后一次
-  // 计划，避免反复重建实例。
-  function scheduleSpeechRestart(delay) {
-    if (!speechActive) return;
-    if (speechRestartTimer != null) clearTimeout(speechRestartTimer);
-    speechRestartTimer = setTimeout(function () {
-      speechRestartTimer = null;
-      if (!speechActive) return;
-      startSpeechSession();
-    }, delay);
+  function scheduleSpeechEditFlush() {
+    if (speechEditTimer != null) clearTimeout(speechEditTimer);
+    speechEditTimer = setTimeout(function () {
+      speechEditTimer = null;
+      flushSpeechEdit();
+    }, 0);
   }
 
-  input.addEventListener("input", function () {
-    // 语音自身写回（speechWriting）忽略；用户编辑则重锚定继续监听。
-    if (!speechWriting && speechActive) reanchorSpeech();
+  function beginSpeechEdit() {
+    if (speechWriting || speechLastWritten == null) return false;
+    if (!speechActive && !speechEnded) {
+      stopSpeechInput(); // 显式停止后的迟到结果不应覆盖后续编辑。
+      return false;
+    }
+    if (speechEditBaseline == null) speechEditBaseline = speechResults.slice();
+    speechEditing = true;
+    return true;
+  }
+  input.addEventListener("beforeinput", function () {
+    if (beginSpeechEdit() && !speechComposing) scheduleSpeechEditFlush();
+  });
+  input.addEventListener("compositionstart", function () {
+    if (beginSpeechEdit()) speechComposing = true;
+  });
+  input.addEventListener("compositionend", function () {
+    if (!speechComposing) return;
+    speechComposing = false;
+    // 部分浏览器先触发 compositionend，再触发最终 input；等这一组事件
+    // 提交完成后再写回，避免候选词被软件赋值打断。
+    scheduleSpeechEditFlush();
+  });
+  input.addEventListener("input", function (event) {
+    if (!beginSpeechEdit()) return;
+    if (speechComposing || event.isComposing || speechEditTimer != null) return;
+    flushSpeechEdit();
   });
 
-  // 创建识别实例并开始识别（首次启动与静默结束后的自动重启共用）：
-  // 每次重启使用新实例——旧实例的迟到事件经 speechRec 比对全部丢弃，
-  // 不会把上一周期的结果写回输入框。用户编辑不重建实例（见 reanchorSpeech）。
+  // 每次显式启动使用新实例；旧实例的迟到事件通过身份比对丢弃。
   function startSpeechSession() {
     if (!speechActive) return;
+    if (speechClosing.size) {
+      speechStartRequested = true;
+      voiceBtn.classList.add("is-starting");
+      syncSpeechLanguageUI();
+      speechReleaseTimer = setTimeout(function () {
+        speechReleaseTimer = null;
+        if (!speechStartRequested) return;
+        // 某些浏览器报错/abort 后不会再发 end；不能让旧实例永久阻塞麦克风。
+        speechClosing.clear();
+        speechStartRequested = false;
+        if (!speechActive || document.hidden) { stopSpeechInput(); return; }
+        startSpeechSession();
+      }, SPEECH_RELEASE_TIMEOUT_MS);
+      return;
+    }
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
       stopSpeechInput();
@@ -557,95 +837,135 @@
     try { rec = new SR(); }
     catch (err) { stopSpeechInput(); toast("语音识别启动失败：" + (err && err.message || err)); return; }
     speechRec = rec;
-    speechSkipCount = 0;
-    speechResultCount = 0;
-    rec.lang = "zh-CN";
+    speechStarting = true;
+    rec.lang = speechLanguage;
     rec.continuous = true;
     rec.interimResults = true;
+    let emptyNoticeShown = false;
+    let receivedSpeechText = false;
+    const ready = function () {
+      if (speechRec !== rec || !speechActive) return;
+      speechStarting = false;
+      if (speechStartTimer != null) clearTimeout(speechStartTimer);
+      speechStartTimer = null;
+      voiceBtn.classList.remove("is-starting");
+      voiceBtn.classList.add("is-recording");
+      syncSpeechLanguageUI();
+    };
+    const emptyResult = function () {
+      if (speechRec !== rec || !speechActive || emptyNoticeShown) return;
+      emptyNoticeShown = true;
+      toast("语音服务未返回可用文字，请检查麦克风和所选识别语言；草稿已保留");
+    };
+    rec.onstart = ready;
+    rec.onaudiostart = ready;
+    rec.onnomatch = emptyResult;
     rec.onresult = function (event) {
       if (speechRec !== rec) return;
-      speechResultCount = event.results.length;
-      if (input.value !== speechLastWritten) {
-        if (!speechActive) return; // 已停止：丢弃迟到结果
-        reanchorSpeech(); // 听写中：以当前文本与光标重锚定，继续监听
+      ready();
+      const results = Array.from(event.results).map(function (result) {
+        return result[0] && result[0].transcript || "";
+      });
+      if (results.length && results.every(part => !part.trim())) {
+        // 某些服务会返回空 transcript；不能把可见的临时文本或草稿清掉。
+        if (Array.from(event.results).some(result => result.isFinal)) emptyResult();
         return;
       }
-      // 本周期累计快照全量重建（重复 final 回调不会重复追加）；重锚定后
-      // 跳过已消费的旧结果，仅从新结果开始累积（编辑前文本不重放）。
-      speechCycleText = Array.from(event.results).slice(speechSkipCount).map(function (result) {
-        return result[0] && result[0].transcript || "";
-      }).join("");
-      if (speechCycleText) {
-        speechEmptyRestarts = 0;
-        speechNetworkErrors = 0;
+      if (results.some(part => part.trim())) {
+        receivedSpeechText = true;
+        emptyNoticeShown = false;
+        speechEmptyResumes = 0;
       }
-      applySpeechText();
+      if (speechComposing || speechEditing) {
+        speechPendingResults = results;
+        return;
+      }
+      if (input.value !== speechLastWritten) {
+        // 兼容未分发 input 的外部修改；保留新草稿，不重放之前的结果。
+        if (beginSpeechEdit()) {
+          speechPendingResults = results;
+          flushSpeechEdit();
+        }
+        return;
+      }
+      // 先按规范连接全部结果，再清理中文空格，覆盖跨结果边界的空格。
+      writeSpeechResults(results);
     };
     rec.onerror = function (event) {
       if (speechRec !== rec) return;
       const err = event && event.error || "";
-      if (err === "no-speech") return; // 静默由 onend 自动重启处理。
-      if (err === "aborted") return; // 主动中断/浏览器中断：由 onend 决定重启。
-      if (err === "network") {
-        // 网络抖动：温和重试（由 onend 重启），连续多次失败才停止提示
-        speechNetworkErrors += 1;
-        if (speechNetworkErrors >= SPEECH_MAX_NETWORK_ERRORS) {
-          stopSpeechInput();
-          toast("语音识别服务网络异常，已停止录音；请检查网络后重新开始");
-        }
-        return;
-      }
+      const wasActive = speechActive;
+      stopSpeechInput();
+      if (!wasActive) return; // 手动停止后的服务收尾/aborted 不重复打扰用户。
       const errors = {
+        "no-speech": "暂未识别到语音，听写已结束；请点击麦克风重新开始",
+        "aborted": "语音识别被浏览器中断，草稿已保留；可点击麦克风重新开始",
+        "network": "语音识别服务网络异常，已停止录音；请检查网络后点击麦克风重试",
         "not-allowed": "麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问",
         "service-not-allowed": "浏览器禁止使用语音识别服务，请检查浏览器设置",
         "audio-capture": "无法访问麦克风，请检查设备连接及是否被其他程序占用",
-        "language-not-supported": "当前语音服务不支持中文识别",
+        "language-not-supported": "当前浏览器的语音服务不支持「" + speechLanguages.get(speechLanguage).label + "」，请在聊天设置中选择其他语言",
       };
-      stopSpeechInput();
       toast(errors[err] || "语音识别出错：" + err);
     };
     rec.onend = function () {
-      if (speechRec !== rec) return;
-      if (!speechActive) {
+      if (speechRec === rec) {
+        const unexpected = speechActive;
+        const wasStarting = speechStarting;
+        const canResume = unexpected && !wasStarting && !document.hidden &&
+          !(state.streaming && state.streamingSession === state.sessionId) &&
+          !(state.manualCompactRunning && state.manualCompactSession === state.sessionId) &&
+          (receivedSpeechText || speechEmptyResumes++ < SPEECH_MAX_EMPTY_RESUMES);
+        speechActive = canResume;
+        speechStarting = canResume;
         speechRec = null;
-        speechLastWritten = null;
-        resetVoiceButton();
-        return;
+        if (speechStartTimer != null) clearTimeout(speechStartTimer);
+        speechStartTimer = null;
+        if (speechEditing) {
+          speechEnded = true;
+          if (!speechComposing) scheduleSpeechEditFlush();
+        } else {
+          speechLastWritten = null;
+        }
+        if (canResume) {
+          voiceBtn.classList.remove("is-recording");
+          voiceBtn.classList.add("is-starting");
+          syncSpeechLanguageUI();
+          refreshComposerButtons();
+          if (!speechResumeNoticeShown) {
+            speechResumeNoticeShown = true;
+            toast("语音服务短暂断开，正在继续听写；草稿已保留");
+          }
+          scheduleSpeechResume();
+        } else {
+          resetVoiceButton();
+          if (unexpected) toast(wasStarting ? "语音服务未能完成启动，请点击麦克风重试"
+            : "语音服务已结束，草稿已保留；可点击麦克风继续");
+        }
       }
-      // 周期结束后保留最后可见文本，重启时 results 索引从零开始。
-      if (speechCycleText) speechCommitted += speechCycleText;
-      else speechEmptyRestarts += 1;
-      speechCycleText = "";
-      if (speechEmptyRestarts >= SPEECH_MAX_EMPTY_RESTARTS) {
-        stopSpeechInput();
-        toast("长时间未识别到语音，已停止录音；可点击麦克风重新开始");
-        return;
-      }
-      // 正常结束短延迟快速续听；静默/网络异常时逐步增大延迟（最多 2s）
-      const backoff = speechEmptyRestarts + speechNetworkErrors;
-      scheduleSpeechRestart(backoff > 0 ? Math.min(2000, 200 * backoff) : 80);
+      // 即使旧实例已被隔离，也必须释放占用，才能安全处理下次显式启动。
+      releaseSpeechSession(rec);
     };
+    voiceBtn.classList.add("is-starting");
+    syncSpeechLanguageUI();
+    refreshComposerButtons();
+    speechStartTimer = setTimeout(function () {
+      speechStartTimer = null;
+      if (speechRec !== rec || !speechStarting) return;
+      stopSpeechInput();
+      toast("语音服务启动超时，请确认麦克风权限后点击重试；草稿已保留");
+    }, SPEECH_START_TIMEOUT_MS);
     try { rec.start(); }
     catch (err) {
-      // 启动失败：短延迟重试（新建实例），连续失败达上限才彻底停止
+      // start 同步抛错表示本次根本没有进入识别，不等待一个不会到来的 end。
       speechRec = null;
-      speechEmptyRestarts += 1;
-      if (speechEmptyRestarts >= SPEECH_MAX_EMPTY_RESTARTS) {
-        stopSpeechInput();
-        toast("语音识别启动失败：" + (err && err.message || err));
-        return;
-      }
-      scheduleSpeechRestart(200 * Math.min(speechEmptyRestarts, 5));
-      return;
+      speechClosing.delete(rec);
+      stopSpeechInput();
+      toast("语音识别启动失败：" + (err && err.message || err));
     }
-    voiceBtn.classList.add("is-recording");
-    voiceBtn.title = "停止语音输入";
-    voiceBtn.setAttribute("aria-pressed", "true");
-    voiceBtn.setAttribute("aria-label", "停止语音输入");
-    refreshComposerButtons();
   }
 
-  function startSpeechInput() {
+  function startSpeechInput(resume) {
     if ((state.streaming && state.streamingSession === state.sessionId) ||
         (state.manualCompactRunning && state.manualCompactSession === state.sessionId)) return;
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -654,15 +974,24 @@
       return;
     }
     stopSpeechInput();
+    if (!resume) {
+      speechEmptyResumes = 0;
+      speechResumeNoticeShown = false;
+    }
+    if (speechDeferredLanguage) {
+      speechLanguage = speechDeferredLanguage;
+      speechDeferredLanguage = null;
+    }
     const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
     const end = input.selectionEnd == null ? pos : input.selectionEnd;
     speechBase = input.value.slice(0, pos);
     speechTail = input.value.slice(end);
-    speechSep = speechBase && !/\s$/.test(speechBase) ? " " : "";
-    speechCommitted = "";
-    speechCycleText = "";
-    speechEmptyRestarts = 0;
-    speechNetworkErrors = 0;
+    speechSelected = input.value.slice(pos, end);
+    speechLastSelectionStart = pos;
+    speechLastSelectionEnd = end;
+    speechFollowCaret = true;
+    speechResults = [];
+    speechConsumed = [];
     speechLastWritten = input.value;
     speechActive = true;
     startSpeechSession();
@@ -670,10 +999,27 @@
 
   voiceBtn.addEventListener("click", function () {
     if (speechActive) stopSpeechInput(true);
-    else startSpeechInput();
+    else startSpeechInput(false);
   });
   window.addEventListener("pagehide", function () { stopSpeechInput(); });
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stopSpeechInput();
+  });
+  if (speechLanguageSelect) {
+    speechLanguages.languages.forEach(function (language) {
+      const option = document.createElement("option");
+      option.value = language.code;
+      option.textContent = language.label;
+      speechLanguageSelect.appendChild(option);
+    });
+    speechLanguageSelect.addEventListener("change", function () {
+      const next = speechLanguages.get(speechLanguageSelect.value).code;
+      return saveSpeechInputLanguage(next);
+    });
+  }
+  syncSpeechLanguageUI();
   App.stopVoiceInput = function () { stopSpeechInput(); };
+  App.loadSpeechInputSettings = loadSpeechInputSettings;
 
   // ---------- 运行中发送选项（上拉菜单） ----------
   // 上拉钮点击弹出菜单；菜单项整体可点击，直接执行对应动作
@@ -701,7 +1047,6 @@
   // ---------- “+” 功能菜单 ----------
   plusBtn.addEventListener("click", function (e) {
     e.stopPropagation();
-    themeMenu.classList.add("hidden");
     plusMenu.classList.toggle("hidden");
     if (!plusMenu.classList.contains("hidden")) placeAbove(plusMenu, plusBtn);
   });
@@ -790,6 +1135,7 @@
     chatSettingsModal.classList.remove("hidden");
     chatSettingsModal.setAttribute("aria-hidden", "false");
     if (App.showChatSettingsModal) App.showChatSettingsModal();
+    loadSpeechInputSettings();
     chatSettingsConfirm.disabled = true;
     loadSettingsRetitle();
     const permissionLoad = App.permissions ? App.permissions.loadSettings() : Promise.resolve();
@@ -1080,6 +1426,7 @@
       state.pendingMedia = [];
       state.pendingQuotes = [];
     }
+    if (App.closeSlashCommands) App.closeSlashCommands();
     App.renderComposerAttachments();
     App.renderComposerQuotes();
     App.autosize();

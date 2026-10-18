@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
-FILE_FIELDS = {"read_file": "full_file_name", "write_file": "full_file_name", "edit_file": "full_file_name", "search_files": "dir_path"}
+FILE_FIELDS = {"read_file": "path", "write_file": "path", "edit_file": "path", "search_files": "dir_path"}
+# 旧参数名兼容：JSONL 旧历史/重放仍用 full_file_name，规划时迁移到新名
+LEGACY_FILE_FIELDS = {"read_file": "full_file_name", "write_file": "full_file_name", "edit_file": "full_file_name"}
 LOCAL_TOOLS = {*FILE_FIELDS, "read_media", "read_document", "run_command", "poll_command", "stop_command", "todo_write", "ask_user", "sub_agent", "over_task"}
 APP_ROOT = Path(__file__).resolve().parents[2]
 
@@ -63,6 +65,10 @@ def plan_tool(name, args, context, *, server=None, original_name=None):
         args["shell"] = _resolve_shell(args.get("shell") or "auto", os.name == "nt")[1]
     elif name in FILE_FIELDS:
         field = FILE_FIELDS[name]
+        # 旧名迁移：旧调用用 full_file_name，新 schema 用 path；缺新名时从旧名取值
+        legacy = LEGACY_FILE_FIELDS.get(name)
+        if legacy and not args.get(field) and args.get(legacy):
+            args[field] = args.pop(legacy)
         if not args.get(field) and name != "search_files":
             raise ValueError(field + " 不能为空")
         args[field] = resolve_path(args.get(field), root)

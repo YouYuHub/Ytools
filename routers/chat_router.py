@@ -47,6 +47,7 @@ from factory.agent_runtime.builtin_tools import (
 from memory.chat_memory import (
     ChatMemoryManager,
     get_chat_memory_manager,
+    get_existing_chat_memory_manager,
     normalize_session_id,
     cleanup_chat_memory_manager,
     chat_memory_file_exists,
@@ -302,6 +303,13 @@ async def list_chat_history_sessions():
         raise HTTPException(status_code=400, detail=str(e))
 
     
+@api_chat_router.get('/chat_history/summaries')
+async def list_chat_history_summaries(session_id: Optional[str] = None):
+    """Thin sidebar rows; optional single-session lookup never creates history."""
+    from memory.session_listing import list_session_summaries
+    return await asyncio.to_thread(list_session_summaries, session_id)
+
+
 @api_chat_router.get('/chat_history/search')
 async def search_chat_history(
     request: Request,
@@ -356,7 +364,9 @@ async def get_chat_history_file(session_id: str = "default"):
         文件响应
     """
     session_id = normalize_session_id(session_id)
-    manager = await get_chat_memory_manager(session_id)
+    manager = await get_existing_chat_memory_manager(session_id)
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Chat session file not found")
     text = await manager.get_file_text()
     if text is None:
         raise HTTPException(status_code=404, detail="Chat session file not found")
@@ -373,13 +383,16 @@ async def get_chat_history_meta(session_id: str = "default"):
         元数据字典
     """
     try:
-        manager = await get_chat_memory_manager(normalize_session_id(session_id))
+        manager = await get_existing_chat_memory_manager(normalize_session_id(session_id))
+        if manager is None:
+            raise HTTPException(status_code=404, detail="Chat session file not found")
         meta = await manager.get_session_meta()
         return JSONResponse(content=meta)
     except HTTPException as e:
         raise e
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("读取会话元数据失败")
+        raise HTTPException(status_code=500, detail="读取会话元数据失败")
 
 
 @api_chat_router.put('/chat_history/title')
@@ -496,8 +509,10 @@ async def list_chat_session_groups():
         JSONL 首行 _meta.group_id（扫描时只读首行，损坏文件跳过）。
     """
     try:
-        groups = list_session_groups()
-        assignments = list_session_group_assignments()
+        groups, assignments = await asyncio.gather(
+            asyncio.to_thread(list_session_groups),
+            asyncio.to_thread(list_session_group_assignments),
+        )
         return JSONResponse(content={"groups": groups, "assignments": assignments})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

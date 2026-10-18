@@ -47,6 +47,16 @@ $fh-del-text: #cf222e;
   z-index: 60;
 }
 
+@container main-area (max-width: 680px) {
+  .fh-panel {
+    left: 12px;
+    right: 12px;
+    top: 56px;
+    width: auto;
+    max-width: none;
+  }
+}
+
 .fh-panel-head {
   display: flex;
   align-items: baseline;

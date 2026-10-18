@@ -4,6 +4,13 @@ import os
 import json
 import traceback
 import asyncio
+import atexit
+import base64
+import concurrent.futures
+import mimetypes
+import tempfile
+import threading
+import uuid
 from typing import List, Any, Optional
 import sys
 import shutil
@@ -65,6 +72,10 @@ from env_manager import load_var
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+_PERSISTENT_CLIENTS: dict[tuple[str, str], "_PersistentStdioClient"] = {}
+_PERSISTENT_CLIENTS_LOCK = threading.Lock()
+_MCP_IMAGE_MAX_BYTES = 12 * 1024 * 1024
+
 
 def _load_mcp_servers_config() -> dict:
     server_path = PROJECT_ROOT / "setting" / "mcp_servers.json"
@@ -93,6 +104,21 @@ def _get_configured_server_command(server_ref: str) -> tuple[str, list[str]] | N
     if not isinstance(args, list):
         raise ValueError(f"MCP 服务器 [{server_ref}] 的 args 必须是数组")
     return command.strip(), [str(item) for item in args]
+
+
+def _get_configured_server_environment(server_ref: str) -> dict[str, str] | None:
+    server_info = _load_mcp_servers_config().get(server_ref)
+    if not isinstance(server_info, dict) or not server_info.get("env"):
+        return None
+    configured_env = server_info["env"]
+    if not isinstance(configured_env, dict):
+        raise ValueError(f"MCP 服务器 [{server_ref}] 的 env 必须是对象")
+    environment = os.environ.copy()
+    for key, value in configured_env.items():
+        if not isinstance(key, str) or not key or not isinstance(value, str):
+            raise ValueError(f"MCP 服务器 [{server_ref}] 的 env 键和值必须是字符串")
+        environment[key] = os.path.expandvars(value.replace("{temp}", tempfile.gettempdir()))
+    return environment
 
 
 def _resolve_project_file(value: str) -> str:
@@ -237,7 +263,11 @@ def build_stdio_server_parameters(mcp_service: str) -> StdioServerParameters:
         parts = _split_command_line(svc)
         command, args = parts[0], parts[1:]
     args = [_resolve_project_file(item) for item in args]
-    return _build_stdio_parameters(command, args, svc)
+    params = _build_stdio_parameters(command, args, svc)
+    environment = _get_configured_server_environment(svc)
+    if environment is not None:
+        params.env = environment
+    return params
 
 
 def _format_mcp_error(exc: BaseException) -> str:
@@ -352,6 +382,188 @@ def _mcp_call_timeout_seconds() -> float:
         return float(DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS)
 
 
+def _save_mcp_image(content_item: Any) -> str:
+    """MCP 图片结果落盘为 read_media 可读取的本地文件。"""
+    mime = str(_sdk_attr(content_item, "mime_type", "mimeType", "") or "").lower()
+    if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        raise ValueError(f"不支持的 MCP 图片类型: {mime or 'unknown'}")
+    encoded = getattr(content_item, "data", None)
+    if not isinstance(encoded, str) or len(encoded) > _MCP_IMAGE_MAX_BYTES * 2:
+        raise ValueError("MCP 图片数据无效或超过大小上限")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ValueError("MCP 图片 Base64 数据无效") from exc
+    if len(raw) > _MCP_IMAGE_MAX_BYTES:
+        raise ValueError("MCP 图片超过 12 MiB 上限")
+    suffix = mimetypes.guess_extension(mime) or ".png"
+    if suffix == ".jpe":
+        suffix = ".jpg"
+    output_dir = Path(tempfile.gettempdir()) / "ytools_mcp_images"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{uuid.uuid4().hex}{suffix}"
+    with output_path.open("xb") as output:
+        output.write(raw)
+    return str(output_path)
+
+
+def _parse_mcp_tool_result(result: Any) -> Any:
+    content = getattr(result, "content", None) or []
+    if _sdk_attr(result, "is_error", "isError", False):
+        error_text = next(
+            (str(item.text) for item in content if getattr(item, "text", None)),
+            "未知错误",
+        )
+        raise ValueError(f"MCP 工具执行失败: {error_text}")
+    if not content:
+        return []
+    parts = []
+    for item in content:
+        item_text = getattr(item, "text", None)
+        if item_text:
+            parts.append(str(item_text))
+        elif getattr(item, "data", None) is not None and str(
+            _sdk_attr(item, "mime_type", "mimeType", "") or ""
+        ).startswith("image/"):
+            path = _save_mcp_image(item)
+            parts.append(f"[MCP 图片已保存] {path}（视觉模型可用 read_media 读取）")
+    return "\n".join(parts) if parts else ""
+
+
+class _PersistentStdioClient:
+    """在独立事件循环里维持一个 MCP stdio 会话，供工具线程跨调用复用。"""
+
+    def __init__(self, server_ref: str, signature: str):
+        self.signature = signature
+        self._server_params = build_stdio_server_parameters(server_ref)
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._queue: asyncio.Queue | None = None
+        self._pending: set[concurrent.futures.Future] = set()
+        self._error: BaseException | None = None
+        self._closing = False
+        self._thread = threading.Thread(
+            target=self._run, name=f"mcp-persistent-{server_ref}", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive() and not self._closing
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._serve())
+        except BaseException as exc:
+            self._error = _unwrap_exception_group(exc)
+        finally:
+            self._ready.set()
+            for future in self._pending:
+                if not future.done():
+                    future.set_exception(RuntimeError(f"MCP 常驻连接已关闭: {self._error or '连接结束'}"))
+            self._pending.clear()
+
+    async def _serve(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.current_task()
+        self._queue = asyncio.Queue()
+        async with stdio_client(self._server_params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                await _upgrade_modern_protocol(session)
+                tools = await session.list_tools()
+                available = {tool.name for tool in tools.tools}
+                self._ready.set()
+                while True:
+                    function_name, arguments, future = await self._queue.get()
+                    if future.cancelled():
+                        self._pending.discard(future)
+                        continue
+                    try:
+                        if function_name not in available:
+                            raise ValueError(f"工具 '{function_name}' 不存在。可用工具: {', '.join(sorted(available))}")
+                        result = await session.call_tool(function_name, arguments)
+                        value = _parse_mcp_tool_result(result)
+                        if not future.done():
+                            future.set_result(value)
+                    except Exception as exc:
+                        if not future.done():
+                            future.set_exception(exc)
+                    finally:
+                        self._pending.discard(future)
+
+    async def call(self, function_name: str, arguments: dict) -> Any:
+        await asyncio.to_thread(self._ready.wait)
+        if self._error is not None:
+            raise RuntimeError(f"MCP 常驻连接启动失败: {_format_mcp_error(self._error)}") from self._error
+        if not self.alive or self._loop is None or self._queue is None:
+            raise RuntimeError("MCP 常驻连接已关闭")
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def enqueue() -> None:
+            if self._closing or self._queue is None:
+                future.set_exception(RuntimeError("MCP 常驻连接已关闭"))
+            else:
+                self._pending.add(future)
+                self._queue.put_nowait((function_name, arguments, future))
+
+        self._loop.call_soon_threadsafe(enqueue)
+        return await asyncio.wrap_future(future)
+
+    def close(self) -> None:
+        self._closing = True
+        if self._loop is not None and self._loop.is_running() and self._task is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+            except RuntimeError:
+                pass  # 连接已自行退出，事件循环可能刚刚关闭。
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=3)
+
+
+def _persistent_server_signature(server_ref: str) -> str | None:
+    info = _load_mcp_servers_config().get(server_ref)
+    if not isinstance(info, dict) or info.get("persistent") is not True:
+        return None
+    return json.dumps(info, ensure_ascii=False, sort_keys=True)
+
+
+def _get_persistent_client(server_ref: str, scope: str, signature: str) -> _PersistentStdioClient:
+    key = (server_ref, scope)
+    stale = None
+    with _PERSISTENT_CLIENTS_LOCK:
+        client = _PERSISTENT_CLIENTS.get(key)
+        if client is not None and (client.signature != signature or not client.alive):
+            stale = _PERSISTENT_CLIENTS.pop(key)
+            client = None
+        if client is None:
+            client = _PersistentStdioClient(server_ref, signature)
+            _PERSISTENT_CLIENTS[key] = client
+    if stale is not None:
+        stale.close()
+    return client
+
+
+def _drop_persistent_client(server_ref: str, scope: str, client: _PersistentStdioClient) -> None:
+    with _PERSISTENT_CLIENTS_LOCK:
+        if _PERSISTENT_CLIENTS.get((server_ref, scope)) is client:
+            _PERSISTENT_CLIENTS.pop((server_ref, scope), None)
+    client.close()
+
+
+def close_persistent_mcp_clients(session_scope: str | None = None) -> None:
+    """关闭指定子任务或整个会话 worker 的常驻 MCP 子进程。"""
+    with _PERSISTENT_CLIENTS_LOCK:
+        keys = [key for key in _PERSISTENT_CLIENTS if session_scope is None or key[1] == session_scope]
+        clients = [_PERSISTENT_CLIENTS.pop(key) for key in keys]
+    for client in clients:
+        client.close()
+
+
+atexit.register(close_persistent_mcp_clients)
+
+
 async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
     """ 通过 MCP 客户端调用 MCP 服务器上的工具
     Args:
@@ -393,19 +605,7 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
                         f"工具 '{function_name}' 不存在。可用工具: {', '.join(available_tools)}"
                     )
                 result = await session.call_tool(function_name, arguments or {})
-                # 解析结果。即使 result.content 为空，也可能是合法的返回值（如空列表）。
-                # 2.0 协议优先，auto 兼容 1.x（isError）。
-                if _sdk_attr(result, "is_error", "isError", False):
-                    error_text = result.content[0].text if result.content else "未知错误"
-                    raise ValueError(f"MCP 工具执行失败: {error_text}")
-                if result.content and len(result.content) > 0:
-                    texts = []
-                    for content_item in result.content:
-                        if hasattr(content_item, 'text') and content_item.text:
-                            texts.append(content_item.text)
-                    return "\n".join(texts) if texts else ""
-                # 没有 content 但也没有错误，可能是空列表等合法返回值。
-                return []
+                return _parse_mcp_tool_result(result)
     except Exception as error:
         # 统一异常收口（版本无关）：
         # - anyio 在退出 stdio_client/ClientSession 上下文时会把底层异常打包成
@@ -424,13 +624,29 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
         raise error
 
 
-async def call_mcp_tool(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
+async def call_mcp_tool(
+    function_name: str,
+    arguments: dict = None,
+    mcp_service: str = "sysServer",
+    session_scope: str = "main",
+) -> Any:
     """通过 MCP 客户端调用工具，并对完整生命周期施加配置的总超时。"""
     timeout_seconds = _mcp_call_timeout_seconds()
-    call = _call_mcp_tool_impl(function_name, arguments, mcp_service)
-    if timeout_seconds > 0:
-        return await asyncio.wait_for(call, timeout=timeout_seconds)
-    return await call
+    signature = _persistent_server_signature(mcp_service)
+    client = None
+    if signature is not None:
+        client = _get_persistent_client(mcp_service, session_scope, signature)
+        call = client.call(function_name, arguments or {})
+    else:
+        call = _call_mcp_tool_impl(function_name, arguments, mcp_service)
+    try:
+        if timeout_seconds > 0:
+            return await asyncio.wait_for(call, timeout=timeout_seconds)
+        return await call
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if client is not None:
+            _drop_persistent_client(mcp_service, session_scope, client)
+        raise
 
 
 if __name__ == '__main__':
@@ -442,11 +658,11 @@ if __name__ == '__main__':
         #     "pipe_name": r"\\.\pipe\default_server",
         #     "terminal_mode": r"cmd.exe /k chcp 65001",
         #     # "terminal_mode": r"powershell.exe",
-        #     # "first_command": "ssh root@120.48.43.229",
+        #     # "first_command": "ssh user@example.com",
         #     # "first_command": "powershell",
         #     "first_command": "powershell -Command \"Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object MainWindowTitle, ProcessName, Id | Format-Table -AutoSize\"",
         #     "wait_milliseconds": 5000,
-        #     "prompt": "C:\\\\Users\\\\Administrator\\\\Desktop\\\\python学习录\\\\main_study\\\\large_model\\\\agent_tool_sse>",
+        #     "prompt": "C:\\\\Users\\\\example\\\\Desktop\\\\python学习录\\\\main_study\\\\large_model\\\\agent_tool_sse>",
         # }, mcp_service=r"mcp_server\PipeCmdMCP.exe"))
         res = asyncio.run(call_mcp_tool('run_pipe_command', {
             # 这里是函数的参数字典，比如 'a': 10, b: 20
@@ -456,9 +672,9 @@ if __name__ == '__main__':
             # "prompt": "",
             "prompt": "c:\\>",
             # "terminal_mode": r"powershell.exe",
-            # "first_command": "ssh root@120.48.43.229",
+            # "first_command": "ssh user@example.com",
             "next_command": "123",
-        }, mcp_service=r"C:\Users\Administrator\Desktop\C++学习录\MCP\MCPshell\x64\Release\PipeIpcMCP.exe"))
+        }, mcp_service=r"C:\example\PipeIpcMCP.exe"))
         print('RESULT:', res)
     except Exception as e:
         print(f"\n❌ 程序执行失败: {e}")

@@ -1184,6 +1184,7 @@ class SubAgentRunner:
                 tool_mcp_servers=ctx.tool_servers,
                 max_workers=max_workers,
                 tool_original_names=ctx.tool_original_names,
+                session_scope=f"sub_agent:{ctx.agent_id}",
             )
             results.extend(mcp_results)
         results.sort(key=lambda item: item["index"])
@@ -1219,6 +1220,11 @@ class SubAgentRunner:
             except Exception:
                 pass
             return self._make_result()
+        finally:
+            from util.mcp_client import close_persistent_mcp_clients
+            await asyncio.to_thread(
+                close_persistent_mcp_clients, f"sub_agent:{self.context.agent_id}"
+            )
 
     async def _run_inner(self) -> SubAgentResult:
         ctx = self.context

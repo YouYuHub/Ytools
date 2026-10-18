@@ -197,3 +197,59 @@ def test_two_commands_mixed_decisions_execute_only_allowed_call(environment, mon
                 try: await generation
                 except asyncio.CancelledError: pass
     asyncio.run(run())
+
+
+def suspend(task_id):
+    with store.database() as db:
+        db.execute("UPDATE tasks SET state='suspended',owner=-1 WHERE id=?", (task_id,))
+
+
+def test_resume_poll_timeout_releases_task_to_suspended(environment, monkeypatch):
+    from routers import tool_approval_router as router
+    task = store.create_task("s", {"root": str(environment), "request": {}})
+    store.checkpoint(task["id"], "main", {"messages": []})
+    old = store.request_approval(task["id"], "main", "call", task["epoch"],
+                                 {"args": {}, "digest": "d", "paths": [], "sources": [], "tool": "run_command"})
+    suspend(task["id"])
+    monkeypatch.setattr(cf, "resume_permission_task", lambda task_id: asyncio.sleep(0))
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda delay: real_sleep(0))
+    async def run():
+        with pytest.raises(ValueError, match="尚未就绪"):
+            await router.resume_approval(store.approval(old["id"]))
+    asyncio.run(run())
+    current = store.task(task["id"])
+    assert current["state"] == "suspended" and current["owner"] == -1
+    assert store.approval(old["id"])["state"] == "invalidated"
+
+
+def test_resume_poll_worker_death_reports_without_recovery(environment, monkeypatch):
+    from routers import tool_approval_router as router
+    task = store.create_task("s", {"root": str(environment), "request": {}})
+    store.checkpoint(task["id"], "main", {"messages": []})
+    old = store.request_approval(task["id"], "main", "call", task["epoch"],
+                                 {"args": {}, "digest": "d", "paths": [], "sources": [], "tool": "run_command"})
+    suspend(task["id"])
+    async def finish(task_id):
+        store.set_task_state(task_id, "failed")
+    monkeypatch.setattr(cf, "resume_permission_task", finish)
+    async def run():
+        with pytest.raises(ValueError, match="未能继续"):
+            await router.resume_approval(store.approval(old["id"]))
+    asyncio.run(run())
+    assert store.task(task["id"])["state"] == "failed"
+
+
+def test_decide_on_invalidated_approval_guides_to_resume(environment):
+    task = store.create_task("s", {"root": str(environment), "request": {}})
+    store.checkpoint(task["id"], "main", {"messages": []})
+    old = store.request_approval(task["id"], "main", "call", task["epoch"], {"args": {}})
+    suspend(task["id"])
+    current = store.resume(task["id"])
+    store.release_resume(task["id"], current["epoch"])
+    async def run():
+        async with client() as api:
+            response = await api.post(f'/tool_approvals/{old["id"]}/decision', json=payload(old))
+            assert response.status_code == 409
+            assert "恢复原任务" in response.json()["detail"]
+    asyncio.run(run())

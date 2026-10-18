@@ -59,7 +59,7 @@ Responses API 本身是 HTTP 接口，SDK 只提供调用封装，不是协议�
 
 因此，无状态模式每轮请求体、输入用量及本地请求审计通常更大；能否记住内容由本次发送的本地上下文决定，与旧响应 ID 的保存期限无关。`store: false` 也不代表第三方平台的日志、训练或隐私政策发生改变。
 
-前端正文、思考摘要、工具卡、用量统计继续使用现有应用 SSE 格式。流式工具参数只表示活动，直到完整 completed 响应通过验证并持久提交，才进入执行器。failed/incomplete、残缺 JSON、缺少 ID 或异常输出类型不会执行工具。
+前端正文、思考摘要、工具卡、用量统计继续使用现有应用 SSE 格式。流式工具参数只表示活动，直到完整 completed 响应通过验证并持久提交，才进入执行器。failed/incomplete、残缺 JSON、缺少 ID 或异常输出类型不会执行工具；其中瞬时类 failed（`server_error` 等）与 completed 畸形工具调用会消耗网络重试预算自动重建请求，畸形项的精确原因与原始响应会记入请求审计，incomplete/cancelled 与确定性错误直接终止。
 
 Responses 原生推理密文及 compaction 密文只保存在私有侧车；可见推理摘要映射为原来的 reasoning_content，不把 done 中的完整文本再追加一次。不同响应的用量分别计数。
 

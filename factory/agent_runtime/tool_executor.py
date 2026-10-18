@@ -136,6 +136,7 @@ def _invoke_tool_function(
     arguments: dict,
     tool_mcp_servers: Dict[str, str],
     tool_original_names: Dict[str, str] | None = None,
+    session_scope: str = "main",
 ) -> Any:
     if name not in tool_mcp_servers:
         raise ValueError(f"工具 {name} 未在MCP服务器中注册，无法调用")
@@ -147,6 +148,7 @@ def _invoke_tool_function(
             function_name=original_name,
             arguments=arguments,
             mcp_service=mcp_service,
+            session_scope=session_scope,
         ))
     finally:
         loop.close()
@@ -157,13 +159,14 @@ def execute_tool_round(
     tool_mcp_servers: Dict[str, str],
     max_workers: int,
     tool_original_names: Dict[str, str] | None = None,
+    session_scope: str = "main",
 ) -> list[dict[str, Any]]:
     tool_results: list[dict[str, Any]] = []
 
     def execute_tool(index, tool_call, tool_name, tool_args) -> tuple:
         try:
             result = _invoke_tool_function(
-                tool_name, tool_args, tool_mcp_servers, tool_original_names
+                tool_name, tool_args, tool_mcp_servers, tool_original_names, session_scope
             )
             ret = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             return index, tool_call, tool_name, tool_args, ret, None

@@ -180,6 +180,17 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
             {"type": "live_round_model", "model": {"name": "模型 A"}},
         )
 
+    def test_adapter_live_round_usage_total_reaches_main_stream(self):
+        import queue
+
+        evt_queue = queue.Queue()
+        adapter = session_worker._WorkerStreamAdapter("adapter-usage-test", evt_queue)
+        adapter.live_round_usage_total = {"prompt_tokens": 8, "total_tokens": 9}
+        self.assertEqual(
+            evt_queue.get_nowait(),
+            {"type": "live_round_usage_total", "usage": {"prompt_tokens": 8, "total_tokens": 9}},
+        )
+
     def test_handler_dispatches_round_and_parts_to_stream(self):
         proxy = session_worker.SessionWorkerProxy("evt-dispatch-test")
 
@@ -189,6 +200,7 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
                 self.question_parts = None
                 self.live_round_no = None
                 self.live_round_model = None
+                self.live_round_usage_total = None
                 self.round_started = False
 
             def emit(self, chunk):
@@ -202,11 +214,13 @@ class WorkerEventDispatchTests(unittest.IsolatedAsyncioTestCase):
         handler = session_worker._make_worker_event_handler(proxy)
         handler({"type": "live_round_no", "round": 7})
         handler({"type": "live_round_model", "model": {"provider": "供应商", "name": "模型 A"}})
+        handler({"type": "live_round_usage_total", "usage": {"total_tokens": 9}})
         handler({"type": "question_parts", "parts": [{"type": "text", "text": "看图"}]})
         handler({"type": "question_text", "text": "看图"})
         handler({"type": "round_start"})
         self.assertEqual(stream.live_round_no, 7)
         self.assertEqual(stream.live_round_model, {"provider": "供应商", "name": "模型 A"})
+        self.assertEqual(stream.live_round_usage_total, {"total_tokens": 9})
         self.assertEqual(stream.question_parts, [{"type": "text", "text": "看图"}])
         self.assertEqual(stream.question_text, "看图")
         self.assertTrue(stream.round_started)

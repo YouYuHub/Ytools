@@ -1,4 +1,4 @@
-"""内置文件工具 diff 功能测试：_build_file_diff / _file_diff 顶级键 / content_hash。
+﻿"""内置文件工具 diff 功能测试：_build_file_diff / _file_diff 顶级键 / content_hash。
 
 覆盖：
 - unified diff 生成正确性（行数统计、文件头格式、CRLF 归一化）
@@ -100,7 +100,7 @@ def test_build_file_diff_unchanged():
 
 def test_write_file_new_file_with_diff(tmp_path):
     target = tmp_path / "w1.txt"
-    result = execute_write_file({"full_file_name": str(target), "content": "abc"})
+    result = execute_write_file({"path": str(target), "content": "abc"})
     assert result["created"] is True
     assert result["_file_diff"]["lines_added"] == 1
     assert result["_file_diff"]["lines_removed"] == 0
@@ -112,7 +112,7 @@ def test_write_file_new_file_with_diff(tmp_path):
 def test_write_file_overwrite_diff(tmp_path):
     target = tmp_path / "w2.txt"
     target.write_text("old line\n", encoding="utf-8")
-    result = execute_write_file({"full_file_name": str(target), "content": "new line\n"})
+    result = execute_write_file({"path": str(target), "content": "new line\n"})
     assert result["created"] is False
     assert result["_file_diff"]["lines_added"] == 1
     assert result["_file_diff"]["lines_removed"] == 1
@@ -123,7 +123,7 @@ def test_write_file_overwrite_diff(tmp_path):
 def test_write_file_append_diff(tmp_path):
     target = tmp_path / "w3.txt"
     target.write_text("first\n", encoding="utf-8")
-    result = execute_write_file({"full_file_name": str(target), "content": "second\n", "append": True})
+    result = execute_write_file({"path": str(target), "content": "second\n", "append": True})
     assert result["action"] == "append"
     assert result["_file_diff"]["lines_added"] == 1
     assert result["_file_diff"]["lines_removed"] == 0
@@ -133,7 +133,7 @@ def test_edit_file_result_contains_diff(tmp_path):
     target = tmp_path / "e1.py"
     target.write_text("value = 1\n", encoding="utf-8")
     result = try_execute_builtin_file_tool("edit_file", {
-        "full_file_name": str(target),
+        "path": str(target),
         "old_string": "value = 1",
         "new_string": "value = 2",
     })
@@ -160,7 +160,7 @@ def test_edit_file_error_no_diff(tmp_path):
     target = tmp_path / "e2.py"
     target.write_text("value = 1\n", encoding="utf-8")
     result = try_execute_builtin_file_tool("edit_file", {
-        "full_file_name": str(target),
+        "path": str(target),
         "old_string": "不存在的原文",
         "new_string": "x",
     })
@@ -200,7 +200,7 @@ def test_edit_file_returns_compact_novel_diff(tmp_path):
     target = tmp_path / "inline.py"
     target.write_text("prefix OLD suffix" + chr(10), encoding="utf-8")
     result = try_execute_builtin_file_tool("edit_file", {
-        "full_file_name": str(target), "old_string": "OLD", "new_string": "NEW",
+        "path": str(target), "old_string": "OLD", "new_string": "NEW",
     })
     summary = result["_model_result"]
     assert summary["success"] is True
@@ -213,5 +213,5 @@ def test_read_file_content_hash(tmp_path):
     target = tmp_path / "r1.txt"
     # write_bytes 避开 Windows 下 text 模式的 \n→\r\n 转换，保证字节级一致
     target.write_bytes(b"hello\n")
-    result = execute_read_file({"full_file_name": str(target)})
+    result = execute_read_file({"path": str(target)})
     assert result["content_hash"] == _content_hash("hello\n")

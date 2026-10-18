@@ -58,6 +58,43 @@ def close_pending_native(task_id, session, reason="任务已停止"):
             native_store.tool_completed(session, reference, call["id"], content, is_error)
 
 
+def reset_unexecuted_native(task_id):
+    """Rewind natively started Responses slots the ledger proves never executed.
+
+    Suspended tasks keep native running slots so a resume can continue them,
+    but the replay re-runs tool_started, which refuses running/unknown slots.
+    The execution ledger is authoritative: a slot without an execution record
+    (or with a completed cache / replayable dispatch) rewinds to planned so
+    the replay re-requests approval and runs once. Slots with an 'executing'
+    record keep their unknown state and the replay still refuses them.
+    Returns the number of rewound slots.
+    """
+    from chat.protocols.responses_store import reset_tool
+    saved = store.task(task_id)
+    if not saved:
+        return 0
+    session = saved["session"]
+    with store.database() as db:
+        snapshots = [(row[0], json.loads(row[1])) for row in db.execute("SELECT agent,data FROM checkpoints WHERE task=?", (task_id,))]
+    rewound = 0
+    for agent, snapshot in snapshots:
+        messages = snapshot.get("messages", [])
+        assistant = snapshot.get("assistant") or (messages[-1] if messages else {})
+        reference = assistant.get("provider_state")
+        if not reference or reference.get("protocol") != "responses":
+            continue
+        for call in assistant.get("tool_calls") or []:
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if not call_id:
+                continue
+            execution = store.execution(task_id, agent, call_id)
+            if execution and execution["state"] == "executing":
+                continue
+            if reset_tool(session, reference, call_id):
+                rewound += 1
+    return rewound
+
+
 def guard_path(path, *, search=False):
     current = CURRENT.get()
     if not current or current.context["mode"] == "full_control":
@@ -113,6 +150,10 @@ class PermissionRuntime:
             self.task = store.adopt(resume_id)
             if not self.task or self.task["session"] != session or self.task["state"] != "running":
                 raise ValueError("恢复任务身份无效")
+            # Rewind natively started slots the ledger proves never executed;
+            # otherwise the replay trips the unknown-execution guard and the
+            # resumed Responses task fails permanently (suspend/resume deadlock).
+            reset_unexecuted_native(resume_id)
         else:
             self.task = store.create_task(session, {"request": request, "mode": store.policy(session)["mode"], "root": str(Path.cwd().resolve())})
         self.context = {"session": session, "root": self.task["data"]["root"], "mode": self.task["data"]["mode"]}

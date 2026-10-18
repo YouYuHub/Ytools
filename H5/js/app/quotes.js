@@ -1,7 +1,7 @@
 /**
  * 选中文本引用到提问（docs/quote_selection.md）
  * - 选区检测：聊天正文中「用户提问正文」或「助手回答正文」内的同一条消息选择
- * - 浮钮「引用到提问」：选区末端附近出现，点击把文本快照加入当前会话草稿
+ * - 选区浮层：引用到提问（快照入草稿）或复制选中文字
  * - 草稿引用入口：输入框上方显示数量按钮，悬停/聚焦展开原文与来源，可跳转/移除
  * - 气泡引用卡片：用户消息气泡内展示（历史回放与实时发送共用）
  *
@@ -17,40 +17,58 @@
   // 引用入口（输入框上方）：index.html 中位于附件区之前
   const composerQuotes = App.$("#composerQuotes");
 
-  // ---------- 浮钮 ----------
-  let floatBtn = null;
+  // ---------- 选区操作浮层 ----------
+  let floatToolbar = null;
   let floatVisible = false;
   let pendingCapture = null; // mousedown 时保留的选区快照（浏览器点击后可能清选区）
   let selectionRefreshFrame = 0;
 
-  function ensureFloatBtn() {
-    if (floatBtn) return floatBtn;
-    floatBtn = el("button", "quote-float-btn");
-    floatBtn.type = "button";
-    floatBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 7h4v4a4 4 0 0 1-4 4H6"/><path d="M15 7h4v4a4 4 0 0 1-4 4h-1"/></svg><span>引用到提问</span>';
+  function ensureFloatToolbar() {
+    if (floatToolbar) return floatToolbar;
+    floatToolbar = el("div", "quote-float-toolbar hidden");
+    floatToolbar.setAttribute("role", "toolbar");
+    floatToolbar.setAttribute("aria-label", "选中文本操作");
+    const quoteBtn = el("button", "quote-float-action quote-float-quote");
+    quoteBtn.type = "button";
+    quoteBtn.title = "把选中文字引用到提问";
+    quoteBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a8 8 0 0 1-8 8 8.1 8.1 0 0 1-3.8-.9L3 20l1.5-5.2a8 8 0 1 1 15.5-3.3Z"/><path d="M8 10h8M8 13.5h5"/></svg><span>引用到提问</span>';
+    const copyBtn = el("button", "quote-float-action quote-float-copy");
+    copyBtn.type = "button";
+    copyBtn.title = "复制选中文字";
+    copyBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span>复制</span>';
+    floatToolbar.appendChild(quoteBtn);
+    floatToolbar.appendChild(el("span", "quote-float-divider"));
+    floatToolbar.appendChild(copyBtn);
     // mousedown 阶段读取并缓存选区：默认行为会先清掉浏览器选区，
     // 在 click 里再读 selection 会拿到空文本
-    floatBtn.addEventListener("mousedown", function (e) {
+    floatToolbar.addEventListener("mousedown", function (e) {
       e.preventDefault();
       e.stopPropagation();
       captureSelection();
     });
-    floatBtn.addEventListener("click", function (e) {
+    quoteBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
       applyCapture();
     });
-    document.body.appendChild(floatBtn);
-    return floatBtn;
+    copyBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      copyCapture();
+    });
+    document.body.appendChild(floatToolbar);
+    return floatToolbar;
   }
 
-  function showFloatBtn(rect) {
-    const btn = ensureFloatBtn();
-    btn.classList.remove("hidden");
+  function showFloatToolbar(snapshot) {
+    const toolbar = ensureFloatToolbar();
+    pendingCapture = snapshot;
+    toolbar.classList.remove("hidden");
     floatVisible = true;
     // 先显示再测量宽度，保证钳制计算准确
-    const width = btn.offsetWidth || 132;
-    const height = btn.offsetHeight || 34;
+    const width = toolbar.offsetWidth || 220;
+    const height = toolbar.offsetHeight || 38;
+    const rect = snapshot.rect;
     let left = rect.left + rect.width / 2;
     let top = rect.top - 8;
     if (top - height < 4) {
@@ -61,15 +79,15 @@
     const minTop = Math.min(height + 4, Math.max(4, window.innerHeight - 4));
     const maxTop = Math.max(minTop, window.innerHeight - 4);
     top = Math.max(minTop, Math.min(top, maxTop));
-    btn.style.left = left + "px";
-    btn.style.top = top + "px";
+    toolbar.style.left = left + "px";
+    toolbar.style.top = top + "px";
   }
 
-  function hideFloatBtn() {
+  function hideFloatToolbar() {
     if (!floatVisible) return;
     floatVisible = false;
     pendingCapture = null;
-    if (floatBtn) floatBtn.classList.add("hidden");
+    if (floatToolbar) floatToolbar.classList.add("hidden");
   }
 
   /**
@@ -109,7 +127,8 @@
   function readSelection() {
     const selection = window.getSelection && window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount < 1) return null;
-    const text = QuoteUtils.normalizeQuoteText(selection.toString());
+    const rawText = selection.toString();
+    const text = QuoteUtils.normalizeQuoteText(rawText);
     if (!text) return null;
     const range = selection.getRangeAt(0);
     const start = quotableTarget(range.startContainer);
@@ -127,6 +146,7 @@
     if (eventIndex != null) source.event_index = eventIndex;
     return {
       text: text,
+      rawText: rawText,
       source: source,
       rect: rect,
     };
@@ -135,7 +155,7 @@
   function captureSelection() {
     const snapshot = readSelection();
     if (!snapshot) {
-      hideFloatBtn();
+      hideFloatToolbar();
       return;
     }
     pendingCapture = snapshot;
@@ -143,7 +163,7 @@
 
   function applyCapture() {
     const snapshot = pendingCapture || readSelection();
-    hideFloatBtn();
+    hideFloatToolbar();
     if (!snapshot) return;
     const added = App.addDraftQuote({ text: snapshot.text, source: snapshot.source });
     if (added) {
@@ -154,15 +174,43 @@
     }
   }
 
+  async function copyCapture() {
+    const snapshot = pendingCapture || readSelection();
+    hideFloatToolbar();
+    if (!snapshot) return;
+    const text = snapshot.rawText || snapshot.text;
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      // 非安全上下文或剪贴板权限不可用时沿用浏览器复制命令。
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.left = "-9999px";
+      document.body.appendChild(helper);
+      helper.select();
+      let copied = false;
+      try { copied = document.execCommand("copy"); } catch (_) { /* 统一在下面提示失败 */ }
+      helper.remove();
+      if (!copied) {
+        toast("复制失败（浏览器未授权剪贴板）");
+        return;
+      }
+    }
+    toast("已复制选中文字");
+  }
+
   /** 选区变化入口：mouseup / keyup（键盘扩选）后统一检查。 */
   function handleSelectionChange() {
     // 浮钮自身的交互（mousedown/click）已单独处理，避免被这里隐藏
     const snapshot = readSelection();
     if (!snapshot) {
-      hideFloatBtn();
+      hideFloatToolbar();
       return;
     }
-    showFloatBtn(snapshot.rect);
+    showFloatToolbar(snapshot);
   }
 
   // 滚动时选区本身可能仍存在；按新的视口坐标重定位浮钮。
@@ -176,7 +224,7 @@
   }
 
   document.addEventListener("mouseup", function (e) {
-    if (floatBtn && (e.target === floatBtn || floatBtn.contains(e.target))) return;
+    if (floatToolbar && floatToolbar.contains(e.target)) return;
     // 延迟到浏览器完成选区更新后判定
     window.setTimeout(handleSelectionChange, 0);
   });
@@ -188,11 +236,11 @@
     window.setTimeout(handleSelectionChange, 0);
   });
   document.addEventListener("mousedown", function (e) {
-    if (floatBtn && (e.target === floatBtn || floatBtn.contains(e.target))) return;
-    hideFloatBtn();
+    if (floatToolbar && floatToolbar.contains(e.target)) return;
+    hideFloatToolbar();
   });
   document.addEventListener("keydown", function (e) {
-    if (e.key === "Escape") hideFloatBtn();
+    if (e.key === "Escape") hideFloatToolbar();
   });
   chatScroll.addEventListener("scroll", scheduleSelectionRefresh, { passive: true });
   // 兼容页面滚动和聊天区内嵌滚动容器滚动；上面的 RAF 会合并重复事件。
@@ -409,5 +457,5 @@
     const snapshot = readSelection();
     return snapshot ? { text: snapshot.text, source: snapshot.source } : null;
   };
-  App.hideQuoteFloat = hideFloatBtn;
+  App.hideQuoteFloat = hideFloatToolbar;
 })(window.App);

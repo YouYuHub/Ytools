@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 import time
@@ -47,15 +47,15 @@ def test_global_and_independent_session_policy_persist():
     ("run_command", {"action": "poll", "job_id": "j"}, "__builtin__", False),
     ("poll_command", {"job_id": "j"}, "__builtin__", False),
     ("stop_command", {"job_id": "j"}, "__builtin__", False),
-    ("read_file", {"full_file_name": "a.txt"}, "__builtin__", False),
-    ("read_file", {"full_file_name": "../outside.txt"}, "__builtin__", True),
+    ("read_file", {"path": "a.txt"}, "__builtin__", False),
+    ("read_file", {"path": "../outside.txt"}, "__builtin__", True),
     ("search_files", {"dir_path": "../"}, "__builtin__", True),
     ("read_media", {"references": ["https://example.com/a.png"]}, "__builtin__", True),
     ("read_media", {"references": ["media://upload.png"]}, "__builtin__", False),
     ("todo_write", {}, "__builtin__", False),
     ("ask_user", {}, "__builtin__", False),
     ("sub_agent", {"task": "work"}, "__builtin__", False),
-    ("read_file", {"full_file_name": "a.txt"}, "mcp-server", True),
+    ("read_file", {"path": "a.txt"}, "mcp-server", True),
 ])
 def test_permission_matrix(tmp_path, tool, args, server, required):
     assert plan_tool(tool, args, context(tmp_path), server=server)["needs_approval"] is required
@@ -70,7 +70,7 @@ def test_prefix_and_link_escape(tmp_path):
         (root / "link").symlink_to(other, target_is_directory=True)
     except OSError:
         pytest.skip("Windows symlink privilege unavailable")
-    assert plan_tool("write_file", {"full_file_name": "link/new.txt"}, context(root))["needs_approval"]
+    assert plan_tool("write_file", {"path": "link/new.txt"}, context(root))["needs_approval"]
 
 
 def test_approve_once_and_cache_result(tmp_path):

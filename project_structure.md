@@ -73,6 +73,7 @@ agent_tool_sse/
 │   ├── file_history_router.py   # 文件版本链与差异块操作接口（/file_diff/*）
 │   ├── export_router.py         # md 表格导出 xlsx 下载（前端「更多→下载 Excel」入口）
 │   ├── user_profile_router.py   # 访客用户显示名 GET/POST /user/profile（全局唯一，存项目 .env USER_NAME；账号/数据库体系落地前的过渡实现）
+│   ├── speech_config_router.py  # GET/POST /chat_config/speech_input；语音默认语种保存到 .env，旧浏览器偏好有条件迁移
 │
 ├── prompt/                      # Skills 提示词库模块
 │   ├── prompt_manager.py        # md_files 目录初始化（空目录播种示例）、文件名规整与增删改查
@@ -347,7 +348,7 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 ### 9. H5 前端（`H5/`）
 - 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口
 - 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染；文档上传类型放宽——`core.js` 的 `DOC_EXTENSIONS` 包含后端 `TEXT_FILE_EXTENSIONS`，另加 PDF、DOC/DOCX、XLS/XLSX 五种由专用解析器处理的扩展名，未知扩展名交后端二进制嗅探），命中当前模型 `supportDocTypes` 的文档仅在 `read_document` 调用后按需原生发送一次（vision 与文档能力分别判断）
-- **语音输入**：Web Speech API（Chrome/Edge）——点麦克风连续听写，识别文本以录音时光标为插入点实时写入输入框（确认结果累积、中间结果实时预览），长静默自动重启会话，再点停止；发送/切会话自动收尾，剪贴板无关、仅依赖浏览器在线语音服务
+- **语音输入**：Web Speech API（Chrome/Edge）——点麦克风听写；「聊天设置 → 常规 → 语音输入」手动选择 20 个语言/地区选项，自动保存项目 `.env` 的 `SPEECH_INPUT_LANGUAGE`，浏览器仅缓存；刷新/打开设置同步全局默认，识别器使用对应语言标签；按语种处理空格。键盘编辑复用当前实例，输入法组合期间缓存结果、提交后写入新增语音；发送/切会话隔离迟到事件；自然结束、静默和错误均不自动重启，避免重复申请权限。详见 `docs/speech_input.md`
 - **会话标题跑马灯**：溢出标题 hover 250ms 后向左滚动（约 80px/s）至末尾文本对齐右缘，滚动期间移除右缘渐隐遮罩，移出即复位
 - **富媒体渲染**：模型输出的 ```svg（双视图：代码/图片 + 复制代码/复制图片）、```mermaid（懒加载 Mermaid.js 异步渲染，代码/图片双视图）、```canvas（**运行确认 + iframe 沙箱**：sandbox="allow-scripts" 隔离执行，postMessage 握手下发源码；沙箱包装 rAF/定时器统计待执行回调数——一次性绘制回传 canvas-done 快照，动画/游戏脚本进入"独活"模式保持运行态可交互（点击/键盘直接玩），console 逐行实时回传，截图随时索要当前帧，脚本自然收尾自动补发最终快照；⛶ 全屏作用于整个控件块，画布 object-fit:contain 等比缩放，全屏内按钮可用；```svg|mermaid|canvas 栅栏与媒体伪标签均独占一行不参与两列并排
 - 公式：KaTeX 0.18.7 本地 vendor（$…$、$$…$$、\(…\)、\[…\] 四种定界符；代码栅栏先遮蔽防误提取；价格文本防误判；无 katex 环境降级原文）

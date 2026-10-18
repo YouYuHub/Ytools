@@ -1,4 +1,4 @@
-"""Persistent permission storage relocates without losing approvals or WAL data."""
+﻿"""Persistent permission storage relocates without losing approvals or WAL data."""
 import multiprocessing
 import sqlite3
 from pathlib import Path
@@ -124,7 +124,7 @@ def test_state_and_backup_paths_are_protected_inside_workspace(tmp_path, monkeyp
     for relative in [store.DATABASE_NAME, "backups/permission_runtime.legacy.sqlite3"]:
         path = store.ROOT / relative
         assert permission_policy.protected(path)
-        plan = permission_policy.plan_tool("read_file", {"full_file_name": str(path)}, {"root": str(tmp_path), "mode": "ask", "session": "one"})
+        plan = permission_policy.plan_tool("read_file", {"path": str(path)}, {"root": str(tmp_path), "mode": "ask", "session": "one"})
         assert plan["needs_approval"] and plan["reason"] == "protected_control_resource"
 
 

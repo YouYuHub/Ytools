@@ -121,3 +121,36 @@ test('切换会话后旧配置响应不会覆盖当前会话；未保存配置�
   assert.notEqual(nodes.get('#permissionGlobal').value, 'full_control');
   await assert.rejects(App.permissions.saveSettings(), /尚未加载/);
 });
+
+test('后端上报已失效状态后卡片消失，重放的请求事件不能复活按钮', async () => {
+  const item = a();
+  const { App } = setup({ pendingApprovals: async () => ({ approvals: [], states: [{ ...item, state: 'invalidated', task_state: 'suspended' }] }) });
+  const inside = ui();
+  App.permissions.bindTool(inside, { sessionId: 's', agentId: 'child', toolCallId: 'call' });
+  App.permissions.receive({ phase: 'requested', approval: item });
+  assert.equal(inside.approvalHost.hidden, false);
+  await App.permissions.syncPending('s');
+  assert.equal(inside.approvalHost.hidden, true);
+  App.permissions.receive({ phase: 'requested', approval: item });
+  assert.equal(inside.approvalHost.hidden, true);
+});
+
+test('刷新后后端不再上报的卡片被退役，重放不能复活', async () => {
+  const { App } = setup();
+  const inside = ui();
+  App.permissions.bindTool(inside, { sessionId: 's', agentId: 'child', toolCallId: 'call' });
+  App.permissions.receive({ phase: 'requested', approval: a() });
+  assert.equal(inside.approvalHost.hidden, false);
+  await App.permissions.syncPending('s');
+  assert.equal(inside.approvalHost.hidden, true);
+  App.permissions.receive({ phase: 'requested', approval: a() });
+  assert.equal(inside.approvalHost.hidden, true);
+});
+
+test('控制器对未知审批直接本地拒绝，不发送决定请求', async () => {
+  let posted = 0;
+  const api = { pendingApprovals: async () => ({ approvals: [] }), decideApproval: async () => { posted++; return {}; } };
+  const controller = ToolApprovalState.create(api, () => {});
+  await assert.rejects(controller.decide('ghost', 'approve'), /审批已失效/);
+  assert.equal(posted, 0);
+});

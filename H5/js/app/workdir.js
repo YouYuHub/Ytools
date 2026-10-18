@@ -1,5 +1,5 @@
 /**
- * 工作路径（状态栏右侧）：双击编辑，hover 悬浮完整路径
+ * 工作路径（状态栏右侧）：桌面双击内联编辑，手机单击弹窗编辑
  * - 新对话编辑全局默认目录；已有会话编辑会话独立目录（清空恢复跟随默认）
  * 依赖：app/core.js、API
  */
@@ -10,9 +10,13 @@
     hideToolTip
   } = App;
 
-  // ---------- 工作路径（composer 底部右侧，双击修改；会话级配置） ----------
+  // ---------- 工作路径（composer 底部右侧；会话级配置） ----------
   let workDirEditBusy = false;
   let workDirEditing = false;
+
+  function useMobileWorkDirEditor() {
+    return window.matchMedia("(max-width: 600px)").matches;
+  }
 
   function renderWorkDir(path, overridden) {
     state.workDir = path || "";
@@ -25,6 +29,8 @@
         ? state.workDir
         : "默认 · " + state.workDir;
     }
+    contextTokenWorkdir.setAttribute("aria-label",
+      "工作路径：" + (state.workDir || "未设置") + "；激活以编辑");
   }
 
   function loadWorkDir() {
@@ -49,6 +55,7 @@
     // 新对话（尚未产生 sessionId）：编辑的是全局默认目录（新会话初始目录）；
     // 已有会话：编辑的是本会话的独立目录（清空恢复跟随默认）
     const editingGlobalDefault = !state.sessionId;
+    const mobile = useMobileWorkDirEditor();
     const editor = document.createElement("input");
     editor.className = "context-token-workdir-editor";
     editor.type = "text";
@@ -61,13 +68,56 @@
         : "输入目录路径；清空恢复跟随默认"
     );
     hideToolTip();
-    contextTokenWorkdir.textContent = "";
-    contextTokenWorkdir.appendChild(editor);
+    let backdrop = null;
+    let saveButton = null;
+    if (mobile) {
+      backdrop = document.createElement("div");
+      backdrop.className = "workdir-edit-backdrop";
+      const dialog = document.createElement("div");
+      dialog.className = "workdir-edit-dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      const heading = document.createElement("strong");
+      heading.className = "workdir-edit-title";
+      heading.textContent = editingGlobalDefault ? "修改默认工作路径" : "修改本会话工作路径";
+      dialog.setAttribute("aria-label", heading.textContent);
+      const hint = document.createElement("p");
+      hint.className = "workdir-edit-hint";
+      hint.textContent = editingGlobalDefault
+        ? "新会话会使用此目录。"
+        : "留空并保存可恢复跟随默认目录。";
+      const actions = document.createElement("div");
+      actions.className = "workdir-edit-actions";
+      const cancelButton = document.createElement("button");
+      cancelButton.type = "button";
+      cancelButton.textContent = "取消";
+      saveButton = document.createElement("button");
+      saveButton.type = "button";
+      saveButton.className = "primary";
+      saveButton.textContent = "保存";
+      actions.append(cancelButton, saveButton);
+      dialog.append(heading, hint, editor, actions);
+      backdrop.appendChild(dialog);
+      document.body.appendChild(backdrop);
+      cancelButton.addEventListener("click", function () { finish(false); });
+      saveButton.addEventListener("click", function () { finish(true); });
+      backdrop.addEventListener("click", function (event) {
+        if (event.target === backdrop) finish(false);
+      });
+    } else {
+      contextTokenWorkdir.textContent = "";
+      contextTokenWorkdir.appendChild(editor);
+    }
     workDirEditing = true;
     editor.focus();
     editor.select();
 
     let finished = false;
+    function closeMobileEditor() {
+      if (!backdrop) return;
+      backdrop.remove();
+      contextTokenWorkdir.focus();
+    }
     async function finish(save) {
       if (finished) return;
       finished = true;
@@ -76,10 +126,12 @@
       // 未保存、或未覆盖时清空输入：视为取消，恢复原显示
       if (!save || (!next && !overridden) || (next && next === current)) {
         renderWorkDir(current, overridden);
+        closeMobileEditor();
         return;
       }
       workDirEditBusy = true;
       editor.disabled = true;
+      if (saveButton) saveButton.disabled = true;
       try {
         if (editingGlobalDefault) {
           // 新对话：写全局默认 DEFAULT_CHAT_WORK_DIR，不在此时创建会话
@@ -110,6 +162,7 @@
         toast("修改会话工作路径失败：" + err.message);
       } finally {
         workDirEditBusy = false;
+        closeMobileEditor();
       }
     }
 
@@ -123,10 +176,19 @@
         finish(false);
       }
     });
-    editor.addEventListener("blur", function () { finish(true); });
+    if (!mobile) editor.addEventListener("blur", function () { finish(true); });
   }
 
   contextTokenWorkdir.addEventListener("dblclick", startWorkDirEdit);
+  contextTokenWorkdir.addEventListener("click", function () {
+    if (useMobileWorkDirEditor()) startWorkDirEdit();
+  });
+  contextTokenWorkdir.addEventListener("keydown", function (event) {
+    if (event.target !== contextTokenWorkdir) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    startWorkDirEdit();
+  });
 
   // hover 显示完整路径：显示在常态行上方（不遮挡），窄窗口右对齐不出界；
   // tooltip 本身也支持双击进入编辑（双保险）
@@ -144,7 +206,7 @@
   }
 
   contextTokenWorkdir.addEventListener("mouseenter", function () {
-    if (workDirEditing || !state.workDir) return;
+    if (useMobileWorkDirEditor() || workDirEditing || !state.workDir) return;
     toolTip.innerHTML = "";
     const tipBody = document.createElement("div");
     const pathLine = document.createElement("div");
@@ -175,4 +237,5 @@
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.loadWorkDir = loadWorkDir;
+  App.startWorkDirEdit = startWorkDirEdit;
 })(window.App);

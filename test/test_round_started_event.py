@@ -8,9 +8,10 @@
 import asyncio
 import json
 import sys
+from pathlib import Path
 import uuid
 
-sys.path.insert(0, r"C:\Users\Administrator\Desktop\python学习录\main_study\large_model\agent_tool_sse")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import factory.chat_factory as cf
 from config import ChatLLMRequest
@@ -124,6 +125,7 @@ async def main():
     assert any("[DONE]" in c for c in full3), "编辑重发应正常结束"
     frames3 = parse_frames(full3)
     assert collect_round_started(frames3) == [], "target_round 路径不应推 round_started"
+    assert cf._get_session_stream(sid).live_round_no == 1, "编辑重发附接标记应携带目标轮次"
     assert any('"target_round"' in c for c in full3), "应推送 target_round 帧"
     assert collect_round_model(frames3) == [expected_model], \
         f"编辑重发路径同样应推送 round_model（实际 {collect_round_model(frames3)}）"
@@ -141,6 +143,7 @@ async def main():
     assert any("[DONE]" in c for c in full4), "回答插入应正常结束"
     frames4 = parse_frames(full4)
     assert collect_round_started(frames4) == [], "insert_round 路径不应推 round_started"
+    assert cf._get_session_stream(sid).live_round_no == 2, "插入回答附接标记应携带插入后的轮次"
     assert collect_round_model(frames4) == [expected_model], \
         f"回答插入路径同样应推送 round_model（实际 {collect_round_model(frames4)}）"
     await asyncio.sleep(0.1)

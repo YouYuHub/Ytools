@@ -1,24 +1,25 @@
-# 运行时数据与本地环境（不进仓库）
-.vs/
-__pycache__/
-.pytest_cache/
-node_modules/
-*.log
-
-# 临时调试文件
-tmp_*.py
-_tmp_*.txt
-_sec*.txt
-pytest_out.log
-setting/models.json
-setting/key-*.txt
-history_files/
-
-# Local secrets and transient files
 .env
 .env.*
 !.env.example
 .venv/
 venv/
-log/
+.vs/
+.playwright-mcp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+node_modules/
+*.log
+history_files/
 tmp/
+log/
+logs/
+setting/models.json
+setting/key-*.txt
+agents_message_board.txt
+prompt/md_files/git推送Ytools项目说明.md
+test/123.py
+tmp_*.py
+_tmp_*.txt
+_sec*.txt

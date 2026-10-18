@@ -153,29 +153,59 @@
   // 1) 流式铺满：去掉根节点固定 width/height（缺 viewBox 时由其转出），
   //    否则 CSS height:auto 会取属性内在高度导致视口压扁、内容居中留白；
   // 2) 触顶收字框：按 viewBox 比例注入 aspect-ratio 自适应样式（见 applyAdaptiveStyle）；
-  // 3) 渲染净化：移除 <script>、on* 事件属性与 javascript: 链接——
-  //    innerHTML 插入的 SVG <script> 会执行，这里是渲染前唯一防线；
+  // 3) 渲染净化：用 DOMPurify 的 SVG 白名单解析，而不是正则删除危险片段。
+  //    净化器未加载时关闭图片预览；源码仍可在代码视图查看/复制。
   //    代码视图/复制始终保留完整原文（净化只作用于图片视图）。
   function makeDisplaySvg(rawSvg) {
-    let svg = String(rawSvg);
-    svg = svg.replace(/<script\b[\s\S]*?<\/script\s*>/gi, "")
-      .replace(/<script\b[^>]*\/\s*>/gi, "");
+    if (!global.DOMPurify || typeof global.DOMPurify.sanitize !== "function") {
+      return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+    }
+    const source = String(rawSvg);
+    // SMIL 的部分动画元素、CSS 样式及 <use>/<mpath> 的本地引用会被内联
+    // SVG 白名单移除。将这类 SVG 放进浏览器的 image 文档环境：动画和样式
+    // 可以运行，而脚本、事件处理器及外部资源不会获得页面执行权限。
+    // 不能把动画标签直接加入 DOMPurify 的内联白名单（SMIL 可改写 href）。
+    if (/<(?:animate[\w:-]*|set|discard|style|use|mpath)\b|\bstyle\s*=/i.test(source)) {
+      const openMatch = source.match(/^\s*<svg\b[^>]*>/i);
+      if (!openMatch) return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+      let imageSvg = source;
+      if (!/\bxmlns\s*=/.test(openMatch[0])) {
+        imageSvg = imageSvg.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+      }
+      if (/\bxlink:/.test(source) && !/\bxmlns:xlink\s*=/.test(openMatch[0])) {
+        imageSvg = imageSvg.replace(/<svg\b/i, '<svg xmlns:xlink="http://www.w3.org/1999/xlink"');
+      }
+      const ar = viewBoxAspectRatio(openMatch[0]);
+      const sizeStyle = ar
+        ? "aspect-ratio:" + ar + ";width:calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1));height:auto"
+        : "width:calc(100% * var(--md-zoom, 1));height:auto";
+      try {
+        const src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(imageSvg);
+        return '<img class="md-animated-svg" alt="SVG 图片" src="' + escapeHtml(src) + '" style="' + sizeStyle + '">';
+      } catch (_) {
+        return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+      }
+    }
+    let svg = global.DOMPurify.sanitize(source, {
+      USE_PROFILES: { svg: true, svgFilters: true },
+      FORBID_TAGS: ["foreignObject", "script", "style"],
+      FORBID_ATTR: ["style", "href", "xlink:href"],
+    });
     const openMatch = svg.match(/<svg\b[^>]*>/i);
-    if (openMatch) {
+    if (openMatch && /^\s*<svg\b/i.test(svg)) {
       let open = openMatch[0];
       const w = /\bwidth\s*=\s*["']([\d.]+)/i.exec(open);
       const h = /\bheight\s*=\s*["']([\d.]+)/i.exec(open);
       if (!/\bviewBox\s*=/i.test(open) && w && h) {
-        open = open.replace(/<svg/i, '<svg viewBox="' + w[1] + " " + h[1] + '"');
+        open = open.replace(/<svg/i, '<svg viewBox="0 0 ' + w[1] + " " + h[1] + '"');
       }
       const ar = viewBoxAspectRatio(open);
       if (ar) open = applyAdaptiveStyle(open, ar);
       open = open.replace(/\s(width|height)\s*=\s*["'][^"']*["']/gi, "");
       svg = svg.replace(openMatch[0], open);
+      return svg;
     }
-    svg = svg.replace(/\son[a-z]+\s*=\s*["'][^"']*["']/gi, "");
-    svg = svg.replace(/((?:xlink:)?href)\s*=\s*["']\s*javascript:[^"']*["']/gi, '$1="#"');
-    return svg;
+    return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
   }
 
   // 缩放按钮组（三控件 svg/mermaid/canvas 共用）：[−] [百分比] [＋]。

@@ -130,6 +130,10 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/chat_history/sessions");
   }
 
+  function listSessionSummaries(sessionId) {
+    return request("/chat_history/summaries" + (sessionId == null ? "" : "?session_id=" + encodeURIComponent(sessionId)));
+  }
+
   function streamStatus(sessionId) {
     return request("/chat_stream/status?session_id=" + encodeURIComponent(sessionId));
   }
@@ -913,6 +917,18 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
+  function getSpeechInputConfig(options) {
+    return request("/chat_config/speech_input", options);
+  }
+
+  function updateSpeechInputConfig(language, onlyIfUnset, options) {
+    return request("/chat_config/speech_input", Object.assign({}, options, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language: language, only_if_unset: Boolean(onlyIfUnset) }),
+    }));
+  }
+
   // ---------- V2 文件历史版本链（docs/file_diff.md §9） ----------
   function listFileChanges(sessionId) {
     return request("/file_diff/list?session_id=" + encodeURIComponent(sessionId || "default"));
@@ -1054,6 +1070,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     },
     BASE,
     listSessions,
+    listSessionSummaries,
     streamStatus,
     getSessionMeta,
     generateSessionTitle,
@@ -1124,6 +1141,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     deletePrompt,
     getUserProfile,
     updateUserProfile,
+    getSpeechInputConfig,
+    updateSpeechInputConfig,
     listFileChanges,
     fileVersions,
     fileContent,

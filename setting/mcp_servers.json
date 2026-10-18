@@ -13,6 +13,21 @@
         "mcp_server/sys_tools_server.py"
       ],
       "version": "1.0.0"
+    },
+    "Browser": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "browser/node_modules/@playwright/mcp/cli.js",
+        "--headless",
+        "--isolated",
+        "--no-webmcp"
+      ],
+      "env": {
+        "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts"
+      },
+      "persistent": true,
+      "version": "0.0.83"
     }
   },
   "inputs": {
@@ -32,6 +47,16 @@
     "SysServer": [
       "fetch_url",
       "web_search"
+    ],
+    "Browser": [
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_click",
+      "browser_type",
+      "browser_take_screenshot",
+      "browser_console_messages",
+      "browser_network_requests",
+      "browser_tabs"
     ]
   }
 }

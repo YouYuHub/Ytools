@@ -17,6 +17,7 @@
   const dragBar = $("#skillsDragBar");
   const backdrop = $("#skillsBackdrop");
   const closeBtn = $("#skillsClose");
+  const backBtn = $("#skillsBack");
   const dirtyFlag = $("#skillsDirtyFlag");
   const listEl = $("#skillsList");
   const newBtn = $("#skillsNewBtn");
@@ -105,7 +106,7 @@
       metaRow.appendChild(dot);
       li.appendChild(nameRow);
       li.appendChild(metaRow);
-      li.addEventListener("click", function () { selectFile(item.name); });
+      li.addEventListener("click", function () { selectFile(item.name, true); });
       listEl.appendChild(li);
     });
   }
@@ -161,7 +162,7 @@
     }
   }
 
-  async function selectFile(name) {
+  async function selectFile(name, showMobileDetail) {
     resetDeleteArm(); // 切换文件必须撤掉上一个文件的删除确认态（防误删新选中文件）
     resetRenameEdit();
     stashDraft(); // 保存当前文件的未保存修改（无修改时是 no-op）
@@ -180,6 +181,7 @@
       renderList();
       updateToolbar();
       setViewMode("preview");
+      if (showMobileDetail && isMobile()) dialog.classList.add("mobile-detail");
     } catch (err) {
       toast("读取提示词失败：" + err.message);
     }
@@ -504,7 +506,7 @@
       newNameInput.value = "";
       toast("已创建 " + data.name);
       await refreshList(true);
-      await selectFile(data.name);
+      await selectFile(data.name, true);
       setViewMode("edit");
       editor.focus();
     } catch (err) {
@@ -575,6 +577,8 @@
     opened = true;
     modal.classList.remove("hidden");
     modal.setAttribute("aria-hidden", "false");
+    dialog.classList.remove("mobile-detail");
+    if (isMobile() && dragPos) resetDragPos();
     // 记忆的拖拽位置仍完整可见时恢复，否则回到居中
     if (dragPos && !isMobile()) {
       const maxLeft = window.innerWidth - dialog.offsetWidth - 8;
@@ -608,6 +612,7 @@
     openSkills();
   });
   closeBtn.addEventListener("click", closeSkills);
+  backBtn.addEventListener("click", function () { dialog.classList.remove("mobile-detail"); });
   backdrop.addEventListener("click", closeSkills);
   dragBar.addEventListener("pointerdown", initDrag);
 
@@ -671,7 +676,7 @@
       const data = await API.createPrompt(stem, content);
       toast("已上传 " + data.name);
       await refreshList(true);
-      await selectFile(data.name);
+      await selectFile(data.name, true);
       setViewMode("preview"); // 上传后马上预览
     } catch (err) {
       toast("上传失败：" + err.message);

@@ -7,7 +7,8 @@
 (function (App) {
   "use strict";
   const {
-    state, tokenTotal, contextTokenStatus, contextTokenSummary,
+    state, tokenTotal, sessionMenuUsage, sessionMenuUsageValues,
+    contextTokenStatus, contextTokenSummary,
     contextTokenModel
   } = App;
 
@@ -93,11 +94,16 @@
   function setSessionUsage(usage) {
     state.sessionUsage = FormatUtils.normalizeUsage(usage);
     state.sessionTotalTokens = state.sessionUsage.total_tokens;
-    tokenTotal.innerHTML =
+    const usageText =
       "<span>" + FormatUtils.fmtNum(state.sessionUsage.total_tokens) + " tokens</span>" +
       "<span>输入 " + FormatUtils.fmtNum(state.sessionUsage.prompt_tokens) +
       " · 输出 " + FormatUtils.fmtNum(state.sessionUsage.completion_tokens) + "</span>";
+    tokenTotal.innerHTML = usageText;
     tokenTotal.classList.toggle("hidden", !state.sessionUsage.total_tokens);
+    if (sessionMenuUsage && sessionMenuUsageValues) {
+      sessionMenuUsageValues.innerHTML = usageText;
+      sessionMenuUsage.classList.toggle("hidden", !state.sessionUsage.total_tokens);
+    }
   }
 
   function setSessionTotalTokens(n) {

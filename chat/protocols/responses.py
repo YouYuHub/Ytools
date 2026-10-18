@@ -102,8 +102,21 @@ def normalize_response(response, *, require_stored=True):
             reasoning.extend(part.get("text") or "" for part in item.get("summary") or [] if part.get("type") == "summary_text")
         elif kind == "function_call":
             call_id, name, args = item.get("call_id"), item.get("name"), item.get("arguments")
-            if not call_id or call_id in call_ids or not name or item.get("status") not in {None, "completed"}:
-                raise ResponsesProtocolError("Responses 工具调用 ID/名称/完成状态无效")
+            # A malformed tool item in an otherwise completed response is an upstream
+            # data failure, not a local protocol violation: report precisely which
+            # check failed and attach the raw response so the retry layer persists
+            # it for forensics instead of failing the turn without evidence.
+            label = "第 %d 个 function_call（call_id=%s，name=%s）" % (
+                len(calls) + 1, call_id or "<缺失>", name or "<缺失>")
+            if not call_id:
+                raise ResponsesUpstreamError("Responses 工具调用缺少 call_id：" + label, response)
+            if call_id in call_ids:
+                raise ResponsesUpstreamError("Responses 工具调用 call_id 重复：" + label, response)
+            if not name:
+                raise ResponsesUpstreamError("Responses 工具调用缺少名称：" + label, response)
+            if item.get("status") not in {None, "completed"}:
+                raise ResponsesUpstreamError(
+                    "Responses 工具调用完成状态无效：%s，status=%r" % (label, item.get("status")), response)
             try:
                 parsed = json.loads(args)
             except (ValueError, TypeError) as exc:

@@ -246,6 +246,116 @@
     display: block;
   }
 
+  // read_media 图片条：可展开的缩略图网格（“已查看 N 张图像”）。
+  // 默认折叠（展开时才设置媒体 src，避免预加载外部资源）。
+  .read-media-strip {
+    margin-top: 8px;
+  }
+
+  .read-media-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 10px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    text-align: left;
+
+    &:hover {
+      background: var(--bg-hover);
+    }
+  }
+
+  .read-media-chevron {
+    margin-left: auto;
+    color: var(--text-tertiary);
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .read-media-strip.open .read-media-chevron {
+    transform: rotate(180deg);
+  }
+
+  .read-media-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+
+    &[hidden] {
+      display: none;
+    }
+  }
+
+  .read-media-tile {
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-code);
+    overflow: hidden;
+    min-width: 0;
+
+    &.is-clickable {
+      cursor: zoom-in;
+    }
+
+    &.is-skipped,
+    &.is-missing {
+      border-style: dashed;
+    }
+  }
+
+  .read-media-thumb {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    background: var(--bg-elevated);
+  }
+
+  .read-media-name {
+    padding: 4px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .read-media-badge {
+    position: absolute;
+    right: 4px;
+    bottom: 26px;
+    padding: 0 5px;
+    font-size: 11px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.65);
+    border-radius: 4px;
+  }
+
+  .read-media-audio-icon,
+  .read-media-missing-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    aspect-ratio: 16 / 9;
+    font-size: 28px;
+  }
+
+  .read-media-missing-text {
+    padding: 0 6px 2px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    text-align: center;
+  }
+
   .tool-io-label {
     display: block;
     font-size: 12px;
@@ -783,6 +893,12 @@ html[data-theme="dark"] {
   padding: 2px 4px 0;
 }
 
+// 历史回放把用量行直接放在 chat-inner 下；抵消一部分 24px 的消息间距，
+// 让它贴近所属轮次的最后一条内容。流式消息内已有 6px 的子项间距。
+.chat-inner > :not(.qnav-load-older) + .round-usage {
+  margin-top: -16px;
+}
+
 // ---------- 上下文压缩进度块 ----------
 .compaction-bar {
   width: 100%;
@@ -1241,6 +1357,37 @@ html[data-theme="dark"] {
   width: 100%;
   margin-bottom: 8px;
   overflow: visible;
+
+  // +N 折叠的子项用 hidden 属性隐藏：必须覆盖子项各自的 display 声明
+  [hidden] {
+    display: none;
+  }
+}
+
+// 附件 +N 展开块：占一个网格单元，点击展开/收起超出两行的部分
+.attachment-more-tile {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--text-secondary);
+  background: var(--bg-code);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+
+  &[hidden] {
+    display: none;
+  }
 }
 
 .msg-quote-list,
@@ -1515,32 +1662,59 @@ html[data-theme="dark"] {
 
 ::highlight(history-search-hit) { background: #f5d36b; color: #16120a; }
 
-// 选区浮钮「引用到提问」：body 级 fixed 定位（视口坐标钳制），
-// 点击后把选区快照加入当前会话草稿；滚动时跟随选区重定位，Esc/点击别处时隐藏
-.quote-float-btn {
+// 选区操作浮层：引用到提问 / 复制选中文字。body 级 fixed 定位，
+// 滚动时跟随选区重定位，Esc/点击别处时隐藏。
+.quote-float-toolbar {
   position: fixed;
   z-index: 130;
   transform: translate(-50%, -100%);
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 6px 12px;
+  padding: 3px;
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   background: var(--bg-elevated);
-  color: var(--text-primary);
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
 
-  .icon {
-    width: 13px;
-    height: 13px;
+  .quote-float-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 11px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 0.16s ease, background-color 0.16s ease;
+
+    .icon {
+      width: 17px;
+      height: 17px;
+      flex: none;
+    }
+
+    &:hover,
+    &:focus-visible {
+      color: var(--tool-icon-pink);
+      background: color-mix(in srgb, var(--tool-icon-pink) 12%, transparent);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--tool-icon-pink);
+      outline-offset: 1px;
+    }
   }
 
-  &:hover {
-    background: var(--bg-hover);
+  .quote-float-divider {
+    width: 1px;
+    height: 18px;
+    margin: 0 2px;
+    background: var(--border-strong);
+    pointer-events: none;
   }
 }
 
@@ -1914,6 +2088,24 @@ html[data-theme="dark"] {
   // 表格自身不再带外边距（由滚动块统一控制），宽度超限时容器内滚动
   table {
     margin: 0;
+    // 内容定宽 + 至少撑满容器：窄表铺满不留白，宽表溢出滚动，
+    // 而不是被 width:100% 压扁成一字一行
+    width: max-content;
+    min-width: 100%;
+  }
+}
+
+// 窄屏：单元格收紧，表格纵向少占地方
+@container main-area (max-width: 420px) {
+  .md {
+    table {
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      padding: 6px 8px;
+    }
   }
 }
 
@@ -2321,7 +2513,8 @@ html[data-theme="dark"] {
       display: none;
     }
 
-    svg {
+    svg,
+    img.md-animated-svg {
       display: block;
       width: 100%;
       height: auto;
@@ -2457,7 +2650,8 @@ html[data-theme="dark"] {
 
   // 兜底限高（正常路径由 JS 按各图宽高比写内联尺寸接管，见
   // messages.js syncSvgFullscreenLayout；这里仅防 JS 未生效时溢出视口）
-  .md-svg-view svg {
+  .md-svg-view svg,
+  .md-svg-view img.md-animated-svg {
     max-height: calc(100vh - 96px);
   }
 

@@ -324,6 +324,28 @@ def tool_completed(session_id, reference, call_id, content, is_error=False):
             _write(_record_path(session_id, record["record_id"]), record)
 
 
+def reset_tool(session_id, reference, call_id):
+    """Rewind a natively started slot the execution ledger proves never ran.
+
+    Suspend preserves native running slots so a resume can continue them, but
+    the replay re-runs tool_started, which refuses running/unknown slots. Only
+    slots the ledger clears (no record, completed cache or replayable dispatch)
+    may rewind to planned; 'executing' slots keep their unknown state so the
+    replay still refuses them. Returns True when a slot was rewound.
+    """
+    if not reference or reference.get("protocol") != "responses":
+        return False
+    with _guard(session_id, reference["scope"]):
+        record = load_record(session_id, reference)
+        if not record or call_id not in record["tool_status"]:
+            return False
+        if record["tool_status"][call_id].get("status") not in {"running", "unknown"}:
+            return False
+        record["tool_status"][call_id] = {"status": "planned"}
+        _write(_record_path(session_id, record["record_id"]), record)
+        return True
+
+
 def tool_result(session_id, reference, call_id):
     record = load_record(session_id, reference)
     value = (record or {}).get("tool_status", {}).get(call_id)

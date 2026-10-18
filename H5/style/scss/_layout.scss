@@ -79,8 +79,8 @@
 
   // qnav 显示时给聊天区右侧留出悬浮导航空间（常态指示条最宽 20px +
   // right 14px = 最左缘距右 34px，44px 留白零遮挡；hover 涟漪最长 34px
-  // 是临时态，允许轻微覆盖）。桌面端生效，移动端导航隐藏不留白。
-  @media (min-width: 767px) {
+  // 是临时态，允许轻微覆盖）。桌面端生效；移动端导航改为顶栏按钮，不留白。
+  @container main-area (min-width: 680.01px) {
     &:has(> .qnav:not(.hidden)) .chat-inner {
       padding-right: 44px;
     }
@@ -109,6 +109,7 @@
 
   .topbar-spacer {
     flex: 1;
+    min-width: 0;
   }
 }
 
@@ -122,6 +123,57 @@
   right: 0;
   top: calc(100% + 8px);
   min-width: 168px;
+}
+
+.topbar .qnav-mobile-toggle,
+.mobile-session-usage {
+  display: none;
+}
+
+.main:has(> .qnav.hidden) .qnav-mobile-toggle {
+  display: none;
+}
+
+@container main-area (max-width: 680px) {
+  .topbar {
+    padding: 10px 12px;
+  }
+
+  .topbar .token-total {
+    display: none;
+  }
+
+  .topbar .qnav-mobile-toggle {
+    display: flex;
+  }
+
+  #sessionActionsMenu {
+    width: min(300px, calc(100cqw - 24px));
+  }
+
+  .mobile-session-usage:not(.hidden) {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px 11px;
+    margin-bottom: 5px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  .mobile-session-usage-label {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  .mobile-session-usage-values {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
 }
 
 // ---------- 会话操作按钮：空态显示"加载 JSONL"图标 ----------
@@ -200,6 +252,46 @@
   &.show {
     opacity: 1;
     pointer-events: auto;
+  }
+
+  .scroll-bottom-dots {
+    display: none;
+    align-items: center;
+    gap: 3px;
+
+    span {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: scroll-bottom-dot-bounce 1.1s ease-in-out infinite;
+
+      &:nth-child(2) { animation-delay: 0.15s; }
+      &:nth-child(3) { animation-delay: 0.3s; }
+    }
+  }
+
+  &.is-generating {
+    .icon { display: none; }
+    .scroll-bottom-dots { display: flex; }
+
+    &:hover,
+    &:focus-visible {
+      .icon { display: block; }
+      .scroll-bottom-dots { display: none; }
+    }
+  }
+}
+
+@keyframes scroll-bottom-dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.55; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-bottom-btn .scroll-bottom-dots span {
+    animation: none;
+    opacity: 1;
   }
 }
 

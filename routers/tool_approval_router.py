@@ -139,6 +139,11 @@ async def resume_approval(old):
         if store.task(current["id"])["state"] not in {"running", "suspended"}:
             raise ValueError("恢复任务未能继续，请查看会话中的错误信息并重新发送")
         await asyncio.sleep(0.05)
+    # The worker never re-requested (dead, stuck or too slow): release the
+    # dispatch back to suspended so the task never strands in running with
+    # nobody watching it (owner is this backend process, so liveness checks
+    # would never reclaim it). A live worker winds down on suspension.
+    store.release_resume(current["id"], current["epoch"])
     raise ValueError("任务恢复尚未就绪，请刷新审批列表；不会自动执行")
 
 
@@ -162,7 +167,7 @@ async def decide(request: Request, approval_id: str, payload: DecisionPayload):
             raise ValueError(f"任务{label}，此审批不能继续执行；请重新发送任务")
         if old["task_state"] == "suspended":
             if old["state"] not in {"pending", "approved", "denied"}:
-                raise ValueError("旧审批已失效，请刷新")
+                raise ValueError("该审批已失效；如任务仍挂起，请在权限面板恢复原任务或放弃")
             old = await resume_approval(old)
             resumed = True
         result = store.decide(old["id"], old["session"], old["epoch"], payload.decision)

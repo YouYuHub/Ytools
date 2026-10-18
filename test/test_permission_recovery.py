@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import pytest
 from test_permission_generation import environment, configure_model, request, Stream
@@ -33,7 +33,7 @@ def test_parent_completed_file_and_child_wait_resume_without_duplicate_execution
         kind = "child" if model_config.get("selected_model_id") == "child" else "parent"
         counts[kind] += 1
         if counts[kind] == 1:
-            calls = [tc(0, "run_command", {"command": "echo safe"}, "child-command")] if kind == "child" else [tc(0, "read_file", {"full_file_name": "a.txt"}, "file"), tc(1, "sub_agent", {"task": "执行测试"}, "dispatch")]
+            calls = [tc(0, "run_command", {"command": "echo safe"}, "child-command")] if kind == "child" else [tc(0, "read_file", {"path": "a.txt"}, "file"), tc(1, "sub_agent", {"task": "执行测试"}, "dispatch")]
             yield "data: " + json.dumps({"tool_calls": calls, "finish_reason": "tool_calls"}) + "\n\n"
         else:
             yield 'data: {"content":"完成","finish_reason":"stop"}\n\n'
@@ -174,7 +174,7 @@ def test_failure_closes_native_tool_slots_without_claiming_unexecuted_tools(envi
     async def run():
         runtime = PermissionRuntime("s", {}, lambda event: asyncio.sleep(0), lambda: False)
         ids = ["known", "pending", "uncertain"]
-        blocks = [{"type": "tool_use", "id": identifier, "name": "read_file", "input": {"full_file_name": "a.txt"}} for identifier in ids]
+        blocks = [{"type": "tool_use", "id": identifier, "name": "read_file", "input": {"path": "a.txt"}} for identifier in ids]
         reference = native_store.save_record("s", {}, {"messages": [{"role": "user", "content": "test"}]}, {"content": blocks, "stop_reason": "tool_use"})
         assistant = {"role": "assistant", "provider_state": reference, "tool_calls": [{"id": identifier} for identifier in ids]}
         runtime.save("main", {"assistant": assistant, "messages": [assistant]})

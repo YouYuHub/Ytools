@@ -28,6 +28,9 @@
       for (const [id, a] of records) if (a.session_id === sid &&
         !(result.approvals || []).some(next => next.id === id) && !(result.states || []).some(next => next.id === id)) {
         setState({ ...a, state: "unavailable" });
+        // The backend no longer reports this card: retire it so a replayed
+        // "requested" event can never resurrect it as actionable.
+        retired.add(id);
       }
       for (const [id, a] of records) if (a.session_id === sid) records.delete(id);
       (result.states || []).concat(result.approvals || []).forEach(a => {

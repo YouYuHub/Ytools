@@ -377,7 +377,7 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - 测试：`test_file_history.py` 25 用例（V2.2 新增 full_view rows/hunks/截断、until_hunk 撤/留、单块撤回磁盘写回、cleanup 只清 clean、full_view.hunks 与接口坐标一致性）；全量回归 525 passed。
 
 **V2.3 追加（2026-09，按用户实测反馈；阶段 3「编辑器行内 Prism 高亮」落地）**：
-- **工具块头部完整文件路径**：`_file_diff` 载荷新增 `path/display_path`（builtin_tools._build_file_diff）；工具块头部在「调用工具 edit_file +4 -2」右侧渲染完整路径（`tool-block-file`，flex:1 自动换行、垂直居中、点击复制）。旧历史数据无 path 字段时前端三级兜底：参数 JSON 的 `full_file_name` → diff 文件头 `--- a/xxx` → path 字段；
+- **工具块头部完整文件路径**：`_file_diff` 载荷新增 `path/display_path`（builtin_tools._build_file_diff）；工具块头部在「调用工具 edit_file +4 -2」右侧渲染完整路径（`tool-block-file`，flex:1 自动换行、垂直居中、点击复制）。旧历史数据无 path 字段时前端三级兜底：参数 JSON 的 `path`（兼容旧名 `full_file_name`）→ diff 文件头 `--- a/xxx` → path 字段；
 - **独立编辑器页**：新增 `H5/editor.html` + `js/app/editor.js` + `style/scss/_editor.scss`（注册进 main.scss）。面板点击文件改为 `window.open("editor.html?session_id=...&key=...")` 新窗口打开，替代原主页面内嵌全屏 modal（index.html 的 fileDiffModal 已移除，fhConfirmModal 保留给「清理留档」）。编辑器页具备全部操作：保存（乐观锁，Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 保留与撤回（含"此处及之后"区间语义，按钮挂在差异块头部）；主题经 theme.js 与主应用同步，API base 复用同一 localStorage（同 file:// origin）；头部完整文件路径独占顶行（过长自动换行，次行为基线→当前版本号），操作按钮调矮（12px 紧凑布局）。
 - **全文可编辑**：编辑器 ctx 行（未变行）与 add 行（绿行）均改为可编辑 overlay（Prism 高亮层 pre.eh-hl + 透明 textarea 叠加，caret 可见）；del 红块保持只读无行号。全文其余部分编辑不改变 diff 语义，保存时以当前版本全文为底替换被编辑行整体入链（user_edit 版本），EOL 尾随换行按 `current_ends_with_nl` 保真；
 - **行内语法高亮**：编辑器页按文件后缀推断语言（与主应用 DIFF_FILE_EXTS 同口径的 LANG_EXTS 表），行文本经 Prism tokenize → encode → Token.stringify 输出已转义 HTML 注入高亮层；未就绪/不支持的语言自动回退纯文本。主应用 messages.js 的 diff-view 高亮此前已存在（V1.1），本轮补齐编辑器侧。
@@ -405,6 +405,7 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **差异块导航**：顶栏操作栏新增固定「↑ 上一块 / ↓ 下一块」按钮（`eh-hunk-nav`，关闭按钮左侧）——初版把按钮放进 hunk 头并给块头加 sticky 钉顶，实测同一滚动容器内多个 sticky 块头互相叠压显示错乱、钉住态 rect 不反映真实文档位置导致跳转只挪一行；V2.5 重构为固定顶栏 + `jumpHunk(dir)` **滚动位置锚定**：以滚动容器顶 32px 锚定带内命中的块头为"当前块"（带内没有取容器上方最近块头，上方没有返回 -1 落到头/尾块），跳到相邻块头并把其滚到容器顶下 8px（正好落回锚定带，可连续点击逐块推进）；纵向只调 `scrollTop` 不经 `scrollIntoView`（避免横向滚动位置被拉回最左）；跳转后目标块头 `is-flash` 900ms 高亮辅助定位，到达头/尾时 toast 提示。紧凑视图（truncated）同样适用，无差异块时 toast「没有可跳转的差异块」；
 - **hunk 头恢复普通文档流**：撤销 sticky 钉顶（多块叠压问题根源），块头上的保留/撤回按钮维持原有对应位置不变；
 - **面板避让问题导航条**：顶栏展开面板 `right: 12px → 40px`——右侧问题导航条 qnav（`right:14px`、轨道虚线最宽 20px，最左缘约距右 38px）z-index 30 高于顶栏 26，空间重叠时导航条会画在面板上；面板右缘外移至距主区右缘约 56px、与轨道留 ~18px 间隙（移动端 qnav 隐藏，媒体查询内 `right:8px` 覆盖不变）；
+- **现行移动端布局**：问题导航在窄屏改为顶栏按钮点开列表；文件变更面板在窄主区内左右各留 12px，不再沿用桌面端的右侧偏移。
 - **编辑器页主题切换**：顶栏新增下拉（跟随系统/浅色/深色），复用 `js/theme.js` ThemeManager（同一 `ytools-theme-preference` 偏好、`themechange` 事件、system 跟随 prefers-color-scheme）；页面 `<html data-theme="light">` 初值由 theme.js 首绘前按偏好覆盖，消除"编辑器页只有深色"的不可切换问题。
 
 阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 快照文本文件的原子写入（当前 JSON 元数据原子替换，但文本快照仍直接写目标文件）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。

@@ -11,7 +11,7 @@ soup = BeautifulSoup(html, 'lxml')
 description = ' '.join([p.get_text(strip=True) for p in soup.select('p')])
 print(description)
 
-# with open(r"C:\Users\Administrator\Desktop\千帆AppBuilder-产品文档.html", 'r') as f:
+# with open(r"C:\example\document.html", 'r') as f:
 #     html = f.read()
 #     soup = BeautifulSoup(html, 'lxml')
 #     description = ' '.join([p.get_text(strip=True) for p in soup.select('p')])
@@ -29,7 +29,7 @@ print(description)
 
 
 # from trafilatura import extract
-# with open(r"C:\Users\Administrator\Desktop\千帆AppBuilder-产品文档.html", 'r') as f:
+# with open(r"C:\example\document.html", 'r') as f:
 #     html = f.read()
 # text = extract(html, include_comments=False, include_tables=True)
 # print(text)

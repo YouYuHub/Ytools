@@ -327,6 +327,15 @@ class ChatRuntimeTests(unittest.TestCase):
             )
 
             try:
+                import copy
+
+                import env_manager
+
+                snapshot = {
+                    name: copy.deepcopy(getattr(env_manager, name, None))
+                    for name in ("env_file", "env_vars", "setting_file", "models_config",
+                                 "mcp_config", "model_selection", "setting_vars")
+                }
                 init_path(str(temp_path))
                 default_chat_config = get_default_chat_config()
                 self.assertIsInstance(default_chat_config, dict)
@@ -336,7 +345,8 @@ class ChatRuntimeTests(unittest.TestCase):
                 self.assertEqual(default_chat_config.get("apiKey"), "test-key")
                 self.assertEqual(resolve_model_max_input_tokens(default=8192), 123456)
             finally:
-                init_path(str(repo_root))
+                for name, value in snapshot.items():
+                    setattr(env_manager, name, value)
                 try:
                     from config import set_current_dir
                     set_current_dir(str(original_cwd))

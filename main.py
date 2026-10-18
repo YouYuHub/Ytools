@@ -12,6 +12,7 @@ from config import (
     PROJECT_ROOT,
 )
 from util import config_watcher, ollama_model_watcher
+from util.ui_cache import ui_cache_headers
 from factory.agent_runtime import tool_registry
 from env_manager import init_path
 
@@ -35,6 +36,7 @@ from routers.prompt_router import api_prompt_router
 from routers.export_router import api_export_router
 from routers.file_history_router import api_file_history_router
 from routers.user_profile_router import api_user_profile_router
+from routers.speech_config_router import api_speech_config_router
 from routers.terminal_router import api_terminal_router
 from routers.tool_approval_router import api_permission_router
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +48,9 @@ app = FastAPI(
     description="工具类测试",
     version="v0.1"
 )
+
+
+app.middleware("http")(ui_cache_headers)
 
 
 def custom_openapi():
@@ -104,6 +109,7 @@ app.include_router(api_prompt_router, tags=["Skills"])
 app.include_router(api_export_router, tags=["Export"])
 app.include_router(api_file_history_router, tags=["FileDiffHistory"])
 app.include_router(api_user_profile_router, tags=["UserProfile"])
+app.include_router(api_speech_config_router, tags=["ChatConfig"])
 app.include_router(api_terminal_router, tags=["Terminal"])
 app.include_router(api_permission_router, tags=["Permissions"])
 app.mount("/ui", StaticFiles(directory=str(PROJECT_ROOT / "H5"), html=True), name="ui")
@@ -113,11 +119,22 @@ app.mount("/ui", StaticFiles(directory=str(PROJECT_ROOT / "H5"), html=True), nam
 async def permission_ui_startup():
     from memory.permission_store import prepare_database
     await asyncio.to_thread(prepare_database)
+    from memory.session_listing import recover_pending_sessions
+    app.state.history_recovery_stop = threading.Event()
+    app.state.history_recovery_thread = threading.Thread(
+        target=recover_pending_sessions, args=(app.state.history_recovery_stop,),
+        name="history-checkpoint-recovery", daemon=True,
+    )
+    app.state.history_recovery_thread.start()
     print(f"聊天页面：http://127.0.0.1:{DEFAULT_SERVICE_PORT}/ui/", flush=True)
 
 
 @app.on_event("shutdown")
 async def permission_ui_shutdown():
+    recovery_stop = getattr(app.state, "history_recovery_stop", None)
+    if recovery_stop is not None:
+        recovery_stop.set()
+        await asyncio.to_thread(app.state.history_recovery_thread.join, 1)
     from factory.session_worker import _WORKER_PROXIES
     from memory.permission_store import suspend_session
     for session, proxy in list(_WORKER_PROXIES.items()):

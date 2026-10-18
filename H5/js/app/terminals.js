@@ -271,7 +271,7 @@
     requestListRefresh(); dismiss.focus();
   }
   button.addEventListener("click", showPanel);
-  if (window.App) window.App.terminalJobs = { noteSessionChanged, noteToolResult, refresh: requestListRefresh };
+  if (window.App) window.App.terminalJobs = { noteSessionChanged, noteToolResult, refresh: requestListRefresh, open: showPanel };
   document.addEventListener("visibilitychange", () => {
     syncPolling();
     if (!document.hidden) { requestListRefresh(); refreshOutput(); }

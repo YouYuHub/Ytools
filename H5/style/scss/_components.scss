@@ -567,7 +567,7 @@ body.tool-settings-open { overflow: hidden; }
       .tool-group-count { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
       &.has-selection .tool-group-count { color: var(--text-secondary); }
       &.has-error .tool-group-id { color: var(--danger); }
-      .tool-row { align-items: center; min-height: 34px; gap: 8px; padding: 5px 12px; cursor: pointer; }
+      .tool-row { align-items: center; min-height: 34px; gap: 8px; padding: 5px 12px 5px 28px; cursor: pointer; }
       .tool-row + .tool-row { border-top: 1px solid var(--border); }
       .tool-row.is-selected { background: color-mix(in srgb, #0b84d8 5%, transparent); }
       .tool-row:hover { background: var(--bg-hover); }
@@ -614,7 +614,7 @@ body.tool-settings-open { overflow: hidden; }
       .tool-group-head { gap: 8px; padding: 0 10px; }
       .tool-group-toggle { gap: 7px; }
       .tool-group-icon { display: none; }
-      .tool-row { min-height: 40px; padding: 5px 10px; }
+      .tool-row { min-height: 40px; padding: 5px 10px 5px 24px; }
       .tool-row-info { gap: 8px; }
       .tool-row-name { max-width: 55%; }
       .tool-row-icon { width: 18px; height: 18px; margin-top: 0; }
@@ -853,8 +853,28 @@ body.tool-settings-open { overflow: hidden; }
     }
   }
 
-  @media (max-width: 766px) {
-    display: none !important;
+  @container main-area (max-width: 680px) {
+    display: none;
+    top: 58px;
+    right: 12px;
+    transform: none;
+    max-width: calc(100cqw - 24px);
+
+    &.mobile-open {
+      display: block;
+    }
+
+    .qnav-rail {
+      display: none;
+    }
+
+    .qnav-panel {
+      display: block;
+      position: static;
+      transform: none;
+      width: min(320px, calc(100cqw - 24px));
+      max-height: min(60dvh, 480px);
+    }
   }
 }
 
@@ -1422,8 +1442,20 @@ body.model-settings-open { overflow: hidden; }
     border: 0;
 
     .enhance-head { padding: max(8px, env(safe-area-inset-top)) 8px 8px; }
-    .model-tabs { gap: 4px; }
-    .model-tab { font-size: clamp(12px, 3.3vw, 13px); min-height: 40px; padding: 8px 2px; white-space: nowrap; }
+    .model-tabs {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+    }
+    .model-tab {
+      font-size: clamp(12px, 3.3vw, 13px);
+      min-height: 40px;
+      padding: 8px 2px;
+      line-height: 1.25;
+      text-align: center;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
     .enhance-body { padding: 10px 12px 16px; gap: 8px; }
     .enhance-field { flex-direction: column; align-items: stretch; gap: 7px; }
     .enhance-field select, .model-picker {
@@ -1585,16 +1617,29 @@ body.chat-settings-open { overflow: hidden; }
       &:disabled { opacity: 0.55; cursor: not-allowed; }
     }
   }
+  .chat-setting-field-with-hint {
+    padding: 8px 0;
+
+    > span .chat-setting-inline-hint {
+      margin-top: 4px;
+      color: var(--text-tertiary);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    > span .chat-setting-inline-hint[hidden] { display: none; }
+  }
+  .chat-setting-field-with-hint-long {
+    align-items: flex-start;
+  }
   #permissionSettings select { width: 140px; background: var(--bg-code); }
 
-  .chat-settings-threshold-hint {
-    margin: 6px 0;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
-    background: var(--bg-code);
-    color: var(--text-secondary);
-    font-size: 11px;
-    line-height: 1.5;
+  .speech-settings { margin-bottom: 18px; padding-bottom: 6px; border-bottom: 1px solid var(--border-strong); }
+  .speech-language-field {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    > span { flex: 1 1 200px; }
+    select { width: min(100%, 280px); max-width: 100%; flex: 1 1 220px; }
   }
 
   .chat-settings-note {
@@ -1671,15 +1716,20 @@ body.chat-settings-open { overflow: hidden; }
     .tool-modal-head { padding: max(6px, env(safe-area-inset-top)) 12px 6px; }
     .chat-settings-heading small { display: none; }
     .chat-settings-tabs { padding: 0 12px 8px; gap: 2px; }
-    .chat-settings-tabs button { min-height: 44px; padding: 8px 9px; }
+    // 窄屏页签允许收缩（flex:1 1 0 + 最小内边距），四个页签始终完整可见，
+    // 不依赖横滑（此前临界宽度下末尾页签会被裁掉）
+    .chat-settings-tabs button { min-height: 44px; padding: 8px 4px; font-size: 12px; flex: 1 1 0; min-width: 0; }
     .chat-settings-body { padding: 12px; }
     .chat-setting-field { gap: 10px; padding: 10px 0; }
     .chat-setting-field input, .chat-setting-field select { width: 104px; min-height: 44px; font-size: 16px; }
     #permissionSettings select { width: 120px; font-size: 16px; }
+    .speech-language-field select { width: 100%; flex-basis: 100%; }
     .chat-settings-foot { padding: 6px 12px max(6px, env(safe-area-inset-bottom)); }
     .chat-settings-foot button { min-width: 0; min-height: 44px; padding: 8px 12px; }
   }
-  @media (max-width: 380px) {
+  // 窄屏（含 390~430 主流手机）：字段行标签在上、控件独占一行，
+  // 输入框不再被挤成一小条
+  @media (max-width: 480px) {
     .chat-setting-field { flex-wrap: wrap; gap: 6px; }
     .chat-setting-field > span { flex-basis: 100%; }
     .chat-setting-field input, #permissionSettings select { width: 100%; }
@@ -1700,6 +1750,89 @@ body.chat-settings-open { overflow: hidden; }
     color: var(--text-tertiary);
     cursor: not-allowed;
   }
+}
+
+// ---------- 输入框 /主题 的主题选择弹窗 ----------
+.theme-picker-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 240;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+
+  .theme-picker-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.58);
+  }
+
+  .theme-picker-dialog {
+    position: relative;
+    width: min(400px, 100%);
+    padding: 20px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-menu);
+  }
+
+  .theme-picker-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+
+    h2 { font-size: 18px; }
+  }
+
+  .theme-picker-close {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 24px;
+    line-height: 1;
+
+    &:hover { color: var(--text); background: var(--bg-hover); }
+  }
+
+  .theme-picker-description {
+    margin: 4px 0 16px;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+
+  .theme-picker-options { display: grid; gap: 8px; }
+
+  .theme-picker-option {
+    position: relative;
+    display: grid;
+    gap: 2px;
+    width: 100%;
+    padding: 10px 42px 10px 13px;
+    text-align: left;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+
+    &:hover { background: var(--bg-hover); }
+    &:focus-visible { outline: 2px solid var(--tool-icon-pink); outline-offset: 2px; }
+    &.selected { border-color: var(--tool-icon-pink); background: var(--bg-hover); }
+  }
+
+  .theme-picker-option-label { font-size: 14px; font-weight: 600; }
+  .theme-picker-option-hint { color: var(--text-secondary); font-size: 12px; }
+  .theme-picker-check {
+    position: absolute;
+    top: 50%;
+    right: 14px;
+    display: none;
+    transform: translateY(-50%);
+    color: var(--tool-icon-pink);
+    font-weight: 700;
+  }
+  .theme-picker-option.selected .theme-picker-check { display: block; }
 }
 
 // ---------- 删除确认 ----------

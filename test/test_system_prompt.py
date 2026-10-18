@@ -14,7 +14,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from env_manager import init_path, set_env_vars
 
-init_path(".")
+
+def setup_module(module):
+    # Import-time init would leak the real repo config into every module
+    # collected afterwards; initialise at run time and restore on teardown.
+    import copy
+
+    import env_manager
+
+    global _ENV_SNAPSHOT
+    _ENV_SNAPSHOT = {
+        name: copy.deepcopy(getattr(env_manager, name, None))
+        for name in ("env_file", "env_vars", "setting_file", "models_config",
+                     "mcp_config", "model_selection", "setting_vars")
+    }
+    init_path(".")
+
+
+def teardown_module(module):
+    import env_manager
+
+    for name, value in _ENV_SNAPSHOT.items():
+        setattr(env_manager, name, value)
 
 from config import DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS  # noqa: E402
 from factory import chat_factory as cf  # noqa: E402

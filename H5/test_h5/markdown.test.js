@@ -8,6 +8,8 @@ const path = require("path");
 try {
   global.katex = require(path.join(__dirname, "..", "js", "vendor", "katex", "katex.min.js"));
 } catch (_) { /* 无 katex：降级路径 */ }
+const { JSDOM } = require("jsdom");
+global.DOMPurify = require("dompurify")(new JSDOM("").window);
 const Markdown = require(path.join(__dirname, "..", "js", "markdown.js"));
 
 // ---------- 代码围栏（历史消息 / 流式内容共用解析器） ----------
@@ -238,7 +240,7 @@ test("render: ```svg 代码块渲染为双视图控件（默认图片视图）",
   const html = Markdown.render(src);
   assert.ok(html.includes('class="md-svg-block"'), html);
   // 图片视图内联 SVG 原样渲染
-  assert.ok(html.includes('<circle cx="50" cy="50" r="40" fill="red"/>'), html);
+  assert.match(html, /<circle cx="50" cy="50" r="40" fill="red"\s*\/?>(?:<\/circle>)?/);
   // 代码视图：源码经转义进 pre/code
   assert.ok(html.includes('<code class="language-markup">&lt;svg'), html);
   // 三个功能按钮 + 双视图
@@ -252,6 +254,33 @@ test("render: ```svg 代码块渲染为双视图控件（默认图片视图）",
   assert.ok(html.includes("</svg></div></div>"), html);
   // 栅栏遮蔽后不再出现普通 ```svg 代码块复制按钮（不重复渲染）
   assert.ok(!html.includes("```svg"), html);
+});
+
+test("render: SVG 预览剔除 foreignObject 和不带引号的事件属性", function () {
+  const attack = '<svg viewBox="0 0 10 10"><foreignObject><img src=x onerror=globalThis.pwned=1></foreignObject><circle onload=globalThis.pwned=1 cx="5" cy="5" r="2"/></svg>';
+  const html = Markdown.render("```svg\n" + attack + "\n```");
+  const preview = html.match(/<div class="md-svg-view" data-svg-view="image">([\s\S]*?)<\/div>/)[1];
+  assert.ok(preview.includes("<circle"), preview);
+  assert.ok(!/foreignObject|<img|onerror|onload|pwned/i.test(preview), preview);
+  assert.ok(html.includes("data-svg-code="), "原始源码仍应可复制");
+});
+
+test("render: SMIL 和 CSS 动画 SVG 在图片环境保留动画源码", function () {
+  const svg = '<svg viewBox="0 0 100 50"><style>rect{animation:pulse 1s infinite}@keyframes pulse{to{opacity:.5}}</style>' +
+    '<path id="orbit" d="M0 25H100"/><rect width="10" height="10"><animate attributeName="x" from="0" to="90" dur="1s" repeatCount="indefinite"/>' +
+    '<animateMotion dur="1s" repeatCount="indefinite"><mpath href="#orbit"/></animateMotion></rect></svg>';
+  const html = Markdown.render("```svg\n" + svg + "\n```");
+  const doc = new JSDOM(html).window.document;
+  const image = doc.querySelector(".md-svg-view img.md-animated-svg");
+  assert.ok(image, "动画应进入隔离的图片环境");
+  assert.match(image.getAttribute("style"), /aspect-ratio:2;/);
+  const encoded = decodeURIComponent(image.getAttribute("src").split(",")[1]);
+  assert.match(encoded, /<animate\b/);
+  assert.match(encoded, /<animateMotion\b/);
+  assert.match(encoded, /<style>/);
+  assert.match(encoded, /<mpath href="#orbit"/);
+  assert.match(encoded, /xmlns="http:\/\/www.w3.org\/2000\/svg"/);
+  assert.equal(doc.querySelector(".md-svg-view animate"), null, "动画源码不能直接注入页面 DOM");
 });
 
 test("render: 一行一张图（多个 svg 块各自独立成行）", function () {

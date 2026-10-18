@@ -394,6 +394,7 @@ class _SessionStream:
         self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
         self.live_round_model: dict | None = None  # 本轮生效聊天模型（round_model 推送时记录，回放 marker 携带）
+        self.live_round_usage_total: dict | None = None  # 本轮绝对累计用量（缓冲截断后附接仍可恢复）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.stop_requested = False  # 仅属于这个生成任务，不存放在历史管理器中
         self.cond = asyncio.Condition()
@@ -1078,6 +1079,9 @@ async def _run_chat_generation(
         except (OSError, ValueError):
             pass
         session_chat_memory._round_store.pending_round = pending
+        resumed_usage = pending.get("usage_total") if isinstance(pending, dict) else None
+        if isinstance(resumed_usage, dict):
+            stream.live_round_usage_total = copy.deepcopy(resumed_usage)
     if not is_responses:
         from chat.protocols.responses_store import load_state, invalidate
         remote_state = load_state(session_id)
@@ -1166,22 +1170,19 @@ async def _run_chat_generation(
                         await session_chat_memory.update_context_summary(None)
         except Exception as trunc_error:
             logger.warning(f"覆盖式回答截断失败（按追加处理）: {trunc_error}")
-        # 普通发送：覆盖式截断可能已改变轮次计数，此刻计算并推送
-        # round_started（本轮的最终轮次号），前端据此给本轮提问气泡
-        # 就地补挂编辑/删除入口
-        if emit_round_started:
-            try:
-                live_round_no = await session_chat_memory.get_current_round_number()
-                # 记录本轮最终轮次号：附接回放 marker 携带（前端按轮次精确去重/
-                # 补挂编辑入口），round_started 帧本身在回放起点之后，附接消费
-                # 端收不到——必须在推送时同步写入 stream。
-                stream.live_round_no = int(live_round_no)
+        # 覆盖式截断后重新取得最终轮次号。编辑重发/插入虽不再发送
+        # round_started 帧，刷新附接的 marker 仍必须携带轮次号，才能按轮
+        # 收养历史中的用量行，而不误合并相邻轮次。
+        try:
+            live_round_no = await session_chat_memory.get_current_round_number()
+            stream.live_round_no = int(live_round_no)
+            if emit_round_started:
                 await _stream_emit(
                     stream,
                     f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n",
                 )
-            except Exception as round_emit_error:
-                logger.warning(f"round_started 事件发送失败（前端走重载兜底）: {round_emit_error}")
+        except Exception as round_emit_error:
+            logger.warning(f"当前轮次标记发送失败（前端走重载兜底）: {round_emit_error}")
         use_backend_history = parse_bool_like(
             getattr(tool_request, "use_backend_history", None),
             parse_bool_like(load_var("USE_BACKEND_HISTORY", "true"), True)
@@ -1862,6 +1863,16 @@ async def _run_chat_generation(
                     usage_total=round_usage_total,
                     completion_count=usage_accumulator.count,
                 )
+                pending_round = getattr(getattr(session_chat_memory, "_round_store", None), "pending_round", None)
+                cumulative_usage = pending_round.get("usage_total") if isinstance(pending_round, dict) else None
+                if isinstance(cumulative_usage, dict) and cumulative_usage:
+                    # 每次模型调用结束后下发整轮绝对值。附接时事件环形缓冲可能
+                    # 已裁掉早期 completion 的 usage，不能只靠前端重算回放帧。
+                    stream.live_round_usage_total = copy.deepcopy(cumulative_usage)
+                    await _stream_emit(
+                        stream,
+                        f"data: {json.dumps({'round_usage_total': cumulative_usage}, ensure_ascii=False)}\n\n",
+                    )
             # print(f"[DEBUG] tool_calls: {tool_calls}")
             if pending_finish_payload is not None:
                 await _stream_emit(stream, f"data: {json.dumps(pending_finish_payload, ensure_ascii=False)}\n\n")
@@ -3133,6 +3144,7 @@ async def tool_chat_server(
     try:
         if stream.done:
             seen = stream.seq  # 已完成的生成：不重复回放（内容已在 JSONL）
+            replay_end_pending = False
         else:
             seen = stream.round_start_seq
             if not creating:
@@ -3154,11 +3166,23 @@ async def tool_chat_server(
                     marker["question_quotes"] = stream.question_quotes
                 if stream.live_round_no:
                     marker["round"] = int(stream.live_round_no)
+                    # 编辑重发旧第 N 轮时历史可能尚有旧用量；即使新轮还没有
+                    # usage，也明确下发空绝对值，前端据此清除旧轮基线。
+                    marker["round_usage_total"] = copy.deepcopy(
+                        getattr(stream, "live_round_usage_total", None) or {}
+                    )
                 # getattr 防御：测试替身等最小 stream 桩可能没有该属性
                 live_round_model = getattr(stream, "live_round_model", None)
                 if live_round_model:
                     marker["model"] = live_round_model
+                # 回放结束标记配对：新前端据此关闭“回放去重窗口”，之后不再把
+                # 流内容与历史已渲染节点做匹配（避免误删正常重复文本）；老前端
+                # 忽略未知字段，行为不变。
+                marker["replay_end_supported"] = True
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
+                replay_end_pending = True
+            else:
+                replay_end_pending = False
         while True:
             while seen < stream.seq:
                 base = stream.seq - len(stream.buffer)
@@ -3167,6 +3191,11 @@ async def tool_chat_server(
                 chunk = stream.buffer[seen - base]
                 seen += 1
                 yield chunk
+            if replay_end_pending:
+                # 附接回放耗尽：此后均为实时帧（并发产生的新帧按到达顺序排在
+                # 回放之后，前端按序消费匹配，不会误删）。
+                replay_end_pending = False
+                yield f"data: {json.dumps({'replay_end': True}, ensure_ascii=False)}\n\n"
             if stream.done:
                 break
             # 心跳：模型长时间无增量输出时（长思考/慢工具/网关缓冲等），

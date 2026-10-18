@@ -132,7 +132,13 @@
     }
     if (rec.kind === "usage") {
       const summary = FormatUtils.roundSummaryText(rec.usage, rec.model);
-      if (summary) container.appendChild(el("div", "round-usage", summary));
+      if (summary) {
+        const line = el("div", "round-usage", summary);
+        // 附接当前轮 SSE 时可直接收养这行，并保留已落盘的累计值。
+        line._roundUsageSnapshot = rec.usage;
+        line._roundModelSnapshot = rec.model;
+        container.appendChild(line);
+      }
       return;
     }
     if (rec.kind === "agentBlock") {
@@ -1827,6 +1833,10 @@
   function buildToolBlock(name, identity) {
     identity = Object.assign({ sessionId: state.sessionId, agentId: "main" }, identity);
     const wrap = el("div", "tool-block");
+    // 调用 ID 落盘到 DOM：流管线收到重放的 tool_calls/tool_start/tool_return
+    // 时按 callId 收养历史已渲染的卡片（复用其 ui 控制器），而不是新建重复卡。
+    // ui 控制器挂在节点上供收养时取回（msg._editData 同模式）。
+    if (identity.toolCallId) wrap.dataset.toolCallId = String(identity.toolCallId);
     const head = el("button", "tool-block-head");
     head.type = "button";
     const header = el("div", "tool-block-header");
@@ -1966,8 +1976,10 @@
       wrap: wrap,
       approvalHost: approvalHost,
       get toolCallId() { return identity.toolCallId; },
+      get sessionId() { return identity.sessionId; },
       bindPermission: function (next) {
         Object.assign(identity, next);
+        if (identity.toolCallId) wrap.dataset.toolCallId = String(identity.toolCallId);
         if (App.permissions && identity.toolCallId) App.permissions.bindTool(ui, identity);
       },
       setApprovalWaiting: function (approval, outcome) {
@@ -2109,6 +2121,7 @@
       },
     };
     ui.bindPermission(identity);
+    wrap._toolBlockUi = ui;
     return ui;
   }
 
@@ -2262,7 +2275,7 @@
   }
 
   // 从工具参数（对象或 JSON 文本均可）提取标题栏路径信息：
-  // read_file/write_file/edit_file 用 full_file_name；search_files 用搜索目录 dir_path；
+  // read_file/write_file/edit_file 用 path（旧数据 full_file_name 兜底）；search_files 用搜索目录 dir_path；
   // 兜底 _file_diff 无 path 字段的旧数据。参数可能是流式未闭合 JSON，宽松正则兜底。
   function extractPathFromArgsValue(args, name) {
     let obj = args;
@@ -2272,9 +2285,9 @@
       try {
         obj = JSON.parse(args);
       } catch (_) {
-        const m = /"full_file_name"\s*:\s*"([^"]+)"/.exec(args)
-          || /"dir_path"\s*:\s*"([^"]+)"/.exec(args)
-          || /"path"\s*:\s*"([^"]+)"/.exec(args);
+        const m = /"path"\s*:\s*"([^"]+)"/.exec(args)
+          || /"full_file_name"\s*:\s*"([^"]+)"/.exec(args)
+          || /"dir_path"\s*:\s*"([^"]+)"/.exec(args);
         return m ? m[1].replace(/\\\\/g, "\\") : "";
       }
     }
@@ -2286,7 +2299,7 @@
       if (dir && pattern) return dir + "（" + pattern + "）";
       return dir || pattern;
     }
-    return String(obj.full_file_name || obj.path || "").trim();
+    return String(obj.path || obj.full_file_name || "").trim();
   }
 
   // 相对路径按会话工作目录解析为完整路径（模型常传相对路径，标题栏展示
@@ -2309,10 +2322,39 @@
     return m ? m[1].trim() : "";
   }
 
+  /** read_media 结果的图片条：可展开的缩略图网格，点击缩略图进预览弹窗。
+   * 幂等：重复应用先移除旧条（保留展开态）；解析失败或无条目时不画条。 */
+  function renderReadMediaStrip(block, resultText) {
+    if (!block || !block.wrap || typeof ReadMediaStrip === "undefined") return;
+    const parsed = ReadMediaStrip.parseReadMediaResult(resultText);
+    const old = block.wrap.querySelector(".read-media-strip");
+    const wasOpen = Boolean(old && old.classList.contains("open"));
+    if (old) old.remove();
+    if (!parsed) return;
+    const sessionId = (block.sessionId != null && block.sessionId !== "")
+      ? block.sessionId : state.sessionId;
+    const model = ReadMediaStrip.buildStripItems(API, parsed, sessionId);
+    if (!model.items.length) return;
+    const strip = ReadMediaStrip.buildMediaStrip({
+      el: el,
+      onPreview: function (item) {
+        if (App.openMediaPreview && item.url) {
+          App.openMediaPreview({ type: item.previewType, src: item.url, title: item.name });
+        }
+      },
+    }, model.headerText, model.items);
+    const body = block.wrap.querySelector(".tool-block-body");
+    (body || block.wrap).appendChild(strip);
+    if (wasOpen) {
+      const head = strip.querySelector(".read-media-head");
+      if (head) head.click();
+    }
+  }
+
   /** 工具输出统一入口：带 file_diff 的结构化结果渲染 diff 视图 + 统计摘要文本，
    * 其余一律按原文纯文本输出（MCP 版同名工具 / 旧历史无 diff 自动回退）。
    * args（可选，对象或 JSON 文本）：工具原始参数——用于在 _file_diff 无 path
-   * 字段的旧数据里兜底提取完整文件路径（full_file_name），以及为 read_file /
+   * 字段的旧数据里兜底提取完整文件路径（path，兼容旧名 full_file_name），以及为 read_file /
    * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
   function applyToolResult(block, name, resultText, fileDiff, args) {
     if (name === "edit_file" || name === "write_file" || name === "run_command" || name === "poll_command" || name === "stop_command") {
@@ -2368,6 +2410,10 @@
     // 旧数据 write_file）时从参数补齐；diff 已带路径时 setDiff 已设置
     if (!fileDiff || !fileDiff.path) {
       block.setFileTag(extractPathFromArgsValue(args, name));
+    }
+    // 读取媒体：输出文本之外，追加可展开的图片缩略图条
+    if (name === "read_media") {
+      renderReadMediaStrip(block, resultText);
     }
   }
 
@@ -3236,7 +3282,7 @@
   // 的崩坏比例；不可见（代码视图激活）时回退 viewBox 基准尺寸。
   // 按 2x~3x（跟随 devicePixelRatio）超采样导出，粘贴出去不发虚。
   async function svgBlockToPngBlob(block) {
-    const view = block.querySelector('[data-svg-view="image"] svg');
+    const view = block.querySelector('[data-svg-view="image"] svg, [data-svg-view="image"] img.md-animated-svg');
     if (!view) {
       // mermaid 渲染失败/被中断时图片视图没有 svg——给出可操作的提示
       if (block.dataset.svgKind === "mermaid" && block.dataset.mermaidState !== "done") {
@@ -3251,7 +3297,18 @@
     let baseW = 0, baseH = 0;
     const visible = !!(view.getClientRects && view.getClientRects().length);
     const rect = visible ? view.getBoundingClientRect() : null;
-    const vb = (view.getAttribute("viewBox") || "").split(/[\s,]+/).map(parseFloat);
+    let sourceSvg = view;
+    if (view.localName === "img") {
+      // 动画预览在 <img> 的 image 环境中运行；导出时从同一图片源码重建 SVG。
+      // PNG 是静态图片，因此只导出动画的单帧快照。
+      const imageUrl = view.getAttribute("src") || "";
+      const separator = imageUrl.indexOf(",");
+      if (!imageUrl.startsWith("data:image/svg+xml") || separator < 0) throw new Error("SVG 图片来源无效");
+      const parsed = new DOMParser().parseFromString(decodeURIComponent(imageUrl.slice(separator + 1)), "image/svg+xml");
+      sourceSvg = parsed.documentElement;
+      if (!sourceSvg || sourceSvg.localName !== "svg") throw new Error("SVG 源码无法解析");
+    }
+    const vb = (sourceSvg.getAttribute("viewBox") || "").split(/[\s,]+/).map(parseFloat);
     const vbOk = vb.length === 4 && isFinite(vb[2]) && isFinite(vb[3]) && vb[2] > 0 && vb[3] > 0;
     if (rect && rect.width > 2 && rect.height > 2) {
       if (vbOk) {
@@ -3298,7 +3355,7 @@
       h = Math.round(h * k);
       scale = w / baseW;
     }
-    const clone = view.cloneNode(true);
+    const clone = sourceSvg.cloneNode(true);
     // 去内联样式（mermaid 的 max-width / 自适应 width:100% 在独立解码语境
     // 无意义且会干扰固有尺寸），改用显式像素尺寸 + viewBox 保证比例
     clone.removeAttribute("style");
@@ -3817,7 +3874,7 @@
   function syncSvgFullscreenLayout() {
     const fsEl = document.fullscreenElement;
     chatInner.querySelectorAll(".md-svg-block").forEach(function (block) {
-      const svg = block.querySelector(".md-svg-view svg");
+      const svg = block.querySelector(".md-svg-view svg, .md-svg-view img.md-animated-svg");
       if (!svg) return;
       if (fsEl === block) {
         if (block.__svgStyleBackup == null) {
@@ -4228,6 +4285,29 @@
   }
 
   // ---------- 从用户引用卡片定位到原文 ----------
+  // 手机端以顶栏按钮打开问题列表；桌面端继续使用右侧悬浮导航。
+  const qnavMobileBtn = document.getElementById("qnavMobileBtn");
+  function closeMobileQnav() {
+    qnav.classList.remove("mobile-open");
+    qnavMobileBtn.setAttribute("aria-expanded", "false");
+  }
+  qnavMobileBtn.addEventListener("click", function (event) {
+    event.stopPropagation();
+    const open = !qnav.classList.contains("mobile-open");
+    if (open) App.closeMenus();
+    qnav.classList.toggle("mobile-open", open);
+    qnavMobileBtn.setAttribute("aria-expanded", String(open));
+  });
+  qnavPanel.addEventListener("click", function (event) {
+    if (event.target.closest(".qnav-item")) closeMobileQnav();
+  });
+  document.addEventListener("click", function (event) {
+    if (!qnav.contains(event.target) && !qnavMobileBtn.contains(event.target)) closeMobileQnav();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") closeMobileQnav();
+  });
+
   let highlightedQuoteNode = null;
   let quoteHighlightTimer = null;
   let restoreSearchVisibility = null;
@@ -4611,18 +4691,76 @@
     return true;
   }
 
+  let qnavJumpGeneration = 0;
+  let qnavJumpFrame = null;
+  let qnavJumpTimer = null;
+  let qnavJumpRestoreVisibility = null;
+
+  function cancelQuestionJump() {
+    qnavJumpGeneration += 1;
+    if (qnavJumpFrame != null) cancelAnimationFrame(qnavJumpFrame);
+    if (qnavJumpTimer != null) clearTimeout(qnavJumpTimer);
+    qnavJumpFrame = null;
+    qnavJumpTimer = null;
+    if (qnavJumpRestoreVisibility) qnavJumpRestoreVisibility();
+    qnavJumpRestoreVisibility = null;
+  }
+
   function jumpToQuestion(i) {
     const target = qnavUsers[i];
     if (!target) return;
-    // 瞬跳：.chat-scroll 的 CSS 是 scroll-behavior: smooth，
-    // 而 scrollTop 赋值/scrollTo(behavior:"auto") 都会继承该属性触发动画，
-    // 因此先临时覆盖为 auto，再恢复，保证点击即瞬跳
-    const prev = chatScroll.style.scrollBehavior;
-    chatScroll.style.scrollBehavior = "auto";
-    const delta = target.getBoundingClientRect().top - chatScroll.getBoundingClientRect().top;
-    chatScroll.scrollTop += delta;
-    chatScroll.style.scrollBehavior = prev;
+    cancelQuestionJump();
+    const generation = qnavJumpGeneration;
+    // 目标可能在 content-visibility:auto 的离屏占位中；先让该消息真实布局。
+    let root = target;
+    while (root.parentElement && root.parentElement !== chatInner) root = root.parentElement;
+    const previousVisibility = root.style.contentVisibility;
+    root.style.contentVisibility = "visible";
+    qnavJumpRestoreVisibility = function () { root.style.contentVisibility = previousVisibility; };
+    // 流式回复的自动贴底与待执行的置底帧不能覆盖用户主动导航。
+    App.pauseAutoScroll();
+
+    function align() {
+      if (!chatInner.contains(target)) return false;
+      const delta = target.getBoundingClientRect().top - chatScroll.getBoundingClientRect().top;
+      if (Math.abs(delta) <= 1) return true;
+      // scrollTop/scrollTo(auto) 会继承 CSS 的 smooth；临时改为瞬时滚动。
+      const previousBehavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScroll.scrollTop += delta;
+      chatScroll.style.scrollBehavior = previousBehavior;
+      return true;
+    }
+
+    align();
+    // 懒渲染消息进入视口后会用真实高度替换 240px 占位，首次落点随之漂移。
+    // 后续帧按同一个目标校正；晚到的布局再补一次，避免用户需要点击第二次。
+    let framesLeft = 18;
+    function correct() {
+      if (generation !== qnavJumpGeneration) return;
+      qnavJumpFrame = null;
+      if (!align()) { cancelQuestionJump(); return; }
+      if (--framesLeft > 0) qnavJumpFrame = requestAnimationFrame(correct);
+    }
+    qnavJumpFrame = requestAnimationFrame(correct);
+    qnavJumpTimer = window.setTimeout(function () {
+      if (generation !== qnavJumpGeneration) return;
+      align();
+      cancelQuestionJump();
+    }, 650);
   }
+
+  // 一旦用户开始自行滚动或操作消息，停止导航校正，避免把视口拉回旧目标。
+  ["wheel", "touchstart", "pointerdown"].forEach(function (type) {
+    chatScroll.addEventListener(type, function () {
+      if (qnavJumpRestoreVisibility) cancelQuestionJump();
+    }, { passive: true, capture: true });
+  });
+  window.addEventListener("keydown", function (event) {
+    if (qnavJumpRestoreVisibility && ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+      cancelQuestionJump();
+    }
+  }, true);
 
   function updateQnavActive() {
     if (!qnavUsers.length) return;

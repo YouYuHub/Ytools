@@ -17,6 +17,7 @@
   // ---------- 会话列表 ----------
   // 会话标识规整请见 SessionUtils.sanitizeSessionId（js/session_utils.js）
   let lastSortedRows = [];   // 最近一次排序后的会话行（多选分组视图的数据源）
+  let sessionListLoadSeq = 0, sessionRenderVersion = 0, sessionRenderTimer = null;
 
   // 「当前标题」注册表：记录每个会话侧边栏正在显示的标题，来源依次为
   //   后端 _meta.title（loadSessions / openSession 拉取）
@@ -38,66 +39,65 @@
     return currentTitles.get(sessionId) || "";
   }
   function clearSessionItems() {
+    sessionRenderVersion++;
+    if (sessionRenderTimer != null) { clearTimeout(sessionRenderTimer); sessionRenderTimer = null; }
     sessionList.querySelectorAll(".session-item, .empty-tip, .bulk-group").forEach(function (n) { n.remove(); });
   }
 
+  async function fetchSessionSummaries(sessionId) {
+    if (typeof API.listSessionSummaries === "function") {
+      try { return await API.listSessionSummaries(sessionId); }
+      catch (error) { if (error.status !== 404) throw error; }
+    }
+    // Legacy servers use filename/local-title labels, never N meta requests.
+    const files = await API.listSessions();
+    return (Array.isArray(files) ? files : []).map(function (filename) {
+      const id = SessionUtils.fileNameToSessionId(filename);
+      return { id: id, filename: filename, title: knownSessionTitle(id) || (state.sessionRecency[id] || {}).title || id };
+    }).filter(function (row) { return sessionId == null || row.id === sessionId; });
+  }
+
   async function loadSessions() {
-    clearSessionItems();
-    let files = [];
+    const mine = ++sessionListLoadSeq;
+    const titlesBefore = new Map(currentTitles);
+    if (!sessionList.querySelector(".session-item") && !lastSortedRows.length) {
+      clearSessionItems();
+      sessionList.appendChild(el("div", "empty-tip", "正在加载会话…"));
+    }
+    let summaries;
     try {
-      files = await API.listSessions();
+      summaries = await fetchSessionSummaries();
+      if (!Array.isArray(summaries)) throw new Error("会话列表格式无效");
     } catch (err) {
-      sessionList.appendChild(el("div", "empty-tip", "无法连接后端服务"));
-      return;
+      if (mine !== sessionListLoadSeq) return null;
+      if (!lastSortedRows.length) {
+        clearSessionItems();
+        sessionList.appendChild(el("div", "empty-tip", "无法加载会话，请检查后端连接后重试"));
+      } else toast("会话列表刷新失败，已保留当前列表");
+      return null;
     }
-
-    const items = [];
-    const fetchedIds = new Set();
-    if (Array.isArray(files) && files.length) {
-      const rows = await Promise.all(files.map(async function (file) {
-        const id = SessionUtils.fileNameToSessionId(file);
-        let title = id;
-        let updated = "";
-        let created = "";
-        try {
-          const meta = await API.getSessionMeta(id);
-          title = SessionUtils.getSessionTitle(id, meta.title || (meta.user_questions && meta.user_questions[0]) || id);
-          updated = meta.updated_at || "";
-          created = meta.created_at || "";
-          // 后端标题是权威来源：登记为当前标题（发送消息时优先沿用，
-          // 不再被"提问前 40 字"临时占位顶掉）
-          if (meta.title) rememberSessionTitle(id, meta.title);
-        } catch (_) { /* 元数据读取失败时用 id 兜底 */ }
-        return { id: id, title: title, updated: updated, created: created };
-      }));
-      rows.forEach(function (row) { fetchedIds.add(row.id); items.push(row); });
-    }
-
-    // 本地刚发送/重命名但后端尚未落盘的会话也一并展示，避免列表重建后“消失”
+    if (mine !== sessionListLoadSeq) return null;
+    const items = [], fetchedIds = new Set();
+    summaries.forEach(function (row) {
+      const id = SessionUtils.sanitizeSessionId(row.id || row.filename);
+      const changedTitle = currentTitles.get(id) !== titlesBefore.get(id) ? knownSessionTitle(id) : "";
+      const title = changedTitle || SessionUtils.getSessionTitle(id, row.title || knownSessionTitle(id) || id);
+      rememberSessionTitle(id, title);
+      fetchedIds.add(id);
+      items.push({ id: id, title: title, updated: row.updated_at || "", created: row.created_at || "", group_id: row.group_id });
+    });
     Object.keys(state.sessionRecency).forEach(function (id) {
       if (fetchedIds.has(id)) return;
       const rec = state.sessionRecency[id] || { title: id };
       items.push({ id: id, title: rec.title || id, updated: "", created: "" });
     });
-
-    if (!items.length) {
-      lastSortedRows = [];
-      renderSessionItems();
-      if (App.sessionGroups) App.sessionGroups.render([]);
-      return;
-    }
-
     const recencyMap = {};
-    Object.keys(state.sessionRecency).forEach(function (id) {
-      recencyMap[id] = state.sessionRecency[id].ts;
-    });
-    // 按最近更新倒序（后更新的在前）：后端 updated_at 为主，本地 recency 兜底，created_at 再兜底
+    Object.keys(state.sessionRecency).forEach(function (id) { recencyMap[id] = state.sessionRecency[id].ts; });
     const sorted = SessionListUtils.sortRows(items, recencyMap);
     lastSortedRows = sorted;
     renderSessionItems();
-    refreshSessionFades();
-    // 分组区同步最新会话行（展开的分组内显示组内会话标题）
     if (App.sessionGroups) App.sessionGroups.render(sorted);
+    return sorted;
   }
 
   // 溢出淡出标记：给真正被截断的标题加 .truncated（右缘渐隐遮罩，替代「…」占位）。
@@ -423,9 +423,23 @@
     if (bulkMode) {
       renderBulkGroupedView();
     } else {
-      lastSortedRows.forEach(function (item) {
-        sessionList.appendChild(buildSessionItem(item.id, item.title));
-      });
+      const rows = lastSortedRows.slice(), version = sessionRenderVersion;
+      let offset = 0;
+      function appendBatch() {
+        sessionRenderTimer = null;
+        if (version !== sessionRenderVersion || bulkMode) return;
+        const end = Math.min(rows.length, offset + 50);
+        for (; offset < end; offset++) {
+          const item = rows[offset];
+          // A fresh send/rename may already have inserted this row at the top.
+          if (!sessionList.querySelector('[data-session="' + item.id + '"]')) {
+            sessionList.appendChild(buildSessionItem(item.id, knownSessionTitle(item.id) || item.title));
+          }
+        }
+        refreshSessionFades();
+        if (offset < rows.length) sessionRenderTimer = setTimeout(appendBatch, 0);
+      }
+      appendBatch();
     }
     syncBulkSelectionUi();
   }
@@ -970,6 +984,23 @@
   // 会话打开请求序号：切会话瞬间旧请求仍可能在途，过期响应直接丢弃
   let sessionOpenSeq = 0;
 
+  async function openInitialSession(rawId) {
+    const id = SessionUtils.sanitizeSessionId(rawId), seq = sessionOpenSeq, previous = state.sessionId;
+    const initialInput = input.value;
+    try {
+      const rows = await fetchSessionSummaries(id);
+      // User interaction wins over a late startup lookup. Membership comes
+      // from data, never the partly rendered sidebar DOM.
+      if (seq !== sessionOpenSeq || state.sessionId !== previous || input.value !== initialInput) return false;
+      if (Array.isArray(rows) && rows.some(row => row.id === id)) return openSession(id);
+      startNewChat();
+    } catch (_) {
+      // Never open an unchecked id and create a phantom default history file.
+      if (seq === sessionOpenSeq && state.sessionId === previous) toast("初始会话暂时无法加载，可稍后从历史列表打开");
+    }
+    return false;
+  }
+
   // 视图就绪跟踪（重复点击同一会话时跳过重载）：
   //   readySessionId   = 当前聊天区已完整显示的会话（历史渲染完成 / 本地导入预览）
   //   loadingSessionId = 正在加载中的会话（加载期间重复点击同样跳过，防并发重载）
@@ -1094,7 +1125,14 @@
     App.renderTodoWidget();
     API.getSessionMeta(id).then(function (meta) {
       // 打开会话即登记后端权威标题：发送消息时优先沿用（不被 40 字占位顶掉）
-      if (meta && meta.title) rememberSessionTitle(id, meta.title);
+      if (meta && meta.title) {
+        rememberSessionTitle(id, meta.title);
+        const row = lastSortedRows.find(item => item.id === id);
+        if (row) row.title = meta.title;
+        const item = sessionList.querySelector('[data-session="' + id + '"]');
+        if (item) setSessionNameText(item.querySelector(".session-name"), meta.title);
+        if (App.sessionGroups && App.sessionGroups.updateRowTitle) App.sessionGroups.updateRowTitle(id, meta.title);
+      }
       if (state.sessionId !== id) return;
       App.applySessionTodo(meta && meta.todo);
     }).catch(function () { /* ignore */ });
@@ -1107,7 +1145,10 @@
       const text = await API.fetchSessionFile(id);
       // 等待期间用户已切到其他会话，丢弃过期响应，避免误覆盖
       if (seq !== sessionOpenSeq) return false;
-      const parsed = HistoryParser.parseHistory(text);
+      const parsed = await (typeof HistoryParseAsync !== "undefined"
+        ? HistoryParseAsync.parse(text)
+        : HistoryParser.parseHistory(text));
+      if (seq !== sessionOpenSeq) return false;
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
       // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
       // marker / round_started 回填），无轮次号时回退提问文本 + 引用快照匹配
@@ -1234,6 +1275,7 @@
   App.ensureSessionId = ensureSessionId;
   App.startNewChat = startNewChat;
   App.openSession = openSession;
+  App.openInitialSession = openInitialSession;
   // 视图就绪标记（本地导入预览等直接铺开内容的路径调用；重复点击守卫依据）
   App.markSessionViewReady = markSessionViewReady;
   App.restoreActiveStream = restoreActiveStream;

@@ -108,10 +108,66 @@ def _retrieval_unavailable(session_id, record, exc):
 
 
 def _retryable(exc):
-    if isinstance(exc, (ResponsesProtocolError, ResponsesUpstreamError)):
+    if isinstance(exc, ResponsesProtocolError):
         return False
+    if isinstance(exc, ResponsesUpstreamError):
+        return _upstream_retryable(exc)
     status = getattr(exc, "status_code", None)
     return status in {408, 409, 425, 429} or (status is not None and status >= 500) or status is None
+
+
+# Deterministic upstream terminations: retrying the same frozen payload only
+# reproduces them, so they must not consume the network retry budget. Anything
+# else (server_error, rate limits, bare error frames) is transient like an
+# HTTP 5xx and shares NETWORK_RETRY_MAX_ATTEMPTS with the transport errors.
+_NON_RETRYABLE_UPSTREAM_CODES = frozenset({
+    "invalid_request", "invalid_request_error",
+    "authentication_error", "permission_error", "not_found_error",
+})
+
+_NON_RETRYABLE_UPSTREAM_HINTS = ("invalid", "auth", "permission", "not_found", "not found")
+
+
+def _upstream_retryable(exc):
+    response = exc.response or {}
+    if not response:
+        # Bare "error" event frame without a terminal response: retry by default
+        # like the chat_completions provider error frame, except for request or
+        # credential failures identifiable from the message text.
+        detail = str(exc).lower()
+        if re.search(r"\b40[134]\b", detail):
+            return False
+        return not any(hint in detail for hint in _NON_RETRYABLE_UPSTREAM_HINTS)
+    if response.get("status") == "completed":
+        # Only the malformed-tool-call check raises with a completed response
+        # (normalize raises anything else non-completed as failed/incomplete).
+        # Nothing was executed, so recreating the frozen request within the
+        # network budget lets a one-off gateway glitch self-heal; a systematic
+        # mismatch still terminates once the budget is exhausted, now with the
+        # raw response persisted for forensics.
+        return True
+    if response.get("status") != "failed":
+        # incomplete (max_output_tokens/content_filter) and cancelled are
+        # deterministic model-side terminations, not transient faults.
+        return False
+    code = str(((response.get("error") or {}).get("code")) or "").lower()
+    if not code:
+        return True
+    if code in _NON_RETRYABLE_UPSTREAM_CODES:
+        return False
+    return not any(hint in code for hint in _NON_RETRYABLE_UPSTREAM_HINTS)
+
+
+def _restart_failed_request(request, record, exc, *, stateless):
+    """Abandon a terminally failed request so the retry recreates it.
+
+    Retrieving the same response ID only replays the terminal failure. The
+    failed record never committed, so the chain head still points at the last
+    success and the next loop iteration can begin a fresh request from the
+    frozen payload. The caller must drop its record reference.
+    """
+    responses_store.abandon_request(request.session_id, record, exc)
+    return ResponsesStream(require_stored=not stateless)
 
 
 def _parent_missing(exc):
@@ -350,12 +406,16 @@ async def async_stream(transport, request, config, stop=None):
                     yield _sse({"warning": {"code": "RESPONSES_REBUILT", "message": "有状态续接失败：本次回传本地原生上下文重建响应链，仍为有状态模式；若反复出现，请选择“无状态兼容”"}})
                     continue
                 attempt += 1
-                if stateless and (assembly.response_id or assembly.content or assembly.reasoning) and _retryable(exc):
+                if (stateless and (assembly.response_id or assembly.content or assembly.reasoning)
+                        and _retryable(exc) and not isinstance(exc, ResponsesUpstreamError)):
                     exc = _stateless_interrupted(exc)
                 retrying = _retryable(exc) and (maximum <= 0 or attempt < maximum)
                 if isinstance(exc, ResponsesUpstreamError) and exc.response:
                     record["terminal_response"] = exc.response
-                if not retrying and record:
+                if retrying and isinstance(exc, ResponsesUpstreamError):
+                    assembly = _restart_failed_request(request, record, exc, stateless=stateless)
+                    record = None
+                elif not retrying and record:
                     responses_store.abandon_request(request.session_id, record, exc,
                                                     unknown=bool(assembly.response_id) and not stateless and not isinstance(exc, ResponsesUpstreamError))
                 yield _sse(_failure(exc, attempt, maximum, retrying))
@@ -476,10 +536,16 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
                     record, rebuilt, assembly = None, True, ResponsesStream()
                     continue
                 attempt += 1
-                if stateless and (assembly.response_id or assembly.content or assembly.reasoning) and _retryable(exc):
+                if (stateless and (assembly.response_id or assembly.content or assembly.reasoning)
+                        and _retryable(exc) and not isinstance(exc, ResponsesUpstreamError)):
                     exc = _stateless_interrupted(exc)
                 retrying = _retryable(exc) and (maximum <= 0 or attempt < maximum)
-                if not retrying and record:
+                if isinstance(exc, ResponsesUpstreamError) and exc.response:
+                    record["terminal_response"] = exc.response
+                if retrying and isinstance(exc, ResponsesUpstreamError):
+                    assembly = _restart_failed_request(request, record, exc, stateless=stateless)
+                    record = None
+                elif not retrying and record:
                     responses_store.abandon_request(request.session_id, record, exc,
                                                     unknown=bool(assembly.response_id) and not stateless and not isinstance(exc, ResponsesUpstreamError))
                 yield _failure(exc, attempt, maximum, retrying)

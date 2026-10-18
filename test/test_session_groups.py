@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, r"C:\Users\Administrator\Desktop\python学习录\main_study\large_model\agent_tool_sse")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import memory.chat_memory as chat_memory
 from memory.chat_memory import (

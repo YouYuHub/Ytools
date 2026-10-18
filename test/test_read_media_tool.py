@@ -14,6 +14,7 @@
   execute_read_media 无白名单边界（available=None 时全放行）
 """
 import base64
+import asyncio
 import io
 import json
 import os
@@ -37,7 +38,7 @@ def _cleanup_test_session():
     upload_dir = fm.HISTORY_ROOT / TEST_SESSION
     if upload_dir.exists():
         shutil.rmtree(upload_dir, ignore_errors=True)
-    fm.cleanup_file_memory_manager(TEST_SESSION)
+    asyncio.run(fm.cleanup_file_memory_manager(TEST_SESSION))
 
 
 def _make_png_bytes(width: int, height: int) -> bytes:
