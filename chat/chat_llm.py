@@ -498,6 +498,8 @@ class ChatLLM:
         timeout_connect: float,
         stop_checker: Optional[Any] = None,
     ):
+        from factory.agent_runtime.task_costs import network_attempt
+        await network_attempt()
         connection_kwargs: dict[str, Any] = {}
         if use_ssl:
             connection_kwargs["ssl"] = ssl.create_default_context()
@@ -726,6 +728,8 @@ class ChatLLM:
                     return
                 body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 last_step = "connect"
+                from factory.agent_runtime.task_costs import network_attempt_sync
+                network_attempt_sync()
                 sock = socket.create_connection((host, port), timeout=timeout_connect)
                 if use_ssl:
                     sock.settimeout(timeout_connect)
@@ -1286,6 +1290,20 @@ class ChatLLM:
         stream: Optional[bool] = None,
         stop_checker: Optional[Any] = None,
         model_config: Optional[Dict[str, Any]] = None,
+    ):
+        from factory.agent_runtime.task_costs import current, tracked_call
+        invoke = lambda: ChatLLM._unmetered_chat_completions(request, stream, stop_checker, model_config)
+        if request is None or current(request) is None:
+            return invoke()
+        return tracked_call(invoke, request, request.stream if stream is None else stream,
+                            stop_checker, ChatLLM._resolve_chat_config(model_config))
+
+    @staticmethod
+    def _unmetered_chat_completions(
+        request: ChatLLMRequest = None,
+        stream: Optional[bool] = None,
+        stop_checker: Optional[Any] = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> Union[AsyncGenerator[str, Any], dict[str, Any]]:
         """统一聊天入口，支持流式和非流式响应。
 
@@ -1354,6 +1372,8 @@ class ChatLLM:
                 raise RuntimeError(hard_limit_error)
             body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             last_step = "connect"
+            from factory.agent_runtime.task_costs import network_attempt_sync
+            network_attempt_sync()
             sock = socket.create_connection((host, port), timeout=timeout_connect)
             if use_ssl:
                 sock.settimeout(timeout_connect)

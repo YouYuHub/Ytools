@@ -1,0 +1,27 @@
+.task-cost-modal[hidden], .task-budget-banner[hidden] { display: none; }
+.task-cost-modal { position: fixed; inset: 0; z-index: 1600; display: grid; place-items: center; padding: 16px; }
+.task-cost-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .45); }
+.task-cost-dialog { position: relative; display: flex; flex-direction: column; width: min(760px, 100%); max-height: min(90dvh, 940px); min-height: 0; background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: var(--shadow-menu); overflow: hidden; }
+.task-cost-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--border-strong); h2 { font-size: 19px; margin: 0; } }
+.task-cost-content { overflow: auto; min-height: 0; padding: 0 20px 20px; overscroll-behavior: contain; }
+.task-cost-section { padding: 16px 0; border-bottom: 1px solid var(--border-strong); h3 { font-size: 16px; margin: 0 0 10px; } p { margin: 8px 0; overflow-wrap: anywhere; } }
+.task-cost-hint { font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
+.task-cost-button { border: 1px solid var(--border-strong); border-radius: 9px; background: var(--bg-hover); color: var(--text); padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; &:hover { color: var(--tool-icon-pink); background: var(--bg-active); } &:disabled { opacity: .5; cursor: wait; } }
+.task-cost-dialog input, .task-cost-dialog select { box-sizing: border-box; min-width: 0; max-width: 100%; padding: 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+.task-cost-section > select { display: block; margin: 10px 0; width: 100%; }
+.task-cost-field { display: grid; grid-template-columns: minmax(110px, 1fr) 110px minmax(110px, 150px); align-items: center; gap: 8px; margin: 10px 0; font-size: 14px; input:disabled { opacity: .5; } }
+.task-cost-price { display: grid; grid-template-columns: 1fr 150px; gap: 12px; align-items: center; margin: 8px 0; font-size: 14px; }
+.task-cost-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.task-cost-error { margin: 0; padding: 0 20px; color: var(--danger); font-size: 13px; &:not(:empty) { padding-top: 12px; padding-bottom: 12px; } }
+.task-cost-breakdown { font-size: 14px; }
+.task-budget-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 8px 12px; border: 1px solid var(--tool-icon-pink); border-radius: 12px; background: var(--bg-elevated); font-size: 13px; margin-bottom: 6px; }
+#tokenTotal[role="button"] { cursor: pointer; }
+@media (max-width: 600px) {
+  .task-cost-modal { padding: 8px; }
+  .task-cost-dialog { max-height: 94dvh; border-radius: 14px; }
+  .task-cost-header { padding: 12px; h2 { font-size: 17px; } }
+  .task-cost-content { padding: 0 12px 12px; }
+  .task-cost-field { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); span { grid-column: 1 / -1; } }
+  .task-cost-price { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .task-cost-actions > button { flex: 1 1 140px; }
+}

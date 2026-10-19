@@ -46,7 +46,8 @@
     const round = Number(activeRound);
     if (Number.isFinite(round) && round > 0) {
       records.forEach(function (record, index) {
-        if (record.kind === "user" && Number(record.round) === round) activeIndex = index;
+        // 运行中注入的用户引导也属于同一轮，必须从最初提问起裁剪。
+        if (activeIndex < 0 && record.kind === "user" && Number(record.round) === round) activeIndex = index;
       });
       return activeIndex >= 0 ? records.slice(0, activeIndex) : records;
     }
@@ -87,6 +88,7 @@
         ? obj.trigger_context_tokens : null,
       trigger_threshold: obj.trigger_threshold != null
         ? obj.trigger_threshold : null,
+      history_prefix_rounds: obj.history_prefix_rounds,
       target_tokens: obj.target_tokens != null
         ? obj.target_tokens : compactionUsage && compactionUsage.target_tokens,
       budget_scope: obj.budget_scope != null ? obj.budget_scope : "",

@@ -583,6 +583,10 @@ class ContextCompactionTests(unittest.IsolatedAsyncioTestCase):
         # 触发阈值（触发比较基准）与本批预算（压缩批输入预算）分离
         self.assertEqual(done.get("trigger_threshold"), 9_999)
         self.assertEqual(done.get("token_limit"), 2048)
+        start = next(p for p in emitted if p.get("phase") == "start")
+        self.assertEqual(start.get("trigger_reason"), "task")
+        self.assertEqual(start.get("trigger_context_tokens"), 123_456)
+        self.assertEqual(start.get("trigger_threshold"), 9_999)
 
     async def test_small_history_does_not_trigger_session_compaction(self):
         memory = _MemoryStub([{

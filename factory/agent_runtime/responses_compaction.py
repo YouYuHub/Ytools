@@ -43,8 +43,25 @@ async def coordinate(local_call, request, config, *, emitter=None, manual=False,
         lease_acquired = True
         await emit_remote("start")
         reused = bool(responses_store.reusable_compaction_ref(state, has_pending_input=bool(pending_items)))
-        reference = await compact(frozen, config, scope=scope,
-                                  stop=(request.responses_context or {}).get("stop_checker"))
+        from .task_costs import current, ModelMeter, MODEL_METER
+        tracker = current(request)
+        meter = None
+        if tracker and not reused:
+            metered_request = frozen.model_copy(update={"usage_role": "compaction"})
+            meter = ModelMeter(tracker, metered_request, config)
+            await meter.start()
+        meter_token = MODEL_METER.set(meter) if meter else None
+        try:
+            reference = await compact(frozen, config, scope=scope,
+                                      stop=(request.responses_context or {}).get("stop_checker"))
+            if meter:
+                native = (responses_store.load_state(request.session_id, scope).get("last_compaction") or {}).get("usage")
+                meter.feed({"usage": native})
+        finally:
+            if meter:
+                meter.settle()
+                MODEL_METER.reset(meter_token)
+                await tracker.notify()
         if manager is not None:
             updated = responses_store.load_state(request.session_id, scope)
             native_usage = (updated.get("last_compaction") or {}).get("usage") or {}

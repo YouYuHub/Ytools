@@ -101,6 +101,9 @@ class ToolDefinition(BaseModel):
 
 
 class ChatLLMRequest(BaseModel):
+    # Internal accounting labels; never serialized into provider payloads.
+    usage_role: str = Field("main", exclude=True)
+    usage_agent: str = Field("main", exclude=True)
     """用户信息"""
     messages: List[Message]                     # 输入的消息列表，每个消息包含一个角色 role 和内容 content，用于表示对话的上下文。
     max_tokens: int = 8192                      # 指定生成的最大 token 数量

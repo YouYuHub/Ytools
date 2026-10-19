@@ -1018,6 +1018,7 @@
     if (!state.sessionId) {
       state.sessionId = SessionUtils.sanitizeSessionId(SessionUtils.generateSessionId());
       if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
+    if (App.taskCosts) App.taskCosts.noteSessionChanged();
       // 文件变更徽标事件驱动同步（替代旧 2s 轮询看门狗；未变化时零请求）
       if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     }
@@ -1030,6 +1031,7 @@
 
   function startNewChat() {
     sessionOpenSeq++;
+    if (App.resetHistoryView) App.resetHistoryView();
     // 保存当前会话的输入草稿（文本+附件），再进入"待开始"状态
     App.saveSessionDraft();
     // 新对话时结束进行中的语音输入（识别文本不能串写到新对话的输入框）
@@ -1037,6 +1039,7 @@
     // 只进入"待开始"状态，不生成本地 ID；首次发送消息时才由 ensureSessionId() 分配
     state.sessionId = null;
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
+    if (App.taskCosts) App.taskCosts.noteSessionChanged();
     // 清空视图就绪跟踪：新对话不属于任何已打开会话
     readySessionId = "";
     loadingSessionId = "";
@@ -1086,8 +1089,9 @@
   const bulkSelectAllBtn = $("#bulkSelectAllBtn");
   if (bulkSelectAllBtn) bulkSelectAllBtn.addEventListener("click", toggleBulkSelectAll);
 
-  async function openSession(id) {
+  async function openSession(id, options) {
     const seq = ++sessionOpenSeq;
+    if (App.resetHistoryView) App.resetHistoryView();
     // 保存当前会话的输入草稿（文本+附件），再切换到目标会话
     App.saveSessionDraft();
     // 切换会话时结束进行中的语音输入（识别文本不能串写到另一个会话的输入框）
@@ -1095,6 +1099,7 @@
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
+    if (App.taskCosts) App.taskCosts.noteSessionChanged();
     // 视图就绪跟踪：加载期间同会话的重复点击被跳过；本次加载完成前旧的
     // 就绪标记失效（成功/空/异常分支各自落定最终状态）
     loadingSessionId = id;
@@ -1151,8 +1156,9 @@
       if (seq !== sessionOpenSeq) return false;
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
       // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
-      // marker / round_started 回填），无轮次号时回退提问文本 + 引用快照匹配
-      const visibleRecords = active
+      // marker / round_started 回填）。附接流确认能完整重建才裁掉快照；
+      // 旧后端/权限恢复段保留历史，避免只剩附接后的少数工具。
+      const visibleRecords = active && active.replayComplete !== false
         ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText, active.round, active.quotes)
         : parsed.records;
       App.setSessionUsage(parsed.metaUsage);
@@ -1164,12 +1170,12 @@
       } else {
         setEmpty(false);
         chatInner.innerHTML = "";
-        // 不传 replayState：初始打开走分段渲染（末尾 240 条先行，向上滚动
+        // 不传 replayState：初始打开走分段渲染（末尾 120 条先行，向上滚动
         // 加载更早），flushRenderedTail 内部负责贴底
-        App.renderRecords(visibleRecords);
+        App.renderRecords(visibleRecords, options && options.historyMatch ? { historyMatch: options.historyMatch } : undefined);
         restoreActiveStream(id);
         App.rebuildQnav();
-        scrollToBottom(true);
+        if (!(options && options.historyMatch)) scrollToBottom(true);
       }
       // 历史已完整显示：本会话进入就绪态（重复点击侧边栏行不再重载）
       loadingSessionId = "";

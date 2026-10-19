@@ -222,8 +222,11 @@ class PermissionRuntime:
             self.agent_wait_totals[agent] = self.agent_wait_totals.get(agent, 0) + time.monotonic() - started
             self.agent_waits.pop(agent, None)
 
-    def paused_time(self, agent):
-        return self.agent_wait_totals.get(agent, 0) + (time.monotonic() - self.agent_waits[agent] if agent in self.agent_waits else 0)
+    def paused_time(self, agent, *, include_budget=True):
+        budget = getattr(self, "costs", None)
+        return (self.agent_wait_totals.get(agent, 0)
+                + (time.monotonic() - self.agent_waits[agent] if agent in self.agent_waits else 0)
+                + (budget.paused_seconds(agent) if budget and include_budget else 0))
 
     async def authorize(self, calls, servers, originals=None, agent="main"):
         allowed, rejected, requests = [], [], []
@@ -265,6 +268,9 @@ class PermissionRuntime:
                 idx, call, name, args = item
                 store.completed(self.id, agent, call["id"], result)
                 rejected.append({"index": idx, "tool_call": call, "tool_name": name, "tool_args": args, "result": result, "error": None})
+        budget = getattr(self, "costs", None)
+        if budget and allowed:
+            await budget.gate(tools=[agent + ":" + call["id"] for _, call, _, _ in allowed])
         for _, call, name, _ in allowed:
             if name == "read_media":
                 self.media_grants.update(self.plans[(agent, call["id"])]["paths"])

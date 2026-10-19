@@ -16,6 +16,24 @@ function fakeRound(events, usageTotal) {
   return JSON.stringify(line);
 }
 
+test('recordsBeforeActiveRound: 同轮用户引导不能把任务早期工具留在历史中', () => {
+  const records = [{kind:'user',round:1}, {kind:'assistant',round:1},
+    {kind:'user',round:2}, {kind:'tool',round:2}, {kind:'toolResult',round:2},
+    {kind:'user',round:2}, {kind:'tool',round:2}];
+  assert.deepEqual(historyParser.recordsBeforeActiveRound(records, '', 2), records.slice(0,2));
+});
+
+test("parseHistory: 历史前缀压缩保留来源位置与触发阈值，刷新后可解释触发原因", function () {
+  const parsed = historyParser.parseHistory(JSON.stringify({event:'context_compaction',scope:'session',phase:'start',
+    context_summary:'压缩预览',history_prefix_rounds:28,trigger_reason:'first_call',
+    trigger_context_tokens:748261,trigger_threshold:628000,token_limit:60000}));
+  const record=parsed.records.find(r=>r.kind==='compaction');
+  assert.equal(record.history_prefix_rounds,28);
+  assert.equal(record.trigger_reason,'first_call');
+  assert.equal(record.trigger_context_tokens,748261);
+  assert.equal(record.trigger_threshold,628000);
+});
+
 test("parseHistory: 首行 _meta 提取 usage", function () {
   const meta = JSON.stringify({
     _meta: {

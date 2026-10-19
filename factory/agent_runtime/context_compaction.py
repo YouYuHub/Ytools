@@ -1145,6 +1145,7 @@ def _build_summary_request(
         session_id=session_id,
         use_backend_history=False,
         backend_history_rounds=0,
+        usage_role="compaction",
     )
     if isinstance(extra_body, dict) and extra_body:
         request.extra_body = dict(extra_body)
@@ -1665,6 +1666,13 @@ async def _compact_session_history_local(
                     "scope": "session",
                     "phase": "start",
                     "role": "assistant",
+                    "before_tokens": batch_before_tokens,
+                    "token_limit": budget_limit,
+                    "trigger_reason": trigger_reason,
+                    "budget_scope": ("request_history_component" if trigger_reason in {"task", "first_call"} else "history"),
+                    **({"trigger_context_tokens": int(trigger_context_tokens)} if trigger_context_tokens is not None else {}),
+                    **({"trigger_threshold": int(reported_trigger_threshold)} if reported_trigger_threshold is not None else {}),
+                    **({"target_tokens": target_tokens} if target_tokens > 0 else {}),
                     "context_summary": (
                         f"【上下文摘要】（即将压缩 {len(chunk_rounds)} 个旧轮次）\n"
                         f"{_truncate_text_to_token_budget(chunk_source, _COMPACTION_EVENT_EXCERPT_TOKEN_BUDGET)}"
@@ -2243,11 +2251,21 @@ async def _compact_active_round_local(
 
 
 async def compact_session_history_if_needed(session_chat_memory, tool_request, **kwargs):
+    from .history_summary_repair import repair_history_summary_if_needed
+    await repair_history_summary_if_needed(session_chat_memory, tool_request,
+        settings=kwargs.get("settings"), event_emitter=kwargs.get("event_emitter"))
     from .responses_compaction import coordinate
     config = _wire_compaction_config(tool_request)
     emitter = kwargs.pop("event_emitter", None)
+    view_factory = getattr(session_chat_memory, "get_context_compaction_view", None)
+    local_memory = view_factory() if callable(view_factory) else session_chat_memory
     async def local(emit):
-        return await _compact_session_history_local(session_chat_memory, tool_request, event_emitter=emit, **kwargs)
+        return await _compact_session_history_local(local_memory, tool_request, event_emitter=emit, **kwargs)
+    if local_memory is not session_chat_memory:
+        # 历史重发只压缩可见前缀；不能使用含未来轮次的远端窗口或改写全会话摘要。
+        async def emit_prefix(payload):
+            await emitter({**payload, "history_prefix_rounds": local_memory.cutoff - 1})
+        return await local(emit_prefix if emitter is not None else None)
     return await coordinate(local, tool_request, config, emitter=emitter,
                             manual=kwargs.get("trigger_reason") == "manual", manager=session_chat_memory)
 

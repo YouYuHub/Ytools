@@ -82,7 +82,7 @@
     const mine = ++navigating;
     close();
     try {
-      const opened = await App.openSession(match.session_id);
+      const opened = await App.openSession(match.session_id, { historyMatch: match });
       if (opened === false || mine !== navigating || state.sessionId !== match.session_id) return;
       if (match.round_no && App.jumpToHistoryMatch) {
         await App.jumpToHistoryMatch(match, query, function () { return mine === navigating && state.sessionId === match.session_id; });

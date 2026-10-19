@@ -1351,6 +1351,7 @@ async def select_active_chat_model(payload: ChatModelSelection):
 class FrontendTitleRequest(BaseModel):
     """前端触发的标题生成请求体（SSE 流内采集到预览后发起一次）。"""
     session_id: str = Field(..., description="会话 ID")
+    cost_task_id: str | None = Field(None, description="关联原聊天任务的用量账本")
     question_text: str = Field("", description="用户问题文本（截断在前端）")
     model_preview: str = Field("", description="模型输出预览（思考/正文累计前100字符）")
     question_parts: Optional[list[dict[str, Any]]] = Field(
@@ -1378,7 +1379,15 @@ async def generate_session_title_frontend(payload: FrontendTitleRequest):
     from memory.chat_memory import resolve_session_model_selection
     from env_manager import reset_ambient_model_selection, set_ambient_model_selection
 
+    from factory.agent_runtime.task_costs import CURRENT as COST_CONTEXT, BudgetTracker
+    from memory import task_cost_store
     effective_selection, _warnings = resolve_session_model_selection(session_id)
+    cost_token = None
+    if payload.cost_task_id:
+        task = task_cost_store.status(payload.cost_task_id)
+        if not task or task["session_id"] != session_id or task["kind"] != "chat":
+            raise HTTPException(status_code=400, detail="标题计量任务与会话不匹配")
+        cost_token = COST_CONTEXT.set(BudgetTracker(task["id"], session_id))
     ambient_token = set_ambient_model_selection(effective_selection)
     try:
         result = await generate_title_for_frontend(
@@ -1391,6 +1400,8 @@ async def generate_session_title_frontend(payload: FrontendTitleRequest):
         raise HTTPException(status_code=500, detail=f"标题生成失败：{exc}")
     finally:
         reset_ambient_model_selection(ambient_token)
+        if cost_token is not None:
+            COST_CONTEXT.reset(cost_token)
     return JSONResponse(content=result)
 
 

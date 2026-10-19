@@ -93,16 +93,17 @@
   // 用量归一化 / 文案见 FormatUtils（js/format_utils.js）
   function setSessionUsage(usage) {
     state.sessionUsage = FormatUtils.normalizeUsage(usage);
-    state.sessionTotalTokens = state.sessionUsage.total_tokens;
+    const displayedUsage = (App.taskCosts && App.taskCosts.usage()) || state.sessionUsage;
+    state.sessionTotalTokens = displayedUsage.total_tokens;
     const usageText =
-      "<span>" + FormatUtils.fmtNum(state.sessionUsage.total_tokens) + " tokens</span>" +
-      "<span>输入 " + FormatUtils.fmtNum(state.sessionUsage.prompt_tokens) +
-      " · 输出 " + FormatUtils.fmtNum(state.sessionUsage.completion_tokens) + "</span>";
+      "<span>" + FormatUtils.fmtNum(displayedUsage.total_tokens) + " tokens</span>" +
+      "<span>输入 " + FormatUtils.fmtNum(displayedUsage.prompt_tokens) +
+      " · 输出 " + FormatUtils.fmtNum(displayedUsage.completion_tokens) + "</span>";
     tokenTotal.innerHTML = usageText;
-    tokenTotal.classList.toggle("hidden", !state.sessionUsage.total_tokens);
+    tokenTotal.classList.toggle("hidden", !displayedUsage.total_tokens);
     if (sessionMenuUsage && sessionMenuUsageValues) {
       sessionMenuUsageValues.innerHTML = usageText;
-      sessionMenuUsage.classList.toggle("hidden", !state.sessionUsage.total_tokens);
+      sessionMenuUsage.classList.toggle("hidden", !displayedUsage.total_tokens);
     }
   }
 

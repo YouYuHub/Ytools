@@ -449,6 +449,9 @@ class SubAgentRunner:
         self._permission_resume = None
         self._permission_replaying = False
         if self.permission_runtime:
+            budget = getattr(self.permission_runtime, "costs", None)
+            if budget:
+                budget.register_agent(context.agent_id)
             from memory.permission_store import load_checkpoint
             self._permission_resume = load_checkpoint(self.permission_runtime.id, context.agent_id)
             if self._permission_resume:
@@ -659,6 +662,8 @@ class SubAgentRunner:
             # 请求里不出现该 schema，模型就无从知道并调用）
             tools=self._visible_tool_definitions() or None,
             session_id=self.context.session_id,
+            usage_role="sub_agent",
+            usage_agent=self.context.agent_id,
             responses_context=self._responses_context,
         )
         request.responses_context = self._responses_context

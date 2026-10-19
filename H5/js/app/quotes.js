@@ -284,7 +284,8 @@
       });
       const head = el("span", "composer-quote-head");
       head.appendChild(el("span", "composer-quote-badge", "引用 " + (index + 1)));
-      const label = QuoteUtils.quoteSourceLabel(quote.source);
+      const label = QuoteUtils.quoteSourceLabel(App.quoteSourceDisplay
+        ? App.quoteSourceDisplay(quote.source, quote.text) : quote.source);
       if (label) head.appendChild(el("span", "composer-quote-source", label));
       jump.appendChild(head);
       jump.appendChild(el("span", "composer-quote-text", quote.text));
@@ -341,6 +342,23 @@
   }
 
   // ---------- 气泡引用卡片（历史回放 / 实时发送共用） ----------
+  let activeQuotePopover = null;
+  let quotePopoverFrame = 0;
+  function scheduleQuotePopoverClamp() {
+    if (!activeQuotePopover || quotePopoverFrame) return;
+    quotePopoverFrame = window.requestAnimationFrame(function () {
+      quotePopoverFrame = 0;
+      const active = activeQuotePopover;
+      if (active && active.tile.isConnected) clampQuotePopover(active.tile, active.popover);
+    });
+  }
+  window.addEventListener("resize", scheduleQuotePopoverClamp);
+  window.addEventListener("sidebarresizeend", scheduleQuotePopoverClamp);
+  if (chatScroll) chatScroll.addEventListener("scroll", scheduleQuotePopoverClamp, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", scheduleQuotePopoverClamp);
+    window.visualViewport.addEventListener("scroll", scheduleQuotePopoverClamp);
+  }
   /**
    * 浮层视口钳制（与 CSS 默认展开方向互补）：
    * - 垂直：默认向下展开；消息靠近聊天区底部、下方放不下（会被 .chat-scroll
@@ -355,31 +373,40 @@
     popover.style.left = "";
     popover.style.right = "";
     popover.style.maxHeight = "";
+    popover.style.maxWidth = "";
     if (!popover.getBoundingClientRect) return;
+    const margin = 8;
+    const viewport = window.visualViewport;
+    const viewLeft = viewport ? viewport.offsetLeft : 0;
+    const viewTop = viewport ? viewport.offsetTop : 0;
+    const scrollRect = chatScroll && chatScroll.getBoundingClientRect
+      ? chatScroll.getBoundingClientRect() : null;
+    const contentLeft = scrollRect ? scrollRect.left + (chatScroll.clientLeft || 0) : 0;
+    const contentRight = scrollRect && chatScroll.clientWidth
+      ? contentLeft + chatScroll.clientWidth : scrollRect ? scrollRect.right : window.innerWidth;
+    const left = Math.max(viewLeft, contentLeft) + margin;
+    const right = Math.min(viewLeft + (viewport ? viewport.width : window.innerWidth),
+      contentRight) - margin;
+    const top = Math.max(viewTop, scrollRect ? scrollRect.top : 0) + margin;
+    const bottom = Math.min(viewTop + (viewport ? viewport.height : window.innerHeight),
+      scrollRect ? scrollRect.bottom : window.innerHeight) - margin;
+    popover.style.maxWidth = Math.max(0, right - left) + "px";
     const rect = popover.getBoundingClientRect();
     if (!rect || (!rect.width && !rect.height)) return; // 尚未显示，无需钳制
-    const margin = 8;
-    if (chatScroll && chatScroll.getBoundingClientRect && tile.getBoundingClientRect) {
-      const scrollRect = chatScroll.getBoundingClientRect();
+    if (tile.getBoundingClientRect) {
       const tileRect = tile.getBoundingClientRect();
       const gap = 7; // 浮层与 tile 的间距（与 CSS top/bottom 的 7px 对齐）
-      const spaceBelow = scrollRect.bottom - margin - tileRect.bottom - gap;
-      const spaceAbove = tileRect.top - scrollRect.top - margin - gap;
+      const spaceBelow = bottom - tileRect.bottom - gap;
+      const spaceAbove = tileRect.top - top - gap;
       if (rect.height > spaceBelow && spaceAbove > spaceBelow) {
         tile.classList.add("is-flipped");
-        if (rect.height > spaceAbove && spaceAbove > 80) {
-          popover.style.maxHeight = Math.floor(spaceAbove) + "px";
-        }
-      } else if (rect.height > spaceBelow && spaceBelow > 80) {
-        popover.style.maxHeight = Math.floor(spaceBelow) + "px";
       }
+      popover.style.maxHeight = Math.max(0, Math.floor(Math.min(300,
+        tile.classList.contains("is-flipped") ? spaceAbove : spaceBelow))) + "px";
     }
-    // 翻转只改变垂直位置，不影响水平 left/right，直接用同一份 rect 钳制。
-    const overflowLeft = margin - rect.left;
-    if (overflowLeft <= 0) return;
-    const maxShift = (window.innerWidth - margin) - rect.right;
-    const shift = Math.min(overflowLeft, Math.max(0, maxShift));
-    if (shift <= 0) return;
+    // 同时处理左右越界；聊天区左侧可能有展开或收起的侧栏，不能按视口 0 计算。
+    const shift = Math.max(left - rect.left, Math.min(0, right - rect.right));
+    if (!shift) return;
     // offsetParent 即 tile（position:relative），offsetLeft 相对 tile 计算。
     popover.style.left = (popover.offsetLeft + shift) + "px";
     popover.style.right = "auto";
@@ -390,6 +417,7 @@
     popover.style.left = "";
     popover.style.right = "";
     popover.style.maxHeight = "";
+    popover.style.maxWidth = "";
   }
 
   /** 构造用户气泡中的引用卡片列表；无有效引用返回 null。 */
@@ -422,7 +450,8 @@
       });
       const head = el("span", "msg-quote-head");
       head.appendChild(el("span", "msg-quote-badge", "引用 " + (index + 1)));
-      const label = QuoteUtils.quoteSourceLabel(quote.source);
+      const label = QuoteUtils.quoteSourceLabel(App.quoteSourceDisplay
+        ? App.quoteSourceDisplay(quote.source, quote.text) : quote.source);
       if (label) head.appendChild(el("span", "msg-quote-source", label));
       jump.appendChild(head);
       jump.appendChild(el("span", "msg-quote-text", quote.text));
@@ -433,15 +462,23 @@
     // 浮层显示后做一次视口钳制（rAF 等 CSS :hover/:focus-within 生效后再测量）；
     // 隐藏时清除内联位移，恢复 CSS 默认右对齐。
     tile.addEventListener("mouseenter", function () {
-      window.requestAnimationFrame(function () { clampQuotePopover(tile, popover); });
+      activeQuotePopover = { tile: tile, popover: popover };
+      scheduleQuotePopoverClamp();
     });
     tile.addEventListener("focusin", function () {
-      window.requestAnimationFrame(function () { clampQuotePopover(tile, popover); });
+      activeQuotePopover = { tile: tile, popover: popover };
+      scheduleQuotePopoverClamp();
     });
-    tile.addEventListener("mouseleave", function () { resetQuotePopover(tile, popover); });
+    function hidePopover() {
+      if (activeQuotePopover && activeQuotePopover.tile === tile) activeQuotePopover = null;
+      resetQuotePopover(tile, popover);
+    }
+    tile.addEventListener("mouseleave", function () {
+      if (!tile.contains(document.activeElement)) hidePopover();
+    });
     tile.addEventListener("focusout", function (e) {
       if (e.relatedTarget && tile.contains(e.relatedTarget)) return;
-      resetQuotePopover(tile, popover);
+      if (!tile.matches(":hover")) hidePopover();
     });
     wrap.appendChild(tile);
     return wrap;

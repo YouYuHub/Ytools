@@ -136,7 +136,7 @@ function harness() {
   const activeStream = { round: 2 };
   const pipe = context.createStreamPipeline(msg, 's', activeStream);
   return {
-    pipe, chatInner, msg, activeStream, state: context.state, builtTools, builtThinks,
+    pipe, chatInner, msg, activeStream, context, state: context.state, builtTools, builtThinks,
     send: data => pipe.handle({ data }),
     toolsIn: root => queryAll(root, '.tool-block'),
     textsIn: root => queryAll(root, '.msg-assistant-body'),
@@ -167,6 +167,20 @@ function historyRound(h, round) {
   for (const node of [user, text, think, tool]) h.chatInner.insertBefore(node, h.msg);
   return { user, text, think, tool, historyUi };
 }
+
+test('完整任务回放保留旧提问卡但不反复自动弹窗，实时提问仍弹窗', () => {
+  const h=harness();let opened=0;
+  h.context.App.buildAskBlock=()=>makeNode('div','ask-block');
+  h.context.App.refreshAskBlockStates=()=>{};
+  h.context.App.openAskModal=()=>opened++;
+  h.pipe.setReplayWindow(true);
+  h.send({event:'ask_user',questions:[{question:'旧提问'}]});
+  assert.equal(opened,0);
+  h.pipe.setReplayWindow(false);
+  h.send({event:'ask_user',questions:[{question:'新提问'}]});
+  assert.equal(opened,1);
+  assert.equal(h.msg.querySelectorAll('.ask-block').length,2);
+});
 
 test('刷新附接流收养同轮历史 usage 行，并随新快照更新', () => {
   const h = harness();
@@ -199,6 +213,21 @@ test('附接标记的累计用量在历史行缺失、回放无 usage 时仍显�
   assert.equal(h.chatInner.querySelector('.round-usage[data-round="2"]').textContent, '15');
   h.pipe.finish();
   assert.equal(h.chatInner.querySelector('.round-usage[data-round="2"]').textContent, '15');
+});
+
+test('实时轮次摘要保存结构化模型和用量快照，供任务用量展示使用', () => {
+  const h = harness();
+  const first = {provider:'p',name:'first'};
+  h.pipe.setRoundModel(first);
+  const line = h.chatInner.querySelector('.round-usage[data-round="2"]');
+  assert.equal(line._roundModelSnapshot, first);
+  h.send({id:'completion-1',usage:{total_tokens:20}});
+  assert.equal(line._roundUsageSnapshot.total_tokens, 20);
+  const second = {provider:'p',name:'second'};
+  h.pipe.setRoundModel(second);
+  assert.equal(line._roundModelSnapshot, second);
+  assert.equal(line._roundUsageSnapshot.total_tokens, 20);
+  h.pipe.finish();
 });
 
 test('后端绝对累计优先于不完整的 usage 回放，并接收后续增长', () => {

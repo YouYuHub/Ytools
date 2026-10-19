@@ -383,6 +383,7 @@ window.App = window.App || {};
   }
 
   function scrollToBottom(instant) {
+    if (App.showHistoryTail) App.showHistoryTail();
     autoScrollPaused = false;
     cancelBottomCorrection();
     const prev = instant ? chatScroll.style.scrollBehavior : null;
@@ -578,6 +579,9 @@ window.App = window.App || {};
   let sidebarResizePointer = null;
   let sidebarResizeStartWidth = SIDEBAR_DEFAULT_WIDTH;
   let sidebarResizeStartCollapsed = false;
+  let sidebarResizeMetrics = null;
+  let sidebarResizeFrame = null;
+  let sidebarResizeX = null;
 
   try {
     const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
@@ -607,9 +611,10 @@ window.App = window.App || {};
     const width = clampSidebarWidth(sidebarPreferredWidth);
     const collapsed = sidebar.classList.contains("collapsed");
     document.documentElement.style.setProperty("--sidebar-width", width + "px");
-    sidebarResizeHandle.setAttribute("aria-valuemin", String(sidebarRailWidth()));
+    const rail = sidebarResizeMetrics ? sidebarResizeMetrics.rail : sidebarRailWidth();
+    sidebarResizeHandle.setAttribute("aria-valuemin", String(rail));
     sidebarResizeHandle.setAttribute("aria-valuemax", String(sidebarWidthLimit()));
-    sidebarResizeHandle.setAttribute("aria-valuenow", String(collapsed ? sidebarRailWidth() : width));
+    sidebarResizeHandle.setAttribute("aria-valuenow", String(collapsed ? rail : width));
     sidebarResizeHandle.setAttribute("aria-valuetext", collapsed ? "已收起" : width + " 像素");
   }
 
@@ -620,6 +625,10 @@ window.App = window.App || {};
   function finishSidebarResize(commit) {
     if (sidebarResizePointer === null) return;
     const pointerId = sidebarResizePointer;
+    if (sidebarResizeFrame !== null) cancelAnimationFrame(sidebarResizeFrame);
+    sidebarResizeFrame = null;
+    if (commit && sidebarResizeX !== null) applySidebarPointer();
+    sidebarResizeX = null;
     if (!commit) {
       sidebarPreferredWidth = sidebarResizeStartWidth;
       setSidebarCollapsed(sidebarResizeStartCollapsed);
@@ -630,6 +639,8 @@ window.App = window.App || {};
       sidebarResizeHandle.releasePointerCapture(pointerId);
     }
     applySidebarWidth();
+    sidebarResizeMetrics = null;
+    window.dispatchEvent(new Event("sidebarresizeend"));
     if (commit) saveSidebarWidth();
   }
 
@@ -644,13 +655,17 @@ window.App = window.App || {};
     sidebarResizePointer = event.pointerId;
     sidebarResizeStartWidth = sidebarPreferredWidth;
     sidebarResizeStartCollapsed = sidebar.classList.contains("collapsed");
+    sidebarResizeMetrics = { left: sidebar.getBoundingClientRect().left,
+      rail: sidebarRailWidth(), threshold: sidebarCollapseThreshold() };
     if (sidebarResizeHandle.setPointerCapture) sidebarResizeHandle.setPointerCapture(event.pointerId);
     document.body.classList.add("sidebar-resizing");
   });
-  window.addEventListener("pointermove", function (event) {
-    if (event.pointerId !== sidebarResizePointer) return;
-    const width = event.clientX - sidebar.getBoundingClientRect().left - 1;
-    const threshold = sidebarCollapseThreshold();
+  function applySidebarPointer() {
+    sidebarResizeFrame = null;
+    if (sidebarResizePointer === null || sidebarResizeX === null) return;
+    // 拖动起点的左边缘/阈值固定；移动过程中只写宽度，避免每次事件先强制布局。
+    const width = sidebarResizeX - sidebarResizeMetrics.left - 1;
+    const threshold = sidebarResizeMetrics.threshold;
     // 迟滞 8px，防止指针停在阈值附近时侧栏来回闪烁。
     if (sidebar.classList.contains("collapsed")) {
       if (width >= threshold + 8) setSidebarCollapsed(false);
@@ -661,6 +676,11 @@ window.App = window.App || {};
       sidebarPreferredWidth = clampSidebarWidth(width);
       applySidebarWidth();
     }
+  }
+  window.addEventListener("pointermove", function (event) {
+    if (event.pointerId !== sidebarResizePointer) return;
+    sidebarResizeX = event.clientX;
+    if (sidebarResizeFrame === null) sidebarResizeFrame = requestAnimationFrame(applySidebarPointer);
   });
   window.addEventListener("pointerup", function (event) {
     if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
@@ -893,10 +913,17 @@ responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulCon
         ? requestAnimationFrame : function (fn) { return setTimeout(fn, 16); };
       defer(function () {
         queued = false;
+        if (document.body.classList.contains("sidebar-resizing")) return;
         chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(function (c) {
           fitAttachmentBlockGrid(c);
         });
       });
     }).observe(chatInner);
+    window.addEventListener("sidebarresizeend", function () {
+      lastWidth = chatInner.clientWidth || 0;
+      chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(function (c) {
+        fitAttachmentBlockGrid(c);
+      });
+    });
   })();
 })(window.App);

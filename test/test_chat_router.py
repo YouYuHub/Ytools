@@ -36,6 +36,12 @@ class ChatRouterTests(unittest.TestCase):
         captured = []
 
         class ManagerStub:
+            async def get_file_text(self):
+                return ""
+
+            async def get_session_meta(self):
+                return {"usage": {}}
+
             async def get_context_token_stats(self, **_kwargs):
                 return {"request_context_tokens": 5000, "messages_tokens": 5000}
 
@@ -83,6 +89,12 @@ class ChatRouterTests(unittest.TestCase):
         class ManagerStub:
             async def get_context_token_stats(self, **_kwargs):
                 return {"request_context_tokens": 100, "messages_tokens": 100}
+
+            async def get_file_text(self):
+                return ""
+
+            async def get_session_meta(self):
+                return {"usage": {}}
 
         manager = ManagerStub()
 

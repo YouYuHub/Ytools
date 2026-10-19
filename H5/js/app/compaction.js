@@ -134,6 +134,10 @@
       await API.compactContextStream(compactSessionId, function (evt) {
         if (!evt || evt.type === "done") return;
         const data = evt.data || {};
+        if (data.event === "task_usage") {
+          if (App.taskCosts && state.sessionId === compactSessionId) App.taskCosts.event(data);
+          return;
+        }
         // 用户切走后的压缩事件不渲染进其他会话视图；切回后由 done/统计刷新呈现
         const inCompactView = state.sessionId === compactSessionId;
         if (data.event === "responses_compaction") {

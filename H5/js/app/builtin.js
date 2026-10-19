@@ -403,6 +403,12 @@
         break;
       }
     }
+    // 搜索只挂载命中附近的消息；后续提问可能尚未进入 DOM。
+    const later = App.historyQuestionAfterRound && App.historyQuestionAfterRound(askRound);
+    if (later) {
+      hasLaterRounds = true;
+      hasExistingAnswer = later.text.indexOf("【回答模型提问】") === 0;
+    }
     if (!hasLaterRounds) {
       // 提问是最新轮次：回答直接发送（插入点在末尾，等价追加，无需确认）
       App.send({ text: text, insertAfterRound: askRound });

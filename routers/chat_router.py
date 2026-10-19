@@ -1162,33 +1162,35 @@ async def compact_chat_context_manual(
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
-            "messages": [],
-            "session_id": session_id,
-            "tools": list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
-        }))
-        compressed_rounds = await compact_session_history_if_needed(
-            manager,
-            tool_request,
-            budget_tokens=manual_budget_tokens,
-            # 用户已在确认框中明确触发手动压缩：全量把已完成轮次纳入累计摘要
-            # （历史轮次窗口已废弃，无自动压缩保护需要放宽）。
-            enforce=True,
-            force_all=True,
-            # 手动压缩无 SSE 流可推，仅落盘同一结构的事件行，历史加载时可见
-            event_emitter=lambda payload: manager.add_context_compaction_event(payload),
-            # 触发来源 = 用户手动触发
-            trigger_reason="manual",
-        )
-        stats = await manager.get_context_token_stats(
-            tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
-        )
-        return JSONResponse(content={
-            "state": "succeed",
-            "session_id": session_id,
-            "compressed_rounds": compressed_rounds,
-            "stats": stats,
-        })
+        from factory.agent_runtime.task_costs import auxiliary_task
+        async with auxiliary_task(session_id, manager):
+            tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
+                "messages": [],
+                "session_id": session_id,
+                "tools": list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
+            }))
+            compressed_rounds = await compact_session_history_if_needed(
+                manager,
+                tool_request,
+                budget_tokens=manual_budget_tokens,
+                # 用户已在确认框中明确触发手动压缩：全量把已完成轮次纳入累计摘要
+                # （历史轮次窗口已废弃，无自动压缩保护需要放宽）。
+                enforce=True,
+                force_all=True,
+                # 手动压缩无 SSE 流可推，仅落盘同一结构的事件行，历史加载时可见
+                event_emitter=lambda payload: manager.add_context_compaction_event(payload),
+                # 触发来源 = 用户手动触发
+                trigger_reason="manual",
+            )
+            stats = await manager.get_context_token_stats(
+                tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
+            )
+            return JSONResponse(content={
+                "state": "succeed",
+                "session_id": session_id,
+                "compressed_rounds": compressed_rounds,
+                "stats": stats,
+            })
     except ChatModelConfigurationError as exc:
         raise HTTPException(status_code=400, detail=f"压缩模型配置无效: {exc}")
     except HTTPException as e:
@@ -1241,10 +1243,23 @@ async def _manual_compaction_event_stream(
         except Exception:
             effective_selection = None
         ambient_token = set_ambient_model_selection(effective_selection)
+        from memory import task_cost_store
+        from factory.agent_runtime.task_costs import CURRENT as COST_CONTEXT, BudgetTracker
+        cost_task_id = None
+        cost_token = None
+        cost_stopped = False
         try:
             if precheck_error:
                 result["error"] = precheck_error
                 return
+            cost_task_id = "manual_compaction_" + uuid.uuid4().hex
+            baseline = None
+            if not task_cost_store.has_session(session_id):
+                baseline = task_cost_store.legacy_baseline(await manager.get_file_text(), await manager.get_session_meta())
+            task_cost_store.create_task(cost_task_id, session_id, baseline=baseline, kind="manual_compaction")
+            cost_tracker = BudgetTracker(cost_task_id, session_id, lambda: cost_stopped, queue.put)
+            cost_token = COST_CONTEXT.set(cost_tracker)
+            await cost_tracker.notify()
             tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
                 "messages": [],
                 "session_id": session_id,
@@ -1289,6 +1304,12 @@ async def _manual_compaction_event_stream(
         except Exception as exc:
             result["error"] = str(exc)
         finally:
+            cost_stopped = True
+            if cost_task_id:
+                existing = task_cost_store.status(cost_task_id)
+                task_cost_store.finish(cost_task_id, "cancelled" if existing and existing["state"] == "cancelled" else "failed" if result.get("error") else "completed")
+            if cost_token is not None:
+                COST_CONTEXT.reset(cost_token)
             reset_ambient_model_selection(ambient_token)
             await queue.put(sentinel)
 

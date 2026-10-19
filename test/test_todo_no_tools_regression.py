@@ -60,6 +60,12 @@ class _MemoryStub:
         self.records = []
         self.todos = []
 
+    async def get_file_text(self):
+        return ""
+
+    async def get_session_meta(self):
+        return {"usage": {}}
+
     async def add_chat_history(self, record=None, *, input_text=None):
         if input_text is not None:
             record = input_text

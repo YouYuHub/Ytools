@@ -31,3 +31,17 @@ test('自定义回答支持多行长文本并完整提交', () => {
   context.handleAskSubmit();
   assert.ok(submitted.endsWith(text));
 });
+
+test('搜索窗口外已有回答时仍先确认处理方式', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/builtin.js'), 'utf8');
+  const confirmed = [], sent = [];
+  const chatInner = { children: [] };
+  const block = { isConnected:true, getAttribute:()=>'20', parentElement:chatInner };
+  const context = { chatInner, App: { historyQuestionAfterRound:()=>({round:21,text:'【回答模型提问】\n已回答'}), send:data=>sent.push(data) },
+    showAskAnswerConfirm:(...args)=>confirmed.push(args) };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('  function submitAskAnswer('),source.indexOf('  function showAskAnswerConfirm(')),context);
+  context.submitAskAnswer('新回答',block);
+  assert.equal(sent.length,0);
+  assert.deepEqual(confirmed,[['新回答',20,true]]);
+});

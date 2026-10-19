@@ -825,6 +825,7 @@ def _resolve_model_selection_override(
 from memory.chat_history_format import (
     normalize_context_summary as _normalize_context_summary,
     adjust_context_summary_for_deleted_rounds as _adjust_summary_for_deleted_rounds,
+    mark_context_summary_for_repair as _mark_summary_for_repair,
     shift_context_summary_for_inserted_round as _shift_summary_for_inserted_round,
     render_context_summary as _render_context_summary,
     render_recent_questions_message as _render_recent_questions_message,
@@ -1160,6 +1161,41 @@ def _delete_path_with_retry(path: Path, *, recursive: bool = False, attempts: in
             time.sleep(0.01 * (attempt + 1))
 
 
+class _HistoryPrefixCompactionView:
+    """编辑/插入任务的压缩视图：只读取允许的历史，摘要仅在本任务内生效。"""
+
+    def __init__(self, manager, cutoff: int):
+        self.manager = manager
+        self.cutoff = cutoff
+
+    def __getattr__(self, name):
+        return getattr(self.manager, name)
+
+    async def get_chat_history(self):
+        entries = await self.manager.get_chat_history()
+        rounds = [entry for entry in entries if isinstance(entry, dict) and entry.get("event") == "chat_round"]
+        return rounds[:self.cutoff - 1]
+
+    async def get_context_summary(self):
+        override = self.manager._prefix_context_summary
+        if override is not None and override[0] == self.cutoff:
+            return copy.deepcopy(override[1])
+        meta, _entries = self.manager._load_for_read()
+        summary = _normalize_context_summary(meta.get("context_summary"))
+        count = int((summary or {}).get("source_round_count", 0) or 0)
+        if _normalize_context_summary_raw_rounds(meta.get("context_summary_raw_rounds"), count):
+            # 摘要内被编辑过的轮次必须重新纳入本次前缀摘要，不能沿用旧事实。
+            return None
+        # 无来源游标或覆盖目标位置以后的摘要，不能用于历史前缀。
+        return summary if 0 < count < self.cutoff else None
+
+    async def update_context_summary(self, summary):
+        self.manager._prefix_context_summary = (
+            self.cutoff, _normalize_context_summary(copy.deepcopy(summary)),
+        )
+        return "任务历史摘要已更新"
+
+
 class ChatMemoryManager:
     """工具调用历史管理器 - 持久化到文件，支持多会话隔离"""
 
@@ -1177,6 +1213,7 @@ class ChatMemoryManager:
         self._insert_round_number: int | None = None
         # 历史构建截断点（原地重跑时上下文只取第 N-1 轮及以前）
         self._history_cutoff_rounds: int | None = None
+        self._prefix_context_summary: tuple[int, dict[str, Any] | None] | None = None
         if read_only:
             if not self._file_path.is_file():
                 raise FileNotFoundError(self._file_path)
@@ -1318,9 +1355,9 @@ class ChatMemoryManager:
         完成后自动复位为 None。设置无效值（非正整数）按 None 处理。
         与回答插入模式（set_insert_round）互斥：设置一方会清掉另一方。
 
-        若目标轮已被跨轮摘要覆盖，保留压缩时的摘要快照及压缩事件；轮次
-        替换写入后，将该轮加入原文补充索引。编辑请求本身只取目标轮之前的
-        历史，不会把旧摘要中目标轮之后的内容带入本次请求。
+        编辑请求只取目标轮之前的历史，不把旧摘要中目标轮之后的内容带入请求。
+        替换写入后，受影响的摘要块延迟重建，未受影响块保留；原始压缩事件
+        仍供界面审计。原文补充索引在对应摘要块修复成功后清除。
         """
         try:
             normalized = int(target_round) if target_round is not None else None
@@ -1330,6 +1367,7 @@ class ChatMemoryManager:
             normalized = None
         self._target_round_number = normalized
         self._history_cutoff_rounds = normalized
+        self._prefix_context_summary = None
         if normalized is not None:
             self._insert_round_number = None
 
@@ -1350,6 +1388,7 @@ class ChatMemoryManager:
         # 内容才能作答。截断口径 [:cutoff-1] 与 target_round 共用（后者截到
         # 第 N-1 轮），这里 +1 表示保留前 N 轮（提问轮及其之前）。
         self._history_cutoff_rounds = normalized + 1 if normalized is not None else None
+        self._prefix_context_summary = None
         if normalized is not None:
             self._target_round_number = None
 
@@ -1528,8 +1567,7 @@ class ChatMemoryManager:
                             old_round.get("started_at") or completed_round.get("started_at")
                         )
                     # 用户消息已编辑或原样重跑：一律整轮替换原条目（新轮插回原位置）。
-                    # 摘要保持压缩时快照；若本轮已被覆盖，追加原文补充索引，
-                    # 使后续请求同时看到编辑后的完整轮次。
+                    # 已覆盖本轮的摘要块隔离待重建；未受影响摘要保留。
                     # 锚定到本轮次的跨轮压缩行（重跑期间独立落盘、通常位于文件
                     # 尾部）重排到替换位置之前，保持「压缩行先于其锚定轮次行」的
                     # 行序契约（见 _relocate_anchored_compaction_rows）
@@ -1537,6 +1575,9 @@ class ChatMemoryManager:
                         entries, target_round, replace_index
                     )
                     entries[replace_index] = completed_round
+                    meta["context_summary"] = _mark_summary_for_repair(
+                        meta.get("context_summary"), [target_round], total_rounds=len(round_positions)
+                    )
                     _add_context_summary_raw_round(meta, target_round)
                     self._target_round_number = None
                     self._history_cutoff_rounds = None
@@ -1575,6 +1616,8 @@ class ChatMemoryManager:
                 else:
                     # 正常追加语义：新收尾轮次挂到末尾
                     entries.append(completed_round)
+                if target_round is not None or insert_round is not None:
+                    self._invalidate_remote_history(meta, "历史编辑/插入已完成，按完整本地历史重新建立链")
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
                 if replaced_round is not None:
@@ -1695,10 +1738,13 @@ class ChatMemoryManager:
                         entries, target_round, replace_index
                     )
                     entries[replace_index] = completed_round
+                    meta["context_summary"] = _mark_summary_for_repair(
+                        meta.get("context_summary"), [target_round], total_rounds=len(round_positions)
+                    )
                     _add_context_summary_raw_round(meta, target_round)
                     self._target_round_number = None
                     self._history_cutoff_rounds = None
-                    # 中断收尾与正常收尾同口径：摘要快照保留，编辑轮以原文补充。
+                    # 中断与正常收尾同口径：受影响摘要块待重建。
                     self._backup_history_file()
                 elif insert_round is not None:
                     # 回答插入（ask_user 卡片再答）：中断收尾同样插入第 N 轮之后。
@@ -1725,6 +1771,8 @@ class ChatMemoryManager:
                     self._backup_history_file()
                 else:
                     entries.append(completed_round)
+                if target_round is not None or insert_round is not None:
+                    self._invalidate_remote_history(meta, "历史编辑/插入已停止，按完整本地历史重新建立链")
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
                 if replaced_round is not None:
@@ -1784,9 +1832,10 @@ class ChatMemoryManager:
             deleted_round_numbers = list(range(ask_round_number + 1, total_rounds + 1))
             _adjust_context_summary_raw_rounds_for_deleted(meta, deleted_round_numbers)
             meta["context_summary"] = _adjust_summary_for_deleted_rounds(
-                meta.get("context_summary"), deleted_round_numbers
+                meta.get("context_summary"), deleted_round_numbers, total_rounds=total_rounds
             )
             entries = entries[:ask_idx + 1]
+            self._invalidate_remote_history(meta, "覆盖式重新回答已截断历史")
             meta = _recompute_meta_from_entries(self.session_id, meta, entries)
             _write_meta_and_entries(self._file_path, meta, entries)
             return len(removed)
@@ -2077,10 +2126,9 @@ class ChatMemoryManager:
 
             # 破坏性写盘前留 .bak 侧车备份（sidecars/ 子目录，与 .tmp 原子写同目录），误删可手动恢复
             self._backup_history_file()
-            # 累计摘要不整体作废：按删除位置平移游标（source_round_count）、
-            # 摘要块覆盖范围与保真问题索引的轮次编号，摘要继续生效。
-            # 丢弃摘要会让下轮上下文退化为原始轮次回传，大会话直接超窗
-            # （删除只影响编号锚点，不影响摘要正文承载的历史事实）
+            # 累计摘要不整体作废：未受影响块保留；混合块隔离待重建；整块
+            # 已删除则移除，同时平移游标和问题索引。下一次请求先重建受影响
+            # 块，不能发送旧事实，也不能通过清空摘要退化为原文全量回传。
             deleted_round_numbers = (
                 list(range(start_round, total_rounds + 1))
                 if mode == "truncate"
@@ -2088,14 +2136,9 @@ class ChatMemoryManager:
             )
             _adjust_context_summary_raw_rounds_for_deleted(meta, deleted_round_numbers)
             meta["context_summary"] = _adjust_summary_for_deleted_rounds(
-                meta.get("context_summary"), deleted_round_numbers
+                meta.get("context_summary"), deleted_round_numbers, total_rounds=total_rounds
             )
-            if meta.get("responses_state"):
-                from chat.protocols.responses_store import invalidate, public_state
-                remote = invalidate(self.session_id, "历史轮次已删除", mirror=False)
-                meta["responses_state"] = public_state(remote, include_ids=True)
-                meta["context_summary"] = None
-                meta["context_summary_raw_rounds"] = []
+            self._invalidate_remote_history(meta, "历史轮次已删除")
             meta = _recompute_meta_from_entries(self.session_id, meta, remaining_entries)
             _write_meta_and_entries(self._file_path, meta, remaining_entries)
             return {
@@ -2655,6 +2698,65 @@ class ChatMemoryManager:
                     return exchange[i:i + 2]
         return []
 
+    def get_context_compaction_view(self):
+        cutoff = self._history_cutoff_rounds
+        return _HistoryPrefixCompactionView(self, cutoff) if cutoff is not None else self
+
+    def _context_summary_for_request(self, meta):
+        override = self._prefix_context_summary
+        if override is not None and override[0] == self._history_cutoff_rounds:
+            return copy.deepcopy(override[1])
+        return _normalize_context_summary(meta.get("context_summary"))
+
+    def _context_raw_rounds_for_request(self, meta):
+        override = self._prefix_context_summary
+        if override is not None and override[0] == self._history_cutoff_rounds:
+            # 本任务摘要已基于当前位置的完整前缀重建，不应再次注入旧摘要的补充原文。
+            return []
+        return meta.get("context_summary_raw_rounds")
+
+    def _invalidate_remote_history(self, meta, reason):
+        """在本地历史提交前断开远端链；不删除本地摘要，避免整段原文回传。"""
+        from chat.protocols.responses_store import load_state, invalidate, public_state
+        state = load_state(self.session_id)
+        if meta.get("responses_state") or any(state.get(key) for key in (
+            "head_response_id", "pending_request_ref", "pending_compaction_ref"
+        )):
+            state = invalidate(self.session_id, reason, mirror=False)
+            meta["responses_state"] = public_state(state, include_ids=True)
+
+    def get_summary_repair_snapshot(self):
+        # 正常续聊只读首行；不要为了检查一个标记反复解析大会话全部工具轨迹。
+        meta = _read_meta_first_line(self._file_path)
+        if meta is not None:
+            summary = meta.get("context_summary")
+            blocks = summary.get("blocks", []) if isinstance(summary, dict) else []
+            if not any(isinstance(b, dict) and b.get("repair_required") for b in blocks):
+                return None
+        meta, entries = self._load_for_read()
+        summary = _normalize_context_summary(meta.get("context_summary"))
+        if not any(block.get("repair_required") for block in (summary or {}).get("blocks", [])):
+            return None
+        rounds = [entry for entry in entries if entry.get("event") == "chat_round"]
+        return copy.deepcopy(summary), rounds
+
+    async def commit_summary_repair(self, original, rounds, repaired):
+        """网络请求期间不持文件锁；若历史变化则拒绝提交旧来源的摘要。"""
+        with self._write_guard():
+            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+            current_rounds = [entry for entry in entries if entry.get("event") == "chat_round"]
+            if _normalize_context_summary(meta.get("context_summary")) != original or current_rounds != rounds:
+                raise RuntimeError("摘要重建期间历史已变化，请重试当前任务")
+            self._invalidate_remote_history(meta, "历史摘要已重建，按有效本地上下文重新建立链")
+            meta["context_summary"] = _normalize_context_summary(repaired)
+            ranges = [(b["round_start"], b["round_end"]) for b in original["blocks"] if b.get("repair_required")]
+            meta["context_summary_raw_rounds"] = [
+                n for n in meta.get("context_summary_raw_rounds", [])
+                if not any(start <= n <= end for start, end in ranges)
+            ]
+            _write_meta_and_entries(self._file_path, meta, entries)
+        self._prefix_context_summary = None
+
     async def get_context_summary(self) -> dict[str, Any] | None:
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
@@ -2744,7 +2846,7 @@ class ChatMemoryManager:
                 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
             )
         meta, entries = self._load_for_read()
-        context_summary = _normalize_context_summary(meta.get("context_summary"))
+        context_summary = self._context_summary_for_request(meta)
         summary_message = _render_context_summary(context_summary)
         round_entries = [
             row for row in entries
@@ -2780,8 +2882,11 @@ class ChatMemoryManager:
             except (TypeError, ValueError):
                 question_budget = 10_000
 
+        if any(block.get("repair_required") for block in (context_summary or {}).get("blocks", [])):
+            raise RuntimeError("历史摘要待重建，不能使用已修改轮次的旧摘要继续请求")
+        raw_overrides = self._context_raw_rounds_for_request(meta)
         forced_raw_rounds = set(_normalize_context_summary_raw_rounds(
-            meta.get("context_summary_raw_rounds"), summarized_count
+            raw_overrides, summarized_count
         )) if context_summary is not None else set()
         summary_message = _annotate_summary_raw_rounds(
             summary_message, sorted(forced_raw_rounds)
@@ -2801,7 +2906,7 @@ class ChatMemoryManager:
             ]
             raw_rounds = _raw_rounds_with_summary_overrides(
                 round_entries, summarized_count,
-                meta.get("context_summary_raw_rounds"),
+                raw_overrides,
             )
             recent_questions_message = _render_recent_questions_message(question_items)
             if recent_questions_message:
@@ -2853,7 +2958,7 @@ class ChatMemoryManager:
             # 侧车快照，让任务进行中（无 usage/压缩事件的静默间隔）统计
             # 也能实时反映当前轮增量。
             pending_round = self._read_pending_round_snapshot()
-        context_summary = _normalize_context_summary(meta.get("context_summary"))
+        context_summary = self._context_summary_for_request(meta)
         summary_message = (
             _render_context_summary(context_summary)
             if context_summary is not None else None
@@ -2885,8 +2990,9 @@ class ChatMemoryManager:
         # 已压缩轮次问题按剩余窗口进入保真索引；没有摘要的旧会话
         # 暂时保留原始估算，供前端展示并触发首次压缩。
         summary_only = context_summary is not None
+        raw_overrides = self._context_raw_rounds_for_request(meta)
         forced_raw_rounds = set(_normalize_context_summary_raw_rounds(
-            meta.get("context_summary_raw_rounds"), summarized_round_count
+            raw_overrides, summarized_round_count
         )) if summary_only else set()
         summary_message = _annotate_summary_raw_rounds(
             summary_message, sorted(forced_raw_rounds)
@@ -2901,7 +3007,7 @@ class ChatMemoryManager:
             ]
             retained_rounds: list[dict[str, Any]] = _raw_rounds_with_summary_overrides(
                 round_entries, summarized_round_count,
-                meta.get("context_summary_raw_rounds"),
+                raw_overrides,
             )
         else:
             question_items = []
@@ -3414,10 +3520,21 @@ class ChatMemoryManager:
         with manager._write_guard():
             meta, entries = _load_meta_and_entries(manager._file_path, manager.session_id)
             new_entries: list[Any] = []
+            changed_rounds = []
+            round_number = 0
             for entry in entries:
+                is_round = isinstance(entry, dict) and entry.get("event") == "chat_round"
+                if is_round:
+                    round_number += 1
                 new_entry = _walk(entry)
-                if new_entry is not entry:
+                if new_entry != entry:
                     touched_entries += 1
+                    if is_round:
+                        changed_rounds.append(round_number)
+                        # 原生侧车输出仍是修改前的内容，不能通过原生回放复活。
+                        for event in new_entry.get("events", []):
+                            if isinstance(event, dict):
+                                event.pop("provider_state", None)
                 new_entries.append(new_entry)
             if replaced_total <= 0:
                 return {
@@ -3425,6 +3542,11 @@ class ChatMemoryManager:
                     "describe": "未在会话历史中找到对应内容",
                     "replaced": 0,
                 }
+            manager._backup_history_file()
+            meta["context_summary"] = _mark_summary_for_repair(
+                meta.get("context_summary"), changed_rounds, total_rounds=round_number
+            )
+            manager._invalidate_remote_history(meta, "历史内容已修改，按有效本地历史重新建立链")
             meta = _recompute_meta_from_entries(manager.session_id, meta, new_entries)
             _write_meta_and_entries(manager._file_path, meta, new_entries)
         return {

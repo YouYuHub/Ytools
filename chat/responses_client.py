@@ -337,6 +337,9 @@ async def async_stream(transport, request, config, stop=None):
             stream = None
             operation = "retrieve" if assembly.response_id else "create"
             try:
+                if operation == "create":
+                    from factory.agent_runtime.task_costs import network_attempt
+                    await network_attempt()
                 if record is None:
                     record = responses_store.begin_request(request.session_id, state["scope"], payload, config, ids, snapshot=state)
                 if assembly.response_id:
@@ -472,6 +475,9 @@ def _sync_call(request, config, *, stream, stop=None, transport=None):
             upstream = None
             operation = "retrieve" if assembly.response_id else "create"
             try:
+                if operation == "create":
+                    from factory.agent_runtime.task_costs import network_attempt_sync
+                    network_attempt_sync()
                 if record is None:
                     record = responses_store.begin_request(request.session_id, state["scope"], payload, config, ids, snapshot=state)
                 if assembly.response_id:
@@ -607,6 +613,8 @@ async def compact(request, config, *, scope="chat_model", stop=None):
             return await _compact_trigger(client, query, request, config, state, pending, boundary_ids, stop)
         try:
             instructions = _compaction_instructions(request, state)
+            from factory.agent_runtime.task_costs import network_attempt
+            await network_attempt()
             response = await ChatLLM._wait_with_stop(client.responses.compact(
                 model=config["selected_model_id"], input=native_input_items(window),
                 **({"instructions": instructions} if instructions else {}),
@@ -650,6 +658,8 @@ async def _compact_trigger(client, query, request, config, state, pending, ids, 
                                           snapshot=state, compaction=True)
     try:
         from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.task_costs import network_attempt
+        await network_attempt()
         raw = _dump(await ChatLLM._wait_with_stop(
             client.responses.create(**_kwargs(client.responses.create, payload, query)), request.timeout_read, stop))
         responses_store.note_response_id(request.session_id, record, raw.get("id"))

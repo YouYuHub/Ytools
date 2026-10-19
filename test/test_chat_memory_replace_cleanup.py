@@ -1,8 +1,9 @@
 """原位重生成成功落盘后，只清理旧轮不再引用的媒体文件。"""
+import asyncio
+import json
 import shutil
 import tempfile
 import unittest
-import asyncio
 from pathlib import Path
 from unittest import mock
 
@@ -118,7 +119,10 @@ class ReplacedRoundMediaCleanupTests(unittest.TestCase):
 
         asyncio.run(replace_round())
         updated_meta, updated_entries = manager._load_for_read()
-        self.assertEqual(updated_meta["context_summary"]["summary"], "旧图片 media://old.png")
+        # 受影响块标待重建（旧正文移除），而非保留旧快照。
+        repaired_block = updated_meta["context_summary"]["blocks"][0]
+        self.assertTrue(repaired_block.get("repair_required"))
+        self.assertNotIn("旧图片", json.dumps(updated_meta["context_summary"], ensure_ascii=False))
         self.assertEqual(updated_meta["context_summary_raw_rounds"], [2])
         historical_snapshots = [
             entry for entry in updated_entries
@@ -134,12 +138,32 @@ class ReplacedRoundMediaCleanupTests(unittest.TestCase):
             for entry in updated_entries
             if isinstance(entry, dict)
         ))
+        # 重建前拒绝使用旧摘要；重建后新摘要替换历史轮。
+        with self.assertRaises(RuntimeError):
+            asyncio.run(manager.get_context_messages())
+        self._repair_summary(manager)
         context = asyncio.run(manager.get_context_messages())
         context_text = "\n".join(str(item.get("content")) for item in context)
-        self.assertIn("旧图片", context_text)
+        self.assertNotIn("旧图片", context_text)
         self.assertIn("编辑后问题2", context_text)
         self.assertIn("替换后回复", context_text)
-        self.assertIn("第 2 轮在摘要生成后被编辑或插入", context_text)
+
+    def _repair_summary(self, manager):
+        from config import ChatLLMRequest
+        from factory.agent_runtime import context_compaction as compact
+        from factory.agent_runtime.history_summary_repair import repair_history_summary_if_needed
+        from factory.agent_runtime.context_compaction import SummaryBuildResult
+
+        async def summarize(source, *args, **kwargs):
+            self.assertIn("编辑后问题2", source)
+            self.assertNotIn("旧图片", source)
+            return SummaryBuildResult("重建摘要含编辑后问题2替换后回复", False, False)
+
+        with mock.patch.object(compact, "summarize_context_text", summarize), \
+             mock.patch.object(compact, "resolve_effective_summary_budget", return_value=2048):
+            asyncio.run(repair_history_summary_if_needed(manager, ChatLLMRequest(
+                session_id="sess_replace_summary", messages=[{"role": "user", "content": "继续"}]
+            )))
 
     def test_invalidated_snapshot_does_not_keep_replaced_media(self):
         manager = chat_memory.ChatMemoryManager("sess_invalidated_media")

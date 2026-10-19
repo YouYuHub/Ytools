@@ -8,6 +8,7 @@ from pathlib import Path
 import copy
 import json
 import time
+import threading
 import uuid
 from collections import deque
 # import inspect
@@ -375,16 +376,23 @@ class _SessionStream:
     """一次后台 Agent 生成任务的环形事件缓冲 + 订阅管理。
 
     - 生成循环独立任务运行：页面刷新不再中止生成；
-    - 后到的消费者回放"任务起点"起的全部事件（含 reconnect 标记）：
-      运行中任务的 chat_round 在任务收尾才写 JSONL，历史读不到，
-      回放必须覆盖整个任务才能在刷新后重建此前轮次的界面；
-    - emit 为非阻塞追加（有界 deque），消费端断线不影响生产端。
+    - 后到的消费者从任务回放日志恢复全部事件；有界 deque 只作为热缓存，
+      不能用它的容量限制长任务的可恢复范围；
+    - 消费端断线不影响生产端；完整日志随任务订阅结束释放。
     """
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.task: asyncio.Task | None = None
         self.buffer = deque(maxlen=_SESSION_STREAM_MAX_BUFFER)
+        from .agent_runtime.stream_replay import StreamReplayJournal
+        self._replay_journal = StreamReplayJournal()
+        self._buffer_end_offsets = deque(maxlen=_SESSION_STREAM_MAX_BUFFER)
+        self._replay_lock = threading.Lock()
+        self._replay_complete = True
+        self._replay_has_history_prefix = False
+        self._round_start_offset = 0
+        self._replay_readers = 0
         self.seq = 0              # 已放入缓冲的事件总条数
         self.round_start_seq = 0  # 任务回放起点（首个循环检查点记录，此后不变）
         self._round_start_set = False
@@ -412,8 +420,47 @@ class _SessionStream:
     def emit(self, chunk: str) -> None:
         if not isinstance(chunk, str):
             return
-        self.buffer.append(chunk)
-        self.seq += 1
+        with self._replay_lock:
+            end = None
+            if self._replay_complete:
+                try:
+                    end = self._replay_journal.append(chunk)
+                except (OSError, ValueError) as error:
+                    # Replay storage failure must not stop the real task.
+                    self._replay_complete = False
+                    logger.warning(f"任务完整回放日志不可用，保留历史快照与热缓存：{error}")
+                    self._replay_journal.close()
+            self.buffer.append(chunk)
+            self._buffer_end_offsets.append(end)
+            self.seq += 1
+
+    def acquire_replay(self):
+        with self._replay_lock:
+            self._replay_readers += 1
+            return (self.round_start_seq, self._round_start_offset,
+                    self._replay_complete and not self._replay_has_history_prefix)
+
+    def release_replay(self):
+        with self._replay_lock:
+            self._replay_readers -= 1
+            if self.done and self._replay_readers == 0:
+                self._replay_journal.close()
+
+    def read_replay(self, seen, offset):
+        with self._replay_lock:
+            base = self.seq - len(self.buffer)
+            if seen < base and self._replay_complete:
+                try:
+                    chunk, offset = self._replay_journal.read(offset)
+                    return chunk, seen + 1, offset, False
+                except (OSError, ValueError) as error:
+                    self._replay_complete = False
+                    logger.warning(f"任务回放日志读取失败，退回热缓存：{error}")
+                    self._replay_journal.close()
+            gap = seen < base
+            seen = max(seen, base)
+            index = seen - base
+            return self.buffer[index], seen + 1, self._buffer_end_offsets[index], gap
 
     def notify(self) -> None:
         async def notify_all() -> None:
@@ -434,16 +481,21 @@ class _SessionStream:
             pass
 
     def set_round_start(self) -> None:
-        # 每轮循环开始处都会调用，但只有首次生效（任务起点）。运行中任务
+        # 提问落盘后及每轮循环开始处调用，但只有首次生效（任务起点）。运行中任务
         # 的 chat_round 尚未落盘（任务收尾才写 JSONL），刷新重连必须回放
         # 整个任务的事件才能重建此前轮次的界面；若每轮都重置起点，前端
         # 只能收到当前轮的实时数据，任务早期步骤会全部丢失
-        if not self._round_start_set:
-            self.round_start_seq = self.seq
-            self._round_start_set = True
+        with self._replay_lock:
+            if not self._round_start_set:
+                self.round_start_seq = self.seq
+                self._round_start_offset = self._replay_journal.end
+                self._round_start_set = True
 
     async def finish(self) -> None:
-        self.done = True
+        with self._replay_lock:
+            self.done = True
+            if self._replay_readers == 0:
+                self._replay_journal.close()
         async with self.cond:
             self.cond.notify_all()
 
@@ -1090,7 +1142,7 @@ async def _run_chat_generation(
     # 编辑重发（target_round）：设置原地重跑目标轮次号。此后：
     # - 轮次收尾替换历史第 N 轮条目而非追加（add_chat_history / stop_current_round）；
     # - 上下文历史截到第 N-1 轮；被摘要覆盖的目标轮在替换落盘后以原文补充，
-    #   压缩摘要作为历史快照保留，不因编辑而失效；
+    #   未受影响的摘要块保留，受影响块在下一次请求前重建；
     # - 版本链 round 标注仍为 N（get_current_round_number 覆盖）。
     request_target_round = getattr(tool_request, "target_round", None)
     if request_target_round is not None:
@@ -1135,11 +1187,23 @@ async def _run_chat_generation(
         remote_state = load_state(session_id)
         if request_target_round is not None or request_insert_round is not None:
             invalidate(session_id, "历史编辑或插入，按有效前缀重新建立链")
-            await session_chat_memory.update_context_summary(None)
+            # 原生远端链含旧轮/未来消息，必须失效；本地摘要由历史位置边界
+            # 决定是否可复用。无条件清空会把小上下文膨胀回整段原文。
         elif remote_state.get("source_key") and remote_state["source_key"] != source_key(chat_config_effective):
             invalidate(session_id, "模型、端点或账户已变化，按本地上下文重新建立链")
     permission_final_state = "failed"
     try:
+        from memory import task_cost_store
+        from .agent_runtime.task_costs import BudgetTracker
+        baseline = None
+        if not task_cost_store.has_session(session_id):
+            baseline = task_cost_store.legacy_baseline(
+                await session_chat_memory.get_file_text(), await session_chat_memory.get_session_meta())
+        task_cost_store.create_task(permission_runtime.id, session_id, baseline=baseline, round_no=current_round_number)
+        async def cost_emit(event):
+            await _stream_emit(stream, "data: " + json.dumps(event, ensure_ascii=False) + "\n\n")
+        permission_runtime.costs = BudgetTracker(permission_runtime.id, session_id, stop_checker, cost_emit, permission_runtime)
+        await permission_runtime.costs.notify()
         permission_runtime.bind_config("main", {"model": chat_config_effective, "servers": round_tool_servers, "original_names": round_tool_original_names, "tools": round_tools})
         # 轮次开始事件：告知前端本轮的最终轮次号（普通发送=已收尾轮次数+1；
         # target_round/insert_round 已在上方单独推送，不再重复）。前端据此给
@@ -1167,7 +1231,7 @@ async def _run_chat_generation(
                     if is_responses:
                         from chat.protocols.responses_store import invalidate
                         invalidate(session_id, "覆盖式重新回答已截断历史")
-                        await session_chat_memory.update_context_summary(None)
+                        # truncate_rounds_for_reanswer 已同步摘要锚点，保留其有效结果。
         except Exception as trunc_error:
             logger.warning(f"覆盖式回答截断失败（按追加处理）: {trunc_error}")
         # 覆盖式截断后重新取得最终轮次号。编辑重发/插入虽不再发送
@@ -1239,6 +1303,10 @@ async def _run_chat_generation(
                 # 压缩：压缩会以当前盘上历史（旧版第 N 轮仍在）为源更新摘要
                 # 游标，违背截断语义；本轮上下文已由保留摘要+截断拼装覆盖，
                 # 收尾替换/插入后下次普通发送再基于新状态重建
+                from .agent_runtime.history_summary_repair import repair_history_summary_if_needed
+                await repair_history_summary_if_needed(session_chat_memory, tool_request,
+                    settings=history_compaction_settings,
+                    event_emitter=lambda payload: _emit_compaction_event(stream, session_chat_memory, payload))
                 if request_target_round is None and request_insert_round is None:
                     await compact_session_history_if_needed(
                         session_chat_memory,
@@ -1334,6 +1402,9 @@ async def _run_chat_generation(
                     latest_user_message.get("content"), latest_user_quotes
                 )
                 latest_user_message.pop("quotes", None)
+        # 从提问落盘后的准备阶段开始回放，首调用超窗时的压缩/错误也属于
+        # 当前轮，不能等进入模型循环才记录起点，否则完整重建会丢掉这些卡片。
+        stream.set_round_start()
         # read_media 的 media:// 引用常规集合（当前任务轮用户消息中出现的引用）；
         # 当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
         # 常规过滤传给 execute_read_media（本地/网络来源不在此列、不受过滤）。
@@ -1506,7 +1577,8 @@ async def _run_chat_generation(
                             recent_questions_token_budget=question_budget,
                         )
                         candidate = _assemble_candidate(candidate_backend)
-                        if estimate_send_context_tokens(candidate, tool_request.tools) <= model_window:
+                        candidate_tokens = estimate_send_context_tokens(candidate, tool_request.tools)
+                        if candidate_tokens <= model_window:
                             degraded_messages = candidate
                             if question_budget != question_budgets[0]:
                                 logger.info("摘要上下文已按窗口收紧最近问题索引")
@@ -1521,12 +1593,14 @@ async def _run_chat_generation(
                             f"{first_call_tokens} tokens（摘要-only，最近问题预算已收紧，"
                             f"后端历史约 {history_tokens} tokens）")
                     else:
-                        # 全部降级后仍超限，才报压缩错误
+                        # 错误展示最后实际候选的规模，不能继续显示压缩前的旧数字。
+                        remaining_history_tokens = estimate_send_context_tokens(candidate_backend)
                         detail = (
-                            f"首次模型调用上下文预估 {first_call_tokens} tokens，"
+                            f"压缩后首次模型调用上下文预估 {candidate_tokens} tokens"
+                            f"（压缩前 {first_call_tokens} tokens），"
                             f"超过模型窗口 {model_window} tokens。"
                             f"组成：系统提示+文件 {system_tokens}、后端历史 "
-                            f"{max(0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens)}、"
+                            f"{remaining_history_tokens}、"
                             f"当前请求 {frontend_tokens}、工具定义 {tools_tokens}。"
                             "已尝试强制压缩历史并收紧最近问题索引仍无法放入窗口，"
                             "请清理上传文件或开启新会话后重试。"
@@ -1611,6 +1685,7 @@ async def _run_chat_generation(
                 tool_request.responses_context = permission_resume.get("responses_context") or tool_request.responses_context
                 tool_request.responses_context["stop_checker"] = stop_checker
         while not stop_checker():
+            task_cost_store.update_round(permission_runtime.id, current_round_number)
             permission_replaying = permission_resume is not None
             stream.set_round_start()
             # 每轮检查点：取出注入消息，本轮模型调用即可看到
@@ -2932,6 +3007,12 @@ async def _run_chat_generation(
         raise ce
     finally:
         permission_state = permission_store.task(permission_runtime.id)
+        if getattr(permission_runtime, "costs", None):
+            from memory import task_cost_store
+            task_cost_store.finish(permission_runtime.id,
+                "suspended" if permission_state and permission_state["state"] == "suspended"
+                else "cancelled" if stop_checker() and permission_final_state != "completed" else permission_final_state)
+            await permission_runtime.costs.notify()
         permission_runtime.close("suspended" if permission_state and permission_state["state"] == "suspended"
                                  else "cancelled" if getattr(stream, "user_stop_requested", False) or (permission_state and permission_state["state"] == "cancelled") else permission_final_state)
         stream.stop_requested = True
@@ -3016,6 +3097,9 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
     挂到 stream.task；inline 模式：保持旧行为，在主进程内起 asyncio 任务。
     返回 False 表示启动失败（已向流内写入 error 事件）。
     """
+    # 权限恢复的新流只含恢复点之后的事件；检查点里更早的工具结果仍由
+    # 历史快照提供，不能声明可替换整个任务。日志本身仍保存全部恢复段。
+    stream._replay_has_history_prefix = bool(permission_resume_id)
     if not permission_resume_id:
         from memory.permission_store import resumable
         if resumable(tool_request.session_id):
@@ -3141,12 +3225,13 @@ async def tool_chat_server(
         if not await _start_session_generation(proxy, stream, tool_request):
             return
         creating = True
+    replay_start, replay_offset, replay_complete = stream.acquire_replay()
     try:
         if stream.done:
             seen = stream.seq  # 已完成的生成：不重复回放（内容已在 JSONL）
             replay_end_pending = False
         else:
-            seen = stream.round_start_seq
+            seen = replay_start
             if not creating:
                 # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
                 # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
@@ -3179,17 +3264,16 @@ async def tool_chat_server(
                 # 流内容与历史已渲染节点做匹配（避免误删正常重复文本）；老前端
                 # 忽略未知字段，行为不变。
                 marker["replay_end_supported"] = True
+                marker["replay_complete"] = replay_complete
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
                 replay_end_pending = True
             else:
                 replay_end_pending = False
         while True:
             while seen < stream.seq:
-                base = stream.seq - len(stream.buffer)
-                if seen < base:
-                    seen = base  # 环形缓冲已滚动：跳过过期片段
-                chunk = stream.buffer[seen - base]
-                seen += 1
+                chunk, seen, replay_offset, gap = stream.read_replay(seen, replay_offset)
+                if gap:
+                    yield 'data: {"warning":{"code":"STREAM_REPLAY_GAP","message":"回放日志不可用，部分早期流事件请在任务结束后重新加载完整历史。"}}\n\n'
                 yield chunk
             if replay_end_pending:
                 # 附接回放耗尽：此后均为实时帧（并发产生的新帧按到达顺序排在
@@ -3225,6 +3309,7 @@ async def tool_chat_server(
     finally:
         if stream.task is not None and stream.task.done() and not stream.done:
             await stream.finish()
+        stream.release_replay()
 
 
 async def inject_user_message(session_id: str, message: dict) -> dict:

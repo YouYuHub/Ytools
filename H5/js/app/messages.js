@@ -19,15 +19,69 @@
   // 只构建可视尾部，主线程阻塞时长与记录总数解耦。分段边界不允许落在
   // 「欠账记录」上（见 isDependentRecord），保证工具调用与结果、压缩
   // start/done 的配对不被切开；record.round 非空时新节点统一打 data-round。
-  const RENDER_TAIL_RECORDS = 240;
-  const RENDER_OLDER_BATCH = 160;
-  // 后台渐进回填的批间空闲间隔（ms）：批间让出主线程，浏览器的输入响应、
-  // 流式渲染、动画不受影响；期间用户上滚也不会看到空白（等 800ms 就有）
-  const BACKFILL_IDLE_DELAY = 120;
-  // loadOlder: { records, start, loading, timer } —— 待分段渲染的完整记录
-  // 表/下一个待渲染下标/批量渲染并发锁/后台回填调度句柄（细条由
-  // flushRenderedTail 创建插入；初始显示末尾后由后台渐进补全剩余记录）
-  const loadOlderState = { records: null, start: 0, loading: false, timer: null, button: null };
+  const RENDER_TAIL_RECORDS = 120;
+  const RENDER_OLDER_BATCH = 80;
+  // 完整记录保存在内存，DOM 只按需构建。跳转直接切换到目标附近的窗口，
+  // 不再从尾部一路回填；普通向上/下阅读仍可通过边缘加载条连续翻阅。
+  const loadOlderState = { records: null, start: 0, end: 0, loading: false,
+    timer: null, button: null, newerButton: null, observer: null };
+
+  function resetHistoryPaging() {
+    if (loadOlderState.timer != null) window.clearTimeout(loadOlderState.timer);
+    if (loadOlderState.observer) loadOlderState.observer.disconnect();
+    loadOlderState.timer = null;
+    loadOlderState.observer = null;
+    loadOlderState.button = null;
+    loadOlderState.newerButton = null;
+  }
+
+  function historyMatchIndex(records, match) {
+    if (!match) return -1;
+    const round = Number(match.round_no || match.round);
+    const event = match.event_index;
+    const exact = event == null ? -1 : records.findIndex(function (rec) {
+      return Number(rec.round) === round && (rec.source_event_index === Number(event)
+        || (match.agent_id && rec.agent_id === match.agent_id));
+    });
+    return exact >= 0 ? exact : records.findIndex(function (rec) { return Number(rec.round) === round; });
+  }
+
+  function renderHistoryWindowAt(index) {
+    const records = loadOlderState.records;
+    if (!records || index < 0) return false;
+    chatInner.replaceChildren();
+    renderRecords(records, { historyIndex: index, noScroll: true });
+    if (loadOlderState.end === records.length && App.restoreActiveStream) App.restoreActiveStream(state.sessionId);
+    App.rebuildQnav();
+    return true;
+  }
+
+  // 完整任务回放已确认后，撤掉检查点中的当前轮（包括尚未渲染的分页
+  // 数据），由 SSE 从任务起点重建。保留其它历史及搜索窗口，不能只清
+  // DOM，否则向上翻页又会把当前轮的旧快照追加一次。
+  function prepareActiveRoundReplay(active) {
+    if (!active || !active.replayComplete || active.sessionId !== state.sessionId) return;
+    const records = loadOlderState.records;
+    if (!records) return;
+    const prefix = HistoryParser.recordsBeforeActiveRound(records, active.userText, active.round, active.quotes);
+    if (prefix === records) return;
+    if (loadOlderState.timer != null) window.clearTimeout(loadOlderState.timer);
+    loadOlderState.timer = null;
+    loadOlderState.records = prefix;
+    loadOlderState.start = Math.min(loadOlderState.start, prefix.length);
+    loadOlderState.end = Math.min(loadOlderState.end, prefix.length);
+    Array.from(chatInner.children).forEach(function (node) {
+      if (node === active.messageNode) return;
+      const index = node.getAttribute("data-history-index");
+      if (index != null && Number(index) >= prefix.length) node.remove();
+    });
+    if (loadOlderState.newerButton && loadOlderState.end >= prefix.length) {
+      loadOlderState.newerButton.remove();
+      loadOlderState.newerButton = null;
+    }
+    if (loadOlderState.button) loadOlderState.button.classList.toggle("is-hidden", loadOlderState.start === 0);
+    active.userNode = null;
+  }
 
   // 欠账记录：渲染它需要其配对记录位于同段更早位置——toolResult 依赖同名
   // tool 调用；压缩 done/aborted 依赖 start（interrupted 中断态独立展示，
@@ -196,6 +250,7 @@
         trigger_reason: rec.trigger_reason,
         trigger_context_tokens: rec.trigger_context_tokens,
         trigger_threshold: rec.trigger_threshold,
+        history_prefix_rounds: rec.history_prefix_rounds,
         batch_source_tokens: rec.batch_source_tokens,
         source_budget: rec.source_budget,
         tail_rounds: rec.tail_rounds,
@@ -240,7 +295,7 @@
   }
 
   function renderRecords(records, replayState) {
-    // 渲染上下文（分段渲染状态）：replayState 为 null/缺省表示流式收尾、
+    // 渲染上下文（分段渲染状态）：replayState 为 null 表示流式收尾、
     // 编辑重发等对已打开会话的增量回放（记录数少、直接全量渲染，不贴底）；
     // 初始全量渲染走分段并承担贴底/加载更早消息职责
     const ctx = replayState === null ? { initial: false } : { initial: true };
@@ -255,24 +310,22 @@
     // 增量渲染（replayState === null）记录数一般很小，直接全量且不贴底。
     const isInitialRender = ctx.initial;
     let slice = records;
-    if (isInitialRender && records.length > RENDER_TAIL_RECORDS) {
-      const tailCount = pendingQueueSafeEnd(records, records.length - RENDER_TAIL_RECORDS, RENDER_TAIL_RECORDS);
-      const start = pendingQueueSafeStart(records, records.length - tailCount);
-      ctx.loadOlder = {
-        records: records,
-        start: start,
-      };
-      slice = records.slice(start);
+    if (isInitialRender) {
+      resetHistoryPaging();
+      const index = Number.isInteger(ctx.historyIndex) ? ctx.historyIndex : historyMatchIndex(records, ctx.historyMatch);
+      const start = pendingQueueSafeStart(records, index >= 0
+        ? Math.max(0, index - 20) : Math.max(0, records.length - RENDER_TAIL_RECORDS));
+      const end = start + pendingQueueSafeEnd(records, start,
+        Math.max(RENDER_TAIL_RECORDS, index >= 0 ? index - start + 40 : 0));
+      slice = records.slice(start, end);
       loadOlderState.records = records;
       loadOlderState.start = start;
-    } else {
-      // 增量回放 / 记录数少的初始渲染：清掉上一会话的分段状态（进行中的
-      // 后台回填循环据此在下一次调度校验时发现 records 已更换并停止）
-      loadOlderState.records = null;
-      loadOlderState.start = 0;
+      loadOlderState.end = end;
+      ctx.noScroll = ctx.noScroll || index >= 0;
     }
 
     let rendered = 0;
+    const recordOffset = isInitialRender ? loadOlderState.start : ctx.recordOffset;
     const doRenderBatch = function (batchSize) {
       const count = rendered >= slice.length ? 0 : pendingQueueSafeEnd(slice, rendered, batchSize);
       for (let i = 0; i < count; i += 1) {
@@ -283,6 +336,7 @@
         for (let k = before; k < chatInner.childNodes.length; k += 1) {
           const node = chatInner.childNodes[k];
           if (node.nodeType === 1) {
+            if (Number.isInteger(recordOffset)) node.setAttribute("data-history-index", String(recordOffset + rendered + i));
             node.setAttribute("data-round", String(rec.round));
             if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
           }
@@ -305,25 +359,24 @@
     }
   }
 
-  // 「加载更早消息」细条（renderRecords 分段时插在聊天流顶部，styles 见
-  // _chat.scss .qnav-load-older）：初始显示末尾对话后，**后台渐进回填**会
-  // 自动把更早记录全部补齐（批间让出主线程保持流畅）；点击/向上滚动触及
-  // 细条可立即优先触发下一批，无需等待后台节奏
-  function createLoadOlderButton() {
+  // 仅在读到边缘或点击时加载，不进行整段历史的后台回填。
+  function createLoadOlderButton(newer) {
     const button = el("button", "qnav-load-older");
     button.type = "button";
-    button.title = "加载更早的消息";
-    button.setAttribute("aria-label", "加载更早的消息");
+    button.title = newer ? "加载后续消息" : "加载更早的消息";
+    button.setAttribute("aria-label", button.title);
     button.addEventListener("click", function () {
-      scheduleBackfill(0);
+      if (newer) runNewerBatch(); else scheduleBackfill(0);
     });
     if (typeof IntersectionObserver !== "undefined") {
-      const observer = new IntersectionObserver(function (entries) {
+      if (!loadOlderState.observer) loadOlderState.observer = new IntersectionObserver(function (entries) {
         entries.forEach(function (entry) {
-          if (entry.isIntersecting) scheduleBackfill(0);
+          if (!entry.isIntersecting || !entry.target.isConnected) return;
+          if (entry.target === loadOlderState.newerButton) runNewerBatch();
+          else if (entry.target === loadOlderState.button) scheduleBackfill(0);
         });
-      }, { root: chatScroll, rootMargin: "120px 0px 0px 0px" });
-      observer.observe(button);
+      }, { root: chatScroll, rootMargin: "120px 0px" });
+      loadOlderState.observer.observe(button);
     }
     return button;
   }
@@ -348,10 +401,7 @@
     }
   }
 
-  // 后台渐进回填调度：批次间隔 idle 延时（批间让出主线程），链式直到全部
-  // 记录渲染完——用户无需反复上滚，最终整段历史全部可见。会话切换的判定：
-  // 调度闭包持有发起时的 records 引用，renderRecords 换会话会整体替换该
-  // 引用，二者不同即说明已切走，立即停止（新会话自会启动自己的回填）
+  // 合并边缘加载请求；会话切换后丢弃旧调度，不链式回填整段历史。
   function scheduleBackfill(delay) {
     if (loadOlderState.timer != null) return;
     if (!loadOlderState.records || loadOlderState.start <= 0) {
@@ -363,13 +413,26 @@
     loadOlderState.timer = window.setTimeout(async function () {
       loadOlderState.timer = null;
       if (loadOlderState.records !== myRecords) return; // 已切走
-      const remainBefore = loadOlderState.start;
       await runOlderBatch();
-      if (loadOlderState.records !== myRecords) return;
-      if (loadOlderState.start < remainBefore && loadOlderState.start > 0) {
-        scheduleBackfill(BACKFILL_IDLE_DELAY);
-      }
-    }, delay || BACKFILL_IDLE_DELAY);
+    }, delay || 0);
+  }
+
+  async function runNewerBatch() {
+    const paging = loadOlderState;
+    const records = paging.records;
+    if (paging.loading || !records || paging.end >= records.length) return;
+    paging.loading = true;
+    try {
+      const end = paging.end + pendingQueueSafeEnd(records, paging.end, RENDER_OLDER_BATCH);
+      const button = paging.newerButton;
+      if (button) button.remove();
+      renderRecords(records.slice(paging.end, end), { initial: false, recordOffset: paging.end });
+      paging.end = end;
+      if (button && end < records.length) chatInner.appendChild(button);
+      if (end === records.length && App.restoreActiveStream) App.restoreActiveStream(state.sessionId);
+      App.rebuildQnav();
+      App.updateCodeblockCopyButtons();
+    } finally { paging.loading = false; }
   }
 
   // 追加更早的一段记录：插到当前聊天流最前面（保持时间顺序），以原首条
@@ -395,13 +458,14 @@
     const pendingCompactions = {};
     const segment = loadOlderState.records.slice(targetStart, targetStart + count);
     const frag = document.createDocumentFragment();
-    segment.forEach(function (rec) {
+    segment.forEach(function (rec, index) {
       const before = frag.childNodes.length;
       renderOneRecordInto(frag, rec, pendingTools, pendingCompactions);
       if (rec.round == null) return;
       for (let k = before; k < frag.childNodes.length; k += 1) {
         const node = frag.childNodes[k];
         if (node.nodeType === 1) {
+          node.setAttribute("data-history-index", String(targetStart + index));
           node.setAttribute("data-round", String(rec.round));
           if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
         }
@@ -431,18 +495,19 @@
     App.refreshAskBlockStates();
   }
 
-  // 初始渲染收尾：有分段时先在聊天流顶部插入「加载更早消息」细条，再瞬跳
-  // 到底——并启动后台渐进回填（无需滚动/点击，剩余记录自动分批补全直到
-  // 整段历史全部显示；scrollToBottom(true) 内部已临时覆盖 scroll-behavior，
-  // content-visibility 懒高度回填由其内部下一帧复位兜底）
+  // 初始渲染收尾：插入前后翻阅入口；搜索定位自行滚动，普通打开贴底。
   function flushRenderedTail(ctx) {
-    if (ctx.loadOlder) {
+    if (loadOlderState.start > 0) {
       const button = createLoadOlderButton();
       loadOlderState.button = button;
       chatInner.insertBefore(button, chatInner.firstChild);
-      scheduleBackfill(BACKFILL_IDLE_DELAY);
     }
-    scrollToBottom(true);
+    if (loadOlderState.end < loadOlderState.records.length) {
+      const button = createLoadOlderButton(true);
+      loadOlderState.newerButton = button;
+      chatInner.appendChild(button);
+    }
+    if (!ctx.noScroll) scrollToBottom(true);
   }
 
   function appendTime(ts) {
@@ -463,7 +528,10 @@
   // summary_text 重建摘要展示。
   function buildCompactionBlock(compaction) {
     const scope = compaction.scope === "session" ? "session" : "round";
-    const scopeLabel = scope === "session" ? "跨轮历史" : "本轮工具轨迹";
+    const prefixRounds = Number(compaction.history_prefix_rounds);
+    const scopeLabel = scope === "session"
+      ? (Number.isInteger(prefixRounds) && prefixRounds >= 0 ? "历史前缀（前 " + prefixRounds + " 轮）" : "跨轮历史")
+      : "本轮工具轨迹";
     const box = el("div", "compaction-bar");
     const head = el("button", "compaction-head");
     head.type = "button";
@@ -700,7 +768,8 @@
           detail.push(limitLabel + " " + FormatUtils.fmtNum(tokenLimit));
         }
         // 触发来源（auto=任务开始检查、task=任务内检查点、
-        // first_call=首调用超窗降级、post=任务收尾、manual=手动）：历史回放同样可见
+        // first_call=首调用超窗降级、post=任务收尾、manual=手动、
+        // history_mutation=历史增删改后重建）：历史回放同样可见
         const triggerReason = latestCompaction.trigger_reason != null
           ? String(latestCompaction.trigger_reason) : "";
         const REASON_LABELS = {
@@ -709,6 +778,7 @@
           first_call: "首调用超窗降级",
           post: "任务收尾",
           manual: "手动",
+          history_mutation: "历史修改后重建",
         };
         if (REASON_LABELS[triggerReason]) {
           let reasonText = "触发来源 " + REASON_LABELS[triggerReason];
@@ -1065,7 +1135,7 @@
     }
     // 流式注入（attachment 指向流节点）时尊重自动贴底暂停：用户上滚阅读
     // 时不被拉回；整段历史回放后由 history.js 的 scrollToBottom 置底复位
-    stickToBottom();
+    if (!container || (container !== chatInner && container.nodeType !== 11)) stickToBottom();
     return msg;
   }
 
@@ -4201,6 +4271,7 @@
 
   // ---------- 右侧问题导航 ----------
   let qnavUsers = [];
+  let qnavEntries = [];
   let qnavRippleBound = false;
 
   function clearQnavRipple() {
@@ -4213,7 +4284,34 @@
   }
 
   function rebuildQnav() {
-    qnavUsers = Array.from(chatInner.querySelectorAll(".msg-user"));
+    const rendered = Array.from(chatInner.querySelectorAll(".msg-user"));
+    const records = typeof loadOlderState !== "undefined" && loadOlderState.records;
+    const byIndex = new Map(rendered.filter(function (node) { return node.dataset.historyIndex != null; })
+      .map(function (node) { return [Number(node.dataset.historyIndex), node]; }));
+    const byEvent = new Map(rendered.map(function (node) {
+      return [node.dataset.round + ":" + (node.dataset.sourceEvent || ""), node];
+    }));
+    // 无戳节点（实时流式/收养复用的提问气泡，无 history-index）按轮次兜底：
+    // 每轮恰好一条 user 记录，轮次 1:1；有戳节点不进此表，原路径零影响
+    const byRoundUnstamped = new Map();
+    rendered.forEach(function (node) {
+      if (node.dataset.historyIndex == null && node.dataset.round != null) {
+        byRoundUnstamped.set(Number(node.dataset.round), node);
+      }
+    });
+    qnavEntries = [];
+    if (records) records.forEach(function (rec, index) {
+      if (rec.kind !== "user") return;
+      qnavEntries.push({ index: index, round: Number(rec.round), text: contentToPlainText(rec.content),
+        node: byIndex.get(index) || byEvent.get(String(rec.round) + ":" + (rec.source_event_index == null ? "" : rec.source_event_index)) || byRoundUnstamped.get(Number(rec.round)) || null });
+    });
+    const knownRounds = new Set(qnavEntries.map(function (entry) { return entry.round; }));
+    rendered.forEach(function (node) {
+      if (knownRounds.has(Number(node.dataset.round))) return;
+      const bubble = node.querySelector(".msg-bubble");
+      qnavEntries.push({ index: -1, round: Number(node.dataset.round), text: bubble ? bubble.textContent : "", node: node });
+    });
+    qnavUsers = qnavEntries.map(function (entry) { return entry.node; });
     qnavRail.innerHTML = "";
     qnavPanel.innerHTML = "";
     if (qnavUsers.length < 2) {
@@ -4232,8 +4330,7 @@
     for (let j = 0; j < dashCount; j++) {
       const start = Math.floor(j * total / dashCount);
       const end = Math.floor((j + 1) * total / dashCount);
-      const bubble = qnavUsers[start].querySelector(".msg-bubble");
-      let text = bubble ? bubble.textContent : "问题 " + (start + 1);
+      let text = qnavEntries[start].text || "问题 " + (start + 1);
       // 一条指示条对应多个问题时，标题标注问题序号区间
       if (end - start > 1) text = (start + 1) + "-" + end + ". " + text;
       const dash = el("button", "qnav-dash");
@@ -4274,9 +4371,8 @@
       qnavPanel.addEventListener("mouseenter", clearQnavRipple);
     }
 
-    qnavUsers.forEach(function (userEl, i) {
-      const bubble = userEl.querySelector(".msg-bubble");
-      const text = bubble ? bubble.textContent : "问题 " + (i + 1);
+    qnavEntries.forEach(function (entry, i) {
+      const text = entry.text || "问题 " + (i + 1);
       const item = el("button", "qnav-item", i + 1 + ". " + text);
       item.addEventListener("click", function () { jumpToQuestion(i); });
       qnavPanel.appendChild(item);
@@ -4397,6 +4493,25 @@
       }) || null;
     };
     return matching(scoped) || (allowUnscoped && scoped !== candidates ? matching(candidates) : null);
+  }
+
+  // 引用定位仍使用后端 round/event_index；显示编号与提问导航一致。
+  // 同一后端轮可含多条用户引导，不能直接把 round 当作导航序号。
+  function quoteSourceDisplay(source, text) {
+    if (!source || (source.session_id && source.session_id !== state.sessionId)) return source;
+    const records = loadOlderState.records;
+    const index = findQuoteRecordIndex(records, source, text);
+    let question = 0;
+    if (index >= 0) {
+      for (let i = 0; i <= index; i++) if (records[i].kind === "user") question++;
+    } else {
+      const target = findRenderedQuoteSource(source, text, false);
+      if (target) qnavEntries.forEach(function (entry, i) {
+        if (entry.node && (entry.node === target || entry.node.contains(target)
+            || (entry.node.compareDocumentPosition(target) & 4))) question = i + 1;
+      });
+    }
+    return question > 0 ? Object.assign({}, source, { round: question }) : source;
   }
 
   function normalizedTextOffsets(rawText) {
@@ -4582,6 +4697,10 @@
     const recordIndex = findQuoteRecordIndex(records, locator, quoteText);
     let target = findRenderedQuoteSource(locator, quoteText, false);
     let renderLocator = locator;
+    if (!target && records && recordIndex >= 0 && typeof renderHistoryWindowAt === "function") {
+      renderHistoryWindowAt(recordIndex);
+      target = findRenderedQuoteSource(renderLocator, quoteText, false);
+    }
     if (!target && records && recordIndex >= 0) {
       const sourceRecord = records[recordIndex];
       renderLocator = Object.assign({}, locator, { round: sourceRecord.round });
@@ -4655,6 +4774,10 @@
     let target = findTarget();
     const records = loadOlderState.records;
     const index = records && records.findIndex(function (rec) { return Number(rec.round) === round; });
+    if (!target && records && index >= 0 && typeof renderHistoryWindowAt === "function") {
+      renderHistoryWindowAt(historyMatchIndex(records, match));
+      target = findTarget();
+    }
     while (!target && records && index >= 0 && loadOlderState.records === records && index < loadOlderState.start && current()) {
       const previous = loadOlderState.start;
       if (loadOlderState.loading) await new Promise(function (resolve) { window.setTimeout(resolve, 20); });
@@ -4707,7 +4830,11 @@
   }
 
   function jumpToQuestion(i) {
-    const target = qnavUsers[i];
+    let target = qnavUsers[i];
+    const entry = qnavEntries[i];
+    if (!target && entry && renderHistoryWindowAt(entry.index)) {
+      target = chatInner.querySelector('.msg-user[data-history-index="' + entry.index + '"]');
+    }
     if (!target) return;
     cancelQuestionJump();
     const generation = qnavJumpGeneration;
@@ -4765,8 +4892,18 @@
   function updateQnavActive() {
     if (!qnavUsers.length) return;
     const scrollRect = chatScroll.getBoundingClientRect();
+    // 分页窗口只渲染部分消息：首个已渲染条目之前的全是更早的历史，
+    // 逻辑上都在视口上方，基线指向其中最后一个；否则窗口顶部
+    // （如尾轮用户消息仍在 120px 线下方时）高亮会钉死第一条
     let current = 0;
+    for (let k = 0; k < qnavUsers.length; k++) {
+      if (qnavUsers[k]) {
+        if (k > 0) current = k - 1;
+        break;
+      }
+    }
     qnavUsers.forEach(function (userEl, i) {
+      if (!userEl) return;
       if (userEl.getBoundingClientRect().top - scrollRect.top < 120) current = i;
     });
     // 高亮当前问题所属的采样段：与 rebuildQnav 同口径计算每段起点，
@@ -4794,15 +4931,19 @@
   // ---------- 滚动：回到底部 + 导航高亮 ----------
   let scrollTick = false;
   chatScroll.addEventListener("scroll", function () {
-    const far = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight > 240;
-    scrollBottomBtn.classList.toggle("show", far);
-    // 钉住按钮同步更新：若放进 rAF 会晚一帧，滚动时按钮相对页面内容产生滞后抖动
-    updateCodeblockCopyButtons();
     if (scrollTick) return;
     scrollTick = true;
     requestAnimationFrame(function () {
-      updateQnavActive();
-      scrollTick = false;
+      // 任一更新器抛错也不能卡死 scrollTick，否则导航高亮与回底按钮永久冻结
+      try {
+        const far = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight > 240
+          || Boolean(loadOlderState.records && loadOlderState.end < loadOlderState.records.length);
+        scrollBottomBtn.classList.toggle("show", far);
+        updateCodeblockCopyButtons();
+        updateQnavActive();
+      } finally {
+        scrollTick = false;
+      }
     });
   });
 
@@ -4812,23 +4953,38 @@
   const COPY_PIN_OFFSET = 8;
 
   function updateCodeblockCopyButtons() {
+    if (document.body.classList.contains("sidebar-resizing")) return;
     const scrollRect = chatScroll.getBoundingClientRect();
     const pinY = scrollRect.top + COPY_PIN_OFFSET;
     const buttons = chatInner.querySelectorAll(".codeblock .copy-btn");
     // 读写分离：先对全部按钮一口气收集 rect（阶段一，纯读不触发写回布局），
     // 再统一计算并写 class/样式（阶段二，纯写）。避免此前「逐个 rect 读 →
     // 写 class → 下一个再读」交替造成的强制同步布局抖动（长会话滚动卡顿主因）
-    const rects = new Array(buttons.length);
-    for (let i = 0; i < buttons.length; i++) {
-      rects[i] = buttons[i].closest(".codeblock").getBoundingClientRect();
-    }
+    const visible = [];
+    const roots = new Map();
     for (let i = 0; i < buttons.length; i++) {
       const btn = buttons[i];
-      const blockRect = rects[i];
-      const btnH = btn.offsetHeight || 28;
+      // 测量离屏后代会强制 content-visibility:auto 展开整条消息。
+      // 先检查顶层消息的占位框，仅测量视口内实际可见的代码块。
+      let root = btn;
+      while (root.parentElement && root.parentElement !== chatInner) root = root.parentElement;
+      if (!roots.has(root)) roots.set(root, root.getBoundingClientRect());
+      const box = roots.get(root);
+      if (box.bottom < scrollRect.top || box.top > scrollRect.bottom) continue;
+      if (btn.checkVisibility && !btn.checkVisibility({ contentVisibilityAuto: true })) continue;
+      const rect = btn.closest(".codeblock").getBoundingClientRect();
+      visible.push({ btn: btn, rect: rect, height: btn.offsetHeight || 28,
+        width: btn.offsetWidth, gap: parseFloat(getComputedStyle(btn).marginRight) || 12 });
+    }
+    for (let i = 0; i < visible.length; i++) {
+      const item = visible[i];
+      const btn = item.btn;
+      const blockRect = item.rect;
+      const btnH = item.height;
       // 代码块在视口内的可见高度（含下边框可见部分）
-      const visible = Math.min(blockRect.bottom, scrollRect.bottom) - Math.max(blockRect.top, scrollRect.top);
-      if (visible < btnH) {
+      // 注：此处不可命名为 visible——外层数组已叫 visible，同块重声明会遮蔽并触发 TDZ
+      const visibleHeight = Math.min(blockRect.bottom, scrollRect.bottom) - Math.max(blockRect.top, scrollRect.top);
+      if (visibleHeight < btnH) {
         btn.classList.add("is-hidden");
         continue;
       }
@@ -4840,8 +4996,7 @@
       if (pinned) {
         // 正常态右边距跟随窄屏规则变化，按实际 margin 计算居中位移；
         // 窗口缩放导致按钮宽度变化时，仅在位移真的变化时写入，避免滚动中重复触发布局。
-        const rightGap = parseFloat(getComputedStyle(btn).marginRight) || 12;
-        const shift = btn.offsetWidth / 2 + rightGap - blockRect.width / 2;
+        const shift = item.width / 2 + item.gap - blockRect.width / 2;
         const currentShift = parseFloat(btn.style.getPropertyValue("--pin-shift"));
         if (!wasPinned || !Number.isFinite(currentShift) || Math.abs(currentShift - shift) > 0.5) {
           btn.style.setProperty("--pin-shift", shift + "px");
@@ -4853,6 +5008,9 @@
       }
     }
   }
+  window.addEventListener("sidebarresizeend", function () {
+    requestAnimationFrame(updateCodeblockCopyButtons);
+  });
 
   scrollBottomBtn.addEventListener("click", scrollToBottom);
 
@@ -4860,6 +5018,23 @@
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.finalizeMermaidBlocks = finalizeMermaidBlocks;
   App.renderRecords = renderRecords;
+  App.prepareActiveRoundReplay = prepareActiveRoundReplay;
+  App.resetHistoryView = function () {
+    resetHistoryPaging();
+    loadOlderState.records = null;
+    loadOlderState.start = loadOlderState.end = 0;
+  };
+  App.historyQuestionAfterRound = function (round) {
+    const rec = loadOlderState.records && loadOlderState.records.find(function (item) {
+      return item.kind === "user" && Number(item.round) > round;
+    });
+    return rec ? { round: rec.round, text: contentToPlainText(rec.content) } : null;
+  };
+  App.showHistoryTail = function () {
+    if (loadOlderState.records && loadOlderState.end < loadOlderState.records.length) {
+      renderHistoryWindowAt(loadOlderState.records.length - 1);
+    }
+  };
   App.appendTime = appendTime;
   App.buildCompactionBlock = buildCompactionBlock;
   App.highlightCodeBlocks = highlightCodeBlocks;
@@ -4889,6 +5064,7 @@
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
   App.jumpToQuoteSource = jumpToQuoteSource;
+  App.quoteSourceDisplay = quoteSourceDisplay;
   App.jumpToHistoryMatch = jumpToHistoryMatch;
   App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
   App.renderPreservingWidgets = renderPreservingWidgets;

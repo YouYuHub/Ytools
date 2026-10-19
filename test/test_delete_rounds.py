@@ -301,6 +301,8 @@ class DeleteRoundsSummaryTests(unittest.TestCase):
 
     def test_context_messages_use_summary_after_delete(self):
         asyncio.run(self.manager.delete_rounds(2, mode="single"))
+        # 混合摘要不能直接复用旧事实；重建后继续保持摘要模式。
+        self._repair_summary()
         messages = asyncio.run(self.manager.get_context_messages(max_rounds=0))
         rendered = json.dumps(messages, ensure_ascii=False)
         self.assertIn("【历史压缩摘要】", rendered)
@@ -310,6 +312,54 @@ class DeleteRoundsSummaryTests(unittest.TestCase):
         # 游标之后的轮次仍以完整对话回传
         self.assertIn("回答四", rendered)
         self.assertIn("回答五", rendered)
+
+    def test_responses_delete_keeps_summary_and_invalidates_remote_chain(self):
+        # Responses 会话删轮：远端原生链失效，但本地摘要保留平移、
+        # 之后仍用摘要替换历史轮（与 truncate/编辑/插入同口径）。
+        meta, entries = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        meta["responses_state"] = {"status": "ready", "generation": 1}
+        chat_memory._write_meta_and_entries(self.manager._file_path, meta, entries)
+        asyncio.run(self.manager.delete_rounds(2, mode="single"))
+        meta, _ = chat_memory._load_meta_and_entries(
+            self.manager._file_path, self.session_id
+        )
+        summary = meta.get("context_summary")
+        self.assertIsNotNone(summary, "Responses 删轮不应丢弃累计摘要")
+        self.assertEqual(summary["source_round_count"], 2)
+        self.assertEqual(summary["blocks"][0]["round_end"], 2)
+        self.assertTrue(summary["blocks"][0].get("repair_required"))
+        self.assertEqual(summary["recent_questions"], ["问题三"])
+        self.assertEqual(meta["context_summary_raw_rounds"], [2])
+        remote = meta.get("responses_state") or {}
+        self.assertEqual(remote.get("status"), "rebuild_pending")
+        self.assertFalse(remote.get("has_remote_head"))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self.manager.get_context_messages(max_rounds=0))
+        self._repair_summary()
+        # 重建后的摘要替换历史轮：游标内原文不回传
+        messages = asyncio.run(self.manager.get_context_messages(max_rounds=0))
+        rendered = json.dumps(messages, ensure_ascii=False)
+        self.assertIn("【历史压缩摘要】", rendered)
+        self.assertNotIn("回答一", rendered)
+        self.assertIn("回答四", rendered)
+
+    def _repair_summary(self):
+        from unittest.mock import patch
+        from config import ChatLLMRequest
+        from factory.agent_runtime.context_compaction import SummaryBuildResult
+        from factory.agent_runtime.history_summary_repair import repair_history_summary_if_needed
+
+        async def summarize(source, *args, **kwargs):
+            self.assertNotIn("回答二", source)
+            return SummaryBuildResult("已重新核对保留的历史", False, False)
+
+        with patch("factory.agent_runtime.context_compaction.summarize_context_text", summarize), \
+             patch("factory.agent_runtime.context_compaction.resolve_effective_summary_budget", return_value=2048):
+            asyncio.run(repair_history_summary_if_needed(self.manager, ChatLLMRequest(
+                session_id=self.session_id, messages=[{"role": "user", "content": "继续"}]
+            )))
 
 
 class TargetRoundTests(unittest.TestCase):

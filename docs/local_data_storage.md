@@ -7,6 +7,7 @@
 | `history_files/*_chat.jsonl` | 聊天历史与会话元数据 | 持久数据 |
 | `history_files/session_files/<session>/` | 上传文件、媒体、解析记录和文件修改记录 | 会话数据 |
 | `history_files/state/permission_runtime.sqlite3` | 权限选项、审批、任务恢复和工具执行台账 | 持久控制数据 |
+| `history_files/state/task_costs.sqlite3` | 任务预算、模型价格、完整用量和预算等待状态 | 持久计量数据；见[任务预算](task_budgets.md) |
 | `history_files/state/backups/permission_runtime.legacy-*.sqlite3` | 从旧路径迁移时生成的完整权限库快照 | 迁移备份 |
 | `history_files/sidecars/history_search.sqlite3` | 从聊天 JSONL 提取的搜索文本和位置 | 可重建缓存 |
 | `history_files/sidecars/` 中其他文件 | 待落盘轮次、摘要/协议相关记录、历史备份等 | 应按具体文件用途保留，不能把整个目录视作缓存删除 |

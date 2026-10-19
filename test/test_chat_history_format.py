@@ -485,15 +485,12 @@ class AdjustSummaryForDeletedRoundsTests(unittest.TestCase):
             adjust_context_summary_for_deleted_rounds(summary, ["x", 0, -1]), summary
         )
 
-    def test_unpaired_question_numbers_keep_questions(self):
+    def test_unpaired_question_numbers_are_rebuilt_from_remaining_history(self):
         summary = self._summary()
         summary.pop("recent_question_numbers")
         adjusted = adjust_context_summary_for_deleted_rounds(summary, [2])
-        # 无法对齐编号时保持问题列表原样（宁可冗余不可错位）
-        self.assertEqual(
-            adjusted["recent_questions"],
-            ["问题二", "问题三", "问题四", "问题五"],
-        )
+        # 无法证明旧索引不含已删除问题；请求端从保留的真实轮次重建。
+        self.assertEqual(adjusted["recent_questions"], [])
 
     def test_adjusted_summary_stays_renderable(self):
         adjusted = adjust_context_summary_for_deleted_rounds(self._summary(), [2])

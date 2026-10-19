@@ -285,7 +285,9 @@
 
     function renderRoundSummary() {
       const line = ensureUsageLine();
-      const summary = FormatUtils.roundSummaryText(displayRoundUsage(), roundModel);
+      line._roundUsageSnapshot = displayRoundUsage();
+      line._roundModelSnapshot = roundModel;
+      const summary = FormatUtils.roundSummaryText(line._roundUsageSnapshot, line._roundModelSnapshot);
       if (!summary) {
         // 编辑重发附接时，JSONL 可能仍保留旧轮的 usage 行；marker 的
         // 空绝对值明确表示新轮尚无用量，不能继续显示旧数字。
@@ -443,6 +445,10 @@
     function handle(evt) {
       if (evt.type === "done") return;
       const data = evt.data || {};
+      if (data.event === "task_usage") {
+        if (App.taskCosts && state.sessionId === sessionId) App.taskCosts.event(data);
+        return;
+      }
 
       if (data.round_usage_total && typeof data.round_usage_total === "object") {
         setRoundUsageBaseline(data.round_usage_total);
@@ -540,7 +546,7 @@
         hasStage = true;
         appendStage(askCard);
         App.refreshAskBlockStates();
-        if (state.sessionId === sessionId) App.openAskModal(questions, askCard);
+        if (!replayWindow && state.sessionId === sessionId) App.openAskModal(questions, askCard);
         return;
       }
       if (data.event === "sub_agent") {
@@ -907,7 +913,7 @@
     // 标题触发判定（管线内：访问采集变量）：未触发且有预览时发起一次请求；
     // force=true（流结束兜底）不足 100 字符也以已有全文触发
     function maybeTriggerTitle(sessionId, force) {
-      if (titleTriggered) return;
+      if (titleTriggered || replayWindow) return;
       const preview = pickTitlePreview(titleReasoning, titleContent);
       if (!preview) return;
       if (!force && preview.length < TITLE_PREVIEW_CHARS) return;
@@ -1264,9 +1270,11 @@
     } else {
       scrollToBottom();
     }
-    App.rebuildQnav();    const activeStream = {
+    App.rebuildQnav();
+    const activeStream = {
       sessionId: streamSessionId,
       userText: text,
+      replayComplete: true,
       // 首问原始 content（字符串或部件列表）：round_started 到达时给本轮
       // 提问气泡补挂编辑/删除入口用（编辑回填与媒体芯片解析的数据源）
       userContent: userContent,
@@ -1436,6 +1444,7 @@
       // 附接回放后回填：提问原始 content（部件列表/文本）与本轮最终轮次号，
       // openSession 的历史裁剪/去重与编辑入口补挂都按这两个字段精确匹配
       userContent: null,
+      replayComplete: false,
       round: null,
       userNode: null,
       messageNode: msg,
@@ -1458,6 +1467,7 @@
           }
           if (data && data.replay) {
             sawReplay = true;
+            activeStream.replayComplete = data.replay_complete === true;
             // 新后端随 marker 声明回放结束标记支持：打开去重窗口，窗口内
             // 的正文/思考/工具调用先与历史已渲染节点匹配（命中则收养/丢弃）
             pipe.setReplayWindow(Boolean(data.replay_end_supported));
@@ -1488,6 +1498,9 @@
             // 时绘制引用卡片，并进 _editData 供编辑回填
             if (Array.isArray(data.question_quotes) && data.question_quotes.length) {
               activeStream.quotes = QuoteUtils.quotesForRequest(data.question_quotes);
+            }
+            if (activeStream.replayComplete && App.prepareActiveRoundReplay) {
+              App.prepareActiveRoundReplay(activeStream);
             }
             // 本轮生效聊天模型（round_model 帧在回放起点之前，消费端收不到，
             // 随 marker 下发）：usage 行模型名文案的数据源
@@ -1605,6 +1618,7 @@
     try {
       const res = await API.generateSessionTitle({
         session_id: sid,
+        cost_task_id: App.taskCosts && App.taskCosts.activeId(sid),
         question_text: String(questionText || "").slice(0, 300),
         model_preview: preview || "",
         question_parts: Array.isArray(questionParts) && questionParts.length ? questionParts : undefined,
@@ -1614,6 +1628,7 @@
     } catch (_) { /* 请求失败静默：标题保持现状 */ }
     finally {
       if (titleInflight && titleInflight.sessionId === sid) titleInflight = null;
+      if (App.taskCosts && state.sessionId === sid) App.taskCosts.refresh();
     }
   }
 

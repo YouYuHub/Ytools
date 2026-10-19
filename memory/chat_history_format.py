@@ -811,9 +811,60 @@ def normalize_context_summary(summary: Any) -> dict[str, Any] | None:
     return normalized
 
 
+def mark_context_summary_for_repair(summary, changed_rounds, *, total_rounds=None):
+    """隔离被修改轮次污染的摘要块；保留覆盖游标，延迟重建而非回传全文。
+
+    旧累计摘要没有逐句来源，不能从混合块可靠删除某轮事实。此时只保留
+    范围和原摘要预算，下一次请求前用现存原文重建。未受影响块不变。
+    """
+    normalized = normalize_context_summary(summary)
+    if not normalized:
+        return None
+    count = normalized["source_round_count"]
+    if not count and total_rounds:
+        count = normalized["source_round_count"] = total_rounds
+    changed = {number for number in changed_rounds if 1 <= number <= count}
+    if not changed:
+        return normalized
+    questions, numbers = normalized.get("recent_questions", []), normalized.get("recent_question_numbers", [])
+    if len(questions) == len(numbers):
+        keep = [(n, q) for n, q in zip(numbers, questions) if n not in changed]
+        normalized["recent_question_numbers"] = [n for n, _ in keep]
+        normalized["recent_questions"] = [q for _, q in keep]
+    else:
+        # 无来源编号的旧问题索引不能证明仍有效；请求端会从现存轮次重建。
+        normalized["recent_questions"] = []
+        normalized.pop("recent_question_numbers", None)
+    blocks = []
+    for block in normalized["blocks"]:
+        start, end = block.get("round_start"), block.get("round_end")
+        if not (isinstance(start, int) and isinstance(end, int) and 1 <= start <= end <= count):
+            start, end = 1, count
+        if any(start <= number <= end for number in changed):
+            block = {
+                "summary": "历史已修改，此范围的摘要待重建。",
+                "round_start": start, "round_end": end,
+                "repair_required": True,
+                "repair_token_budget": block.get("repair_token_budget") or max(
+                    1024, estimate_text_tokens(render_summary_block(block))),
+            }
+        blocks.append(block)
+    return _summary_with_blocks(normalized, blocks)
+
+
+def _summary_with_blocks(summary, blocks):
+    # 顶层字段是 blocks 的兼容投影，不能在最后一块删除后把旧内容复活。
+    result = dict(summary)
+    result.update(blocks=blocks, summary="", content="")
+    for field, _ in SUMMARY_SECTION_FIELDS:
+        result[field] = []
+    return normalize_context_summary(result)
+
+
 def adjust_context_summary_for_deleted_rounds(
     summary: Any,
     deleted_round_numbers: Any,
+    *, total_rounds: int | None = None,
 ) -> Any:
     """删除轮次后同步调整累计摘要的游标与编号，让摘要继续可用。
 
@@ -828,11 +879,13 @@ def adjust_context_summary_for_deleted_rounds(
     - recent_question_numbers + recent_questions：被删轮次的问题移除，
       其后编号前移；编号缺失或与问题列表不等长（无法对齐）时保持原样。
 
-    摘要为 None / 非法结构时原样返回；纯文本摘要（游标恒为 0、无编号
-    锚点）不受删除影响，也原样返回。
+    交叉覆盖被删轮次的块先隔离，下一次请求前重建；整块被删则移除。
+    旧文本摘要由 total_rounds 提供保守的全历史覆盖边界。
     """
-    if not isinstance(summary, dict):
+    if not isinstance(summary, (dict, str)):
         return summary
+    if isinstance(summary, str) and total_rounds is None:
+        return summary  # 兼容纯格式化调用；持久层必须传入真实轮次数。
     if not isinstance(deleted_round_numbers, (list, tuple, set)):
         return summary
     deleted: set[int] = set()
@@ -845,6 +898,9 @@ def adjust_context_summary_for_deleted_rounds(
             deleted.add(parsed)
     if not deleted:
         return summary
+    summary = mark_context_summary_for_repair(summary, deleted, total_rounds=total_rounds)
+    if summary is None:
+        return None
 
     def _deleted_before(number: int) -> int:
         return sum(1 for item in deleted if item < number)
@@ -901,7 +957,7 @@ def adjust_context_summary_for_deleted_rounds(
             kept_questions.append(question)
         adjusted["recent_questions"] = kept_questions
         adjusted["recent_question_numbers"] = kept_numbers
-    return adjusted
+    return _summary_with_blocks(adjusted, adjusted.get("blocks", []))
 
 
 def shift_context_summary_for_inserted_round(

@@ -54,6 +54,12 @@ class _MemoryStub:
     def __init__(self):
         self.records = []
 
+    async def get_file_text(self):
+        return ""
+
+    async def get_session_meta(self):
+        return {"usage": {}}
+
     async def add_chat_history(self, record):
         self.records.append(record)
         if isinstance(record, dict) and record.get("done") == "[DONE]":

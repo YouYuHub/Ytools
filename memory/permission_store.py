@@ -447,3 +447,5 @@ def delete_session(session):
             db.execute(f"DELETE FROM {table} WHERE task IN (SELECT id FROM tasks WHERE session=?)", (session,))
         db.execute("DELETE FROM tasks WHERE session=?", (session,))
         db.execute("DELETE FROM policies WHERE scope=?", ("session:" + session,))
+    from memory.task_cost_store import delete_session as delete_costs
+    delete_costs(session)

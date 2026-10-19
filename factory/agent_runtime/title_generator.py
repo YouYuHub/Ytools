@@ -252,6 +252,7 @@ def _build_title_request(source_content: Any, session_id: str | None) -> ChatLLM
         tool_choice=None,
         parallel_tool_calls=None,
         session_id=session_id or "default",
+        usage_role="title",
         use_backend_history=False,
         backend_history_rounds=0,
     )

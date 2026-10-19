@@ -542,7 +542,7 @@ class SubAgentRunner:
 4. **子任务 ask_user 转发**：子阻塞问题经父转达用户（父决定何时问），回答经 task 增量注入。
 5. **子任务结构化结果**：final_reply 支持 JSON（status/conclusions/files/blocks），父级与前端引用更精准。
 6. **read_media 透传**已实现：按 task 收集当前轮 media:// 引用，并按实际子模型 vision 能力决定是否注入；可继续评估复用更完整的媒体转换策略。
-7. **独立 usage 汇总**：当前已在每个子任务块的 `done.usage_total` 分桶；`_meta.sub_agent_usage` 跨轮聚合尚未实现，且子任务 usage 不并入父轮 `usage_total`。
+7. **独立 usage 汇总**：子块继续保存 `done.usage_total`，JSONL 父轮 `usage_total` 保持兼容口径。新增任务计量账本按主模型、子任务、压缩与标题汇总，前端累计和本轮显示完整用量；主子任务共享可配置预算，预算等待从子任务活动超时中扣除，后启动的子任务不继承之前的等待时长。详见[任务预算与完整用量](task_budgets.md)。
 
 
 ### 2026-09-30：全局限制与独立停止

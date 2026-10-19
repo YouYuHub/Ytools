@@ -15,7 +15,7 @@ function setup() {
   const source = fs.readFileSync(path.join(__dirname, '../js/app/core.js'), 'utf8');
   const start = source.indexOf('  // 自动跟随与用户滚动');
   const end = source.indexOf('  function setEmpty(', start);
-  const context = { chatScroll: scroll, updateScrollBottomOffset() {},
+  const context = { App: {}, chatScroll: scroll, updateScrollBottomOffset() {},
     requestAnimationFrame(fn) { frames.set(++id, fn); return id; },
     cancelAnimationFrame(key) { frames.delete(key); },
   };
@@ -69,4 +69,12 @@ test('触摸向下滑和向上翻页均暂停跟随，输入框按键不干扰',
   context.scrollToBottom(true);
   fire('keydown', { key: 'ArrowUp', target: { tagName: 'TEXTAREA' } });
   scroll.scrollTop = 880; context.stickToBottom(); assert.equal(scroll.scrollTop, 900);
+});
+test('主动回底先恢复历史尾部窗口再读取滚动位置', () => {
+  const { context, scroll } = setup();
+  let restored = 0;
+  context.App.showHistoryTail = () => { restored++; scroll.scrollHeight = 5000; };
+  context.scrollToBottom(true);
+  assert.equal(restored, 1);
+  assert.equal(scroll.scrollTop, 900);
 });

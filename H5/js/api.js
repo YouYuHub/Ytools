@@ -46,6 +46,24 @@ const api_url = localStorage.getItem("ytools-api-base")
     if (!sessionId) throw new Error("后台终端需要指定当前会话");
     return "?session_id=" + encodeURIComponent(sessionId);
   }
+  function taskCostConfig(sessionId) {
+    return request("/task_costs/config" + (sessionId ? "?session_id=" + encodeURIComponent(sessionId) : ""));
+  }
+  function saveTaskCostConfig(limits, sessionId) {
+    return request("/task_costs/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limits: limits, session_id: sessionId || null }) });
+  }
+  function saveTaskPricing(pricing) {
+    return request("/task_costs/pricing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(pricing) });
+  }
+  function taskCostUsage(sessionId, options) {
+    return request("/task_costs/usage?session_id=" + encodeURIComponent(sessionId), options);
+  }
+  function continueTaskBudget(task, limits) {
+    return request("/task_costs/" + encodeURIComponent(task.id) + "/continue", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: task.session_id, version: task.version, limits: limits }) });
+  }
+  function stopTaskBudget(task) {
+    return request("/task_costs/" + encodeURIComponent(task.id) + "/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: task.session_id }) });
+  }
   function listTerminalJobs(sessionId, options) { return request("/terminal/jobs" + terminalSessionQuery(sessionId), options); }
   function getTerminalJob(id, sessionId, options) {
     return request("/terminal/jobs/" + encodeURIComponent(id) + terminalSessionQuery(sessionId), options);
@@ -1061,6 +1079,7 @@ const api_url = localStorage.getItem("ytools-api-base")
   }
 
   global.API = {
+    taskCostConfig, saveTaskCostConfig, saveTaskPricing, taskCostUsage, continueTaskBudget, stopTaskBudget,
     getResponsesState: function (sessionId) {
       return request("/chat_context/responses_state?session_id=" + encodeURIComponent(sessionId));
     },

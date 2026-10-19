@@ -249,6 +249,8 @@ def sync_stream(transport, request, config, stop=None):
             _precheck(transport, payload, config)
             url, port, wire = _wire(config, payload, request.session_id)
             step = "connect"
+            from factory.agent_runtime.task_costs import network_attempt_sync
+            network_attempt_sync()
             sock = socket.create_connection((url.hostname, port), timeout=connect)
             try:
                 if url.scheme == "https":
@@ -430,6 +432,8 @@ def nonstream(transport, request, config, stop=None):
             _precheck(transport, payload, config)
             url, port, wire = _wire(config, payload, request.session_id)
             step = "connect"
+            from factory.agent_runtime.task_costs import network_attempt_sync
+            network_attempt_sync()
             sock = socket.create_connection((url.hostname, port), timeout=connect)
             try:
                 if url.scheme == "https":
