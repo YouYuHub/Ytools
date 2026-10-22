@@ -150,6 +150,8 @@ class ContextCompactionSettings:
     # 压缩目标（tokens）：独立历史压缩时约束历史部分；任务内压缩时约束完整请求窗口，
     # 两种场景均与触发阈值解耦；0 表示不设目标（仅按阈值/可用空间压缩）。
     target_tokens: int = 0
+    # 独立子模型的输入窗口；未指定时沿用主聊天模型。只用于运行时预算计算。
+    input_window_override: int | None = None
 
 
 @dataclass(frozen=True)
@@ -497,7 +499,7 @@ def resolve_effective_window(
     解析压缩模型失败时退化为聊天窗口。
     """
     settings = settings or load_context_compaction_settings()
-    chat_window = resolve_model_max_input_tokens(default=8192)
+    chat_window = settings.input_window_override or resolve_model_max_input_tokens(default=8192)
     try:
         compaction_window = resolve_config_max_input_tokens(
             resolve_context_compaction_model_config(settings),

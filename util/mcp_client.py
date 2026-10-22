@@ -20,6 +20,9 @@ import time
 from pathlib import Path
 
 from util.logger import get_logger
+from util.mcp_server_info import validate_browser_connection
+from util.mcp_profiles import (profiles, select_profile, connection_config, tool_allowed,
+                               validate_arguments, model_envelope)
 
 logger = get_logger("util.mcp_client")
 
@@ -72,7 +75,7 @@ from env_manager import load_var
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_PERSISTENT_CLIENTS: dict[tuple[str, str], "_PersistentStdioClient"] = {}
+_PERSISTENT_CLIENTS: dict[tuple, "_PersistentStdioClient"] = {}
 _PERSISTENT_CLIENTS_LOCK = threading.Lock()
 _MCP_IMAGE_MAX_BYTES = 12 * 1024 * 1024
 
@@ -89,12 +92,13 @@ def _load_mcp_servers_config() -> dict:
     return servers if isinstance(servers, dict) else {}
 
 
-def _get_configured_server_command(server_ref: str) -> tuple[str, list[str]] | None:
+def _get_configured_server_command(server_ref: str, mcp_profile=None) -> tuple[str, list[str]] | None:
     """返回配置中的 command 和 args，未命中服务器标识时返回 None。"""
     servers = _load_mcp_servers_config()
     server_info = servers.get(server_ref)
     if not isinstance(server_info, dict):
         return None
+    server_info = connection_config(server_info, mcp_profile)
     command = server_info.get("command")
     if not isinstance(command, str) or not command.strip():
         return None
@@ -103,11 +107,15 @@ def _get_configured_server_command(server_ref: str) -> tuple[str, list[str]] | N
         args = []
     if not isinstance(args, list):
         raise ValueError(f"MCP 服务器 [{server_ref}] 的 args 必须是数组")
+    validate_browser_connection(server_info)
     return command.strip(), [str(item) for item in args]
 
 
-def _get_configured_server_environment(server_ref: str) -> dict[str, str] | None:
-    server_info = _load_mcp_servers_config().get(server_ref)
+def _get_configured_server_environment(server_ref: str, mcp_profile=None) -> dict[str, str] | None:
+    servers = _load_mcp_servers_config()
+    server_info = servers.get(server_ref)
+    if isinstance(server_info, dict):
+        server_info = connection_config(server_info, mcp_profile)
     if not isinstance(server_info, dict) or not server_info.get("env"):
         return None
     configured_env = server_info["env"]
@@ -239,7 +247,7 @@ def _build_stdio_parameters(command: str, args: list[str], original_ref: str) ->
         raise ValueError(f"无法构建服务器启动参数: {exc}") from exc
 
 
-def build_stdio_server_parameters(mcp_service: str) -> StdioServerParameters:
+def build_stdio_server_parameters(mcp_service: str, mcp_profile=None) -> StdioServerParameters:
     """
     根据传入的服务器标识（文件路径或命令）构建 StdioServerParameters。
     如果传入的是 mcp_servers.json 中的服务器标识，则按配置中的 command/args
@@ -254,7 +262,7 @@ def build_stdio_server_parameters(mcp_service: str) -> StdioServerParameters:
     if not mcp_service or not isinstance(mcp_service, str):
         raise ValueError("mcp_service 必须是非空字符串")
     svc = mcp_service.strip()
-    configured = _get_configured_server_command(svc)
+    configured = _get_configured_server_command(svc, mcp_profile)
     if configured is not None:
         # 配置中的 command/args 已经是结构化数据，不能先拼成字符串再解析，
         # 否则带空格的文件参数会丢失边界，也会把整条命令误判为文件路径。
@@ -264,7 +272,7 @@ def build_stdio_server_parameters(mcp_service: str) -> StdioServerParameters:
         command, args = parts[0], parts[1:]
     args = [_resolve_project_file(item) for item in args]
     params = _build_stdio_parameters(command, args, svc)
-    environment = _get_configured_server_environment(svc)
+    environment = _get_configured_server_environment(svc, mcp_profile)
     if environment is not None:
         params.env = environment
     return params
@@ -310,7 +318,7 @@ async def _upgrade_modern_protocol(session: Any) -> None:
         pass
 
 
-async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinition] | None:
+async def _discover_tools(mcp_server, mcp_profile=None):
     """
     获取指定 MCP 服务器的所有可用工具
     Args:
@@ -333,7 +341,7 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
     # )
     # 构建启动参数，支持多语言/可执行文件/命令（.py/.js/.jar/.exe/可执行文件/PATH 命令）
     try:
-        server_params = build_stdio_server_parameters(mcp_server)
+        server_params = build_stdio_server_parameters(mcp_server, mcp_profile) if mcp_profile else build_stdio_server_parameters(mcp_server)
     except Exception as e:
         traceback.print_exc()
         raise
@@ -345,11 +353,11 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
                 # mcp 2.0+：尝试 discover 升级到 modern 协议；旧 SDK/旧服务端自动保持原版本
                 await _upgrade_modern_protocol(session)
                 # 列出可用工具
-                tools_result = await session.list_tools()
-                logger.info(f"✅ 成功获取 {len(tools_result.tools)} 个工具")
+                found = await _list_native_tools(session)
+                logger.info(f"✅ 成功获取 {len(found)} 个工具")
                 # 转换为 FunctionDefinition 对象
                 tools = []
-                for tool in tools_result.tools:
+                for tool in found:
                     # MCP 协议中工具的参数 schema 属性：2.0 为 input_schema，1.x 为 inputSchema
                     parameters = _sdk_attr(tool, "input_schema", "inputSchema", {})
                     tools.append(FunctionDefinition(
@@ -364,6 +372,64 @@ async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinitio
         # Python 不能 raise 字符串；保留真实异常链，避免工具发现失败时
         # 二次变成“exceptions must derive from BaseException”而丢失根因。
         raise RuntimeError(f"MCP 服务器 [{mcp_server}] 连接失败: {detail}") from e
+
+
+async def _list_native_tools(session):
+    found, cursor, seen = [], None, set()
+    for _ in range(30):
+        page = await session.list_tools(**({"cursor": cursor} if cursor else {}))
+        found.extend(page.tools)
+        cursor = _sdk_attr(page, "next_cursor", "nextCursor")
+        if len(found) > 2000:
+            raise ValueError("MCP 工具清单超过 2000 项")
+        if not cursor:
+            return found
+        if cursor in seen:
+            raise ValueError("MCP 工具分页游标重复")
+        seen.add(cursor)
+    raise ValueError("MCP 工具清单分页超过 30 页")
+
+
+class MCPToolCatalog(list):
+    def __init__(self, tools, tool_profiles, schema_variants, profile_status):
+        super().__init__(tools)
+        self.tool_profiles = tool_profiles
+        self.schema_variants = schema_variants
+        self.profile_status = profile_status
+
+
+async def get_mcp_tools(mcp_server: str = "sysServer") -> List[FunctionDefinition] | None:
+    config = _load_mcp_servers_config().get(mcp_server)
+    entries = profiles(config)
+    if not entries:
+        return await _discover_tools(mcp_server)
+    select_profile(config)  # Validate default/lock before starting any process.
+    gate = asyncio.Semaphore(4)
+    async def discover(profile):
+        async with gate:
+            try:
+                effective = connection_config(config, profile)
+                tools = await _discover_tools(mcp_server, profile)
+                return profile, [tool for tool in tools if tool_allowed(effective, tool.name)], None
+            except Exception as exc:
+                logger.warning("MCP profile [%s/%s] 发现失败", mcp_server, profile)
+                return profile, [], exc
+    active = [config['locked_profile']] if config.get('locked_profile') else list(entries)
+    results = await asyncio.gather(*(discover(profile) for profile in active))
+    variants, descriptions, status = {}, {}, []
+    for profile, tools, error in results:
+        status.append({"id": profile, "ok": error is None, "tool_count": len(tools)})
+        for tool in tools:
+            variants.setdefault(tool.name, {})[profile] = tool.parameters or {"type": "object"}
+            descriptions.setdefault(tool.name, tool.description or "")
+    if all(error is not None for _, _, error in results):
+        raise RuntimeError("MCP 所有 profile 发现失败，请在诊断面板逐个检查连接")
+    output, counts = [], {}
+    default = config.get('locked_profile') or select_profile(config)
+    for name, schemas in variants.items():
+        counts[name] = len({json.dumps(schema, sort_keys=True) for schema in schemas.values()})
+        output.append(FunctionDefinition(name=name, description=descriptions[name], parameters=model_envelope(schemas, default)))
+    return MCPToolCatalog(output, {name: list(schemas) for name, schemas in variants.items()}, counts, status)
 
 
 def _mcp_call_timeout_seconds() -> float:
@@ -433,9 +499,10 @@ def _parse_mcp_tool_result(result: Any) -> Any:
 class _PersistentStdioClient:
     """在独立事件循环里维持一个 MCP stdio 会话，供工具线程跨调用复用。"""
 
-    def __init__(self, server_ref: str, signature: str):
+    def __init__(self, server_ref: str, signature: str, mcp_profile=None):
         self.signature = signature
-        self._server_params = build_stdio_server_parameters(server_ref)
+        self._profile = mcp_profile
+        self._server_params = build_stdio_server_parameters(server_ref, mcp_profile) if mcp_profile else build_stdio_server_parameters(server_ref)
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
@@ -472,8 +539,8 @@ class _PersistentStdioClient:
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 await _upgrade_modern_protocol(session)
-                tools = await session.list_tools()
-                available = {tool.name for tool in tools.tools}
+                tools = await _list_native_tools(session)
+                available = {tool.name: tool for tool in tools}
                 self._ready.set()
                 while True:
                     function_name, arguments, future = await self._queue.get()
@@ -481,8 +548,12 @@ class _PersistentStdioClient:
                         self._pending.discard(future)
                         continue
                     try:
+                        if self._profile:
+                            available = {tool.name: tool for tool in await _list_native_tools(session)}
                         if function_name not in available:
                             raise ValueError(f"工具 '{function_name}' 不存在。可用工具: {', '.join(sorted(available))}")
+                        if self._profile:
+                            validate_arguments(_sdk_attr(available[function_name], "input_schema", "inputSchema", {"type": "object"}), arguments)
                         result = await session.call_tool(function_name, arguments)
                         value = _parse_mcp_tool_result(result)
                         if not future.done():
@@ -522,15 +593,17 @@ class _PersistentStdioClient:
             self._thread.join(timeout=3)
 
 
-def _persistent_server_signature(server_ref: str) -> str | None:
-    info = _load_mcp_servers_config().get(server_ref)
-    if not isinstance(info, dict) or info.get("persistent") is not True:
+def _persistent_server_signature(server_ref: str, mcp_profile=None) -> str | None:
+    servers = _load_mcp_servers_config()
+    info = servers.get(server_ref)
+    if not isinstance(info, dict):
         return None
-    return json.dumps(info, ensure_ascii=False, sort_keys=True)
+    effective = connection_config(info, mcp_profile)
+    return json.dumps(effective, ensure_ascii=False, sort_keys=True) if effective.get("persistent") is True else None
 
 
-def _get_persistent_client(server_ref: str, scope: str, signature: str) -> _PersistentStdioClient:
-    key = (server_ref, scope)
+def _get_persistent_client(server_ref: str, scope: str, signature: str, mcp_profile=None) -> _PersistentStdioClient:
+    key = (server_ref, scope, mcp_profile) if mcp_profile else (server_ref, scope)
     stale = None
     with _PERSISTENT_CLIENTS_LOCK:
         client = _PERSISTENT_CLIENTS.get(key)
@@ -538,17 +611,18 @@ def _get_persistent_client(server_ref: str, scope: str, signature: str) -> _Pers
             stale = _PERSISTENT_CLIENTS.pop(key)
             client = None
         if client is None:
-            client = _PersistentStdioClient(server_ref, signature)
+            client = _PersistentStdioClient(server_ref, signature, mcp_profile) if mcp_profile else _PersistentStdioClient(server_ref, signature)
             _PERSISTENT_CLIENTS[key] = client
     if stale is not None:
         stale.close()
     return client
 
 
-def _drop_persistent_client(server_ref: str, scope: str, client: _PersistentStdioClient) -> None:
+def _drop_persistent_client(server_ref: str, scope: str, client: _PersistentStdioClient, mcp_profile=None) -> None:
+    key = (server_ref, scope, mcp_profile) if mcp_profile else (server_ref, scope)
     with _PERSISTENT_CLIENTS_LOCK:
-        if _PERSISTENT_CLIENTS.get((server_ref, scope)) is client:
-            _PERSISTENT_CLIENTS.pop((server_ref, scope), None)
+        if _PERSISTENT_CLIENTS.get(key) is client:
+            _PERSISTENT_CLIENTS.pop(key, None)
     client.close()
 
 
@@ -564,7 +638,7 @@ def close_persistent_mcp_clients(session_scope: str | None = None) -> None:
 atexit.register(close_persistent_mcp_clients)
 
 
-async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_service: str = "sysServer") -> Any:
+async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_service: str = "sysServer", mcp_profile=None) -> Any:
     """ 通过 MCP 客户端调用 MCP 服务器上的工具
     Args:
         function_name: 工具名称
@@ -586,7 +660,7 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
     # )
     # 构建启动参数（支持多语言/可执行文件/命令）
     try:
-        server_params = build_stdio_server_parameters(mcp_service)
+        server_params = build_stdio_server_parameters(mcp_service, mcp_profile) if mcp_profile else build_stdio_server_parameters(mcp_service)
     except Exception as build_error:
         traceback.print_exc()
         raise build_error
@@ -598,12 +672,15 @@ async def _call_mcp_tool_impl(function_name: str, arguments: dict = None, mcp_se
                 # mcp 2.0+：尝试 discover 升级到 modern 协议；旧 SDK/旧服务端自动保持原版本
                 await _upgrade_modern_protocol(session)
                 # 验证工具是否存在
-                tools = await session.list_tools()
-                available_tools = [tool.name for tool in tools.tools]
+                tools = await _list_native_tools(session)
+                available_tools = [tool.name for tool in tools]
                 if function_name not in available_tools:
                     raise ValueError(
                         f"工具 '{function_name}' 不存在。可用工具: {', '.join(available_tools)}"
                     )
+                if mcp_profile:
+                    tool = next(tool for tool in tools if tool.name == function_name)
+                    validate_arguments(_sdk_attr(tool, "input_schema", "inputSchema", {"type": "object"}), arguments or {})
                 result = await session.call_tool(function_name, arguments or {})
                 return _parse_mcp_tool_result(result)
     except Exception as error:
@@ -629,23 +706,51 @@ async def call_mcp_tool(
     arguments: dict = None,
     mcp_service: str = "sysServer",
     session_scope: str = "main",
+    mcp_profile: str | None = None,
 ) -> Any:
     """通过 MCP 客户端调用工具，并对完整生命周期施加配置的总超时。"""
     timeout_seconds = _mcp_call_timeout_seconds()
-    signature = _persistent_server_signature(mcp_service)
+    servers = _load_mcp_servers_config()
+    config = servers.get(mcp_service)
+    entries = profiles(config)
+    if entries:
+        envelope = {} if arguments is None else arguments
+        if not isinstance(envelope, dict) or set(envelope) - {"mcp_profile", "arguments"}:
+            raise ValueError("profile 工具须使用 {mcp_profile, arguments} 调用封装，业务字段放入 arguments")
+        if "mcp_profile" in envelope:
+            requested = envelope['mcp_profile']
+            if not isinstance(requested, str) or requested not in entries:
+                raise ValueError("无效的 mcp_profile")
+            if mcp_profile is not None and requested != mcp_profile:
+                raise ValueError("mcp_profile 连接目标不一致")
+            mcp_profile = requested
+        mcp_profile = select_profile(config, mcp_profile)
+        arguments = envelope.get('arguments', {})
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments 必须为原始工具参数对象")
+        if not tool_allowed(connection_config(config, mcp_profile), function_name):
+            raise ValueError("当前 profile 未允许调用工具：" + function_name)
+    elif mcp_profile is not None:
+        raise ValueError("此 MCP 未配置 profiles")
+    signature = _persistent_server_signature(mcp_service, mcp_profile) if mcp_profile else _persistent_server_signature(mcp_service)
     client = None
     if signature is not None:
-        client = _get_persistent_client(mcp_service, session_scope, signature)
+        client = _get_persistent_client(mcp_service, session_scope, signature, mcp_profile) if mcp_profile else _get_persistent_client(mcp_service, session_scope, signature)
         call = client.call(function_name, arguments or {})
     else:
-        call = _call_mcp_tool_impl(function_name, arguments, mcp_service)
+        call = _call_mcp_tool_impl(function_name, arguments, mcp_service, mcp_profile) if mcp_profile else _call_mcp_tool_impl(function_name, arguments, mcp_service)
     try:
         if timeout_seconds > 0:
-            return await asyncio.wait_for(call, timeout=timeout_seconds)
-        return await call
+            result = await asyncio.wait_for(call, timeout=timeout_seconds)
+        else:
+            result = await call
+        return f"[MCP 服务: {mcp_service}; profile: {mcp_profile}]\n{result}" if mcp_profile else result
     except (asyncio.TimeoutError, asyncio.CancelledError):
         if client is not None:
-            _drop_persistent_client(mcp_service, session_scope, client)
+            if mcp_profile:
+                _drop_persistent_client(mcp_service, session_scope, client, mcp_profile)
+            else:
+                _drop_persistent_client(mcp_service, session_scope, client)
         raise
 
 

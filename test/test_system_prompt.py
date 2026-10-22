@@ -138,10 +138,10 @@ class ConditionalNoteTests(unittest.TestCase):
         self.assertIn("search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名", prompt)
         self.assertIn("按文件名查找或列出文件时", prompt)
         self.assertIn("若 run_command 可用则使用相应终端命令", prompt)
-        self.assertIn("查到目标内容后用 read_file 查看必要上下文", prompt)
-        self.assertIn("局部修改用 edit_file", prompt)
-        self.assertIn("新建或整文件写入用 write_file", prompt)
-        self.assertIn("再用 run_command", prompt)
+        self.assertIn("用 read_file 核对原文，edit_file 修改局部", prompt)
+        self.assertIn("write_file 明确指定新建、覆盖或追加模式", prompt)
+        self.assertIn("长任务后台运行，用 poll_command 查询、stop_command 停止", prompt)
+        self.assertIn("需要用户回答时单独调用 ask_user", prompt)
 
 
 class ReadMediaNoteTests(unittest.TestCase):

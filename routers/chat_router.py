@@ -2,12 +2,12 @@ import asyncio
 import json
 import uuid
 import threading
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Literal
 import urllib.parse
 # fastapi 库导入
 from fastapi import APIRouter, Query, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, StrictBool, Field
 from routers.raw_upload import read_upload, require_raw_upload
 
 # 自定义模块导入
@@ -290,24 +290,64 @@ async def chat_stream_status(session_id: str = "default"):
 
 
 @api_chat_router.get('/chat_history/sessions')
-async def list_chat_history_sessions():
+async def list_chat_history_sessions(archive_scope: Literal["active", "archived", "all"] = "active"):
     """
     列出所有聊天历史会话文件
     返回:
         会话文件名列表
     """
     try:
-        sessions = ChatMemoryManager.list_chat_sessions()
-        return JSONResponse(content=[session.name for session in sessions])
+        from memory.session_listing import list_session_summaries
+        rows = await asyncio.to_thread(list_session_summaries, archive_scope=archive_scope)
+        return JSONResponse(content=[row["filename"] for row in rows])
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     
 @api_chat_router.get('/chat_history/summaries')
-async def list_chat_history_summaries(session_id: Optional[str] = None):
+async def list_chat_history_summaries(session_id: Optional[str] = None, archive_scope: Literal["active", "archived", "all"] = "active", with_archive_state: bool = False):
     """Thin sidebar rows; optional single-session lookup never creates history."""
     from memory.session_listing import list_session_summaries
-    return await asyncio.to_thread(list_session_summaries, session_id)
+    try:
+        if with_archive_state:
+            def sidebar_snapshot():
+                from memory.session_archives import snapshot
+                archives = snapshot()
+                rows = list_session_summaries(session_id, archive_scope, archive_entries=archives)
+                return {"sessions": rows, "archived_ids": list(archives)}
+            return await asyncio.to_thread(sidebar_snapshot)
+        if archive_scope == "active":
+            return await asyncio.to_thread(list_session_summaries, session_id)
+        return await asyncio.to_thread(list_session_summaries, session_id, archive_scope)
+    except (OSError, ValueError):
+        raise HTTPException(503, "会话归档状态暂时无法读取，请检查归档状态文件后重试")
+
+
+class SessionArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str = Field(min_length=1, max_length=512)
+    archived: StrictBool
+
+
+@api_chat_router.put("/chat_history/archive")
+async def update_chat_session_archive(payload: SessionArchiveRequest):
+    from memory.session_archives import set_archived
+    try:
+        return await asyncio.to_thread(set_archived, payload.session_id, payload.archived)
+    except FileNotFoundError:
+        raise HTTPException(404, "会话不存在，无法更改归档状态")
+    except (OSError, ValueError, TimeoutError):
+        logger.exception("会话归档状态保存失败")
+        raise HTTPException(503, "归档状态保存失败，请检查状态文件或稍后重试")
+
+
+@api_chat_router.get("/chat_history/archives")
+async def list_archived_chat_sessions(q: str = Query("", max_length=200), limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    from memory.session_archives import list_archived
+    try:
+        return await asyncio.to_thread(list_archived, q=q, limit=limit, offset=offset)
+    except (OSError, ValueError):
+        raise HTTPException(503, "归档会话暂时无法读取，请检查状态文件后重试")
 
 
 @api_chat_router.get('/chat_history/search')
@@ -319,6 +359,7 @@ async def search_chat_history(
     revision: Optional[str] = Query(None, max_length=64),
     include_internal: bool = False,
     include_filenames: bool = False,
+    archive_scope: Literal["all", "active", "archived"] = "active",
 ):
     """Literal, case-insensitive search of all persisted conversation records.
 
@@ -329,7 +370,7 @@ async def search_chat_history(
     cancel = threading.Event()
     task = asyncio.create_task(asyncio.to_thread(
         search_history, q, limit=limit, offset=offset, revision=revision, cancel=cancel,
-        include_internal=include_internal, include_filenames=include_filenames,
+        include_internal=include_internal, include_filenames=include_filenames, archive_scope=archive_scope,
     ))
     try:
         while not task.done():
@@ -387,7 +428,9 @@ async def get_chat_history_meta(session_id: str = "default"):
         if manager is None:
             raise HTTPException(status_code=404, detail="Chat session file not found")
         meta = await manager.get_session_meta()
-        return JSONResponse(content=meta)
+        from memory.session_archives import status
+        archive = await asyncio.to_thread(status, normalize_session_id(session_id))
+        return JSONResponse(content={**meta, **archive})
     except HTTPException as e:
         raise e
     except Exception:
@@ -885,6 +928,9 @@ async def get_chat_context_token_stats(
         None,
         description="已选择的工具名称；传入后仅统计这些工具定义，需同时 include_tools=true",
     ),
+    inspection: bool = False,
+    round_offset: int = Query(0, ge=0),
+    round_limit: int = Query(40, ge=1, le=100),
 ):
     """
     返回指定会话模型上下文构成的 token 统计（与真实请求同口径）。
@@ -928,7 +974,10 @@ async def get_chat_context_token_stats(
                 "history_compress_count": 0,
                 "round_tokens": [],
             })
-        manager = await get_chat_memory_manager(normalized_session_id)
+        manager = (await asyncio.to_thread(ChatMemoryManager, normalized_session_id, read_only=True)
+                   if inspection else await get_chat_memory_manager(normalized_session_id))
+        if manager is None:
+            raise HTTPException(404, "会话已不存在，请刷新会话列表")
         # 上下文窗口按会话生效模型计算（会话独立模型选择覆盖全局默认），
         # 与真实生成任务的模型口径一致
         ambient_token = set_ambient_model_selection(
@@ -985,16 +1034,32 @@ async def get_chat_context_token_stats(
             read_media_selected = False
             if include_tools and tool_names is not None:
                 read_media_selected = READ_MEDIA_NAME in selected_names
-            stats = await manager.get_context_token_stats(
-                max_rounds=effective_max_rounds,
-                tools=context_tools,
-                # 系统提示词按会话生效目录计算（worker 内由任务开始时 chdir 保证，
-                # 主进程统计侧需显式解析），与真实请求口径一致
-                system_prompt_text=build_runtime_system_text(
-                    work_dir=resolve_session_work_dir(normalized_session_id)[0],
-                    include_read_media_note=read_media_selected,
-                ),
-            )
+            async def collect_stats():
+                return await manager.get_context_token_stats(
+                    max_rounds=effective_max_rounds,
+                    tools=context_tools,
+                    system_prompt_text=build_runtime_system_text(
+                        work_dir=resolve_session_work_dir(normalized_session_id)[0],
+                        include_read_media_note=read_media_selected,
+                    ),
+                    **({"inspection": True,
+                        "round_offset": round_offset if isinstance(round_offset, int) else 0,
+                        "round_limit": round_limit if isinstance(round_limit, int) else 40} if inspection else {}),
+                )
+            if inspection:
+                # 显式打开面板时才读详细历史，避免在主事件循环解析大会话。
+                stats = await asyncio.to_thread(lambda: asyncio.run(collect_stats()))
+                from memory.context_inspection import inspect_configuration
+                from env_manager import require_default_chat_config
+                config = require_default_chat_config()
+                parameters = apply_role_parameter_defaults({}, "chat_model")
+                stats["inspection"].update(await asyncio.to_thread(
+                    inspect_configuration, normalized_session_id, config, parameters))
+                stats["inspection"]["running"] = is_chat_stream_running(normalized_session_id)
+                # 详细轮次单独分页，旧统计字段不再携带所有未压缩轮次的问题全文。
+                stats["round_tokens"] = []
+            else:
+                stats = await collect_stats()
         finally:
             reset_ambient_model_selection(ambient_token)
         return JSONResponse(content={

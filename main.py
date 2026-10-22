@@ -30,6 +30,7 @@ from config import DEFAULT_SERVICE_HOST, DEFAULT_SERVICE_PORT
 # 引入路由，需要在 init_path() 之后
 from routers.chat_router import api_chat_router
 from routers.task_cost_router import api_task_cost_router
+from routers.task_template_router import api_task_template_router
 from routers.chat_config_router import api_chat_config_router, sync_tool_selection_memory
 from routers.tools_manage_router import api_tools_manage_router
 from routers.file_router import api_file_router
@@ -104,6 +105,7 @@ async def root():
 # 包含路由
 app.include_router(api_chat_router, tags=["ChatLLM"])
 app.include_router(api_task_cost_router, tags=["TaskCosts"])
+app.include_router(api_task_template_router, tags=["TaskTemplates"])
 app.include_router(api_chat_config_router, tags=["ChatConfig"])
 app.include_router(api_tools_manage_router, tags=["ToolsManage"])
 app.include_router(api_file_router, tags=["FileUpload"])

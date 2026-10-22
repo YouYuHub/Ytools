@@ -28,7 +28,7 @@ def get_media_limits(config):
     configured = config.get('media_limits', config.get('mediaLimits', selected.get('mediaLimits', {})))
     limits = {k: v for k, v in configured.items() if k in {'total', *set(_PART_KINDS.values())}
               and isinstance(v, int) and not isinstance(v, bool) and v >= 0} if isinstance(configured, dict) else {}
-    if str(config.get('apiType') or '').strip().casefold() == 'messages':
+    if str(config.get('apiType') or '').strip().casefold() in {'messages', 'responses'}:
         limits.update(audio=0, video=0)
     with _lock:
         cached = _cache.get(_key(config))

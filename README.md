@@ -60,7 +60,7 @@ python main.py
 - 可选 `parameterCapabilities` 用于声明 Messages/Responses 模型不支持的原生参数（例如 `{"temperature": false, "top_p": false, "thinking_budget": false}`）；默认未声明的参数由供应商自行决定。服务端会再次过滤标记为 `false` 的字段，避免旧会话参数发到上游。
 - 角色的 `parameter`（生成参数）按协议分桶存放（`chat_completions` / `messages` / `responses`），`headers` 为自定义请求头；两者均可省略，也可以直接在前端「参数」面板中修改（写入同一份配置）。
 - 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；启用 `read_document` 后按目标扩展名选择读取方式。不支持原生表格的模型会获得保留表头和原始行号的 Markdown 表格，支持工作表选择和按行续读；文本支持 `offset` / `limit`，结果按当前模型预算分页。原生 PDF 支持页区间；原生文件只发送一次。XLSX/XLS 解析分别需要 `openpyxl`/`xlrd`，详见 [文档读取参数](docs/api_docs.md#内置-read_document-工具factoryagent_runtimebuiltin_toolspy)。
-- 内置文件工具按需勾选：`read_file` 有 64 MiB 读取上限，默认连续读取 200 行，并用 `next_start_line` 指示续读；`edit_file` 支持单处替换或 `edits` 列表一次完成多处替换，`expected_hash` 可校验读后变更；`write_file` 的新调用须明确指定 `mode=create|overwrite|append`，旧调用参数仍兼容；`search_files` 默认按普通文本搜索，正则需指定 `is_regex=true`。勾选 `run_command` 后，模型还可使用 `poll_command`、`stop_command` 管理后台任务；已有会话可在「配置工具」中选择默认 shell。`read_media` 对仍在上下文的图片避免重复注入，已回收的视频区间可以重新读取。
+- 内置工具按需勾选，见 [使用简表](docs/builtin_tools.md)。`read_file` 按行续读，局部修改用 `edit_file`；`write_file` 必须明确 `mode=create|overwrite|append`。`search_files` 默认普通文本，正则使用可中断匹配。勾选 `run_command` 同时启用 `poll_command/stop_command`；默认 shell 按平台选择。`ask_user` 暂停同轮其他调用，前台命令随任务停止而取消；后台任务独立管理。媒体部件仅在内存中复用，已回收的视频区间可重读。
 - 修改保存后自动热重载生效，无需重启服务。
 
 Responses 使用 Python 标准库直接调用 HTTP/JSON/SSE，无需 OpenAI SDK；默认以 `store: true` 和 `previous_response_id` 增量续聊，也可在模型参数面板选择“无状态兼容”，使用 `store: false` 每次发送有效本地上下文。支持图片/文档工具及异常处理；有状态并行保留本地摘要与官方压缩，无状态仅使用本地摘要。前端显示本地上下文；详见 [Responses 使用说明](docs/responses_api_usage.md)、[无状态兼容排查](docs/responses_stateless_2026-10-16.md) 与 [原有状态方案](docs/responses_api_stateful_plan.md)。
@@ -110,7 +110,11 @@ if __name__ == "__main__":
 - `inputs` 列出要启用的工具（`服务名: [工具名]`），只有启用的工具才会提供给模型；也可以在前端「配置工具」弹窗中勾选，保存后写回此键。跨服务重名或与内置工具/`over_task` 冲突的 MCP 工具会获得稳定的模型调用名；配置按服务身份读取旧的原始名称，并在保存时逐步迁移为新名称。
 - `servers` 修改后会自动重新探测工具（配置热重载，默认 5 秒轮询）；普通 MCP 工具每次调用重新启动服务子进程。标记 `persistent: true` 的服务在会话 worker 中保持连接，适合需要跨调用保留状态的浏览器工具。
 
-浏览器点击与调试工具的安装、无界面运行和截图读取见 [浏览器工具说明](docs/browser_tools.md)。
+浏览器只配置一个 `Browser` MCP，完整清单只返回一份；前端提供「网页操作」「调试诊断」两套工具勾选预设，也可全选或手动调整。每次调用通过 `mcp_profile=isolated/extension` 选择独立浏览器或 Playwright Extension，后端按需保持两个独立进程并复用连接。工具参数采用 `{mcp_profile, arguments}` 封装；项目消费路由字段后仍按标准 MCP 调用微软原始工具。其他 stdio MCP 也可配置多个连接，详见 [通用 profiles](docs/mcp_profiles.md)。安装、授权与目标指定见 [浏览器工具说明](docs/browser_tools.md)。
+
+在「配置工具 → MCP 测试」可主动测试服务连接，根据工具 Schema 自动生成参数表单，或手动编辑 JSON 执行测试，查看错误分类并导出脱敏报告，详见 [MCP 诊断与手动测试](docs/mcp_diagnostics.md)。
+
+在「＋ → 任务模板」或 `/template` 中，可将任务正文、四种角色的模型引用、工具、预算、工作路径规则、输出格式和验收要求保存为模板；预览后创建独立会话，确认发送才运行。支持从当前配置、Skills 提示词创建，以及 JSON 导入导出，详见 [任务模板说明](docs/task_templates.md)。
 
 ## 工作路径与模型参数（会话独立机制）
 
@@ -124,6 +128,10 @@ if __name__ == "__main__":
   - 已有会话中修改 → 只保存为本会话的独立选择，面板中「清除会话覆盖」恢复跟随全局默认。
 
 独立机制：会话首次正式开始任务时，会把当时的全局默认（工作路径 / 工具选择 / 模型选择）固化为会话独立配置；此后该会话不再跟随全局设置变化，全局默认的修改只影响之后的新会话。
+
+## 上下文管理
+
+点击输入框上方的上下文用量、会话菜单“上下文管理”，或输入 `/context`，可查看本地上下文构成、历史与摘要覆盖、待重建状态、最近压缩原因及 Responses 远端链。面板按需读取，兼容手机，详见 [上下文管理说明](docs/context_panel.md)。
 
 ## 任务预算
 
@@ -173,3 +181,7 @@ if __name__ == "__main__":
 ### 供应商媒体限制
 
 支持在供应商或模型条目配置 `mediaLimits`，并针对明确的媒体数量报错自动降级。GIF 转换的视频也按视频配额处理，工具参数、分段读取及回传说明见 [read_media 使用说明](docs/read_media.md)，供应商示例配置见 [媒体限制说明](docs/media_limits.md)。
+
+### 会话归档
+
+会话菜单支持归档；侧栏底部「设置 → 归档会话」可查找、打开、取消归档和删除，归档后仍可继续聊天。侧栏和常规搜索默认只处理未归档会话，可切换为已归档或全部范围；会话文件无需搬迁。使用及备份说明见 [会话归档文档](docs/session_archives.md)。

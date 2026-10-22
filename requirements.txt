@@ -5,6 +5,10 @@ uvicorn
 
 # Data validation
 pydantic
+jsonschema
+
+# Interruptible regex matching for file and web searches
+regex>=2026.9.29
 
 # MCP (Model Context Protocol); optional for general use, required for MCP features
 mcp

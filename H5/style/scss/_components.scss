@@ -493,6 +493,7 @@ body.tool-settings-open { overflow: hidden; }
 
   .tool-config-dialog {
     width: min(820px, 100%);
+    color: var(--text);
     height: auto;
     max-height: min(740px, 100%);
     min-height: 0;
@@ -567,6 +568,15 @@ body.tool-settings-open { overflow: hidden; }
       .tool-group-count { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
       &.has-selection .tool-group-count { color: var(--text-secondary); }
       &.has-error .tool-group-id { color: var(--danger); }
+      .tool-browser-presets { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px 4px; }
+      .tool-browser-preset {
+        min-height: 32px; padding: 5px 9px; border: 1px solid var(--border-strong); border-radius: 7px;
+        background: var(--bg-code); color: var(--text-secondary); font: inherit; font-size: 12px; white-space: nowrap;
+        &[aria-pressed="true"], &:hover { background: var(--bg-hover); color: var(--tool-icon-pink); border-color: var(--tool-icon-pink); }
+        &:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+        &:disabled { opacity: 0.6; }
+      }
+      .tool-browser-note { margin: 0; padding: 3px 12px 8px; color: var(--text-tertiary); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
       .tool-row { align-items: center; min-height: 34px; gap: 8px; padding: 5px 12px 5px 28px; cursor: pointer; }
       .tool-row + .tool-row { border-top: 1px solid var(--border); }
       .tool-row.is-selected { background: color-mix(in srgb, #0b84d8 5%, transparent); }
@@ -601,26 +611,84 @@ body.tool-settings-open { overflow: hidden; }
   .tool-config-actions { display: flex; flex-shrink: 0; gap: 8px; margin-left: auto; }
   button:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
 
-  @media (max-width: 600px) {
+  @media (max-width: 640px) {
     padding: 0;
     .tool-config-dialog { width: 100%; height: 100%; max-height: 100%; border: 0; border-radius: 0; }
-    .tool-modal-head { padding: max(8px, env(safe-area-inset-top)) 12px 8px; gap: 8px; }
-    .tool-modal-toolbar { padding: 0 12px 10px; }
-    .tool-modal-toolbar .tool-search { height: 44px; }
-    .tool-modal-toolbar .tool-search input { font-size: 16px; }
-    .tool-modal-toolbar .tool-refresh, .tool-modal-toolbar .tool-collapse-all { height: 44px; }
-    .tool-config-content { padding: 10px 12px 14px; }
-    .tool-groups .tool-group {
-      .tool-group-head { gap: 8px; padding: 0 10px; }
-      .tool-group-toggle { gap: 7px; }
-      .tool-group-icon { display: none; }
-      .tool-row { min-height: 40px; padding: 5px 10px 5px 24px; }
-      .tool-row-info { gap: 8px; }
-      .tool-row-name { max-width: 55%; }
-      .tool-row-icon { width: 18px; height: 18px; margin-top: 0; }
+    // 标题独占前两列，状态和数量同排；缩放后的极窄窗口也不会把标题挤成竖排。
+    .tool-modal-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto 36px;
+      grid-template-areas: "title title close" "scope selected close";
+      column-gap: 6px;
+      row-gap: 2px;
+      padding: max(8px, env(safe-area-inset-top)) 10px 8px;
+      .tool-config-heading { display: contents; }
+      h2 { grid-area: title; font-size: 15px; line-height: 1.3; white-space: nowrap; }
+      .tool-config-heading small { grid-area: scope; min-width: 0; font-size: 11px; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tool-selected { grid-area: selected; padding: 1px 6px; font-size: 11px; line-height: 1.5; }
+      .icon-btn { grid-area: close; width: 36px; height: 36px; align-self: center; .icon { width: 20px; height: 20px; } }
     }
-    .tool-config-foot { padding: 6px 12px max(6px, env(safe-area-inset-bottom)); }
-    .tool-config-foot button { min-height: 44px; padding: 8px 12px; }
+    // 搜索一行，三个操作一行，避免 flex 换行把 MCP 测试单独推到第三行。
+    .tool-modal-toolbar {
+      display: grid;
+      grid-template-columns: 36px 36px minmax(0, 1fr);
+      gap: 6px;
+      padding: 0 10px 8px;
+      .tool-search { grid-column: 1 / -1; width: 100%; height: 38px; padding: 0 9px; gap: 6px; .icon { width: 16px; height: 16px; } }
+      // 保留 16px，避免 iOS 聚焦搜索框时自动放大页面。
+      .tool-search input { font-size: 16px; }
+      .tool-refresh, .tool-collapse-all { width: 36px; height: 38px; min-width: 0; }
+      .tool-refresh .icon { width: 17px; height: 17px; }
+      .mcp-test-entry { min-width: 0; width: 100%; min-height: 38px; padding: 5px 6px; font-size: 12px; line-height: 1.3; white-space: nowrap; }
+    }
+    .tool-config-content { padding: 8px 10px 10px; }
+    .tool-config-note { font-size: 11px; line-height: 1.4; margin-bottom: 8px; }
+    .tool-groups .tool-group {
+      .tool-group-head { gap: 6px; padding: 0 8px; min-height: 50px; }
+      .tool-browser-presets { padding: 7px 8px 4px; gap: 5px; }
+      .tool-browser-preset { flex: 1 1 auto; min-height: 34px; padding: 5px 6px; font-size: 11px; }
+      .tool-browser-note { padding: 3px 8px 7px; }
+      .tool-group-toggle { gap: 5px; min-height: 50px; }
+      .tool-group-icon { display: none; }
+      .tool-group-name { font-size: 13px; }
+      .tool-group-count { min-width: 0; font-size: 11px; white-space: nowrap; }
+      .tool-row { min-height: 42px; padding: 6px 8px 6px 24px; gap: 6px; }
+      .tool-row-info { display: block; }
+      .tool-row-name { display: block; max-width: 100%; font-size: 12px; line-height: 1.4; }
+      .tool-row-description { font-size: 11px; line-height: 1.4; margin-top: 2px; }
+      .tool-row-icon { width: 16px; height: 16px; margin-top: 0; }
+      .mcp-test-entry { min-height: 32px; padding: 4px 6px; font-size: 11px; line-height: 1.3; }
+    }
+    // 按整体按钮换行，不压缩按钮内部的文字；隐藏“跟随全局”时操作按钮自动铺满。
+    .tool-config-foot {
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 6px 10px max(6px, env(safe-area-inset-bottom));
+      button { min-width: 0; min-height: 40px; padding: 6px 8px; font-size: 12px; line-height: 1.4; white-space: nowrap; }
+      .tool-follow-global { flex: 1 1 76px; }
+      .tool-config-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); flex: 1 1 140px; min-width: 0; margin-left: 0; gap: 6px; }
+      .tool-config-actions button { width: 100%; min-width: 0; }
+    }
+  }
+  @media (max-width: 280px) {
+    .tool-config-note { display: none; }
+    .tool-config-foot {
+      gap: 4px;
+      button { min-height: 36px; padding: 5px 4px; font-size: 11px; }
+      .tool-follow-global { flex: 0 0 auto; }
+      .tool-config-actions { flex-basis: 76px; gap: 4px; }
+    }
+    .tool-groups .tool-group {
+      .tool-group-head { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; grid-template-areas: "check toggle test" "check count test"; min-height: 44px; column-gap: 6px; row-gap: 0; padding: 5px 8px; }
+      .tool-group-check { grid-area: check; }
+      .tool-group-toggle { grid-area: toggle; min-height: 0; padding: 0; }
+      .tool-group-id, .tool-row-icon { display: none; }
+      .tool-group-name { font-size: 12px; line-height: 1.4; }
+      .tool-group-count { grid-area: count; font-size: 10px; line-height: 1.3; text-align: left; margin-left: 19px; }
+      .tool-group-head > .mcp-test-entry { grid-area: test; margin-left: 0; }
+      .tool-row { padding-left: 20px; }
+      .tool-row > .mcp-test-entry { margin-left: 0; }
+    }
   }
 }
 

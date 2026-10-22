@@ -23,7 +23,8 @@ from html import unescape
 from html.parser import HTMLParser
 from http.client import IncompleteRead
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Annotated, Literal
+from pydantic import Field
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, parse_qs, urljoin
 from urllib.request import Request, urlopen
@@ -33,6 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from util.text_encoding import decode_text
+from util.tool_arguments import string_arg, int_arg, number_arg
+from util.bounded_regex import compile_pattern
+from factory.agent_runtime.tool_control import tool_deadline, remaining_seconds
 
 # 第三方库
 try:
@@ -300,7 +304,7 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
     request = Request(url, data=data, headers=merged_headers, method=method.upper())
     try:
         try:
-            response = urlopen(request, timeout=timeout_seconds)
+            response = urlopen(request, timeout=remaining_seconds(timeout_seconds))
         except HTTPError as exc:
             response = exc  # HTTP 错误仍有可读正文，使用同样的大小与解压保护。
         with response:
@@ -309,7 +313,17 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
             partial_note = ""
             while transferred <= _HTTP_MAX_TRANSFER_BYTES:
                 try:
-                    chunk = response.read(min(65536, _HTTP_MAX_TRANSFER_BYTES + 1 - transferred))
+                    remaining = remaining_seconds(timeout_seconds)
+                    # urllib's timeout is otherwise an inactivity timeout. Refresh
+                    # the socket budget and use read1 to check a slow stream promptly.
+                    stream = getattr(response, "fp", None)
+                    if stream is not None and hasattr(stream, "fp"):
+                        stream = stream.fp
+                    sock = getattr(getattr(stream, "raw", None), "_sock", None)
+                    if sock is not None:
+                        sock.settimeout(remaining)
+                    read = getattr(response, "read1", response.read)
+                    chunk = read(min(65536, _HTTP_MAX_TRANSFER_BYTES + 1 - transferred))
                 except IncompleteRead as exc:
                     chunks.append(exc.partial)
                     transferred += len(exc.partial)
@@ -371,6 +385,27 @@ def _pick_web_charset(content_type: str, raw: bytes, encoding: str) -> str:
 # ============================ 网页工具实现 ============================
 def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
                     encoding, method, body, headers, offset=0) -> str:
+    values = {"url": url, "mode": mode, "pattern": pattern, "tag": tag, "max_chars": max_chars,
+              "timeout_seconds": timeout_seconds, "encoding": encoding, "method": method,
+              "body": body, "offset": offset}
+    for key, maximum in (("url", 8192), ("mode", 20), ("pattern", 8192), ("tag", 4096),
+                         ("encoding", 64), ("method", 20), ("body", 2 * 1024 * 1024)):
+        string_arg(values, key, max_length=maximum)
+    timeout = number_arg(values, "timeout_seconds", 30, minimum=1, maximum=120)
+    int_arg(values, "offset", 0)
+    int_arg(values, "max_chars", 8000, maximum=100000)
+    if offset and method.upper() not in {"GET", "HEAD"}:
+        raise ValueError("offset 续读仅支持 GET/HEAD；本次请求未发送")
+    if headers is not None and (not isinstance(headers, dict) or len(headers) > 64
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items())):
+        raise ValueError("headers 必须是最多 64 项的字符串键值对象")
+    with tool_deadline(timeout):
+        return _fetch_url_checked(url, mode, pattern, tag, max_chars, timeout,
+                                  encoding, method, body, headers, offset)
+
+
+def _fetch_url_checked(url, mode, pattern, tag, max_chars, timeout_seconds,
+                       encoding, method, body, headers, offset):
     mode = (mode or "text").lower()
     if mode not in ("text", "html", "tag", "regex"):
         raise ValueError("mode 仅支持 text/html/tag/regex")
@@ -383,14 +418,8 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     if offset < 0:
         raise ValueError("offset 必须为非负字符偏移")
     if mode == "regex":
-        try:
-            regex = re.compile(str(pattern))
-        except re.error as exc:
-            raise ValueError(f"正则表达式不合法: {exc}")
-    try:
-        timeout = min(max(float(timeout_seconds), 1.0), 120.0)
-    except (TypeError, ValueError):
-        timeout = 30.0
+        regex = compile_pattern(pattern)
+    timeout = timeout_seconds
     response = _http_request(
         url, method=method or "GET", body=body or "", headers=headers, timeout_seconds=timeout, allow_partial=True)
     final_url, status, content_type, raw = response
@@ -413,15 +442,19 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
         # regex 模式：单条匹配展示上限 = max_chars/4，钳制在 [200, 2000]（默认 8000 → 每条 2000 字符）
         per_match_cap = max(200, min(2000, (int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS) // 4))
         matches = []
-        for found in regex.finditer(html_text):
-            piece = (" | ".join(g if g is not None else "" for g in found.groups())
-                     if found.groups() else found.group(0))
-            if len(piece) > per_match_cap:
-                regex_truncated = True
-            matches.append(piece[:per_match_cap])
-            if len(matches) >= 200:
-                regex_truncated = True
-                break
+        try:
+            for found in regex.finditer(html_text, timeout=remaining_seconds(2)):
+                piece = (" | ".join(g if g is not None else "" for g in found.groups())
+                         if found.groups() else found.group(0))
+                if len(piece) > per_match_cap:
+                    regex_truncated = True
+                matches.append(piece[:per_match_cap])
+                if len(matches) >= 200:
+                    regex_truncated = True
+                    break
+        except TimeoutError:
+            regex_truncated = True
+            extract_note = "正则执行超时，结果不完整"
         content = "\n".join(matches)
     limit = min(max(int(max_chars) if max_chars else _FETCH_URL_DEFAULT_CHARS, 200), 100000)
     original_len = len(content)
@@ -454,7 +487,10 @@ def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
     if offset >= original_len and offset:
         notes.append("offset 已达到或超过提取文本末尾；没有后续内容")
     if end < original_len:
-        notes.append(f"内容超过 max_chars={limit} 已截断；next_offset={end}，用同一 URL/模式和 offset={end} 继续读取（每次重新请求）；也可用 pattern/tag 缩小范围")
+        if method.upper() in {"GET", "HEAD"}:
+            notes.append(f"内容超过 max_chars={limit} 已截断；next_offset={end}，用同一 URL/模式和 offset={end} 继续读取（每次重新请求）；也可用 pattern/tag 缩小范围")
+        else:
+            notes.append(f"内容超过 max_chars={limit} 已截断；当前方法不支持 offset 续读")
     if notes:
         header += "\n[fetch_url] " + "；".join(notes)
     return header + "\n" + (content if content else "（提取结果为空）")
@@ -715,10 +751,13 @@ def _fetch_ddg_results(query: str, limit: int) -> list:
 
 
 def _web_search_impl(query, max_results, engine="auto") -> str:
-    query = str(query or "").strip()
-    if not query:
-        raise ValueError("query 不能为空")
-    limit = max(1, min(int(max_results) if max_results else 8, _WEB_SEARCH_MAX_RESULTS))
+    query = string_arg({"query": query}, "query", required=True, max_length=4096).strip()
+    limit = int_arg({"max_results": max_results}, "max_results", 8, minimum=1, maximum=_WEB_SEARCH_MAX_RESULTS)
+    with tool_deadline(45):
+        return _web_search_checked(query, limit, engine)
+
+
+def _web_search_checked(query, limit, engine):
     engine_key = str(engine or "auto").strip().lower()
     if engine_key in ("ddg", "duckduckgo"):
         engine_key = "ddg"
@@ -798,51 +837,32 @@ def _web_search_impl(query, max_results, engine="auto") -> str:
 
 # 仅注册网页抓取与搜索；本地文件和命令由后端内置工具提供。
 @sys_mcp_server.tool()
-async def fetch_url(url: str, mode: str = "text", pattern: str = "", tag: str = "",
-                    max_chars: int = _FETCH_URL_DEFAULT_CHARS, timeout_seconds: float = 30.0, encoding: str = "",
-                    method: str = "GET", body: str = "", headers: Optional[dict] = None,
-                    offset: int = 0) -> str:
-    """抓取网页或 HTTP 接口内容：支持纯文本提取、按标签/正则抽取，超长自动截断
-    参数：
-        url:             完整链接，仅支持 http/https
-        mode:            提取模式：text=正文纯文本（默认，自动剥离导航噪音）、
-                         html=原始 HTML、tag=按真实元素抽取纯文本（排除脚本/样式）、regex=按原始响应正则抽取
-        pattern:         mode=regex 时必填，在原始 HTML 上执行的正则（可用 (?s) 跨行匹配）
-        tag:             mode=tag 时必填，简单选择器：div、div#id、div.class，可用逗号多选如 h2,p；不支持完整 CSS/XPath
-        max_chars:       返回内容最大字符数（200-100000）；默认 8000（传 0 也视为默认）
-        offset:          提取后文本的起始字符偏移；按 next_offset 续读（每次重新请求，网页变化会影响位置）
-        timeout_seconds: 请求超时秒数（1-120），默认 30
-        encoding:        指定响应编码（如 gbk）；留空自动判断
-        method:          HTTP 方法，默认 GET；POST 时配合 body 使用
-        body:            请求体（POST 等使用），默认按 application/json 发送
-        headers:         额外请求头字典，例如 {"Authorization": "Bearer xxx"}
-    返回：
-        头部（状态码/最终 URL/Content-Type/标题/长度）+ 提取的内容；内容过长会截断，
-        HTTP 4xx/5xx 保留状态码、错误正文及 Retry-After；中途断流保留已收到内容并标记部分响应，无内容的网络故障仍报错。
-        tag 返回纯文本，regex 保持原始匹配（包括脚本），并提示局部截断。
-        不执行 JavaScript；网页太大时建议用 tag/regex 只抽取需要的部分
-    """
+async def fetch_url(
+    url: Annotated[str, Field(min_length=1, max_length=8192, description="完整 HTTP(S) 地址")],
+    mode: Literal["text", "html", "tag", "regex"] = "text",
+    pattern: Annotated[str, Field(max_length=8192, description="regex 模式的原始响应正则，可用 (?s) 跨行")] = "",
+    tag: Annotated[str, Field(max_length=4096, description="tag 模式：div、div#id、div.class，逗号分隔最多 20 个")] = "",
+    max_chars: Annotated[int, Field(strict=True, ge=0, le=100000, description="正文字符预算，默认 8000；最少返回预算 200，0 使用默认")] = _FETCH_URL_DEFAULT_CHARS,
+    timeout_seconds: Annotated[float, Field(strict=True, ge=1, le=120, allow_inf_nan=False, description="请求总时限秒数，默认 30")] = 30.0,
+    encoding: Annotated[str, Field(max_length=64, description="响应编码；省略自动判断")] = "",
+    method: Annotated[str, Field(min_length=1, max_length=20, description="HTTP 方法，默认 GET")] = "GET",
+    body: Annotated[str, Field(max_length=2 * 1024 * 1024, description="请求体；默认 Content-Type 为 application/json")] = "",
+    headers: Annotated[Optional[dict[str, str]], Field(max_length=64, description="附加请求头字符串键值对象")] = None,
+    offset: Annotated[int, Field(strict=True, ge=0, description="GET/HEAD 文本字符偏移；按 next_offset 续读，每次重新请求")] = 0,
+) -> str:
+    '抓取网页或 HTTP 接口，不执行 JavaScript。text 提取正文，html 返回原文，tag 简单选择器，regex 匹配原始响应。按 next_offset 续读仅支持 GET/HEAD；4xx/5xx 或部分响应会明确标记，不能当作完整成功结果。'
     return await asyncio.to_thread(
         _fetch_url_impl, url, mode, pattern, tag, max_chars, timeout_seconds,
         encoding, method, body, headers, offset)
 
 
 @sys_mcp_server.tool()
-async def web_search(query: str, max_results: int = 8, engine: str = "auto") -> str:
-    """网页搜索：解析 Bing 网页版结果（DuckDuckGo 自动回退），返回标题/链接/摘要
-    参数：
-        query:       搜索关键词
-        max_results: 最多返回条数（1-20），默认 8
-        engine:      搜索引擎：auto=Bing 失败/无结果或候选不足/弱相关时尝试 DuckDuckGo（默认）、
-                     bing=仅用 Bing（失败即报错）、ddg=仅用 DuckDuckGo
-    返回：
-        编号结果列表，每条含标题、链接、摘要（已按相关性排序，头部标注实际使用的引擎）；
-        需要正文时把链接交给 fetch_url 抓取
-    说明：
-        max_results 只控制展示数量，候选池策略固定；site: 域名/路径会二次过滤。
-        无 API Key（解析搜索引擎网页版）；验证码、访问受限或结构变化会提示失败。
-        完整版本号/年份优先匹配；相关性仍为关键词启发式，请核对原文，不把空结果当成网页不存在。
-    """
+async def web_search(
+    query: Annotated[str, Field(min_length=1, max_length=4096, description="搜索词，可用 site: 限定来源")],
+    max_results: Annotated[int, Field(strict=True, ge=1, le=20, description="展示条数，默认 8；不改变候选池策略")] = 8,
+    engine: Literal["auto", "bing", "ddg"] = "auto",
+) -> str:
+    '搜索候选网页，返回标题、链接和摘要；用 fetch_url 核验正文。auto 在 Bing 候选不足或失败时尝试 DDG；总预算 45 秒。空结果不证明网页不存在。'
     return await asyncio.to_thread(_web_search_impl, query, max_results, engine)
 
 

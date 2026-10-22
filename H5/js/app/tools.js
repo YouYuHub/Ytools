@@ -26,6 +26,11 @@
   let background = [];
   let hadScrollLock = false;
   let tooltipTimer = null;
+  let serverMetadata = Object.create(null);
+  const BROWSER_PRESETS = [
+    { id: "web", label: "网页操作", names: ["browser_close", "browser_handle_dialog", "browser_file_upload", "browser_drop", "browser_find", "browser_fill_form", "browser_press_key", "browser_type", "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_click", "browser_drag", "browser_hover", "browser_select_option", "browser_tabs", "browser_wait_for"] },
+    { id: "debug", label: "调试诊断", names: ["browser_resize", "browser_console_messages", "browser_emulate_media", "browser_evaluate", "browser_network_requests", "browser_network_request", "browser_take_screenshot", "browser_navigate", "browser_snapshot", "browser_tabs", "browser_find", "browser_wait_for"] }
+  ];
 
   function hideDescription() {
     if (tooltipTimer !== null) { clearTimeout(tooltipTimer); tooltipTimer = null; }
@@ -74,7 +79,7 @@
       return;
     }
     if (event.key !== "Tab") return;
-    const focusable = Array.from(toolModal.querySelectorAll("button, input, [tabindex]")).filter(function (node) {
+    const focusable = Array.from(toolModal.querySelectorAll("button, input, select, [tabindex]")).filter(function (node) {
       return !node.disabled && node.tabIndex >= 0 && !node.closest("[inert]") && node.getClientRects().length;
     });
     if (!focusable.length) { event.preventDefault(); return; }
@@ -163,6 +168,7 @@
       state.tools = (data.tools || []).map(normalizeTool).filter(function (tool) { return tool.name; });
       state.servers = Array.isArray(data.servers) ? data.servers.map(String) : [];
       state.failedServers = Array.isArray(data.failed_servers) ? data.failed_servers.map(String) : [];
+      serverMetadata = Object.assign(Object.create(null), data.server_metadata || {});
       if (pendingSelectionInputs) {
         const pending = pendingSelectionInputs;
         pendingSelectionInputs = null;
@@ -176,6 +182,7 @@
       state.tools = [];
       state.servers = [];
       state.failedServers = [];
+      serverMetadata = Object.create(null);
     }
     const modelConfigRefreshed = await modelConfigRefresh;
     if (success) {
@@ -269,7 +276,7 @@
               return;
             }
             const exact = state.tools.find(function (tool) {
-              return tool.name === name && tool.serverId === server;
+              return tool.serverId === server && tool.name === name;
             });
             if (exact) {
               names.push(exact.name);
@@ -370,8 +377,13 @@
     }
 
     order.forEach(function (serverId) {
-      const allTools = groups.get(serverId) || [];
-      const serverMatches = query && (serverId + " " + serverLabel(serverId)).toLowerCase().includes(query);
+      const sourceServerId = serverId;
+      const isBrowser = Boolean((serverMetadata[serverId] || {}).browser_mode);
+      const groupLabel = serverLabel(serverId);
+      const allTools = groups.get(sourceServerId) || [];
+      const connection = serverMetadata[sourceServerId] || {};
+      const searchLabel = (isBrowser ? "浏览器 " : "") + serverId + " " + groupLabel;
+      const serverMatches = query && (searchLabel + " " + (connection.connection_label || "")).toLowerCase().includes(query);
       const visibleTools = allTools.filter(function (tool) {
         return !query || serverMatches || tool.name.toLowerCase().includes(query)
           || String(tool.originalName || tool.name).toLowerCase().includes(query)
@@ -382,13 +394,13 @@
       const group = el("section", "tool-group");
       group.dataset.serverId = serverId;
       group.classList.toggle("open", Boolean(query) || !collapsedServers.has(serverId));
-      group.classList.toggle("has-error", state.failedServers.includes(serverId));
+      group.classList.toggle("has-error", state.failedServers.includes(sourceServerId));
       const head = el("div", "tool-group-head");
       const groupCheck = document.createElement("input");
       groupCheck.type = "checkbox";
       groupCheck.className = "tool-group-check";
       groupCheck.title = "选择此服务下的全部工具";
-      groupCheck.setAttribute("aria-label", "选择“" + serverLabel(serverId) + "”的全部工具");
+      groupCheck.setAttribute("aria-label", "选择“" + groupLabel + "”的全部工具");
       groupCheck.disabled = !allTools.length;
 
       const toggle = el("button", "tool-group-toggle");
@@ -397,11 +409,12 @@
         '<svg class="icon tool-group-arrow" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>' +
         '<svg class="icon tool-group-icon" viewBox="0 0 24 24"><path d="M12 3v18M5 7h14M5 17h14M7 3v4m10-4v4M7 17v4m10-4v4"/></svg>' +
         '<span class="tool-group-title"><span class="tool-group-name"></span><span class="tool-group-id"></span></span>';
-      toggle.querySelector(".tool-group-name").textContent = serverLabel(serverId);
+      toggle.querySelector(".tool-group-name").textContent = groupLabel;
       toggle.querySelector(".tool-group-id").textContent =
         serverId === App.BUILTIN_SERVER_KEY ? "内置 · 本机执行"
-        : state.failedServers.includes(serverId) ? "MCP · 连接失败"
-        : serverId === serverLabel(serverId) || serverId === "__unassigned__" ? "MCP 服务" : serverId;
+        : state.failedServers.includes(sourceServerId) ? "MCP · 连接失败"
+        : connection.connection_label || (serverId === serverLabel(serverId) || serverId === "__unassigned__" ? "MCP 服务" : serverId);
+      if (connection.connection_hint) toggle.title = connection.connection_hint;
       toggle.setAttribute("aria-expanded", String(group.classList.contains("open")));
       toggle.addEventListener("click", function () {
         const opened = group.classList.toggle("open");
@@ -414,12 +427,57 @@
       head.appendChild(groupCheck);
       head.appendChild(toggle);
       head.appendChild(count);
+      const isMcp = serverId !== App.BUILTIN_SERVER_KEY && serverId !== "__unassigned__";
+      function testButton(toolName) {
+        const test = el("button", "mcp-test-entry", "测试");
+        test.type = "button";
+        test.setAttribute("aria-label", "测试 " + serverLabel(sourceServerId) + (toolName ? " / " + toolName : " 连接"));
+        test.addEventListener("click", function (event) {
+          event.stopPropagation();
+          if (App.mcpDiagnostics) App.mcpDiagnostics.open(sourceServerId, toolName);
+        });
+        return test;
+      }
+      if (isMcp) head.appendChild(testButton());
       group.appendChild(head);
       updateGroupCheckbox(groupCheck, allTools);
 
       const body = el("div", "tool-group-body");
+      if (connection.profile_status) {
+        const failedProfiles = connection.profile_status.filter(function (profile) { return !profile.ok; });
+        if (failedProfiles.length) body.appendChild(el("p", "tool-group-connection-hint", "部分连接发现失败：" + failedProfiles.map(function (profile) { return profile.id; }).join("、") + "。当前清单仅包含发现成功的连接，请在 MCP 测试中检查。"));
+      }
+      if (!isBrowser && connection.mcp_profiles) body.appendChild(el("p", "tool-group-connection-hint", connection.connection_hint));
+      if (isBrowser) {
+        const presetBar = el("div", "tool-browser-presets");
+        presetBar.setAttribute("role", "group"); presetBar.setAttribute("aria-label", groupLabel + "工具预设");
+        const presets = BROWSER_PRESETS.concat([{ id: "all", label: "全部", names: null }, { id: "none", label: "清空", names: [] }]);
+        presets.forEach(function (preset) {
+          const desired = new Set(allTools.filter(function (tool) { return !preset.names || preset.names.includes(tool.originalName || tool.name); }).map(function (tool) { return tool.name; }));
+          const selected = allTools.filter(function (tool) { return state.draftTools.has(tool.name); });
+          const button = el("button", "tool-browser-preset", preset.label + (preset.id === "none" ? "" : " · " + desired.size));
+          button.type = "button"; button.dataset.preset = preset.id;
+          button.disabled = !allTools.length;
+          button.setAttribute("aria-pressed", String(selected.length === desired.size && selected.every(function (tool) { return desired.has(tool.name); })));
+          button.addEventListener("click", function () {
+            if (App.toolModalSaving || toolRefresh.disabled) return;
+            allTools.forEach(function (tool) { state.draftTools.delete(tool.name); });
+            desired.forEach(function (name) { state.draftTools.add(name); });
+            renderToolGroups();
+            const currentGroup = Array.from(toolGroups.querySelectorAll(".tool-group")).find(function (node) { return node.dataset.serverId === serverId; });
+            const nextButton = currentGroup && currentGroup.querySelector('[data-preset="' + preset.id + '"]');
+            if (nextButton) nextButton.focus({ preventScroll: true });
+          });
+          presetBar.appendChild(button);
+        });
+        body.appendChild(presetBar);
+        body.appendChild(el("p", "tool-browser-note", "预设替换本服务勾选，可继续手动调整。" + (connection.mcp_profiles ? "多个连接可同时保留；提问时指定“独立浏览器”或“已打开网页”，模型通过 mcp_profile 选择。默认连接：" + connection.default_profile + "。" : "预设不改变浏览器连接模式。")));
+      }
+
+      if (connection.browser_mode === "extension") body.appendChild(el("p", "tool-group-connection-hint",
+        (connection.browser_channel || "浏览器") + " 扩展连接：首次实际调用时，请在 Playwright Extension 中授权并选择已有标签页。"));
       if (!allTools.length) {
-        body.appendChild(el("div", "tool-group-empty", state.failedServers.includes(serverId) ? "服务连接失败，暂无可用工具" : "暂无可用工具"));
+        body.appendChild(el("div", "tool-group-empty", state.failedServers.includes(sourceServerId) ? "服务连接失败，暂无可用工具" : "暂无可用工具"));
       } else {
         visibleTools.forEach(function (tool) {
           const row = el("div", "tool-row");
@@ -457,6 +515,7 @@
             row.querySelector(".tool-row-description").textContent = tool.description;
           }
           row.insertBefore(checkbox, row.firstChild);
+          if (isMcp) row.appendChild(testButton(tool.originalName || tool.name));
           row.addEventListener("click", function () {
             if (checkbox.disabled || App.toolModalSaving) return;
             checkbox.checked = !checkbox.checked;
@@ -587,7 +646,7 @@
     toast(!result.success
       ? "工具列表更新失败"
       : result.modelConfigRefreshed
-        ? "工具列表和模型能力已更新，共 " + state.tools.length + " 项"
+        ? "工具列表和模型能力已更新"
         : "工具列表已更新，但模型能力刷新失败");
   });
   $("#toolCollapseAll").addEventListener("click", function () {

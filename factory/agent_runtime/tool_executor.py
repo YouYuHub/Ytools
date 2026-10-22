@@ -9,6 +9,13 @@ from typing import Any, Dict, List
 from util.mcp_client import call_mcp_tool
 
 
+ARGUMENT_PARSE_ERROR = "__ytools_invalid_arguments__"
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"JSON 不支持 {value}")
+
+
 @dataclass
 class ToolExecutionPlan:
     parsed_tools: list[tuple[int, dict, str, dict]]
@@ -20,17 +27,19 @@ def parse_tool_call(tool_call: dict) -> tuple[str | None, dict]:
     if not isinstance(tool_call, dict):
         return None, {}
     function_info = tool_call.get("function") or {}
+    if not isinstance(function_info, dict):
+        return None, {}
     tool_name = function_info.get("name")
     arguments = function_info.get("arguments")
+    if arguments is None:
+        return tool_name, {}
     if isinstance(arguments, str):
         try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {}
-    if arguments is None:
-        arguments = {}
+            arguments = json.loads(arguments, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
+            return tool_name, {ARGUMENT_PARSE_ERROR: "arguments 必须是完整的 JSON 对象；请修正后重试"}
     if not isinstance(arguments, dict):
-        arguments = {"arguments": arguments}
+        return tool_name, {ARGUMENT_PARSE_ERROR: "arguments 必须是 JSON 对象，不能是数组、字符串或 null"}
     return tool_name, arguments
 
 
@@ -56,7 +65,7 @@ def split_concatenated_tool_names(name: str, known_names: List[str]) -> List[str
 def split_concatenated_json_objects(arguments: str) -> List[Any]:
     if not isinstance(arguments, str):
         return []
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
     text = arguments.strip()
     results: List[Any] = []
     pos = 0
@@ -67,7 +76,7 @@ def split_concatenated_json_objects(arguments: str) -> List[Any]:
             break
         try:
             obj, next_pos = decoder.raw_decode(text, pos)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return []
         results.append(obj)
         pos = next_pos
@@ -82,6 +91,9 @@ def normalize_tool_calls(tool_calls: List[dict], known_names: List[str]) -> List
         if not isinstance(tc, dict):
             continue
         function_info = tc.get("function") or {}
+        if not isinstance(function_info, dict):
+            normalized.append(tc)
+            continue
         tool_name = function_info.get("name")
         arguments = function_info.get("arguments")
         if tool_name in known_names:
@@ -92,10 +104,10 @@ def normalize_tool_calls(tool_calls: List[dict], known_names: List[str]) -> List
             normalized.append(tc)
             continue
         split_args = split_concatenated_json_objects(arguments) if isinstance(arguments, str) else []
-        if split_args and len(split_args) == len(split_names):
-            arg_texts = [arg if isinstance(arg, str) else json.dumps(arg, ensure_ascii=False) for arg in split_args]
-        else:
-            arg_texts = ["{}" for _ in split_names]
+        if len(split_args) != len(split_names) or not all(isinstance(arg, dict) for arg in split_args):
+            normalized.append(tc)
+            continue
+        arg_texts = [json.dumps(arg, ensure_ascii=False) for arg in split_args]
         base_id = tc.get("id") or f"call_{uuid.uuid4().hex}"
         base_index = tc.get("index", len(normalized))
         base_type = tc.get("type", "function")
@@ -120,13 +132,11 @@ def prepare_tool_execution(tool_calls: List[dict], known_names: List[str]) -> To
         tool_name, tool_args = parse_tool_call(tool_call)
         if not tool_name:
             continue
-        if tool_name == "over_task":
+        if ARGUMENT_PARSE_ERROR in tool_args:
+            has_parse_error = True
+        if tool_name == "over_task" and ARGUMENT_PARSE_ERROR not in tool_args:
             over_task_call = (i, tool_call, tool_name, tool_args)
         else:
-            func_info = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-            arguments_str = func_info.get("arguments", "")
-            if arguments_str and not tool_args and str(arguments_str).strip() not in {"{}", "[]", "null"}:
-                has_parse_error = True
             parsed_tools.append((i, tool_call, tool_name, tool_args))
     return ToolExecutionPlan(parsed_tools=parsed_tools, over_task_call=over_task_call, has_parse_error=has_parse_error)
 
@@ -138,6 +148,8 @@ def _invoke_tool_function(
     tool_original_names: Dict[str, str] | None = None,
     session_scope: str = "main",
 ) -> Any:
+    if ARGUMENT_PARSE_ERROR in arguments:
+        raise ValueError(arguments[ARGUMENT_PARSE_ERROR])
     if name not in tool_mcp_servers:
         raise ValueError(f"工具 {name} 未在MCP服务器中注册，无法调用")
     mcp_service = tool_mcp_servers[name]

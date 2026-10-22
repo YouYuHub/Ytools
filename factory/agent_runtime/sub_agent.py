@@ -6,7 +6,7 @@
   SubAgentContext 在派发时刻固化工具快照/限制/回调/取消令牌；子任务私有的
   messages/todo/usage/rounds 全部收敛在 Runner 实例属性内，不写全局。
 - 层级取消：父级停止（stop_checker）→ 取消全部子任务；单个子任务超时/
-  轮次上限/流错误 → 只终止自己，不向父级传播。父级 wait_for 超时后由
+  轮次上限/流错误 → 只终止自己，不向父级传播。有效执行时限到期后由
   run_sub_agent_batch 兜底补写 done 事件（runner.done_emitted 防重复）。
 - 子任务不直接持有 chat_memory：所有事件经 emit_event 回调进入父循环
   （父循环负责 timestamp 补齐 + SSE 推送 + JSONL 落盘，写入发生在事件循环
@@ -25,7 +25,7 @@ import json
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Dict
 
 from chat.chat_llm import ChatLLM
@@ -89,6 +89,7 @@ from factory.agent_runtime.context_compaction import (
 )
 from factory.system_prompt import build_sub_agent_system_text
 from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext
+from factory.agent_runtime.tool_control import run_sync_tool
 from factory.agent_runtime.text_tool_call import TextToolCallBuffer, text_tool_call_reminder
 from factory.agent_runtime.tool_executor import (
     execute_tool_round,
@@ -137,8 +138,11 @@ class SubAgentContext:
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
     # 单个子任务的用户停止，与父级停止/超时分别判定。
     user_stop_requested: bool = False
+    timeout_requested: bool = False
+    file_access: Any = None
     # 模型可见名称到 MCP 原始工具名的映射，供子任务调用时还原协议名称。
     tool_original_names: Dict[str, str] = field(default_factory=dict)
+    reply_token_budget: int = 0
 
     def stop_requested(self) -> bool:
         """本子任务是否被要求停止（父级停止 或 取消令牌置位）。"""
@@ -426,6 +430,13 @@ class SubAgentRunner:
         self.rounds = 0
         self.started_at = now_str()
         self._started_monotonic = time.monotonic()
+        self._restored_active_seconds = 0.0
+        self._execution_started = False
+        self._paused_baseline = 0.0
+        self._activity = "queued"
+        self._activity_detail = ""
+        self._last_activity = time.monotonic()
+        self._file_conflicts: list[str] = []
         self.done_emitted = False
         self.start_emitted = False
         self._seq = 0
@@ -449,9 +460,6 @@ class SubAgentRunner:
         self._permission_resume = None
         self._permission_replaying = False
         if self.permission_runtime:
-            budget = getattr(self.permission_runtime, "costs", None)
-            if budget:
-                budget.register_agent(context.agent_id)
             from memory.permission_store import load_checkpoint
             self._permission_resume = load_checkpoint(self.permission_runtime.id, context.agent_id)
             if self._permission_resume:
@@ -464,7 +472,8 @@ class SubAgentRunner:
                 self._api_type, self._is_messages, self._is_responses = api_type, api_type == "messages", api_type == "responses"
                 self._active_provider_state = self._permission_resume["messages"][-1].get("provider_state")
                 self.todo = self._permission_resume.get("todo", self.todo)
-                self._started_monotonic -= self._permission_resume.get("active_seconds", 0)
+                self._restored_active_seconds = max(0.0, self._permission_resume.get("active_seconds", 0))
+                self._started_monotonic -= self._restored_active_seconds
                 for usage in self._permission_resume.get("usage", []):
                     self.usage_accumulator.collect({"usage": usage})
         # 计划是否被模型触碰过（成功调用 todo_write 即置位）：收尾提醒只
@@ -478,6 +487,7 @@ class SubAgentRunner:
         # 不落盘）；视频区间读取的坐标含区间；injected_refs 防重复读取
         # （键带区间：同视频不同区间是新的读取）；滚动窗口只保留最近 5 个
         self.read_media_pending_parts: list[tuple[str, Any, Any, Any, str]] = []
+        self._loaded_media_parts = {}
         self.read_media_injected_refs: set[str] = set()
         # read_document 原生分支待注入部件（模型支持该文档类型时）
         self.native_doc_pending_parts: list[Any] = []
@@ -491,6 +501,47 @@ class SubAgentRunner:
         self._vision_enabled: bool | None = getattr(
             context, "parent_vision_enabled", None
         )
+
+    def begin_execution(self) -> None:
+        if self._execution_started:
+            return
+        self._execution_started = True
+        self._started_monotonic = time.monotonic() - self._restored_active_seconds
+        if self.permission_runtime:
+            budget = getattr(self.permission_runtime, "costs", None)
+            if budget:
+                budget.register_agent(self.context.agent_id)
+            self._paused_baseline = self.permission_runtime.paused_time(self.context.agent_id)
+
+    def active_seconds(self) -> float:
+        if not self._execution_started:
+            return self._restored_active_seconds
+        paused = self.permission_runtime.paused_time(self.context.agent_id) if self.permission_runtime else 0
+        return max(0.0, time.monotonic() - self._started_monotonic - max(0, paused - self._paused_baseline))
+
+    async def _progress(self, activity: str, detail: str = "") -> None:
+        if (activity, detail) == (self._activity, self._activity_detail):
+            return
+        self._activity, self._activity_detail = activity, detail
+        await self._emit("progress", activity=activity, detail=detail, rounds=self.rounds,
+                         elapsed_seconds=round(self.active_seconds(), 1))
+
+    async def _heartbeat(self) -> None:
+        while not self.done_emitted:
+            await asyncio.sleep(5)
+            if self.done_emitted:
+                return
+            activity = self._activity
+            runtime = self.permission_runtime
+            if runtime and self.context.agent_id in getattr(runtime, "agent_waits", {}):
+                activity = "waiting_approval"
+            elif runtime and getattr(runtime, "costs", None):
+                from memory import task_cost_store
+                if (task_cost_store.status(runtime.costs.id) or {}).get("state") == "paused":
+                    activity = "waiting_budget"
+            await self._emit("heartbeat", activity=activity, detail=self._activity_detail,
+                             rounds=self.rounds, elapsed_seconds=round(self.active_seconds(), 1),
+                             idle_seconds=round(time.monotonic() - self._last_activity, 1))
 
     def _visible_tool_definitions(self) -> list[dict[str, Any]]:
         """当前子任务可见的工具定义。
@@ -510,6 +561,10 @@ class SubAgentRunner:
 
     # ----------------------------- 事件发射 -----------------------------
     async def _emit(self, phase: str, **fields: Any) -> None:
+        if phase != "heartbeat":
+            self._last_activity = time.monotonic()
+        if phase == "notice" and fields.get("retry_kind"):
+            await self._progress("retrying", str(fields.get("message") or ""))
         if self._permission_replaying and phase == "model_call":
             return
         if self.permission_runtime and phase == "done":
@@ -747,32 +802,45 @@ class SubAgentRunner:
         request = self._build_request(parameter)
         request.wire_protocol = self._api_type
         request.protocol_config = actual_config
-        if self._is_responses and self._active_provider_state:
+        if any(m.get("role") == "tool" for m in self.messages) or (self._is_responses and self._active_provider_state):
             from chat.protocols.responses_store import load_state
-            previous_compaction = (load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}).get("record_ref")
+            previous_compaction = ((load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}).get("record_ref")
+                                   if self._is_responses else None)
             async def emit_compaction(payload):
                 if payload.get("phase") == "delta":
                     return
+                if payload.get("phase") == "start":
+                    await self._progress("compacting")
                 await self._emit("notice", seq=self._seq,
                     message=payload.get("message") or (payload.get("warning") or {}).get("message") or
                         ("子任务上下文压缩：" + str(payload.get("phase") or "")),
                     context_compaction=payload)
-            result = await compact_active_round_context_if_needed(self.messages, request, event_emitter=emit_compaction)
+            settings = replace(load_context_compaction_settings(),
+                               input_window_override=resolve_config_max_input_tokens(actual_config, default=8192))
+            result = await compact_active_round_context_if_needed(
+                self.messages, request, settings=settings, event_emitter=emit_compaction)
             if result.triggered:
                 self.messages = result.messages
-                from .responses_context import mark_baseline
-                mark_baseline(self._responses_context, self.messages)
+                if self._is_responses:
+                    from .responses_context import mark_baseline
+                    mark_baseline(self._responses_context, self.messages)
                 request = self._build_request(parameter)
                 request.wire_protocol, request.protocol_config = self._api_type, actual_config
             if result.usage:
                 usage.collect({"id": "sub_compact_" + uuid.uuid4().hex, "usage": result.usage})
-            native = load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}
+            native = (load_state(ctx.session_id, self._responses_context["scope"]).get("last_compaction") or {}) if self._is_responses else {}
             if native.get("phase") == "done" and native.get("record_ref") != previous_compaction and native.get("usage"):
                 values = native["usage"]
                 usage.collect({"id": native["record_ref"], "usage": {
                     "prompt_tokens": values.get("input_tokens", 0),
                     "completion_tokens": values.get("output_tokens", 0),
                     "total_tokens": values.get("total_tokens", 0)}})
+        estimated = estimate_send_context_tokens(self.messages, request.tools)
+        window = resolve_config_max_input_tokens(actual_config, default=8192)
+        if estimated > window:
+            raise ValueError(f"子任务请求上下文预估 {estimated} tokens，超过模型窗口 {window}；"
+                             "压缩后仍无法容纳任务、工具定义或附件，请精简任务或减少工具/附件后重新派发")
+        await self._progress("model")
         sse_iter = ChatLLM.chat_completions(
             request=request,
             stream=True,
@@ -830,6 +898,7 @@ class SubAgentRunner:
                 if event.get("error") is not None:
                     # 重试帧只提示进度（子任务无法向用户提示），不终止
                     if event.get("retrying"):
+                        await self._progress("retrying", str(event.get("error") or "模型请求重试"))
                         if event.get("discard_tool_calls"):
                             tool_calls.clear()
                             finish_reason = None
@@ -845,6 +914,8 @@ class SubAgentRunner:
                     event.pop("finish_reason", None)
                 content = event.get("content")
                 reasoning_content = event.get("reasoning_content")
+                if content or reasoning_content or event.get("tool_calls"):
+                    await self._progress("model")
                 tool_calls_delta = event.get("tool_calls")
                 function_call_delta = event.get("function_call")
                 if content:
@@ -924,12 +995,15 @@ class SubAgentRunner:
         plan = prepare_tool_execution(normalized, known_tool_names)
         parsed_tools = [item for item in plan.parsed_tools if item[2] in ctx.tool_servers]
         permission_results = []
+        if not self.permission_runtime:
+            from .tool_validation import prepare_builtin_calls
+            parsed_tools, permission_results = prepare_builtin_calls(parsed_tools)
         if self.permission_runtime:
             self.permission_runtime.save(ctx.agent_id, {
                 "messages": self.messages, "rounds": self.rounds, "seq": self._seq,
                 "parent_tool_call_id": ctx.parent_tool_call_id, "parent_round_number": ctx.parent_round_number,
                 "todo": self.todo, "api_type": getattr(self, "_api_type", "chat-completions"),
-                "active_seconds": max(0, time.monotonic() - self._started_monotonic - self.permission_runtime.paused_time(ctx.agent_id)),
+                "active_seconds": self.active_seconds(),
                 "usage": list(self.usage_accumulator._usage_by_id.values()),
                 "responses_context": {key: value for key, value in (self._responses_context or {}).items() if key != "stop_checker"},
             })
@@ -975,8 +1049,11 @@ class SubAgentRunner:
             model_config=media_config, messages=self.messages, tools=self._visible_tool_definitions(),
             tool_count=len(parsed_tools))
         for idx, tc, tn, ta in parsed_tools:
+            if ctx.stop_requested():
+                raise asyncio.CancelledError()
             if self.permission_runtime:
                 self.permission_runtime.begin_call(ctx.agent_id, tc["id"])
+            await self._progress("tools", tn)
             await self._emit("tool_start", tool_call_id=tc.get("id", ""), function_name=tn, arguments=ta, seq=self._seq)
             if getattr(self, "_is_responses", False) and self._active_provider_state:
                 from chat.protocols.responses_store import tool_result
@@ -1079,7 +1156,7 @@ class SubAgentRunner:
                         "injected_references": [],
                     }
                 else:
-                    read_media_result = execute_read_media(
+                    read_media_result = await run_sync_tool(execute_read_media,
                         ta,
                         ctx.session_id,
                         self.task_media_references,
@@ -1087,6 +1164,7 @@ class SubAgentRunner:
                         media_limits=get_media_limits(media_config),
                         vision_enabled=self._vision_enabled,
                         api_type=getattr(self, "_api_type", None) if getattr(self, "_api_type", None) in {"messages", "responses"} else None,
+                        loaded_parts=self._loaded_media_parts,
                     )
                 if read_media_result.get("ok"):
                     for loaded in read_media_result.get("loaded") or []:
@@ -1109,12 +1187,14 @@ class SubAgentRunner:
                         evicted = self.read_media_pending_parts[:-5]
                         self.read_media_pending_parts = self.read_media_pending_parts[-5:]
                         self.read_media_injected_refs.difference_update(item[4] for item in evicted)
+                        for item in evicted:
+                            self._loaded_media_parts.pop(item[4], None)
                 builtin_results.append((idx, tc, tn, ta, read_media_result))
                 continue
             if tn == READ_DOCUMENT_NAME:
                 # 按子任务模型对此文件扩展名的 supportDocTypes 决定 auto 模式；
                 # 不依据 vision 标志。原生输入只进入下一次请求一次。
-                read_document_result = execute_read_document(
+                read_document_result = await run_sync_tool(execute_read_document,
                     {**ta, "_max_chars": model_tool_output_char_budget(media_config), "_max_tokens": document_budget},
                     ctx.session_id, support_doc_types=self._native_doc_types(),
                 )
@@ -1143,7 +1223,7 @@ class SubAgentRunner:
                                              in TABLE_EXTENSIONS else "text")
                             text_args = {**ta, "mode": fallback_mode, "_max_chars": model_tool_output_char_budget(media_config),
                                          "_max_tokens": document_budget}
-                            read_document_result = execute_read_document(
+                            read_document_result = await run_sync_tool(execute_read_document,
                                 text_args, ctx.session_id,
                                 support_doc_types=self._native_doc_types(),
                             )
@@ -1163,15 +1243,21 @@ class SubAgentRunner:
             bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(media_config),
                             "_default_shell": resolve_default_command_shell(ctx.session_id),
                             "_session_id": ctx.session_id}
-            file_tool_result = try_execute_builtin_file_tool(tn, bounded_args)
+            file_tool_result = (await run_sync_tool(ctx.file_access.execute, ctx.agent_id, tn, bounded_args, try_execute_builtin_file_tool)
+                                if ctx.file_access else await run_sync_tool(try_execute_builtin_file_tool, tn, bounded_args))
             if file_tool_result is not None:
+                if isinstance(file_tool_result, dict) and file_tool_result.get("code") == "SUB_AGENT_FILE_CONFLICT":
+                    self._file_conflicts.append(file_tool_result["path"])
+                    await self._emit("notice", message=file_tool_result["error"],
+                                     file_conflict={"path": file_tool_result["path"],
+                                                    "agent_id": file_tool_result["conflicting_agent"]})
                 builtin_results.append((idx, tc, tn, ta, file_tool_result))
                 continue
             # 内置终端命令工具（run_command）：服务端本地执行；命令为同步阻塞
             # 调用（可能长达分钟级），经 asyncio.to_thread 放到工作线程执行，
             # 避免卡死子任务事件循环（与 MCP 工具走线程池的语义一致）
             if tn in COMMAND_TOOL_NAMES:
-                command_result = await asyncio.to_thread(
+                command_result = await run_sync_tool(
                     try_execute_builtin_command_tool, tn, bounded_args)
                 builtin_results.append((idx, tc, tn, ta, command_result))
                 continue
@@ -1197,18 +1283,18 @@ class SubAgentRunner:
 
     # ----------------------------- 主循环 -----------------------------
     async def run(self) -> SubAgentResult:
+        self.begin_execution()
+        heartbeat = asyncio.create_task(self._heartbeat())
         try:
             return await self._run_inner()
         except asyncio.CancelledError:
             # 用户单独停止优先标记 stopped；超时取消仍标记 timeout。
             if self.context.user_stop_requested:
                 status = "stopped"
-            elif self.context.cancel_token.is_set():
+            elif self.context.timeout_requested:
                 status = "timeout"
-            elif self.context.stop_requested():
-                status = "stopped"
             else:
-                status = "timeout"
+                status = "stopped"
             self._status = status
             self._final_reply = self._build_progress_reply(status)
             try:
@@ -1226,6 +1312,8 @@ class SubAgentRunner:
                 pass
             return self._make_result()
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             from util.mcp_client import close_persistent_mcp_clients
             await asyncio.to_thread(
                 close_persistent_mcp_clients, f"sub_agent:{self.context.agent_id}"
@@ -1251,7 +1339,7 @@ class SubAgentRunner:
             else resolve_model_max_input_tokens(default=8192)
         )
         estimated = estimate_send_context_tokens(self.messages, visible_tools)
-        if window > 0 and estimated > window:
+        if window > 0 and estimated > window and not any(m.get("role") == "tool" for m in self.messages):
             detail = (
                 f"子任务上下文预估 {estimated} tokens 超过模型窗口 {window}："
                 "任务描述过长或注入工具过多，请父智能体精简 task 后重新派发"
@@ -1263,12 +1351,12 @@ class SubAgentRunner:
             await self._emit_done("error", detail, detail)
             return self._make_result()
         await self._emit_start()
-        compaction_settings = load_context_compaction_settings()
+        compaction_settings = replace(load_context_compaction_settings(), input_window_override=window)
         oversized_threshold = resolve_oversized_result_token_threshold(compaction_settings)
         max_oversized_rejections = compaction_settings.max_oversized_rejections
         while True:
             # ---- 停止条件检查（每轮顶部）----
-            if ctx.cancel_token.is_set() and not ctx.user_stop_requested:
+            if ctx.timeout_requested and not ctx.user_stop_requested:
                 self._status = "timeout"
                 self._final_reply = self._build_progress_reply("timeout")
                 await self._emit_done("timeout", self._final_reply, None)
@@ -1285,7 +1373,7 @@ class SubAgentRunner:
                 self._final_reply = self._build_progress_reply("error", error=detail)
                 await self._emit_done("error", self._final_reply, detail)
                 return self._make_result()
-            elapsed = time.monotonic() - self._started_monotonic - (self.permission_runtime.paused_time(ctx.agent_id) if self.permission_runtime else 0)
+            elapsed = self.active_seconds()
             if ctx.timeout_seconds > 0 and elapsed >= ctx.timeout_seconds:
                 self._status = "timeout"
                 self._final_reply = self._build_progress_reply("timeout")
@@ -1699,11 +1787,13 @@ class SubAgentRunner:
                 retire_prior_video_parts(self.messages)
                 media_parts = []
                 for reference, quality, start_time, end_time, _key in self.read_media_pending_parts:
-                    info = load_any_media_model_part(
-                        ctx.session_id, reference, quality=quality,
-                        start_time=start_time, end_time=end_time,
-                        **({"api_type": self._api_type} if getattr(self, "_api_type", None) in {"messages", "responses"} else {}),
-                    )
+                    info = self._loaded_media_parts.pop(_key, None)
+                    if info is None:
+                        info = await run_sync_tool(load_any_media_model_part,
+                            ctx.session_id, reference, quality=quality,
+                            start_time=start_time, end_time=end_time,
+                            **({"api_type": self._api_type} if getattr(self, "_api_type", None) in {"messages", "responses"} else {}),
+                        )
                     if info is not None and info.get("part") is not None:
                         media_parts.append(info["part"])
                     elif isinstance(info, dict) and info.get("error"):
@@ -1741,6 +1831,7 @@ class SubAgentRunner:
                     "_media_injected_keys": retained_keys,
                 })
                 self.read_media_pending_parts = []
+                self._loaded_media_parts.clear()
             # read_document 原生文档注入（子任务版）：部件只作为下一次请求的
             # user 消息内容（仅内存、不落盘）；完整响应后已转为文本占位。
             if self.native_doc_pending_parts:
@@ -1813,6 +1904,8 @@ class SubAgentRunner:
 
     def _make_result(self) -> SubAgentResult:
         final_reply = self._final_reply or self._build_progress_reply(self._status, self._error)
+        if self._file_conflicts:
+            final_reply += "\n\n文件协作提示：曾拒绝基于旧版本的并行修改；涉及 " + "、".join(dict.fromkeys(self._file_conflicts))
         # 最终回复长度保护：截断 + 尾注（完整轨迹始终在 JSONL 块内）
         limit = self.context.reply_max_chars
         if limit > 0 and len(final_reply) > limit:
@@ -1820,6 +1913,16 @@ class SubAgentRunner:
                 final_reply[:limit]
                 + "\n\n（最终回复过长已截断，完整轨迹见子任务事件块）"
             )
+        token_budget = self.context.reply_token_budget
+        if token_budget > 0 and estimate_text_tokens(final_reply) > token_budget:
+            note = "\n\n（报告按父模型上下文预算截取；完整结果保存在子任务事件中。）"
+            original = final_reply
+            length = len(original)
+            while estimate_text_tokens(final_reply) > token_budget and length > 32:
+                length = int(length * 0.75)
+                head = max(1, length * 3 // 4)
+                tail = max(1, length - head)
+                final_reply = original[:head] + "\n…\n" + original[-tail:] + note
         usage_total: dict[str, Any] = {}
         self.usage_accumulator.merge_to(usage_total, _merge_usage_values)
         return SubAgentResult(
@@ -1858,7 +1961,7 @@ async def run_sub_agent_batch(
     """并发执行一批子任务；返回可直接汇入父级 tool_results 的结果 dict 列表。
 
     - 每个子任务一个 asyncio.Task，受 SUB_AGENT_MAX_CONCURRENT 信号量限流；
-    - 每个子任务整体包 wait_for(timeout)：超时 → 任务被取消 → Runner 的
+    - 每个子任务使用有效执行时间监控：超时 → 任务被取消 → Runner 的
       CancelledError 处理器补写 done(timeout)；Runner 卡死时由本函数兜底
       补写（runner.done_emitted 防重复）；
     - 子任务失败不影响兄弟任务与父任务：异常转错误结果文本；
@@ -1870,6 +1973,22 @@ async def run_sub_agent_batch(
         return []
     limits = load_sub_agent_limits()
     semaphore = asyncio.Semaphore(limits["max_concurrent"])
+    from .sub_agent_files import SubAgentFileAccess
+    local_file_access = SubAgentFileAccess()
+    for context in contexts:
+        if context.file_access is not None:
+            continue
+        runtime = context.permission_runtime
+        if runtime:
+            if not getattr(runtime, "sub_agent_files", None):
+                from memory.permission_store import load_checkpoint
+                runtime.sub_agent_files = SubAgentFileAccess(
+                    load_checkpoint(runtime.id, "sub_agent_files"),
+                    save=lambda snapshot, runtime=runtime: runtime.save("sub_agent_files", snapshot),
+                )
+            context.file_access = runtime.sub_agent_files
+        else:
+            context.file_access = local_file_access
 
     async def _run_one(context: SubAgentContext) -> dict[str, Any]:
         if context.permission_runtime:
@@ -1895,6 +2014,7 @@ async def run_sub_agent_batch(
             # 排队任务也先创建可控制的块，不必等获得并发名额才显示停止按钮。
             await runner._emit_start(queued=queued)
             async with semaphore:
+                runner.begin_execution()
                 if queued:
                     await runner._emit("notice", message="排队结束，子任务开始执行", queued=False)
                 if timeout > 0:
@@ -1927,15 +2047,15 @@ async def run_sub_agent_batch(
             try:
                 result = await execute()
             except asyncio.CancelledError:
-                # 单独停止不能向 gather 传播取消，否则兄弟/父任务也会结束。
-                if not context.user_stop_requested or context.stop_checker():
-                    raise
                 runner._status = "stopped"
                 runner._final_reply = runner._build_progress_reply("stopped")
                 if not runner.done_emitted:
                     if runner.rounds == 0:
                         await runner._emit_start()
                     await runner._emit_done("stopped", runner._final_reply, None)
+                # 排队时取消也要收尾；单独停止只结束本子任务。
+                if not context.user_stop_requested or context.stop_checker():
+                    raise
                 result = runner._make_result()
             logger.info(f"子任务完成（agent_id={result.agent_id}, status={result.status}, "
                 f"rounds={result.rounds}）")

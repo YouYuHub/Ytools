@@ -1,54 +1,174 @@
-# 浏览器点击与调试工具
+# 浏览器工具：一个 MCP、两套预设、两个运行目标
 
-本项目接入官方 Playwright MCP，让模型打开网页、读取页面快照、点击、输入、截图，并查看控制台与网络请求。默认运行无界面的 Chromium；**不需要开发或打开额外的 GUI 程序**。如果需要亲眼观察操作、手动登录或接管已有标签，可将服务切换为可见浏览器模式；此时需要运行在可显示桌面的会话中。
+本项目使用微软官方 `@playwright/mcp`。配置和工具发现只有 **一个 Browser 服务**，当前返回 25 个不重复的工具。浏览器工具按能力定义，点击、输入、快照等能力可用于不同连接，无需按连接模式把工具硬拆成两份。
 
-## 安装
+## 三个概念
 
-在项目根目录执行：
+| 项目 | 控制什么 |
+| --- | --- |
+| Browser MCP 服务 | 一份标准工具清单、原始参数与 stdio 传输 |
+| 前端工具预设 | 本轮给模型提供哪些工具；可手动修改或全选 |
+| mcp_profile | 本次调用使用哪个浏览器运行实例 |
+
+后端按需启动并复用两个微软 MCP 进程，一个独立隔离，一个扩展连接。**两者可以同时存活**，页面、标签索引、元素引用和调用队列分别维护。无需另写 GUI 程序；扩展连接使用用户电脑上的真实 Chrome / Edge（当前配置使用 msedge；--no-webmcp 是服务能力选项）。
+
+`profiles` 是本项目通用连接配置；模型传 `{mcp_profile, arguments}`，项目消费路由字段，将 arguments 内的原始参数发送给微软 MCP。工具名不参与目标分类。详见 [通用 profiles 与完整调用流程](mcp_profiles.md)。
+
+## 前端两套工具预设
+
+打开「＋ → 配置工具」，展开 Browser 后显示工具预设和说明；收起 Browser 时预设、说明与工具列表一起隐藏：
+
+- **网页操作**：当前 17 项，覆盖标签页、导航、快照、查找、点击、输入、表单、下拉选择、拖动、文件操作、键盘、等待等。
+- **调试诊断**：当前 12 项，覆盖窗口、媒体模拟、页面 JavaScript、控制台、网络清单与单请求详情、截图，以及导航、快照、标签、查找、等待。
+- **全部**：选择服务实际返回的全部工具，当前 25 项；新版服务增加的工具也能全选或手动选择。
+- **清空**：只清除此 Browser 服务的勾选，保留其他 MCP 和内置工具选择。
+
+点击预设会替换本服务的勾选，可以继续手动增删；点击确定才保存，取消不改变生效配置。两套预设有少量共用基础工具，不产生重复工具定义。`browser_run_code_unsafe` 保持可选，不自动加入这两套预设；可手动选择或通过「全部」启用，含义以微软原始工具说明为准。
+
+**预设不切换浏览器连接**。可使用任一预设操作独立或扩展目标，连接由每次调用的 `mcp_profile` 决定。
+
+## 如何让模型选择目标
+
+| mcp_profile | 实际效果 |
+| --- | --- |
+| `isolated` | 独立、无界面的隔离浏览器，适合开发测试 |
+| `extension` | 通过 Playwright Extension 连接用户已打开、已登录的页面 |
+
+默认配置沿用 `isolated`。可以直接在聊天中说：
+
+> 使用扩展连接（mcp_profile=extension），列出可访问的标签页，找到标题包含“订单管理”、URL 包含 example.com/orders 的页面，读取快照。多个匹配先让我选择。
+
+也可以同时安排两边：
+
+> 用 extension 查看我已打开的测试页面；另用 isolated 打开 http://127.0.0.1:8000/ 做独立验证。每次调用明确目标，各自保持页面状态。
+
+对应工具参数示例：
+
+```json
+{"mcp_profile": "extension", "arguments": {"action": "list"}}
+```
+
+```json
+{"mcp_profile": "isolated", "arguments": {"url": "http://127.0.0.1:8000/"}}
+```
+
+模型应先列出目标连接的标签页，核对标题与 URL，再获取快照、点击和输入。`browser_tabs` 切换标签使用同一连接最新列表中的索引，例如 `{"mcp_profile":"extension","arguments":{"action":"select","index":1}}`。页面变化或用户手动操作后重新取快照；不能把独立浏览器的索引、元素引用交给扩展连接。工具结果会标注 `[MCP 服务: Browser; profile: isolated/extension]`，便于确认归属。
+
+用户可在真实浏览器中与模型交替操作；切换前台标签不等于切换模型目标，应通过 MCP 的标签列表确认。扩展版本与授权决定可访问的页面范围。从手机使用项目前端，操作的仍是运行后端电脑上的浏览器。
+
+## 安装与配置
+
+项目根目录执行：
 
 ```powershell
 npm ci --prefix browser
 node browser/node_modules/playwright/cli.js install chromium
 ```
 
-Node.js 需要 20 或更新版本。`browser/package-lock.json` 固定了 Playwright MCP 版本；不要把 `browser/node_modules` 当作项目源码。Chromium 下载后保存在 Playwright 的用户缓存中。首次安装需要网络；日常运行不需要为浏览器工具额外启动服务。
+Node.js 需要 20 或更新版本，MCP 当前锁定为 `0.0.83`。Chromium 用于独立目标；扩展目标使用本机已安装的 Chrome / Edge。
 
-安装后可运行 `python test/manual_browser_smoke.py`，用本地测试页面验证真实的导航、点击和截图链路。
+在目标浏览器安装微软 [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)，打开目标网页并登录。Edge 可允许其他商店的扩展后安装。该扩展与 Codex / ChatGPT 的浏览器扩展不同。
 
-工具服务已在 `setting/mcp_servers.json` 中注册为 `Browser`，选用了 `browser_navigate`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_take_screenshot`、`browser_console_messages`、`browser_network_requests` 和 `browser_tabs`。新会话默认选中这些工具；旧会话若已固化工具选择，需要在前端「配置工具」中启用。没有安装依赖时，Browser 工具发现会失败，其他 MCP 工具仍可用。
+当前只保留以下 Browser 配置（位于 `setting/mcp_servers.json` 的 servers 内）：
 
-## 使用
+```json
+"Browser": {
+  "type": "stdio",
+  "command": "node",
+  "args": [
+    "browser/node_modules/@playwright/mcp/cli.js",
+    "--no-webmcp",
+    "--browser",
+    "msedge"
+  ],
+  "env": {
+    "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts"
+  },
+  "persistent": true,
+  "version": "0.0.83",
+  "default_profile": "isolated",
+  "profiles": {
+    "isolated": {
+      "label": "独立隔离浏览器",
+      "description": "用于独立测试，页面与登录状态独立。",
+      "args": [
+        "browser/node_modules/@playwright/mcp/cli.js",
+        "--no-webmcp",
+        "--browser",
+        "msedge",
+        "--isolated",
+        "--headless"
+      ],
+      "env": {
+        "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts/isolated",
+        "PLAYWRIGHT_MCP_EXTENSION": "false",
+        "PLAYWRIGHT_MCP_ISOLATED": "true",
+        "PLAYWRIGHT_MCP_HEADLESS": "true",
+        "PLAYWRIGHT_MCP_CDP_ENDPOINT": "",
+        "PLAYWRIGHT_MCP_ENDPOINT": "",
+        "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "",
+        "PLAYWRIGHT_MCP_PROFILE_DIR_NAME": "",
+        "PLAYWRIGHT_MCP_USER_DATA_DIR": ""
+      }
+    },
+    "extension": {
+      "label": "已打开网页 · 扩展连接",
+      "description": "用于用户已打开的浏览器页面；首次实际调用需要用户授权并选择标签页。",
+      "args": [
+        "browser/node_modules/@playwright/mcp/cli.js",
+        "--no-webmcp",
+        "--browser",
+        "msedge",
+        "--extension"
+      ],
+      "env": {
+        "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts/extension",
+        "PLAYWRIGHT_MCP_EXTENSION": "true",
+        "PLAYWRIGHT_MCP_ISOLATED": "false",
+        "PLAYWRIGHT_MCP_HEADLESS": "false",
+        "PLAYWRIGHT_MCP_CDP_ENDPOINT": "",
+        "PLAYWRIGHT_MCP_ENDPOINT": ""
+      }
+    }
+  }
+}
+```
 
-推荐让模型按以下顺序操作：
+- 公共 command/env 可继承，profile.args 显式设置两种完整启动参数；不再由代码根据工具名或模式改写启动参数。args 是替换，env 是合并。
+- 当前两个连接使用 Edge；修改通道时需同时调整对应 profile 的完整 args。扩展专有的资料目录或 token 只配置在 extension 中。
+- 输出目录在 profile.env 中分别指定。保留 persistent=true 才能跨工具调用保留页面状态。
+- 不会立即常驻两个进程；首次业务调用按需建立对应连接。发现阶段会短暂启动各配置读取工具清单，随后释放。
+- 扩展目标首次实际调用需要用户在浏览器授权、选择标签页；握手和工具发现不要求授权业务网页。
 
-1. `browser_navigate` 打开网页，例如本地服务地址 `http://127.0.0.1:8000/`。
-2. `browser_snapshot` 获取页面结构与元素引用。
-3. `browser_click` / `browser_type` 操作快照中的目标；页面变化后重新取快照。
-4. `browser_console_messages` 和 `browser_network_requests` 排查脚本错误及请求失败。
-5. `browser_take_screenshot` 保存画面，需要视觉判断时使用 `read_media` 读取工具返回的本地绝对路径。
+## 连接生命周期
 
-页面快照是文字，因此无视觉能力的模型也能完成常规点击和调试。截图会以 MCP 图片结果返回；本项目将图片写入系统临时目录下的 `ytools_mcp_images`，并把绝对路径放进工具结果。Playwright 自身的快照、日志及截图文件则写入系统临时目录下的 `ytools_playwright_artifacts`，不写到会话工作目录。`read_media` 仅在本轮选中且所用模型支持视觉时可用。图片单张上限 12 MiB；临时文件可以按需清理。
+### env、persistent、profiles 的区别
 
-## 会话状态
+| 字段 | 用途 | 能否用于其他 MCP |
+| --- | --- | --- |
+| env | 子进程环境；服务地址、认证或输出目录，键和值均为字符串 | 可用于所有已配置的 stdio MCP；变量名由服务决定 |
+| persistent | 聊天中复用进程和 MCP 连接，保留连接内状态 | 可用于其他 stdio MCP；profile 可覆盖公共值 |
+| profiles | 定义多个连接的 command/args/env/persistent 和可选工具白名单 | 通用，不依赖工具名称、服务名或浏览器品牌 |
+| default_profile / locked_profile | 默认连接 / 固定连接 | 通用；固定值在后端强制校验 |
 
-浏览器服务在 `setting/mcp_servers.json` 中标记为 `persistent: true`。项目的普通 MCP 工具仍按每次调用启动子进程的原有方式运行；Browser 使用独立事件循环维持一个 stdio 连接，因此导航后的页面能在后续点击、截图等调用中继续使用。
+这些是本项目客户端配置，其他客户端不一定识别。env 继承后端环境再逐层覆盖，支持 `{temp}` 和系统环境变量展开。args 在 profile 内整体替换，输出目录不再由代码自动追加。详情和其他服务示例见 [通用 profiles](mcp_profiles.md)。
 
-每个聊天的 worker 进程有自己的浏览器连接。父智能体使用主连接；每个子智能体使用独立连接和 `--isolated` 浏览器环境，避免并行子任务互相点击同一页面。子智能体结束、聊天 worker 退出或浏览器工具超时后会关闭相应连接。连接关闭后，下一次调用会启动新浏览器，之前的未持久化页面状态会丢失。`--isolated` 也意味着登录状态不会跨浏览器重启保存。
+### 连接释放与复用
 
-配置中的 `--headless` 可去掉以显示浏览器窗口。可见模式需要桌面显示环境；Windows 服务或无桌面会话应继续使用无界面模式。官方 Playwright MCP 也支持通过扩展或 CDP 连接现有浏览器，但这需要另行配置，不属于默认隔离模式。
+连接按「服务、聊天 worker、父/子智能体范围、运行目标」分别复用。isolated → extension → isolated 不会重新启动前一个正常连接。某目标超时或取消仅清理该目标连接；子智能体结束清理自己的两个目标，worker 退出清理全部。扩展连接重建后可能需要再次授权，连接释放不会撤回已发生的网页操作。
 
-## 接口与限制
+扩展目标沿用真实浏览器授权页面；不同子智能体的连接不会自动复制日常登录环境。并发客户端还需遵循扩展对标签页归属的限制，同一真实页面应避免被多个智能体同时控制。
 
-工具定义先进入项目统一的工具注册表，再由聊天循环调用。因此 Chat Completions、Messages 和 Responses 三种模型接口共享同一套浏览器工具与文本工具结果。截图不会自动作为图像注入每一种接口；视觉模型需调用 `read_media`。工具是否出现在某轮请求中，仍取决于该会话的工具选择。
+Chat Completions、Messages、Responses 三种模型接口共用同一份工具注册和运行路由。工具选择以当前服务 ID 与工具清单为准；服务已移除或工具名失效时，需在配置工具面板或任务模板中重新选择，不做旧浏览器服务名、旧调用别名迁移。用户自行配置的其他 MCP 服务保留各自身份。
 
-浏览器可以访问模型所请求的网页。项目本身主要面向受信任的本机环境；若要开放给其他用户，应同时限制工具可访问的站点、浏览器下载与上传路径，并为服务增加身份认证。不要把带登录状态的可见浏览器配置为多个用户共用。当前默认使用隔离模式，避免读取日常浏览器配置文件。
+## MCP 测试与验证
 
-## 故障排查
+「配置工具 → MCP 测试」只列一个 Browser，额外选择 **连接配置（profile）** 即可测试两个运行实例。路由目标放在HTTP 请求顶层 mcp_profile；JSON/表单工具参数仍使用微软返回的原始 Schema。
 
-- **工具列表没有 Browser**：先完成上述 `npm ci`，再重启服务或等待 MCP 工具热重载；检查后端日志中的工具发现失败信息。
-- **提示缺少浏览器可执行文件**：执行 `node browser/node_modules/playwright/cli.js install chromium`。
-- **导航后再次调用出现空白页**：检查工具调用是否超时、聊天 worker 是否已因空闲退出。两者都会关闭隔离浏览器。
-- **截图路径无法读取**：确认本轮选择了 `read_media`，模型启用了视觉能力，并且临时图片尚未清理。
-- **页面操作超时**：先重新获取 `browser_snapshot`；动态页面可检查控制台和网络请求。全局 `MCP_TOOL_CALL_TIMEOUT_SECONDS` 覆盖连接、启动和工具调用全过程。
+连接测试只握手、读取清单；实际调用才执行网页动作。extension 首次实际调用要在浏览器授权，可将测试超时调为 120 秒。诊断使用独立临时连接，不复用聊天连接；每项结束后释放，不能通过逐项诊断组成持续页面工作流。
 
-官方资料：[Playwright MCP](https://github.com/microsoft/playwright-mcp)、[Playwright 定位器](https://playwright.dev/docs/locators)、[浏览器安装](https://playwright.dev/docs/browsers)。
+可执行 `python test/manual_browser_smoke.py`，验证独立目标的真实导航、点击、控制台/网络、截图和父子智能体隔离。扩展真实网页动作需用户完成授权后验证。
+
+本次更新包括 Python 路由和配置变更，请在正在运行的任务结束或停止后重启后端，再刷新前端。
+
+官方参考：[Playwright MCP](https://github.com/microsoft/playwright-mcp)、[Playwright Extension](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)、[浏览器安装](https://playwright.dev/docs/browsers)。

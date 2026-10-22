@@ -73,7 +73,9 @@ def pending(request: Request, session_id: str, approval_ids: list[str] | None = 
         if item and item["session"] == session:
             execution = store.execution(item["task"], item["agent"], item["call_id"])
             states.append({**public(item), "execution_state": execution["state"] if execution else None})
-    return {"approvals": approvals, "tasks": tasks, "states": states}
+    from routers.chat_router import _session_generation_busy
+    return {"approvals": approvals, "tasks": tasks, "states": states,
+            "running": _session_generation_busy(session)}
 
 
 @api_permission_router.post("/tool_approvals/tasks/{task_id}/resume")

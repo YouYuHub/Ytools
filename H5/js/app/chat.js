@@ -101,6 +101,17 @@
    * send() 与 attachStreamSession() 共用，保证刷新重连后渲染行为一致。
    */
   function createStreamPipeline(msg, sessionId, activeStream) {
+    function ensureLiveContainer() {
+      if (state.activeStream !== activeStream || state.sessionId !== sessionId ||
+          activeStream.detached || activeStream.completed || msg.parentNode === chatInner) return;
+      const view = App.getHistoryWindow && App.getHistoryWindow();
+      // 阅读旧历史时不抢回视口；尾部窗口被重建后，要把同一个回复容器挂回，
+      // 否则 SSE 仍在处理，却只会写入脱离页面的节点，直到刷新才能看到。
+      if (view && view.records && view.end < view.records.length) return;
+      if (activeStream.userNode && activeStream.userNode.parentNode !== chatInner) chatInner.appendChild(activeStream.userNode);
+      chatInner.appendChild(msg);
+      App.rebuildQnav();
+    }
     let curThink = null;
     let curAnswer = null;
     let answerText = "";
@@ -439,11 +450,12 @@
       }
       block.ui.applyEvent(data);
       if (data.phase === "done") block.done = true;
-      if (state.sessionId === sessionId) stickToBottom();
+      if (state.sessionId === sessionId && data.phase !== "heartbeat" && data.phase !== "progress") stickToBottom();
     }
 
     function handle(evt) {
       if (evt.type === "done") return;
+      ensureLiveContainer();
       const data = evt.data || {};
       if (data.event === "task_usage") {
         if (App.taskCosts && state.sessionId === sessionId) App.taskCosts.event(data);
@@ -466,6 +478,7 @@
         if (activeStream.round == null) activeStream.round = data.round_started.round;
         if (usageLine) ensureUsageLine();
         App.attachLiveRoundEntry(activeStream, data.round_started.round);
+        if (state.sessionId === sessionId) App.rebuildQnav();
       }
 
       // 空增量、心跳、签名活动和 usage 快照不构成文本阶段边界。
@@ -1139,7 +1152,7 @@
     const requestQuotes = QuoteUtils.quotesForRequest(pendingQuotes);
 
     const userNode = App.appendUserMessage(
-      userContent, null, streamSessionId, state.sessionDocs, null, null, requestQuotes
+      userContent, null, streamSessionId, state.sessionDocs, document.createDocumentFragment(), null, requestQuotes
     );
     App.upsertLocalSession(streamSessionId, { userText: text || (uploadedMedia.length ? "[图片/附件]" : text) });
     // 问题导航重建已移到下方 DOM 手术（原地重发删旧轮+原位插入）之后：
@@ -1181,6 +1194,22 @@
     const liveRound = direct && direct.targetRound != null ? direct.targetRound
       : direct && direct.insertAfterRound != null ? direct.insertAfterRound + 1
       : null;
+    // 先登记新流，再挂载和滚动。置底可能同步切换历史窗口，窗口恢复必须
+    // 持有本次回复节点，不能仍指向上一轮或等到节点被移除之后才登记。
+    const activeStream = {
+      sessionId: streamSessionId,
+      userText: text,
+      replayComplete: true,
+      round: liveRound,
+      userContent: userContent,
+      questionParts: Array.isArray(userContent) ? userContent : null,
+      quotes: requestQuotes,
+      userNode: userNode,
+      messageNode: msg,
+      completed: false,
+      usage: null,
+    };
+    state.activeStream = activeStream;
     // 编辑重发（重新生成该轮）：屏幕锚点插入——删除旧第 N 轮的屏幕节点，
     // 新回复插入其原位（第 N+1 轮首节点之前），保持与历史结构一致；
     // ask_user 卡片再答（insertAfterRound）：新回复插入第 N+1 轮首节点之前
@@ -1251,6 +1280,7 @@
     // 新 userNode 若先带上 data-round=N，会被上面的删除循环误删
     if (liveRound != null) {
       userNode.dataset.round = String(liveRound);
+      if (direct && direct.targetRound != null) userNode.dataset.replacesRound = String(liveRound);
       userNode._editData = { content: userContent, round: liveRound, quotes: requestQuotes };
       App.attachUserEditAction(userNode);
       msg.dataset.round = String(liveRound);
@@ -1271,24 +1301,6 @@
       scrollToBottom();
     }
     App.rebuildQnav();
-    const activeStream = {
-      sessionId: streamSessionId,
-      userText: text,
-      replayComplete: true,
-      // 首问原始 content（字符串或部件列表）：round_started 到达时给本轮
-      // 提问气泡补挂编辑/删除入口用（编辑回填与媒体芯片解析的数据源）
-      userContent: userContent,
-      // 多模态时含 media:// 引用，标题请求透传给后端解析
-      questionParts: Array.isArray(userContent) ? userContent : null,
-      // 本轮引用快照（附接回放去重与编辑回填用）
-      quotes: requestQuotes,
-      userNode: userNode,
-      messageNode: msg,
-      completed: false,
-      usage: null,
-    };
-    state.activeStream = activeStream;
-
     const pipe = createStreamPipeline(msg, streamSessionId, activeStream);
 
     const payload = {
@@ -1434,10 +1446,6 @@
     setEmpty(false);
 
     const msg = el("div", "msg");
-    chatInner.appendChild(msg);
-    // A history-search jump may have paused following while streamStatus was
-    // in flight. Reconnecting must preserve that reading position.
-    stickToBottom();
     const activeStream = {
       sessionId: sessionId,
       userText: "",
@@ -1452,6 +1460,9 @@
       usage: null,
     };
     state.activeStream = activeStream;
+    chatInner.appendChild(msg);
+    // 窗口恢复要先看到本流；搜索跳转已暂停跟随时仍保留阅读位置。
+    stickToBottom();
     const pipe = createStreamPipeline(msg, sessionId, activeStream);
     let sawReplay = false;
 
@@ -1669,9 +1680,11 @@
    * 本地流式状态；取消返回 false（用户放弃本次编辑重发）。
    * @returns {Promise<boolean>} true=已停止可继续删除/重发；false=用户取消
    */
-  async function requestStopRunningGeneration(sessionId) {
-    const message = "当前会话正在生成回复。确认后将立刻停止本次生成" +
-      "（已生成内容按中断收尾落盘），并以编辑后的消息重新发起。";
+  async function requestStopRunningGeneration(sessionId, suspended) {
+    const message = suspended
+      ? "当前会话有服务中断后保留的任务，实际未在运行。确认后将保存已有轨迹、结束旧任务的恢复状态，并以编辑后的消息重新发起。"
+      : "当前会话正在生成回复。确认后将立刻停止本次生成" +
+        "（已生成内容按中断收尾落盘），并以编辑后的消息重新发起。";
     const confirmed = await new Promise(function (resolve) {
       if (typeof App.openConfirmDialog !== "function") {
         resolve(window.confirm(message + "确认继续？"));
@@ -1679,9 +1692,9 @@
       }
       let settled = false;
       App.openConfirmDialog({
-        title: "任务正在进行中",
+        title: suspended ? "任务已中断" : "任务正在进行中",
         message: message,
-        confirmText: "停止生成并重发",
+        confirmText: suspended ? "结束旧任务并重发" : "停止生成并重发",
         onConfirm: function () { settled = true; resolve(true); },
         onCancel: function () { if (!settled) { settled = true; resolve(false); } },
       });
@@ -1733,7 +1746,9 @@
     if (!pendingPermissions || state.sessionId !== sessionId) return;
     const hasSavedTask = (pendingPermissions.tasks || []).length > 0 || (pendingPermissions.approvals || []).some(a => a.agent_id !== "preview");
     if ((state.streaming && state.streamingSession === sessionId) || hasSavedTask) {
-      const proceed = await requestStopRunningGeneration(sessionId);
+      const suspended = hasSavedTask && (pendingPermissions.running === false ||
+        (pendingPermissions.running == null && !(state.streaming && state.streamingSession === sessionId)));
+      const proceed = await requestStopRunningGeneration(sessionId, suspended);
       if (!proceed || state.sessionId !== sessionId) return;
     }
     if (plan.mode === "insert") {

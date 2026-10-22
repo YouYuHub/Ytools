@@ -124,13 +124,13 @@ def estimate_text_tokens(value: Any) -> int:
     return max(1, ascii_chars // 4 + non_ascii_chars)
 
 
-# 多模态部件按固定占位计费：base64/data URL 数据按字符估算会虚高数万倍，
-# 会误触发上下文预算检查；主流多模态模型单图成本约 1k token 量级，取固定占位值
+# 多模态部件只做固定占位估算，避免把 base64/data URL 当普通文本计算。
+# 1024 不是服务商计费值，尤其不能据此推断视频的实际用量；以返回 usage 为准。
 MULTIMODAL_PART_PLACEHOLDER_TOKENS = 1024
 
 
 def _estimate_content_value_tokens(content: Any) -> int:
-    """content 支持 str 与多部件列表：媒体部件按固定占位计费，文本部件按字符估算。"""
+    """媒体部件按固定占位估算，文本部件按字符估算。"""
     if not isinstance(content, list):
         return estimate_text_tokens(content)
     total = 0
@@ -155,7 +155,7 @@ def _estimate_content_value_tokens(content: Any) -> int:
         if part.get("type") == "tool_result":
             total += _estimate_content_value_tokens(part.get("content"))
             continue
-        # 媒体部件：data URL / base64 / media:// 引用一律按固定占位计费
+        # 媒体部件：data URL / base64 / media:// 引用一律按固定占位估算
         total += MULTIMODAL_PART_PLACEHOLDER_TOKENS
     return total
 

@@ -2,6 +2,7 @@
 # from __future__ import annotations
 from urllib.parse import urlsplit
 import base64
+import codecs
 import copy
 import difflib
 import fnmatch
@@ -20,6 +21,7 @@ import urllib.request
 import urllib.error
 import uuid
 from collections import OrderedDict
+from functools import wraps
 from pathlib import Path
 from factory.agent_runtime.permission_runtime import guard_path, permission_urlopen
 from threading import Lock
@@ -27,6 +29,11 @@ from typing import Any, Optional
 
 
 from util.text_encoding import decode_text, unicode_bom, powershell_text_prelude
+from util.tool_arguments import string_arg, int_arg, number_arg
+from util.file_lock import cross_process_lock
+from factory.agent_runtime.tool_control import (
+    ToolCancelledError, check_tool_control, remaining_seconds, tool_deadline,
+)
 from memory import file_memory
 
 
@@ -158,51 +165,33 @@ def resolve_default_command_shell(session_id: str | None = None) -> str:
     return _resolve_shell("auto", os.name == "nt")[1]
 
 
-TODO_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-      "name": TODO_TOOL_NAME,
-      "description": (
-          "维护多步骤任务计划；简单任务无需调用。每次提交完整列表（最多 20 项），"
-          "仅在步骤或状态变化时更新，合并已完成和下一步状态；更新计划不等于执行任务，"
-          "不要连续重复调用。最新完整计划在工具结果 todos 中，不会另行嵌入系统提示词。"
-          "通过原生工具调用提交；返回 plan_complete=true 后汇总答复。"
-      ),
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "todos": {
-            "type": "array",
-            "description": (
-                "当前完整的任务计划列表。"
-                "每次调用都会全量覆盖之前的列表，最多 20 项。"
-            ),
-            "maxItems": 20,
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string",
-                  "description": "Todo 唯一标识。创建后保持不变，用于标识同一个任务步骤。",
-                },
-                "content": {
-                  "type": "string",
-                  "description": "步骤内容（一句话，祈使句，≤200 字符）",
-                },
-                "status": {
-                  "type": "string",
-                  "enum": ["pending", "in_progress", "done"],
-                  "description": "pending=待办 in_progress=进行中 done=已完成",
-                },
-              },
-              "required": ["id", "content", "status"],
-            },
-          }
-        },
-        "required": ["todos"],
-      },
-    },
-}
+TODO_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'todo_write',
+              'description': '更新多步骤计划；每次提交完整 todos，最多 20 项，空数组清空。保持步骤 id，仅在计划或状态变化时调用。',
+              'parameters': {'type': 'object',
+                             'properties': {'todos': {'type': 'array',
+                                                      'description': '完整计划；最多 20 项，[] 清空。',
+                                                      'maxItems': 20,
+                                                      'items': {'type': 'object',
+                                                                'properties': {'id': {'type': 'string',
+                                                                                      'description': '步骤标识，创建后保持不变；省略时自动分配。',
+                                                                                      'maxLength': 64},
+                                                                               'content': {'type': 'string',
+                                                                                           'description': '步骤内容（一句话，祈使句，≤200 '
+                                                                                                          '字符）',
+                                                                                           'minLength': 1,
+                                                                                           'maxLength': 200},
+                                                                               'status': {'type': 'string',
+                                                                                          'enum': ['pending',
+                                                                                                   'in_progress',
+                                                                                                   'done'],
+                                                                                          'description': 'pending=待办 '
+                                                                                                         'in_progress=进行中 '
+                                                                                                         'done=已完成'}},
+                                                                'required': ['content', 'status'],
+                                                                'additionalProperties': False}}},
+                             'required': ['todos'],
+                             'additionalProperties': False}}}
 
 _TODO_VALID_STATUSES = ("pending", "in_progress", "done")
 _TODO_MAX_ITEMS = 20
@@ -263,7 +252,9 @@ def normalize_todo_items(
     for index, entry in enumerate(raw, start=1):
         if not isinstance(entry, dict):
             return None, None, f"第 {index} 项必须是对象（含 id/content/status 字段）"
-        content = str(entry.get("content") or "").strip()
+        if not isinstance(entry.get("content"), str):
+            return None, None, f"第 {index} 项 content 不能为空且必须是字符串"
+        content = entry["content"].strip()
         if not content:
             return None, None, f"第 {index} 项 content 不能为空"
         if len(content) > _TODO_MAX_CONTENT_CHARS:
@@ -271,13 +262,17 @@ def normalize_todo_items(
                 f"第 {index} 项 content 超长（{len(content)} > "
                 f"{_TODO_MAX_CONTENT_CHARS} 字符），请压缩为一句祈使句"
             )
-        status = str(entry.get("status") or "pending").strip().lower()
+        if not isinstance(entry.get("status", "pending"), str):
+            return None, None, f"第 {index} 项 status 必须是字符串"
+        status = entry.get("status", "pending").strip().lower()
         if status not in _TODO_VALID_STATUSES:
             return None, None, (
                 f"第 {index} 项 status 非法：{status!r}，"
                 "仅支持 pending / in_progress / done"
             )
-        raw_id = str(entry.get("id") or "").strip()
+        if not isinstance(entry.get("id", ""), str) or len(entry.get("id", "")) > 64:
+            return None, None, f"第 {index} 项 id 必须是最多 64 字符的字符串"
+        raw_id = entry.get("id", "").strip()
         if raw_id:
             if raw_id in used_ids:
                 id_duplicated += 1
@@ -316,53 +311,37 @@ def normalize_todo_items(
 
 
 # --------------------------- ask_user：向用户提问 ---------------------------
-ASK_USER_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": ASK_USER_TOOL_NAME,
-        "description": (
-            "向用户提问并等待回答：前端会弹出交互卡片，用户可点选选项或在输入框自由作答，"
-            "回答会作为下一条用户消息发送给你。"
-            "适用场景：任务存在关键分歧（方案二选一、缺失必要参数、执行不可逆操作前确认）；"
-            "一次提出 1-5 个问题，问题要具体、选项要互斥且可直接执行；"
-            "需要用户同时选择多项时把该题的 multiple 设为 true。"
-            "注意：调用后当前任务会暂停等待用户回答，收到用户的回答消息后再继续任务；"
-            "不要用本工具进行闲聊或询问常识性问题。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "description": "问题列表（1-5 个）",
-                    "minItems": 1,
-                    "maxItems": 5,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "问题内容（一句话，具体明确，≤200 字符）",
-                            },
-                            "options": {
-                                "type": "array",
-                                "description": "候选选项列表（可选，2-6 项，每项 ≤100 字符；用户也可以不选选项而自由输入）",
-                                "maxItems": 6,
-                                "items": {"type": "string"},
-                            },
-                            "multiple": {
-                                "type": "boolean",
-                                "description": "该题是否允许多选（用户可同时选择多个选项）；默认 false 单选",
-                            },
-                        },
-                        "required": ["question"],
-                    },
-                }
-            },
-            "required": ["questions"],
-        },
-    },
-}
+ASK_USER_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'ask_user',
+              'description': '向用户提出 1-5 个必要问题并暂停，回答作为下一条用户消息到达。需确认或缺少必要信息时使用；同轮其他工具会延后。',
+              'parameters': {'type': 'object',
+                             'properties': {'questions': {'type': 'array',
+                                                          'description': '1-5 个问题；每题可自由输入或选择选项。',
+                                                          'minItems': 1,
+                                                          'maxItems': 5,
+                                                          'items': {'type': 'object',
+                                                                    'properties': {'question': {'type': 'string',
+                                                                                                'description': '具体问题，最多 '
+                                                                                                               '200 '
+                                                                                                               '字符。',
+                                                                                                'minLength': 1,
+                                                                                                'maxLength': 200},
+                                                                                   'options': {'type': 'array',
+                                                                                               'description': '可选 '
+                                                                                                              '2-6 '
+                                                                                                              '项；用户也可自由输入。',
+                                                                                               'maxItems': 6,
+                                                                                               'items': {'type': 'string',
+                                                                                                         'minLength': 1,
+                                                                                                         'maxLength': 100}},
+                                                                                   'multiple': {'type': 'boolean',
+                                                                                                'description': '是否多选，默认 '
+                                                                                                               'false。',
+                                                                                                'default': False}},
+                                                                    'required': ['question'],
+                                                                    'additionalProperties': False}}},
+                             'required': ['questions'],
+                             'additionalProperties': False}}}
 
 _ASK_MAX_QUESTIONS = 5
 _ASK_MAX_QUESTION_CHARS = 200
@@ -392,10 +371,14 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
     for entry in raw:
         if not isinstance(entry, dict):
             return None
-        question = str(entry.get("question") or "").strip()
+        if not isinstance(entry.get("question"), str) or not isinstance(entry.get("multiple", False), bool):
+            return None
+        question = entry["question"].strip()
         if not question or len(question) > _ASK_MAX_QUESTION_CHARS:
             return None
         raw_options = entry.get("options")
+        if raw_options is not None and (not isinstance(raw_options, list) or any(not isinstance(item, str) for item in raw_options)):
+            return None
         options: list[str] = []
         if isinstance(raw_options, list):
             for option in raw_options:
@@ -408,7 +391,7 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
         questions.append({
             "question": question,
             "options": options,
-            "multiple": bool(entry.get("multiple")),
+            "multiple": entry.get("multiple", False),
         })
     return questions
 
@@ -417,68 +400,43 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
 # 派发参数长度上限（防超大参数直接进上下文）
 _SUB_AGENT_TASK_MAX_CHARS = 20_000
 
-SUB_AGENT_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": SUB_AGENT_TOOL_NAME,
-        "description": (
-            "派发可独立完成的子任务；同轮多个调用会并发执行，父模型只收到最终回复。"
-            "子智能体看不到对话历史和上传文件，不能调用 ask_user 或 sub_agent。"
-            "task 必须写明目标、绝对路径、已知事实、限制和期望证据；可用 todo 预置计划。"
-            "单次工具即可完成的工作直接调用工具。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "maxLength": _SUB_AGENT_TASK_MAX_CHARS,
-                    "description": (
-                        "子任务目标（必填，自包含）。必须包含：目标与验收标准、涉及文件/目录的绝对路径、"
-                        "已有事实与结论、执行约束、期望回复的内容结构"
-                    ),
-                },
-                "todo": {
-                    "type": "array",
-                    "description": "可选：为子智能体预置的初始任务计划（每次全量覆盖，最多 20 项）",
-                    "maxItems": 20,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string", "description": "步骤唯一标识"},
-                            "content": {"type": "string", "description": "步骤内容（一句话，≤200 字符）"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "done"],
-                                "description": "pending=待办 in_progress=进行中 done=已完成",
-                            },
-                        },
-                        "required": ["id", "content", "status"],
-                    },
-                },
-            },
-            "required": ["task"],
-        },
-    },
-}
+SUB_AGENT_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'sub_agent',
+              'description': '派发独立子任务；同轮多个调用并发执行，只返回最终报告。子任务看不到对话历史，不能提问或再次派发；task 写全目标、路径、事实和限制。',
+              'parameters': {'type': 'object',
+                             'properties': {'task': {'type': 'string',
+                                                     'maxLength': 20000,
+                                                     'description': '自包含任务：目标、验收标准、绝对路径、已知事实、限制和所需证据。'},
+                                            'todo': {'type': 'array',
+                                                     'description': '可选初始计划，最多 20 项。',
+                                                     'maxItems': 20,
+                                                     'items': {'type': 'object',
+                                                               'properties': {'id': {'type': 'string',
+                                                                                     'description': '步骤标识，创建后保持不变；省略时自动分配。',
+                                                                                     'maxLength': 64},
+                                                                              'content': {'type': 'string',
+                                                                                          'description': '步骤内容（一句话，≤200 '
+                                                                                                         '字符）',
+                                                                                          'minLength': 1,
+                                                                                          'maxLength': 200},
+                                                                              'status': {'type': 'string',
+                                                                                         'enum': ['pending',
+                                                                                                  'in_progress',
+                                                                                                  'done'],
+                                                                                         'description': 'pending=待办 '
+                                                                                                        'in_progress=进行中 '
+                                                                                                        'done=已完成'}},
+                                                               'required': ['content', 'status'],
+                                                               'additionalProperties': False}}},
+                             'required': ['task'],
+                             'additionalProperties': False}}}
 
 def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
-    """校验 sub_agent 的 task 参数；返回 (规整后的 task, 错误原因)。
-
-    容错：task 传成 {text/content/task: ...} 对象或 JSON 字符串时自动提取。
-    """
+    """Require a self-contained task string; return (task, error)."""
     if isinstance(raw, str):
         task_text = raw.strip()
-    elif isinstance(raw, dict):
-        for key in ("text", "content", "task"):
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                task_text = value.strip()
-                break
-        else:
-            task_text = ""
     else:
-        task_text = str(raw or "").strip()
+        return None, "task 必须是非空字符串"
     if not task_text:
         return None, "task 参数无效：需要一段非空的子任务描述（自包含目标、路径、约束与期望回复）"
     if len(task_text) > _SUB_AGENT_TASK_MAX_CHARS:
@@ -499,59 +457,79 @@ def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
 
 _WRITE_EDIT_MAX_CHARS = 2 * 1024 * 1024   # 单次写入/替换内容上限（防超大参数）
 _EDIT_FILE_MAX_BYTES = 64 * 1024 * 1024  # 超大文件明确拒绝，不能截取前缀后覆盖原文件
+_EDIT_BATCH_MAX_CHARS = 4 * 1024 * 1024
 
-WRITE_FILE_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": WRITE_FILE_NAME,
-        "description": (
-            "写入文本文件（新建/整文件覆盖/追加，自动创建多级目录）。"
-            "覆盖已有文件须明确 mode=overwrite；只改局部内容时优先用 edit_file；"
-            "大文件分段写入可用 append 续写。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径；相对路径基于会话工作目录"},
-                "content": {"type": "string", "description": "要写入的完整内容（覆盖模式会清空原内容）", "maxLength": _WRITE_EDIT_MAX_CHARS},
-                "encoding": {"type": "string", "description": "文件编码；新文件默认 utf-8，追加已有文件时自动识别"},
-                "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "description": "写入模式；新建用 create，覆盖已有文件须明确使用 overwrite"},
-                "expected_hash": {"type": "string", "description": "可选：read_file 返回的全文 content_hash，内容变化时拒绝写入"},
-            },
-            "required": ["path", "content", "mode"],
-        },
-    },
-}
+WRITE_FILE_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'write_file',
+              'description': '写入文本并自动建目录。mode=create 新建、overwrite 整文件覆盖、append 追加；mode 必填。局部修改用 edit_file。',
+              'parameters': {'type': 'object',
+                             'properties': {'path': {'type': 'string',
+                                                     'description': '文件路径；相对路径基于会话工作目录',
+                                                     'maxLength': 4096},
+                                            'content': {'type': 'string',
+                                                        'description': '要写入的完整内容（覆盖模式会清空原内容）',
+                                                        'maxLength': 2097152},
+                                            'encoding': {'type': 'string',
+                                                         'description': '文件编码；新文件默认 utf-8，追加已有文件时自动识别',
+                                                         'maxLength': 256},
+                                            'mode': {'type': 'string',
+                                                     'enum': ['create', 'overwrite', 'append'],
+                                                     'description': '写入模式；新建用 create，覆盖已有文件须明确使用 overwrite',
+                                                     'maxLength': 256},
+                                            'expected_hash': {'type': 'string',
+                                                              'description': '可选：read_file 返回的全文 '
+                                                                             'content_hash，内容变化时拒绝写入',
+                                                              'maxLength': 16,
+                                                              'pattern': '^[0-9a-f]{16}$'}},
+                             'required': ['path', 'content', 'mode'],
+                             'additionalProperties': False}}}
 
-EDIT_FILE_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": EDIT_FILE_NAME,
-        "description": (
-            "按精确字符串替换编辑文件（比按行号改写更安全）。"
-            "old_string 出现多次时报错并提示加长上下文，或用 replace_all 全量替换；"
-            "单次替换同时提供 old_string/new_string；多处替换用 edits 列表，二者不可混用，全部验证通过后一次写入。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-                "old_string": {"type": "string", "description": "单次替换格式：要替换的原文，必须与文件内容完全一致；须与 new_string 一起提供，且不可与 edits 同用", "maxLength": _WRITE_EDIT_MAX_CHARS},
-                "new_string": {"type": "string", "description": "单次替换格式：替换后的内容；空串表示删除 old_string；须与 old_string 一起提供，且不可与 edits 同用", "maxLength": _WRITE_EDIT_MAX_CHARS},
-                "replace_all": {"type": "boolean", "description": "仅用于顶层 old_string/new_string 格式；匹配多处时是否全部替换，默认 false；使用 edits 时在对应项设置", "default": False},
-                "encoding": {"type": "string", "description": "指定文件编码（如 gbk）；留空按 BOM、UTF-8 和常见本地编码自动识别", "default": ""},
-                "expected_hash": {"type": "string", "description": "可选：read_file 返回的全文 content_hash，内容变化时拒绝编辑"},
-                "edits": {"type": "array", "minItems": 1, "maxItems": 100,
-                          "description": "多处替换格式：按顺序执行的替换项，后项在前项替换后的文本上匹配；只传 edits，不要同时传顶层 old_string/new_string/replace_all；全部验证通过后一次写入，任一项失败则文件不改动",
-                          "items": {"type": "object", "properties": {
-                              "old_string": {"type": "string"}, "new_string": {"type": "string"},
-                              "replace_all": {"type": "boolean", "default": False}},
-                              "required": ["old_string", "new_string"]}},
-            },
-            "required": ["path"],
-        },
-    },
-}
+EDIT_FILE_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'edit_file',
+              'description': '按精确原文替换。单次用 old_string/new_string，多处用 edits，二者不可混用。匹配多处需加长原文或 '
+                             'replace_all=true；任一项失败不写入。',
+              'parameters': {'type': 'object',
+                             'properties': {'path': {'type': 'string',
+                                                     'description': '文件路径',
+                                                     'maxLength': 4096},
+                                            'old_string': {'type': 'string',
+                                                           'description': '原文，须与文件内容一致；与 new_string 成对，不可与 '
+                                                                          'edits 同用。',
+                                                           'maxLength': 2097152,
+                                                           'minLength': 1},
+                                            'new_string': {'type': 'string',
+                                                           'description': '替换文本，空串表示删除；与 old_string 成对。',
+                                                           'maxLength': 2097152},
+                                            'replace_all': {'type': 'boolean',
+                                                            'description': '默认 false；多处替换在 edits 各项内设置。',
+                                                            'default': False},
+                                            'encoding': {'type': 'string',
+                                                         'description': '指定文件编码（如 gbk）；留空按 BOM、UTF-8 '
+                                                                        '和常见本地编码自动识别',
+                                                         'default': '',
+                                                         'maxLength': 256},
+                                            'expected_hash': {'type': 'string',
+                                                              'description': '可选：read_file 返回的全文 '
+                                                                             'content_hash，内容变化时拒绝编辑',
+                                                              'maxLength': 16,
+                                                              'pattern': '^[0-9a-f]{16}$'},
+                                            'edits': {'type': 'array',
+                                                      'minItems': 1,
+                                                      'maxItems': 100,
+                                                      'description': '只传 edits：按顺序匹配前项修改后的文本；每项含 '
+                                                                     'old_string/new_string，可选 replace_all。',
+                                                      'items': {'type': 'object',
+                                                                'properties': {'old_string': {'type': 'string',
+                                                                                              'maxLength': 2097152,
+                                                                                              'minLength': 1},
+                                                                               'new_string': {'type': 'string',
+                                                                                              'maxLength': 2097152},
+                                                                               'replace_all': {'type': 'boolean',
+                                                                                               'default': False}},
+                                                                'required': ['old_string', 'new_string'],
+                                                                'additionalProperties': False}}},
+                             'required': ['path'],
+                             'additionalProperties': False}}}
 
 
 def _decode_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> tuple:
@@ -564,8 +542,11 @@ def _decode_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("ut
 
 
 
-def _is_probably_binary(data: bytes) -> bool:
+def _is_probably_binary(data: bytes, encoding: str = "") -> bool:
     """前 8KB 中出现空字节即视为二进制文件。"""
+    explicit = encoding.lower().replace("_", "-")
+    if explicit.startswith(("utf-16", "utf-32")):
+        return False
     return not unicode_bom(data) and b"\x00" in data[:8192]
 
 
@@ -574,6 +555,7 @@ def _read_bytes_with_limit(path: Path, max_bytes: int) -> bytes:
     data = bytearray()
     with path.open("rb") as handle:
         while True:
+            check_tool_control()
             # read(max_bytes + 1) can allocate the entire ceiling even for a tiny file.
             chunk = handle.read(min(64 * 1024, max_bytes - len(data) + 1))
             if not chunk:
@@ -838,7 +820,53 @@ def _decode_for_edit(data: bytes, encoding: str) -> tuple[str, str]:
 
 
 
-def _atomic_write_text(path: Path, content: str, encoding: str) -> None:
+_VERSION_UNSET = object()
+
+
+def _file_version(path):
+    try:
+        info = path.stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    except FileNotFoundError:
+        return None
+
+
+def _assert_file_version(path, version):
+    if _file_version(path) != version:
+        raise ValueError("FILE_MODIFIED_EXTERNALLY：读取后文件已变化，请重新 read_file 后合并修改")
+
+
+def _encoded_size(content, encoding, maximum):
+    encoder = codecs.getincrementalencoder(encoding)()
+    total = 0
+    for offset in range(0, len(content), 65536):
+        check_tool_control()
+        total += len(encoder.encode(content[offset:offset + 65536]))
+        if total > maximum:
+            raise ValueError(f"写入结果超过 {maximum // (1024 * 1024)} MiB 上限；请拆分文件")
+    total += len(encoder.encode("", final=True))
+    if total > maximum:
+        raise ValueError(f"写入结果超过 {maximum // (1024 * 1024)} MiB 上限；请拆分文件")
+    return total
+
+
+def _serialized_file_mutation(executor):
+    @wraps(executor)
+    def execute(args):
+        path_text = _tool_path(args)
+        if not path_text:
+            return executor(args)
+        path = Path(path_text).expanduser().resolve()
+        guard_path(path)
+        identity = hashlib.sha256(os.path.normcase(str(path)).encode("utf-8")).hexdigest()
+        lock_path = Path(tempfile.gettempdir()) / "ytools-file-locks" / (identity + ".lock")
+        with cross_process_lock(lock_path, timeout=remaining_seconds(10)):
+            check_tool_control()
+            return executor({**args, "path": str(path)})
+    return execute
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str, *, expected_version=_VERSION_UNSET) -> None:
     """在目标目录完整写入临时文件，再替换目标文件。"""
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temp_path = Path(temp_name)
@@ -849,6 +877,9 @@ def _atomic_write_text(path: Path, content: str, encoding: str) -> None:
             os.fsync(handle.fileno())
         if path.exists():
             shutil.copymode(path, temp_path)
+        check_tool_control()
+        if expected_version is not _VERSION_UNSET:
+            _assert_file_version(path, expected_version)
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -863,6 +894,7 @@ def _atomic_create_text(path: Path, content: str, encoding: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        check_tool_control()
         os.link(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -882,9 +914,10 @@ def _tool_path(tool_args: dict[str, Any] | None) -> str:
     执行层与权限规划层统一经本函数读取，保证新旧调用都能执行。
     """
     args = tool_args or {}
-    return str(args.get("path") or args.get("full_file_name") or "").strip()
+    return string_arg(args, "path", args.get("full_file_name", "")).strip()
 
 
+@_serialized_file_mutation
 def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 write_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
     file_path = _tool_path(tool_args)
@@ -894,8 +927,8 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ValueError("content 必须为字符串")
     if len(content) > _WRITE_EDIT_MAX_CHARS:
-        raise ValueError(f"content 超过 {_WRITE_EDIT_MAX_CHARS // (1024 * 1024)}MB 上限")
-    requested_encoding = str(tool_args.get("encoding") or "").strip()
+        raise ValueError("content 超过 2 Mi 字符上限；请分段写入")
+    requested_encoding = string_arg(tool_args, "encoding").strip()
     encoding = requested_encoding or "utf-8"
     legacy_append = _optional_bool(tool_args, "append")
     legacy_create_only = _optional_bool(tool_args, "create_only")
@@ -907,16 +940,19 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         if ("append" in tool_args and legacy_append != (mode == "append")) or ("create_only" in tool_args and legacy_create_only != (mode == "create")):
             raise ValueError("mode 与 append/create_only 参数冲突；请只使用 mode")
     else:
-        # 旧工具调用没有 mode，沿用原先的默认覆盖语义；模型可见的新 schema 必填 mode。
-        mode = "create" if legacy_create_only else "append" if legacy_append else "overwrite"
+        if legacy_create_only or legacy_append:
+            mode = "create" if legacy_create_only else "append"
+        else:
+            raise ValueError("mode 必填：create 新建、overwrite 覆盖、append 追加；文件未修改")
     append = mode == "append"
     create_only = mode == "create"
-    expected_hash = str(tool_args.get("expected_hash") or "").strip()
+    expected_hash = string_arg(tool_args, "expected_hash").strip()
     if create_only and expected_hash:
         raise ValueError("create 模式不能同时指定 expected_hash")
     path = Path(file_path).expanduser().resolve()
     guard_path(path)
     existed = path.exists()
+    version_before = _file_version(path)
     if create_only and existed:
         raise ValueError("FILE_ALREADY_EXISTS：create_only=true，原文件未修改")
     if expected_hash:
@@ -948,6 +984,11 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             old_text = None
     elif existed:
         old_text = None
+    encoded_size = _encoded_size(content, encoding, _EDIT_FILE_MAX_BYTES)
+    if append and size_before + encoded_size > _EDIT_FILE_MAX_BYTES:
+        raise ValueError("追加结果超过 64 MiB 上限；请写入新文件")
+    check_tool_control()
+    _assert_file_version(path, version_before)
     if create_only:
         try:
             _atomic_create_text(path, content, encoding)
@@ -959,7 +1000,7 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             file.flush()
             os.fsync(file.fileno())
     else:
-        _atomic_write_text(path, content, encoding)
+        _atomic_write_text(path, content, encoding, expected_version=version_before)
     action = "追加" if append else "新建" if create_only else "覆盖"
     # 追加模式的新文本 = 旧内容 + 新内容（diff 才能正确反映最终文件变化）
     new_text_for_diff = (old_text + content) if append and old_text is not None else content
@@ -1003,6 +1044,7 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_serialized_file_mutation
 def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 edit_file 实现：语义对齐 MCP 同名工具，返回结构化结果。
 
@@ -1026,15 +1068,19 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
                 "单次替换必须同时提供 old_string 和 new_string；多处替换请只提供 edits 列表"
             )
         edits = [args]
+    batch_chars = 0
     for edit in edits:
         if not isinstance(edit, dict) or not isinstance(edit.get("old_string"), str) or not edit["old_string"]:
             raise ValueError("old_string 不能为空；如需清空文件请使用 write_file 写入空内容")
         if not isinstance(edit.get("new_string"), str):
             raise ValueError("new_string 必须为字符串（可为空串表示删除）")
         if max(len(edit["old_string"]), len(edit["new_string"])) > _WRITE_EDIT_MAX_CHARS:
-            raise ValueError("old_string/new_string 超过 2 MiB 上限")
+            raise ValueError("old_string/new_string 超过 2 Mi 字符上限")
+        batch_chars += len(edit["old_string"]) + len(edit["new_string"])
+        if batch_chars > _EDIT_BATCH_MAX_CHARS:
+            raise ValueError("edits 文本合计超过 4 Mi 字符；请拆分调用")
         _optional_bool(edit, "replace_all")
-    encoding = str(args.get("encoding") or "").strip()
+    encoding = string_arg(args, "encoding").strip()
     file_path = _tool_path(args)
     if not file_path:
         raise ValueError("path 不能为空")
@@ -1043,17 +1089,26 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"{path} 不存在或不是文件")
     size = path.stat().st_size
+    version_before = _file_version(path)
     if size > _EDIT_FILE_MAX_BYTES:
         raise ValueError(f"文件超过 {_EDIT_FILE_MAX_BYTES // (1024 * 1024)} MiB 编辑上限，原文件未修改")
     data = _read_bytes_with_limit(path, _EDIT_FILE_MAX_BYTES)
-    if _is_probably_binary(data):
+    if _is_probably_binary(data, encoding):
         raise ValueError(f"{path} 疑似二进制文件，不支持文本编辑")
     original, used_encoding = _decode_for_edit(data, encoding)
-    expected_hash = str(args.get("expected_hash") or "").strip()
+    expected_hash = string_arg(args, "expected_hash").strip()
     current_hash = _content_hash(original)
     if expected_hash and expected_hash != current_hash:
         raise ValueError("FILE_MODIFIED_EXTERNALLY：文件内容与 expected_hash 不一致，原文件未修改；请重新 read_file")
-    eol = "\r\n" if "\r\n" in original else "\n"
+    line_endings = set()
+    eol = "\n"
+    for ending in re.finditer(r"\r\n|\r|\n", original):
+        if not line_endings:
+            eol = ending.group()
+        line_endings.add(ending.group())
+        if len(line_endings) == 3:
+            break
+    written_text = original
     # 匹配在换行归一化文本上进行，写回时还原原文件的换行风格
     text = original.replace("\r\n", "\n").replace("\r", "\n")
     original_text = text
@@ -1061,8 +1116,9 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     replaced = 0
     matched_lines = 0
     for index, edit in enumerate(edits, 1):
-        old_norm = edit["old_string"].replace("\r\n", "\n")
-        new_norm = edit["new_string"].replace("\r\n", "\n")
+        check_tool_control()
+        old_norm = edit["old_string"].replace("\r\n", "\n").replace("\r", "\n")
+        new_norm = edit["new_string"].replace("\r\n", "\n").replace("\r", "\n")
         count = text.count(old_norm)
         if count == 0:
             # read_file 默认在 content 中加行号；模型复制连续完整行时自动去除。
@@ -1091,14 +1147,24 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"第 {index} 项 old_string 在文件中匹配到 {count} 处，存在歧义；请提供更长的上下文使其唯一，或传 replace_all=true 全部替换"
             )
+        occurrences = count if replace_all else 1
+        projected = len(text) + occurrences * (len(new_norm) - len(old_norm))
+        if projected > _EDIT_FILE_MAX_BYTES:
+            raise ValueError(f"第 {index} 项替换结果过大（超过 64 Mi 字符）；请缩小替换范围")
+        raw_pattern = re.compile(r"(?:\r\n|\r|\n)".join(re.escape(part) for part in old_norm.split("\n")))
+        def replacement(match):
+            local_eol = re.search(r"\r\n|\r|\n", match.group())
+            return new_norm.replace("\n", local_eol.group() if local_eol else eol)
+        written_text = raw_pattern.sub(replacement, written_text, count=0 if replace_all else 1)
+        _encoded_size(written_text, used_encoding, _EDIT_FILE_MAX_BYTES)
         text = text.replace(old_norm, new_norm) if replace_all else text.replace(old_norm, new_norm, 1)
         replaced += count if replace_all else 1
         matched_lines += len(old_norm.split("\n"))
     updated = text
     file_diff = _build_file_diff(original_text, updated, path)
-    written_text = updated.replace("\n", eol)
-    _atomic_write_text(path, written_text, used_encoding)
-    style = "CRLF" if eol == "\r\n" else "LF"
+    if written_text != original:
+        _atomic_write_text(path, written_text, used_encoding, expected_version=version_before)
+    style = "mixed" if len(line_endings) > 1 else {"\r\n": "CRLF", "\r": "CR", "\n": "LF"}[eol]
     diff_note = (
         f"，diff +{file_diff['lines_added']} -{file_diff['lines_removed']} 行"
         if not file_diff["diff_skipped"] and (file_diff["lines_added"] or file_diff["lines_removed"])
@@ -1175,6 +1241,9 @@ _SEARCH_HARD_FILE_MAX_BYTES = 16 * 1024 * 1024
 _SEARCH_DEFAULT_MAX_DEPTH = 6
 _SEARCH_DEFAULT_MAX_SCANNED_FILES = 3000
 _SEARCH_DEFAULT_MAX_SCAN_SECONDS = 10.0
+_read_snapshot_cache = OrderedDict()
+_read_snapshot_lock = Lock()
+_READ_SNAPSHOT_CACHE_WEIGHT = 4 * 1024 * 1024
 # 跨文件搜索/遍历时默认跳过的目录名（含各语言依赖与构建产物目录）
 _SKIP_DIR_NAMES = {
     ".git", ".idea", ".vscode", "__pycache__", "node_modules",
@@ -1182,63 +1251,102 @@ _SKIP_DIR_NAMES = {
     "history_files", "tmp", "vendor",
 }
 
-READ_FILE_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": READ_FILE_NAME,
-        "description": (
-            "读取文本文件内容（带行号，支持分段续读；超限文件拒绝读取）。"
-            "大文件按返回中的 next_start_line / next_char_offset 分段续读，不要一次读取全部内容。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "文件路径；相对路径基于会话工作目录；传入目录会报错"},
-                "start_line": {"type": "integer", "description": "起始行（从 1 开始）", "default": 1},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "本次最多读取的连续行数", "default": 200},
-                "encoding": {"type": "string", "description": "指定文件编码（如 utf-8、gbk）；留空按 BOM、UTF-8 和常见本地编码自动识别", "default": ""},
-                "show_line_numbers": {"type": "boolean", "description": "是否带 \"行号| 内容\" 前缀显示，默认 true；行号可用于后续 edit_file 定位", "default": True},
-                "char_offset": {"type": "integer", "description": "仅单行超长时使用的字符偏移（按返回的 next_char_offset 续读）", "default": 0},
-            },
-            "required": ["path"],
-        },
-    },
-}
+READ_FILE_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'read_file',
+              'description': '分段读取文本，默认带行号。按 next_start_line 续读；单行超长时同时传原 start_line 和 next_char_offset。返回全文 '
+                             'content_hash 可用于编辑校验。',
+              'parameters': {'type': 'object',
+                             'properties': {'path': {'type': 'string',
+                                                     'description': '文件路径；相对路径基于会话工作目录；传入目录会报错',
+                                                     'maxLength': 4096},
+                                            'start_line': {'type': 'integer',
+                                                           'description': '起始行（从 1 开始）',
+                                                           'default': 1,
+                                                           'minimum': 1},
+                                            'limit': {'type': 'integer',
+                                                      'minimum': 1,
+                                                      'maximum': 2000,
+                                                      'description': '本次最多读取的连续行数',
+                                                      'default': 200},
+                                            'encoding': {'type': 'string',
+                                                         'description': '指定文件编码（如 utf-8、gbk）；留空按 BOM、UTF-8 '
+                                                                        '和常见本地编码自动识别',
+                                                         'default': '',
+                                                         'maxLength': 256},
+                                            'show_line_numbers': {'type': 'boolean',
+                                                                  'description': '是否显示行号，默认 true；编辑时复制原文即可。',
+                                                                  'default': True},
+                                            'char_offset': {'type': 'integer',
+                                                            'description': '仅单行超长时使用的字符偏移（按返回的 '
+                                                                           'next_char_offset 续读）',
+                                                            'default': 0,
+                                                            'minimum': 0}},
+                             'required': ['path'],
+                             'additionalProperties': False}}}
 
-SEARCH_FILES_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": SEARCH_FILES_NAME,
-        "description": (
-            "跨文件搜索文件内容（只搜索内容，不枚举文件名）；file_pattern 只筛选待搜索文件。"
-            "需要按文件名查找或列出文件时，若已启用 run_command，请使用相应终端命令；否则说明当前工具无法枚举文件名。"
-            "返回带行号上下文的匹配区块；"
-            "默认按普通文本匹配；例如 A|B 必须传 is_regex=true 才表示任选其一。"
-            "自动跳过二进制、隐藏目录、依赖/构建目录及 history_files/tmp/vendor；"
-            "可直接指定这些目录为 dir_path，或用 no_default_excludes 关闭默认排除后扫描。"
-            "超限时返回部分结果；scan_complete=false 或 scan_truncated=true 时不能判定目标不存在。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "要查找的文本；is_regex=true 时为正则表达式"},
-                "dir_path": {"type": "string", "description": "搜索根目录", "default": "."},
-                "file_pattern": {"type": "string", "description": "仅按文件名筛选内容搜索范围，例如 *.py、*.md；不返回文件清单；空串表示所有文件", "default": ""},
-                "ignore_case": {"type": "boolean", "description": "是否忽略大小写", "default": False},
-                "is_regex": {"type": "boolean", "description": "pattern 是否按正则解析，默认按普通文本匹配", "default": False},
-                "context_lines": {"type": "integer", "description": "每处匹配附带上下文行数（0-5）", "default": 0},
-                "max_results": {"type": "integer", "description": "最多返回的匹配区块数（1-200）", "default": 50},
-                "max_depth": {"type": "integer", "description": "递归深度，0=仅当前目录", "default": 6},
-                "max_scanned_files": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 3000, "description": "候选文件扫描上限；未扫完会标记部分结果"},
-                "max_scan_seconds": {"type": "number", "minimum": 0.1, "maximum": 120, "default": 10, "description": "扫描时间上限（秒）"},
-                "max_file_mb": {"type": "number", "default": 2, "description": "单文件读取上限 MB；0 使用硬上限 16MB；超限文件计为未读取"},
-                "exclude_dirs": {"type": "array", "items": {"type": "string"}, "description": "追加到默认排除的目录名，支持通配符（不跟随目录符号链接）"},
-                "no_default_excludes": {"type": "boolean", "default": False, "description": "true 时关闭默认排除（隐藏/依赖/构建目录也会被扫描），只应用 exclude_dirs；默认 false"},
-            },
-            "required": ["pattern"],
-        },
-    },
-}
+SEARCH_FILES_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'search_files',
+              'description': '跨文件搜索内容；只搜索内容，不枚举文件名。file_pattern 只筛选待搜索文件。默认普通文本，正则须 '
+                             'is_regex=true；结果不完整时不能判断目标不存在。',
+              'parameters': {'type': 'object',
+                             'properties': {'pattern': {'type': 'string',
+                                                        'description': '要查找的文本；is_regex=true 时为正则表达式',
+                                                        'maxLength': 8192},
+                                            'dir_path': {'type': 'string',
+                                                         'description': '搜索根目录',
+                                                         'default': '.',
+                                                         'maxLength': 4096},
+                                            'file_pattern': {'type': 'string',
+                                                             'description': '按文件名筛选，如 *.py；不返回文件清单。',
+                                                             'default': '',
+                                                             'maxLength': 4096},
+                                            'ignore_case': {'type': 'boolean',
+                                                            'description': '是否忽略大小写',
+                                                            'default': False},
+                                            'is_regex': {'type': 'boolean',
+                                                         'description': 'pattern 是否按正则解析，默认按普通文本匹配',
+                                                         'default': False},
+                                            'context_lines': {'type': 'integer',
+                                                              'description': '每处匹配附带上下文行数（0-5）',
+                                                              'default': 0,
+                                                              'minimum': 0,
+                                                              'maximum': 5},
+                                            'max_results': {'type': 'integer',
+                                                            'description': '最多返回的匹配区块数（1-200）',
+                                                            'default': 50,
+                                                            'minimum': 1,
+                                                            'maximum': 200},
+                                            'max_depth': {'type': 'integer',
+                                                          'description': '递归深度，0=仅当前目录',
+                                                          'default': 6,
+                                                          'minimum': 0},
+                                            'max_scanned_files': {'type': 'integer',
+                                                                  'minimum': 1,
+                                                                  'maximum': 20000,
+                                                                  'default': 3000,
+                                                                  'description': '候选文件扫描上限；未扫完会标记部分结果'},
+                                            'max_scan_seconds': {'type': 'number',
+                                                                 'minimum': 0.1,
+                                                                 'maximum': 120,
+                                                                 'default': 10,
+                                                                 'description': '扫描时间上限（秒）'},
+                                            'max_file_mb': {'type': 'number',
+                                                            'default': 2,
+                                                            'description': '单文件上限 MiB，默认 2；0 使用硬上限 16。',
+                                                            'minimum': 0,
+                                                            'maximum': 16},
+                                            'exclude_dirs': {'type': 'array',
+                                                             'items': {'type': 'string',
+                                                                       'minLength': 1,
+                                                                       'maxLength': 256},
+                                                             'description': '追加排除的目录名，支持通配符；[] 不改变默认排除。',
+                                                             'maxItems': 64},
+                                            'no_default_excludes': {'type': 'boolean',
+                                                                    'default': False,
+                                                                    'description': 'true 关闭默认排除；仍应用 '
+                                                                                   'exclude_dirs。默认 false。'}},
+                             'required': ['pattern'],
+                             'additionalProperties': False}}}
 
 
 def _resolve_dir_path(dir_path: Any) -> Path:
@@ -1300,6 +1408,32 @@ def _iter_text_lines(text):
         yield text[start:]
 
 
+def _read_text_snapshot(path, encoding):
+    version = _file_version(path)
+    key = (str(path.resolve()), version, encoding)
+    with _read_snapshot_lock:
+        cached = _read_snapshot_cache.get(key)
+        if cached is not None:
+            _read_snapshot_cache.move_to_end(key)
+            return cached
+    data = _read_bytes_with_limit(path, _READ_FILE_MAX_BYTES)
+    if _is_probably_binary(data, encoding):
+        raise ValueError(f"{_display_path(path)} 疑似二进制文件，拒绝按文本读取")
+    text, used_encoding = _decode_bytes_used(data, encoding)
+    _assert_file_version(path, version)
+    small = len(text) <= 1024 * 1024
+    line_count = sum(1 for _ in re.finditer(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]", text)) if small else 4097
+    lines = tuple(_iter_text_lines(text)) if small and line_count <= 4096 else None
+    weight = len(text) * 4 + (sum(len(line) * 4 + 64 for line in lines) if lines is not None else 0)
+    snapshot = (text, used_encoding, _content_hash(text), lines, weight)
+    if lines is not None and weight <= _READ_SNAPSHOT_CACHE_WEIGHT:
+        with _read_snapshot_lock:
+            _read_snapshot_cache[key] = snapshot
+            while sum(item[4] for item in _read_snapshot_cache.values()) > _READ_SNAPSHOT_CACHE_WEIGHT:
+                _read_snapshot_cache.popitem(last=False)
+    return snapshot
+
+
 def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     """内置 read_file 实现：语义对齐 MCP 同名工具，返回结构化结果。"""
     args = tool_args or {}
@@ -1319,25 +1453,28 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             f"{_display_path(path)} 超过 {_READ_FILE_MAX_BYTES // (1024 * 1024)} MiB 读取上限；"
             "请缩小文件，或用命令按块查看"
         )
-    data = _read_bytes_with_limit(path, _READ_FILE_MAX_BYTES)
-    if _is_probably_binary(data):
-        raise ValueError(f"{_display_path(path)} 疑似二进制文件（{len(data)} 字节），拒绝按文本读取")
-    text, used_encoding = _decode_bytes_used(data, str(args.get("encoding") or ""))
-    start = int(args.get("start_line", 1))
-    if start < 1:
-        raise ValueError("start_line 必须从 1 开始")
-    limit = int(args.get("limit", 200))
-    if not 1 <= limit <= _READ_FILE_MAX_LINES:
-        raise ValueError(f"limit 必须在 1-{_READ_FILE_MAX_LINES} 之间")
-    raw_end = int(args.get("end_line") or 0)
+    encoding = string_arg(args, "encoding")
+    text, used_encoding, content_hash, cached_lines, _weight = _read_text_snapshot(path, encoding)
+    start = int_arg(args, "start_line", 1, minimum=1)
+    limit = int_arg(args, "limit", 200, minimum=1, maximum=_READ_FILE_MAX_LINES)
+    char_offset = int_arg(args, "char_offset", 0)
+    show_numbers = _optional_bool(args, "show_line_numbers", default=True)
+    raw_end = int_arg(args, "end_line", 0)
     if "end_line" in args and "limit" in args:
         raise ValueError("limit 与 end_line 不能同时指定")
     requested_end = (raw_end if raw_end > 0 else float("inf")) if "end_line" in args else start + limit - 1
     selected = []
     total = 0
-    for total, line in enumerate(_iter_text_lines(text), 1):
-        if start <= total <= requested_end and len(selected) < _READ_FILE_MAX_LINES:
-            selected.append(line)
+    if cached_lines is not None:
+        total = len(cached_lines)
+        selected = list(cached_lines[start - 1:min(start - 1 + _READ_FILE_MAX_LINES,
+                                                int(requested_end) if requested_end != float("inf") else total)])
+    else:
+        for total, line in enumerate(_iter_text_lines(text), 1):
+            if total % 1024 == 0:
+                check_tool_control()
+            if start <= total <= requested_end and len(selected) < _READ_FILE_MAX_LINES:
+                selected.append(line)
     if total == 0:
         return {
             "success": True,
@@ -1345,7 +1482,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "content": "", "path": _display_path(path), "encoding": used_encoding,
             "mode": "lines", "total_lines": 0, "range_start": 0,
             "range_end": 0, "truncated": False, "has_more": False,
-            "content_hash": _content_hash(text),
+            "content_hash": content_hash,
         }
     # end_line 仅为旧调用保留，不再暴露给模型；新调用统一使用 start_line + limit。
     if "end_line" in args:
@@ -1360,9 +1497,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     # 单行超长（如压缩过的大 JSON/日志）时按字符分块返回，避免头尾截断丢失中间内容
     if len(selected[0]) >= return_max_chars - 32:
         line_text = selected[0]
-        offset = int(args.get("char_offset") or 0)
-        if offset < 0:
-            raise ValueError("char_offset 不能为负数")
+        offset = char_offset
         chunk = line_text[offset:offset + return_max_chars]
         if not chunk:
             raise ValueError(f"char_offset={offset} 已超出该行长度 {len(line_text)}，无内容可读")
@@ -1389,11 +1524,10 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "next_char_offset": next_offset if next_offset < len(line_text) else None,
             "next_start_line": start + 1 if next_offset >= len(line_text) and start < total else None,
             "line_length": len(line_text),
-            "content_hash": _content_hash(text),
+            "content_hash": content_hash,
         }
-    if "char_offset" in args and int(args["char_offset"]) != 0:
+    if char_offset != 0:
         raise ValueError("char_offset 只适用于单行超长的 char_chunk 模式")
-    show_numbers = _optional_bool(args, "show_line_numbers", default=True)
     width = len(str(start + len(selected) - 1))
     output_lines = []
     used_chars = 0
@@ -1426,7 +1560,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "has_more": last_line < total or char_limited,
         # 全文（非本次区间）的内容指纹：模型可在 edit_file 时以 expected_hash
         # 引用，用于检测读后文件被外部修改的竞态
-        "content_hash": _content_hash(text),
+        "content_hash": content_hash,
     }
     if last_line < total:
         result["next_start_line"] = last_line + 1
@@ -1457,36 +1591,30 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
 
 
 def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
-    """内置 search_files 实现：语义对齐 MCP 同名工具，返回纯文本结果。"""
+    """Search file contents; return bounded snippets, counts and completeness."""
     args = tool_args or {}
     return_max_chars = max(512, min(60000, int(args.get("_max_chars") or 60000)))
-    pattern = str(args.get("pattern") or "")
+    pattern = string_arg(args, "pattern", required=True, max_length=8192)
     if not pattern:
         raise ValueError("pattern 不能为空")
     root = _resolve_dir_path(args.get("dir_path") or ".")
     guard_path(root)
-    flags = re.IGNORECASE if _optional_bool(args, "ignore_case") else 0
+    ignore_case = _optional_bool(args, "ignore_case")
+    flags = re.IGNORECASE if ignore_case else 0
     # 键名兼容：schema 定义为 is_regex；旧实现误读 isregex 导致该参数被静默忽略
     is_regex_raw = args.get("is_regex")
     if is_regex_raw is None:
         is_regex_raw = args.get("isregex")
     isregex = False if is_regex_raw is None else _optional_bool({"is_regex": is_regex_raw}, "is_regex")
     if isregex:
-        try:
-            regex = re.compile(pattern, flags)
-        except re.error as exc:
-            raise ValueError(f"正则表达式不合法: {exc}")
+        from util.bounded_regex import compile_pattern
+        regex = compile_pattern(pattern, ignore_case=ignore_case)
     else:
         regex = re.compile(re.escape(pattern), flags)
-    context = max(0, min(int(args.get("context_lines") or 0), _SEARCH_CONTEXT_MAX))
-    limit = max(1, min(int(args.get("max_results") or 50), _SEARCH_MAX_RESULTS_LIMIT))
-    name_filter = (str(args.get("file_pattern") or "")).strip()
-    try:
-        size_limit = float(args.get("max_file_mb")) if args.get("max_file_mb") is not None else _SEARCH_DEFAULT_FILE_MB
-    except (TypeError, ValueError):
-        size_limit = _SEARCH_DEFAULT_FILE_MB
-    if size_limit <= 0:
-        size_limit = 0.0
+    context = int_arg(args, "context_lines", 0, maximum=_SEARCH_CONTEXT_MAX)
+    limit = int_arg(args, "max_results", 50, minimum=1, maximum=_SEARCH_MAX_RESULTS_LIMIT)
+    name_filter = string_arg(args, "file_pattern").strip()
+    size_limit = number_arg(args, "max_file_mb", _SEARCH_DEFAULT_FILE_MB, maximum=16)
     effective_max_bytes = _SEARCH_HARD_FILE_MAX_BYTES
     if size_limit:
         effective_max_bytes = min(effective_max_bytes, max(1, int(size_limit * 1024 * 1024)))
@@ -1498,31 +1626,23 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     skipped_unreadable = 0
     total_blocks = 0
     scan_truncated = False
+    capture_truncated = False
     started_at = time.monotonic()
-    try:
-        max_scanned_files = max(1, min(int(args.get("max_scanned_files") or _SEARCH_DEFAULT_MAX_SCANNED_FILES), 20000))
-        max_scan_seconds = max(0.1, min(float(args.get("max_scan_seconds") or _SEARCH_DEFAULT_MAX_SCAN_SECONDS), 120.0))
-    except (TypeError, ValueError):
-        max_scanned_files = _SEARCH_DEFAULT_MAX_SCANNED_FILES
-        max_scan_seconds = _SEARCH_DEFAULT_MAX_SCAN_SECONDS
+    max_scanned_files = int_arg(args, "max_scanned_files", _SEARCH_DEFAULT_MAX_SCANNED_FILES, minimum=1, maximum=20000)
+    max_scan_seconds = number_arg(args, "max_scan_seconds", _SEARCH_DEFAULT_MAX_SCAN_SECONDS, minimum=0.1, maximum=120)
+    deadline = started_at + max_scan_seconds
     files_checked = 0
-    try:
-        raw_depth = args.get("max_depth")
-        max_depth = int(raw_depth) if raw_depth is not None else _SEARCH_DEFAULT_MAX_DEPTH
-    except (TypeError, ValueError):
-        max_depth = _SEARCH_DEFAULT_MAX_DEPTH
+    max_depth = int_arg(args, "max_depth", _SEARCH_DEFAULT_MAX_DEPTH)
     exclude_dirs = args.get("exclude_dirs")
     if exclude_dirs is not None and (not isinstance(exclude_dirs, list) or
             any(not isinstance(rule, str) or not rule for rule in exclude_dirs)):
         raise ValueError("exclude_dirs 必须为目录名字符串数组")
-    no_default_excludes = bool(args.get("no_default_excludes", False))
-    # 兼容旧语义：显式空数组曾表示关闭默认排除
-    if exclude_dirs == []:
-        no_default_excludes = True
+    no_default_excludes = _optional_bool(args, "no_default_excludes")
     walk_errors = []
     permission_skips = []
     for path, kind in _walk_entries(root, max(0, max_depth), exclude_dirs, walk_errors.append,
                                     permission_skips.append, no_default_excludes):
+        check_tool_control()
         if time.monotonic() - started_at >= max_scan_seconds:
             scan_truncated = True
             break
@@ -1554,15 +1674,42 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         files_scanned += 1
         decoded, _used = _decode_bytes_used(data)
         lines = decoded.splitlines()
-        hit_indexes = [idx for idx, line in enumerate(lines) if regex.search(line)]
+        hit_indexes = []
+        file_matches = 0
+        file_blocks = 0
+        previous_hit = None
+        try:
+            for idx, line in enumerate(lines):
+                if idx % 64 == 0:
+                    check_tool_control()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    scan_truncated = True
+                    break
+                matched = regex.search(line, timeout=min(0.25, remaining)) if isregex else regex.search(line)
+                if matched:
+                    file_matches += 1
+                    if previous_hit is None or idx > previous_hit + 2 * context + 1:
+                        file_blocks += 1
+                    previous_hit = idx
+                    if len(hit_indexes) < max(200, limit * 4):
+                        hit_indexes.append(idx)
+                    else:
+                        capture_truncated = True
+        except TimeoutError:
+            scan_truncated = True
         if not hit_indexes:
+            if scan_truncated:
+                break
             continue
         files_matched += 1
-        total_matches += len(hit_indexes)
+        total_matches += file_matches
         block_group = _format_match_block(path, lines, hit_indexes, context)
-        total_blocks += len(block_group)
+        total_blocks += file_blocks
         room = max(0, limit - len(blocks))
         blocks.extend(block_group[:room])
+        if scan_truncated:
+            break
     search_label = "正则" if isregex else "文本"
     skipped_unreadable += len(walk_errors)
     skipped_permission = len(permission_skips)
@@ -1589,7 +1736,7 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     room = max(0, return_max_chars - len(prefix) - 180)
     shown = []
     used = 0
-    output_truncated = False
+    output_truncated = capture_truncated
     for block in blocks:
         if used + len(block) + 1 <= room:
             shown.append(block)
@@ -1634,6 +1781,9 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         "output_truncated": output_truncated or result_limited,
         "truncated": not scan_complete or output_truncated or result_limited,
         "scan_truncated": scan_truncated,
+        "max_depth": max_depth,
+        "no_default_excludes": no_default_excludes,
+        "exclude_dirs": list(exclude_dirs or []),
     }
 
 
@@ -1684,6 +1834,8 @@ def _bounded_document_result(result, token_budget, *, render_table=None):
 
 def _extract_document_table(path: Path, filename: str, data: bytes):
     from factory.table_document import parse_table
+    if len(data) > _READ_DOCUMENT_LOCAL_MAX_BYTES:
+        raise ValueError("文档超过表格解析上限 10 MiB；请拆分文件，或使用模型支持的原生文档输入")
     stat = path.stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     with _document_table_cache_lock:
@@ -1725,7 +1877,14 @@ def _extract_document_text(path: Path, filename: str, data: bytes) -> str:
     return content
 
 
-def _load_local_document(filename: str, *, parse_text: bool = True) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
+def _native_document_byte_limit() -> int:
+    configured = file_memory.native_doc_max_bytes()
+    hard_limit = 64 * 1024 * 1024
+    return min(configured, hard_limit) if configured > 0 else hard_limit
+
+
+def _load_local_document(filename: str, *, parse_text: bool = True,
+                         max_bytes: int | None = None) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
     """读取显式指定的本地文档并复用上传链路解析器。"""
     path = Path(filename).expanduser()
     guard_path(path)
@@ -1737,14 +1896,15 @@ def _load_local_document(filename: str, *, parse_text: bool = True) -> tuple[dic
         return None, None, f"本地文档路径不存在或不可访问：{filename}"
     if not path.is_file():
         return None, None, f"本地文档路径不是文件：{filename}"
+    byte_limit = _READ_DOCUMENT_LOCAL_MAX_BYTES if max_bytes is None else max_bytes
     try:
         size = path.stat().st_size
-        if size > _READ_DOCUMENT_LOCAL_MAX_BYTES:
+        if size > byte_limit:
             return None, None, (
-                f"本地文档超过读取上限 {_READ_DOCUMENT_LOCAL_MAX_BYTES // (1024 * 1024)}MB："
+                f"本地文档超过读取上限 {byte_limit / (1024 * 1024):g} MiB："
                 f"{path.name}（{size / (1024 * 1024):.1f}MB）"
             )
-        data = _read_bytes_with_limit(path, _READ_DOCUMENT_LOCAL_MAX_BYTES)
+        data = _read_bytes_with_limit(path, byte_limit)
     except (OSError, ValueError) as exc:
         return None, None, f"读取本地文档失败：{exc}"
 
@@ -1795,71 +1955,58 @@ def _load_local_document(filename: str, *, parse_text: bool = True) -> tuple[dic
 
 
 def _read_document_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(parsed, maximum))
+    return int_arg({"offset/limit": value}, "offset/limit", default, minimum=minimum, maximum=maximum)
 
 
-READ_DOCUMENT_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-      "name": READ_DOCUMENT_NAME,
-      "description": (
-          "读取当前会话上传文件，或按明确提供的本地绝对/相对路径读取文档"
-          "（PDF/Word/Excel/CSV/MD/TXT 等）。mode=auto 按目标扩展名和模型 supportDocTypes 选择读取方式，"
-          "不以通用 vision 能力分流；"
-          "表格 CSV/TSV/XLS/XLSX 降级文本时自动返回 Markdown 表格，按行分页且每页重复表头；"
-          "Word DOCX 的 auto/text 保留正文段落及 Markdown 表格，按字符续读；"
-          "mode=table 可强制表格读取，续读使用 next_row/next_sheet；"
-          "mode=text 使用 offset/limit 按字符读取（默认 10000，最大 20000，可能按模型窗口收紧）；"
-          "原生 PDF 可用 page_start/page_count 读取 1 起始的页面范围（最多 20 页）。"
-          "原生文件只在下一次模型请求中发送一次；之后需再次调用本工具查看原文。"
-      ),
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "filename": {
-            "type": "string",
-            "description": "会话文件清单中的原始文件名，或当前工作目录下的相对/绝对文档路径",
-          },
-          "mode": {
-            "type": "string",
-            "enum": ["auto", "text", "table", "native"],
-            "description": "auto 按能力选择，表格文本按行读取；table 强制 Markdown 表格；text 按字符读取；native 发送原文",
-          },
-          "offset": {
-            "type": "integer",
-            "description": "解析文本起始字符位置（从 0 开始）；指定后 auto 使用文本模式",
-          },
-          "limit": {
-            "type": "integer",
-            "description": (
-                f"本次读取的最大字符数（默认 {_READ_DOCUMENT_DEFAULT_MAX_CHARS}，"
-                f"最大 {_READ_DOCUMENT_MAX_CHARS}）"
-            ),
-          },
-          "sheet": {"type": "string", "description": "表格工作表名称；默认第一个，返回 sheets 列出全部工作表"},
-          "header_row": {"type": "integer", "minimum": 0,
-                         "description": "表格表头行号，从 1 开始，默认 1；0 表示无表头，使用列 A/B 等且保留首行数据"},
-          "start_row": {"type": "integer", "minimum": 1,
-                        "description": "表格数据起始行号，从 1 开始；默认表头之后，续读用 next_row；与 offset 互斥"},
-          "row_limit": {"type": "integer", "minimum": 1, "maximum": 200,
-                        "description": "表格最多读取的数据行数，默认 100，最多 200；同时受 limit 字符预算约束"},
-          "page_start": {
-            "type": "integer",
-            "description": "原生 PDF 起始页码（从 1 开始）；与 page_count 同时指定",
-          },
-          "page_count": {
-            "type": "integer",
-            "description": "原生 PDF 读取页数（1–20）；与 page_start 同时指定",
-          },
-        },
-        "required": ["filename"],
-      },
-    },
-}
+READ_DOCUMENT_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'read_document',
+              'description': '读取上传文件或本地文档。auto 自动选择；text 按 offset/limit 字符续读；table 按 next_row/next_sheet '
+                             '续读。PDF 页段须同时指定 page_start/page_count；失败不改变读取范围。原生文件仅供下一次请求。',
+              'parameters': {'type': 'object',
+                             'properties': {'filename': {'type': 'string',
+                                                         'description': '会话上传文件名，或本地相对/绝对路径。',
+                                                         'maxLength': 4096},
+                                            'mode': {'type': 'string',
+                                                     'enum': ['auto', 'text', 'table', 'native'],
+                                                     'description': 'auto 自动选择；text 字符分页；table 表格行分页；native '
+                                                                    '原生文件。',
+                                                     'maxLength': 256,
+                                                     'default': 'auto'},
+                                            'offset': {'type': 'integer',
+                                                       'description': '文本起始字符，从 0 开始；auto 指定后使用文本模式。',
+                                                       'minimum': 0},
+                                            'limit': {'type': 'integer',
+                                                      'description': '文本/表格字符预算，默认 10000，最大 20000；可能按上下文收紧。',
+                                                      'minimum': 1,
+                                                      'maximum': 20000,
+                                                      'default': 10000},
+                                            'sheet': {'type': 'string',
+                                                      'description': '表格工作表名称；默认第一个，返回 sheets 列出全部工作表',
+                                                      'maxLength': 256},
+                                            'header_row': {'type': 'integer',
+                                                           'minimum': 0,
+                                                           'description': '表格表头行号，从 1 开始，默认 1；0 表示无表头，使用列 '
+                                                                          'A/B 等且保留首行数据'},
+                                            'start_row': {'type': 'integer',
+                                                          'minimum': 1,
+                                                          'description': '表格数据起始行号，从 1 开始；默认表头之后，续读用 '
+                                                                         'next_row；与 offset 互斥'},
+                                            'row_limit': {'type': 'integer',
+                                                          'minimum': 1,
+                                                          'maximum': 200,
+                                                          'description': '表格最多读取的数据行数，默认 100，最多 200；同时受 '
+                                                                         'limit 字符预算约束'},
+                                            'page_start': {'type': 'integer',
+                                                           'description': '原生 PDF 起始页码（从 1 开始）；与 page_count '
+                                                                          '同时指定',
+                                                           'minimum': 1},
+                                            'page_count': {'type': 'integer',
+                                                           'description': '原生 PDF 读取页数（1–20）；与 page_start '
+                                                                          '同时指定',
+                                                           'minimum': 1,
+                                                           'maximum': 20}},
+                             'required': ['filename'],
+                             'additionalProperties': False}}}
 
 
 def execute_read_document(
@@ -1873,7 +2020,15 @@ def execute_read_document(
     原生结果不带解析文本；调用方须把 native.part 作为独立消息发送，且不得落盘。
     """
     args = tool_args if isinstance(tool_args, dict) else {}
-    filename = str(args.get("filename") or "").strip()
+    try:
+        filename = string_arg(args, "filename", required=True).strip()
+        for key, minimum, maximum in (("offset", 0, 10**9), ("start_char", 0, 10**9),
+                                      ("limit", 1, _READ_DOCUMENT_MAX_CHARS), ("max_chars", 1, 10**9),
+                                      ("page_start", 1, 10**9), ("page_count", 1, 20)):
+            if key in args:
+                int_arg(args, key, 0, minimum=minimum, maximum=maximum)
+    except ValueError as exc:
+        return {"error": str(exc)}
     if not filename:
         return {"error": "filename 不能为空（传入会话文件名或明确的本地文档路径）"}
 
@@ -1909,14 +2064,14 @@ def execute_read_document(
         0, minimum=0, maximum=10**9,
     )
     limit = _read_document_int(
-        args.get("limit", args.get("max_chars", _READ_DOCUMENT_DEFAULT_MAX_CHARS)),
+        args.get("limit", min(args.get("max_chars", _READ_DOCUMENT_DEFAULT_MAX_CHARS), _READ_DOCUMENT_MAX_CHARS)),
         _READ_DOCUMENT_DEFAULT_MAX_CHARS,
         minimum=1,
         maximum=_READ_DOCUMENT_MAX_CHARS,
     )
     if args.get("_max_chars") is not None:
         limit = min(limit, max(1, int(args["_max_chars"])))
-    token_budget = max(0, int(args.get("_max_tokens", document_output_token_budget())))
+    token_budget = max(0, int(args["_max_tokens"] if "_max_tokens" in args else document_output_token_budget()))
 
     local_data: bytes | None = None
     local_parsing_deferred = False
@@ -1925,6 +2080,11 @@ def execute_read_document(
     except Exception as exc:
         return {"error": f"读取文件记录失败：{exc}"}
     if record is None:
+        local_native = bool(
+            support_doc_types
+            and file_memory.document_supports_native(Path(filename).name, support_doc_types)
+            and (mode == "native" or (mode == "auto" and not has_text_range and not has_table_args))
+        )
         local_parsing_deferred = bool(
             mode == "native" or mode == "table" or (
                 mode == "auto" and Path(filename).suffix.lower() in TABLE_EXTENSIONS and not has_offset
@@ -1934,8 +2094,13 @@ def execute_read_document(
                 and file_memory.document_supports_native(Path(filename).name, support_doc_types)
             )
         )
+        local_byte_limit = _native_document_byte_limit() if local_native else _READ_DOCUMENT_LOCAL_MAX_BYTES
+        if local_native and mode == "auto" and not has_page_range:
+            # Keep text fallback available when its cap exceeds the native quota.
+            local_byte_limit = max(local_byte_limit, _READ_DOCUMENT_LOCAL_MAX_BYTES)
         record, local_data, local_error = _load_local_document(
-            filename, parse_text=not local_parsing_deferred
+            filename, parse_text=not local_parsing_deferred,
+            max_bytes=local_byte_limit,
         )
         if record is None:
             try:
@@ -1967,10 +2132,7 @@ def execute_read_document(
         if path is None:
             return None
         try:
-            configured_limit = file_memory.native_doc_max_bytes()
-            hard_limit = 64 * 1024 * 1024
-            limit = min(configured_limit, hard_limit) if configured_limit > 0 else hard_limit
-            return _read_bytes_with_limit(path, limit)
+            return _read_bytes_with_limit(path, _native_document_byte_limit())
         except (OSError, ValueError):
             return None
 
@@ -2033,7 +2195,7 @@ def execute_read_document(
                         "total_pages": native_block.get("total_pages"),
                     })
                 return result
-            if mode == "native":
+            if mode == "native" or has_page_range:
                 return {"error": native_block.get("error") or "原生文档不可用"}
             native_fallback_note = str(native_block.get("error") or "原生文档不可用")
     else:
@@ -2256,16 +2418,10 @@ def build_read_media_tool_definition() -> dict[str, Any]:
         "function": {
             "name": READ_MEDIA_NAME,
             "description": (
-                "按需读取 media:// 引用、本地路径或 http(s) 直链的图片、音频、视频。"
-                "每次最多 5 个来源，同一条回复只调用一次（重复调用仅首个会执行）；"
-                "多个来源合并到 references 列表。"
-                "还需遵守请求中的供应商媒体配额：上限为 1 时每轮只读一个，"
-                "上限为 0 时不能发送该类型；未发送项不代表已看过。"
-                "媒体数据作为下一次请求的多模态部件发送，工具结果只含读取状态。"
-                f"视频/动图每次最多读取 {max_seconds} 秒；start_time=end_time 可只探测元数据，"
-                "继续读取时使用上一段的结束时间。单请求仅保留一个视频片段，"
-                "此前视频画面会回收；如需回看，重新读取相同引用和区间。"
-                "动态 GIF 通常转换为视频，占视频配额；超限或不支持会返回原因。"
+                "读取图片、音频或视频，供下一次模型请求查看。每轮一次，references 合并最多 5 个来源；"
+                "仍受模型媒体配额限制，检查 loaded/skipped。"
+                f"本地/会话视频每段最多 {max_seconds} 秒，按 video.read.end 续读；"
+                "start_time=end_time 仅探测元数据。网络 URL 不支持区间。旧视频画面会回收，回看需重读。"
             ),
             "parameters": {
                 "type": "object",
@@ -2273,35 +2429,37 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                     "references": {
                         "type": "array",
                         "description": (
-                            "媒体来源列表（最多 5 个）：media:// 引用 / 本地文件路径 / "
-                            "http(s) 网络直链，可混用；已知供应商配额更小时按该配额分轮读取"
+                            "media:// 引用、本地路径或 http(s) 媒体直链；最多 5 个。"
                         ),
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "minLength": 1, "maxLength": 8192},
+                        "minItems": 1,
                         "maxItems": READ_MEDIA_MAX_ITEMS,
                     },
                     "quality": {
                         "type": "integer",
                         "minimum": _READ_MEDIA_QUALITY_MIN,
                         "maximum": _READ_MEDIA_QUALITY_MAX,
-                        "description": "图片质量 50-100，默认 85；通常无需指定，大图可调整",
+                        "description": "本地/会话图片质量 50-100，默认 85；网络图片直传时不调整。",
                     },
                     "start_time": {
                         "type": "number",
+                        "minimum": 0,
                         "description": (
-                            "视频区间读取开始秒数（可选，精确到帧）；仅对视频与动图 gif "
-                            "生效"
+                            "本地/会话视频或动图开始秒数，默认 0；同批来源共用区间。"
                         ),
                     },
                     "end_time": {
                         "type": "number",
+                        "minimum": 0,
                         "description": (
-                            "视频区间读取结束秒数（可选，精确到帧）；省略时读取 "
+                            "本地/会话视频或动图结束秒数；省略时读取 "
                             f"start_time 起 {max_seconds} 秒；"
                             "start_time == end_time 表示仅探测元数据（不回传视频数据）"
                         ),
                     },
                 },
                 "required": ["references"],
+                "additionalProperties": False,
             },
         },
     }
@@ -2344,16 +2502,16 @@ def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int
         ), None, None
     references: list[str] = []
     for item in raw_references:
-        text = str(item or "").strip()
+        if not isinstance(item, str):
+            return [], None, "references 每项必须是字符串", None, None
+        text = item.strip()
         if not text:
             continue
         if text not in references:
             references.append(text)
     quality = args.get("quality")
     if quality is not None:
-        try:
-            quality = int(quality)
-        except (TypeError, ValueError):
+        if isinstance(quality, bool) or not isinstance(quality, int):
             return [], None, f"quality 参数无效: {quality!r}（应为 50-100 的整数）", None, None
         if quality < _READ_MEDIA_QUALITY_MIN or quality > _READ_MEDIA_QUALITY_MAX:
             return [], None, (
@@ -2366,10 +2524,9 @@ def normalize_read_media_args(tool_args: dict[str, Any]) -> tuple[list[str], int
         if raw is None:
             times.append(None)
             continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
             return [], None, f"{name} 参数无效: {raw!r}（应为秒数，支持毫秒精度）", None, None
+        value = float(raw)
         if value < 0:
             return [], None, f"{name} 不能为负数: {value}", None, None
         times.append(value)
@@ -2658,20 +2815,21 @@ def load_any_media_model_part(
         info = file_memory.load_session_media_model_part(
             session_id, source, quality=quality,
             start_time=start_time, end_time=end_time,
-            **({"api_type": "messages"} if api_type == "messages" else {}),
+            **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
         )
         if info is None:
             return None
         return {**info, "source_type": "session", "source": source}
     if source.startswith("http://") or source.startswith("https://"):
+        if start_time is not None or end_time is not None:
+            return {"error": "网络 URL 不支持时间区间；请下载到本地后读取", "source_type": "network", "source": source}
         # URL 直传：按扩展名推断 kind/mime；未知扩展名按图片处理。
         name = Path(urlsplit(source).path).name or "remote_media"
         kind = file_memory.media_kind(name) or "image"
         mime = file_memory.media_mime_type(name) if file_memory.media_kind(name) else "image/jpeg"
-        if api_type == "messages" and kind != "image":
-            return {"error": "Messages API 不支持原生音频/视频输入", "source_type": "network", "source": source}
-        if api_type == "messages" and (start_time is not None or end_time is not None):
-            return {"error": "Messages 图片读取不支持视频时间区间", "source_type": "network", "source": source}
+        image_only = api_type in {"messages", "responses"}
+        if image_only and kind != "image":
+            return {"error": "当前 API 不支持音频或视频，仅支持图片输入", "source_type": "network", "source": source}
         part: dict[str, Any]
         if kind == "image":
             part = {"type": "image_url", "image_url": {"url": source}}
@@ -2687,16 +2845,16 @@ def load_any_media_model_part(
         # 转换失败（下载失败/ffmpeg 缺失/损坏文件）回退 URL 直传原行为
         suffix = Path(name).suffix.lower()
         if kind == "image" and (
-            (suffix == ".gif" and api_type != "messages") or suffix in file_memory._VISION_UNSAFE_IMAGE_EXTENSIONS
+            (suffix == ".gif" and not image_only) or suffix in file_memory._VISION_UNSAFE_IMAGE_EXTENSIONS
         ):
             try:
-                data = _fetch_url_media_bytes(source, max_bytes=file_memory.MEDIA_SEND_IMAGE_LIMIT_BYTES if api_type == "messages" else _network_media_fetch_limit_bytes(name))
+                data = _fetch_url_media_bytes(source, max_bytes=file_memory.MEDIA_SEND_IMAGE_LIMIT_BYTES if image_only else _network_media_fetch_limit_bytes(name))
                 sniffed = file_memory._sniff_media_filename(data)
                 probe_name = (sniffed or name) if (suffix == ".gif" or not sniffed) else name
                 tmp_path = file_memory._transcode_cache_dir("network_media") / f"dl_{uuid.uuid4().hex[:8]}_{Path(probe_name).name}"
                 tmp_path.write_bytes(data)
                 try:
-                    if api_type == "messages":
+                    if image_only:
                         info = file_memory._messages_image_model_part(tmp_path, quality)
                         return {**info, "source_type": "network", "source": source}
                     converted_result = file_memory._load_converted_media_base64(
@@ -2728,7 +2886,7 @@ def load_any_media_model_part(
                         "source": source,
                     }
             except Exception as exc:
-                if api_type == "messages":
+                if image_only:
                     return {"error": "图片格式转换失败：" + str(exc), "source_type": "network", "source": source}
                 pass  # 转换链路任何失败都回退 URL 直传
         return {
@@ -2743,7 +2901,7 @@ def load_any_media_model_part(
             "source_type": "network",
             "source": source,
             **({"converted": {"converted_kind": "image", "first_frame_only": True}}
-               if api_type == "messages" and suffix == ".gif" else {}),
+               if image_only and suffix == ".gif" else {}),
         }
     # 本地路径：直接读取真实位置（相对路径基于会话工作目录，worker 已 os.chdir）
     local_path = Path(source)
@@ -2752,7 +2910,7 @@ def load_any_media_model_part(
         return {"error": f"未找到，可能已删除: {source}", "source_type": "local", "source": source}
     info = file_memory._media_model_part_from_path(
         local_path, quality, start_time=start_time, end_time=end_time,
-        **({"api_type": "messages"} if api_type == "messages" else {}),
+        **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
     )
     if info is None:
         return {"error": f"读取失败: {source}", "source_type": "local", "source": source}
@@ -2818,6 +2976,7 @@ def execute_read_media(
     vision_enabled: bool | None = None,
     media_limits: dict | None = None,
     api_type: str | None = None,
+    loaded_parts: dict | None = None,
 ) -> dict[str, Any]:
     """内置 read_media 实现：把媒体来源解析为可注入的数据（统一入口）。
 
@@ -2858,9 +3017,9 @@ def execute_read_media(
     available = {str(item) for item in (available_references or [])}
     injected = {str(item) for item in (already_injected or set())}
     loader = load_media or load_any_media_model_part
-    if load_media is None and api_type == "messages":
+    if load_media is None and api_type in {"messages", "responses"}:
         from functools import partial
-        loader = partial(loader, api_type="messages")
+        loader = partial(loader, api_type=api_type)
     allowed, skipped = [], []
     for reference in references:
         # 本地/网络来源不做白名单拦截；media:// 引用在传入了边界集合时按旧语义过滤
@@ -2882,9 +3041,21 @@ def execute_read_media(
             skipped.append({"reference": reference, "reason": "limit_5_per_round"})
         allowed = allowed[:READ_MEDIA_MAX_ITEMS]
     loaded_items: list[dict[str, Any]] = []
-    media_limits = media_limits or {}
+    media_limits = dict(media_limits or {})
+    media_limits["video"] = min(media_limits.get("video", 1), 1)
     kind_counts: dict[str, int] = {}
     for reference in allowed:
+        check_tool_control()
+        probe_only = start_time is not None and end_time is not None and start_time == end_time
+        source_name = Path(urlsplit(reference).path).name if "://" in reference else reference
+        inferred_kind = file_memory.media_kind(source_name)
+        if not probe_only and inferred_kind and (
+            (inferred_kind in media_limits and kind_counts.get(inferred_kind, 0) >= media_limits[inferred_kind])
+            or ("total" in media_limits and sum(kind_counts.values()) >= media_limits["total"])
+        ):
+            skipped.append({"reference": reference, "reason": "provider_media_limit",
+                            "message": "当前请求媒体配额已满或不支持此类型；请分轮读取或更换模型"})
+            continue
         # 每个引用的去重键在注入时逐项计算（勿复用 allowed 构建循环的旧变量）
         injected_key = _media_injected_key(reference, start_time, end_time)
         try:
@@ -2895,6 +3066,11 @@ def execute_read_media(
         except file_memory.MediaSendTooLargeError as gate_error:
             # 超过发送/读取上限：明确拒绝（绝不回退注入原始大文件）
             skipped.append({"reference": reference, "reason": str(gate_error)})
+            continue
+        except ToolCancelledError:
+            raise
+        except Exception as exc:
+            skipped.append({"reference": reference, "reason": f"读取失败：{exc}"})
             continue
         if info is None:
             # media:// 引用解析失败 = 会话媒体库中不存在（引用无效或文件已删除）
@@ -2911,15 +3087,19 @@ def execute_read_media(
             skipped.append({"reference": reference, "reason": info["error"]})
             continue
         kind = info.get("kind")
+        metadata_only = info.get("part", {}).get("type") == "text" and (info.get("video") or {}).get("probe")
         kind_limit = media_limits.get(kind)
         total_limit = media_limits.get("total")
-        if (kind_limit is not None and kind_counts.get(kind, 0) >= kind_limit) or (
-            total_limit is not None and len(loaded_items) >= total_limit
-        ):
+        if not metadata_only and ((kind_limit is not None and kind_counts.get(kind, 0) >= kind_limit) or (
+            total_limit is not None and sum(kind_counts.values()) >= total_limit
+        )):
             skipped.append({"reference": reference, "reason": "provider_media_limit",
                             "message": f"当前供应商限制 {kind}≤{kind_limit}，总媒体≤{total_limit}；未注入该媒体。数量为 1 时请下一轮单独读取，数量为 0 时请更换模型。"})
             continue
-        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if not metadata_only:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if loaded_parts is not None:
+            loaded_parts[injected_key] = info
         loaded_items.append({
             "reference": reference,
             "injected_key": _media_injected_key(reference, start_time, end_time),
@@ -2938,7 +3118,7 @@ def execute_read_media(
     return {
         "ok": loaded,
         "message": (
-            f"已读取 {len(loaded_items)} 个媒体（数据已注入后续请求的多模态部件）"
+            f"已准备 {len(loaded_items)} 个媒体，将提供给下一次模型请求；请检查 skipped"
             if loaded
             else "没有可读取的媒体（引用无效/重复或全部被跳过）"
         ),
@@ -3278,7 +3458,7 @@ def _resolve_shell(shell: str, is_nt: bool) -> tuple:
             if powershell:
                 return powershell, "powershell", ["-NoProfile", "-NonInteractive", "-Command"]
             return os.environ.get("COMSPEC") or "cmd.exe", "cmd", []
-        return shutil.which("sh") or "/bin/sh", "sh", []
+        return shutil.which("sh") or "/bin/sh", "sh", ["-c"]
     if kind == "cmd":
         if not is_nt:
             raise ValueError("shell=cmd 仅在 Windows 上可用；Linux/macOS 请使用 bash/sh/zsh")
@@ -3475,6 +3655,7 @@ def _pipe_filter_works(tool: str, args: str, exe_path: str = "") -> bool:
     ]
     ok = True
     for probe in probes:
+        check_tool_control()
         probe_path = None
         try:
             handle, probe_path = tempfile.mkstemp(prefix="rc_probe_", suffix=".cmd")
@@ -3483,12 +3664,14 @@ def _pipe_filter_works(tool: str, args: str, exe_path: str = "") -> bool:
                 file.write(probe)
             proc = subprocess.run(
                 [os.environ.get("COMSPEC") or "cmd.exe", "/c", "call", probe_path],
-                capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=remaining_seconds(2), stdin=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 env=_merged_child_env() or None)
             text = _decode_command_bytes(proc.stdout or b"", candidates=_command_output_candidates())
             if f"{marker}_{total - 1}" not in text:
                 ok = False
+        except ToolCancelledError:
+            raise
         except Exception:
             ok = False
         finally:
@@ -4013,7 +4196,7 @@ def _wmi_create_process(command_line: str) -> int:
     encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        capture_output=True, timeout=30,
+        capture_output=True, timeout=remaining_seconds(5),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     text = completed.stdout.decode(_command_output_candidates()[0], errors="replace").strip()
     if completed.returncode != 0 or not text.isdigit():
@@ -4103,6 +4286,13 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
     }
 
 
+_POWERSHELL_EXIT_SUFFIX = (
+    "$__ytools_command_ok = $?\n"
+    "if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+    "if (-not $__ytools_command_ok) { exit 1 }\n"
+)
+
+
 def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> None:
     """写执行脚本：cmd→.run.cmd（mbcs）；powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；
     bash/sh/zsh→.run.sh（UTF-8，stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，
@@ -4125,7 +4315,7 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> No
     text = normalized + "\n"
     if shell_kind in ("powershell", "pwsh"):
         text = powershell_text_prelude() + text
-        text += "if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\n"
+        text += _POWERSHELL_EXIT_SUFFIX
         runner_path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
         return
     text += "exit $?\n"
@@ -4169,22 +4359,34 @@ def _save_full_output(stdout_text: str, stderr_text: str) -> Optional[Path]:
         return None
 
 
-def _kill_process_tree(proc: subprocess.Popen, is_nt: bool) -> None:
+def _terminate_windows_tree(pid):
+    try:
+        result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                capture_output=True, timeout=5,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _kill_process_tree(proc: subprocess.Popen, is_nt: bool) -> bool:
     """超时后终止进程及其子树（Windows 用 taskkill /T，POSIX 用进程组 SIGKILL）。"""
     try:
         if is_nt:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True, timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if _terminate_windows_tree(proc.pid):
+                return True
+            proc.kill()
+            return False
         else:
             import signal
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return True
     except Exception:
         try:
             proc.kill()
+            return False
         except OSError:
-            pass
+            return False
 
 
 _RUN_COMMAND_PREVIEW_BYTES = 1024 * 1024
@@ -4216,8 +4418,7 @@ def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
         if shell_kind in ("powershell", "pwsh"):
             # 与隐藏中转脚本保持一致：管道末段是 Select-Object 等 cmdlet 时，
             # PowerShell -Command 可能只返回 0/1，丢失上游原生程序的退出码。
-            command = (powershell_text_prelude() + command
-                       + "\nif ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\n")
+            command = powershell_text_prelude() + command + "\n" + _POWERSHELL_EXIT_SUFFIX
         argv = [shell_exe, *shell_prefix, command]
     popen_kwargs = dict(
         stdin=subprocess.DEVNULL, cwd=cwd,
@@ -4235,29 +4436,46 @@ def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
     out_path = _BG_LOG_DIR / f"{base}.out.txt"
     err_path = _BG_LOG_DIR / f"{base}.err.txt"
     started = time.monotonic()
+    termination_confirmed = None
+    proc = None
     with out_path.open("wb") as out_handle, err_path.open("wb") as err_handle:
         try:
+            check_tool_control()
             proc = subprocess.Popen(
                 argv, stdout=out_handle, stderr=err_handle, **popen_kwargs)
             timed_out = False
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            deadline = started + timeout
+            while proc.poll() is None:
+                check_tool_control(check_deadline=False)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    termination_confirmed = _kill_process_tree(proc, is_nt)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        termination_confirmed = False
+                    break
+                try:
+                    proc.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            if proc is not None and proc.poll() is None:
                 _kill_process_tree(proc, is_nt)
                 try:
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-        except Exception:
-            out_path.unlink(missing_ok=True)
-            err_path.unlink(missing_ok=True)
+            # Keep cancellation/error logs for the normal 24h cleanup. On Windows
+            # these handles are still open until the surrounding context exits.
             raise
     elapsed = time.monotonic() - started
     candidates = _command_output_candidates()
     stdout_text, out_cut = _read_command_output_preview(out_path, candidates)
     stderr_text, err_cut = _read_command_output_preview(err_path, candidates)
-    info = {"out": out_path, "err": err_path, "output_truncated": out_cut or err_cut}
+    info = {"out": out_path, "err": err_path, "output_truncated": out_cut or err_cut,
+            "termination_confirmed": termination_confirmed}
     return proc.returncode, stdout_text, stderr_text, timed_out, elapsed, info
 
 
@@ -4275,24 +4493,32 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
         return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
                                       cwd, timeout, is_nt)
     started = time.monotonic()
+    check_tool_control()
     try:
         info = _write_relay_script(
             command, cwd, shell_exe, shell_kind, shell_prefix, "fg",
             split_streams=True)
+    except ToolCancelledError:
+        raise
     except Exception:
+        check_tool_control()
         return _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
-                                      cwd, timeout, is_nt)
+                                       cwd, remaining_seconds(timeout), is_nt)
     timed_out = False
     deadline = started + timeout
     done_path = Path(info["done"])
-    while time.monotonic() < deadline:
-        if done_path.exists():
-            text = done_path.read_text(encoding="mbcs", errors="ignore").strip()
-            if text:
-                break  # 退出码已写入
-            time.sleep(0.02)  # done 已创建但退出码尚在写入
-        else:
+    try:
+        while time.monotonic() < deadline:
+            check_tool_control(check_deadline=False)
+            if done_path.exists():
+                text = done_path.read_text(encoding="mbcs", errors="ignore").strip()
+                if text:
+                    break
             time.sleep(0.05)
+    except BaseException:
+        _terminate_windows_tree(info["pid"])
+        _cleanup_relay_files(info, include_streams=True)
+        raise
     exit_code = None
     if done_path.exists():
         try:
@@ -4306,12 +4532,13 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
         root_pid = info.get("pid")
         if root_pid:
             try:
-                subprocess.run(
+                stopped = subprocess.run(
                     ["taskkill", "/PID", str(root_pid), "/T", "/F"],
-                    capture_output=True, timeout=15,
+                    capture_output=True, timeout=5,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                info["termination_confirmed"] = stopped.returncode == 0
             except Exception:
-                pass
+                info["termination_confirmed"] = False
         exit_code = -1
     elapsed = time.monotonic() - started
     candidates = _command_output_candidates()
@@ -4323,7 +4550,7 @@ def _run_command_foreground(command, shell_exe, shell_kind, shell_prefix,
 
 
 def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, is_nt,
-                            session_id="") -> str:
+                             session_id="", *, structured=False) -> str | dict:
     """后台分离模式：立即返回，输出落盘到日志文件供轮询。"""
     try:
         _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4335,15 +4562,14 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
         info = _write_relay_script(command, cwd, shell_exe, shell_kind, shell_prefix, "bg")
         alive = _pid_alive_windows(info["pid"])
         job_id = _save_command_job(info["pid"], info["out"], info["done"], shell_kind, cwd, session_id, command)
-        return "\n".join([
+        message = "\n".join([
             f"[run_command] 后台模式{'已启动' if alive else '已启动（进程状态未知，可能瞬间结束）'}"
             f" | shell={shell_kind} | pid={info['pid']} | job_id={job_id}",
             f"输出文件: {_display_path(info['out'])}",
             f"结束标记: {_display_path(info['done'])}（命令结束后写入退出码；该文件出现即已结束）",
-            "轮询建议: 用 read_file 读取输出文件（推荐）；确认退出码时读取结束标记文件内容",
-            f"终止建议: taskkill /PID {info['pid']} /T /F（必须带 /T 终止整棵进程树；"
-            "只杀该 pid 会留下实际服务进程）",
+            f"查询: poll_command(job_id=\"{job_id}\")；停止: stop_command(job_id=\"{job_id}\")",
         ])
+        return _background_command_result(message, job_id, session_id) if structured else message
     # POSIX：独立进程组中的监督进程等待 shell 退出并写入完成标记。
     stamp = time.strftime("%Y%m%d_%H%M%S")
     base = f"bg_{stamp}_{next(_BG_NAME_SEQ) % 10000}_{os.getpid()}"
@@ -4361,12 +4587,21 @@ def _run_command_background(command, shell_exe, shell_kind, shell_prefix, cwd, i
     from threading import Thread
     Thread(target=proc.wait, daemon=True).start()
     job_id = _save_command_job(proc.pid, out_path, done_path, shell_kind, cwd, session_id, command)
-    return "\n".join([
+    message = "\n".join([
         f"[run_command] 后台模式已启动 | shell={shell_kind} | pid={proc.pid} | job_id={job_id}",
         f"输出文件: {_display_path(out_path)}（stdout+stderr 合并追加）",
-        "轮询建议: 用 read_file 读取输出文件，或用 ps -p <pid> 确认进程仍在运行",
-        f"终止建议: kill -TERM -{proc.pid}（负号=整个进程组，含子进程）",
+        f"结束标记: {_display_path(done_path)}",
+        f"查询: poll_command(job_id=\"{job_id}\")；停止: stop_command(job_id=\"{job_id}\")",
     ])
+    return _background_command_result(message, job_id, session_id) if structured else message
+
+
+def _background_command_result(message, job_id, session_id):
+    from .command_jobs import read_job, snapshot
+    _, meta = read_job(job_id, session_id)
+    result = snapshot(meta)
+    result.update(message=message, stdout="", stderr="", timed_out=False, truncated=False)
+    return result
 
 
 def _save_command_job(pid: int, output_path: Path, done_path: Path | None, shell: str, cwd: str,
@@ -4449,15 +4684,15 @@ def _pid_alive_posix(pid: int) -> bool:
 
 def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max_output_chars=None,
                       structured=False, session_id="") -> str | dict[str, Any]:
-    command = str(command or "").strip()
-    if not command:
-        raise ValueError("command 不能为空")
-    try:
-        timeout = float(timeout_seconds)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("timeout_seconds 必须是 1-1800 之间的数字") from exc
-    if not math.isfinite(timeout) or not 1 <= timeout <= 1800:
-        raise ValueError("timeout_seconds 必须是 1-1800 之间的数字")
+    command = string_arg({"command": command}, "command", required=True, max_length=200000).strip()
+    timeout = number_arg({"timeout_seconds": timeout_seconds}, "timeout_seconds", 120, minimum=1, maximum=1800)
+    with tool_deadline(30 if background else timeout):
+        return _execute_command_impl(command, shell, work_dir, timeout, background,
+                                     max_output_chars, structured, session_id)
+
+
+def _execute_command_impl(command, shell, work_dir, timeout, background, max_output_chars,
+                          structured, session_id):
     output_limit = max(512, min(_RUN_COMMAND_MAX_CHARS, int(max_output_chars or _RUN_COMMAND_MAX_CHARS)))
     is_nt = os.name == "nt"
     # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
@@ -4499,15 +4734,18 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
     elif shell_kind in ("powershell", "pwsh"):
         command, pipe_notes = _guard_powershell_pipeline(command)
         guard_notes = guard_notes + pipe_notes
-    work_text = str(work_dir or "").strip()
+    work_text = string_arg({"work_dir": work_dir}, "work_dir").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
     if background:
-        result_text = _run_command_background(
-            command, shell_exe, shell_kind, shell_prefix, cwd, is_nt, session_id)
-        result_text = _append_command_notes(result_text, guard_notes)
-        return _structured_command_result(result_text) if structured else result_text
+        result = _run_command_background(
+            command, shell_exe, shell_kind, shell_prefix, cwd, is_nt, session_id, structured=structured)
+        if isinstance(result, dict):
+            result["message"] = _append_command_notes(result["message"], guard_notes)
+            return result
+        return _append_command_notes(result, guard_notes)
+    check_tool_control()
     exit_code, stdout_text, stderr_text, timed_out, elapsed, relay_info = _run_command_foreground(
-        command, shell_exe, shell_kind, shell_prefix, cwd, timeout, is_nt)
+        command, shell_exe, shell_kind, shell_prefix, cwd, remaining_seconds(timeout), is_nt)
     if "\ufffd" in stdout_text or "\ufffd" in stderr_text:
         guard_notes.append(
             "输出包含替换字符 �；可能是子进程读取源文件时已替换原始字节，"
@@ -4563,7 +4801,15 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
         _cleanup_relay_files(relay_info, include_streams=not keep_streams)
     header = (f"[run_command] shell={shell_kind} | cwd={_display_path(Path(cwd))}"
               f" | exit={exit_code} | 耗时 {elapsed:.1f}s"
-              + (" | 命令超时，进程树已被强制终止" if timed_out else ""))
+              + ((" | 命令超时，进程树已被强制终止" if relay_info and relay_info.get("termination_confirmed")
+                  else " | 命令超时，已请求终止进程树，请核实状态") if timed_out else ""))
+    fields = {"status": "timeout" if timed_out else "completed" if exit_code == 0 else "failed",
+              "exit_code": exit_code, "timed_out": timed_out, "shell": shell_kind,
+              "cwd": _display_path(Path(cwd)), "background": False, "pid": None, "job_id": None,
+              "completion_path": None,
+              "termination_confirmed": relay_info.get("termination_confirmed") if relay_info else None,
+              "truncated": bool((relay_info or {}).get("output_truncated") or len(raw_stdout) > output_limit
+                                or len(raw_stderr) > min(3000, output_limit // 2))}
     # ③ 失败或可疑时的 cmd 语法提示（分号串联 / && 串联 / Unix 命令名）
     if shell_kind == "cmd":
         guard_notes = guard_notes + _cmd_syntax_hints(
@@ -4572,7 +4818,7 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
         result_text = _append_command_notes(f"{header}\n（无输出）", guard_notes)
         if not structured:
             return result_text
-        result = _structured_command_result(result_text)
+        result = dict(fields)
         result.update({"message": _append_command_notes(f"{header}\n（无输出）", guard_notes),
                        "stdout": "", "stderr": "", "output_path": _display_path(Path(full_output_path)) if full_output_path else None})
         return result
@@ -4584,11 +4830,11 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
     if timed_out:
         parts.append(
             f"[run_command] 已超过 timeout={timeout:g}s；长任务请改用 background=true，"
-            "随后用输出文件路径轮询结果")
+            "随后用 poll_command 查询结果")
     result_text = _append_command_notes("\n".join(parts), guard_notes)
     if not structured:
         return result_text
-    result = _structured_command_result(result_text)
+    result = dict(fields)
     result.update({"message": _append_command_notes(header, guard_notes),
                    "stdout": stdout_text, "stderr": stderr_text,
                    "output_path": _display_path(Path(full_output_path)) if full_output_path else None})
@@ -4596,89 +4842,70 @@ def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max
 
 # ------------------- run_command 工具定义与执行入口 -------------------
 
-RUN_COMMAND_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": RUN_COMMAND_NAME,
-        "description": (
-            "运行终端命令；每次使用新 shell，默认 Windows 用 PowerShell（不可用时 cmd），Linux/macOS 用 sh。"
-            "background=true 时返回 job_id，随后使用 poll_command 或 stop_command。"
-            "结果含状态、退出码和输出；长输出保存到文件。读写文件优先用专用工具。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": (
-                        "命令原文，由目标 shell 解释（管道、重定向、链式命令、多行均可；"
-                        "多行按顺序逐行执行）。cmd 家族用 && / & 串联（不支持 ;）"
-                    ),
-                },
-                "shell": {
-                    "type": "string",
-                    "enum": ["auto", "cmd", "powershell", "pwsh", "bash", "sh", "zsh"],
-                    "description": (
-                        "目标 shell：省略或 auto 时，Windows 用 PowerShell（不可用时 cmd），Linux/macOS 用 sh；"
-                        "可选 cmd/powershell/pwsh/bash/sh/zsh"
-                    ),
-                    "default": "auto",
-                },
-                "work_dir": {
-                    "type": "string",
-                    "description": "工作目录，默认当前目录（会话工作目录）；目录不存在时报错",
-                    "default": "",
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "minimum": 1,
-                    "maximum": 1800,
-                    "description": "超时秒数（默认 120，最大 1800）",
-                    "default": 120.0,
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": (
-                        "true=后台分离模式：立即返回 pid 与输出/结束标记文件路径"
-                        "（适合长任务）；默认 false 前台等待"
-                    ),
-                    "default": False,
-                },
-            },
-            "required": ["command"],
-        },
-    },
-}
+RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'run_command',
+              'description': '运行终端命令；每次新建 shell。短命令前台等待，长任务用 background=true，按 job_id 调用 '
+                             'poll_command/stop_command。文件读写优先用专用工具。',
+              'parameters': {'type': 'object',
+                             'properties': {'command': {'type': 'string',
+                                                        'description': '目标 shell 的命令原文；语法须与 shell 一致。cmd 用 '
+                                                                       '&& 或 & 串联。',
+                                                        'maxLength': 200000},
+                                            'shell': {'type': 'string',
+                                                      'enum': ['auto',
+                                                               'cmd',
+                                                               'powershell',
+                                                               'pwsh',
+                                                               'bash',
+                                                               'sh',
+                                                               'zsh'],
+                                                      'description': '默认 auto：Windows PowerShell（不可用时 '
+                                                                     'cmd），其他平台 sh。',
+                                                      'default': 'auto',
+                                                      'maxLength': 256},
+                                            'work_dir': {'type': 'string',
+                                                         'description': '工作目录；默认会话目录。每次调用独立，cd 不会影响下一次调用。',
+                                                         'default': '',
+                                                         'maxLength': 4096},
+                                            'timeout_seconds': {'type': 'number',
+                                                                'minimum': 1,
+                                                                'maximum': 1800,
+                                                                'description': '仅前台有效，默认 120 秒，范围 '
+                                                                               '1-1800；含预处理和启动，超时终止进程树。',
+                                                                'default': 120.0},
+                                            'background': {'type': 'boolean',
+                                                           'description': 'true 启动后台任务并返回 job_id；不受 '
+                                                                          'timeout_seconds 限制，结束后仍可查询日志。',
+                                                           'default': False}},
+                             'required': ['command'],
+                             'additionalProperties': False}}}
 
-POLL_COMMAND_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": POLL_COMMAND_NAME,
-        "description": "查询 run_command(background=true) 启动的后台任务状态和最新输出。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "run_command 返回的 job_id"},
-                "tail_lines": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30,
-                               "description": "最近输出行数，默认30、最多200；受字符预算限制，截断时用 read_file 读取 output_path"},
-            },
-            "required": ["job_id"],
-        },
-    },
-}
+POLL_COMMAND_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'poll_command',
+              'description': '查询后台任务状态和最近输出；仅管理当前会话任务。尾部采样可能遗漏轮询间输出，完整内容见 output_path。',
+              'parameters': {'type': 'object',
+                             'properties': {'job_id': {'type': 'string',
+                                                       'description': 'run_command 返回的 job_id',
+                                                       'maxLength': 256,
+                                                       'pattern': '^bg_[A-Za-z0-9_]+$'},
+                                            'tail_lines': {'type': 'integer',
+                                                           'minimum': 1,
+                                                           'maximum': 200,
+                                                           'default': 30,
+                                                           'description': '最近 1-200 行，默认 30；同时受字符预算限制。'}},
+                             'required': ['job_id'],
+                             'additionalProperties': False}}}
 
-STOP_COMMAND_TOOL_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": STOP_COMMAND_NAME,
-        "description": "停止 run_command(background=true) 启动的后台任务。",
-        "parameters": {
-            "type": "object",
-            "properties": {"job_id": {"type": "string", "description": "run_command 返回的 job_id"}},
-            "required": ["job_id"],
-        },
-    },
-}
+STOP_COMMAND_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': 'stop_command',
+              'description': '停止当前会话后台任务的进程树并保留日志；任务已结束时返回其当前状态。',
+              'parameters': {'type': 'object',
+                             'properties': {'job_id': {'type': 'string',
+                                                       'description': 'run_command 返回的 job_id',
+                                                       'maxLength': 256,
+                                                       'pattern': '^bg_[A-Za-z0-9_]+$'}},
+                             'required': ['job_id'],
+                             'additionalProperties': False}}}
 
 
 def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
@@ -4723,7 +4950,8 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
 def _structured_command_result(message: str) -> dict[str, Any]:
     """Expose stable status fields while retaining the legacy readable output."""
     header = message.splitlines()[0] if message else ""
-    exit_match = re.search(r"\bexit=(-?\d+)\b", header)
+    exit_matches = list(re.finditer(r"(?:^|\|)\s*exit=(-?\d+)\b", header))
+    exit_match = exit_matches[-1] if exit_matches else None
     pid_match = re.search(r"\bpid=(\d+)\b", header)
     job_match = re.search(r"\bjob_id=([A-Za-z0-9_]+)\b", header)
     shell_match = re.search(r"\bshell=([^\s|]+)", header)
@@ -4777,4 +5005,9 @@ def try_execute_builtin_command_tool(
         result = execute_run_command({**args, "_structured_output": True})
         return result if isinstance(result, dict) else _structured_command_result(result)
     except Exception as exc:
-        return {"error": str(exc), "tool": tool_name}
+        result = {"success": False, "error": str(exc), "tool": tool_name}
+        if isinstance(exc, TimeoutError):
+            result.update(status="timeout", timed_out=True)
+        elif isinstance(exc, ToolCancelledError):
+            result.update(status="cancelled")
+        return result

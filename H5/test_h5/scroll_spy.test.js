@@ -26,6 +26,10 @@ class Node {
     };
   }
   getBoundingClientRect() { return this._rect; }
+  closest(selector) {
+    if (selector.startsWith('.') && this.classList.contains(selector.slice(1))) return this;
+    return this.parentElement ? this.parentElement.closest(selector) : null;
+  }
 }
 
 function slice(from, to) {

@@ -88,7 +88,8 @@ class BuiltinFileToolTests(unittest.TestCase):
         }
 
         write = definitions["write_file"]
-        self.assertIn("mode=overwrite", write["description"])
+        self.assertIn("overwrite", write["description"])
+        self.assertIn("mode 必填", write["description"])
         self.assertIn("edit_file", write["description"])
         self.assertEqual(write["parameters"]["properties"]["mode"]["enum"], [
             "create", "overwrite", "append",
@@ -119,7 +120,7 @@ class BuiltinFileToolTests(unittest.TestCase):
     # ---------- write_file ----------
 
     def test_write_file_creates_and_overwrites(self):
-        result = bt.execute_write_file({
+        result = bt.execute_write_file({"mode": "overwrite", 
             "path": "sub/dir/a.txt",
             "content": "第一行\n第二行",
         })
@@ -150,9 +151,9 @@ class BuiltinFileToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "FILE_ALREADY_EXISTS"):
             bt.execute_write_file({"path": str(path), "content": "after", "create_only": True})
         with self.assertRaisesRegex(ValueError, "FILE_MODIFIED_EXTERNALLY"):
-            bt.execute_write_file({"path": str(path), "content": "after", "expected_hash": "stale"})
+            bt.execute_write_file({"mode": "overwrite", "path": str(path), "content": "after", "expected_hash": "stale"})
         self.assertEqual(path.read_text(encoding="utf-8"), "before")
-        bt.execute_write_file({"path": str(path), "content": "after", "expected_hash": bt._content_hash("before")})
+        bt.execute_write_file({"mode": "overwrite", "path": str(path), "content": "after", "expected_hash": bt._content_hash("before")})
         self.assertEqual(path.read_text(encoding="utf-8"), "after")
 
     def test_write_file_explicit_modes_and_conflicts(self):
@@ -188,11 +189,11 @@ class BuiltinFileToolTests(unittest.TestCase):
 
     def test_write_file_rejects_bad_args(self):
         with self.assertRaises(ValueError):
-            bt.execute_write_file({"path": "", "content": "x"})
+            bt.execute_write_file({"mode": "overwrite", "path": "", "content": "x"})
         with self.assertRaises(ValueError):
-            bt.execute_write_file({"path": "a.txt", "content": 123})
+            bt.execute_write_file({"mode": "overwrite", "path": "a.txt", "content": 123})
         with self.assertRaises(ValueError):
-            bt.execute_write_file({
+            bt.execute_write_file({"mode": "overwrite", 
                 "path": "big.txt",
                 "content": "x" * (bt._WRITE_EDIT_MAX_CHARS + 1),
             })
@@ -573,7 +574,8 @@ class BuiltinFileToolTests(unittest.TestCase):
             Path(self._tmp, name, "a.txt").write_text("hit\n", encoding="utf-8")
         self._make_file("source.py", "hit\n")
         self.assertEqual(bt.execute_search_files({"pattern": "hit"})["total_matches"], 1)
-        self.assertEqual(bt.execute_search_files({"pattern": "hit", "exclude_dirs": []})["total_matches"], 5)
+        self.assertEqual(bt.execute_search_files({"pattern": "hit", "exclude_dirs": []})["total_matches"], 1)
+        self.assertEqual(bt.execute_search_files({"pattern": "hit", "no_default_excludes": True})["total_matches"], 5)
         self.assertEqual(bt.execute_search_files({"pattern": "hit", "dir_path": "history_files"})["total_matches"], 1)
 
     def test_search_files_exclude_dirs_appends_to_defaults(self):

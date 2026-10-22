@@ -1,8 +1,10 @@
 # 子智能体（Sub Agent）实现说明 V1
 
+2026-10-22 工具优化：子任务最终报告同时受父模型剩余 token 预算与字符硬上限约束；所有内置参数先校验再审批。文件、文档和媒体工作移入线程，媒体部件在内存复用；停止/超时会向前台命令发送取消信号并回收进程树。文件写入另有按真实路径的跨进程锁和提交前版本复核。简短模型用法见 [内置工具](builtin_tools.md)。
+
 > 版本：V1（2026-08 定稿；P0/P1 及 P2 大部分已实现，正文为现行实现描述）
 > 定位：作为实现与修改的**唯一依据文档**；实现偏差必须回写本文档。
-> 尚未实现：heartbeat 帧（P2 预留，当前代码无发射点）。原 V2 规划中的 `parent_round_number` 入链、`sub_agent_model` 独立角色、`tool_original_names` 协议名还原及 `read_media` 媒体引用透传均已提前落地；详见第 14 节更新状态。
+> 已补齐 heartbeat、阶段状态、三种接口的子任务上下文压缩和并行文件版本保护，详见第 15 节。原 V2 规划中的 `parent_round_number` 入链、`sub_agent_model` 独立角色、`tool_original_names` 协议名还原及 `read_media` 媒体引用透传均已提前落地；详见第 14 节更新状态。
 
 ---
 
@@ -42,7 +44,7 @@ V1 只有单层子智能体、一次派发对应一个 tool_call，此时 `tool_
 | 子任务独立模型选择 | 已实现独立 `sub_agent_model` 角色；未配置时沿用父级聊天模型，Runner 每次模型调用实时解析角色配置，不放入 SubAgentContext | 可继续完善模型级能力说明/测试；当前不支持嵌套派发时为孙任务独立选模 |
 | 子任务内 ask_user | 子无用户通道；不注入定义，意外调用由白名单拒绝 | 阻塞问题写回最终回复让父决策 |
 | 子任务内 read_media | 已实现：从派发 task 中收集当前任务媒体引用，并按子任务生效模型的视觉能力注入 | 可继续扩展媒体策略；当前引用范围受 task 与 vision 能力限制 |
-| 子任务独立压缩 | Chat Completions/Messages 依赖轮次与超大结果限制；Responses 子任务已在活跃轮超窗时调用原生上下文压缩 | 可评估其他协议下的独立压缩策略 |
+| 子任务独立压缩 | 三种接口均按实际子模型窗口检查与压缩工具轨迹；Responses 沿用独立范围的远端/本地协同压缩 | 任务原文、累计摘要与最新计划保留，压缩后仍超窗明确报错 |
 | 子任务后台存活 | 子任务生命周期严格限制在父轮内，父轮结束/打断即终止 | 独立后台任务模型 |
 
 ---
@@ -217,7 +219,7 @@ SUB_AGENT_TOOL_NAME = "sub_agent"
   1. `stop_checker()` 为真（父级停止）→ 收尾 status=stopped；
   2. 单独停止：`user_stop_requested` 与 `cancel_token` 置位 → 收尾 status=stopped；纯超时取消 → timeout；
   3. `max_rounds > 0 && rounds >= max_rounds` → 收尾 status=max_rounds（0 表示不限制）。
-- **超时监控**：仅派发快照 `timeout_seconds > 0` 时包一层 `asyncio.wait_for`；0 或负数不设置整体超时。`TimeoutError` 由 Runner 取消处理器及批次兜底补写 `done(status=timeout)`，避免无收尾块。
+- **超时监控**：仅派发快照 `timeout_seconds > 0` 时使用 `run_with_active_timeout`；获得并发名额后开始计时，扣除审批和预算等待；0 或负数不设置整体超时。`TimeoutError` 由 Runner 取消处理器及批次兜底补写 `done(status=timeout)`，避免无收尾块。
 - **父级停止路径**：父级取消经 `run_sub_agent_batch` 的 `asyncio.gather` 向全部子任务传播；子任务 `CancelledError` 处理器尽力补写 `done(status=stopped)`（写失败静默，父级兜底补写）；子循环内每轮顶部另按上文三个条件收尾（stop_checker / cancel_token / 轮次上限）。
 - **崩溃恢复**：子事件随 `.pending` 侧车检查点逐事件落盘（emit 回调走 add_chat_history 同款检查点逻辑）；进程重启后该轮恢复为 `interrupted`，缺失 `done` 事件的子任务块由前端渲染为"已中断"（见 10.4）。
 - **不传播**：子任务失败/超时**不**导致父任务终止；结果文本如实说明（"子任务未完成：原因 + 已完成进展"），由父模型决策重派或换路径。
@@ -296,7 +298,7 @@ class SubAgentRunner:
 | 防护 | 机制 |
 |---|---|
 | 轮次上限 | max_rounds（默认 40） |
-| 整体超时 | wait_for + cancel_token（默认 900s） |
+| 整体超时 | run_with_active_timeout + timeout_requested/cancel_token（默认 900s） |
 | 单结果超大 | 复用父级同款阈值与头尾节选拒绝逻辑（独立连续计数） |
 | 最终回复长度 | 超过 `reply_max_chars` 截断 + "（最终回复过长已截断，完整轨迹见子任务事件块）"尾注 |
 | 请求预算 | 系统提示 + 派发 task + 工具定义超窗 → error 收尾 |
@@ -312,7 +314,7 @@ class SubAgentRunner:
  ├─ MCP/内置工具先行执行：asyncio.to_thread(execute_tool_round…)（等全部执行完）
  ├─ 子任务随后 gather（相互并发，与 MCP 路径串行）：
  │     asyncio.gather(
- │         [wait_for(runner_A.run(), timeout), wait_for(runner_B.run(), timeout), ...]
+ │         [run_with_active_timeout(runner_A, timeout), run_with_active_timeout(runner_B, timeout), ...]
  │     )
  │    ├─ 每个子任务内部：见 6.3 run() 伪码
  │    └─ 事件流向：runner._emit → 父循环 emit_sub_agent_event(payload)：
@@ -327,7 +329,7 @@ class SubAgentRunner:
 要点：
 - 子任务 result 中 `result` 字段 = `final_reply`（已按 reply_max_chars 截断）；超时/中断时为进展说明文本；
 - JSONL 中父级 `role=tool` 条目照常落盘（tool_call_id=call_abc123, tool_name=sub_agent），**与子任务块通过 parent_tool_call_id 关联**；
-- 子任务抛出的异常不外溢：Runner 内部兜底转 error 结果；wait_for 的 TimeoutError 由父循环兜底补 done。
+- 子任务抛出的异常不外溢：Runner 内部兜底转 error 结果；有效执行时限监控的 TimeoutError 由批次兜底补 done。
 
 ### 7.1 JSONL 事件块格式（最终版）
 
@@ -393,7 +395,7 @@ class SubAgentRunner:
 注意：
 - 所有条目**不带 role 字段**（区别于消息类事件）；
 - `agent_index`、`parent_agent_id` 属冗余便利字段：前端不必逐条解析父调用链即可排序/命名；
-- `phase=delta` 仅实时 SSE 推送、**不落盘**（`heartbeat` 为 P2 预留未实现，同样设计为仅推流不落盘；与 `context_compaction` 的 delta 策略一致）；
+- `phase=delta` 与 `phase=heartbeat` 仅实时 SSE 推送、**不落盘**（与 `context_compaction` 的 delta 策略一致）；`progress` 阶段变化落盘；
 - `phase=notice` 落盘（历史回放可见），`message` 必须非空；`retry_kind` 可能缺省或为 null，已知类型含 `todo_remind`、`final_reply`、`stream_error`、`text_tool_call`，排队/压缩提示不一定属于重试；
 - todo 校验失败（父给的 `todo` 参数不合法）时 start 事件缺省 todo 字段（不做 task 前告警行追加，仅在 worker 日志告警）；start 事件还会带 `queued` 布尔值。
 
@@ -401,7 +403,7 @@ class SubAgentRunner:
 
 | 文件 | 改动 | 原因 |
 |---|---|---|
-| `memory/chat_round_store.py` `_is_valid_event()` | 新增 `event=="sub_agent"` 分支：校验 `agent_id`/`parent_tool_call_id` 非空、`phase` ∈ {start, model_call, tool_start, tool_result, todo, notice, done}；start 需 task 非空；notice 需 message 非空；done 需 status ∈ 白名单 | **不改则全部子事件被静默丢弃（最大坑）** |
+| `memory/chat_round_store.py` `_is_valid_event()` | 校验 `agent_id`/`parent_tool_call_id` 非空、`phase` ∈ {start, model_call, tool_start, tool_result, todo, notice, progress, done}；start 需 task 非空；notice 需 message 非空；progress 的 activity 需在白名单内；done 需 status ∈ 白名单 | 非法事件不落盘 |
 | `chat_round_store.ChatRoundStore` | 新增 `record_sub_agent_event(payload)`：pending_round 存在性校验（子任务只存在于父轮进行中）→ `_is_valid_event` → 补 timestamp → append；不触发收尾 | 落盘入口 |
 | `memory/chat_memory.py` | 新增 `add_sub_agent_event(payload)`：`_write_guard` 内调 record_sub_agent_event + 检查点快照（同 add_chat_history 模式） | 崩溃恢复不丢子轨迹 |
 | `memory/chat_history_format.py` | `round_entry_to_context_messages`（两模式）与 `round_entry_to_compaction_text` 循环开头统一：`if event.get("event") == "sub_agent": continue` | 历史重建/压缩输入**显式排除**子轨迹（text/tool_result 模式虽因无 role 天然跳过，compaction 渲染必须显式排除） |
@@ -425,7 +427,8 @@ class SubAgentRunner:
 | `{event:"sub_agent", phase:"tool_result", agent_id, ...}` | ✅ | 块内工具块填充结果（含 blocked/timeout/oversized 标记） |
 | `{event:"sub_agent", phase:"todo", agent_id, todos}` | ✅ | 块内 todo 卡片（复用父级 todo 渲染组件） |
 | `{event:"sub_agent", phase:"notice", agent_id, message, retry_kind, seq}` | ✅ | 块内浅色条目展示交付保障重试提示（空收尾重试/断流续跑/todo 提醒，§10.1） |
-| `{event:"sub_agent", phase:"heartbeat", agent_id, rounds, elapsed_seconds}` | ❌ | **未实现（P2 预留）**：当前代码无 heartbeat 发射点，前端亦无对应分支 |
+| `{event:"sub_agent", phase:"progress", agent_id, activity, detail, rounds, elapsed_seconds}` | ✅ | 更新活动徽标，记录模型请求、执行工具、重试和压缩等阶段 |
+| `{event:"sub_agent", phase:"heartbeat", agent_id, activity, detail, rounds, elapsed_seconds, idle_seconds}` | ❌ | 每 5 秒更新活动、有效耗时；等待审批/预算时显示相应状态，不追加正文或强制滚动 |
 | `{event:"sub_agent", phase:"done", agent_id, status, final_reply, rounds, usage_total, error}` | ✅ | 块收口折叠为摘要条，可展开回看全量轨迹 |
 
 - **父级 tool_start 帧补字段**：`chat_factory.py` 工具开始事件循环处，为所有帧（不只 sub_agent）追加 `tool_call_id`（additive，旧前端无害）；前端可在 `sub_agent/start` 到达前用 parent_tool_call_id 预建块占位。
@@ -493,7 +496,7 @@ class SubAgentRunner:
 | 父派发 task 为空/超长 | 校验失败 → 即刻返回工具错误结果（不创建块、不 emit start） |
 | 派发时预算超窗 | error 收尾（final_reply 说明"任务描述过长无法在窗口内执行"），父模型可自行精简重派 |
 | 子任务上游流错误（含重试上限） | error 收尾，final_reply=错误摘要；父任务继续 |
-| 子任务超时 | timeout 收尾（wait_for + cancel 兜底补写），final_reply=已完成进展说明 |
+| 子任务超时 | timeout 收尾（有效执行时间监控 + cancel 兜底补写），final_reply=已完成进展说明 |
 | 子任务轮次达上限 | max_rounds 收尾，final_reply=进展说明 |
 | 用户停止（/stop_chat / 新消息打断） | 全部子任务 stopped；父轮收尾照常 |
 | 服务崩溃/worker 被杀 | 子事件已在检查点；恢复轮 interrupted；孤儿块前端渲染"已中断" |
@@ -516,7 +519,7 @@ class SubAgentRunner:
 5. SubAgentRunner（mock ChatLLM）：多轮工具循环 → done；first-call 超窗 → error；length 续写；工具流超时反馈；max_rounds 收尾；stop_checker 命中 → stopped；流错误 → error；
 6. 工具白名单：子任务工具集无 sub_agent / ask_user；子模型无视觉能力时剔除 read_media；
 7. 并发：两个子任务事件按 agent_id 区分不串块；Semaphore 排队生效；
-8. 超时：wait_for 触发后块有 done(status=timeout) 收口（含 Runner 卡死时父级兜底补写）；
+8. 超时：有效执行时限到期后块有 done(status=timeout) 收口（含 Runner 被取消时批次兜底补写）；
 9. 父级 tool result 契约：assistant(tool_calls) 与 role=tool 成对、id 一致；
 10. 停止传播：父停止 → 子任务 cancelled → done(stopped) 落盘。
 
@@ -530,7 +533,7 @@ class SubAgentRunner:
 
 - **P0 后端最小闭环**：共享函数提取（6.2）→ builtin_tools 定义/注入 → SubAgentContext + SubAgentRunner（不含 heartbeat）→ 父循环分发/gather/结果汇入 → round_store 校验放行 + record 方法 → done 块落盘 → pytest；
 - **P1 SSE + 前端**：事件帧 → chat.js 块聚合 → history_parser 回放 → 样式 → node --test；
-- **P2 状态**：heartbeat 仍未实现；tool_start 的 `tool_call_id` 与 `function_name` 已落地；`get_context_token_stats` 已排除子轨迹；事件模板与 API/项目结构文档需随当前格式同步维护。
+- **P2 状态**：heartbeat 与活动徽标已实现；tool_start 的 `tool_call_id` 与 `function_name` 已落地；`get_context_token_stats` 已排除子轨迹。
 
 ---
 
@@ -543,6 +546,15 @@ class SubAgentRunner:
 5. **子任务结构化结果**：final_reply 支持 JSON（status/conclusions/files/blocks），父级与前端引用更精准。
 6. **read_media 透传**已实现：按 task 收集当前轮 media:// 引用，并按实际子模型 vision 能力决定是否注入；可继续评估复用更完整的媒体转换策略。
 7. **独立 usage 汇总**：子块继续保存 `done.usage_total`，JSONL 父轮 `usage_total` 保持兼容口径。新增任务计量账本按主模型、子任务、压缩与标题汇总，前端累计和本轮显示完整用量；主子任务共享可配置预算，预算等待从子任务活动超时中扣除，后启动的子任务不继承之前的等待时长。详见[任务预算与完整用量](task_budgets.md)。
+
+## 15. 子任务可靠性完善（2026-10-20）
+
+- **三种接口的长上下文**：Chat Completions、Messages 和 Responses 的子任务均在下次模型请求前检查并压缩已执行工具轨迹。按实际子模型与压缩模型的较小窗口计算阈值，保留任务原文、累计摘要和最新计划。Responses 继续使用独立的 `sub_agent:<id>` 上下文范围及原有远端/本地压缩策略。压缩用量计入子任务结果和共享任务账本。压缩后仍超窗会明确报错，避免继续提交必然失败的请求。
+- **状态与等待**：卡片显示请求模型、执行工具、压缩、重试、等待确认或等待调整预算，并每 5 秒刷新有效耗时。悬停徽标可看当前工具、模型调用轮次及距上次输出的时间。心跳只推流，阶段变化和重要提示落盘；刷新回放保留重试、冲突及压缩提示。心跳不会展开手动折叠的卡片，也不会触发滚动。
+- **排队与取消**：获得并发名额后才开始计时，审批等待和预算等待继续排除在执行时限外；恢复任务保留已消耗的有效时间。父任务取消时，执行中与排队中的子任务都会收尾为停止；独立停止仍只作用于指定子任务。真正超时收尾为超时，每个子任务只产生一次终态事件。
+- **并行文件保护**：同一父任务内的子任务共享内置 `read_file` / `write_file` / `edit_file` 的文件版本记录。读取后修改自动携带读取时的内容指纹；另一个子任务已经改过文件时，拒绝旧版本上的修改或未经读取的覆盖，返回 `SUB_AGENT_FILE_CONFLICT`，文件不被修改。模型须重新读取并合并后再提交；冲突提示同时进入子任务详情和返回父任务的结果。协作记录保存到审批检查点，挂起后恢复仍有效。
+
+文件协作保护覆盖同一父任务中的内置文件工具。通过终端、MCP、其他会话或外部编辑器的任意写文件操作不纳入子任务作者识别；已读取文件的内容指纹仍能发现内容变化。停止子任务不会撤销已经完成的文件修改，也不保证外部程序立即终止。
 
 
 ### 2026-09-30：全局限制与独立停止

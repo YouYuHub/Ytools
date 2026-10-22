@@ -90,6 +90,37 @@ test("子任务审批已允许或拒绝后不再错误显示等待确认", () =>
   }
 });
 
+test("子任务心跳更新活动和耗时，保留手动折叠且不追加正文", () => {
+  const ui = buildControls([]);
+  ui.applyEvent({ phase: "start", agent_id: "child", task: "任务" });
+  const head = ui.wrap.children[0].children[0], body = ui.wrap.children[1], badge = head.children[3];
+  head.listeners.click();
+  const size = body.children.length;
+  ui.applyEvent({ phase: "progress", activity: "model", elapsed_seconds: 1 });
+  assert.equal(badge.textContent, "请求模型 · 1秒");
+  ui.applyEvent({ phase: "heartbeat", activity: "tools", detail: "read_file", elapsed_seconds: 12.8, idle_seconds: 7, rounds: 3 });
+  assert.equal(badge.textContent, "执行工具 · 12秒");
+  assert.match(badge.title, /read_file.*3 轮.*7 秒/);
+  assert.equal(body.children.length, size);
+  assert.equal(ui.wrap.classList.contains("open"), false);
+});
+
+test("审批状态优先展示，解除后恢复最新活动，结束后迟到心跳不能改写状态", () => {
+  const ui = buildControls([]);
+  ui.applyEvent({ phase: "start", agent_id: "child", task: "任务" });
+  const badge = ui.wrap.children[0].children[0].children[3];
+  ui.setApprovalWaiting({ state: "pending" });
+  ui.applyEvent({ phase: "progress", activity: "tools", detail: "edit_file" });
+  assert.equal(badge.textContent, "等待确认");
+  ui.setApprovalWaiting({ state: "approved" });
+  assert.equal(badge.textContent, "执行工具");
+  ui.applyEvent({ phase: "done", status: "stopped", final_reply: "保留进展", rounds: 2 });
+  ui.applyEvent({ phase: "heartbeat", activity: "model", elapsed_seconds: 40 });
+  ui.setApprovalWaiting({ state: "pending" });
+  assert.equal(badge.textContent, "已停止 · 2 轮");
+  assert.equal(ui.wrap.classList.contains("is-waiting"), false);
+});
+
 
 test("委派参数默认折叠并保留在子任务卡片内，不被启动及计划事件清除", () => {
   const ui = buildControls([]);

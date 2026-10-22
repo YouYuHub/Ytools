@@ -25,6 +25,7 @@
     const hasContent = state.hasConversation || state.streaming;
     shareSessionItem.classList.toggle("hidden", !hasContent);
     compactSessionItem.classList.toggle("hidden", !hasContent);
+    if (App.archives) App.archives.syncCurrent();
   }
 
   function downloadText(filename, text) {

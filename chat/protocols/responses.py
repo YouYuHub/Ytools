@@ -58,7 +58,7 @@ def parameters(request, config, stream):
         function = raw.get("function") or {}
         function = copy.deepcopy(function)
         if function.get("name") == "read_media":
-            function["description"] = "读取图片（本地路径、网络 URL 或 media:// 引用）；Responses 暂不接收音频或视频。"
+            function["description"] = "读取图片：本地路径、HTTP(S) 直链或 media:// 引用。每轮一次、最多 5 个来源；GIF 仅读首帧。不支持音频、视频或时间区间；图片仅供下一次模型请求。"
             schema = function.get("parameters") or {}
             for key in ("start_time", "end_time"):
                 schema.get("properties", {}).pop(key, None)

@@ -158,11 +158,12 @@ def _fingerprint(path: Path) -> str:
     return f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
 
 
-def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event):
+def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event, *, archive_scope="all", archives=None):
     known = {row[0]: row[1] for row in db.execute("SELECT filename,fingerprint FROM sessions")}
     paths = [path for path in root.glob("*.jsonl") if path.is_file() and not path.is_symlink()]
     filenames = {path.name for path in paths}
-    changed, skipped_files = False, 0
+    archives = archives or {}
+    changed, skipped_files, checked_files, indexed_files, excluded_files = False, 0, 0, 0, 0
     with db:
         for name in known.keys() - filenames:
             _check(cancel)
@@ -171,6 +172,11 @@ def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event):
             changed = True
         for path in paths:
             _check(cancel)
+            session_id = path.name[:-11] if path.name.endswith("_chat.jsonl") else path.stem
+            if archive_scope != "all" and (session_id in archives) != (archive_scope == "archived"):
+                excluded_files += 1
+                continue  # 范围外不读正文，也不更新指纹；取消归档后按新指纹补索引。
+            checked_files += 1
             try:
                 fingerprint = _fingerprint(path)
                 if fingerprint == known.get(path.name):
@@ -186,7 +192,6 @@ def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event):
                     db.execute("DELETE FROM sessions WHERE filename=?", (path.name,))
                     changed = True
                 continue
-            session_id = path.name[:-11] if path.name.endswith("_chat.jsonl") else path.stem
             db.execute("DELETE FROM documents WHERE filename=?", (path.name,))
             db.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)",
                        (path.name, session_id, title, updated, fingerprint, skipped))
@@ -195,10 +200,12 @@ def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event):
                     _check(cancel)
                     yield path.name, round_no, event_index, role, field, text, text.casefold(), str(timestamp or ""), agent_id
             db.executemany("INSERT INTO documents(filename,round_no,event_index,role,field,text,search_text,timestamp,agent_id) VALUES(?,?,?,?,?,?,?,?,?)", rows())
+            indexed_files += 1
             changed = True
         if changed:
             db.execute("UPDATE settings SET value=? WHERE key='revision'", (uuid.uuid4().hex,))
-    return skipped_files
+    return {"skipped_files": skipped_files, "checked_files": checked_files,
+            "indexed_files": indexed_files, "excluded_files": excluded_files}
 
 
 def _snippets(text: str, query: str) -> list[dict]:
@@ -229,9 +236,11 @@ def _snippets(text: str, query: str) -> list[dict]:
 def search_history(query: str, *, limit: int = 40, offset: int = 0,
                    revision: str | None = None, cancel: threading.Event | None = None,
                    root: Path | None = None, include_internal: bool = False,
-                   include_filenames: bool = False) -> dict:
+                   include_filenames: bool = False, archive_scope: str = "active") -> dict:
     from memory import chat_memory
     root = Path(root if root is not None else chat_memory.HISTORY_ROOT)
+    if archive_scope not in {"all", "active", "archived"}:
+        raise ValueError("无效的归档搜索范围")
     query = query.strip()
     if not query or len(query) > 200 or "\x00" in query:
         raise ValueError("搜索文本需为 1–200 个字符，且不能包含空字符")
@@ -241,27 +250,42 @@ def search_history(query: str, *, limit: int = 40, offset: int = 0,
     db = None
     try:
         _check(cancel)
+        from memory.session_archives import snapshot as archive_snapshot
+        archives = archive_snapshot(root)
         index_dir = root / "sidecars"
         index_dir.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(index_dir / "history_search.sqlite3", timeout=15)
         db.row_factory = sqlite3.Row
         db.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         _schema(db)
-        skipped_files = _sync(db, root, cancel)
+        sync_stats = _sync(db, root, cancel, archive_scope=archive_scope, archives=archives)
+        if archive_snapshot(root) != archives:
+            raise SearchSnapshotChanged("归档状态已变化，请重新搜索")
         current = db.execute("SELECT value FROM settings WHERE key='revision'").fetchone()[0]
-        scope = f"{int(include_internal)}:{int(include_filenames)}"
+        db.execute("CREATE TEMP TABLE archived_sessions(session_id TEXT PRIMARY KEY)")
+        db.executemany("INSERT INTO archived_sessions VALUES(?)", ((sid,) for sid in archives))
+        db.execute("CREATE TEMP TABLE eligible_sessions(filename TEXT PRIMARY KEY) WITHOUT ROWID")
+        membership = ""
+        if archive_scope != "all":
+            membership = " WHERE session_id " + ("IN" if archive_scope == "archived" else "NOT IN") + " (SELECT session_id FROM archived_sessions)"
+        db.execute("INSERT INTO eligible_sessions SELECT filename FROM sessions" + membership)
+        archive_revision = hashlib.sha256(json.dumps(archives, sort_keys=True).encode()).hexdigest()
+        scope = f"{int(include_internal)}:{int(include_filenames)}:{archive_scope}:{archive_revision}"
         snapshot = hashlib.sha256((current + "\0" + query.casefold() + "\0" + scope).encode()).hexdigest()[:24]
         if revision and revision != snapshot:
             raise SearchSnapshotChanged("会话记录已变化，请重新搜索")
         needle = query.casefold()
         args = [needle]
-        # Apply scope inside SQLite, before counting/paging. The role/field index
-        # keeps the default query from scanning large tool/reasoning bodies.
+        # Filter message categories before matching large tool/reasoning bodies;
+        # session membership is resolved before documents are visited below.
         categories = ["(d.role='session' AND d.field='title')"]
         categories.append("d.role!='session'" if include_internal else "(d.role IN ('user','assistant') AND d.field='content')")
         if include_filenames:
             categories.append("(d.role='session' AND d.field='filename')")
-        source = ("FROM documents d JOIN sessions s ON s.filename=d.filename WHERE ("
+        # 固定先遍历范围内的会话，再用文件索引定位文档。仅在最终 WHERE 排除
+        # 归档会话仍可能先扫描整个 documents 表，达不到 500 -> 50 的效果。
+        source = ("FROM eligible_sessions e CROSS JOIN sessions s ON s.filename=e.filename "
+                  "CROSS JOIN documents d INDEXED BY documents_file ON d.filename=e.filename WHERE ("
                   + " OR ".join(categories) + ") AND instr(d.search_text,?) > 0")
         # Scan normalized text once; never sort/copy large message bodies just
         # to paginate. Only the selected page reads the original display text.
@@ -276,12 +300,12 @@ def search_history(query: str, *, limit: int = 40, offset: int = 0,
             _check(cancel)
             snippets = _snippets(row["text"], query)
             results.append({key: row[key] for key in ("session_id", "filename", "title", "round_no", "event_index", "role", "field", "timestamp", "agent_id")}
-                           | {"id": row["id"], "snippets": snippets})
-        skipped_lines = db.execute("SELECT coalesce(sum(skipped),0) FROM sessions").fetchone()[0]
+                           | {"id": row["id"], "snippets": snippets, "archived": row["session_id"] in archives})
+        skipped_lines = db.execute("SELECT coalesce(sum(skipped),0) FROM sessions WHERE filename IN (SELECT filename FROM eligible_sessions)").fetchone()[0]
         return {"query": query, "results": results, "total": total, "session_count": session_count,
-                "include_internal": include_internal, "include_filenames": include_filenames,
+                "include_internal": include_internal, "include_filenames": include_filenames, "archive_scope": archive_scope,
                 "offset": offset, "next_offset": offset + len(results) if offset + len(results) < total else None,
-                "revision": snapshot, "skipped_files": skipped_files, "skipped_lines": skipped_lines}
+                "revision": snapshot, **sync_stats, "skipped_lines": skipped_lines}
     except sqlite3.OperationalError:
         _check(cancel)
         raise

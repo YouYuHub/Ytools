@@ -16,7 +16,9 @@
 
   // ---------- 会话列表 ----------
   // 会话标识规整请见 SessionUtils.sanitizeSessionId（js/session_utils.js）
-  let lastSortedRows = [];   // 最近一次排序后的会话行（多选分组视图的数据源）
+  let lastSortedRows = []; // 最近一次排序后的会话行
+  const archivedSessionIds = new Set();
+  let archiveVersion = 0;
   let sessionListLoadSeq = 0, sessionRenderVersion = 0, sessionRenderTimer = null;
 
   // 「当前标题」注册表：记录每个会话侧边栏正在显示的标题，来源依次为
@@ -46,7 +48,7 @@
 
   async function fetchSessionSummaries(sessionId) {
     if (typeof API.listSessionSummaries === "function") {
-      try { return await API.listSessionSummaries(sessionId); }
+      try { return await API.listSessionSummaries(sessionId, { archiveScope: sessionId == null ? "active" : "all", withArchiveState: sessionId == null }); }
       catch (error) { if (error.status !== 404) throw error; }
     }
     // Legacy servers use filename/local-title labels, never N meta requests.
@@ -64,10 +66,15 @@
       clearSessionItems();
       sessionList.appendChild(el("div", "empty-tip", "正在加载会话…"));
     }
-    let summaries;
+    let summaries, archiveIds = [];
     try {
-      summaries = await fetchSessionSummaries();
+      const data = await fetchSessionSummaries();
+      summaries = Array.isArray(data) ? data : data && data.sessions;
       if (!Array.isArray(summaries)) throw new Error("会话列表格式无效");
+      if (!Array.isArray(data)) {
+        if (!Array.isArray(data.archived_ids) || data.archived_ids.some(function (id) { return typeof id !== "string"; })) throw new Error("归档状态格式无效");
+        archiveIds = data.archived_ids;
+      }
     } catch (err) {
       if (mine !== sessionListLoadSeq) return null;
       if (!lastSortedRows.length) {
@@ -78,16 +85,20 @@
     }
     if (mine !== sessionListLoadSeq) return null;
     const items = [], fetchedIds = new Set();
+    archivedSessionIds.clear(); archiveVersion++;
+    archiveIds.forEach(function (id) { const sid = SessionUtils.sanitizeSessionId(id); archivedSessionIds.add(sid); delete state.sessionRecency[sid]; });
+    summaries.forEach(function (row) { if (row.archived) archivedSessionIds.add(SessionUtils.sanitizeSessionId(row.id || row.filename)); });
     summaries.forEach(function (row) {
       const id = SessionUtils.sanitizeSessionId(row.id || row.filename);
       const changedTitle = currentTitles.get(id) !== titlesBefore.get(id) ? knownSessionTitle(id) : "";
       const title = changedTitle || SessionUtils.getSessionTitle(id, row.title || knownSessionTitle(id) || id);
       rememberSessionTitle(id, title);
       fetchedIds.add(id);
+      if (archivedSessionIds.has(id)) { delete state.sessionRecency[id]; return; }
       items.push({ id: id, title: title, updated: row.updated_at || "", created: row.created_at || "", group_id: row.group_id });
     });
     Object.keys(state.sessionRecency).forEach(function (id) {
-      if (fetchedIds.has(id)) return;
+      if (fetchedIds.has(id) || archivedSessionIds.has(id)) return;
       const rec = state.sessionRecency[id] || { title: id };
       items.push({ id: id, title: rec.title || id, updated: "", created: "" });
     });
@@ -97,6 +108,7 @@
     lastSortedRows = sorted;
     renderSessionItems();
     if (App.sessionGroups) App.sessionGroups.render(sorted);
+    if (App.archives) App.archives.syncCurrent();
     return sorted;
   }
 
@@ -804,6 +816,7 @@
       if (App.sessionGroups) App.sessionGroups.openPicker(id, menu, anchor);
     });
     menu.appendChild(groupBtn);
+    menu.appendChild(sessionMenuButton("归档", '<svg class="icon" viewBox="0 0 24 24"><path d="M3 3h18v5H3zM5 8v13h14V8M9 12h6"/></svg>', function () { if (App.archives) App.archives.setArchived(id, true); }));
     menu.appendChild(sessionMenuButton("删除", deleteIcon, function () { openDeleteModal(id, item); }, "danger"));
     document.body.appendChild(menu);
 
@@ -900,7 +913,8 @@
     deleteConfirm.disabled = true;
     try {
       await API.deleteSession(pending.id);
-      pending.node.remove();
+      if (pending.node) pending.node.remove();
+      forgetSession(pending.id);
       if (App.sessionGroups) App.sessionGroups.removeSession(pending.id);
       delete state.sessionRecency[pending.id];
       const overrides = readTitleOverrides();
@@ -946,6 +960,7 @@
     // 登记本次落定的标题：新会话占位也要记住——下一轮发送继续沿用，
     // 直到标题模型生成（applySessionTitle）或后端 meta 拉取带来更新
     rememberSessionTitle(sessionId, title);
+    if (archivedSessionIds.has(sessionId)) return null;
     state.sessionRecency[sessionId] = { title: title, ts: Date.now() };
 
     // 多选模式：列表为分组视图（由 renderSessionItems 整体重建），跳过单行
@@ -992,7 +1007,11 @@
       // User interaction wins over a late startup lookup. Membership comes
       // from data, never the partly rendered sidebar DOM.
       if (seq !== sessionOpenSeq || state.sessionId !== previous || input.value !== initialInput) return false;
-      if (Array.isArray(rows) && rows.some(row => row.id === id)) return openSession(id);
+      if (Array.isArray(rows) && rows.some(row => row.id === id)) {
+        const row = rows.find(row => row.id === id);
+        if (App.noteSessionArchive) App.noteSessionArchive(id, Boolean(row.archived));
+        return openSession(id);
+      }
       startNewChat();
     } catch (_) {
       // Never open an unchecked id and create a phantom default history file.
@@ -1019,6 +1038,8 @@
       state.sessionId = SessionUtils.sanitizeSessionId(SessionUtils.generateSessionId());
       if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     if (App.taskCosts) App.taskCosts.noteSessionChanged();
+      if (App.contextPanel) App.contextPanel.noteSessionChanged();
+    if (App.archives) App.archives.syncCurrent();
       // 文件变更徽标事件驱动同步（替代旧 2s 轮询看门狗；未变化时零请求）
       if (App.fileHistory && App.fileHistory.noteSessionChanged) App.fileHistory.noteSessionChanged();
     }
@@ -1040,6 +1061,8 @@
     state.sessionId = null;
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     if (App.taskCosts) App.taskCosts.noteSessionChanged();
+    if (App.contextPanel) App.contextPanel.noteSessionChanged();
+    if (App.archives) App.archives.syncCurrent();
     // 清空视图就绪跟踪：新对话不属于任何已打开会话
     readySessionId = "";
     loadingSessionId = "";
@@ -1100,6 +1123,8 @@
     state.sessionId = id;
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     if (App.taskCosts) App.taskCosts.noteSessionChanged();
+    if (App.contextPanel) App.contextPanel.noteSessionChanged();
+    if (App.archives) App.archives.syncCurrent();
     // 视图就绪跟踪：加载期间同会话的重复点击被跳过；本次加载完成前旧的
     // 就绪标记失效（成功/空/异常分支各自落定最终状态）
     loadingSessionId = id;
@@ -1128,7 +1153,10 @@
     state.todoTodos = [];
     state.todoPanelOpen = false;
     App.renderTodoWidget();
+    const archiveReadVersion = archiveVersion;
+    if (App.archives) App.archives.syncCurrent();
     API.getSessionMeta(id).then(function (meta) {
+      if (meta && typeof meta.archived === "boolean" && archiveReadVersion === archiveVersion) noteSessionArchive(id, meta.archived);
       // 打开会话即登记后端权威标题：发送消息时优先沿用（不被 40 字占位顶掉）
       if (meta && meta.title) {
         rememberSessionTitle(id, meta.title);
@@ -1140,6 +1168,7 @@
       }
       if (state.sessionId !== id) return;
       App.applySessionTodo(meta && meta.todo);
+      if (App.taskTemplates) App.taskTemplates.restoreDraft(meta, id);
     }).catch(function () { /* ignore */ });
     App.loadSessionFiles();
     // 切换会话后按“当前会话”重新计算发送/停止按钮（其他会话后台流式不影响本会话）
@@ -1223,7 +1252,9 @@
     // 但未命中 = 本轮尚未落盘（生成中），按未渲染处理（不回退文本比较，
     // 否则会误复用历史中同文本的旧提问节点）；无轮次号时回退文本比较
     // （两侧 trim，与历史回放同口径）
-    let userNode = active.round != null
+    // 实时创建的气泡有稳定对象身份，即使窗口重建也优先挂回原节点。
+    // 轮次确认前按文字查找会误收养历史中的另一条“继续”，导致最新提问丢标。
+    let userNode = active.userNode && active.userNode.dataset.historyIndex == null ? active.userNode : active.round != null
       ? chatInner.querySelector('.msg-user[data-round="' + active.round + '"]')
       : null;
     if (!userNode && active.round == null) {
@@ -1239,7 +1270,8 @@
     if (userNode) {
       // 复用历史渲染的节点：同步回活动流引用（后续补挂入口/重载都以它为准）
       active.userNode = userNode;
-    } else if (active.userNode && active.userNode.parentNode !== chatInner) {
+    }
+    if (active.userNode && active.userNode.parentNode !== chatInner) {
       // 历史渲染清空了聊天区（chatInner.innerHTML=""），把流式节点挂回：
       // 提问气泡必须排在回答容器之前（回答容器可能已在历史渲染中补建）
       if (active.messageNode && active.messageNode.parentNode === chatInner) {
@@ -1257,6 +1289,32 @@
     return true;
   }
 
+
+  function noteSessionArchive(id, archived) {
+    const changed = archivedSessionIds.has(id) !== archived;
+    if (archived) archivedSessionIds.add(id); else archivedSessionIds.delete(id);
+    if (changed) {
+      archiveVersion++; sessionListLoadSeq++;
+      if (archived) {
+        delete state.sessionRecency[id]; bulkSelected.delete(id);
+        lastSortedRows = lastSortedRows.filter(function (row) { return row.id !== id; });
+        renderSessionItems();
+        if (App.sessionGroups) App.sessionGroups.render(lastSortedRows);
+      }
+    }
+    if (App.archives) App.archives.syncCurrent();
+  }
+  function forgetSession(id) {
+    noteSessionArchive(id, false);
+    delete state.sessionRecency[id]; currentTitles.delete(id);
+    lastSortedRows = lastSortedRows.filter(function (row) { return row.id !== id; });
+    sessionList.querySelectorAll('.session-item').forEach(function (node) { if (node.dataset.session === id) node.remove(); });
+    if (App.sessionGroups) App.sessionGroups.removeSession(id);
+    if (App.archives) App.archives.noteDeleted(id);
+  }
+  App.noteSessionArchive = noteSessionArchive;
+  App.forgetSession = forgetSession;
+  App.isSessionArchived = function (id) { return archivedSessionIds.has(id); };
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.clearSessionItems = clearSessionItems;

@@ -374,6 +374,8 @@ window.App = window.App || {};
 
   // 自动跟随与用户滚动共用一份状态；用户意图优先于流式更新。
   let autoScrollPaused = false;
+  let chatScrollbarDragging = false;
+  function isChatScrollbarDragging() { return chatScrollbarDragging; }
   let lastScrollTop = chatScroll.scrollTop;
   let bottomScrollFrame = null;
 
@@ -383,6 +385,7 @@ window.App = window.App || {};
   }
 
   function scrollToBottom(instant) {
+    if (chatScrollbarDragging) return;
     if (App.showHistoryTail) App.showHistoryTail();
     autoScrollPaused = false;
     cancelBottomCorrection();
@@ -395,7 +398,7 @@ window.App = window.App || {};
     // content-visibility 高度回填修正；用户开始浏览后不得执行过期的置底。
     bottomScrollFrame = requestAnimationFrame(function () {
       bottomScrollFrame = null;
-      if (autoScrollPaused) return;
+      if (autoScrollPaused || chatScrollbarDragging) return;
       const behavior = chatScroll.style.scrollBehavior;
       chatScroll.style.scrollBehavior = "auto";
       chatScroll.scrollTop = chatScroll.scrollHeight;
@@ -414,7 +417,7 @@ window.App = window.App || {};
     // 立即终止此前的 smooth 置底动画，避免它在上滚输入后继续推进。
     const behavior = chatScroll.style.scrollBehavior;
     chatScroll.style.scrollBehavior = "auto";
-    chatScroll.scrollTop = chatScroll.scrollTop;
+    if (!chatScrollbarDragging) chatScroll.scrollTop = chatScroll.scrollTop;
     lastScrollTop = chatScroll.scrollTop;
     chatScroll.style.scrollBehavior = behavior;
   }
@@ -447,7 +450,7 @@ window.App = window.App || {};
     if (movingUp) {
       autoScrollPaused = true;
       cancelBottomCorrection();
-    } else if (autoScrollPaused && movingDown &&
+    } else if (!chatScrollbarDragging && autoScrollPaused && movingDown &&
       chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
       autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
     }
@@ -455,7 +458,7 @@ window.App = window.App || {};
   });
 
   function stickToBottom() {
-    if (autoScrollPaused) {
+    if (autoScrollPaused || chatScrollbarDragging) {
       updateScrollBottomOffset();
       return;
     }
@@ -480,7 +483,7 @@ window.App = window.App || {};
 
   function updateScrollBottomOffset() {
     if (!main || !composerWrap) return;
-    const keepBottom = !app.classList.contains("empty") &&
+    const keepBottom = !chatScrollbarDragging && !autoScrollPaused && !app.classList.contains("empty") &&
       chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 24;
     const mainRect = main.getBoundingClientRect();
     const composerRect = composerWrap.getBoundingClientRect();
@@ -517,7 +520,7 @@ window.App = window.App || {};
 
   $("#profileCard").addEventListener("click", function (e) {
     e.stopPropagation();
-    if (App.openThemePicker) App.openThemePicker();
+    if (App.sidebarSettings) App.sidebarSettings.toggle(e.currentTarget);
   });
   document.addEventListener("click", function (e) {
     // composedPath 在事件派发时定格：面板内点击即使处理过程中 DOM 被增删
@@ -729,9 +732,10 @@ window.App = window.App || {};
   $("#menuToggle").addEventListener("click", function () { setSidebarCollapsed(false); });
   scrim.addEventListener("click", function () { setSidebarCollapsed(true); });
 
-  $("#railAvatar").addEventListener("click", function () {
-    setSidebarCollapsed(false);
-    if (App.openThemePicker) App.openThemePicker();
+  // 收起态设置菜单不展开侧边栏。
+  $("#railAvatar").addEventListener("click", function (event) {
+    event.stopPropagation();
+    if (App.sidebarSettings) App.sidebarSettings.toggle(event.currentTarget);
   });
 
   // ---------- 会话搜索 ----------
@@ -889,12 +893,105 @@ responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulCon
   triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint, oversizedRejectFactor,
   maxOversizedRejections, effectiveThresholdHint, state, $,
   el, toast, isMobile,
-  scrollToBottom, nearBottom, stickToBottom, pauseAutoScroll, setEmpty,
+  scrollToBottom, nearBottom, stickToBottom, pauseAutoScroll, isChatScrollbarDragging, setEmpty,
   updateScrollBottomOffset, refreshThemeUI, closeMenus,
   closeToolModal, setSidebarCollapsed, filterSessions,
   readTitleOverrides, docKindOf, hideToolTip,
   toolTip
   });
+
+  // 原生滚动条由浏览器处理拖动，pointermove 通常不会发回 DOM；用
+  // 滚动条区域的按下/全局释放明确标记手势，禁止滚动补偿抢夺原生拖动。
+  (function observeNativeScrollbarDrag() {
+    let pointerId = null;
+    let pressY = 0;
+    function scrollbarGeometry(event) {
+      if (event.target !== chatScroll || event.pointerType === "touch") return null;
+      const rect = chatScroll.getBoundingClientRect();
+      const scale = rect.width / (chatScroll.offsetWidth || rect.width || 1);
+      const left = rect.left + chatScroll.clientLeft * scale, right = left + chatScroll.clientWidth * scale;
+      if (event.clientX >= left && event.clientX < right) return null;
+      if (event.clientY < rect.top || event.clientY >= rect.top + (chatScroll.clientTop + chatScroll.clientHeight) * scale) return null;
+      return {rect,scale};
+    }
+    function clearPreparation() { chatScroll.classList.remove("scrollbar-ready"); }
+    // 在按下之前测准轨道，避免 pointerdown 内的高度回填改变浏览器即将
+    // 命中的滑块位置，使真正的拖动被原生控件误当作点击轨道。
+    chatScroll.addEventListener("pointermove", function (event) {
+      if (chatScrollbarDragging) return;
+      if (App.historyScroll && App.historyScroll.active && App.historyScroll.active()) { clearPreparation(); return; }
+      if (event.buttons || !scrollbarGeometry(event)) { clearPreparation(); return; }
+      if (chatScroll.classList.contains("scrollbar-ready")) return;
+      const range = chatScroll.scrollHeight - chatScroll.clientHeight;
+      const progress = range > 0 ? chatScroll.scrollTop / range : 0;
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScroll.classList.add("scrollbar-ready");
+      chatScroll.scrollTop = progress * Math.max(0, chatScroll.scrollHeight - chatScroll.clientHeight);
+      lastScrollTop = chatScroll.scrollTop;
+      chatScroll.style.scrollBehavior = behavior;
+    }, {passive:true});
+    chatScroll.addEventListener("pointerleave", function () { if (!chatScrollbarDragging) clearPreparation(); });
+    function finish(event, cancelled) {
+      if (cancelled) clearPreparation();
+      if (!chatScrollbarDragging || (event && event.pointerId != null && pointerId != null && event.pointerId !== pointerId)) return;
+      const atTop = chatScroll.scrollTop <= 2;
+      const atBottom = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight <= 2;
+      const historyRelease = App.historyScroll && App.historyScroll.captureRelease();
+      let edge = atTop ? "start" : atBottom ? "end" : null;
+      // 原生滑块可能因轨道命中/浏览器释放处理而保留旧像素位置；有实际
+      // 拖动位移时，也尊重鼠标最终到达轨道端点的意图。单击箭头不算拖动。
+      if (!historyRelease && !cancelled && event && Math.abs(event.clientY - pressY) > 4) {
+        const rect = chatScroll.getBoundingClientRect();
+        const endSize = Math.max(2, (chatScroll.offsetWidth - chatScroll.clientWidth) * rect.width / chatScroll.offsetWidth);
+        if (event.clientY <= rect.top + endSize) edge = "start";
+        else if (event.clientY >= rect.bottom - endSize) edge = "end";
+      }
+      // 先记录手势结束的位置，再释放布局锁。流式内容可继续更新；拖动期间
+      // 被暂存的新增高度在此恢复，只有用户确实拖到底部时才继续跟随。
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScrollbarDragging = false; pointerId = null;
+      chatScroll.classList.remove("scrollbar-dragging");
+      clearPreparation();
+      chatInner.style.removeProperty("--scrollbar-content-height");
+      if (historyRelease) App.historyScroll.endDrag(cancelled,historyRelease);
+      else if (!cancelled && edge === "start") chatScroll.scrollTop = 0;
+      else if (!cancelled && edge === "end") chatScroll.scrollTop = chatScroll.scrollHeight;
+      lastScrollTop = chatScroll.scrollTop;
+      autoScrollPaused = cancelled || edge !== "end";
+      chatScroll.style.scrollBehavior = behavior;
+      chatScroll.dispatchEvent(new CustomEvent("chat-scrollbar-dragend", { detail: {
+        cancelled: Boolean(cancelled), edge: cancelled ? null : edge
+      } }));
+    }
+    chatScroll.addEventListener("pointerdown", function (event) {
+      if (event.button !== 0) return;
+      const geometry = scrollbarGeometry(event);
+      if (!geometry) return;
+      const scale = geometry.scale;
+      if (chatScroll.scrollHeight <= chatScroll.clientHeight) return;
+      chatScrollbarDragging = true; pointerId = event.pointerId; pressY = event.clientY;
+      pauseAutoScroll();
+      const range = chatScroll.scrollHeight - chatScroll.clientHeight;
+      const progress = range > 0 ? chatScroll.scrollTop / range : 0;
+      chatScroll.classList.add("scrollbar-dragging");
+      clearPreparation();
+      // 原生拖动依赖固定 scrollHeight。历史模式包含完整会话的首尾占位，
+      // 不在按下时改比例；没有历史窗口时才测准当前懒渲染内容并补偿比例。
+      chatInner.style.setProperty("--scrollbar-content-height", chatInner.getBoundingClientRect().height / scale + "px");
+      if (!App.historyScroll || !App.historyScroll.active || !App.historyScroll.active()) {
+        chatScroll.scrollTop = progress * (chatScroll.scrollHeight - chatScroll.clientHeight);
+      }
+      if (App.historyScroll) App.historyScroll.beginDrag();
+    }, { capture: true });
+    window.addEventListener("pointerup", function (event) { finish(event, false); }, true);
+    window.addEventListener("mouseup", function (event) { finish(event, false); }, true);
+    window.addEventListener("pointercancel", function (event) { finish(event, true); }, true);
+    window.addEventListener("blur", function () { finish(null, true); });
+    window.addEventListener("resize", function () { finish(null, true); });
+    document.addEventListener("visibilitychange", function () { if (document.hidden) finish(null, true); });
+  })();
 
   // 附件网格跟随缩放/窗口变化重算列数：只在 chatInner 宽度变化时重算
   // （流式高度变化频繁，过滤掉避免抖动），rAF 节流合并。位于导出区

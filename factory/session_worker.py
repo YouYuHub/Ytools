@@ -269,6 +269,15 @@ def _emit_uncaught_generate_error(task: "asyncio.Task", adapter: "_WorkerStreamA
             pass
 
 
+def _complete_worker_generation(task: "asyncio.Task", adapter: "_WorkerStreamAdapter") -> None:
+    """Every finished coroutine must release the parent's running state."""
+    _emit_uncaught_generate_error(task, adapter)
+    if (task.cancelled() or task.exception() is None) and not adapter.done:
+        # Preparation can return before the generation loop's finally block
+        # (e.g. an invalid model after restart). It is still a finished task.
+        asyncio.get_running_loop().create_task(adapter.finish())
+
+
 async def _worker_generate(
     session_id: str,
     request_data: dict,
@@ -416,7 +425,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         task: asyncio.Task,
                         _adapter: _WorkerStreamAdapter = adapter,
                     ) -> None:
-                        _emit_uncaught_generate_error(task, _adapter)
+                        _complete_worker_generation(task, _adapter)
 
                     current_task.add_done_callback(_on_generate_done)
                 elif ctype == "approval_decision":
@@ -706,12 +715,20 @@ class SessionWorkerProxy:
         except Exception as exc:
             logger.warning(f"读取运行时 Ollama 模型快照失败: {exc}")
             runtime_ollama_models = []
-        return self._send({
+        # 排队中的 generate 也算运行中，停止接口必须等到它被消费/取消，
+        # 不能在 task_started 回执尚未到达时提前宣告停止成功。
+        with self._state_lock:
+            self._generation_running = True
+        sent = self._send({
             "type": "generate",
             "request": request_data or {},
             "runtime_ollama_models": runtime_ollama_models,
             "permission_resume_id": permission_resume_id,
         })
+        if not sent:
+            with self._state_lock:
+                self._generation_running = False
+        return sent
 
     def request_stop(self, reason: str = "user") -> bool:
         if not self.is_alive():

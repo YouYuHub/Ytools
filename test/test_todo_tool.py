@@ -38,7 +38,8 @@ class TodoToolDefinitionTests(unittest.TestCase):
     def test_definition_declares_id(self):
         params = builtin_tools.TODO_TOOL_DEFINITION["function"]["parameters"]
         items = params["properties"]["todos"]["items"]
-        self.assertEqual(items["required"], ["id", "content", "status"])
+        self.assertEqual(items["required"], ["content", "status"])
+        self.assertEqual(items["properties"]["id"]["maxLength"], 64)
         self.assertEqual(
             params["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             ["pending", "in_progress", "done"],

@@ -4,6 +4,8 @@
 
 两个工具在 `mcp_server/sys_tools_server.py` 注册，由 MCP 执行。模型使用 `web_search` 找候选链接，再用 `fetch_url` 核验原文。
 
+`fetch_url.timeout_seconds` 是请求预算（默认 30 秒，1–120 秒），连接和后续读取共用截止时间；`web_search` 的跨引擎总预算为 45 秒。正则使用支持执行超时的 `regex` 依赖（见 [项目说明](https://pypi.org/project/regex/#timeout)），单次匹配超时会明确标记结果不完整。
+
 ## fetch_url
 
 - `text`：抽取正文纯文本，优先正文容器，移除脚本、样式与部分导航噪音。
@@ -12,7 +14,7 @@
 - `regex`：对原始响应文本匹配，保留脚本内容的可检索性；没有匹配时明确提示。每条匹配展示长度按 `max_chars / 4` 计算并限制在 200–2000 字符（默认 2000），最多收集 200 条；单条或总量被截断时明确说明，不能把显示内容当成完整原文。
 - HTTP 4xx/5xx 也返回状态码、错误正文、Content-Type 及 Retry-After/Location（若存在），并注明是错误响应。没有内容的 DNS、连接、超时等传输错误仍报错；中途 `IncompleteRead`、读取超时/断连或响应短于 Content-Length 时保留已收到的内容，并明确标记“部分响应”，零匹配不能说明网页不存在目标。成功和错误响应都受下载/解压上限保护。
 - 头部区分声明/推断编码与实际使用编码。max_chars 仍限制输出正文，不是下载大小。
-- 输出显示提取后文本的字符区间 `[offset, end)`。内容超长时返回 `next_offset`；保持 URL、模式、pattern/tag 等参数不变并传 `offset=next_offset` 续读。每次仍会重新请求；网页变化会影响位置。regex 的单条匹配/总匹配上限独立生效，offset 不能恢复此前被正则上限舍弃的部分。
+- 输出显示提取后文本的字符区间 `[offset, end)`。GET/HEAD 内容超长时返回 `next_offset`；保持 URL、模式、pattern/tag 等参数不变并传 `offset=next_offset` 续读。每次仍会重新请求；网页变化会影响位置。POST 等其他方法指定非零 `offset` 会在发送前拒绝，避免重复执行有副作用的请求。regex 的单条匹配/总匹配上限独立生效，offset 不能恢复此前被正则上限舍弃的部分。
 - `text` 提取为空时提示页面可能依赖 JavaScript、登录或受访问限制，并建议用 html/tag 核对或查找正文/下载链接。
 
 空标签、页面不存在的元素、仅由 JavaScript 插入的内容都可能返回空结果；先查看 html 核对，不应自动认定解析故障。

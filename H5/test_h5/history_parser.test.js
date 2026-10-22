@@ -565,6 +565,24 @@ test("recordsBeforeActiveRound: 轮次号有效但未命中时不回退文本匹
 
 // ---------- sub_agent 子任务事件块聚合 ----------
 
+test("parseHistory: 子任务冲突/压缩提示和工具差异在刷新回放后保留，心跳不膨胀轨迹", () => {
+  const base = { event: "sub_agent", agent_id: "agent_a", parent_tool_call_id: "parent" };
+  const diff = { path: "a.txt", diff: "+updated" };
+  const events = [
+    { ...base, phase: "start", task: "协作修改" },
+    { ...base, phase: "notice", message: "检测到并行修改", file_conflict: { path: "a.txt" } },
+    { ...base, phase: "progress", activity: "compacting", elapsed_seconds: 10 },
+    { ...base, phase: "heartbeat", activity: "model", elapsed_seconds: 15 },
+    { ...base, phase: "tool_result", tool_call_id: "edit", tool_name: "edit_file", result: "done", file_diff: diff },
+    { ...base, phase: "done", status: "done", final_reply: "完成" },
+  ];
+  const block = historyParser.parseHistory(fakeRound(events)).records.find(record => record.kind === "agentBlock");
+  assert.equal(block.entries.length, 3);
+  assert.equal(block.entries[0].message, "检测到并行修改");
+  assert.equal(block.entries[0].file_conflict.path, "a.txt");
+  assert.deepEqual(block.entries[2].file_diff, diff);
+});
+
 function subAgentEvents() {
   return [
     { timestamp: "2026-08-08 18:00:01", role: "user", content: "并发查两件事" },

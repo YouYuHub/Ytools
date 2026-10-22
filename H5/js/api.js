@@ -148,8 +148,19 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/chat_history/sessions");
   }
 
-  function listSessionSummaries(sessionId) {
-    return request("/chat_history/summaries" + (sessionId == null ? "" : "?session_id=" + encodeURIComponent(sessionId)));
+  function listSessionSummaries(sessionId, options) {
+    options = options || {};
+    const params = new URLSearchParams({ archive_scope: options.archiveScope || (sessionId == null ? "active" : "all") });
+    if (sessionId != null) params.set("session_id", sessionId);
+    if (options.withArchiveState) params.set("with_archive_state", "true");
+    return request("/chat_history/summaries?" + params.toString());
+  }
+
+  function setSessionArchived(sessionId, archived) {
+    return request("/chat_history/archive", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, archived: archived }) });
+  }
+  function listArchivedSessions(query, offset, signal) {
+    return request("/chat_history/archives?" + new URLSearchParams({ q: query || "", offset: String(offset || 0), limit: "50" }), { signal: signal });
   }
 
   function streamStatus(sessionId) {
@@ -192,6 +203,16 @@ const api_url = localStorage.getItem("ytools-api-base")
     return request("/chat_context/token_stats?" + params.toString());
   }
 
+  function getContextOverview(sessionId, toolNames, offset, signal) {
+    const params = new URLSearchParams({ session_id: sessionId, inspection: "true", max_rounds: "0",
+      round_offset: String(offset || 0), round_limit: "40" });
+    if (Array.isArray(toolNames) && toolNames.length) {
+      params.set("include_tools", "true");
+      toolNames.forEach(name => params.append("tool_names", name));
+    }
+    return request("/chat_context/token_stats?" + params.toString(), { signal: signal });
+  }
+
   function updateSessionTitle(sessionId, title) {
     return request(
       "/chat_history/title?title=" + encodeURIComponent(title) + "&session_id=" + encodeURIComponent(sessionId),
@@ -211,6 +232,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     const params = new URLSearchParams({ q: query, limit: String(options.limit || 40), offset: String(options.offset || 0) });
     params.set("include_internal", String(Boolean(options.includeInternal)));
     params.set("include_filenames", String(Boolean(options.includeFilenames)));
+    params.set("archive_scope", options.archiveScope || "active");
     if (options.revision) params.set("revision", options.revision);
     return request("/chat_history/search?" + params.toString(), { signal: options.signal });
   }
@@ -359,6 +381,23 @@ const api_url = localStorage.getItem("ytools-api-base")
    */
   function listTools(refresh) {
     return request("/tools/list" + (refresh ? "?refresh=1" : ""));
+  }
+
+  function mcpDiagnosticServers(signal) { return request("/tools/diagnostics", { signal: signal }); }
+  function listTaskTemplates(signal) { return request("/task_templates", { signal }); }
+  function validateTaskTemplate(template) { return request("/task_templates/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(template) }); }
+  function taskTemplateOptions(session, signal) { return request("/task_templates/options" + (session ? "?source_session_id=" + encodeURIComponent(session) : ""), { signal }); }
+  function getTaskTemplate(id, signal) { return request("/task_templates/" + encodeURIComponent(id), { signal }); }
+  function saveTaskTemplate(template, id, version) {
+    return request("/task_templates" + (id ? "/" + encodeURIComponent(id) : ""), { method: id ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(id ? { template, version } : template) });
+  }
+  function deleteTaskTemplate(id, version) { return request("/task_templates/" + encodeURIComponent(id) + "?version=" + version, { method: "DELETE" }); }
+  function previewTaskTemplate(template, session, signal) { return request("/task_templates/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ template, source_session_id: session || null }), signal }); }
+  function startTaskTemplate(template, session, requestId, fingerprint) { return request("/task_templates/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ template, source_session_id: session || null, request_id: requestId, expected_fingerprint: fingerprint }) }); }
+  function testMcpServer(payload, signal) {
+    return request("/tools/diagnostics", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload), signal: signal });
   }
 
   // ---------- 模型配置 ----------
@@ -721,29 +760,43 @@ const api_url = localStorage.getItem("ytools-api-base")
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split("\n");
-      buffer = lines.pop(); // 最后一段可能不完整，留到下次
-
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") {
-          onEvent({ type: "done", data: null });
-          return;
-        }
-        try {
-          onEvent({ type: "data", data: JSON.parse(data) });
-        } catch (_) { /* 跳过无法解析的行 */ }
+    let exhausted = false;
+    function dispatch(raw) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) return false;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") {
+        onEvent({ type: "done", data: null });
+        return true;
       }
+      let parsed;
+      try { parsed = JSON.parse(data); }
+      catch (_) { return false; } // 只跳过无效 JSON，不能吞掉页面事件处理异常。
+      onEvent({ type: "data", data: parsed });
+      return false;
     }
-    onEvent({ type: "done", data: null });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        exhausted = done;
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // 最后一段可能不完整，留到下次
+        for (const raw of lines) {
+          if (dispatch(raw)) return;
+        }
+        if (done) {
+          if (buffer && dispatch(buffer)) return;
+          break;
+        }
+      }
+      onEvent({ type: "done", data: null });
+    } finally {
+      // [DONE] 或显示异常提前退出时释放读取器，异常交给聊天层展示。
+      try { if (!exhausted) await reader.cancel(); }
+      catch (_) { /* 保留原始网络/渲染异常，取消读取失败不覆盖它 */ }
+      finally { reader.releaseLock(); }
+    }
   }
 
   /**
@@ -1090,10 +1143,13 @@ const api_url = localStorage.getItem("ytools-api-base")
     BASE,
     listSessions,
     listSessionSummaries,
+    setSessionArchived,
+    listArchivedSessions,
     streamStatus,
     getSessionMeta,
     generateSessionTitle,
     getContextTokenStats,
+    getContextOverview,
     updateSessionTitle,
     fetchSessionFile,
     searchHistory,
@@ -1110,6 +1166,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     listTerminalJobs, getTerminalJob, operateTerminalJob, terminalLogUrl,
     submitImport,
     listTools,
+    mcpDiagnosticServers, testMcpServer,
+      listTaskTemplates, validateTaskTemplate, taskTemplateOptions, getTaskTemplate, saveTaskTemplate, deleteTaskTemplate, previewTaskTemplate, startTaskTemplate,
     getModels,
     selectModel,
     getHistoryCompactionConfig,

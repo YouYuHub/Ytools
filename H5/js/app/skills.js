@@ -33,6 +33,7 @@
   const deleteBtn = $("#skillsDeleteBtn");
   const saveBtn = $("#skillsSaveBtn");
   const loadBtn = $("#skillsLoadBtn");
+  const templateBtn = $("#skillsTemplateBtn");
   const uploadBtn = $("#skillsUploadBtn");
   const uploadInput = $("#skillsUploadInput");
 
@@ -135,6 +136,7 @@
     fileNameLabel.textContent = none ? "未选择文件" : currentName;
     saveBtn.disabled = none;
     loadBtn.disabled = none;
+    if (templateBtn) templateBtn.disabled = none;
     deleteBtn.disabled = none;
     renameBtn.disabled = none;
   }
@@ -639,6 +641,12 @@
   saveBtn.addEventListener("click", saveCurrent);
   deleteBtn.addEventListener("click", deleteCurrent);
   loadBtn.addEventListener("click", loadToComposer);
+    if (templateBtn) templateBtn.addEventListener("click", function () {
+      const content = currentContent();
+      if (!content.trim()) { toast("当前提示词内容为空"); return; }
+      closeSkills();
+      if (App.taskTemplates) App.taskTemplates.open({ prompt: content, capture: true });
+    });
 
   // 重命名：笔图标进入编辑；Enter/失焦确认，Esc 取消
   renameBtn.addEventListener("click", startRename);

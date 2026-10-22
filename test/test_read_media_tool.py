@@ -626,9 +626,9 @@ class ConcurrencyGuardAndCorruptImageTests(unittest.TestCase):
     def test_tool_description_mentions_concurrency_limit(self):
         definition = bt.build_read_media_tool_definition()
         description = definition["function"]["description"]
-        self.assertIn("同一条回复只调用一次", description)
-        self.assertIn("仅首个会执行", description)
-        self.assertIn("references 列表", description)
+        self.assertIn("每轮一次", description)
+        self.assertIn("references", description)
+        self.assertIn("最多 5", description)
 
     def test_quality_description_is_concise_and_keeps_bounds(self):
         definition = bt.build_read_media_tool_definition()

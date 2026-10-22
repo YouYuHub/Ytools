@@ -45,16 +45,33 @@ def _summary(path: Path, session_id: str) -> dict | None:
     }
 
 
-def list_session_summaries(session_id: str | None = None) -> list[dict]:
+def list_session_summaries(session_id: str | None = None, archive_scope: str = "active", *, archive_entries=None) -> list[dict]:
     from memory import chat_memory
+    from memory.session_archives import snapshot, status
+    if archive_scope not in {"active", "archived", "all"}:
+        raise ValueError("无效的归档范围")
+    archived = snapshot() if archive_entries is None else archive_entries
+    def selected(sid):
+        return archive_scope == "all" or (sid in archived) == (archive_scope == "archived")
+    def visible(row):
+        if not row:
+            return False
+        if row["id"] in archived:
+            row.update(status(row["id"], archived))
+        return archive_scope == "all" or (row["id"] in archived) == (archive_scope == "archived")
     if session_id is not None:
         sid = chat_memory.normalize_session_id(session_id)
+        if not selected(sid):
+            return []
         row = _summary(chat_memory._get_chat_history_file(sid), sid)
-        return [row] if row else []
+        return [row] if visible(row) else []
     rows = []
     for path in chat_memory.HISTORY_ROOT.glob("*.jsonl"):
-        row = _summary(path, chat_memory.normalize_session_id(path.name))
-        if row:
+        sid = chat_memory.normalize_session_id(path.name)
+        if not selected(sid):
+            continue  # 归档过滤必须在打开文件/读取首行之前完成。
+        row = _summary(path, sid)
+        if visible(row):
             rows.append(row)
     # Metadata timestamps use a fixed sortable format; the browser merges local
     # recency afterwards. Filename is a deterministic tie breaker.

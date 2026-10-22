@@ -14,15 +14,15 @@
   } = App;
 
   // ---------- 分段渲染 ----------
-  // 初始渲染只画末尾 RENDER_TAIL_RECORDS 条记录（最近对话），顶部留一张
-  // 「加载更早消息」细条，向上滚动到底自动追加更早的分段——长会话打开时
-  // 只构建可视尾部，主线程阻塞时长与记录总数解耦。分段边界不允许落在
+  // 初始渲染只画末尾 RENDER_TAIL_RECORDS 条记录（最近对话），完整历史的
+  // 滚动坐标和可视窗口切换由 history_scroll.js 管理；不逐段回填全部 DOM。
+  // 未启用该模块时保留边缘加载条作为回退。分段边界不允许落在
   // 「欠账记录」上（见 isDependentRecord），保证工具调用与结果、压缩
   // start/done 的配对不被切开；record.round 非空时新节点统一打 data-round。
   const RENDER_TAIL_RECORDS = 120;
   const RENDER_OLDER_BATCH = 80;
   // 完整记录保存在内存，DOM 只按需构建。跳转直接切换到目标附近的窗口，
-  // 不再从尾部一路回填；普通向上/下阅读仍可通过边缘加载条连续翻阅。
+  // 不再从尾部一路回填；滚动、搜索及问题导航共用同一窗口构建入口。
   const loadOlderState = { records: null, start: 0, end: 0, loading: false,
     timer: null, button: null, newerButton: null, observer: null };
 
@@ -46,11 +46,13 @@
     return exact >= 0 ? exact : records.findIndex(function (rec) { return Number(rec.round) === round; });
   }
 
-  function renderHistoryWindowAt(index) {
+  function renderHistoryWindowAt(index, options) {
     const records = loadOlderState.records;
     if (!records || index < 0) return false;
+    if (App.historyScroll) App.historyScroll.beforeRender();
     chatInner.replaceChildren();
-    renderRecords(records, { historyIndex: index, noScroll: true });
+    renderRecords(records, { historyIndex: index, noScroll: true,
+      historyWindowSize:options && options.size, historyLookbehind:options && options.before });
     if (loadOlderState.end === records.length && App.restoreActiveStream) App.restoreActiveStream(state.sessionId);
     App.rebuildQnav();
     return true;
@@ -314,9 +316,9 @@
       resetHistoryPaging();
       const index = Number.isInteger(ctx.historyIndex) ? ctx.historyIndex : historyMatchIndex(records, ctx.historyMatch);
       const start = pendingQueueSafeStart(records, index >= 0
-        ? Math.max(0, index - 20) : Math.max(0, records.length - RENDER_TAIL_RECORDS));
+        ? Math.max(0, index - (Number.isInteger(ctx.historyLookbehind) ? ctx.historyLookbehind : 20)) : Math.max(0, records.length - RENDER_TAIL_RECORDS));
       const end = start + pendingQueueSafeEnd(records, start,
-        Math.max(RENDER_TAIL_RECORDS, index >= 0 ? index - start + 40 : 0));
+        Math.max(ctx.historyWindowSize || RENDER_TAIL_RECORDS, index >= 0 ? index - start + (ctx.historyWindowSize ? 1 : 40) : 0));
       slice = records.slice(start, end);
       loadOlderState.records = records;
       loadOlderState.start = start;
@@ -332,12 +334,11 @@
         const rec = slice[rendered + i];
         const before = chatInner.childNodes.length;
         renderOneRecord(rec);
-        if (rec.round == null) continue;
         for (let k = before; k < chatInner.childNodes.length; k += 1) {
           const node = chatInner.childNodes[k];
           if (node.nodeType === 1) {
             if (Number.isInteger(recordOffset)) node.setAttribute("data-history-index", String(recordOffset + rendered + i));
-            node.setAttribute("data-round", String(rec.round));
+            if (rec.round != null) node.setAttribute("data-round", String(rec.round));
             if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
           }
         }
@@ -372,10 +373,11 @@
       if (!loadOlderState.observer) loadOlderState.observer = new IntersectionObserver(function (entries) {
         entries.forEach(function (entry) {
           if (!entry.isIntersecting || !entry.target.isConnected) return;
+          if (App.historyScroll && App.historyScroll.active()) return;
           if (entry.target === loadOlderState.newerButton) runNewerBatch();
           else if (entry.target === loadOlderState.button) scheduleBackfill(0);
         });
-      }, { root: chatScroll, rootMargin: "120px 0px" });
+      }, { root: chatScroll });
       loadOlderState.observer.observe(button);
     }
     return button;
@@ -384,6 +386,7 @@
   // 触发一次更早分段的渲染（共享并发锁；细条 loading 态在这里统一管理）。
   // 全部补齐后细条隐藏
   async function runOlderBatch() {
+    if (App.isChatScrollbarDragging && App.isChatScrollbarDragging()) return;
     const button = loadOlderState.button;
     if (loadOlderState.loading || !loadOlderState.records) return;
     if (loadOlderState.start <= 0) {
@@ -403,6 +406,7 @@
 
   // 合并边缘加载请求；会话切换后丢弃旧调度，不链式回填整段历史。
   function scheduleBackfill(delay) {
+    if (App.isChatScrollbarDragging && App.isChatScrollbarDragging()) return;
     if (loadOlderState.timer != null) return;
     if (!loadOlderState.records || loadOlderState.start <= 0) {
       const button = loadOlderState.button;
@@ -418,6 +422,7 @@
   }
 
   async function runNewerBatch() {
+    if (App.isChatScrollbarDragging && App.isChatScrollbarDragging()) return;
     const paging = loadOlderState;
     const records = paging.records;
     if (paging.loading || !records || paging.end >= records.length) return;
@@ -433,6 +438,7 @@
       App.rebuildQnav();
       App.updateCodeblockCopyButtons();
     } finally { paging.loading = false; }
+    if (App.historyScroll) App.historyScroll.refresh();
   }
 
   // 追加更早的一段记录：插到当前聊天流最前面（保持时间顺序），以原首条
@@ -478,6 +484,7 @@
     // 附件网格宽度，确保引用/媒体/文档方块按当前聊天区宽度排成一到两行。
     if (App.syncMessageAttachmentBlocks) App.syncMessageAttachmentBlocks();
     loadOlderState.start = targetStart;
+    if (App.historyScroll) App.historyScroll.refresh({preserve:false});
     // 插入把锚点（及其下方内容）下推：按锚点位移回拨 scrollTop，视口内
     // 阅读位置保持不变；content-visibility 下新内容进入视口附近即真实渲染
     if (anchorNode && anchorNode.parentNode === chatInner) {
@@ -507,6 +514,7 @@
       loadOlderState.newerButton = button;
       chatInner.appendChild(button);
     }
+    if (App.historyScroll) App.historyScroll.refresh({initial:true});
     if (!ctx.noScroll) scrollToBottom(true);
   }
 
@@ -1431,12 +1439,16 @@
     // 附件芯片：旧 media:// 引用可直接复用，新选文件仅保存在浏览器内存，
     // 确认发送后才上传；图片/视频显示缩略图，音频显示徽标
     const keptMedia = mediaItems.slice();
+    const editSessionId = App.state.sessionId;
+    let editDisposed = false, attachmentsPending = 0;
+    let attachmentQueue = Promise.resolve();
     const mediaRow = el("div", "msg-edit-media-row");
     const docRow = el("div", "msg-edit-media-row msg-edit-doc-row");
     const uploadControls = el("div", "msg-edit-upload-row");
     const uploadButton = el("button", "msg-edit-upload", "添加图片、音视频或文档");
     uploadButton.type = "button";
-    const uploadHint = el("span", "msg-edit-upload-hint", "文档会加入当前会话，点击发送后上传");
+    const uploadHintText = "可直接粘贴剪贴板图片，点击发送后上传";
+    const uploadHint = el("span", "msg-edit-upload-hint", uploadHintText);
     const fileInput = el("input", "msg-edit-file-input");
     fileInput.type = "file";
     fileInput.multiple = true;
@@ -1523,10 +1535,11 @@
       });
       docRow.style.display = keptDocs.length ? "" : "none";
     }
-    fileInput.addEventListener("change", async function () {
-      const files = Array.from(fileInput.files || []);
-      fileInput.value = "";
-      if (!files.length) return;
+    async function stageEditFiles(files) {
+      if (editDisposed || !panel.isConnected || App.state.sessionId !== editSessionId) {
+        panel._cleanupEdit();
+        return;
+      }
       const mediaFiles = files.filter(function (file) { return App.mediaKindOf(file.name); });
       const docFiles = files.filter(function (file) { return !App.mediaKindOf(file.name); });
       const stagedMediaCount = keptMedia.filter(function (item) { return !!item.file; }).length;
@@ -1537,6 +1550,10 @@
           break;
         }
         const item = await App.prepareMediaFile(file);
+        if (editDisposed || !panel.isConnected || App.state.sessionId !== editSessionId) {
+          panel._cleanupEdit();
+          return;
+        }
         if (!item) continue;
         if (typeof URL.createObjectURL === "function") {
           item.objUrl = URL.createObjectURL(item.file);
@@ -1564,10 +1581,48 @@
       }
       renderMediaRow();
       renderDocRow();
+    }
+    function enqueueEditFiles(files) {
+      if (!files.length || editDisposed) return;
+      attachmentsPending++;
+      sendBtn.disabled = true;
+      uploadHint.textContent = "正在处理附件…";
+      // 新附件使旧的发送/删除确认预览失效，处理完成后再确认当前内容。
+      if (panel._confirmShown && panel._planArea) {
+        panel._confirmShown = false;
+        panel._planArea.replaceChildren();
+      }
+      attachmentQueue = attachmentQueue.then(function () { return stageEditFiles(files); })
+        .catch(function () {
+          if (!editDisposed && panel.isConnected) {
+            renderMediaRow();
+            renderDocRow();
+            App.toast("附件处理失败，请重新粘贴或选择文件");
+          }
+        })
+        .finally(function () {
+          attachmentsPending--;
+          if (!editDisposed && panel.isConnected) {
+            sendBtn.disabled = attachmentsPending > 0;
+            uploadHint.textContent = attachmentsPending ? "正在处理附件…" : uploadHintText;
+          }
+        });
+    }
+    fileInput.addEventListener("change", function () {
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = "";
+      enqueueEditFiles(files);
+    });
+    textarea.addEventListener("paste", function (event) {
+      const files = ClipboardMediaUtils.mediaFiles(event.clipboardData, App.mediaKindOf);
+      if (!files.length) return; // 纯文字沿用浏览器原生粘贴。
+      event.preventDefault();
+      enqueueEditFiles(files);
     });
     renderMediaRow();
     renderDocRow();
     panel._cleanupEdit = function () {
+      editDisposed = true;
       keptMedia.forEach(revokeObjectUrl);
     };
     panel.appendChild(uploadControls);
@@ -1628,6 +1683,7 @@
         area.innerHTML = "";
       });
       ok.addEventListener("click", function () {
+        if (editDisposed) return;
         ok.disabled = true;
         onConfirm();
       });
@@ -1639,6 +1695,7 @@
 
     // 编辑是否产生过改动（文本/附件集合/引用集合任一变化即视为已编辑）
     function isEdited() {
+      if (attachmentsPending) return true;
       if (textarea.value !== originalText) return true;
       if (keptDocs.length) return true;
       if (keptMedia.length !== mediaItems.length) return true;
@@ -1675,6 +1732,7 @@
       });
     };
     sendBtn.addEventListener("click", function () {
+      if (attachmentsPending || editDisposed) return;
       const text = textarea.value.trim();
       if (!text && !keptMedia.length) {
         App.toast("消息内容不能为空");
@@ -1702,6 +1760,7 @@
       }
       // 重新生成该轮：发送前轻量确认（旧回复将被替换，防手抖误触）
       showPlanConfirm("将以当前内容重新生成该轮，旧回复将被替换。", "确认发送", function () {
+        if (attachmentsPending) return;
         App.confirmEditResend({
           msg: msg,
           round: data.round,
@@ -2600,7 +2659,19 @@
     let agentId = "";
     let parentRound = null;
     let approvalWaiting = false;
-    let badgeBeforeApproval = "";
+    let activityText = "运行中";
+    function applyProgress(evt) {
+      if (isDone) return;
+      const labels = { queued: "排队中", model: "请求模型", tools: "执行工具", retrying: "重试中",
+        compacting: "压缩上下文", waiting_approval: "等待确认", waiting_budget: "等待调整预算" };
+      activityText = labels[evt.activity] || "运行中";
+      const elapsed = Number(evt.elapsed_seconds);
+      if (Number.isFinite(elapsed) && elapsed > 0) activityText += " · " + Math.floor(elapsed) + "秒";
+      if (!approvalWaiting) badge.textContent = activityText;
+      const detail = typeof evt.detail === "string" ? evt.detail : "";
+      badge.title = [detail, evt.rounds != null ? "已调用模型 " + evt.rounds + " 轮" : "",
+        Number(evt.idle_seconds) >= 5 ? "距上次输出 " + Math.floor(evt.idle_seconds) + " 秒" : ""].filter(Boolean).join("；");
+    }
     function bindPermissions() {
       if (App.permissions && agentId) App.permissions.bindAgent(ui, { sessionId: agentSessionId, agentId: agentId, round: parentRound });
     }
@@ -2666,6 +2737,11 @@
       else if (SUB_AGENT_ERROR_STATUSES.indexOf(nextStatus) >= 0) wrap.classList.add("is-error");
       else wrap.classList.add("is-done");
       badge.textContent = nextStatus === "running" ? "运行中" : (SUB_AGENT_STATUS_TEXT[nextStatus] || nextStatus);
+      badge.title = "";
+      if (isDone) {
+        approvalWaiting = false;
+        wrap.classList.remove("is-waiting");
+      }
     }
 
     function findRound(seq) {
@@ -2932,13 +3008,12 @@
       wrap: wrap,
       approvalHost: approvalHost,
       setApprovalWaiting: function (approval) {
+        if (isDone) return;
         const waiting = approval && (approval.state === "pending" || !approval.state || approval.task_state === "suspended");
         if (!waiting && !approvalWaiting) return;
-        if (waiting && !approvalWaiting) badgeBeforeApproval = badge.textContent;
         approvalWaiting = Boolean(waiting);
         wrap.classList.toggle("is-waiting", approvalWaiting);
-        const next = waiting ? (approval.task_state === "suspended" ? "待恢复" : "等待确认") :
-          ["待恢复", "等待确认"].includes(badge.textContent) ? (isDone ? badgeBeforeApproval : "运行中") : badge.textContent;
+        const next = waiting ? (approval.task_state === "suspended" ? "待恢复" : "等待确认") : activityText;
         if (badge.textContent !== next) badge.textContent = next;
       },
       applyApproval: function (approval) {
@@ -2977,7 +3052,8 @@
           summary.textContent = taskSummary;
           if (Array.isArray(evt.todo) && evt.todo.length) todoItems = evt.todo;
           if (evt.rounds_limit != null) roundsLimit = Number(evt.rounds_limit);
-          badge.textContent = evt.queued ? "排队中" : "运行中";
+          activityText = evt.queued ? "排队中" : "运行中";
+          if (!approvalWaiting && !isDone) badge.textContent = activityText;
           head.title = "模型调用轮次上限：" + (roundsLimit > 0 ? roundsLimit : "不限制") +
             "；整体超时：" + (evt.timeout_seconds == null ? "未记录" :
               Number(evt.timeout_seconds) > 0 ? evt.timeout_seconds + " 秒" : "不限制");
@@ -2985,6 +3061,7 @@
           autoOpen();
           return;
         }
+        if (phase === "progress" || phase === "heartbeat") { applyProgress(evt); return; }
         if (phase === "delta") { appendLiveDelta(evt); return; }
         if (phase === "model_call") { beginRound(evt, true); return; }
         if (phase === "tool_start") { addToolEntry(evt); return; }
@@ -2996,10 +3073,13 @@
         }
         if (phase === "done") { applyDone(evt); return; }
         if (phase === "notice") {
-          if (evt.queued === false && !isDone) badge.textContent = "运行中";
+          if (evt.queued === false && !isDone) {
+            activityText = "运行中";
+            if (!approvalWaiting) badge.textContent = activityText;
+          }
           // 交付保障重试提示（空收尾重试/断流续跑/todo 提醒）：
           // 以浅色条目追加到块内；历史回放侧 history_parser 对该 phase
-          // 走通用条目兜底，hydrate 忽略（仅实时流展示）
+          // 与历史回放使用同一提示文案。
           const message = typeof evt.message === "string" ? evt.message : "";
           if (message) {
             body.appendChild(el("div", "agent-notice", "↻ " + message));
@@ -4284,6 +4364,8 @@
   }
 
   function rebuildQnav() {
+    const panelTop = qnavPanel.scrollTop || 0;
+    const followPanel = qnavPanel.clientHeight > 0 && qnavPanel.scrollHeight - panelTop - qnavPanel.clientHeight <= 2;
     const rendered = Array.from(chatInner.querySelectorAll(".msg-user"));
     const records = typeof loadOlderState !== "undefined" && loadOlderState.records;
     const byIndex = new Map(rendered.filter(function (node) { return node.dataset.historyIndex != null; })
@@ -4291,25 +4373,39 @@
     const byEvent = new Map(rendered.map(function (node) {
       return [node.dataset.round + ":" + (node.dataset.sourceEvent || ""), node];
     }));
-    // 无戳节点（实时流式/收养复用的提问气泡，无 history-index）按轮次兜底：
-    // 每轮恰好一条 user 记录，轮次 1:1；有戳节点不进此表，原路径零影响
+    // 同一后端轮次可以包含多条用户引导，不能仅凭 round 去重。
+    // 无历史戳的气泡按轮次和内容匹配快照，未匹配的实时问题全部保留。
     const byRoundUnstamped = new Map();
+    function bubbleText(node) {
+      const bubble = node.querySelector(".msg-bubble");
+      return bubble ? bubble.textContent : "";
+    }
     rendered.forEach(function (node) {
       if (node.dataset.historyIndex == null && node.dataset.round != null) {
-        byRoundUnstamped.set(Number(node.dataset.round), node);
+        const round = Number(node.dataset.round);
+        if (!byRoundUnstamped.has(round)) byRoundUnstamped.set(round, []);
+        byRoundUnstamped.get(round).push(node);
       }
     });
+    const matched = new Set(), seenRounds = new Set();
     qnavEntries = [];
     if (records) records.forEach(function (rec, index) {
       if (rec.kind !== "user") return;
-      qnavEntries.push({ index: index, round: Number(rec.round), text: contentToPlainText(rec.content),
-        node: byIndex.get(index) || byEvent.get(String(rec.round) + ":" + (rec.source_event_index == null ? "" : rec.source_event_index)) || byRoundUnstamped.get(Number(rec.round)) || null });
+      const text = contentToPlainText(rec.content);
+      const candidates = byRoundUnstamped.get(Number(rec.round)) || [];
+      const replacement = !seenRounds.has(Number(rec.round)) && candidates.find(function (candidate) { return Number(candidate.dataset.replacesRound) === Number(rec.round); });
+      seenRounds.add(Number(rec.round));
+      const node = replacement || byIndex.get(index) || (rec.source_event_index != null && byEvent.get(String(rec.round) + ":" + rec.source_event_index))
+        || candidates.find(function (candidate) { return !matched.has(candidate) && bubbleText(candidate).trim() === text.trim(); }) || null;
+      if (node) matched.add(node);
+      qnavEntries.push({ index: index, round: Number(rec.round), text: replacement ? bubbleText(node) : text, node: node });
     });
-    const knownRounds = new Set(qnavEntries.map(function (entry) { return entry.round; }));
     rendered.forEach(function (node) {
-      if (knownRounds.has(Number(node.dataset.round))) return;
-      const bubble = node.querySelector(".msg-bubble");
-      qnavEntries.push({ index: -1, round: Number(node.dataset.round), text: bubble ? bubble.textContent : "", node: node });
+      if (matched.has(node)) return;
+      const round = Number(node.dataset.round);
+      const entry = { index: -1, round: round, text: bubbleText(node), node: node };
+      const next = Number.isFinite(round) ? qnavEntries.findIndex(function (item) { return item.round > round; }) : -1;
+      if (next < 0) qnavEntries.push(entry); else qnavEntries.splice(next, 0, entry);
     });
     qnavUsers = qnavEntries.map(function (entry) { return entry.node; });
     qnavRail.innerHTML = "";
@@ -4377,6 +4473,7 @@
       item.addEventListener("click", function () { jumpToQuestion(i); });
       qnavPanel.appendChild(item);
     });
+    qnavPanel.scrollTop = followPanel ? qnavPanel.scrollHeight : panelTop;
     updateQnavActive();
   }
 
@@ -4605,6 +4702,7 @@
   }
 
   function revealQuoteSource(target, quoteText, options) {
+    if (target && target.closest(".history-live-hidden") && App.showHistoryTail) App.showHistoryTail();
     options = options || {};
     if (quoteHighlightTimer != null) window.clearTimeout(quoteHighlightTimer);
     if (window.CSS && window.CSS.highlights) window.CSS.highlights.delete("history-search-hit");
@@ -4653,6 +4751,7 @@
         host.style.scrollBehavior = behavior;
       }
       function align() {
+        if (App.isChatScrollbarDragging && App.isChatScrollbarDragging()) return;
         if (highlightedQuoteNode !== target || !target.isConnected || (options.isCurrent && !options.isCurrent())) return;
         const rect = anchor ? anchor.range.getBoundingClientRect() : target.getBoundingClientRect();
         const box = chatScroll.getBoundingClientRect();
@@ -4831,6 +4930,7 @@
 
   function jumpToQuestion(i) {
     let target = qnavUsers[i];
+    if (target && target.closest(".history-live-hidden") && App.showHistoryTail) App.showHistoryTail();
     const entry = qnavEntries[i];
     if (!target && entry && renderHistoryWindowAt(entry.index)) {
       target = chatInner.querySelector('.msg-user[data-history-index="' + entry.index + '"]');
@@ -4904,6 +5004,7 @@
     }
     qnavUsers.forEach(function (userEl, i) {
       if (!userEl) return;
+      if (userEl.closest(".history-live-hidden")) return;
       if (userEl.getBoundingClientRect().top - scrollRect.top < 120) current = i;
     });
     // 高亮当前问题所属的采样段：与 rebuildQnav 同口径计算每段起点，
@@ -5018,8 +5119,11 @@
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.finalizeMermaidBlocks = finalizeMermaidBlocks;
   App.renderRecords = renderRecords;
+  App.getHistoryWindow = function () { return loadOlderState; };
+  App.renderHistoryWindowAt = renderHistoryWindowAt;
   App.prepareActiveRoundReplay = prepareActiveRoundReplay;
   App.resetHistoryView = function () {
+    if (App.historyScroll) App.historyScroll.reset();
     resetHistoryPaging();
     loadOlderState.records = null;
     loadOlderState.start = loadOlderState.end = 0;

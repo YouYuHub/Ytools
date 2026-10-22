@@ -28,6 +28,47 @@ def denied(message="用户拒绝本次调用", code="PERMISSION_DENIED"):
     return {"success": False, "code": code, "executed": False, "error": message}
 
 
+def interrupted_tool_result(task_id, agent, call_id, reason):
+    """Describe a durable result without re-executing a tool after a crash."""
+    execution = store.execution(task_id, agent, call_id)
+    if execution and execution["state"] == "completed":
+        from factory.chat_factory import _format_tool_result
+        result = execution["result"]
+        return _format_tool_result(result), isinstance(result, dict) and bool(result.get("error"))
+    return (reason + "；工具执行结果未知，请核对实际效果，不要直接重复执行" if execution and execution["state"] == "executing"
+            else reason + "；子任务部分操作可能已完成，请先核对" if execution
+            else reason + "；本次工具未执行"), True
+
+
+def reconcile_interrupted_round(pending, task_id, reason):
+    """Fill missing tool results from the ledger; retain every saved event."""
+    result = copy.deepcopy(pending)
+    events = result.get("events") or []
+    paired = {event.get("tool_call_id") for event in events if isinstance(event, dict) and event.get("role") == "tool"}
+    reconciled, outstanding = [], []
+    def flush():
+        for call in outstanding:
+            call_id = call.get("id")
+            if not call_id or call_id in paired:
+                continue
+            content, is_error = interrupted_tool_result(task_id, "main", call_id, reason)
+            reconciled.append({"role":"tool", "tool_call_id":call_id,
+                               "name":(call.get("function") or {}).get("name", ""),
+                               "content":content, "tool_is_error":is_error})
+            paired.add(call_id)
+        outstanding.clear()
+    for event in events:
+        if isinstance(event, dict) and event.get("role") in {"assistant", "user"}:
+            flush()
+        reconciled.append(event)
+        if isinstance(event, dict) and event.get("role") == "assistant":
+            outstanding.extend(call for call in event.get("tool_calls") or [] if isinstance(call, dict))
+    flush()
+    reconciled.append({"role":"assistant", "content":reason + "。以下新消息将基于已保存的历史继续；已完成的操作保留，结果未知的操作应先核对。"})
+    result["events"] = reconciled
+    return result
+
+
 def close_pending_native(task_id, session, reason="任务已停止"):
     """Retire provider tool slots without inventing execution of unfinished tools."""
     from chat.protocols import native_store
@@ -45,16 +86,7 @@ def close_pending_native(task_id, session, reason="任务已停止"):
             if ((record and (record.get("tool_status", {}).get(call["id"], {}).get("status") == "completed"))
                     or (reference.get("protocol") == "responses" and tool_result(session, reference, call["id"]))):
                 continue
-            execution = store.execution(task_id, agent, call["id"])
-            if execution and execution["state"] == "completed":
-                from factory.chat_factory import _format_tool_result
-                content = _format_tool_result(execution["result"])
-                is_error = isinstance(execution["result"], dict) and bool(execution["result"].get("error"))
-            else:
-                content = (reason + "；工具执行结果未知，请核对实际效果" if execution and execution["state"] == "executing"
-                           else reason + "；子任务部分操作可能已完成" if execution
-                           else reason + "；本次工具未执行")
-                is_error = True
+            content, is_error = interrupted_tool_result(task_id, agent, call["id"], reason)
             native_store.tool_completed(session, reference, call["id"], content, is_error)
 
 
@@ -230,6 +262,22 @@ class PermissionRuntime:
 
     async def authorize(self, calls, servers, originals=None, agent="main"):
         allowed, rejected, requests = [], [], []
+        pending = []
+        for item in calls:
+            idx, call, name, args = item
+            previous = store.execution(self.id, agent, call.get("id") or "")
+            if previous and previous["state"] == "completed":
+                rejected.append({"index": idx, "tool_call": call, "tool_name": name, "tool_args": args,
+                                 "result": copy.deepcopy(previous["result"]), "error": None, "_permission_cached": True})
+            elif previous and previous["state"] == "executing":
+                raise RuntimeError("工具执行结果未知，不能自动重跑，请核对后重新规划")
+            else:
+                pending.append(item)
+        from .tool_validation import prepare_builtin_calls
+        calls, invalid = prepare_builtin_calls(pending)
+        for item in invalid:
+            store.completed(self.id, agent, item["tool_call"]["id"], item["result"])
+        rejected.extend(invalid)
         for idx, call, name, args in calls:
             call_id = call.get("id") or ""
             previous = store.execution(self.id, agent, call_id)
@@ -349,9 +397,15 @@ async def run_with_active_timeout(runner, timeout):
     try:
         while not running.done():
             await asyncio.wait({running}, timeout=0.1)
-            permission = getattr(runner, "permission_runtime", None)
-            paused = permission.paused_time(runner.context.agent_id) if permission else 0
-            if time.monotonic() - started - paused >= timeout and not running.done():
+            if callable(getattr(runner, "active_seconds", None)):
+                elapsed = runner.active_seconds()
+            else:
+                permission = getattr(runner, "permission_runtime", None)
+                paused = permission.paused_time(runner.context.agent_id) if permission else 0
+                elapsed = time.monotonic() - started - paused
+            if elapsed >= timeout and not running.done():
+                runner.context.timeout_requested = True
+                runner.context.cancel_token.set()
                 raise asyncio.TimeoutError()
         return running.result()
     finally:

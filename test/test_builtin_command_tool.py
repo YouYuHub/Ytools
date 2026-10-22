@@ -80,7 +80,7 @@ class BuiltinCommandToolTests(unittest.TestCase):
 
     def test_auto_shell_is_sh_on_linux_even_when_bash_is_available(self):
         with patch.object(bt.shutil, "which", side_effect=lambda name: "/bin/" + name):
-            self.assertEqual(bt._resolve_shell("auto", False), ("/bin/sh", "sh", []))
+            self.assertEqual(bt._resolve_shell("auto", False), ("/bin/sh", "sh", ["-c"]))
 
     def test_large_command_output_preview_is_bounded(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -211,7 +211,7 @@ def build_payload(request, config, stream):
         schema = copy.deepcopy(function.get("parameters") or {"type": "object", "properties": {}})
         description = function.get("description") or ""
         if function["name"] == "read_media":
-            description = "读取图片（media:// 会话引用、本地路径或 http(s) URL）。GIF 仅读取首帧；不支持音频、视频或时间区间。图片会提供给下一次模型请求，quality 可选用于缩小尺寸。"
+            description = "读取图片：media:// 引用、本地路径或 HTTP(S) 直链。每轮一次、最多 5 个来源；GIF 仅读取首帧。不支持音频、视频或时间区间；图片仅供下一次模型请求，quality 可选。"
             properties = schema.get("properties") or {}
             for field in ("start_time", "end_time"):
                 properties.pop(field, None)

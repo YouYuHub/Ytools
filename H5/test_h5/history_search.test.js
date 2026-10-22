@@ -99,3 +99,13 @@ test("scope switches respect Chinese IME composition and survive closing/reopeni
   h.controller.close();h.controller.open('中文');await sleep(10);
   assert.equal(h.requests[1].options.includeInternal,true);h.controller.close();
 });
+
+test("archive scope invalidates old pagination and follows the next search request", async () => {
+  const h=harness();h.controller.open('hit');await sleep(10);
+  assert.equal(h.requests[0].options.archiveScope,'active');
+  h.controller.setScope({archiveScope:'archived'});
+  assert.equal(h.requests[0].options.signal.aborted,true);
+  await sleep(10);assert.equal(h.requests[1].options.archiveScope,'archived');
+  h.requests[0].resolve(result('hit',['stale']));h.requests[1].resolve(result('hit',['archived']));await sleep(1);
+  assert.deepEqual(h.state().results.map(row=>row.id),['archived']);h.controller.close();
+});

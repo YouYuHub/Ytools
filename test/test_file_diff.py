@@ -100,7 +100,7 @@ def test_build_file_diff_unchanged():
 
 def test_write_file_new_file_with_diff(tmp_path):
     target = tmp_path / "w1.txt"
-    result = execute_write_file({"path": str(target), "content": "abc"})
+    result = execute_write_file({"path": str(target), "content": "abc", "mode": "create"})
     assert result["created"] is True
     assert result["_file_diff"]["lines_added"] == 1
     assert result["_file_diff"]["lines_removed"] == 0
@@ -112,7 +112,7 @@ def test_write_file_new_file_with_diff(tmp_path):
 def test_write_file_overwrite_diff(tmp_path):
     target = tmp_path / "w2.txt"
     target.write_text("old line\n", encoding="utf-8")
-    result = execute_write_file({"path": str(target), "content": "new line\n"})
+    result = execute_write_file({"path": str(target), "content": "new line\n", "mode": "overwrite"})
     assert result["created"] is False
     assert result["_file_diff"]["lines_added"] == 1
     assert result["_file_diff"]["lines_removed"] == 1

@@ -8,7 +8,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js?v=4f2f1a56b012"></script>
-    <link rel="stylesheet" href="style/css/main.css?v=b954a8b71919">
+    <link rel="stylesheet" href="style/css/main.css?v=7b6396d044c8">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -42,7 +42,7 @@
                     </svg>
                 </button>
                 <div class="rail-spacer"></div>
-                <button class="rail-avatar" id="railAvatar" title="主题">Y</button>
+                <button class="rail-avatar" id="railAvatar" title="设置">Y</button>
             </div>
 
             <!-- 展开态：完整面板 -->
@@ -141,13 +141,13 @@
                 <div class="session-list" id="sessionList"></div>
 
                 <div class="panel-foot">
-                    <button class="profile-card" id="profileCard" title="主题设置">
+                    <button class="profile-card" id="profileCard" title="设置">
                         <span class="avatar">Y</span>
                         <span class="profile-info">
                             <span class="profile-name" id="profileName" title="点击修改显示名">访客用户</span>
                             <span class="profile-sub" id="profileSub">跟随系统</span>
                         </span>
-                        <span class="profile-plan">主题</span>
+                        <span class="profile-plan">设置</span>
                     </button>
                 </div>
             </div>
@@ -237,6 +237,10 @@
                             </svg>
                             <span class="menu-item-label">加载会话（JSONL / 分享包）</span>
                         </button>
+                        <button class="menu-item" id="contextManagerItem" type="button">
+                            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 10 5-10 5L2 8l10-5ZM2 12l10 5 10-5M2 16l10 5 10-5" /></svg>
+                            <span class="menu-item-label">上下文管理</span>
+                        </button>
                         <button class="menu-item hidden" id="compactSessionItem">
                             <svg class="icon" viewBox="0 0 24 24">
                                 <path d="M4 5h16M4 19h16" />
@@ -274,7 +278,7 @@
                         <span class="context-token-todo-slot" id="contextTokenTodoSlot"></span>
                         <!-- 当前会话聊天模型名：在 todo 与 token 摘要之间的空位居中显示，长名溢出省略 -->
                         <span class="context-token-model hidden" id="contextTokenModel"></span>
-                        <span class="context-token-summary" id="contextTokenSummary"></span>
+                        <button type="button" class="context-token-summary" id="contextTokenSummary" aria-label="查看上下文管理"></button>
                         <span class="context-token-workdir" id="contextTokenWorkdir" role="button" tabindex="0" aria-label="编辑工作路径" title="工作路径加载中..."></span>
                     </div>
                     <!-- 任务计划面板：垂直布局占位（不遮挡输入框），位于状态栏与输入框之间 -->
@@ -314,6 +318,10 @@
                                         d="m12 3 2.1 5.3 5.7.4-4.4 3.7 1.4 5.6-4.8-3.1-4.8 3.1 1.4-5.6-4.4-3.7 5.7-.4Z" />
                                 </svg>
                                 <span class="menu-item-label">Skills 提示词</span>
+                            </button>
+                            <button class="menu-item" id="taskTemplatesItem">
+                                <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M8 12h8M8 17h5"/></svg>
+                                <span class="menu-item-label">任务模板</span>
                             </button>
                         </div>
                         <!-- 引用、媒体与文档共用方块区域，按可用宽度自动排布 -->
@@ -449,6 +457,7 @@
                     </svg>
                 </button>
                 <button class="tool-collapse-all" id="toolCollapseAll" type="button" title="折叠全部" aria-label="折叠全部">−</button>
+                <button class="mcp-test-entry" id="mcpDiagnosticsOpen" type="button">MCP 测试</button>
             </div>
             <div class="tool-config-content" id="toolConfigContent">
                 <p class="tool-config-note">内置工具在本机执行，MCP 工具由对应服务提供。</p>
@@ -733,6 +742,7 @@
                         <button class="skills-act skills-act-danger" id="skillsDeleteBtn" type="button"
                             title="删除当前文件">删除</button>
                         <button class="skills-act" id="skillsSaveBtn" type="button" title="保存 (Ctrl+S)">保存</button>
+                        <button class="skills-act" id="skillsTemplateBtn" type="button" disabled>保存为任务模板</button>
                         <button class="skills-act skills-act-primary" id="skillsLoadBtn" type="button"
                             title="把内容填进消息框">加载到输入框</button>
                     </div>
@@ -991,6 +1001,7 @@
                     aria-label="搜索会话记录" aria-controls="historySearchResults" autocomplete="off">
             </div>
             <div class="history-search-scope" role="group" aria-label="搜索范围">
+                <label>会话范围 <select id="historySearchArchiveScope"><option value="active">未归档</option><option value="archived">已归档</option><option value="all">全部会话</option></select></label>
                 <label><input id="historySearchInternal" type="checkbox">包含工具与内部记录</label>
                 <label title="额外匹配会话 JSONL 文件名；结果卡片始终显示文件名"><input id="historySearchFilenames" type="checkbox">匹配会话文件名</label>
             </div>
@@ -1035,7 +1046,7 @@
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script defer src="js/api.js?v=1a7085c66c87"></script>
+    <script defer src="js/api.js?v=d86f488e9834"></script>
     <script defer src="js/file_history_sync.js?v=efb6ad30eb91"></script>
     <script defer src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
     <script defer src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
@@ -1077,45 +1088,53 @@
     <script defer src="js/session_group_utils.js?v=affad180441e"></script>
     <script defer src="js/session_utils.js?v=f43255f766b9"></script>
     <script defer src="js/format_utils.js?v=13cd70eafe3c"></script>
-    <script defer src="js/history_parser.js?v=b0f4747daefc"></script>
+    <script defer src="js/history_parser.js?v=ed1a918e6e14"></script>
     <script defer src="js/history_parse_async.js?v=52648ac313f2"></script>
-    <script defer src="js/history_search.js?v=ca5500747cd5"></script>
+    <script defer src="js/history_search.js?v=2e813eadce4f"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script defer src="js/quote_utils.js?v=a49a584363fe"></script>
     <script defer src="js/slash_command_utils.js?v=3c912144acec"></script>
+    <script defer src="js/clipboard_media_utils.js?v=205bf42ded56"></script>
     <script defer src="js/speech_language.js?v=3009749b030e"></script>
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=449774404208"></script>
+    <script defer src="js/app/core.js?v=ff7ade47a885"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=4f7d7d2208ab"></script>
-    <script defer src="js/app/sessions.js?v=00217578a92e"></script>
-    <script defer src="js/app/history_search.js?v=b39aec60ab08"></script>
+    <script defer src="js/app/sessions.js?v=4cd25dc553fb"></script>
+    <script defer src="js/app/session_archives.js?v=37f2eac7ece5"></script>
+    <script defer src="js/app/history_search.js?v=fca634fa8815"></script>
     <script defer src="js/app/session_groups.js?v=e17b7b2add01"></script>
     <script defer src="js/app/stats.js?v=30c84f899b75"></script>
+    <script defer src="js/app/context_panel.js?v=fe39183cf9a8"></script>
     <script defer src="js/app/workdir.js?v=1a073e7f603e"></script>
     <script defer src="js/tool_approval_state.js?v=d301678b67f4"></script>
     <script defer src="js/stream_replay_dedup.js?v=8dfebe7055e9"></script>
     <script defer src="js/read_media_strip.js?v=bfdeaabc3b3c"></script>
     <script defer src="js/app/permissions.js?v=005c1e739ae3"></script>
-    <script defer src="js/app/messages.js?v=5ca0bfee506c"></script>
-    <script defer src="js/app/history.js?v=f1df0955f8c7"></script>
+    <script defer src="js/history_scroll_model.js?v=5341fda4b6e5"></script>
+    <script defer src="js/app/messages.js?v=92906d8e3ba9"></script>
+    <script defer src="js/app/history_scroll.js?v=85d0b7b28c8a"></script>
+    <script defer src="js/app/history.js?v=37f5d95cf865"></script>
     <script defer src="js/app/compaction.js?v=e4dc6124f637"></script>
-    <script defer src="js/app/builtin.js?v=1ac6dda8bc12"></script>
-    <script defer src="js/app/user_profile.js?v=af63b0c3f147"></script>
-    <script defer src="js/app/media.js?v=e2481a3b897c"></script>
-    <script defer src="js/app/skills.js?v=bdaf9c81862d"></script>
+    <script defer src="js/app/builtin.js?v=89db559adeed"></script>
+    <script defer src="js/app/user_profile.js?v=3708d7c2ce32"></script>
+    <script defer src="js/app/media.js?v=ec9af7059aeb"></script>
+    <script defer src="js/app/skills.js?v=782b52f8971e"></script>
     <script defer src="js/app/composer.js?v=8d9a9c9b635b"></script>
     <script defer src="js/app/chat_settings_modal.js?v=5092ffb42645"></script>
     <script defer src="js/app/model_panel_modal.js?v=c5776d195fd4"></script>
     <script defer src="js/app/model_panel.js?v=3d62a16b5aae"></script>
-    <script defer src="js/app/tools.js?v=291841487614"></script>
-    <script defer src="js/app/chat.js?v=2aac43bc4b75"></script>
+    <script defer src="js/app/tools.js?v=323bad81c04d"></script>
+    <script defer src="js/app/mcp_schema_form.js?v=a813d9f065e7"></script>
+    <script defer src="js/app/mcp_diagnostics.js?v=29c7e6cf535a"></script>
+    <script defer src="js/app/task_templates.js?v=f5a4c7debcdb"></script>
+    <script defer src="js/app/chat.js?v=01ec28d6a199"></script>
     <script defer src="js/app/filehistory.js?v=8a5da583b0c3"></script>
     <script defer src="js/app/terminals.js?v=13b72797f8e0"></script>
     <script defer src="js/app/task_costs.js?v=8905a42033a3"></script>
-    <script defer src="js/app/slash_commands.js?v=7d4741fb3478"></script>
+    <script defer src="js/app/slash_commands.js?v=dfa0ff94bb1b"></script>
     <script defer src="js/app.js?v=8696b0596707"></script>
 </body>
 

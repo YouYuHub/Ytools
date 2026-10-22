@@ -1,6 +1,6 @@
 # 会话全文搜索
 
-展开侧栏或折叠图标栏的放大镜均可打开搜索弹窗，输入文字即可搜索全部已保存的会话，不受侧栏是否加载、分组是否展开影响。中文输入法组词期间暂停搜索，输入完成后防抖 280 ms；Enter 立即搜索，Esc、关闭按钮或背景关闭弹窗。
+展开侧栏或折叠图标栏的放大镜均可打开搜索弹窗，默认搜索未归档的已保存会话，可切换为已归档或全部会话，不受侧栏是否加载、分组是否展开影响。归档窗口可直接进入已归档内容搜索，普通入口重新打开时恢复未归档范围。中文输入法组词期间暂停搜索，输入完成后防抖 280 ms；Enter 立即搜索，Esc、关闭按钮或背景关闭弹窗。
 
 ## 搜索内容与结果
 
@@ -19,15 +19,16 @@
 
 ## 后端接口
 
-`GET /chat_history/search?q=搜索文本&limit=40&offset=0&include_internal=false&include_filenames=false`
+`GET /chat_history/search?q=搜索文本&limit=40&offset=0&include_internal=false&include_filenames=false&archive_scope=active`
 
-`include_internal` 与 `include_filenames` 均为可选布尔值，默认 `false`。筛选由后端 SQLite 查询执行，命中总数、会话数及分页均基于筛选后的记录。
+`include_internal` 与 `include_filenames` 均为可选布尔值，默认 `false`。`archive_scope` 可选 active（未归档，默认）、archived（已归档）、all（全部）。筛选在读取变更文件和 SQLite 文字匹配前执行，命中总数、会话数及分页均基于筛选后的记录。
 
 ```json
 {
   "query": "搜索文本",
   "include_internal": false,
   "include_filenames": false,
+  "archive_scope": "active",
   "results": [{
     "id": 123,
     "session_id": "yt-example",
@@ -47,7 +48,10 @@
   "next_offset": null,
   "revision": "查询快照标识",
   "skipped_files": 0,
-  "skipped_lines": 0
+  "skipped_lines": 0,
+  "checked_files": 50,
+  "indexed_files": 0,
+  "excluded_files": 450
 }
 ```
 
@@ -61,7 +65,7 @@ SQLite 缓存位于 `history_files/sidecars/history_search.sqlite3`，属于可�
 
 此库仅用于会话搜索，与权限库 `history_files/state/permission_runtime.sqlite3` 独立。`documents` 表是可搜索文本单元，保存原文 `text`、用于大小写不敏感匹配的 `search_text` 及轮次/事件位置；每段文字保存两种形式，所以长会话、较多工具输出会增加缓存体积。删除该缓存后下次搜索会重新建立；不会丢失 JSONL 聊天历史或权限配置。更多目录与数据说明见 [本地数据存储说明](local_data_storage.md)。
 
-每次搜索扫描顶层 JSONL 的文件状态，只重新解析大小/修改时间/文件身份发生变化的文件。删除会话会同时移除对应缓存。查询用 SQLite 的原生 `instr` 扫描规范化文字，只扫描一次，再为当前页读取正文；不依赖 OpenAI SDK、grep、rg 或 SQLite FTS 扩展。原始 JSONL 中可能有中文转义、整轮单行和媒体编码，因此不直接对文件运行 grep。
+每次搜索列举顶层 JSONL 文件名用于删除检测，只检查所选归档范围内的文件指纹和变更正文。查询先选择该范围内的会话，再通过文件索引定位其文档并用 SQLite 原生 `instr` 匹配规范化文字；现有缓存中即使保留了其他范围的全文，也不会参与本次文字匹配。之后只为当前页读取显示正文，不依赖 OpenAI SDK、grep、rg 或 SQLite FTS 扩展。原始 JSONL 中可能有中文转义、整轮单行和媒体编码，因此不直接对文件运行 grep。
 
 为支持随时勾选扩展范围，缓存仍保留内部记录；缩小默认查询范围不会自动缩小现有 SQLite 文件。新增角色/字段索引使默认查询先筛选正文与标题，再匹配文字，减少对大段工具结果的扫描。已有缓存只需自动添加此索引，不需要重解析全部历史或修改 JSONL。
 

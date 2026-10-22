@@ -360,8 +360,7 @@
   $("#askModalBackdrop").addEventListener("click", closeAskModal);
 
   // 回答提交编排（ask_user 卡片）：按提问卡片所处对话位置自动分流——
-  // - 提问是最新轮次（其后无任何轮次）：回答直接作为新轮追加/插入提问轮之后
-  //   （insert_round 语义在末尾等价于追加，无需确认）；
+  // - 提问是最新轮次（其后无任何轮次）：回答按普通新轮追加，无需历史插入；
   // - 提问之后已有回答轮：三选确认——「更新该回答轮」（替换旧回答轮，即
   //   编辑重发 regen 语义）/「删除提问之后所有」/「取消（不发起任务）」；
   // - 提问之后只有普通对话轮（用户曾跳过该提问开启新任务）：三选确认——
@@ -410,8 +409,9 @@
       hasExistingAnswer = later.text.indexOf("【回答模型提问】") === 0;
     }
     if (!hasLaterRounds) {
-      // 提问是最新轮次：回答直接发送（插入点在末尾，等价追加，无需确认）
-      App.send({ text: text, insertAfterRound: askRound });
+      // 自动弹窗的正常续答走普通发送，统一接收 round_started 并跟随实时输出。
+      // 只有中间插入才需要 insert_round，末尾续答不应进入历史编辑分支。
+      App.send({ text: text });
       return;
     }
     // 后面已有对话（回答轮或普通对话）：三选确认后再发送

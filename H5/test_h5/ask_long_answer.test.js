@@ -45,3 +45,17 @@ test('搜索窗口外已有回答时仍先确认处理方式', () => {
   assert.equal(sent.length,0);
   assert.deepEqual(confirmed,[['新回答',20,true]]);
 });
+
+test('自动弹窗的最新提问续答按普通新轮发送，避免误入历史插入分支', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/builtin.js'), 'utf8');
+  const sent = [], chatInner = { children: [] };
+  const block = { isConnected:true, getAttribute:()=>'2', parentElement:chatInner };
+  const context = { chatInner, App: { historyQuestionAfterRound:()=>null, send:data=>sent.push(data) },
+    showAskAnswerConfirm:()=>assert.fail('最新提问无需再次确认') };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('  function submitAskAnswer('),source.indexOf('  function showAskAnswerConfirm(')),context);
+  context.submitAskAnswer('【回答模型提问】\n完整回答',block);
+  assert.equal(sent.length,1);
+  assert.equal(sent[0].text,'【回答模型提问】\n完整回答');
+  assert.equal(sent[0].insertAfterRound,undefined);
+});

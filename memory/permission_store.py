@@ -384,8 +384,11 @@ def pending(session):
         rows = db.execute("SELECT id FROM tasks WHERE session=? AND state IN ('running','suspended')", (session,)).fetchall()
     for row in rows:
         current = task(row[0])
-        if current["state"] == "running" and not pid_alive(current["owner"]):
-            set_task_state(current["id"], "suspended")
+        if current and current["state"] == "running" and not pid_alive(current["owner"]):
+            # A concurrent resume may already have acquired a new owner/epoch.
+            with database() as db:
+                db.execute("UPDATE tasks SET state='suspended',updated=? WHERE id=? AND state='running' AND owner=? AND epoch=?",
+                           (time.time(), current["id"], current["owner"], current["epoch"]))
     with database() as db:
         ids = db.execute("SELECT a.id FROM approvals a JOIN tasks t ON t.id=a.task WHERE t.session=? AND t.state IN ('running','suspended') AND a.state IN ('pending','approved','denied') ORDER BY a.updated", (session,)).fetchall()
     return [approval(row[0]) for row in ids]
@@ -418,11 +421,32 @@ def resume(task_id):
 
 
 def release_resume(task_id, epoch):
-    """Release a dispatch that failed before another process adopted it."""
+    """Release a failed dispatch or interrupted-task retirement claim."""
     with database() as db:
         db.execute("UPDATE tasks SET state='suspended',owner=-1,updated=? "
-                   "WHERE id=? AND epoch=? AND owner=? AND state='running'",
+                   "WHERE id=? AND epoch=? AND owner=? AND state IN ('running','suspended')",
                    (time.time(), task_id, epoch, os.getpid()))
+
+
+def claim_interrupted_task(task_id):
+    """Reserve a dead writer's snapshot while a new user message retires it.
+
+    Keep it suspended so history recovery cannot consume the pending round
+    before its tool ledger is reconciled. Resume and competing sends must not
+    acquire the same checkpoint while this backend owns it.
+    """
+    current = task(task_id)
+    if not current or current["state"] != "suspended":
+        raise ValueError("旧任务状态已变化，请重新发送")
+    if pid_alive(current["owner"]):
+        raise ValueError("旧任务执行进程仍存在，请等待其退出或先停止旧进程后再发送")
+    epoch = uuid.uuid4().hex
+    with database() as db:
+        changed = db.execute("UPDATE tasks SET owner=?,epoch=?,updated=? WHERE id=? AND state='suspended' AND owner=? AND epoch=?",
+                             (os.getpid(), epoch, time.time(), task_id, current["owner"], current["epoch"]))
+        if changed.rowcount != 1:
+            raise ValueError("旧任务已由另一个请求接管，请稍后重试")
+    return task(task_id)
 
 
 def adopt(task_id):

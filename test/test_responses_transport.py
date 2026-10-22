@@ -100,6 +100,36 @@ def config(server):
     return dict(CONFIG, url=server[0])
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("retry", [False, True])
+def test_real_responses_transport_meters_each_generation_once(server, journal, stream, retry):
+    from factory.agent_runtime.task_costs import CURRENT, BudgetTracker
+    from memory import task_cost_store as costs
+    cfg = config(server)
+    if retry:
+        server[1].append([http(b'{"error":"temporary unavailable"}', status=503)])
+    raw = answer("resp_meter", "你好")
+    server[1].append([http(sse(raw), content_type="text/event-stream") if stream else http(json.dumps(raw).encode())])
+    costs.create_task("responses-meter", "meter-session")
+    token = CURRENT.set(BudgetTracker("responses-meter", "meter-session"))
+    request = turn([{"role": "user", "content": "check"}], session="meter-session")
+    try:
+        if stream:
+            async def run():
+                return [frame async for frame in ChatLLM.chat_completions(request=request, stream=True, model_config=cfg)]
+            asyncio.run(run())
+        else:
+            ChatLLM.chat_completions(request=request, stream=False, model_config=cfg)
+    finally:
+        CURRENT.reset(token)
+    result = costs.status("responses-meter")
+    assert len(server[2]) == (2 if retry else 1)
+    assert result["model_calls"] == len(server[2])
+    if not retry:
+        assert result["usage"]["total_tokens"] == 15
+        assert result["estimated_calls"] == 0
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("chunked,compressed", [(False, False), (True, False), (True, True)])
 def test_raw_http_json_create_query_and_extensions(server, asynchronous, chunked, compressed, monkeypatch):

@@ -545,28 +545,10 @@
 
   // 粘贴剪贴板图片：加入待发送附件并在输入框上方预览
   input.addEventListener("paste", function (e) {
-    const items = (e.clipboardData && e.clipboardData.items) || [];
-    const mediaFiles = [];
-    for (const item of items) {
-      if (item.kind !== "file") continue;
-      const file = item.getAsFile && item.getAsFile();
-      if (file && mediaKindOf(file.name || "")) mediaFiles.push(file);
-    }
+    const mediaFiles = ClipboardMediaUtils.mediaFiles(e.clipboardData, mediaKindOf);
     if (!mediaFiles.length) return;
     e.preventDefault();
-    // 剪贴板截图常无扩展名：按 MIME 推断补一个
-    const named = mediaFiles.map(function (file, index) {
-      if (file.name && file.name !== "image.png" && file.name.indexOf(".") >= 0) return file;
-      const mime = file.type || "image/png";
-      const ext = (mime.split("/")[1] || "png").replace("jpeg", "jpg");
-      const name = "clipboard-" + Date.now() + (mediaFiles.length > 1 ? "-" + index : "") + "." + ext;
-      try {
-        return new File([file], name, { type: mime });
-      } catch (_) {
-        return file;
-      }
-    });
-    addPendingMediaFiles(named);
+    addPendingMediaFiles(mediaFiles);
   });
 
 

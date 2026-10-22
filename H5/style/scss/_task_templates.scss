@@ -1,0 +1,40 @@
+body.task-template-open { overflow: hidden; }
+.task-template-modal[hidden], .task-template-modal [hidden] { display: none !important; }
+.task-template-modal { position: fixed; inset: 0; z-index: 1900; padding: 18px; display: grid; place-items: center; }
+.task-template-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.5); }
+.task-template-dialog { position: relative; width: min(900px,100%); min-width: 0; max-height: calc(100dvh - 36px); display: flex; flex-direction: column; overflow: hidden;
+  background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: var(--shadow-menu); font-size: 14px;
+  h2 { margin: 0; font-size: 20px; } h3 { margin: 12px 0 8px; font-size: 16px; }
+  input:not([type=checkbox]), select, textarea { min-width: 0; width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-code); color: var(--text); font: inherit; padding: 9px 10px;
+    &:focus-visible { outline: 2px solid var(--tool-icon-pink); outline-offset: 1px; } }
+  textarea { resize: vertical; max-height: 40dvh; line-height: 1.6; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font-size: 13px; line-height: 1.6; background: var(--bg-code); border-radius: 8px; padding: 12px; }
+}
+.template-header, .template-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 20px; }
+.template-header { border-bottom: 1px solid var(--border); }
+.template-footer { justify-content: flex-end; flex-wrap: wrap; border-top: 1px solid var(--border); }
+.template-button { flex-shrink: 0; border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 12px; font: inherit; font-size: 13px; color: var(--text-secondary); background: var(--bg-code); cursor: pointer;
+  &:hover, &:focus-visible { color: var(--tool-icon-pink); background: var(--bg-hover); }
+  &:focus-visible { outline: 2px solid var(--tool-icon-pink); outline-offset: 1px; } &:disabled { opacity: .5; cursor: default; } }
+.template-footer .template-button:last-child { color: var(--tool-icon-pink); }
+.template-body { padding: 16px 20px; overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.template-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;
+  select { flex: 1 1 100%; } }
+.template-field { display: flex; flex-direction: column; min-width: 0; gap: 6px; margin: 0 0 12px; }
+.template-hint { color: var(--text-secondary); font-size: 13px; line-height: 1.6; margin: 8px 0 12px; overflow-wrap: anywhere; }
+.template-section { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin: 12px 0;
+  summary { cursor: pointer; font-weight: 600; padding: 3px 0; } > select, > .template-button { margin-bottom: 10px; } }
+.template-tools { max-height: 280px; overflow: auto; margin-top: 10px; &.is-inherited { opacity: .5; } }
+.template-tool-group { min-width: 0; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  legend { max-width: 100%; overflow-wrap: anywhere; color: var(--text-secondary); font-size: 12px; } }
+.template-tool { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0 6px 10px; overflow-wrap: anywhere; input { flex-shrink: 0; margin-top: 3px; } span { min-width: 0; } }
+.template-budget-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 0 14px; }
+.template-confirm { padding: 12px; background: var(--bg-code); border: 1px solid var(--tool-icon-pink); border-radius: 10px; .template-button { margin-right: 8px; } }
+.template-status { min-height: 20px; margin: 12px 0 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .task-template-modal { padding: 8px; }
+  .task-template-dialog { max-height: calc(100dvh - 16px); border-radius: 12px; font-size: 13px; h2 { font-size: 18px; }
+    input:not([type=checkbox]), select, textarea { font-size: 16px; } }
+  .template-header, .template-footer { padding: 10px 12px; } .template-body { padding: 12px; }
+  .template-footer .template-button { flex: 1 1 auto; } .template-budget-grid { grid-template-columns: minmax(0,1fr); }
+}

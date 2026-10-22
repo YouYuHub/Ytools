@@ -919,6 +919,11 @@ def _recompute_meta_from_entries(
 ) -> dict[str, Any]:
     now = now_str()
     meta = dict(base_meta) if isinstance(base_meta, dict) else _default_meta(session_id)
+    # 模板初始草稿只恢复到首次接受的轮次落盘前。删除全部轮次后也不再次填回。
+    if isinstance(meta.get("task_template"), dict) and any(
+        isinstance(entry, dict) and entry.get("event") == "chat_round" for entry in entries
+    ):
+        meta["task_template"] = {**meta["task_template"], "draft_consumed": True}
     # 会话标识以文件名为准，不再写入 _meta；每次重算都要清理，
     # 因为上传的 jsonl（如 web-xxx_chat.jsonl）其 _meta 里仍带 session_id，
     # 不是“只清理一次”就能完成的
@@ -1279,40 +1284,12 @@ class ChatMemoryManager:
         的窗口极小，且必须恰好是本主进程/另一 worker 才可能误判）；写者
         仍存活时说明轮次仍在生成，保留检查点交由真正的收尾逻辑处理。
         """
+        if not self._pending_checkpoint_path.exists():
+            return
         from memory.permission_store import has_restorable_round
         if has_restorable_round(self.session_id):
             return
-        with self._write_guard():
-            recovered = None
-            try:
-                if self._pending_checkpoint_path.exists():
-                    recovered = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                recovered = None
-            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
-                return
-            # 写者进程仍存活：轮次还在生成中（多进程架构下主进程读接口
-            # 新建管理器会走到这里），绝不能恢复成 interrupted 历史
-            writer_pid = recovered.get("writer_pid")
-            if isinstance(writer_pid, int) and _pid_alive(writer_pid):
-                return
-            meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            legacy_checkpoint = meta.pop("_pending_round_checkpoint", None)
-            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
-                recovered = legacy_checkpoint
-            if not isinstance(recovered, dict) or recovered.get("event") != "chat_round":
-                return
-            normalized = dict(recovered)
-            if normalized.get("status") == "running":
-                normalized["status"] = "interrupted"
-            normalized.setdefault("ended_at", normalized.get("started_at"))
-            # 幂等去重：同轮（started_at + 首个用户事件一致）已存在于历史时
-            # 不再追加，只清理残留检查点。避免恢复逻辑异常路径下产生重复轮次
-            if not self._round_already_recorded(entries, normalized):
-                entries.append(normalized)
-            meta = _recompute_meta_from_entries(self.session_id, meta, entries)
-            _write_meta_and_entries(self._file_path, meta, entries)
-        self._clear_pending_checkpoint()
+        self._finish_current_round("interrupted", recover_checkpoint=True, require_dead_writer=True)
 
     @staticmethod
     def _round_already_recorded(entries: list[dict[str, Any]], recovered_round: dict[str, Any]) -> bool:
@@ -1464,8 +1441,9 @@ class ChatMemoryManager:
             pass
         return pending if pending.get("event") == "chat_round" else None
 
-    async def finish_saved_permission_round(self, pending: dict, target_round=None) -> None:
-        """用户停止重启后遗留的任务：把已保存轨迹按 stopped 收尾。
+    async def finish_saved_permission_round(self, pending: dict, target_round=None, insert_round=None,
+                                            *, status="stopped", task_id=None, reason=None) -> None:
+        """停止或新消息接替重启后遗留的任务，保存轨迹与原替换/插入位置。
 
         由停止接口在确认活跃写者退出后调用；不能在只读历史/预演中收尾。
         """
@@ -1481,9 +1459,18 @@ class ChatMemoryManager:
             _, entries = _load_meta_and_entries(self._file_path, self.session_id)
             if self._round_already_recorded(entries, pending):
                 return
+            if task_id and reason:
+                from factory.agent_runtime.permission_runtime import reconcile_interrupted_round
+                pending = reconcile_interrupted_round(pending, task_id, reason)
             self._round_store.pending_round = json.loads(json.dumps(pending, ensure_ascii=False))
-            self._target_round_number = target_round
-        await self.stop_current_round()
+            self._round_store.pending_round.pop("writer_pid", None)
+            target = self._round_store.pending_round.pop("target_round", target_round)
+            insert = self._round_store.pending_round.pop("insert_round", insert_round)
+            if target is not None:
+                self.set_target_round(target)
+            elif insert is not None:
+                self.set_insert_round(insert)
+        self._finish_current_round(status)
 
     @staticmethod
     def _user_event_signature(event: dict[str, Any]) -> Any:
@@ -1538,6 +1525,7 @@ class ChatMemoryManager:
                 meta_changed = True
             if completed_round is not None:
                 meta.pop("_active_round_compaction", None)
+                meta.pop("_pending_round_checkpoint", None)
                 # 轮次已收尾：检查点完成使命，连同最终事件一起落盘
                 self._clear_pending_checkpoint()
                 target_round = self._target_round_number
@@ -1683,6 +1671,12 @@ class ChatMemoryManager:
         payload_checkpoint = dict(checkpoint)
         if payload_checkpoint.get("event") == "chat_round":
             payload_checkpoint.setdefault("writer_pid", os.getpid())
+            # 主进程在 worker 强制退出后也能按原位置收尾，避免把重发/插入轮
+            # 当成新轮追加。此定位信息仅存在于检查点，不进入模型上下文。
+            if self._target_round_number is not None:
+                payload_checkpoint["target_round"] = self._target_round_number
+            if self._insert_round_number is not None:
+                payload_checkpoint["insert_round"] = self._insert_round_number
         tmp_path = self._pending_checkpoint_path.with_name(self._pending_checkpoint_path.name + ".tmp")
         payload = json.dumps(payload_checkpoint, ensure_ascii=False)
         last_error: OSError | None = None
@@ -1702,14 +1696,41 @@ class ChatMemoryManager:
         except OSError:
             pass
 
-    async def stop_current_round(self) -> str:
-        """用户手动停止任务：直接以 stopped 状态收尾当前轮次，不写入"停止任务"假消息。"""
+    async def stop_current_round(self, *, recover_checkpoint: bool = False) -> str:
+        """以 stopped 收尾；recover_checkpoint 仅供已确认写者退出生成任务的停止接口。"""
+        return self._finish_current_round("stopped", recover_checkpoint=recover_checkpoint)
+
+    def _finish_current_round(self, status: str, *, recover_checkpoint=False, require_dead_writer=False) -> str:
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
-            completed_round = self._round_store.finalize_round("stopped")
+            if recover_checkpoint:
+                try:
+                    pending = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    pending = None
+                except (OSError, ValueError):
+                    if require_dead_writer:
+                        return "检查点暂不可恢复"
+                    raise
+                if isinstance(pending, dict) and pending.get("event") == "chat_round":
+                    writer_pid = pending.get("writer_pid")
+                    if require_dead_writer and isinstance(writer_pid, int) and _pid_alive(writer_pid):
+                        return "写者仍存活"
+                    if self._round_already_recorded(entries, pending):
+                        self._clear_pending_checkpoint()
+                        return "记录成功"
+                    pending = dict(pending)
+                    pending.pop("writer_pid", None)
+                    target = pending.pop("target_round", self._target_round_number)
+                    insert = pending.pop("insert_round", self._insert_round_number)
+                    self._round_store.pending_round = pending
+                    if target is not None:
+                        self.set_target_round(target)
+                    elif insert is not None:
+                        self.set_insert_round(insert)
+            completed_round = self._round_store.finalize_round(status)
             if completed_round is not None:
                 meta.pop("_active_round_compaction", None)
-                self._clear_pending_checkpoint()
                 # 原地重跑（target_round）：停止收尾同样替换目标轮次——
                 # 编辑后旧回复已失效，中断的新回复占据其历史位置
                 target_round = self._target_round_number
@@ -1772,9 +1793,10 @@ class ChatMemoryManager:
                 else:
                     entries.append(completed_round)
                 if target_round is not None or insert_round is not None:
-                    self._invalidate_remote_history(meta, "历史编辑/插入已停止，按完整本地历史重新建立链")
+                    self._invalidate_remote_history(meta, "历史编辑/插入已结束，按有效本地历史重新建立链")
                 meta = _recompute_meta_from_entries(self.session_id, meta, entries)
                 _write_meta_and_entries(self._file_path, meta, entries)
+                self._clear_pending_checkpoint()
                 if replaced_round is not None:
                     self._cleanup_replaced_round_media(replaced_round, entries)
         return "记录成功"
@@ -2799,6 +2821,8 @@ class ChatMemoryManager:
         首行，仅当读取到的首行 _meta 与重算结果漂移时才需要物化（与
         __init__ 的惰性物化同口径）。
         """
+        if self._read_only:
+            return _load_meta_and_entries(self._file_path, self.session_id)
         with self._write_guard():
             rows = _read_jsonlines(self._file_path)
             stored_meta = rows[0].get("_meta") if (rows and _is_meta_record(rows[0])) else None
@@ -2928,6 +2952,9 @@ class ChatMemoryManager:
         max_tool_result_length: int | None = None,
         tools: list[Any] | None = None,
         system_prompt_text: str | None = None,
+        inspection: bool = False,
+        round_offset: int = 0,
+        round_limit: int = 40,
     ) -> dict[str, Any]:
         """返回模型上下文构成的 token 统计，供调试/前端展示压缩效果。
 
@@ -3123,7 +3150,7 @@ class ChatMemoryManager:
             except (TypeError, ValueError):
                 history_compress_count = 0
 
-        return {
+        result = {
             "context_token_limit": context_token_limit,
             "messages_tokens": messages_tokens,
             "reasoning_tokens": reasoning_tokens,
@@ -3155,6 +3182,11 @@ class ChatMemoryManager:
             "history_compress_count": history_compress_count,
             "round_tokens": round_tokens,
         }
+        if inspection:
+            from .context_inspection import inspect_history
+            result["inspection"] = inspect_history(meta, entries, pending_round, result,
+                offset=round_offset, limit=round_limit)
+        return result
 
     async def clear_chat_history(self) -> str:
         """
@@ -3451,6 +3483,8 @@ class ChatMemoryManager:
         if chat_history_file.exists():
             _delete_path_with_retry(chat_history_file)
             deleted_parts.append(f"会话文件 {chat_history_file.name}")
+        from memory.session_archives import forget
+        forget(session_id)
         for suffix, label in ((".pending", "检查点"), (".todo", "任务计划"), (".bak", "备份")):
             sidecar = _sidecar_dir() / (chat_history_file.name + suffix)
             if sidecar.exists():

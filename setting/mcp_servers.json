@@ -19,15 +19,60 @@
       "command": "node",
       "args": [
         "browser/node_modules/@playwright/mcp/cli.js",
-        "--headless",
-        "--isolated",
-        "--no-webmcp"
+        "--no-webmcp",
+        "--browser",
+        "msedge"
       ],
       "env": {
         "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts"
       },
       "persistent": true,
-      "version": "0.0.83"
+      "version": "0.0.83",
+      "default_profile": "isolated",
+      "profiles": {
+        "isolated": {
+          "label": "独立隔离浏览器",
+          "description": "用于独立测试，页面与登录状态独立。",
+          "args": [
+            "browser/node_modules/@playwright/mcp/cli.js",
+            "--no-webmcp",
+            "--browser",
+            "msedge",
+            "--isolated",
+            "--headless"
+          ],
+          "env": {
+            "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts/isolated",
+            "PLAYWRIGHT_MCP_EXTENSION": "false",
+            "PLAYWRIGHT_MCP_ISOLATED": "true",
+            "PLAYWRIGHT_MCP_HEADLESS": "true",
+            "PLAYWRIGHT_MCP_CDP_ENDPOINT": "",
+            "PLAYWRIGHT_MCP_ENDPOINT": "",
+            "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "",
+            "PLAYWRIGHT_MCP_PROFILE_DIR_NAME": "",
+            "PLAYWRIGHT_MCP_USER_DATA_DIR": ""
+          }
+        },
+        "extension": {
+          "label": "已打开网页 · 扩展连接",
+          "description": "用于用户已打开的浏览器页面；首次实际调用需要用户授权并选择标签页。",
+          "args": [
+            "browser/node_modules/@playwright/mcp/cli.js",
+            "--no-webmcp",
+            "--browser",
+            "msedge",
+            "--extension"
+          ],
+          "env": {
+            "PLAYWRIGHT_MCP_OUTPUT_DIR": "{temp}/ytools_playwright_artifacts/extension",
+            "PLAYWRIGHT_MCP_EXTENSION": "true",
+            "PLAYWRIGHT_MCP_ISOLATED": "false",
+            "PLAYWRIGHT_MCP_HEADLESS": "false",
+            "PLAYWRIGHT_MCP_CDP_ENDPOINT": "",
+            "PLAYWRIGHT_MCP_ENDPOINT": ""
+          }
+        }
+      }
     }
   },
   "inputs": {
@@ -49,14 +94,31 @@
       "web_search"
     ],
     "Browser": [
-      "browser_navigate",
-      "browser_snapshot",
       "browser_click",
-      "browser_type",
-      "browser_take_screenshot",
+      "browser_close",
       "browser_console_messages",
+      "browser_drag",
+      "browser_drop",
+      "browser_emulate_media",
+      "browser_evaluate",
+      "browser_file_upload",
+      "browser_fill_form",
+      "browser_find",
+      "browser_handle_dialog",
+      "browser_hover",
+      "browser_navigate",
+      "browser_navigate_back",
+      "browser_network_request",
       "browser_network_requests",
-      "browser_tabs"
+      "browser_press_key",
+      "browser_resize",
+      "browser_run_code_unsafe",
+      "browser_select_option",
+      "browser_snapshot",
+      "browser_tabs",
+      "browser_take_screenshot",
+      "browser_type",
+      "browser_wait_for"
     ]
   }
 }

@@ -6,7 +6,7 @@
     const delay = options.delay == null ? 280 : options.delay;
     const timeout = options.timeout == null ? 60000 : options.timeout;
     let seq = 0, timer = null, active = null, opened = false;
-    let scope = { includeInternal: false, includeFilenames: false };
+    let scope = { includeInternal: false, includeFilenames: false, archiveScope: "active" };
     let state = { query: "", status: "idle", results: [], total: 0, session_count: 0, next_offset: null };
     function emit(patch) { state = Object.assign({}, state, patch); onState(state); }
     function cancel() {
@@ -27,7 +27,7 @@
       emit({ status: more ? "more" : "loading", error: "" });
       try {
         const data = await search(query, { signal: controller.signal, offset: more ? state.next_offset : 0,
-          revision: more ? state.revision : null, includeInternal: scope.includeInternal, includeFilenames: scope.includeFilenames });
+          revision: more ? state.revision : null, includeInternal: scope.includeInternal, includeFilenames: scope.includeFilenames, archiveScope: scope.archiveScope });
         if (mine !== seq || !opened || state.query !== query) return;
         emit(Object.assign({}, data, { results: more ? state.results.concat(data.results || []) : (data.results || []), status: "ready", error: "" }));
       } catch (error) {
@@ -56,8 +56,8 @@
       close: function () { opened = false; cancel(); },
       update: update,
       setScope: function (next, composing) {
-        const selected = { includeInternal: Boolean(next.includeInternal), includeFilenames: Boolean(next.includeFilenames) };
-        if (selected.includeInternal === scope.includeInternal && selected.includeFilenames === scope.includeFilenames) return;
+        const selected = { includeInternal: Boolean(next.includeInternal), includeFilenames: Boolean(next.includeFilenames), archiveScope: next.archiveScope || scope.archiveScope };
+        if (selected.includeInternal === scope.includeInternal && selected.includeFilenames === scope.includeFilenames && selected.archiveScope === scope.archiveScope) return;
         scope = selected;
         update(state.query, composing);
       },

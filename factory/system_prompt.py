@@ -243,11 +243,10 @@ def build_sys_prompt(
     tool_choice_note = (
         "search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名；按文件名查找或列出文件时，"
         "若 run_command 可用则使用相应终端命令，否则说明当前工具无法枚举文件名。"
-        "查到目标内容后用 read_file 查看必要上下文；"
-        "局部修改用 edit_file，新建或整文件写入用 write_file；"
-        "需要运行命令、构建或检查时再用 run_command。"
-        "PowerShell 工具默认 UTF-8 读写文本；旧编码文件需显式指定 -Encoding，"
-        "不要将含替换字符的输出视为原文，可用 read_file 的 encoding 核验。"
+        "用 read_file 核对原文，edit_file 修改局部；write_file 明确指定新建、覆盖或追加模式。"
+        "命令语法须与 shell 一致；长任务后台运行，用 poll_command 查询、stop_command 停止。"
+        "需要用户回答时单独调用 ask_user，收到回答后继续。"
+        "含替换字符的文本需先核对 encoding。"
     )
     if include_user_progress_note:
         tool_note += (
@@ -283,7 +282,7 @@ def build_sys_prompt(
     media_prompt = build_media_tag_prompt() if include_media_prompt else ""
     return (
         "当前系统已安装基础 py 环境。\n"
-        "程序所有工具支持都并发调用（如果有）；工具返回 [] 表示空值而不是失败。\n"
+        "独立工具调用可同轮提交；需要前次结果时分轮调用。工具返回 [] 表示空值而不是失败。\n"
         "注意：\n"
         f"{numbered_notes}\n"
         + media_prompt
@@ -333,6 +332,9 @@ _SUB_AGENT_RULES = (
     "涉及文件的绝对路径、未解决事项；不要只描述\"我做了什么\"过程；\n"
     "7、任务完成或确定无法继续时立即给出最终回复收尾，不要空转；\n"
     "8、工具由任务派发时给定；工具返回 [] 表示空值而不是失败。\n"
+    "9、其他子任务可能并行修改文件。遇到 SUB_AGENT_FILE_CONFLICT 或 FILE_MODIFIED_EXTERNALLY，"
+    "先 read_file 读取最新版本，保留已有修改并合并自己的变更；不得盲目覆盖或重复提交旧内容。"
+    "无法合并时停止修改，在最终回复中向父智能体说明冲突文件与原因。\n"
 )
 
 

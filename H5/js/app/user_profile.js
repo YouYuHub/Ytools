@@ -45,7 +45,7 @@
     editor.maxLength = profileMaxLength;
     editor.setAttribute("aria-label", "修改显示名");
     editor.setAttribute("placeholder", "输入显示名；留空恢复默认");
-    // 输入框自身点击不应冒泡到 profileCard（否则会顺带打开主题弹窗）
+    // 输入框自身点击不应冒泡到 profileCard（否则会顺带打开设置菜单）
     editor.addEventListener("click", function (event) { event.stopPropagation(); });
 
     profileName.textContent = "";
@@ -98,7 +98,7 @@
   }
 
   profileName.addEventListener("click", function (event) {
-    // 阻止冒泡：profileCard 的点击负责弹出主题选择，本入口只做改名
+    // 阻止冒泡：profileCard 的点击负责弹出设置菜单，本入口只做改名
     event.stopPropagation();
     // 收起其它浮层，再进入改名。
     if (App.closeMenus) App.closeMenus();

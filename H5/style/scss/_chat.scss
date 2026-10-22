@@ -2130,6 +2130,34 @@ html[data-theme="dark"] {
   contain-intrinsic-size: auto 240px;
 }
 
+.scrollbar-ready .chat-inner > * {
+  content-visibility: visible;
+}
+
+// 已渲染窗口真实布局，其余历史由首尾占位表示；滑块始终覆盖完整会话。
+.history-windowed {
+  overflow-anchor: none;
+  .chat-inner > * {
+    content-visibility: visible;
+    translate: 0 var(--history-window-shift, 0px);
+  }
+  .chat-inner > .msg { animation: none; }
+  .qnav-load-older { display: none; }
+  .history-live-hidden { display: none !important; }
+}
+
+// 原生滑块的拖动距离以固定滚动范围计算。手势开始时测准已加载内容，
+// 暂时锁住外层高度；流式更新继续接收，松开后释放高度并恢复懒渲染。
+.scrollbar-dragging .chat-inner {
+  block-size: var(--scrollbar-content-height, auto);
+  overflow: clip;
+
+  > * {
+    content-visibility: visible;
+    flex-shrink: 0;
+  }
+}
+
 // 分页加载提示行（分段渲染底部）：居中细进度条
 .qnav-load-older {
   align-self: center;

@@ -650,7 +650,8 @@ def test_child_agent_uses_own_chain_and_does_not_repeat_write(journal, monkeypat
     context.initial_todo = []
     runner = SubAgentRunner(context)
     monkeypatch.setattr(runner, "_resolve_request_model_config", lambda: (CONFIG, {}))
-    client = ScriptClient([answer("resp_child_call", "", calls=[("call_1", "write_file", "{}")]), answer("resp_child_done")])
+    client = ScriptClient([answer("resp_child_call", "", calls=[("call_1", "write_file",
+                          json.dumps({"path": "child.txt", "content": "saved", "mode": "create"}))]), answer("resp_child_done")])
     monkeypatch.setattr(responses_client, "_client", lambda *args, **kwargs: (client, {}))
     writes = []
     def write(name, args):
@@ -720,9 +721,10 @@ def test_worker_dispatch_preserves_omitted_sampling_parameters(journal, monkeypa
     async def run():
         request = ChatLLMRequest(messages=[{"role": "user", "content": "q"}], max_output_tokens=1024,
                                  reasoning={"effort": "low"})
-        stream = SimpleNamespace(task=None)
+        stream = SimpleNamespace(task=None, finish=AsyncMock())
         assert await chat_factory._start_session_generation(proxy, stream, request)
         await stream.task
+        stream.finish.assert_awaited_once()
     asyncio.run(run())
     reconstructed = ChatLLMRequest(**sent[0])
     payload = parameters(reconstructed, CONFIG, True)

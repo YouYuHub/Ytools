@@ -373,8 +373,8 @@
     "用途": "父智能体经内置 sub_agent 工具派发的子任务全轨迹块（独立上下文的精简 Agent 循环）。写入当前 chat_round.events 内，按 agent_id 聚合；前端渲染为独立子任务块",
     "agent_id": "子智能体实例 ID（agent_<8位hex>），轮内唯一；一次工具调用 ≠ 一个 Agent 实例，身份与 parent_tool_call_id 分离（为 V2 嵌套预留 parent_agent_id 层级）",
     "parent_tool_call_id": "父级 assistant.tool_calls 中该次 sub_agent 调用的 id；子事件归属与父级工具气泡关联都靠它",
-    "phase": "start（任务/预置计划/工具白名单/上限/queued） | model_call（seq + 思考/正文/工具调用轨迹） | tool_start（function_name） | tool_result（tool_name；内置文件工具可带 file_diff，超大结果可带 result_preview） | todo（子任务私有计划） | notice（retry_kind 可选） | done（状态/最终回复/轮次/子任务 usage）",
-    "delta/heartbeat": "delta 仅实时 SSE 推流（reasoning_delta/content_delta），不落盘；heartbeat 当前未实现，无发射点",
+    "phase": "start（任务/预置计划/工具白名单/上限/queued） | model_call（seq + 思考/正文/工具调用轨迹） | tool_start（function_name） | tool_result（tool_name；内置文件工具可带 file_diff，超大结果可带 result_preview） | todo（子任务私有计划） | notice（retry_kind/file_conflict/context_compaction 可选） | progress（activity/detail/rounds/elapsed_seconds） | done（状态/最终回复/轮次/子任务 usage）",
+    "delta/heartbeat": "两者仅实时 SSE 推流、不落盘；delta 包含 reasoning_delta/content_delta；heartbeat 每 5 秒包含 activity/detail/rounds/elapsed_seconds/idle_seconds，更新活动与有效耗时",
     "可见性": "子任务的思考/正文/工具轨迹/ todo 只在本事件块内；父级上下文只有 assistant(tool_calls=sub_agent) + role=tool(最终回复文本)。历史重建与压缩文本渲染会排除这些无 role 条目，绝不进入父级模型上下文",
     "收尾状态": "status 白名单 done|error|stopped|interrupted|timeout|max_rounds；父级停止/进程重启时子事件由父轮兜底补写（stopped/interrupted），块内无 done 事件=中断遗留，前端按 interrupted 渲染",
     "usage_total": "子任务自身模型调用的 token 累计，保存在子任务块并供前端展示；不并入父轮 usage_total"

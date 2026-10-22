@@ -133,8 +133,8 @@
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
 | /chat_history/sessions | GET | - | 会话文件名列表 `["default_chat.jsonl", ...]` |
-| /chat_history/summaries | GET | session_id? | 批量轻量摘要 `[{id, filename, title, updated_at, created_at, group_id}]`；只读首行，在后台线程执行，不初始化管理器。指定 session_id 只查该会话，不存在返回 `[]`，不创建文件。详见 [首屏优化](session_list_performance.md) |
-| /chat_history/search | GET | q(1–200字符), limit(1–100,默认40), offset(默认0), revision? | 全部已保存会话的文字搜索；返回文件名、匹配片段与轮次/事件定位信息，详见 [会话全文搜索](history_search.md)。分页期间记录变化返回409，前端自动重新搜索 |
+| /chat_history/summaries | GET | session_id?, archive_scope=active/archived/all（默认active）, with_archive_state? | 批量轻量摘要 `[{id, filename, title, updated_at, created_at, group_id}]`；范围过滤后只读对应首行，在后台线程执行，不初始化管理器。with_archive_state=true 返回 `{sessions, archived_ids}`，不下载归档摘要。指定 session_id 只查该会话，打开归档需传 all；不存在返回空数组，不创建文件。详见 [归档说明](session_archives.md) |
+| /chat_history/search | GET | q(1–200字符), limit(1–100,默认40), offset(默认0), revision?, archive_scope=active/archived/all（默认active） | 所选范围内的会话文字搜索；范围外跳过正文索引更新及文字匹配，返回文件名、片段与轮次/事件定位，详见 [会话全文搜索](history_search.md)。分页期间记录或归档状态变化返回409 |
 | /chat_history/file | GET | session_id | 下载会话 JSONL 文件（首行 `_meta` 元数据） |
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
@@ -248,7 +248,9 @@ manifest.json                     # {version: 3, exported_at, groups: [{id, name
 - `data: [DONE]` 结束
 - **心跳**：压缩模型长时间无增量输出时（合并大历史等），空闲期每 30 秒发送一帧 SSE 注释 `": ping"`，前端按规范自动忽略（防代理/浏览器把静默连接判死）
 ### GET /chat_context/token_stats
-查看指定会话**模型上下文 token 构成**统计。进入摘要模式后，口径为“累计摘要 + 全历史最近问题 + 当前 pending 任务”；未生成摘要的旧会话暂以原始轮次估算，供首次压缩前展示：
+查看指定会话**本地模型上下文 token 构成**估算。摘要模式的口径为“累计摘要 + 已压缩轮次的最近问题索引 + 未压缩轮次原文及原文补充 + 当前 pending 任务”；未生成摘要时以原始轮次估算。
+
+显式附加 `inspection=true` 可取得上下文管理面板数据；`round_offset`（默认 0）和 `round_limit`（默认 40，1–100）控制最新到最旧的轮次分页。详细模式使用工作线程和只读管理器，不执行摘要重建；`round_tokens` 置为空，轮次改从 `inspection.round_page.items` 获取。完整结构和统计边界见 [上下文管理面板](context_panel.md)。
 
 - `context_token_limit`：当前聊天模型最大输入窗口（model.json `maxInputTokens`）
 - `messages_tokens`：历史消息（含跨轮摘要 system 消息）估算 token；**发送口径**——按真实请求规则计入当前轮（pending）最后一条非空思考（历史轮次思考不回传、不计入），与压缩触发/预算检查口径一致
@@ -258,11 +260,11 @@ manifest.json                     # {version: 3, exported_at, groups: [{id, name
 - `file_memory_tokens`：会话**文件清单块**估算 token（小文件内联/大文件节选；仅启用 `read_document` 时包含读取提示及原生文档索引形态，随首条 system 消息注入；无上传文件时为 0）
 - `request_context_tokens`：`messages_tokens + system_prompt_tokens + tool_definition_tokens + file_memory_tokens`
 - `estimated_budget_ratio`：`request_context_tokens / context_token_limit`（四舍五入到 4 位小数）
-- `rounds`：`{total(总轮数), summarized(已被跨轮摘要覆盖), retained(当前 pending 任务轮数), max_rounds}`
+- `rounds`：`{total(含 pending 的总轮数), summarized(摘要覆盖轮数), retained(以原文保留的轮数，含 pending 与补充轮次), max_rounds}`
 - `has_context_summary` / `summary_text_length`：是否已有跨轮摘要及正文长度
 - `context_compress_count` / `history_compress_count`：单轮压缩累计调用次数 / 跨轮压缩累计调用次数
 - `history_context_mode`：`summary_only` 或 `legacy_raw`
-- `raw_history_rounds_sent`：实际回传给模型的已完成原始轮次数，新模式为 `0`
+- `raw_history_rounds_sent`：本地上下文中以原文保留的已完成轮次数，不含 pending；Responses 有状态模式的远端链按独立规则续接。
 - `recent_questions_count` / `recent_questions_length`：全历史最近用户问题索引的条数/字符数
 - `round_tokens[]`：新模式只统计当前 pending 任务轮；未生成摘要的旧会话才统计原始历史轮次
 
@@ -628,8 +630,10 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 ### 内置文件与终端工具
 
 - **系统提示词固定含文件工具选择优先级说明**：`search_files` 只搜索文件内容，`file_pattern` 只筛选内容搜索范围、不列出文件名；按文件名查找或枚举文件时，若启用 `run_command` 则使用终端命令，否则说明当前工具无法枚举文件名。找到内容后用 `read_file` 查看必要上下文；局部修改用 `edit_file`，新建或整文件写入用 `write_file`；需要运行命令、构建或检查时用 `run_command`。该说明为静态文本，不随本轮实际注入的工具裁剪（区别于 `read_media` 使用指引按真实注入状态条件化）。
-- `write_file` 的模型可见参数要求 `mode=create|overwrite|append`；`create` 在目标已存在时拒绝，`overwrite` 明确覆盖，`append` 追加。旧调用未带 `mode` 时仍按原有默认覆盖行为执行，旧 `append` / `create_only` 参数继续兼容，但不能与冲突的 `mode` 混用。`expected_hash` 与 `read_file.content_hash` 不同时拒绝写入，且不能与 `create` 同用。追加已有文件且未指定 `encoding` 时自动识别 UTF-8/GBK；文件超过 64 MiB 时需显式指定编码。
+- `write_file` 必须明确 `mode=create|overwrite|append`；缺少模式会拒绝，旧历史不会被隐式重新覆盖。执行函数保留明确的旧 `append=true` / `create_only=true` 兼容入口，新模型调用按当前 Schema 校验。`expected_hash` 与 `read_file.content_hash` 不同时拒绝写入，且不能与 `create` 同用。追加已有文件且未指定 `encoding` 时自动识别；追加结果最多 64 MiB。内置写入/编辑按真实路径使用跨进程锁，提交前再次检查文件版本；外部程序不参与该锁，无法承诺任意并发修改下的绝对互斥。
 - **文件工具状态字段**：`write_file`、`edit_file`、`read_file`、`search_files` 成功返回 `success=true`；由工具分发层捕获的执行错误返回 `success=false` 和 `error`，便于模型统一判断结果。
+- **参数与暂停边界**：内置调用在审批及执行前校验当前 Schema，未知字段和非法类型返回 `INVALID_ARGUMENTS`。同轮出现 `ask_user` 时其他调用返回 `WAITING_USER / executed=false`，收到回答后重新调用；合并问题总数不超过 5。布尔值不接受字符串；整数不接受小数；时间不接受 NaN/Infinity。简短示例见 [内置工具使用简表](builtin_tools.md)。
+- **搜索/编辑预算**：搜索正则单行预算最多 0.25 秒，并受本轮扫描截止时间限制；超时返回不完整标记。`exclude_dirs=[]` 不再关闭默认排除，需显式 `no_default_excludes=true`。批量编辑文本合计最多 4 Mi 字符，每一步检查预计结果，最终编码字节数最多 64 MiB；保留未修改区域的混合换行。
 - `edit_file` 使用精确原文替换；单次编辑须同时传顶层 `old_string/new_string`，多处编辑只传 `edits` 列表；两种格式不可混用，全部验证成功后才写入。模型收到独立的紧凑结果：成功时含 `success/path/replacements/changed_range/stats/content_hash`；小型且非重复的变更会附带 `diff`，省略时用 `diff_omitted_reason` 说明，`diff_truncated` 表示返回 diff 是否被截断。大文件无法可靠计算统计时，`stats` 的行数为 `null`，不会伪报为 0。前端和 JSONL 的完整 diff 仍通过独立 `file_diff` 字段传递，不与模型结果混在一起。失败时含 `success=false/error`。复制 `read_file` 输出中连续完整的 `行号| 内容` 行时，首次匹配失败会识别行号并重试。多处匹配仍会拒绝，除非显式传 `replace_all=true`。布尔参数必须为 JSON 布尔值；`read_file` 显式指定错误编码时会报错，而不会把替换字符当成原文。
 - `changed_range` 给出编辑前、编辑后的行号范围；纯插入或删除时没有对应行的一侧为 `null`。批量编辑时该范围是所有改动的包络，因此可能包含未变的中间行；完整分段仍以独立前端 `file_diff` 为准。
 - `read_file`、`search_files`、`read_document` 的文本输出和 `run_command` 的前台输出，在模型调用链中会按当前模型窗口收紧；不足时按工具返回的行号、字符偏移或文件路径继续读取。
@@ -687,7 +691,9 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 
 | 接口 | 方法 | 参数 | 返回 |
 |---|---|---|---|
-| /tools/list | GET | refresh(可选, 默认 false) | `{tools[], total, servers[], failed_servers[], discovery, server_metrics[], mode}`；每项附加 `server_id` 与 `original_name`；跨服务重名、与内置工具同名、与 `over_task` 冲突或不符合模型工具名格式的 MCP 工具使用稳定的合格名作为 `function.name`，`original_name` 保留服务端名称。调用时后端按模型名恢复 `(server_id, original_name)`；单服务超时/失败不阻塞（记录于 failed_servers） |
+| /tools/list | GET | refresh(可选, 默认 false) | `{tools[], total, servers[], server_metadata, failed_servers[], discovery, server_metrics[], mode}`；每项附加 `server_id`、`original_name`；跨服务重名、与内置工具同名、与 `over_task` 冲突或不符合模型工具名格式的 MCP 工具使用稳定的合格名作为 `function.name`，`original_name` 保留服务端名称。调用时后端按模型名恢复 `(server_id, original_name)`；单服务超时/失败不阻塞（记录于 failed_servers）。server_metadata 提供 persistent、浏览器模式及启用的 mcp_profiles/default_profile/locked_profile、连接提示，不包含命令/端点/凭据。单 Browser 工具仅一份，附带通用封装 `{mcp_profile, arguments}`，按连接选择路由，只把原始 arguments 发给 MCP；各工具附带可用 mcp_profiles 与 schema_variants，服务元数据含 profile_status |
+| /tools/diagnostics | GET | 无 | 返回已配置 MCP 服务的 ID、传输方式、配置状态、persistent 及已识别浏览器的连接提示，不启动服务、不暴露命令/端点/凭据 |
+| /tools/diagnostics | POST | server_id, action(connect/call), tool_name(调用时必填), arguments(JSON 对象), timeout_seconds(1–300), mcp_profile(可选已配置的 profile ID) | 新建 stdio 连接，检查握手、能力声明与工具 Schema；call 时校验后实际调用一次。mcp_profile 用于配置了 profiles 的任意 stdio MCP，参数放在请求顶层，工具 arguments 保持原始 MCP Schema。返回脱敏诊断报告 `{ok, steps, tools, result?, error?, elapsed_ms, ...}`，可附带 mcp_profile；只允许已配置服务，不接收任意启动命令。详见 [MCP 测试](mcp_diagnostics.md) |
 
 ### 工具列表缓存与预热
 
@@ -697,6 +703,19 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 - **强制刷新**：`refresh=1` 绕过缓存立即重探，对应前端「配置工具」弹窗的「刷新」按钮；
 - **启动预热**：服务启动时后台线程先探测一次（`tool-registry-prewarm` 线程，失败不阻塞启动），重启后的首个页面加载/首条消息直接命中缓存；
 - **失效同步**：`mcp_servers.json` 的 `servers` 键变更时，配置热重载线程会强制重探并刷新缓存（仅改 `inputs` 不触发），缓存不会滞后于配置变更。
+
+### 可复用任务模板
+
+| 路径 | 方法 | 用途 |
+| --- | --- | --- |
+| `/task_templates` | GET / POST | 列出摘要 / 新建模板定义 |
+| `/task_templates/options` | GET | 可选 source_session_id，返回可用模型、工具与当前配置捕获值 |
+| `/task_templates/validate` | POST | 校验模板定义，无写入副作用 |
+| `/task_templates/{id}` | GET / PUT / DELETE | 读取 / 按 `{template, version}` 更新 / 按 version 查询参数删除 |
+| `/task_templates/preview` | POST | `{template, source_session_id}` → `{summary, fingerprint}`，验证依赖和路径，无模型或 MCP 调用 |
+| `/task_templates/start` | POST | 额外传入 request_id（UUID）和 expected_fingerprint，幂等创建独立配置会话，返回初始任务草稿，不自动发送 |
+
+模板仅保存模型引用；不打包认证信息、模型参数、会话历史或远端响应链。工具与预算支持沿用或指定（0 为无限制），自定义空工具集合表示无工具。完整语义及导入导出格式见 [任务模板说明](task_templates.md)。
 
 ## 6. 文件 FileUpload
 
@@ -769,7 +788,7 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
   - Excel 使用 openpyxl（XLSX）或 xlrd（XLS）。公式读取已保存的缓存值；没有缓存时返回公式表达式并提示，服务端不重新计算。CSV/TSV 支持 BOM、UTF-8、常见中文编码和 CSV 引号语义；
   - 大文件分两层限额：文本解析原始文件最多 10 MiB；表格最多每表 50000 行、1024 列，整文件 20 万行/单元格、4 Mi 字符、100 工作表。XLSX/DOCX 解压总量最多 128 MiB、单项最多 64 MiB，超限拒绝并建议拆分，不静默丢行。模型结果按生效模型窗口、当前上下文及同轮工具数量分配 token 预算，完整 JSON（含元数据）参与估算，预留安全余量；表格不截断行，文本保留精确续读偏移。预算不足时提示先压缩，发送前仍执行上下文预算检查。token 使用项目估算器，非供应商精确分词；原生文档使用独立字节/数量配额，不能由文件字节数保证 token 数；
   - DOCX 正文解析另限最多 4 Mi 字符、20 万个表格网格单元格（含合并占位）、1024 列、1000 个表格、16 层表格嵌套；超限明确失败，不输出假装完整的缺表文本。分页解析入口与上传/工具读取共用此解析器；损坏或超限的 DOCX 不回退为 ZIP 字节乱码；
-  - 原生模式不可用或文件超过单文件大小限制时，`mode=auto` 回退解析文本并说明原因；显式 `mode=native` 返回错误，不静默切换。显式 `mode=text` 始终读取解析文本；
+  - 原生模式不可用或文件超过单文件大小限制时，`mode=auto` 在文本解析上限内尝试回退并说明原因；显式 `mode=native` 返回错误。显式 `mode=text` 始终读取解析文本；
   - 对本地路径，原生分支不预先执行文本解析；回退文本时才解析。文本分段读取复用按文件修改时间和大小键控的有界解析缓存，避免每个片段重复解析；
 - **超窗降级**：清单仍导致首调用超窗时，进一步降级为「文件索引」（仅文件名/类型/大小，`get_file_memory_index`），并推 `CONTEXT_BUDGET_FILE_DOWNGRADED` 警告；
 - **token 统计**：`GET /chat_context/token_stats` 新增 `file_memory_tokens` 字段（清单块估算 token），并计入 `request_context_tokens`。
@@ -780,7 +799,7 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 
 - **部件形态**：OpenAI Chat Completions `{"type":"file","file":{"filename","file_data":"data:<mime>;base64,..."}}`（服务端已分别适配三种协议：Chat Completions 使用 `file` 部件，Messages 使用 `document`，Responses 使用 `input_file`）；
 - **发送节奏**：原生文件只随紧接着的一次模型请求发送。收到完整响应后，内存消息中的原生部件转为 `[文档 文件名]` 占位；仍需原文时模型再次调用 `read_document`。不会在首轮或后续每轮自动重复上传所有支持类型的文件。截断续写或工具调用流超时时暂时保留部件，供重试使用；
-- **分段与大小**：完整原生读取受 `NATIVE_DOC_MAX_BYTES` 单文件限制（默认 20MB）。原生 PDF 可用 `page_start` / `page_count` 选择最多 20 页并发送有效子 PDF；非 PDF 文档可用 `mode=text` 和 `offset` / `limit` 分段读取解析文本。PDF 页段目前仍要求源文件没有超过原生单文件大小限制；
+- **分段与大小**：原生读取受 `NATIVE_DOC_MAX_BYTES` 单文件限制（默认 20MB），工具读取原始字节另有 64 MiB 硬上限；本地原生文件不受文本解析的 10 MiB 上限约束。原生 PDF 可用 `page_start` / `page_count` 选择最多 20 页并发送有效子 PDF；非 PDF 文档可用 `mode=text` 和 `offset` / `limit` 分段读取解析文本。PDF 页段仍要求源文件在读取上限内；
 - **批次预算**（.env 可配、动态热生效）：同一次模型请求最多 `NATIVE_DOC_MAX_ITEMS` 个文件（默认 3），原生文件总量最多 `NATIVE_DOC_TOTAL_MAX_BYTES`（默认 40MB）。`mode=auto` 超预算时回退到文本模式；显式 native 或 PDF 页选段超预算时返回错误，模型可在下一次请求中单独读取；
 - **供应商数量配额**：`models.json` 的 `mediaLimits.document` 限制最终 API 请求中原生 `file` 部件数量，`total` 为文档与图片/音频/视频共享的总配额；不是 `read_media` 专属配置。它与上述服务端批次预算同时生效，解析文本不占配额。最终请求因供应商配额裁剪文档时不会自动回退解析文本，需要模型另行调用 `read_document(mode="text")`。详见 [多模态输入限制](media_limits.md#配置归属与文档工具的关系)；
 - **解析与回退**：上传时照常保存解析文本，供非原生模型、显式 `mode=text` 和自动回退使用。原生读取结果不附加解析文本，避免解析文本与原文件重复进入上下文；本地解析器缺失或解析失败但模型声明支持该类型时，上传仍成功，可通过原生读取查看；
@@ -1007,3 +1026,11 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
 SSE 新增 `{event:"tool_approval",phase:"requested"|"resolved"|"cancelled",approval:{id,task_id,epoch,session_id,agent_id,tool_call_id,state,tool,args,paths,sources,root,reason,server,original_name,round,tool_index,seq?,parent_tool_call_id?,...}}`。`round` 为父会话轮次，子任务附带模型调用轮次 `seq` 及父派发调用 ID，用于绑定主工具、子任务内部工具与顶部的同步审批按钮。事件落在 `chat_round.events`，审批事件仅用于落盘审计，不单独生成展示块；刷新时从 pending 接口恢复原工具块上的有效按钮。原有正文和思考格式保留，`tool_return` 补充 `tool_call_id` 防止同名并发工具结果串位；拒绝生成带原 tool call ID 的配对错误结果。
 
 完整使用方法、存储和恢复边界见 [工具权限说明](tool_permissions.md)。
+
+### 会话归档接口
+
+- `PUT /chat_history/archive`：`{session_id, archived: boolean}`，归档/取消归档。
+- `GET /chat_history/archives?q=&limit=50&offset=0`：分页标题列表与计数。
+- sessions/summaries 新增 `archive_scope=active/archived/all`（默认 active）；search 同名参数默认 all，结果附带 archived；meta 增加 archived/archived_at。
+
+详见 [会话归档](session_archives.md)。

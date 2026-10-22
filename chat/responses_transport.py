@@ -561,8 +561,10 @@ class AsyncClient(_ClientBase):
     async def _call(self, method, suffix, payload, extra_query):
         from .chat_llm import ChatLLM
         parts, host, packet = _wire(self._url(suffix, extra_query), self.headers, method, payload)
+        # Responses 的生成/压缩尝试已在协议客户端登记；底层连接不再登记一遍。
+        # GET 查询恢复结果也不是一次新的模型生成。
         reader, writer = await ChatLLM._open_connection(host, parts.port or (443 if parts.scheme == "https" else 80),
-            parts.scheme == "https", self.request.timeout_connect, self.stop)
+            parts.scheme == "https", self.request.timeout_connect, self.stop, meter_attempt=False)
         io = _AsyncIO(reader, writer, self.request, self.stop)
         self.active.add(io)
         handed_off = False

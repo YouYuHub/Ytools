@@ -30,7 +30,7 @@ class Handler(BaseHTTPRequestHandler):
 def smoke(port: int) -> None:
     # 完整走工具执行器；它会为每次调用新建事件循环。
     def call(name, arguments):
-        return _invoke_tool_function(name, arguments, {name: "Browser"})
+        return _invoke_tool_function(name, {"mcp_profile": "isolated", "arguments": arguments}, {name: "Browser"})
 
     url = f"http://127.0.0.1:{port}/"
     call("browser_navigate", {"url": url})
@@ -54,11 +54,11 @@ def smoke(port: int) -> None:
         raise AssertionError(f"截图未保存：\n{screenshot}")
     child_scope = "sub_agent:smoke"
     _invoke_tool_function(
-        "browser_navigate", {"url": url}, {"browser_navigate": "Browser"},
+        "browser_navigate", {"mcp_profile": "isolated", "arguments": {"url": url}}, {"browser_navigate": "Browser"},
         session_scope=child_scope,
     )
     child_snapshot = _invoke_tool_function(
-        "browser_snapshot", {}, {"browser_snapshot": "Browser"},
+        "browser_snapshot", {"mcp_profile": "isolated", "arguments": {}}, {"browser_snapshot": "Browser"},
         session_scope=child_scope,
     )
     parent_snapshot = call("browser_snapshot", {})

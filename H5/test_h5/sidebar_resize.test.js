@@ -48,3 +48,10 @@ test('cancel restores initial width and collapse state without saving a pending 
   assert.equal(h.document.body.classList.contains('sidebar-resizing'),false);
   assert.equal(h.context.localStorage.getItem('ytools-sidebar-width'),null);
 });
+test('collapsed rail avatar opens settings without expanding sidebar',()=>{
+  const h=setup();let opened=0;h.context.App.sidebarSettings={toggle:()=>{opened++;}};
+  h.sidebar.classList.add('collapsed');
+  h.document.querySelector('#railAvatar').dispatchEvent(new h.context.window.Event('click',{bubbles:true}));
+  assert.equal(opened,1);
+  assert.equal(h.sidebar.classList.contains('collapsed'),true);
+});

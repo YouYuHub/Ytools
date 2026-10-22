@@ -128,7 +128,7 @@ function harness() {
       highlightCodeBlocks() {}, updateCodeblockCopyButtons() {},
       refreshContextTokenStats() {},
       applyToolResult(block, name, resultText) { block.setOutput(resultText); },
-      scheduleContextTokenStatsRefresh() {}, clearInjectedPending() {},
+      scheduleContextTokenStatsRefresh() {}, clearInjectedPending() {}, rebuildQnav() {},
     },
   };
   vm.createContext(context);
@@ -142,6 +142,29 @@ function harness() {
     textsIn: root => queryAll(root, '.msg-assistant-body'),
   };
 }
+
+test('续答的实时容器被尾部窗口重建移除后，下一帧恢复原节点并显示工具过程', () => {
+  const h = harness();
+  h.state.activeStream = h.activeStream;
+  h.activeStream.userNode = makeNode('div','msg-user','回答模型提问');
+  h.msg.remove();
+  h.send({tool_start:{function_name:'read_file',tool_call_id:'live-after-answer'}});
+  assert.equal(h.msg.parentNode,h.chatInner);
+  assert.equal(h.activeStream.userNode.parentNode,h.chatInner);
+  assert.equal(h.chatInner.children[0],h.activeStream.userNode);
+  assert.equal(h.chatInner.children[1],h.msg);
+  assert.equal(h.toolsIn(h.chatInner).length,1);
+});
+
+for (const reason of ['other session','detached','superseded','reading history']) test('实时容器恢复不打断浏览状态：'+reason, () => {
+  const h = harness(); h.state.activeStream = h.activeStream; h.msg.remove();
+  if(reason==='other session')h.state.sessionId='other';
+  if(reason==='detached')h.activeStream.detached=true;
+  if(reason==='superseded')h.state.activeStream={round:3};
+  if(reason==='reading history')h.context.App.getHistoryWindow=()=>({records:[1,2,3],end:1});
+  h.send({content:'后台新内容'});
+  assert.equal(h.msg.parentNode,null);
+});
 
 function historyRound(h, round) {
   const user = makeNode('div', 'msg-user');

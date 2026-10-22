@@ -1,4 +1,5 @@
 """MCP 工具发现、schema 过滤和运行时注册表。"""
+import copy
 import asyncio
 import hashlib
 import json
@@ -10,6 +11,7 @@ from typing import Any, Dict, List
 
 from env_manager import load_var
 from util.mcp_client import get_mcp_tools
+from util.mcp_server_info import describe_mcp_server
 
 from util.logger import get_logger
 
@@ -86,8 +88,11 @@ def resolve_tool_selection(
         original_names = snapshot_originals
     resolved: list[str] = []
     seen: set[str] = set()
+    available_servers = set(tool_servers.values())
     for server_id, names in selection.items():
         server_key = str(server_id)
+        if server_key != "__builtin__" and server_key not in available_servers:
+            continue
         if not isinstance(names, list):
             continue
         for value in names:
@@ -314,6 +319,13 @@ def load_all_tools(current_dir: str) -> None:
 async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
     global ALL_TOOLS, TOOL_MCP_SERVERS, TOOL_ORIGINAL_NAMES, TOOL_NAME_INDEX
     server_ids = _read_server_ids(current_dir)
+    server_configs = _load_mcp_servers(current_dir)
+    server_metadata = {}
+    for server in server_ids:
+        try:
+            server_metadata[server] = describe_mcp_server(server_configs.get(server))
+        except ValueError:
+            server_metadata[server] = {"configuration_error": True, "connection_hint": "连接配置无效，请在 MCP 测试中检查。"}
     if not server_ids:
         with _REGISTRY_SWAP_LOCK:
             ALL_TOOLS = []
@@ -325,6 +337,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             "total": 0,
             "servers": [],
             "failed_servers": [],
+            "server_metadata": {},
             "discovery": {
                 "max_concurrency": 0,
                 "timeout_seconds": 0,
@@ -367,6 +380,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
     tool_original_names: dict[str, str] = {}
     tool_name_index: dict[str, list[str]] = {}
     discovered: list[tuple[str, str, dict]] = []
+    profile_tools = {}
     seen_identities: set[tuple[str, str]] = set()
     failed_servers: list[str] = []
     server_metrics: list[dict[str, Any]] = []
@@ -387,6 +401,8 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
             "tool_count": len(server_tools),
             "elapsed_ms": server_elapsed,
         })
+        if hasattr(server_tools, "profile_status"):
+            server_metadata[server_id]["profile_status"] = server_tools.profile_status
         for tool in server_tools:
             tool_name = getattr(tool, "name", None)
             if not isinstance(tool_name, str) or not tool_name.strip():
@@ -405,6 +421,9 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
                     "parameters": getattr(tool, "parameters", {}) or {},
                 },
             }
+            if hasattr(server_tools, "tool_profiles"):
+                profile_tools[identity] = {"mcp_profiles": server_tools.tool_profiles.get(tool_name, []),
+                                          "schema_variants": server_tools.schema_variants.get(tool_name, 1)}
             discovered.append((server_id, tool_name, tool_definition))
 
     # Raw names remain unchanged when they are globally unique and do not collide
@@ -432,6 +451,21 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
         used_names.add(visible_name)
         filtered_tool = _filter_tool_for_api(tool_definition)
         filtered_tool["function"]["name"] = visible_name
+        connection = server_metadata.get(server_id, {})
+        if (server_id, original_name) in profile_tools:
+            # Preserve local refs/definitions and all constraints in the envelope.
+            filtered_tool["function"]["parameters"] = copy.deepcopy(tool_definition["function"]["parameters"])
+        if needs_qualified_name or connection.get("browser_mode") or connection.get("mcp_profiles"):
+            prefix = f"[MCP 服务: {server_id}; 工具原名: {original_name}]"
+            if connection.get("mcp_profiles"):
+                supported = profile_tools.get((server_id, original_name), {}).get("mcp_profiles", [])
+                prefix += " 选择 mcp_profile，业务参数放入 arguments。连接及用途：" + "；".join(
+                    entry["id"] + "=" + entry["label"] + ("（" + entry["description"] + "）" if entry.get("description") else "")
+                    for entry in connection["mcp_profiles"] if entry["id"] in supported)
+                prefix += "。连续操作同一状态保持 profile 一致；不会自动切换连接。"
+            elif connection.get("connection_label"):
+                prefix += " " + connection["connection_label"] + "。" + connection.get("connection_hint", "")
+            filtered_tool["function"]["description"] = prefix + "\n" + filtered_tool["function"].get("description", "")
         filtered_tools.append(filtered_tool)
         tool_mcp_servers[visible_name] = server_id
         tool_original_names[visible_name] = original_name
@@ -452,6 +486,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
         )
         tool_with_server["server_id"] = tool_mcp_servers.get(func_name, "")
         tool_with_server["original_name"] = tool_original_names.get(func_name, func_name)
+        tool_with_server.update(profile_tools.get((tool_with_server["server_id"], tool_with_server["original_name"]), {}))
         api_tools.append(tool_with_server)
     logger.info(f"✅ 已加载 {len(filtered_tools)} 个工具（{len(server_metrics)} 个 MCP 服务器）")
     for metric in server_metrics:
@@ -463,6 +498,7 @@ async def refresh_tools_from_mcp(current_dir: str) -> dict[str, Any]:
         "total": len(filtered_tools),
         "servers": server_ids,
         "failed_servers": failed_servers,
+        "server_metadata": server_metadata,
         "discovery": {
             "max_concurrency": max_concurrency,
             "timeout_seconds": timeout_seconds,

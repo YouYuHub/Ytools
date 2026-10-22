@@ -65,7 +65,7 @@ class PersistentBrowserClientTests(unittest.TestCase):
         params = mcp_client.build_stdio_server_parameters("Browser")
         self.assertEqual(
             Path(params.env["PLAYWRIGHT_MCP_OUTPUT_DIR"]),
-            Path(tempfile.gettempdir()) / "ytools_playwright_artifacts",
+            Path(tempfile.gettempdir()) / "ytools_playwright_artifacts" / "isolated",
         )
 
     def test_timeout_discards_stalled_browser_connection(self):
@@ -80,7 +80,7 @@ class PersistentBrowserClientTests(unittest.TestCase):
                 patch.object(mcp_client, "_mcp_call_timeout_seconds", return_value=0.01):
             with self.assertRaises(asyncio.TimeoutError):
                 asyncio.run(mcp_client.call_mcp_tool("browser_snapshot", {}, "Browser"))
-        drop.assert_called_once_with("Browser", "main", stalled)
+        drop.assert_called_once_with("Browser", "main", stalled, "isolated")
 
 
 class ImageResultTests(unittest.TestCase):

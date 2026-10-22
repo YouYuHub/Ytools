@@ -74,10 +74,10 @@ class SubAgentToolDefinitionTests(unittest.TestCase):
         self.assertEqual(task, "分析目录")
         self.assertIsNone(err)
 
-    def test_normalize_task_from_object(self):
+    def test_normalize_task_rejects_object(self):
         task, err = builtin_tools.normalize_sub_agent_task({"task": "调研 X"})
-        self.assertEqual(task, "调研 X")
-        self.assertIsNone(err)
+        self.assertIsNone(task)
+        self.assertIn("字符串", err)
 
     def test_normalize_task_empty_rejected(self):
         task, err = builtin_tools.normalize_sub_agent_task("   ")
@@ -278,7 +278,7 @@ TOOL_CALL_CHUNKS = [
          "function": {"name": "write_file", "arguments": "{\"path\""}},
     ]}),
     _sse({"tool_calls": [
-        {"index": 0, "function": {"arguments": ": \"tmp/sub_ut.txt\", \"content\": \"hi\"}}"}},
+        {"index": 0, "function": {"arguments": ": \"tmp/sub_ut.txt\", \"content\": \"hi\", \"mode\": \"overwrite\"}"}},
     ]}),
     _sse({"finish_reason": "tool_calls"}),
     "data: [DONE]\n\n",

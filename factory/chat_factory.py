@@ -11,6 +11,7 @@ import time
 import threading
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 # import inspect
 from typing import Any, List, AsyncGenerator
 
@@ -50,6 +51,7 @@ from memory.quote_format import (
 from memory import file_history as _file_history
 from factory.agent_runtime import tool_registry
 from factory.agent_runtime.todo_runtime import TodoLoopGuard, TodoContext, latest_todo_exchanges
+from factory.agent_runtime.tool_control import run_sync_tool
 from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
@@ -785,10 +787,11 @@ async def _emit_sub_agent_event(session_chat_memory, stream, payload: dict[str, 
                and event.get("tool_call_id") == payload.get("tool_call_id")
                for event in pending.get("events", [])):
             return
-    try:
-        await session_chat_memory.add_sub_agent_event(payload)
-    except Exception as persist_error:
-        logger.warning(f"sub_agent 事件落盘失败（phase={payload.get('phase')}）: {persist_error}")
+    if payload.get("phase") not in {"delta", "heartbeat"}:
+        try:
+            await session_chat_memory.add_sub_agent_event(payload)
+        except Exception as persist_error:
+            logger.warning(f"sub_agent 事件落盘失败（phase={payload.get('phase')}）: {persist_error}")
     try:
         await _stream_emit(
             stream,
@@ -810,6 +813,7 @@ def _build_sub_agent_contexts(
     round_tool_original_names: dict[str, str] | None = None,
     parent_vision_enabled: bool | None = None,
     parent_round_number: int = 0,
+    reply_token_budget: int = 0,
 ) -> list["SubAgentContext"]:
     """把父循环收集的 sub_agent 调用转成 SubAgentContext 列表（docs/sub_agent_v1.md §6.1）。
 
@@ -862,6 +866,7 @@ def _build_sub_agent_contexts(
             max_rounds=limits["max_rounds"],
             timeout_seconds=limits["timeout_seconds"],
             reply_max_chars=limits["reply_max_chars"],
+            reply_token_budget=reply_token_budget,
             emit_event=lambda payload: _emit_sub_agent_event(session_chat_memory, stream, payload),
             stop_checker=stop_checker,
             parent_vision_enabled=parent_vision_enabled,
@@ -1205,14 +1210,11 @@ async def _run_chat_generation(
         permission_runtime.costs = BudgetTracker(permission_runtime.id, session_id, stop_checker, cost_emit, permission_runtime)
         await permission_runtime.costs.notify()
         permission_runtime.bind_config("main", {"model": chat_config_effective, "servers": round_tool_servers, "original_names": round_tool_original_names, "tools": round_tools})
-        # 轮次开始事件：告知前端本轮的最终轮次号（普通发送=已收尾轮次数+1；
-        # target_round/insert_round 已在上方单独推送，不再重复）。前端据此给
+        # 轮次开始事件：三种发送路径统一确认最终轮次号。target_round /
+        # insert_round 只是请求的编辑位置，不能代替前端实时流的轮次身份。前端据此给
         # 本轮提问气泡就地补挂编辑/删除入口，不再依赖收尾整段重载（否则最后
         # 完成的一轮要切走再切回才有操作入口）。轮次可能因覆盖式回答截断而
         # 偏移，事件统一推迟到截断后发送；失败路径不发送（前端走失败重载兜底）
-        emit_round_started = (
-            request_target_round is None and request_insert_round is None
-        )
         # 覆盖式重新回答：新消息是对最新 ask_user 提问的回答时，先截断该提问
         # 轮之后的旧回答轮，保证一个问题只有一个答案轮次。截断方法内置保护：
         # 提问轮之后若已开启普通新任务（非回答轮），则不动历史按追加处理。
@@ -1234,17 +1236,11 @@ async def _run_chat_generation(
                         # truncate_rounds_for_reanswer 已同步摘要锚点，保留其有效结果。
         except Exception as trunc_error:
             logger.warning(f"覆盖式回答截断失败（按追加处理）: {trunc_error}")
-        # 覆盖式截断后重新取得最终轮次号。编辑重发/插入虽不再发送
-        # round_started 帧，刷新附接的 marker 仍必须携带轮次号，才能按轮
+        # 覆盖式截断后重新取得最终轮次号，刷新附接的 marker 同步携带，才能按轮
         # 收养历史中的用量行，而不误合并相邻轮次。
+        live_round_no = current_round_number
         try:
             live_round_no = await session_chat_memory.get_current_round_number()
-            stream.live_round_no = int(live_round_no)
-            if emit_round_started:
-                await _stream_emit(
-                    stream,
-                    f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n",
-                )
         except Exception as round_emit_error:
             logger.warning(f"当前轮次标记发送失败（前端走重载兜底）: {round_emit_error}")
         use_backend_history = parse_bool_like(
@@ -1287,6 +1283,78 @@ async def _run_chat_generation(
                     + runtime_sys_text
                 ),
             })
+        latest_user_message = None
+        latest_user_text = ""
+        for msg in reversed(incoming_messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                # 多模态消息 content 为部件列表：取文本部件作为问题文本，
+                # 原始消息（含 media:// 媒体引用）原样落盘
+                latest_user_text = content_part_to_text(
+                    msg.get("content"), include_media_labels=False
+                ).strip()
+                # 纯媒体提问（无文本）但带引用快照时同样挂到本轮：
+                # 引用快照仍需落盘、随回放 marker 下发并进入模型视图
+                if latest_user_text or msg.get("quotes") or msg.get("content"):
+                    latest_user_message = msg
+                break
+        if latest_user_message:
+            # 引用快照（选中文本引用到提问，见 docs/quote_selection.md）：
+            # 先按容错口径规整；历史视图（JSONL）保存原始 content + 规范化
+            # quotes（供回放/编辑/复制），模型视图在下面把 <quote_list> 前置
+            # 进该条 user 消息的 content（当前轮请求与压缩源共用同一序列化）。
+            latest_user_quotes = normalize_quotes(
+                latest_user_message.get("quotes"), strict=False
+            )
+            history_message = dict(latest_user_message)
+            if latest_user_quotes:
+                history_message["quotes"] = latest_user_quotes
+            else:
+                history_message.pop("quotes", None)
+            if not permission_resume:
+                await session_chat_memory.add_chat_history(history_message)
+            if round_model:
+                # 本轮生效聊天模型（provider/name/id）：唯一下发通道。
+                # round_started 只确认轮次身份，模型名统一由本帧提供；
+                # 三条路径均于提问落盘后推送，前端统一按此更新显示。
+                # 同步写入 stream：round_model 帧在回放起点之前，附接消费端
+                # 收不到，必须随回放 marker 携带（与 live_round_no 同一思路）。
+                # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+                if hasattr(stream, "live_round_model"):
+                    stream.live_round_model = dict(round_model)
+                await session_chat_memory.set_current_round_model(round_model)
+                await _stream_emit(
+                    stream,
+                    f"data: {json.dumps({'round_model': round_model}, ensure_ascii=False)}\n\n",
+                )
+            if not stream.question_text:
+                stream.question_text = latest_user_text
+            # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
+            # 必须在下方 resolve_message_media_refs 就地改写为 base64 之前克隆，
+            # 否则副本会被污染成巨型 data URL（仅引用串很小）。
+            # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+            if getattr(stream, "question_parts", None) is None:
+                stream.question_parts = _normalize_question_parts(
+                    latest_user_message.get("content")
+                )
+            # 回放 marker 携带引用快照：刷新重连后重建引用卡片（与提问部件
+            # 同源，均为落盘/改写前的原始快照）
+            if latest_user_quotes and getattr(stream, "question_quotes", None) is None:
+                stream.question_quotes = latest_user_quotes
+            # 模型视图：<quote_list> 前置到问题正文（多模态消息作为第一个 text
+            # 部件），并从运行时消息移除自定义 quotes 字段——发给上游的请求
+            # 只含标准字段（chat_runtime.copy_for_request 另有兜底剥离）
+            if latest_user_quotes:
+                latest_user_message["content"] = content_with_quotes(
+                    latest_user_message.get("content"), latest_user_quotes
+                )
+                latest_user_message.pop("quotes", None)
+        # 只有提问检查点已保存，才对外确认轮次编号；耗时预处理被停止后仍可编辑。
+        if latest_user_message is not None and live_round_no > 0:
+            stream.live_round_no = int(live_round_no)
+            await _stream_emit(stream, f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n")
+        # 从提问落盘后的准备阶段开始回放，首调用超窗时的压缩/错误也属于
+        # 当前轮，不能等进入模型循环才记录起点，否则完整重建会丢掉这些卡片。
+        stream.set_round_start()
         if use_backend_history and not permission_resume:
             try:
                 # 中断恢复：上次任务可能在压缩进行到一半时被终止（无 done 信号）。
@@ -1336,75 +1404,6 @@ async def _run_chat_generation(
                 # 主 system 保持在首位：累计摘要/最近问题/历史轮次排在其后
                 messages = [messages[0]] + backend_messages + messages[1:]
                 logger.info(f"已拼接累计摘要和最近问题（消息 {len(backend_messages)} 条）")
-        latest_user_message = None
-        latest_user_text = ""
-        for msg in reversed(incoming_messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                # 多模态消息 content 为部件列表：取文本部件作为问题文本，
-                # 原始消息（含 media:// 媒体引用）原样落盘
-                latest_user_text = content_part_to_text(
-                    msg.get("content"), include_media_labels=False
-                ).strip()
-                # 纯媒体提问（无文本）但带引用快照时同样挂到本轮：
-                # 引用快照仍需落盘、随回放 marker 下发并进入模型视图
-                if latest_user_text or msg.get("quotes"):
-                    latest_user_message = msg
-                break
-        if latest_user_message:
-            # 引用快照（选中文本引用到提问，见 docs/quote_selection.md）：
-            # 先按容错口径规整；历史视图（JSONL）保存原始 content + 规范化
-            # quotes（供回放/编辑/复制），模型视图在下面把 <quote_list> 前置
-            # 进该条 user 消息的 content（当前轮请求与压缩源共用同一序列化）。
-            latest_user_quotes = normalize_quotes(
-                latest_user_message.get("quotes"), strict=False
-            )
-            history_message = dict(latest_user_message)
-            if latest_user_quotes:
-                history_message["quotes"] = latest_user_quotes
-            else:
-                history_message.pop("quotes", None)
-            if not permission_resume:
-                await session_chat_memory.add_chat_history(history_message)
-            if round_model:
-                # 本轮生效聊天模型（provider/name/id）：唯一下发通道。
-                # round_started 帧不再携带 model——该帧只在普通发送路径推送，
-                # 编辑重发(target_round)/回答插入(insert_round) 会缺模型名；
-                # 而本帧在三条路径下均于提问落盘后推送，前端统一按此更新显示。
-                # 同步写入 stream：round_model 帧在回放起点之前，附接消费端
-                # 收不到，必须随回放 marker 携带（与 live_round_no 同一思路）。
-                # getattr 防御：测试替身等最小 stream 桩可能没有该属性
-                if hasattr(stream, "live_round_model"):
-                    stream.live_round_model = dict(round_model)
-                await session_chat_memory.set_current_round_model(round_model)
-                await _stream_emit(
-                    stream,
-                    f"data: {json.dumps({'round_model': round_model}, ensure_ascii=False)}\n\n",
-                )
-            if not stream.question_text:
-                stream.question_text = latest_user_text
-            # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
-            # 必须在下方 resolve_message_media_refs 就地改写为 base64 之前克隆，
-            # 否则副本会被污染成巨型 data URL（仅引用串很小）。
-            # getattr 防御：测试替身等最小 stream 桩可能没有该属性
-            if getattr(stream, "question_parts", None) is None:
-                stream.question_parts = _normalize_question_parts(
-                    latest_user_message.get("content")
-                )
-            # 回放 marker 携带引用快照：刷新重连后重建引用卡片（与提问部件
-            # 同源，均为落盘/改写前的原始快照）
-            if latest_user_quotes and getattr(stream, "question_quotes", None) is None:
-                stream.question_quotes = latest_user_quotes
-            # 模型视图：<quote_list> 前置到问题正文（多模态消息作为第一个 text
-            # 部件），并从运行时消息移除自定义 quotes 字段——发给上游的请求
-            # 只含标准字段（chat_runtime.copy_for_request 另有兜底剥离）
-            if latest_user_quotes:
-                latest_user_message["content"] = content_with_quotes(
-                    latest_user_message.get("content"), latest_user_quotes
-                )
-                latest_user_message.pop("quotes", None)
-        # 从提问落盘后的准备阶段开始回放，首调用超窗时的压缩/错误也属于
-        # 当前轮，不能等进入模型循环才记录起点，否则完整重建会丢掉这些卡片。
-        stream.set_round_start()
         # read_media 的 media:// 引用常规集合（当前任务轮用户消息中出现的引用）；
         # 当前策略：工具由用户提供、无安全边界——该集合仅作为 media:// 引用的
         # 常规过滤传给 execute_read_media（本地/网络来源不在此列、不受过滤）。
@@ -1424,8 +1423,8 @@ async def _run_chat_generation(
         # 模型不支持视觉（vision=false）时媒体部件不解析 base64，就地替换为
         # 带引用的文本占位（图片仅存档，不发图片数据）。
         try:
-            unresolved_media = resolve_message_media_refs(
-                session_id, messages, vision_enabled=vision_enabled,
+            unresolved_media = await asyncio.to_thread(
+                resolve_message_media_refs, session_id, messages, vision_enabled=vision_enabled,
                 **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
             )
             if unresolved_media:
@@ -2369,6 +2368,7 @@ async def _run_chat_generation(
             # 待注入坐标含引用、质量、视频区间和去重键，注入时现场加载部件。
             read_media_injected_refs = collect_injected_media_keys(limit_media_messages(messages, chat_config_effective)[0])
             read_media_pending_parts: list[tuple[str, Any, Any, Any, str]] = []
+            loaded_media_parts = {}
             # read_document 原生分支待注入部件：按目标文件的 supportDocTypes
             # 声明选择；工具结果中的 base64 在下方仅加入下一次模型请求（内存）
             native_doc_pending_parts: list[Any] = []
@@ -2479,7 +2479,7 @@ async def _run_chat_generation(
                     #（reference+quality+区间），数据本体（base64）不进入工具结果
                     # 文本（避免刷 JSONL / 超大结果截断），在下方统一处理时按坐标
                     # 现场加载为 user 消息部件（仅内存）
-                    read_media_result = execute_read_media(
+                    read_media_result = await run_sync_tool(execute_read_media,
                         ta,
                         session_id,
                         current_task_media_references,
@@ -2487,6 +2487,7 @@ async def _run_chat_generation(
                         media_limits=get_media_limits(chat_config_effective),
                         vision_enabled=vision_enabled,
                         api_type=api_type if api_type in {"messages", "responses"} else None,
+                        loaded_parts=loaded_media_parts,
                     )
                     if read_media_result.get("ok"):
                         read_media_injected_refs.update(
@@ -2518,7 +2519,7 @@ async def _run_chat_generation(
                     # 按单个文件的 supportDocTypes 决定 auto 模式：命中且原始文件
                     # 可用时只发原生文档；否则返回解析文本。vision 标志不参与此
                     # 分流。模型显式选择 native/text 或区间参数可覆盖 auto。
-                    read_document_result = execute_read_document(
+                    read_document_result = await run_sync_tool(execute_read_document,
                         bounded_args, session_id, support_doc_types=native_doc_types
                     )
                     native_block = read_document_result.get("native") if isinstance(read_document_result, dict) else None
@@ -2542,7 +2543,7 @@ async def _run_chat_generation(
                                 fallback_mode = ("table" if Path(str(ta.get("filename") or "")).suffix.lower()
                                                  in TABLE_EXTENSIONS else "text")
                                 text_args = {**bounded_args, "mode": fallback_mode}
-                                read_document_result = execute_read_document(
+                                read_document_result = await run_sync_tool(execute_read_document,
                                     text_args, session_id, support_doc_types=native_doc_types
                                 )
                                 if isinstance(read_document_result, dict) and not read_document_result.get("error"):
@@ -2582,18 +2583,20 @@ async def _run_chat_generation(
                         })
                         continue
                     initial_todo = None
-                    if isinstance(ta, dict) and isinstance(ta.get("todo"), list):
+                    if isinstance(ta, dict) and "todo" in ta:
                         items, _notices, todo_error = normalize_todo_items(
                             ta.get("todo"), prev_items=[])
                         if todo_error is None and items is not None:
                             initial_todo = items
                         elif todo_error:
-                            logger.warning(f"sub_agent 预置 todo 无效，忽略：{todo_error}")
+                            builtin_results.append({"index": idx, "tool_call": tc, "tool_name": tn,
+                                                    "tool_args": ta, "result": {"error": todo_error}, "error": None})
+                            continue
                     sub_agent_calls.append((idx, tc, task_text, initial_todo))
                     continue
                 # 内置文件编辑工具（write_file/edit_file）：服务端本地执行，
                 # 结构化结果（path/replacements 等）为后续文件 diff 预留
-                file_tool_result = try_execute_builtin_file_tool(tn, bounded_args)
+                file_tool_result = await run_sync_tool(try_execute_builtin_file_tool, tn, bounded_args)
                 if file_tool_result is not None:
                     builtin_results.append({
                         "index": idx,
@@ -2608,7 +2611,7 @@ async def _run_chat_generation(
                 # 阻塞调用（可能长达分钟级），经 asyncio.to_thread 放到工作线程
                 # 执行，避免卡死事件循环（与 MCP 工具走线程池的语义一致）
                 if tn in COMMAND_TOOL_NAMES:
-                    command_result = await asyncio.to_thread(
+                    command_result = await run_sync_tool(
                         try_execute_builtin_command_tool, tn, bounded_args)
                     builtin_results.append({
                         "index": idx,
@@ -2652,6 +2655,7 @@ async def _run_chat_generation(
                     stop_checker=stop_checker,
                     parent_vision_enabled=vision_enabled,
                     parent_round_number=current_round_number,
+                    reply_token_budget=max(128, document_budget),
                 )
                 tool_results.extend(await run_sub_agent_batch(sub_contexts))
             if builtin_results:
@@ -2837,11 +2841,13 @@ async def _run_chat_generation(
                     retire_prior_video_parts(messages)
                     media_parts = []
                     for reference, quality, start_time, end_time, _key in read_media_pending_parts:
-                        info = load_any_media_model_part(
-                            session_id, reference, quality=quality,
-                            start_time=start_time, end_time=end_time,
-                            **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
-                        )
+                        info = loaded_media_parts.pop(_key, None)
+                        if info is None:
+                            info = await run_sync_tool(load_any_media_model_part,
+                                session_id, reference, quality=quality,
+                                start_time=start_time, end_time=end_time,
+                                **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
+                            )
                         if info is not None and info.get("part") is not None:
                             media_parts.append(info["part"])
                         elif isinstance(info, dict) and info.get("error"):
@@ -3015,6 +3021,11 @@ async def _run_chat_generation(
             await permission_runtime.costs.notify()
         permission_runtime.close("suspended" if permission_state and permission_state["state"] == "suspended"
                                  else "cancelled" if getattr(stream, "user_stop_requested", False) or (permission_state and permission_state["state"] == "cancelled") else permission_final_state)
+        # 前置压缩/预算检查可能在进入模型循环前直接返回；已接收的提问也必须
+        # 收尾，不能留下 writer 仍存活、以后却无法恢复的 running 检查点。
+        pending_round = getattr(getattr(session_chat_memory, "_round_store", None), "pending_round", None)
+        if pending_round is not None and not (permission_state and permission_state["state"] == "suspended"):
+            session_chat_memory._finish_current_round("stopped" if getattr(stream, "user_stop_requested", False) else "error")
         stream.stop_requested = True
         # target_round / insert_round 兜底复位：正常路径由收尾替换/插入逻辑
         # 复位，异常路径下管理器缓存随 cleanup 销毁自然复位；这里显式兜底防
@@ -3090,6 +3101,44 @@ async def _wait_worker_generation(proxy, stream) -> None:
         await stream.finish()
 
 
+async def _retire_interrupted_tasks(session_id: str) -> int:
+    """New user input supersedes a dead task, retaining its recoverable history.
+
+    This is a new model turn, not a replay of possibly executed tools. Explicit
+    permission-panel resume remains available until the new message is sent.
+    """
+    from memory import permission_store, task_cost_store
+    from factory.agent_runtime.permission_runtime import close_pending_native
+    permission_store.pending(session_id)
+    with permission_store.database() as db:
+        dispatching = db.execute("SELECT 1 FROM tasks t JOIN checkpoints c ON c.task=t.id AND c.agent='main' WHERE t.session=? AND t.state='running' AND COALESCE(json_extract(t.data,'$.preview'),0)=0 LIMIT 1", (session_id,)).fetchone()
+        orphan_ids = [row[0] for row in db.execute("SELECT id FROM tasks WHERE session=? AND state='suspended' AND COALESCE(json_extract(data,'$.preview'),0)=0 ORDER BY updated", (session_id,))]
+    if dispatching:
+        raise ValueError("原任务正在执行或恢复中，请等待完成或停止原任务后再发送")
+    if not orphan_ids:
+        return 0
+    claimed = []
+    try:
+        for task_id in orphan_ids:
+            claimed.append(permission_store.claim_interrupted_task(task_id))
+        manager = await get_chat_memory_manager(session_id)
+        reason = "原任务因服务中断而结束，已由新消息接续"
+        for current in claimed:
+            task_id = current["id"]
+            snapshot = permission_store.load_checkpoint(task_id) or {}
+            original = current["data"].get("request", {})
+            await manager.finish_saved_permission_round(snapshot.get("pending_round"),
+                original.get("target_round"), original.get("insert_round"),
+                status="interrupted", task_id=task_id, reason=reason)
+            close_pending_native(task_id, session_id, reason)
+            permission_store.set_task_state(task_id, "cancelled")
+            task_cost_store.finish(task_id, "cancelled")
+        return len(claimed)
+    finally:
+        for current in claimed:
+            permission_store.release_resume(current["id"], current["epoch"])
+
+
 async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest, permission_resume_id=None) -> bool:
     """启动一次生成任务。
 
@@ -3100,18 +3149,38 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
     # 权限恢复的新流只含恢复点之后的事件；检查点里更早的工具结果仍由
     # 历史快照提供，不能声明可替换整个任务。日志本身仍保存全部恢复段。
     stream._replay_has_history_prefix = bool(permission_resume_id)
+    resume_claim = None
+    if permission_resume_id:
+        from memory.permission_store import task
+        resume_claim = task(permission_resume_id)
+    def release_unadopted_resume():
+        if resume_claim:
+            from memory.permission_store import release_resume
+            try:
+                release_resume(permission_resume_id, resume_claim["epoch"])
+            except Exception:
+                logger.exception("释放未被接管的恢复任务失败")
     if not permission_resume_id:
-        from memory.permission_store import resumable
-        if resumable(tool_request.session_id):
-            await _stream_emit(stream, _sse_error_payload("会话有待恢复的权限任务，请在权限面板继续审批或放弃该任务后再发送新问题"))
+        try:
+            retired = await _retire_interrupted_tasks(tool_request.session_id) if _request_has_new_user_message(tool_request) else 0
+        except Exception as error:
+            await _stream_emit(stream, _sse_error_payload(f"无法接续中断任务：{error}"))
             await stream.finish()
             return False
+        if retired:
+            await _stream_emit(stream, "data: " + json.dumps({"warning": {
+                "code":"INTERRUPTED_TASK_CONTINUED", "message":"已保存中断任务的轨迹并开始新一轮；结果未知的工具不会自动重跑，请先核对实际效果。"
+            }}, ensure_ascii=False) + "\n\n")
     # 会话配置快照：首次正式开始任务时把当前全局默认（模型/工具/工作目录）
     # 固化为会话独立配置，此后该会话不再跟随全局设置变化（幂等，快照过即跳过）。
     try:
         session_chat_memory = await get_chat_memory_manager(
             normalize_session_id(getattr(tool_request, "session_id", "default"))
         )
+        if not permission_resume_id and hasattr(session_chat_memory, "_recover_pending_round_checkpoint"):
+            # A cached manager can predate the writer's death, including death
+            # before a durable tool checkpoint existed. Recheck before new input.
+            session_chat_memory._recover_pending_round_checkpoint()
         await session_chat_memory.ensure_session_config_snapshot()
     except Exception as snapshot_error:
         logger.warning(f"会话配置快照失败（不影响本轮对话）: {snapshot_error}")
@@ -3119,7 +3188,13 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
         proxy.bind_stream(stream)
         # Preserve explicit parameter selection across the process boundary.
         # Serializing defaults would turn Chat-only defaults into native opts.
-        started = proxy.start_generation(tool_request.model_dump(exclude_unset=True), permission_resume_id=permission_resume_id) if permission_resume_id else proxy.start_generation(tool_request.model_dump(exclude_unset=True))
+        try:
+            started = proxy.start_generation(tool_request.model_dump(exclude_unset=True), permission_resume_id=permission_resume_id) if permission_resume_id else proxy.start_generation(tool_request.model_dump(exclude_unset=True))
+        except Exception as error:
+            logger.exception("会话 worker 启动失败")
+            await _stream_emit(stream, _sse_error_payload(f"会话 worker 进程启动失败：{error}"))
+            await stream.finish()
+            return False
         if not started:
             await _stream_emit(
                 stream,
@@ -3127,9 +3202,27 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
             )
             await stream.finish()
             return False
-        stream.task = asyncio.create_task(_wait_worker_generation(proxy, stream))
+        async def wait_worker():
+            try:
+                await _wait_worker_generation(proxy, stream)
+            finally:
+                release_unadopted_resume()
+                await stream.finish()
+        stream.task = asyncio.create_task(wait_worker())
         return True
-    stream.task = asyncio.create_task(_run_chat_generation(tool_request, stream, permission_resume_id=permission_resume_id))
+    async def run_inline():
+        try:
+            await _run_chat_generation(tool_request, stream, permission_resume_id=permission_resume_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not stream.done:
+                await _stream_emit(stream, _sse_error_payload(f"生成任务异常终止：{error}"))
+            logger.exception("会话生成任务异常终止")
+        finally:
+            release_unadopted_resume()
+            await stream.finish()
+    stream.task = asyncio.create_task(run_inline())
     return True
 
 
@@ -3162,6 +3255,64 @@ async def resume_permission_task(task_id):
 _SSE_HEARTBEAT_SECONDS = 15.0
 
 
+_SESSION_START_GUARDS = {}
+
+
+@asynccontextmanager
+async def _session_start_guard(session_id):
+    # Serialize only setup/dispatch, not SSE consumption. Readers must not see
+    # a half-created stream while recovery awaits history/configuration I/O.
+    key = (asyncio.get_running_loop(), session_id)
+    entry = _SESSION_START_GUARDS.setdefault(key, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if not entry[1]:
+            _SESSION_START_GUARDS.pop(key, None)
+
+
+async def _prepare_chat_stream(tool_request):
+    session_id = tool_request.session_id
+    if _generation_use_worker():
+        # Sweep before looking up the proxy, never evict the one about to run.
+        sweep_dead_worker_proxies()
+        proxy = get_worker_proxy(session_id)
+        proxy.set_loop(asyncio.get_running_loop())
+    else:
+        proxy = None
+    stream = _get_session_stream(session_id)
+    task_active = bool(stream and stream.task and not stream.task.done())
+    task_active = task_active or bool(proxy and proxy.is_generation_running())
+    has_message = _request_has_new_user_message(tool_request)
+    if stream is None or stream.done or not task_active:
+        if not has_message:
+            return None, False
+    elif not has_message:
+        return stream, False
+    else:
+        stream.user_stop_requested = False
+        if proxy is not None:
+            proxy.request_stop(reason="interrupt")
+            await _wait_worker_idle(proxy)
+        else:
+            stream.stop_requested = True
+            stream.task.cancel()
+            try:
+                await stream.task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                logger.warning(f"旧生成任务退出异常（已忽略）: {error}")
+    stream = _set_session_stream(session_id)
+    await _start_session_generation(proxy, stream, tool_request)
+    # A failed start still owns its error frames and must be consumed by the
+    # creating request, even if finish() has already run.
+    return stream, True
+
+
 async def tool_chat_server(
     tool_request: ChatLLMRequest
 ) -> AsyncGenerator[str, None]:
@@ -3172,66 +3323,24 @@ async def tool_chat_server(
     - 页面刷新后的重连请求（无用户消息）只订阅事件缓冲，从任务起点回放；
     - 携带新用户消息的请求会先平滑打断旧任务，再重新开始一轮生成。
     """
-    session_id = getattr(tool_request, 'session_id', 'default')
-    proxy = get_worker_proxy(session_id) if _generation_use_worker() else None
-    if proxy is not None:
-        proxy.set_loop(asyncio.get_running_loop())
-        sweep_dead_worker_proxies()
-    stream = _get_session_stream(session_id)
-    creating = False
-    if proxy is not None:
-        # worker 模式的"活跃"判断：worker 命令循环按顺序处理命令，同一会话的
-        # 请求天然串行（pipelined），start_generation 只是把 generate 命令排入
-        # 队列——首次请求发出后到 task_started 事件回流前的窗口内
-        # is_generation_running 仍是 False，此时绝不能把任务判为不活跃。
-        # （并发重连 + 发送竞争时误判会让同一消息被派发两次，轮次里出现
-        # 两条相同 user 事件。）
-        task_active = (
-            proxy.is_generation_running()
-            or stream is not None
-            and stream.task is not None
-            and not stream.task.done()
-        )
-    else:
-        task_active = stream is not None and stream.task is not None and not stream.task.done()
-    if stream is None or stream.done or not task_active:
-        stream = _set_session_stream(session_id)
-        if not await _start_session_generation(proxy, stream, tool_request):
-            return
-        creating = True
-    elif _request_has_new_user_message(tool_request):
-        # 已存在生成任务且本次请求携带新用户消息：显式打断旧任务并等待其
-        # 完全退出后再启动新任务。旧任务的收尾处理会以 error/interrupted
-        # 事件收尾当前轮次并落盘已积累的工具调用/思考，避免新旧两个生成
-        # 循环交错写入同一 pending 轮次。
-        # 新消息打断不是手动停止：先清掉可能残留的 user_stop_requested，
-        # 保证旧任务按 interrupted 语义落盘。
-        stream.user_stop_requested = False
-        if proxy is not None:
-            proxy.request_stop(reason="interrupt")
-            await _wait_worker_idle(proxy)
-        else:
-            old_task = stream.task
-            stream.stop_requested = True
-            if old_task is not None:
-                old_task.cancel()
-                try:
-                    await old_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as old_error:
-                    logger.warning(f"旧生成任务退出异常（已忽略）: {old_error}")
-        stream = _set_session_stream(session_id)
-        if not await _start_session_generation(proxy, stream, tool_request):
-            return
-        creating = True
+    session_id = normalize_session_id(getattr(tool_request, 'session_id', 'default'))
+    tool_request.session_id = session_id
+    async with _session_start_guard(session_id):
+        stream, creating = await _prepare_chat_stream(tool_request)
+    if stream is None:
+        yield "data: [DONE]\n\n"
+        return
     replay_start, replay_offset, replay_complete = stream.acquire_replay()
     try:
-        if stream.done:
+        if stream.done and not creating:
             seen = stream.seq  # 已完成的生成：不重复回放（内容已在 JSONL）
             replay_end_pending = False
         else:
-            seen = replay_start
+            # 创建者尚未接收任何帧，必须从 0 消费；worker 可能在订阅前
+            # 已推进到回放起点，跳过前缀会丢掉 round_started / round_model。
+            seen = 0 if creating else replay_start
+            if creating:
+                replay_offset = 0
             if not creating:
                 # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
                 # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
@@ -3411,7 +3520,7 @@ async def cancel_injected_message(session_id: str, text: str, *, message_id: str
 
 
 async def _stop_saved_permission_tasks(session_id):
-    """停止后端重启后没有活跃生成流、但仍留有检查点的任务。"""
+    """确认写者停止后，收尾权限快照与首个工具调用前的轮次检查点。"""
     from memory import permission_store
     from factory.agent_runtime.permission_runtime import close_pending_native
     permission_store.pending(session_id)
@@ -3423,9 +3532,14 @@ async def _stop_saved_permission_tasks(session_id):
             continue
         current = permission_store.task(task_id)
         manager = await get_chat_memory_manager(session_id)
-        await manager.finish_saved_permission_round(saved.get("pending_round"), current["data"].get("request", {}).get("target_round"))
+        original = current["data"].get("request", {})
+        await manager.finish_saved_permission_round(saved.get("pending_round"), original.get("target_round"), original.get("insert_round"))
         close_pending_native(task_id, session_id, "用户停止原任务")
         permission_store.set_task_state(task_id, "cancelled")
+    from memory.chat_memory import chat_memory_file_exists
+    if chat_memory_file_exists(session_id):
+        manager = await get_chat_memory_manager(session_id)
+        await manager.stop_current_round(recover_checkpoint=True)
 
 
 async def stop_chat_task(session_id):

@@ -65,12 +65,14 @@ class AskUserToolDefinitionTests(unittest.TestCase):
     def test_normalize_ask_questions_multiple_flag(self):
         normalized = builtin_tools.normalize_ask_questions([
             {"question": "喜欢哪些语言？", "options": ["Python", "Go"], "multiple": True},
-            {"question": "确认执行？", "multiple": "yes"},   # 非空即视为真
-            {"question": "单选题", "multiple": 0},
+            {"question": "确认执行？", "multiple": True},
+            {"question": "单选题", "multiple": False},
         ])
         self.assertTrue(normalized[0]["multiple"])
         self.assertTrue(normalized[1]["multiple"])
         self.assertFalse(normalized[2]["multiple"])
+        for value in ("yes", "false", 0, 1):
+            self.assertIsNone(builtin_tools.normalize_ask_questions([{"question": "确认？", "multiple": value}]))
 
     def test_normalize_ask_questions_tolerates_single_object_and_json_string(self):
         # 单个对象自动包一层数组

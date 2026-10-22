@@ -14,14 +14,14 @@ function setup(){
       closest(){return this.dataset.snippetIndex!=null?this:null;}};
   }
   const $=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
-  const jumps=[];
+  const jumps=[],scopes=[];
   const App={$: $,el:(tag,cls,text)=>node(cls,text),state:{sessionId:'s'},
     openSession:async sid=>{App.state.sessionId=sid;return true;},
     jumpToHistoryMatch:async(match,query,current)=>jumps.push({match,query,current:current()})};
   const context={window:{App},document:{createTextNode:text=>node('',text)},API:{searchHistory(){}},
-    HistorySearch:{createController:(search,cb)=>{render=cb;return {close(){}};}}};
+    HistorySearch:{createController:(search,cb)=>{render=cb;return {close(){},open(){},setScope:value=>scopes.push(value.archiveScope)};}}};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../js/app/history_search.js'),'utf8'),context);
-  return {App,$,jumps,render};
+  return {App,$,jumps,render,scopes};
 }
 const hit=(sid,title)=>({session_id:sid,title,filename:sid+'_chat.jsonl',round_no:3,event_index:4,
   role:'assistant',field:'content',timestamp:'2026-10-17',snippets:[{text:'前面命中',start:2,end:4},{text:'后面命中',start:2,end:4}]});
@@ -45,4 +45,14 @@ test('clicking an excerpt waits for the session to open, then locates that excer
   assert.equal(x.jumps.length,0);release();await new Promise(resolve=>setImmediate(resolve));
   assert.equal(x.jumps.length,1);assert.equal(x.jumps[0].match.snippets[0].text,'后面命中');
   assert.equal(x.jumps[0].query,'命中');assert.equal(x.jumps[0].current,true);
+});
+
+test('normal search reopens in active scope after using the archive content search entry',()=>{
+  const x=setup();
+  x.App.historySearch.open({archiveScope:'archived',query:'归档内容'});
+  assert.equal(x.$('#historySearchArchiveScope').value,'archived');
+  x.App.historySearch.close();x.App.historySearch.open();
+  assert.equal(x.$('#historySearchArchiveScope').value,'active');
+  assert.deepEqual(x.scopes,['archived','active']);
+  x.render({status:'idle',results:[]});assert.match(x.$('#historySearchStatus').textContent,/未归档会话/);
 });

@@ -9,19 +9,25 @@ const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'u
 function setup() {
   const dom = new JSDOM('<div id="scroll"><div id="chat"></div></div><div id="nav"></div><div id="rail"></div><div id="panel"></div>');
   const document = dom.window.document;
+  const scroll = document.querySelector('#scroll');
+  Object.defineProperties(scroll, {scrollHeight:{value:5000,configurable:true}, clientHeight:{value:500,configurable:true}});
+  scroll.scrollTop = 2000;
   const timers = new Map(), observers = [];
   let serial = 0, bottoms = 0;
   const context = { document, HistoryParser: require('../js/history_parser'), state: { sessionId: 's' }, chatInner: document.querySelector('#chat'),
-    chatScroll: document.querySelector('#scroll'), qnav: document.querySelector('#nav'),
+    chatScroll: scroll, qnav: document.querySelector('#nav'),
     qnavRail: document.querySelector('#rail'), qnavPanel: document.querySelector('#panel'), QNAV_MAX_DASHES: 40,
     el(tag, cls, text) { const node = document.createElement(tag); node.className = cls; node.textContent = text || ''; return node; },
-    window: { setTimeout(fn) { timers.set(++serial, fn); return serial; }, clearTimeout(id) { timers.delete(id); } },
+    window: { getComputedStyle:node => dom.window.getComputedStyle(node),
+      setTimeout(fn) { timers.set(++serial, fn); return serial; }, clearTimeout(id) { timers.delete(id); } },
     IntersectionObserver: class {
-      constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
-      observe() {} disconnect() { this.disconnected = true; }
+      constructor(callback) { this.callback = callback; this.disconnected = false; this.observed = []; observers.push(this); }
+      observe(node) { this.observed.push(node); }
+      unobserve(node) { this.observed = this.observed.filter(item => item !== node); }
+      disconnect() { this.disconnected = true; }
     },
-    scrollToBottom() { bottoms++; }, contentToPlainText: s => s,
-    updateQnavActive() {}, App: { refreshAskBlockStates() {}, updateCodeblockCopyButtons() {} },
+    scrollToBottom() { bottoms++; scroll.scrollTop = scroll.scrollHeight-scroll.clientHeight; }, contentToPlainText: s => s,
+    updateQnavActive() {}, App: { pauseAutoScroll() {}, refreshAskBlockStates() {}, updateCodeblockCopyButtons() {} },
   };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('  const RENDER_TAIL_RECORDS'), source.indexOf('  function appendTime(')), context);
@@ -78,6 +84,34 @@ test('one edge load adds one batch, in order, without duplicates or background c
   assert.equal(new Set(keys).size, keys.length);
   assert.equal(nodes.length, h.paging().end - h.paging().start);
   assert.equal(h.timers.size, 0);
+});
+
+test('holding the native scrollbar blocks both edge loaders and a previously queued timer', async () => {
+  const h = setup();
+  h.context.renderRecords(records(1000), {historyIndex:450});
+  const { start, end, button, newerButton } = h.paging();
+  h.context.scheduleBackfill(0);
+  const pending = [...h.timers.values()][0];
+  h.context.App.isChatScrollbarDragging = () => true;
+  await pending();
+  h.timers.clear();
+  await h.context.runOlderBatch();
+  await h.context.runNewerBatch();
+  h.observers[0].callback([{target:button,isIntersecting:true}, {target:newerButton,isIntersecting:true}]);
+  assert.equal(h.paging().start, start);
+  assert.equal(h.paging().end, end);
+  assert.equal(h.timers.size, 0);
+});
+
+test('windowed history owns edge loading; the legacy observer does not append a batch', () => {
+  const h = setup();
+  h.context.renderRecords(records(1000), {historyIndex:450});
+  const {start,end,button,newerButton} = h.paging();
+  h.context.App.historyScroll = {active:()=>true};
+  h.observers[0].callback([{target:button,isIntersecting:true},{target:newerButton,isIntersecting:true}]);
+  assert.equal(h.paging().start,start);
+  assert.equal(h.paging().end,end);
+  assert.equal(h.timers.size,0);
 });
 
 test('direct window changes disconnect old observers and cancel stale session loads', () => {

@@ -1,0 +1,84 @@
+.sidebar-settings-menu {
+  position: fixed;
+  z-index: 235;
+  width: min(232px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  .menu-item { width: 100%; min-width: 0; }
+  &[hidden] { display: none !important; }
+}
+.archive-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 235;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 24px;
+  &[hidden], [hidden] { display: none !important; }
+}
+.archive-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .58); }
+.archive-dialog {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(820px, 100%);
+  max-height: min(820px, calc(100dvh - 48px));
+  min-height: min(360px, calc(100dvh - 48px));
+  overflow: hidden;
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-menu);
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--tool-icon-pink); outline-offset: 2px; }
+}
+.archive-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 6px;
+  h2 { margin: 0; font-size: 20px; }
+}
+.archive-close { flex: 0 0 36px; width: 36px; height: 36px; font-size: 28px; border-radius: 8px; &:hover { background: var(--bg-hover); } }
+.archive-intro { margin: 0; padding: 2px 20px 12px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.archive-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 20px 8px;
+  input { flex: 1 1 230px; min-width: 0; width: 100%; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 14px; }
+}
+.archive-button {
+  border: 1px solid var(--border-strong); border-radius: 9px; padding: 8px 12px;
+  font-size: 13px; line-height: 1.4; white-space: nowrap; color: var(--text); background: var(--bg-elevated);
+  &:hover { background: var(--bg-hover); }
+  &.danger { color: var(--danger); }
+  &:disabled { opacity: .5; cursor: wait; }
+}
+.archive-status { flex-shrink: 0; margin: 0; padding: 4px 20px 10px; color: var(--text-secondary); font-size: 12px; }
+.archive-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 20px; }
+.archive-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 18px; padding: 13px 0; border-bottom: 1px solid var(--border);
+  &:last-child { border-bottom: 0; }
+}
+.archive-row-title { grid-column: 1; width: 100%; min-width: 0; text-align: left; font-size: 15px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; &:hover { color: var(--tool-icon-pink); } }
+.archive-row-meta { grid-column: 1; margin: 4px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.archive-row-actions { grid-column: 2; grid-row: 1 / span 3; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; align-content: center; }
+.archive-delete-warning { grid-column: 1; color: var(--danger); margin: 6px 0; font-size: 12px; line-height: 1.6; }
+.archive-empty { text-align: center; color: var(--text-secondary); padding: 28px 0; font-size: 14px; }
+.archive-footer { display: flex; flex-shrink: 0; justify-content: center; gap: 8px; padding: 10px 20px; }
+.archive-current-banner {
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 4px 12px; padding: 5px 10px;
+  color: var(--text-secondary); font-size: 12px;
+  button { color: var(--tool-icon-pink); text-decoration: underline; padding: 4px; }
+  &[hidden] { display: none !important; }
+}
+.history-search-scope select { max-width: 100%; color: var(--text); background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+@media (max-width: 560px) {
+  .archive-modal { padding: 10px; }
+  .archive-dialog { max-height: calc(100dvh - 20px); min-height: min(360px, calc(100dvh - 20px)); }
+  .archive-head { padding: 12px 14px 4px; h2 { font-size: 18px; } }
+  .archive-intro { padding: 2px 14px 10px; font-size: 11px; }
+  .archive-toolbar { padding: 0 14px 8px; gap: 6px; input { flex-basis: 100%; font-size: 14px; } }
+  .archive-status { padding: 4px 14px 8px; }
+  .archive-list { padding: 0 14px; }
+  .archive-row { display: flex; flex-direction: column; gap: 4px; }
+  .archive-row-title { font-size: 14px; }
+  .archive-row-actions { justify-content: flex-end; margin-top: 4px; }
+  .archive-button { font-size: 12px; padding: 7px 10px; }
+}

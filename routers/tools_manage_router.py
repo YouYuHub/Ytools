@@ -1,10 +1,65 @@
-from fastapi import APIRouter, HTTPException
+import asyncio
+import json
+from typing import Any, Literal
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import get_current_dir
 from factory.agent_runtime import tool_registry
+from util import mcp_diagnostics
 
 # 实例化APIRouter
 api_tools_manage_router = APIRouter(prefix="/tools")
+
+
+class MCPDiagnosticRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server_id: str = Field(min_length=1, max_length=512)
+    action: Literal["connect", "call"] = "connect"
+    tool_name: str | None = Field(default=None, max_length=256)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=30, ge=1, le=300, allow_inf_nan=False)
+    mcp_profile: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @field_validator("arguments")
+    @classmethod
+    def bounded_arguments(cls, value):
+        if len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 65536:
+            raise ValueError("测试参数不能超过 64KB")
+        return value
+
+
+@api_tools_manage_router.get("/diagnostics")
+async def diagnostic_servers():
+    try:
+        return mcp_diagnostics.configured_servers()
+    except mcp_diagnostics.DiagnosticFailure as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@api_tools_manage_router.post("/diagnostics")
+async def test_mcp_server(payload: MCPDiagnosticRequest, request: Request):
+    try:
+        servers = mcp_diagnostics.load_servers()
+    except mcp_diagnostics.DiagnosticFailure as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if payload.server_id not in servers:
+        raise HTTPException(404, "MCP 服务不存在或已从配置中移除")
+    if payload.action == "call" and not (payload.tool_name or "").strip():
+        raise HTTPException(422, "请填写 MCP 工具原名")
+    task = asyncio.create_task(mcp_diagnostics.diagnose(**payload.model_dump()))
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=.2)
+            if await request.is_disconnected():
+                task.cancel()
+                raise HTTPException(499, "测试等待已取消；已经执行的外部操作不会撤回")
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @api_tools_manage_router.get("/list")

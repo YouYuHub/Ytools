@@ -497,9 +497,12 @@ class ChatLLM:
         use_ssl: bool,
         timeout_connect: float,
         stop_checker: Optional[Any] = None,
+        *,
+        meter_attempt: bool = True,
     ):
-        from factory.agent_runtime.task_costs import network_attempt
-        await network_attempt()
+        if meter_attempt:
+            from factory.agent_runtime.task_costs import network_attempt
+            await network_attempt()
         connection_kwargs: dict[str, Any] = {}
         if use_ssl:
             connection_kwargs["ssl"] = ssl.create_default_context()
