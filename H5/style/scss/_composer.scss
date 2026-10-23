@@ -216,8 +216,9 @@
   align-items: flex-end;
   gap: 6px;
   background: var(--bg-composer);
-  border: 1px solid transparent;
+  border: 1px solid var(--border);
   border-radius: 24px;
+  box-shadow: var(--shadow-soft);
   padding: 6px 8px;
   margin: 0 8px;
   transition: background-color 0.2s ease, border-color 0.2s ease,
@@ -228,8 +229,9 @@
   }
 
   &:focus-within {
+    // 聚焦只保留柔光晕，不再把整圈边框染成强调色，避免蓝色边框过于抢眼
     border-color: var(--border-strong);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    box-shadow: 0 0 0 2px var(--focus-halo), var(--shadow-soft);
   }
 
   // 引用、图片/视频与文档共用一个方块区域；空间不足时只在区域内部换行

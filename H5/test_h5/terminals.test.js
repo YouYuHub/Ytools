@@ -285,6 +285,7 @@ test('空列表请求期间到达命令结果会合并成一次后续检查，�
   ui.state.jobs = [job('bg_one')];
   ui.app.terminalJobs.noteToolResult('s', 'run_command');
   ui.app.terminalJobs.noteToolResult('s', 'poll_command');
+  ui.app.terminalJobs.noteToolResult('s', 'write_stdin');
   ui.state.pendingList = null;
   resolve({ jobs: [] }); await pending; await settle();
   assert.deepEqual(ui.state.lists, ['s', 's', 's']);

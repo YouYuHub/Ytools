@@ -12,6 +12,8 @@ class SubAgentFileAccess:
         self.lock = RLock()
 
     def execute(self, agent, name, args, executor):
+        if name == 'apply_patch':
+            return self._patch(agent, args, executor)
         if name not in {"read_file", "write_file", "edit_file"}:
             return executor(name, args)
         raw_path = str(args.get("path") or args.get("full_file_name") or "").strip()
@@ -54,6 +56,41 @@ class SubAgentFileAccess:
                 entry["writer"] = agent
             if self.save:
                 self.save({"files": self.files})
+            return result
+
+    def _patch(self, agent, args, executor):
+        from .context_patch import parse
+        try:
+            operations = parse(args.get('patch'))
+        except ValueError:
+            return executor('apply_patch', args)
+        with self.lock:
+            expected = {}
+            for op in operations:
+                path = os.path.normcase(str(Path(op['path']).expanduser().resolve()))
+                entry = self.files.get(path, {})
+                writer = entry.get('writer')
+                content_hash = entry.get('reads', {}).get(agent)
+                if writer and writer != agent and not content_hash:
+                    return self._conflict(path, writer)
+                if content_hash:
+                    expected[path] = content_hash
+            result = executor('apply_patch', {**args, '_expected_hashes': expected})
+            if isinstance(result, dict) and result.get('success'):
+                for item in result.get('files', []):
+                    path = os.path.normcase(str(Path(item['path']).resolve()))
+                    entry = self.files.setdefault(path, {'reads': {}})
+                    entry['writer'] = agent
+                    entry['reads'][agent] = item['content_hash']
+                if self.save:
+                    self.save({'files': self.files})
+            elif isinstance(result, dict):
+                for item in result.get('files', []):
+                    if item.get('status') == 'rollback_failed':
+                        path = os.path.normcase(str(Path(item['path']).resolve()))
+                        self.files[path] = {'writer': 'unknown_after_patch', 'reads': {}}
+                if self.save:
+                    self.save({'files': self.files})
             return result
 
     @staticmethod

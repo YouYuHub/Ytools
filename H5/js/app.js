@@ -57,6 +57,7 @@
     // validates the target without waiting for every sidebar row to render.
     const target = new URLSearchParams(location.search).get("session") || "default";
     loadSessions();
+    if (App.sessionActivity) App.sessionActivity.start();
     App.openInitialSession(target);
   }
 

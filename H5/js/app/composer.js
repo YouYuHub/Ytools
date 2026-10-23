@@ -24,9 +24,11 @@
 
   // ---------- 输入区 ----------
   function refreshComposerButtons() {
+    if (App.taskStatus) App.taskStatus.refresh();
     const hasText = input.value.trim() !== "" || state.pendingMedia.length > 0;
     // 按钮只反映“当前会话”的任务状态，其他会话在后台流式不影响本会话的发送/停止按钮
-    const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
+    const currentStreaming = state.streaming && state.streamingSession === state.sessionId
+      || !!(App.taskStatus && App.taskStatus.isUncertain(state.sessionId));
     scrollBottomBtn.classList.toggle("is-generating", currentStreaming);
     // 手动压缩进行中：发送会打断压缩任务并交错写入会话历史，隐藏发送入口
     // （键盘发送由 send() 内的同名守卫拦截）；终止按钮接管，点击可中止压缩。

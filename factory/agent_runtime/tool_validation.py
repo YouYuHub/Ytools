@@ -19,7 +19,7 @@ _types = Draft202012Validator.TYPE_CHECKER.redefine("number", _finite_number).re
 _ArgumentValidator = validators.extend(Draft202012Validator, type_checker=_types)
 
 
-@lru_cache(maxsize=12)
+@lru_cache(maxsize=32)
 def _validator(name):
     from . import builtin_tools as bt
     if name == bt.READ_MEDIA_NAME:

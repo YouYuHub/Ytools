@@ -424,14 +424,16 @@ $fh-del-text: #cf222e;
   }
 }
 
-// hunk 头：差异块标题 + 单块/区间保留/撤回按钮（4 按钮，允许换行）
+// hunk 头：差异块标题 + 单块/区间保留/撤回按钮（4 按钮，允许换行）。
+// 注意：不要加 sticky 吸顶——V2.5 已验证同一滚动容器内多个吸顶块头会互相
+// 叠压错乱，且钉住态 rect 会破坏 jumpHunk 的滚动锚定（见 docs/file_diff.md V2.5）。
 .fh-hunk-head {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 4px 10px 4px 0;
+  padding: 4px 10px 4px 12px;
   margin-top: 6px;
   background: var(--bg-code);
   border-top: 1px solid var(--border);

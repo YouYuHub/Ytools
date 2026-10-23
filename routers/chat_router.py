@@ -23,8 +23,9 @@ from factory.chat_factory import (
     tool_chat_server,
     stop_chat_task,
     is_chat_stream_running,
+    get_running_chat_session_ids,
 )
-from factory.session_worker import peek_worker_proxy
+from factory.session_worker import peek_worker_proxy, get_running_worker_session_ids
 from factory.agent_runtime.context_compaction import (
     compact_session_history_if_needed,
     load_context_compaction_settings,
@@ -289,6 +290,17 @@ async def chat_stream_status(session_id: str = "default"):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@api_chat_router.get('/chat_stream/statuses')
+async def chat_stream_statuses():
+    """One lightweight sidebar snapshot of all active chats and manual compactions."""
+    chats = set(get_running_chat_session_ids()) | set(get_running_worker_session_ids())
+    compactions = {sid for sid in list(_MANUAL_COMPACTION_JOBS) if _manual_compaction_running(sid)}
+    return JSONResponse(headers={"Cache-Control": "no-store"}, content={"sessions": [
+        {"session_id": sid, "chat_running": sid in chats, "compacting": sid in compactions}
+        for sid in sorted(chats | compactions)
+    ]})
+
+
 @api_chat_router.get('/chat_history/sessions')
 async def list_chat_history_sessions(archive_scope: Literal["active", "archived", "all"] = "active"):
     """
@@ -408,7 +420,11 @@ async def get_chat_history_file(session_id: str = "default"):
     manager = await get_existing_chat_memory_manager(session_id)
     if manager is None:
         raise HTTPException(status_code=404, detail="Chat session file not found")
-    text = await manager.get_file_text()
+    try:
+        text = await manager.get_file_text()
+    except Exception:
+        logger.exception("读取会话历史文件失败")
+        raise HTTPException(status_code=500, detail="读取会话历史文件失败")
     if text is None:
         raise HTTPException(status_code=404, detail="Chat session file not found")
     return Response(content=text, media_type="text/plain; charset=utf-8")
@@ -1023,6 +1039,7 @@ async def get_chat_context_token_stats(
                             include_ask_user=ASK_USER_TOOL_NAME in selected_names,
                             include_write_file=WRITE_FILE_NAME in selected_names,
                             include_edit_file=EDIT_FILE_NAME in selected_names,
+                            include_apply_patch='apply_patch' in selected_names,
                             include_read_file=READ_FILE_NAME in selected_names,
                             include_search_files=SEARCH_FILES_NAME in selected_names,
                             include_run_command=RUN_COMMAND_NAME in selected_names,
@@ -1150,6 +1167,58 @@ async def rebuild_responses_context(session_id: str, source: str = "local"):
         raise HTTPException(400, str(exc)) from exc
 
 
+# 手动压缩后台任务表：session_id -> job。
+# 后台压缩任务与 SSE 消费端分离（与聊天流一致）：页面刷新/关闭只断开消费端，
+# 压缩任务继续执行并落盘，刷新后可经 attach 重连收看剩余进度。
+# job = {"task": asyncio.Task, "queues": set[asyncio.Queue], "result": dict,
+#        "sentinel": object, "done": bool, "completed_at": float|None}
+_MANUAL_COMPACTION_JOBS: dict[str, dict] = {}
+_MANUAL_COMPACTION_LOCK = asyncio.Lock()
+_MANUAL_COMPACTION_DONE_TTL_SECONDS = 60.0
+
+
+def _manual_compaction_running(session_id: str) -> bool:
+    job = _MANUAL_COMPACTION_JOBS.get(session_id)
+    if not job or job.get("done"):
+        return False
+    task = job.get("task")
+    return bool(task and not task.done())
+
+
+@api_chat_router.get('/chat_context/compact_manual/status')
+async def manual_compaction_status(session_id: str = "default"):
+    """查询指定会话是否有正在进行的手动压缩（前端刷新后据此决定是否重连 SSE）。"""
+    try:
+        normalized = normalize_session_id(session_id)
+        return JSONResponse(content={"running": _manual_compaction_running(normalized),
+                                     "session_id": normalized})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_chat_router.post('/chat_context/compact_manual/stop')
+async def stop_manual_compaction(session_id: str = "default"):
+    """显式停止指定会话的手动压缩（刷新/断线不再隐式取消，必须经此接口停止）。"""
+    try:
+        normalized = normalize_session_id(session_id)
+        job = _MANUAL_COMPACTION_JOBS.get(normalized)
+        task = job.get("task") if job else None
+        if not job or job.get("done") or not task or task.done():
+            return JSONResponse(content={"stopped": False, "running": False,
+                                         "session_id": normalized})
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return JSONResponse(content={"stopped": True, "running": False,
+                                     "session_id": normalized})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @api_chat_router.post('/chat_context/compact_manual')
 async def compact_chat_context_manual(
     session_id: str = "default",
@@ -1161,6 +1230,11 @@ async def compact_chat_context_manual(
         False,
         description="以 SSE 流式返回压缩过程（context_compaction start/delta/done，"
                     "与自动压缩事件同构；结尾附加 compaction_manual_result 结果帧）",
+    ),
+    attach: bool = Query(
+        False,
+        description="为 true 时只附接到已有的压缩任务（刷新后重连），不启动新任务；"
+                    "无运行中任务时返回 404",
     ),
 ):
     """
@@ -1176,18 +1250,36 @@ async def compact_chat_context_manual(
     仅推流不落盘），done 事件携带 summary_text 摘要全文并落盘，最后发送
     `{"event": "compaction_manual_result", compressed_rounds, stats, error}`
     与 `[DONE]`。stream=false 保持原 JSON 响应。
+    后台任务与消费端分离：SSE 断开（刷新/关闭/网络抖动）不再取消压缩，
+    任务继续执行；`attach=true` 可重连收看剩余进度，停止必须经
+    POST /chat_context/compact_manual/stop 显式取消。
     参数:
         session_id: 会话ID
         force: 跳过下限守卫强制压缩
         stream: 是否以 SSE 返回压缩过程
+        attach: 只附接到已有任务，不启动新任务
     返回:
         stream=true: text/event-stream；否则 JSON {compressed_rounds, stats}
     """
     session_id = normalize_session_id(session_id)
     # 兼容直连调用（未过 FastAPI 依赖注入）时 Query 默认对象的情况：
-    # Query 实例为 truthy，会把 force/stream 误判为已开启
+    # Query 实例为 truthy，会把 force/stream/attach 误判为已开启
     force = bool(force) if isinstance(force, bool) else False
     stream = bool(stream) if isinstance(stream, bool) else False
+    attach = bool(attach) if isinstance(attach, bool) else False
+    if attach and not stream:
+        raise HTTPException(status_code=400, detail="attach=true 仅支持 stream=true 的 SSE 重连")
+    if attach:
+        job = _MANUAL_COMPACTION_JOBS.get(session_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="没有正在进行的手动压缩任务")
+        return StreamingResponse(
+            _manual_compaction_consumer_stream(session_id, job),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    if _manual_compaction_running(session_id):
+        raise HTTPException(status_code=409, detail="该会话已有压缩任务在进行中，请等待完成或停止后再试")
     # 压缩模型/预算按会话生效模型选择计算（stream=true 的实际压缩在 SSE 生成器
     # 的新任务中执行，_manual_compaction_event_stream.run 内会重新设置 ambient）
     try:
@@ -1219,10 +1311,24 @@ async def compact_chat_context_manual(
             raise HTTPException(status_code=400, detail=rejection)
 
         if stream:
+            if rejection is not None:
+                result = {"compressed_rounds": 0, "stats": None, "error": rejection}
+                return StreamingResponse(
+                    _manual_compaction_result_stream(session_id, result),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            async with _MANUAL_COMPACTION_LOCK:
+                if _manual_compaction_running(session_id):
+                    raise HTTPException(status_code=409, detail="该会话已有压缩任务在进行中，请等待完成或停止后再试")
+                # 首个消费端队列先建好再启动任务，避免 task_usage/start 在订阅前丢失。
+                initial_consumer: asyncio.Queue = asyncio.Queue()
+                job = _start_manual_compaction_job(
+                    manager, session_id, manual_budget_tokens,
+                    initial_queues=[initial_consumer],
+                )
             return StreamingResponse(
-                _manual_compaction_event_stream(
-                    manager, session_id, manual_budget_tokens, precheck_error=rejection
-                ),
+                _manual_compaction_consumer_stream(session_id, job, initial_consumer),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -1266,31 +1372,50 @@ async def compact_chat_context_manual(
         reset_ambient_model_selection(ambient_token)
 
 
-async def _manual_compaction_event_stream(
-    manager,
-    session_id: str,
-    budget_tokens: int,
-    precheck_error: str | None = None,
-):
-    """手动压缩的 SSE 生成器。
+async def _manual_compaction_result_stream(session_id: str, result: dict[str, Any]):
+    """单结果帧的 SSE 流（下限守卫拒绝、已完成任务的迟到附接，不启动后台任务）。"""
+    yield (
+        "data: "
+        + json.dumps({
+            "event": "compaction_manual_result",
+            "session_id": session_id,
+            "compressed_rounds": result.get("compressed_rounds", 0),
+            "stats": result.get("stats"),
+            "error": result.get("error"),
+        }, ensure_ascii=False)
+        + "\n\n"
+    )
+    yield "data: [DONE]\n\n"
 
-    - context_compaction start/delta/done 事件结构与聊天内自动压缩完全一致；
-      delta 帧（压缩模型思考/正文增量）只实时推送、不落盘，其余事件按同一
-      payload 落盘 JSONL（刷新后可回放摘要）；
-    - 结尾附加一帧 compaction_manual_result（compressed_rounds/stats/error）
-      供前端提示，再发送 [DONE]；
-    - `precheck_error` 非空时（上下文低于摘要预算的下限守卫）不发起压缩，
-      直接以结果帧带回提示；
-    - 客户端断开时取消后台压缩任务，已落盘的 start 由既有孤儿标记机制处理。
+
+def _start_manual_compaction_job(manager, session_id: str, budget_tokens: int,
+                                   initial_queues=None) -> dict:
+    """创建并启动会话的手动压缩后台任务（调用方须持有 _MANUAL_COMPACTION_LOCK）。
+
+    后台任务与 SSE 消费端分离：消费端断开只移除其订阅队列，不取消任务；
+    只有显式停止（POST .../stop）才会 cancel 任务并补写 aborted。
+    `initial_queues` 中的订阅队列先加入再启动任务，避免首批事件丢失。
     """
-    queue: asyncio.Queue = asyncio.Queue()
-    sentinel = object()
-    result: dict[str, Any] = {"compressed_rounds": 0, "stats": None, "error": None}
+    job: dict[str, Any] = {
+        "task": None,
+        "queues": set(initial_queues or []),
+        "result": {"compressed_rounds": 0, "stats": None, "error": None},
+        "sentinel": object(),
+        "done": False,
+        "completed_at": None,
+    }
+
+    async def broadcast(payload: Any) -> None:
+        for consumer in list(job["queues"]):
+            try:
+                await consumer.put(payload)
+            except Exception:
+                pass
 
     async def emit(payload: dict[str, Any]) -> None:
         if isinstance(payload, dict) and (payload.get("phase") == "delta"
                 or payload.get("event") == "responses_compaction" or "warning" in payload):
-            await queue.put(payload)
+            await broadcast(payload)
             return
         add_event = getattr(manager, "add_context_compaction_event", None)
         if callable(add_event):
@@ -1298,7 +1423,7 @@ async def _manual_compaction_event_stream(
                 await add_event(payload)
             except Exception as exc:
                 logger.warning(f"手动压缩事件落盘失败：{exc}")
-        await queue.put(payload)
+        await broadcast(payload)
 
     async def run() -> None:
         # 压缩在新任务中执行（create_task 复制上下文不会带出 handler 的 ambient），
@@ -1313,16 +1438,17 @@ async def _manual_compaction_event_stream(
         cost_task_id = None
         cost_token = None
         cost_stopped = False
+
+        async def cost_emit(payload: Any) -> None:
+            await broadcast(payload)
+
         try:
-            if precheck_error:
-                result["error"] = precheck_error
-                return
             cost_task_id = "manual_compaction_" + uuid.uuid4().hex
             baseline = None
             if not task_cost_store.has_session(session_id):
                 baseline = task_cost_store.legacy_baseline(await manager.get_file_text(), await manager.get_session_meta())
             task_cost_store.create_task(cost_task_id, session_id, baseline=baseline, kind="manual_compaction")
-            cost_tracker = BudgetTracker(cost_task_id, session_id, lambda: cost_stopped, queue.put)
+            cost_tracker = BudgetTracker(cost_task_id, session_id, lambda: cost_stopped, cost_emit)
             cost_token = COST_CONTEXT.set(cost_tracker)
             await cost_tracker.notify()
             tool_request = ChatLLMRequest(**apply_role_parameter_defaults({
@@ -1330,7 +1456,7 @@ async def _manual_compaction_event_stream(
                 "session_id": session_id,
                 "tools": list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
             }))
-            result["compressed_rounds"] = await compact_session_history_if_needed(
+            job["result"]["compressed_rounds"] = await compact_session_history_if_needed(
                 manager,
                 tool_request,
                 budget_tokens=budget_tokens,
@@ -1341,17 +1467,16 @@ async def _manual_compaction_event_stream(
                 # 触发来源 = 用户手动触发
                 trigger_reason="manual",
             )
-            result["stats"] = await manager.get_context_token_stats(
+            job["result"]["stats"] = await manager.get_context_token_stats(
                 tools=list(tool_registry.ALL_TOOLS) if tool_registry.ALL_TOOLS else None,
             )
         except ChatModelConfigurationError as exc:
-            result["error"] = f"压缩模型配置无效: {exc}"
+            job["result"]["error"] = f"压缩模型配置无效: {exc}"
         except asyncio.CancelledError:
-            # 客户端断开（页面刷新/关闭/网络抖动）触发 task.cancel()：
+            # 仅显式停止（POST .../stop）会走到这里：SSE 断开不再取消任务。
             # 立即补写 aborted 事件闭合 start 行，不等下一次聊天任务开始时
-            # 由孤儿标记机制延迟收尾（此前会留下数分钟的"永远转圈"块）。
-            # shield 保护落盘本身不被二次取消；shield 也失败则放弃，
-            # 交由孤儿机制兜底。
+            # 由孤儿标记机制延迟收尾。shield 保护落盘本身不被二次取消；
+            # shield 也失败则放弃，交由孤儿机制兜底。
             try:
                 add_event = getattr(manager, "add_context_compaction_event", None)
                 if callable(add_event):
@@ -1367,25 +1492,53 @@ async def _manual_compaction_event_stream(
                 logger.warning(f"手动压缩中断标记落盘失败（交由孤儿机制收尾）：{shield_exc}")
             raise
         except Exception as exc:
-            result["error"] = str(exc)
+            job["result"]["error"] = str(exc)
         finally:
+            import time as _time
             cost_stopped = True
             if cost_task_id:
                 existing = task_cost_store.status(cost_task_id)
-                task_cost_store.finish(cost_task_id, "cancelled" if existing and existing["state"] == "cancelled" else "failed" if result.get("error") else "completed")
+                task_cost_store.finish(cost_task_id, "cancelled" if existing and existing["state"] == "cancelled" else "failed" if job["result"].get("error") else "completed")
             if cost_token is not None:
                 COST_CONTEXT.reset(cost_token)
             reset_ambient_model_selection(ambient_token)
-            await queue.put(sentinel)
+            job["done"] = True
+            job["completed_at"] = _time.time()
+            await broadcast(job["sentinel"])
+            asyncio.get_running_loop().call_later(
+                _MANUAL_COMPACTION_DONE_TTL_SECONDS,
+                lambda: _MANUAL_COMPACTION_JOBS.pop(session_id, None)
+                if _MANUAL_COMPACTION_JOBS.get(session_id) is job else None,
+            )
 
-    task = asyncio.create_task(run())
+    job["task"] = asyncio.create_task(run())
+    _MANUAL_COMPACTION_JOBS[session_id] = job
+    return job
+
+
+async def _manual_compaction_consumer_stream(session_id: str, job: dict, precreated=None):
+    """单个 SSE 消费端的事件流：断开只取消订阅，后台任务继续执行。
+
+    - 运行中附接：收看订阅之后的剩余事件（start 已落盘，刷新后可从历史重建运行块）；
+    - 已完成任务的迟到附接：直接返回结果帧，不启动新任务。
+    - `precreated` 为首个消费端预建队列（启动任务前已订阅，避免首批事件丢失）。
+    """
+    result = job.get("result", {})
+    task = job.get("task")
+    sentinel = job.get("sentinel")
+    if job.get("done") or (task is not None and task.done()):
+        async for chunk in _manual_compaction_result_stream(session_id, result):
+            yield chunk
+        return
+    consumer: asyncio.Queue = precreated if precreated is not None else asyncio.Queue()
+    job.setdefault("queues", set()).add(consumer)
     try:
         while True:
             try:
                 # 心跳：压缩模型长时间无增量输出时（合并大历史等），每 30 秒
                 # 发一帧 SSE 注释（": ping"），前端按规范自动忽略注释行；
                 # 既防止代理/浏览器把静默连接判死，也让用户确认任务仍在进行。
-                payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+                payload = await asyncio.wait_for(consumer.get(), timeout=30.0)
             except asyncio.TimeoutError:
                 yield ": ping\n\n"
                 continue
@@ -1397,16 +1550,15 @@ async def _manual_compaction_event_stream(
             + json.dumps({
                 "event": "compaction_manual_result",
                 "session_id": session_id,
-                "compressed_rounds": result["compressed_rounds"],
-                "stats": result["stats"],
-                "error": result["error"],
+                "compressed_rounds": result.get("compressed_rounds", 0),
+                "stats": result.get("stats"),
+                "error": result.get("error"),
             }, ensure_ascii=False)
             + "\n\n"
         )
     finally:
-        task.cancel()
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
+            job.get("queues", set()).discard(consumer)
+        except Exception:
             pass
     yield "data: [DONE]\n\n"

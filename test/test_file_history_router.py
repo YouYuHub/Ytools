@@ -107,6 +107,17 @@ class FileHistoryRouterTests(unittest.TestCase):
         resp = self.client.post("/file_diff/keep_all", json={})
         self.assertEqual(resp.status_code, 200, resp.text)
 
+    def test_content_paging_is_bounded_and_validated(self):
+        key=store.file_key(str(self.target))
+        query=f'/file_diff/content?session_id={_SESSION}&key={key}'
+        page=self.client.get(query+'&offset=2&limit=4')
+        self.assertEqual(page.status_code,200,page.text)
+        self.assertEqual(page.json()['content'],'= 10')
+        self.assertEqual(page.json()['next_offset'],6)
+        self.assertTrue(page.json()['has_more'])
+        self.assertEqual(self.client.get(query+'&limit=1048577').status_code,422)
+        self.assertEqual(self.client.get(query+'&offset=-1').status_code,422)
+
 
 if __name__ == "__main__":
     unittest.main()

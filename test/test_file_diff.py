@@ -43,6 +43,12 @@ def test_build_file_diff_basic_stats():
     ]
 
 
+def test_hunk_source_starting_with_plus_or_minus_is_not_a_file_header():
+    diff=_build_file_diff('-- old\n','++ new\n','prefix.txt')
+    assert diff['lines_added'] == 1 and diff['lines_removed'] == 1
+    assert diff['changed_ranges'] == [{'old_start_line':1,'old_end_line':1,'new_start_line':1,'new_end_line':1}]
+
+
 def test_build_file_diff_crlf_normalized():
     old = "a = 1\r\nb = 2\r\n"
     new = "a = 1\nb = 3\n"

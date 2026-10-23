@@ -7,8 +7,8 @@
     <title>Ytools</title>
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
-    <script src="js/theme.js?v=4f2f1a56b012"></script>
-    <link rel="stylesheet" href="style/css/main.css?v=7b6396d044c8">
+    <script src="js/theme.js?v=f5a8a8dc7528"></script>
+    <link rel="stylesheet" href="style/css/main.css?v=050a3d5d3580">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -274,6 +274,10 @@
                     <div class="welcome-title">该从哪里开始？</div>
                 </div>
                 <div class="composer-wrap">
+                    <div class="task-status" id="taskStatus" hidden role="status" aria-live="polite" aria-atomic="true">
+                        <span class="task-status-label"></span><span class="task-status-detail"></span>
+                        <button type="button" hidden>重新连接</button>
+                    </div>
                     <div class="context-token-status ctx-hidden" id="contextTokenStatus">
                         <span class="context-token-todo-slot" id="contextTokenTodoSlot"></span>
                         <!-- 当前会话聊天模型名：在 todo 与 token 摘要之间的空位居中显示，长名溢出省略 -->
@@ -631,7 +635,7 @@
         <div class="tool-modal-backdrop" id="askModalBackdrop"></div>
         <section class="tool-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="askModalTitle">
             <header class="tool-modal-head">
-                <h2 id="askModalTitle">🤖 模型向你提问</h2>
+                <h2 id="askModalTitle"><img class="ask-title-icon" src="ask-squid.svg?v=1" alt=""><span>模型向你提问</span></h2>
                 <button class="icon-btn" id="askModalClose" title="关闭">
                     <svg class="icon" viewBox="0 0 24 24">
                         <path d="M6 6l12 12M18 6 6 18" />
@@ -1040,13 +1044,40 @@
                     <span class="theme-picker-check" aria-hidden="true">✓</span>
                 </button>
             </div>
+            <h3 class="theme-picker-subhead" id="themeAccentLabel">强调色</h3>
+            <div class="theme-picker-accents" role="group" aria-labelledby="themeAccentLabel">
+                <button class="theme-picker-accent" type="button" data-value="blue" aria-pressed="false" aria-label="蓝色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">蓝</span>
+                </button>
+                <button class="theme-picker-accent" type="button" data-value="green" aria-pressed="false" aria-label="绿色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">绿</span>
+                </button>
+                <button class="theme-picker-accent" type="button" data-value="purple" aria-pressed="false" aria-label="紫色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">紫</span>
+                </button>
+                <button class="theme-picker-accent" type="button" data-value="pink" aria-pressed="false" aria-label="粉色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">粉</span>
+                </button>
+                <button class="theme-picker-accent" type="button" data-value="yellow" aria-pressed="false" aria-label="黄色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">黄</span>
+                </button>
+                <button class="theme-picker-accent" type="button" data-value="none" aria-pressed="false" aria-label="无强调色">
+                    <span class="theme-picker-dot" aria-hidden="true"></span>
+                    <span class="theme-picker-accent-label">无</span>
+                </button>
+            </div>
         </section>
     </div>
 
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script defer src="js/api.js?v=d86f488e9834"></script>
+    <script defer src="js/api.js?v=7dab13fcad32"></script>
     <script defer src="js/file_history_sync.js?v=efb6ad30eb91"></script>
     <script defer src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
     <script defer src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
@@ -1087,7 +1118,7 @@
     <script defer src="js/session_list_utils.js?v=0ad0914a2ca0"></script>
     <script defer src="js/session_group_utils.js?v=affad180441e"></script>
     <script defer src="js/session_utils.js?v=f43255f766b9"></script>
-    <script defer src="js/format_utils.js?v=13cd70eafe3c"></script>
+    <script defer src="js/format_utils.js?v=d96a1dee8dff"></script>
     <script defer src="js/history_parser.js?v=ed1a918e6e14"></script>
     <script defer src="js/history_parse_async.js?v=52648ac313f2"></script>
     <script defer src="js/history_search.js?v=2e813eadce4f"></script>
@@ -1099,11 +1130,11 @@
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=ff7ade47a885"></script>
+    <script defer src="js/app/core.js?v=bf43ad8636c7"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=4f7d7d2208ab"></script>
-    <script defer src="js/app/sessions.js?v=4cd25dc553fb"></script>
-    <script defer src="js/app/session_archives.js?v=37f2eac7ece5"></script>
+    <script defer src="js/app/sessions.js?v=c9b19e683a2b"></script>
+    <script defer src="js/app/session_archives.js?v=423700aa2847"></script>
     <script defer src="js/app/history_search.js?v=fca634fa8815"></script>
     <script defer src="js/app/session_groups.js?v=e17b7b2add01"></script>
     <script defer src="js/app/stats.js?v=30c84f899b75"></script>
@@ -1112,30 +1143,35 @@
     <script defer src="js/tool_approval_state.js?v=d301678b67f4"></script>
     <script defer src="js/stream_replay_dedup.js?v=8dfebe7055e9"></script>
     <script defer src="js/read_media_strip.js?v=bfdeaabc3b3c"></script>
-    <script defer src="js/app/permissions.js?v=005c1e739ae3"></script>
+    <script defer src="js/app/permissions.js?v=b64fa99611be"></script>
     <script defer src="js/history_scroll_model.js?v=5341fda4b6e5"></script>
-    <script defer src="js/app/messages.js?v=92906d8e3ba9"></script>
-    <script defer src="js/app/history_scroll.js?v=85d0b7b28c8a"></script>
+    <script defer src="js/app/process_groups.js?v=78c61550db4f"></script>
+    <script defer src="js/app/messages.js?v=469c0a236e9f"></script>
+    <script defer src="js/app/history_scroll.js?v=969793fe4cc9"></script>
     <script defer src="js/app/history.js?v=37f5d95cf865"></script>
-    <script defer src="js/app/compaction.js?v=e4dc6124f637"></script>
-    <script defer src="js/app/builtin.js?v=89db559adeed"></script>
+    <script defer src="js/app/compaction.js?v=52a5369b931d"></script>
+    <script defer src="js/app/builtin.js?v=6ee9f8d92033"></script>
     <script defer src="js/app/user_profile.js?v=3708d7c2ce32"></script>
     <script defer src="js/app/media.js?v=ec9af7059aeb"></script>
     <script defer src="js/app/skills.js?v=782b52f8971e"></script>
-    <script defer src="js/app/composer.js?v=8d9a9c9b635b"></script>
+    <script defer src="js/app/composer.js?v=d7f77f41937f"></script>
     <script defer src="js/app/chat_settings_modal.js?v=5092ffb42645"></script>
     <script defer src="js/app/model_panel_modal.js?v=c5776d195fd4"></script>
-    <script defer src="js/app/model_panel.js?v=3d62a16b5aae"></script>
+    <script defer src="js/app/model_panel.js?v=8a6b6c6f34b7"></script>
     <script defer src="js/app/tools.js?v=323bad81c04d"></script>
     <script defer src="js/app/mcp_schema_form.js?v=a813d9f065e7"></script>
     <script defer src="js/app/mcp_diagnostics.js?v=29c7e6cf535a"></script>
     <script defer src="js/app/task_templates.js?v=f5a4c7debcdb"></script>
-    <script defer src="js/app/chat.js?v=01ec28d6a199"></script>
+    <script defer src="js/task_state.js?v=3b31e198ccb0"></script>
+    <script defer src="js/app/session_activity.js?v=df91293787c3"></script>
+    <script defer src="js/app/task_status.js?v=635fe3b81e6d"></script>
+    <script defer src="js/app/stream_pipeline.js?v=f8377a19a022"></script>
+    <script defer src="js/app/chat.js?v=26f8f86d37de"></script>
     <script defer src="js/app/filehistory.js?v=8a5da583b0c3"></script>
-    <script defer src="js/app/terminals.js?v=13b72797f8e0"></script>
+    <script defer src="js/app/terminals.js?v=a30b6ca89011"></script>
     <script defer src="js/app/task_costs.js?v=8905a42033a3"></script>
-    <script defer src="js/app/slash_commands.js?v=dfa0ff94bb1b"></script>
-    <script defer src="js/app.js?v=8696b0596707"></script>
+    <script defer src="js/app/slash_commands.js?v=b5d7a8487a82"></script>
+    <script defer src="js/app.js?v=e877d0b76ea2"></script>
 </body>
 
 </html>

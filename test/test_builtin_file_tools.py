@@ -546,7 +546,7 @@ class BuiltinFileToolTests(unittest.TestCase):
         for i in range(5):
             self._make_file(f"m{i}.txt", f"hit{i}\n")
         result = bt.execute_search_files({
-            "pattern": r"hit\d", "is_regex": True, "max_results": 2,
+            "pattern": r"hit\d", "is_regex": True, "max_results": 2, "count_total": True,
         })
         self.assertTrue(result["truncated"])
         self.assertEqual(result["total_matches"], 5)
@@ -601,7 +601,7 @@ class BuiltinFileToolTests(unittest.TestCase):
 
     def test_search_files_window_limit_preserves_scan_and_display_counts(self):
         self._make_file("a.txt", ("hit " + "x" * 140 + "\n") * 30)
-        result = bt.execute_search_files({"pattern": "hit", "_max_chars": 512})
+        result = bt.execute_search_files({"pattern": "hit", "_max_chars": 512, "count_total": True})
         self.assertTrue(result["scan_complete"])
         self.assertFalse(result["scan_truncated"])
         self.assertTrue(result["output_truncated"])
@@ -612,7 +612,7 @@ class BuiltinFileToolTests(unittest.TestCase):
 
     def test_search_files_exact_block_limit_is_not_truncated(self):
         self._make_file("a.txt", "hit\n")
-        result = bt.execute_search_files({"pattern": "hit", "max_results": 1})
+        result = bt.execute_search_files({"pattern": "hit", "max_results": 1, "count_total": True})
         self.assertFalse(result["truncated"])
         self.assertEqual(result["displayed_matches"], 1)
 

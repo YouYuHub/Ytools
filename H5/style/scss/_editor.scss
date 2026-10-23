@@ -9,8 +9,11 @@
 // - 复用 _filehistory.scss 的全局类：fh-btn / fh-hunk-head / fh-skip 等
 // ============================================================
 
-$eh-add-bg: rgba(46, 160, 67, 0.16);
-$eh-del-bg: rgba(248, 81, 73, 0.16);
+// 增删行底色减淡（VS Code 式：浅底 + 左侧色条指示，文字仍保持色系）
+$eh-add-bg: rgba(46, 160, 67, 0.07);
+$eh-del-bg: rgba(248, 81, 73, 0.07);
+$eh-add-bar: rgba(46, 160, 67, 0.55);
+$eh-del-bar: rgba(248, 81, 73, 0.55);
 $eh-add-text: #1a7f37;
 $eh-del-text: #cf222e;
 
@@ -79,6 +82,22 @@ body.eh-page {
   flex: none;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+// 顶栏按钮视觉分组：[保存] [回退/刷新/保留] [主题] [块导航] [关闭]
+body.eh-page .eh-bar {
+  #ehThemeSelect,
+  #ehPrevHunk,
+  #ehClose {
+    margin-left: 10px;
+  }
+
+  // 回退是危险操作：悬停时红色提示
+  #ehRevert:hover:not(:disabled) {
+    border-color: var(--danger);
+    color: var(--danger);
+    background: transparent;
+  }
 }
 
 // 编辑器页按钮整体调矮（fh-btn 沿用主应用全局样式，此处按需收紧）
@@ -155,7 +174,7 @@ body.eh-page .eh-hunk-nav {
 // ---------- 行渲染 ----------
 .eh-table {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.55;
   min-width: max-content;
 }
@@ -171,6 +190,8 @@ body.eh-page .eh-hunk-nav {
   flex: none;
   width: 96px;
   padding-right: 10px;
+  margin-right: 10px;
+  border-right: 1px solid var(--border);
   text-align: right;
   color: var(--text-tertiary);
   font-size: 11px;
@@ -230,9 +251,15 @@ body.eh-page .eh-hunk-nav {
   }
 }
 
-// add 行：绿底，编辑中文字保持绿色系
+// ctx 行悬停微亮，便于长行横向追踪（增删行已有底色，不覆盖）
+.eh-line.eh-ctx:hover {
+  background: var(--bg-hover);
+}
+
+// add 行：浅绿底 + 左侧色条，编辑中文字保持绿色系
 .eh-add {
   background: $eh-add-bg;
+  box-shadow: inset 3px 0 0 $eh-add-bar;
 
   .eh-hl {
     color: $eh-add-text;
@@ -242,6 +269,7 @@ body.eh-page .eh-hunk-nav {
 // del 行：红底只读（无行号、删除线）
 .eh-del {
   background: $eh-del-bg;
+  box-shadow: inset 3px 0 0 $eh-del-bar;
 
   .eh-text {
     color: $eh-del-text;

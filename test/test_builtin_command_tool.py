@@ -9,6 +9,7 @@
 说明：真实命令执行依赖系统 shell（Windows 为 cmd）；非 Windows 环境自动跳过。
 """
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -176,8 +177,12 @@ class BuiltinCommandToolTests(unittest.TestCase):
     @unittest.skipUnless(IS_WINDOWS, "真实命令执行用例仅 Windows 验证")
     def test_model_result_has_nonduplicated_output_fields(self):
         result = bt.try_execute_builtin_command_tool("run_command", {"command": "echo structured_ok"})
+        parts = [result.get('output', '')]
+        while result['status'] == 'running' or result.get('has_more'):
+            result = bt.try_execute_builtin_command_tool('poll_command', {'job_id': result['job_id']})
+            parts.append(result['output'])
         self.assertEqual(result["exit_code"], 0)
-        self.assertIn("structured_ok", result["stdout"])
+        self.assertIn("structured_ok", ''.join(parts))
         self.assertNotIn("structured_ok", result["message"])
 
     def test_background_job_can_be_polled_and_stopped(self):
@@ -203,7 +208,12 @@ class BuiltinCommandToolTests(unittest.TestCase):
                     if IS_WINDOWS:
                         stop_command.assert_called_once()
                     else:
-                        stop_group.assert_called_once()
+                        # POSIX：SIGTERM → 存活轮询 → 超时 SIGKILL（见 command_jobs 后台停止语义）；
+                        # 轮询次数随时间片变化，只断言首末两次调用
+                        calls = [c.args for c in stop_group.call_args_list]
+                        self.assertGreaterEqual(len(calls), 2)
+                        self.assertEqual(calls[0], (12345, signal.SIGTERM))
+                        self.assertEqual(calls[-1], (12345, signal.SIGKILL))
                 with self.assertRaisesRegex(ValueError, "job_id 无效"):
                     bt.execute_run_command({"action": "poll", "job_id": "../other"})
 

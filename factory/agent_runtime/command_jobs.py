@@ -40,9 +40,19 @@ def read_job(job_id, session_id=None):
     if session_id is not None and (meta.get("session_id") or "") != session_id:
         raise ValueError("后台任务不属于当前会话")
     # Never let registry metadata turn HTTP output/download into arbitrary file reads.
-    for key in ("output_path", "completion_path"):
-        if meta.get(key) and Path(meta[key]).resolve().parent != root:
-            raise ValueError("后台任务日志路径无效")
+    for key in ("output_path", "completion_path", "lease_path"):
+        if not meta.get(key):
+            continue
+        candidate = Path(meta[key])
+        if key == 'lease_path':
+            # This ephemeral spec is deleted on completion. Resolve its stable
+            # parent, not the disappearing leaf (Windows can resolve it during
+            # deletion to an inconsistent parent). Only sibling state is read.
+            valid = candidate.parent.resolve() == root and bool(re.fullmatch(r'bg_lease_[a-f0-9]{32}\.json',candidate.name))
+        else:
+            valid = candidate.resolve().parent == root
+        if not valid:
+            raise ValueError(f"后台任务日志路径无效（{key}）；请重新启动命令")
     return path, meta
 
 
@@ -64,10 +74,27 @@ def snapshot(meta, *, include_output=False, tail_lines=2000, max_chars=131072):
             pass
     status = ("stopped" if meta.get("stopped") else "failed" if done and exit_code not in (0, None)
               else "completed" if done else "running" if alive else "unknown")
+    lease = {}
+    if meta.get('lease_path'):
+        try:
+            lease = json.loads(Path(meta['lease_path']).with_suffix('.outcome.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            pass
+        if lease.get('timed_out') and not (lease.get('terminating') and alive):
+            status = 'timeout'
+            exit_code = lease.get('exit_code')
+        elif lease.get('cancelled') and not (lease.get('terminating') and alive):
+            status = 'stopped'
+            exit_code = lease.get('exit_code')
     result = {key: meta.get(key) for key in ("job_id", "pid", "command", "shell", "cwd", "created_at", "session_id")}
+    if meta.get('interactive'):
+        result.update(interactive=True, tty=bool(meta.get('tty')), input_encoding='utf-8')
     result.update(status=status, exit_code=exit_code, can_stop=status == "running" and verified,
                   output_path=bt._display_path(Path(meta["output_path"])),
-                  completion_path=bt._display_path(done_path) if done_path else None, background=True)
+                  completion_path=bt._display_path(done_path) if done_path else None,
+                  background=meta.get('background', True), timed_out=bool(lease.get('timed_out')))
+    if 'termination_confirmed' in lease:
+        result['termination_confirmed'] = lease['termination_confirmed']
     if include_output:
         try:
             output, truncated = bt._command_output_tail(Path(meta["output_path"]), tail_lines, max_chars)
@@ -93,7 +120,25 @@ def list_jobs(session_id=None, *, active_only=False):
     return sorted(result, key=lambda item: item.get("created_at") or 0, reverse=True)
 
 
-def action(job_id, operation, session_id=None, *, tail_lines=30, max_chars=12000):
+def incremental(job_id, session_id, cursor, max_chars, wait_seconds=0, encoding='', *, check_deadline=True):
+    from .command_output import read
+    from .tool_control import check_tool_control
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        check_tool_control(check_deadline=check_deadline)
+        _, meta = read_job(job_id, session_id)
+        result = snapshot(meta)
+        result.update(read(meta, cursor, max_chars, finished=result['status'] != 'running', encoding=encoding))
+        result['message'] = f"[run_command] job_id={job_id} | status={result['status']} | exit={result['exit_code']}"
+        if result['output'] or result['status'] != 'running' or time.monotonic() >= deadline:
+            return result
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def action(job_id, operation, session_id=None, *, tail_lines=30, max_chars=12000,
+           cursor=None, wait_seconds=0, encoding=''):
+    if operation == 'poll' and cursor is not None:
+        return incremental(job_id, session_id, cursor, max_chars, wait_seconds, encoding)
     path, _ = read_job(job_id, session_id)
     with cross_process_lock(path.with_suffix(".lock")):
         path, meta = read_job(job_id, session_id)
@@ -133,6 +178,9 @@ def action(job_id, operation, session_id=None, *, tail_lines=30, max_chars=12000
             meta.setdefault("closed_at", time.time())
         if operation in ("stop", "close"):
             write_metadata(path, meta)
+            if meta.get('stopped') and meta.get('interactive') and meta.get('lease_path'):
+                from .command_input import finish_pending
+                finish_pending(meta['lease_path'])
         result = snapshot(meta, include_output=True, tail_lines=tail_lines, max_chars=max_chars)
         result["message"] = f"[run_command] job_id={job_id} | status={result['status']} | exit={result['exit_code']}"
         return result

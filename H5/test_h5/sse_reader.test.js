@@ -20,7 +20,8 @@ test('实时流跨字节分包、无效 JSON 和未换行的末帧均不丢失�
     for(let i=0;i<bytes.length;i++)controller.enqueue(bytes.slice(i,i+1));
     controller.close();
   }}), events=[];
-  await api(stream).chatStream({messages:[]},event=>events.push(event));
+  const outcome=await api(stream).chatStream({messages:[]},event=>events.push(event));
+  assert.equal(outcome.completed,false);
   assert.deepEqual(events.map(e=>e.type==='done'?'done':e.data.content),['继续处理😀','末帧','done']);
   assert.equal(stream.locked,false);
 });
@@ -43,8 +44,20 @@ test('[DONE] 只派发一次且释放仍保持连接的流', async () => {
     start(controller){controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));},
     cancel(){cancelled=true;},
   }), events=[];
-  await api(stream).chatStream({},event=>events.push(event.type));
+  let opened=false;
+  const outcome=await api(stream).chatStream({},event=>events.push(event.type),null,{onOpen(){opened=true;}});
+  assert.equal(opened,true);assert.equal(outcome.completed,true);
   assert.deepEqual(events,['done']);
   assert.equal(cancelled,true);
   assert.equal(stream.locked,false);
+});
+
+for (const completed of [true,false]) test('手动压缩读取器返回真实结束标记：'+(completed?'DONE':'EOF'),async()=>{
+  const stream=new ReadableStream({start(controller){
+    controller.enqueue(new TextEncoder().encode('data: {"event":"context_compaction","phase":"done"}\n\n'+(completed?'data: [DONE]\n\n':'')));
+    controller.close();
+  }}),events=[];
+  const result=await api(stream).compactContextStream('s',event=>events.push(event));
+  assert.equal(result.completed,completed);assert.equal(stream.locked,false);
+  assert.equal(events.filter(event=>event.type==='done').length,1);
 });

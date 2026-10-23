@@ -14,6 +14,15 @@
   // "2026-08-02 20:34:11" -> "08-02 20:34:11"
   function fmtTime(ts) {
     if (!ts || typeof ts !== "string") return "";
+    // 实时节点使用 ISO 时间；按浏览器本地时区展示，兼容历史的服务器时间文本。
+    if (/^\d{4}-\d{2}-\d{2}T/.test(ts)) {
+      const date = new Date(ts);
+      if (!Number.isNaN(date.getTime())) {
+        const pad = value => String(value).padStart(2, "0");
+        return pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + " " +
+          pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
+      }
+    }
     return ts.length > 5 ? ts.slice(5) : ts;
   }
 

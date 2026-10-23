@@ -116,31 +116,140 @@
    * 事件结构与自动压缩完全一致（context_compaction start/delta/done，
    * done 带 summary_text），渲染复用 buildCompactionBlock；
    * 结尾的 compaction_manual_result 帧携带 compressed_rounds / stats / error。
+   * 后台任务与消费端分离：本地 SSE 中断不再停止后台任务，刷新后可经
+   * attachManualCompactionStream(sessionId) 重连收看剩余进度。
    */
   async function runManualCompactionStream() {
-    if (state.manualCompactRunning) return;
-    const compactSessionId = state.sessionId;
+    await consumeCompactionStream(state.sessionId, false);
+  }
+
+  /**
+   * 附接到已有的手动压缩任务（刷新后重连，不二次确认、不重复启动）。
+   * 后端无运行中任务时返回 false，调用方回退为普通历史加载。
+   */
+  async function attachManualCompactionStream(sessionId) {
+    return consumeCompactionStream(sessionId, true);
+  }
+
+  async function consumeCompactionStream(compactSessionId, attach, reconnects) {
+    if (!compactSessionId) return false;
+    if (state.manualCompactRunning) return false;
     state.manualCompactRunning = true;
     // 记录发起压缩的会话：终止按钮/发送守卫只作用于该会话，切到其他会话不受影响
     state.manualCompactSession = compactSessionId;
     // 压缩期间隐藏发送按钮、终止按钮接管（点击可中止压缩），结束后恢复
-    state.manualCompactAbort = new AbortController();
+    const controller = new AbortController();
+    state.manualCompactAbort = controller;
     App.refreshComposerButtons();
+    // 会话状态条同步压缩进度：独立建一条任务行，切走会话也不丢失。
+    const taskHandle = App.taskStatus && App.taskStatus.compactBegin
+      ? App.taskStatus.compactBegin(compactSessionId)
+      : null;
+    function noteCompactionEvent(payload) {
+      if (taskHandle && App.taskStatus && App.taskStatus.compactEvent) {
+        App.taskStatus.compactEvent(taskHandle, payload);
+      }
+    }
     let ui = null;
     let sawStart = false;
     let sawNativeDone = false;
-    scrollToBottom();
+    let compactError = null;
+    let compactStopped = false;
+    let attachMissing = false;
+    let sawResult = false;
+    let reconnect = false;
+    let disconnected = false;
+    function inView() { return state.sessionId === compactSessionId; }
+    function runningBars() {
+      if (!inView()) return [];
+      return Array.from(chatInner.querySelectorAll('.compaction-bar.is-running[data-compaction-scope="session"]'));
+    }
+    // 历史窗口只含 start 时，SSE 收到 done 后也要更新内存记录，避免重建恢复运行态。
+    // 已有配对终态的落盘记录保持原样；这里不改历史文件。
+    function settleHistory(node, data) {
+      if (!inView() || !node || !node.hasAttribute("data-history-index")) return;
+      const view = App.getHistoryWindow && App.getHistoryWindow();
+      const records = view && view.records;
+      const index = Number(node.dataset.historyIndex), rec = records && records[index];
+      if (!rec || rec.kind !== "compaction" || rec.phase !== "start" || rec.scope !== "session") return;
+      const shown = node._compactionUi && node._compactionUi.getState();
+      const source = shown && (shown.compress_context || shown.context_summary);
+      const savedSource = rec.compress_context || rec.content || rec.context_summary;
+      if (source && savedSource && source !== savedSource) return; // 历史快照已替换，旧下标不再对应此块。
+      for (let i = index + 1; i < records.length; i++) {
+        const next = records[i];
+        if (next.kind !== "compaction" || next.scope !== rec.scope) continue;
+        if (next.phase === "start") break;
+        const usage = next.usage || next.summary_usage;
+        if (["done", "aborted"].includes(next.phase) && !(usage && Number(usage.merge_block_count) > 0)) return;
+      }
+      Object.assign(rec, data, {compress_context: savedSource || "",
+        usage: data.summary_usage || data.compress_usage || data.usage || rec.usage});
+    }
+    function removeRunningBars(terminal) {
+      const nodes = runningBars().filter(node => !ui || node !== ui.wrap);
+      // 切回时移除的历史占位仍要在终态时同步；引用跟随控制器跨重连保留。
+      const aliases = ui ? (ui.historyAliases || (ui.historyAliases = new Set())) : new Set();
+      nodes.forEach(node => aliases.add(node));
+      if (terminal) { aliases.forEach(node => settleHistory(node, terminal)); aliases.clear(); }
+      if (App.historyScroll && App.historyScroll.discardNodes) App.historyScroll.discardNodes(nodes);
+      else nodes.forEach(node => node.remove());
+      if (nodes.length && App.processGroups && inView()) App.processGroups.sync(chatInner);
+    }
+    function adoptUi() {
+      if (!ui && inView()) {
+        const existing = runningBars().reverse().find(node => node._compactionUi);
+        if (existing) ui = existing._compactionUi;
+      }
+      return ui;
+    }
+    function mountUi() {
+      if (ui && inView() && !ui.wrap.isConnected) chatInner.appendChild(ui.wrap);
+      if (inView()) setEmpty(false);
+    }
+    function settleUi(data) {
+      adoptUi();
+      removeRunningBars(data);
+      if (ui) {
+        settleHistory(ui.wrap, data);
+        ui.update(data);
+        mountUi();
+      } else if (inView()) {
+        ui = App.buildCompactionBlock(Object.assign({scope: "session"}, data));
+        mountUi();
+      }
+      if (App.processGroups && inView()) App.processGroups.sync(chatInner);
+    }
+    function finishPending(data) {
+      // 仅给尚无终态的块收尾，已完成摘要绝不被连接错误覆盖。
+      const pending = runningBars();
+      if (ui && ui.wrap.classList.contains("is-running") && !pending.includes(ui.wrap)) pending.push(ui.wrap);
+      pending.forEach(node => {
+        if (node._compactionUi) {
+          node._compactionUi.update(data);
+          if (node._compactionUi.historyAliases) {
+            node._compactionUi.historyAliases.forEach(alias => settleHistory(alias, data));
+            node._compactionUi.historyAliases.clear();
+          }
+        }
+        settleHistory(node, data);
+      });
+      if (App.processGroups && inView()) App.processGroups.sync(chatInner);
+    }
+    if (!attach) scrollToBottom();
     try {
-      await API.compactContextStream(compactSessionId, function (evt) {
+      const result = await API.compactContextStream(compactSessionId, function (evt) {
         if (!evt || evt.type === "done") return;
         const data = evt.data || {};
         if (data.event === "task_usage") {
           if (App.taskCosts && state.sessionId === compactSessionId) App.taskCosts.event(data);
           return;
         }
+        if (sawResult) return; // 业务终态之后的迟到进度不能重新打开运行态。
         // 用户切走后的压缩事件不渲染进其他会话视图；切回后由 done/统计刷新呈现
         const inCompactView = state.sessionId === compactSessionId;
         if (data.event === "responses_compaction") {
+          noteCompactionEvent(data);
           if (inCompactView && App.refreshResponsesState) App.refreshResponsesState();
           if (data.phase === "done") sawNativeDone = true;
           if (data.phase === "error") toast("官方压缩未完成：" + (data.error || "请稍后重试"));
@@ -149,8 +258,10 @@
         if (data.warning) { toast(data.warning.message || "压缩部分完成"); return; }
 
         if (data.event === "compaction_manual_result") {
+          sawResult = true;
           const rounds = Number(data.compressed_rounds) || 0;
           if (data.error) {
+            compactError = data.error;
             toast("手动压缩失败：" + data.error);
           } else if (rounds > 0) {
             toast("已将 " + rounds + " 个历史轮次纳入累计摘要");
@@ -164,71 +275,137 @@
           return;
         }
         if (data.event !== "context_compaction") return;
+        noteCompactionEvent(data);
+        if (data.phase === "aborted" && !compactError) compactError = data.error || "压缩失败";
         if (data.phase === "start") {
           sawStart = true;
           if (!inCompactView) return;
-          ui = App.buildCompactionBlock({
-            scope: "session",
-            phase: "start",
-            context_summary: data.context_summary || "",
-          });
-          chatInner.appendChild(ui.wrap);
-          setEmpty(false);
-        } else if (data.phase === "delta" && ui) {
-          // 用户切走又切回：运行块曾随视图清空失联，重新挂回后继续实时渲染
-          if (!ui.wrap.isConnected && inCompactView) chatInner.appendChild(ui.wrap);
-          if (ui.wrap.isConnected) ui.appendDelta(data);
+          adoptUi();
+          // 重放/重复 start 复用当前运行块；真正下一批在上一批终态后另建。
+          if (ui && ui.wrap.classList.contains("is-running")) ui.update(data);
+          else ui = App.buildCompactionBlock(Object.assign({scope: "session"}, data));
+          mountUi();
+          removeRunningBars();
+        } else if (data.phase === "delta") {
+          if (!adoptUi()) return;
+          if (inCompactView && !ui.wrap.isConnected) removeRunningBars();
+          mountUi();
+          ui.appendDelta(data);
         } else if (data.phase === "aborted") {
-          // 压缩失败：块转为失败态（错误信息 + 已生成部分标注未生效），
-          // 不再伪装成完成态
-          if (ui) {
-            ui.update({ phase: "aborted", error: data.error || "" });
-            ui = null;
-          } else if (inCompactView) {
-            const failed = App.buildCompactionBlock(Object.assign({ scope: "session" }, data));
-            chatInner.appendChild(failed.wrap);
-          }
+          settleUi(data);
         } else if (data.phase === "done") {
-          if (ui && ui.wrap.isConnected) {
-            ui.update(data);
-          } else if (inCompactView) {
-            // 切走期间视图被清空：运行块失联，重建完成态块保证切回可见
-            ui = App.buildCompactionBlock(Object.assign({ scope: "session" }, data));
-            chatInner.appendChild(ui.wrap);
-            sawStart = true;
-          }
+          const usage = data.summary_usage || data.compress_usage;
+          if (usage && Number(usage.merge_block_count) > 0) {
+            // 合并摘要的独立 done 不占用当前批次的 start。
+            if (inCompactView) chatInner.appendChild(App.buildCompactionBlock(data).wrap);
+          } else settleUi(data);
+          sawStart = true;
         }
         if (inCompactView) stickToBottom();
-      }, state.manualCompactAbort.signal);
+      }, controller.signal, attach);
+      if (!sawResult && !(result && result.completed)) throw new Error("压缩连接提前结束，未收到结束标记");
     } catch (err) {
       const aborted = err.name === "AbortError";
-      if (!aborted) {
-        const message = String(err.message || "");
-        const networkLike = /fetch|network|failed to|aborted|timed?\s?out|connection/i.test(message);
-        toast(networkLike
-          ? "压缩连接中断，请刷新查看已保存结果，可重试未完成部分"
-          : "手动压缩失败：" + message);
-      } else {
-        // 用户点击终止按钮主动中止：SSE 连接断开即取消，不弹网络错误提示
+      const status = err && err.status;
+      if (sawResult) {
+        // 最终业务结果已经确认，随后读取器断线不应把成功结果改成失败。
+      } else if (!attach && status === 409 && !reconnects) {
+        // 后端已有运行中任务（多半是刷新前启动的）：转入附接收看剩余进度。
+        compactError = null;
+        reconnect = true;
+        toast("已有压缩任务在进行中，正在为你接回进度");
+      } else if (attach && status === 404) {
+        // 附接时任务已结束（或从未启动）：静默回退，历史即为准。
+        attachMissing = true;
+        compactError = null;
+      } else if (aborted) {
+        // 本地消费端中止：唯一调用方是显式停止（stopManualCompactionStream 先调
+        // 后端 stop 再 abort），刷新/关闭时旧页面直接卸载不会执行到这里。
+        compactStopped = true;
         toast("已终止压缩，已保存的结果保留，可刷新查看");
+      } else {
+        const message = String(err.message || "");
+        // 网络抖动导致 SSE 中断，但后台任务仍在继续：自动重连一次，避免误报失败。
+        let reattached = false;
+        if (!compactError) {
+          try {
+            const st = await API.manualCompactionStatus(compactSessionId);
+            disconnected = !!(st && st.running);
+            reattached = disconnected && !reconnects;
+          } catch (_) { disconnected = true; }
+        }
+        if (reattached) {
+          reconnect = true;
+          toast("压缩连接中断，正在重连收看剩余进度");
+        } else {
+          if (!compactError) compactError = message || "连接中断";
+          toast("压缩连接中断，请重新打开会话查看后台进度及已保存结果");
+        }
       }
-      // 连接异常中断且后端未推 aborted 时：本地把块标记为失败态
-      // （原始对话不受影响；若后端实际已成功，刷新页面会按 done 记录回放）
-      if (ui) ui.update({ phase: "aborted", error: aborted ? "用户手动终止" : (err.message || "连接中断") });
     } finally {
-      state.manualCompactRunning = false;
-      state.manualCompactSession = null;
-      state.manualCompactAbort = null;
+      if (!reconnect) {
+        finishPending(compactStopped || (compactError && !disconnected && sawResult)
+          ? {phase: "aborted", error: compactStopped ? "用户手动终止" : compactError}
+          : {phase: "ended", error: disconnected ? "连接已中断，后台任务状态请重新打开会话查看。" : "本次压缩进度已结束，请以已保存的历史结果为准。"});
+      }
+      if (taskHandle && App.taskStatus && App.taskStatus.compactEnd) {
+        App.taskStatus.compactEnd(taskHandle, reconnect || disconnected
+          ? {disconnected: true} : attachMissing ? {missing: true} : compactStopped
+            ? {stopped: true} : compactError ? {error: compactError} : {});
+      }
+      if (state.manualCompactAbort === controller) {
+        state.manualCompactRunning = false;
+        state.manualCompactSession = null;
+        state.manualCompactAbort = null;
+      }
       App.refreshComposerButtons();
       App.refreshSessionUsage(compactSessionId);
       App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, compactSessionId);
       // 压缩结束后派发暂存的引导/队列消息（压缩期间发送被禁止，此处补发）
-      setTimeout(function () { App.flushPendingMessages(compactSessionId); }, 0);
+      if (!reconnect && !disconnected) setTimeout(function () { App.flushPendingMessages(compactSessionId); }, 0);
     }
+    // 必须等旧请求 finally 收尾后再附接，防止旧请求清掉新请求的运行标志/取消器。
+    if (reconnect) return consumeCompactionStream(compactSessionId, true, (reconnects || 0) + 1);
+    return !compactError && !attachMissing;
+  }
+
+  /** 打开会话后：若该会话后台仍在压缩，自动附接续看剩余进度。 */
+  function maybeAttachRunningCompaction(sessionId) {
+    if (!sessionId || state.manualCompactRunning) return;
+    const sid = String(sessionId);
+    API.manualCompactionStatus(sid).then(function (status) {
+      if (state.sessionId !== sid || state.manualCompactRunning) return;
+      if (status && status.running) {
+        toast("检测到该会话有压缩任务在进行中，正在接回进度");
+        attachManualCompactionStream(sid);
+      }
+    }).catch(function () { /* 状态查询失败则跳过续接 */ });
+  }
+
+  /**
+   * 显式停止手动压缩：先通知后端取消后台任务，再断开本地 SSE。
+   * 刷新/断线不再隐式取消，必须经此路径停止。
+   */
+  async function stopManualCompactionStream() {
+    const compactSessionId = state.manualCompactSession || state.sessionId;
+    if (!state.manualCompactRunning || state.manualCompactSession !== state.sessionId) return false;
+    const controller = state.manualCompactAbort;
+    try {
+      await API.stopManualCompaction(compactSessionId);
+    } catch (err) {
+      toast("停止压缩失败： " + (err.message || err));
+      return false;
+    }
+    // 标记由消费端收尾：AbortError 分支据此展示“已终止”而非网络错误。
+    if (controller && state.manualCompactAbort === controller) controller.abort();
+    return true;
   }
 
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.startManualCompaction = startManualCompaction;
+  App.attachManualCompaction = attachManualCompactionStream;
+  App.stopManualCompaction = stopManualCompactionStream;
+  App.maybeAttachRunningCompaction = maybeAttachRunningCompaction;
   App.openConfirmDialog = openConfirmDialog;
 })(window.App);

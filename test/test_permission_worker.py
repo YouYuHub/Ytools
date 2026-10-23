@@ -36,7 +36,7 @@ def worker(root, cmd, events, real_command=False, commands=None):
         if any(message.role == "tool" for message in request.messages):
             yield 'data: {"content":"完成","finish_reason":"stop"}\n\n'
         else:
-            args = commands or [{"command": 'Get-Date -Format "yyyy年MM月dd日 HH:mm:ss dddd"', "shell": "powershell"} if real_command else {"command": "echo safe"}]
+            args = commands or [{"command": 'Get-Date -Format "yyyy年MM月dd日 HH:mm:ss dddd"', "shell": "powershell", "yield_time_ms": 30000} if real_command else {"command": "echo safe"}]
             calls = [{"index": i, "id": f"call-{i + 1}", "type": "function", "function": {"name": "run_command", "arguments": json.dumps(arguments)}} for i, arguments in enumerate(args)]
             yield "data: " + json.dumps({"tool_calls": calls, "finish_reason": "tool_calls"}) + "\n\n"
         yield "data: [DONE]\n\n"
@@ -216,7 +216,9 @@ def test_http_resume_and_confirm_with_real_windows_worker_and_lost_ipc(environme
         assert returned and returned["tool_call_id"] == "call-1"
         result = returned["result"]
         if isinstance(result, str): result = json.loads(result)
-        assert result["exit_code"] == 0 and "年" in result["stdout"]
+        assert result['status'] == 'completed' and result['job_id']
+        assert result["exit_code"] == 0 and "年" in result["output"]
+        assert "年" not in result['message']
         assert (environment / "executions.txt").read_text().splitlines() == ["executed"]
         assert store.task(old["task"])["state"] == "completed"
         current["cmd"].send({"type": "shutdown"})

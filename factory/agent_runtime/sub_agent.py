@@ -587,23 +587,9 @@ class SubAgentRunner:
                 f"（agent_id={self.context.agent_id}, phase={phase}）: {exc}")
 
     def _record_file_history(self, raw_result: dict[str, Any]) -> None:
-        """V2 版本链：子任务内文件工具变更入链（同父级消费点语义，失败静默）。"""
-        payload = raw_result.get("_file_history")
-        if not isinstance(payload, dict) or not payload.get("path"):
-            return
-        try:
-            _file_history.record_change(
-                self.context.session_id,
-                path=str(payload["path"]),
-                display_path=str(payload.get("display_path") or payload["path"]),
-                old_text=payload.get("old_text"),
-                new_text=payload.get("new_text"),
-                tool="sub_agent." + (payload.get("tool") or "file_tool"),
-                round_number=int(self.context.parent_round_number or 0),
-                encoding=str(payload.get("encoding") or "utf-8"),
-            )
-        except Exception as record_error:
-            logger.warning(f"子任务文件版本链记录失败（不影响子任务）: {record_error}")
+        from .file_history_result import record_result
+        record_result(raw_result, self.context.session_id, "sub_agent.file_tool",
+                      self.context.parent_round_number)
 
     async def _emit_start(self, *, queued: bool = False) -> None:
         if self.start_emitted:
@@ -1242,7 +1228,7 @@ class SubAgentRunner:
                 continue
             bounded_args = {**ta, "_max_chars": model_tool_output_char_budget(media_config),
                             "_default_shell": resolve_default_command_shell(ctx.session_id),
-                            "_session_id": ctx.session_id}
+                            "_session_id": ctx.session_id, "_command_owner_agent": ctx.agent_id}
             file_tool_result = (await run_sync_tool(ctx.file_access.execute, ctx.agent_id, tn, bounded_args, try_execute_builtin_file_tool)
                                 if ctx.file_access else await run_sync_tool(try_execute_builtin_file_tool, tn, bounded_args))
             if file_tool_result is not None:
@@ -1691,6 +1677,9 @@ class SubAgentRunner:
                     tool_args if isinstance(tool_args, str)
                     else json.dumps(tool_args, ensure_ascii=False)
                 )
+                raw_file_result = tool_result["result"]
+                if isinstance(raw_file_result, dict) and "_file_history" in raw_file_result and not tool_result.get("_permission_cached"):
+                    await asyncio.to_thread(self._record_file_history, raw_file_result)
                 ret = _format_result_text(tool_result["result"])
                 if self.permission_runtime:
                     self.permission_runtime.finish_call(ctx.agent_id, tool_call_id, tool_result["result"])
@@ -1750,9 +1739,6 @@ class SubAgentRunner:
                 sub_file_diff = (
                     sub_raw_result.get("_file_diff") if isinstance(sub_raw_result, dict) else None
                 )
-                # V2 版本链：子任务内的文件工具变更同样入链（标注父轮次号）
-                if isinstance(sub_raw_result, dict) and "_file_history" in sub_raw_result and not tool_result.get("_permission_cached"):
-                    self._record_file_history(sub_raw_result)
                 await self._emit(
                     "tool_result",
                     tool_call_id=tool_call_id,

@@ -27,8 +27,14 @@
   responseControls.forEach(function (key) { R[key] = App[key] || el("div"); });
   ["responsesModeHint", "responsesStatefulControls"].forEach(function (key) { R[key] = App[key] || el("div"); });
 
+  function apiKindOf(model) {
+    const raw = String(model && model.api_type || "").toLowerCase().replace(/_/g, "-");
+    if (raw === "responses") return "responses";
+    if (raw === "messages") return "messages";
+    return "completions";
+  }
   function isResponsesModel(model) {
-    return Boolean(model && String(model.api_type || "").toLowerCase() === "responses");
+    return apiKindOf(model) === "responses";
   }
   function responseParameters(role) {
     const info = state.modelConfigs[role] && state.modelConfigs[role].role_info;
@@ -231,6 +237,7 @@
     if (!key) {
       modelPickerLabel.textContent = "请选择模型";
       modelPickerLabel.classList.add("placeholder");
+      if (modelPicker && modelPicker.dataset) modelPicker.dataset.api = "none";
       return;
     }
     const sep = key.indexOf("::");
@@ -238,6 +245,8 @@
     const model = modelInfoByKey(state.activeModelRole, key);
     modelPickerLabel.textContent = model && model.api_type ? name + " · " + model.api_type : name;
     modelPickerLabel.classList.remove("placeholder");
+    // 选择按钮按 api 着色（completions 蓝 / messages 绿 / responses 粉），不再跟随全局强调色。
+    if (modelPicker && modelPicker.dataset) modelPicker.dataset.api = apiKindOf(model);
   }
 
   // 模型选择列表在面板内展开（不依赖原生 select 弹出层，窄屏也能完整显示与滚动）
@@ -259,9 +268,11 @@
     groups.forEach(function (items, provider) {
       modelList.appendChild(el("div", "model-list-group", provider));
       items.forEach(function (m) {
-        const item = el("button", "model-list-item", m.model_name);
+        const kind = apiKindOf(m);
+        const item = el("button", "model-list-item api-" + kind, m.model_name);
         item.type = "button";
         item.dataset.key = provider + "::" + m.model_name;
+        item.dataset.api = kind;
         const caps = [];
         if (m.vision) caps.push("视觉");
         if (m.tool_calling) caps.push("工具");
@@ -344,7 +355,7 @@
   }
 
   function isMessagesModel(model) {
-    return Boolean(model && String(model.api_type || "").toLowerCase().replace(/_/g, "-") === "messages");
+    return apiKindOf(model) === "messages";
   }
 
   function supportsMessageParameter(model, key) {
@@ -480,11 +491,18 @@
 
   function updateProtocolControls() {
     const model = modelInfoByKey(state.activeModelRole, state.selectedModelKey);
-    const messages = isMessagesModel(model);
-    const responses = isResponsesModel(model);
+    const kind = apiKindOf(model);
+    const messages = kind === "messages";
+    const responses = kind === "responses";
+    const completions = kind === "completions";
     chatParametersGroup.classList.toggle("hidden", messages || responses);
     R.responsesParametersGroup.classList.toggle("hidden", !responses);
+    // 三色模式互斥：completions 蓝 / messages 绿 / responses 粉，不再依赖全局强调色。
+    enhancePanel.classList.toggle("completions-mode", completions);
+    enhancePanel.classList.toggle("messages-mode", messages);
     enhancePanel.classList.toggle("responses-mode", responses);
+    if (enhancePanel.dataset) enhancePanel.dataset.api = kind;
+    if (modelPicker && modelPicker.dataset) modelPicker.dataset.api = kind;
     R.responsesTemperatureRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "temperature"));
     R.responsesTopPRow.classList.toggle("hidden", !responses || !R.responsesSampling.checked || !supportsMessageParameter(model, "top_p"));
     if (responses) refreshResponsesState();
@@ -495,7 +513,6 @@
       R.responsesRebuildSource.disabled = true;
     }
     messagesParametersGroup.classList.toggle("hidden", !messages);
-    enhancePanel.classList.toggle("messages-mode", messages);
     syncMessagesThinkingControls(model);
     [temperature, topP, presencePenalty, reasoningEffort, enableThinking].forEach(function (control) {
       control.disabled = Boolean(messages || responses);

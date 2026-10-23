@@ -119,7 +119,10 @@
     if (!sid) { suspendedTasks = []; renderAll(); return; }
     try {
       const data = await controller.refresh(sid);
-      if (data && state.sessionId === sid) { suspendedTasks = data.tasks || []; renderAll(); }
+      if (data && state.sessionId === sid) {
+        suspendedTasks = data.tasks || []; renderAll();
+        if (App.taskStatus) App.taskStatus.snapshot(sid, data);
+      }
     } catch (error) { if (state.sessionId === sid) problem(error); }
   }
   async function refresh() {

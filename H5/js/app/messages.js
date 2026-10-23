@@ -25,6 +25,45 @@
   // 不再从尾部一路回填；滚动、搜索及问题导航共用同一窗口构建入口。
   const loadOlderState = { records: null, start: 0, end: 0, loading: false,
     timer: null, button: null, newerButton: null, observer: null };
+  // 压缩块展开选择：历史窗口滚动重建 DOM 时保持用户手动折叠/展开，
+  // 避免“滚动后自动展开”。key 为“会话:起始记录下标”（start 与其配对的
+  // done 共用同一 key），value 为 open 布尔值，上限 500 条。
+  const compactionOpenChoices = new Map();
+  function compactionChoiceKey(historyIndex) {
+    if (!Number.isInteger(historyIndex)) return "";
+    return (state.sessionId || "") + ":compaction:" + historyIndex;
+  }
+  function rememberCompactionChoice(historyIndex, open) {
+    const key = compactionChoiceKey(historyIndex);
+    if (!key) return;
+    compactionOpenChoices.set(key, !!open);
+    if (compactionOpenChoices.size > 500) {
+      compactionOpenChoices.delete(compactionOpenChoices.keys().next().value);
+    }
+  }
+  function readCompactionChoice(historyIndex) {
+    const key = compactionChoiceKey(historyIndex);
+    if (!key || !compactionOpenChoices.has(key)) return null;
+    return compactionOpenChoices.get(key);
+  }
+  // 同一逻辑压缩的 start/done 共用 key：done 记录向前查找最近的同 scope
+  // start（压缩按 scope 顺序配对，与渲染队列一致），找不到则用自身下标。
+  function compactionPairStartIndex(records, index) {
+    if (!Array.isArray(records) || !Number.isInteger(index)) return index;
+    const rec = records[index];
+    if (!rec || rec.kind !== "compaction" || rec.phase === "start" || rec.interrupted) return index;
+    const scope = rec.scope === "session" ? "session" : "round";
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const prev = records[i];
+      if (!prev || prev.kind !== "compaction" || prev.interrupted) continue;
+      const prevScope = prev.scope === "session" ? "session" : "round";
+      if (prevScope !== scope) continue;
+      if (prev.phase === "start") return i;
+      // 遇到同 scope 的 done/aborted 说明中间已闭合，停止向前查找。
+      if (prev.phase === "done" || prev.phase === "aborted") return index;
+    }
+    return index;
+  }
 
   function resetHistoryPaging() {
     if (loadOlderState.timer != null) window.clearTimeout(loadOlderState.timer);
@@ -128,7 +167,7 @@
   // 避免双份渲染逻辑漂移）。container 为 chatInner 时行为与历史版本一致；
   // 配对队列 pendingTools/pendingCompactions 由调用方提供（主渲染与分段
   // 回灌各自持有一套，互不串扰）
-  function renderOneRecordInto(container, rec, pendingTools, pendingCompactions) {
+  function renderOneRecordInto(container, rec, pendingTools, pendingCompactions, historyIndex) {
     if (rec.kind === "approval") {
       // 审批记录用于审计；可操作按钮由后端当前状态绑定到原工具块。
       // 不再为同一调用创建独立的“执行确认”展示块。
@@ -141,9 +180,9 @@
       return;
     }
     if (rec.kind === "think") {
-      appendTimeInto(container, rec.ts);
       const think = buildThinkBlock();
       think.setText(rec.content);
+      setStageTimestamp(think.wrap, rec.ts);
       container.appendChild(think.wrap);
       return;
     }
@@ -159,9 +198,9 @@
       return;
     }
     if (rec.kind === "tool") {
-      appendTimeInto(container, rec.ts);
       const ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round });
       ui.setInput(FormatUtils.prettyJson(rec.args));
+      setStageTimestamp(ui.wrap, rec.ts);
       container.appendChild(ui.wrap);
       // ask_user 历史记录附一张可点击的提问卡片：刷新后仍能重新打开回答窗口
       if (rec.name === App.ASK_USER_TOOL_NAME) {
@@ -176,9 +215,9 @@
       const index = queue && rec.tool_call_id ? queue.findIndex(ui => ui.toolCallId === rec.tool_call_id) : 0;
       let ui = queue && index >= 0 ? queue.splice(index, 1)[0] : null;
       if (!ui) {
-        appendTimeInto(container, rec.ts);
         ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round });
         ui.setInput(FormatUtils.prettyJson(rec.args));
+        setStageTimestamp(ui.wrap, rec.ts);
         container.appendChild(ui.wrap);
       }
       applyToolResult(ui, rec.name, rec.result, rec.file_diff, rec.args);
@@ -193,13 +232,13 @@
         // 附接当前轮 SSE 时可直接收养这行，并保留已落盘的累计值。
         line._roundUsageSnapshot = rec.usage;
         line._roundModelSnapshot = rec.model;
+        setStageTimestamp(line, rec.ts);
         container.appendChild(line);
       }
       return;
     }
     if (rec.kind === "agentBlock") {
       // 子任务块：任务/计划在头，轨迹按轮次，尾部最终回复引用条
-      appendTimeInto(container, rec.started_at);
       const agentUi = buildSubAgentBlock();
       agentUi.applyEvent({ phase: "start", agent_id: rec.agent_id, round: rec.round, task: rec.task, todo: rec.todo, rounds_limit: rec.rounds_limit,
         timeout_seconds: rec.timeout_seconds });
@@ -207,18 +246,20 @@
       agentUi.hydrate(rec);
       if (rec.agent_id) agentUi.wrap.dataset.agentId = rec.agent_id;
       if (rec.done_emitted) agentUi.markReturned(rec);
+      setStageTimestamp(agentUi.wrap, rec.started_at);
       container.appendChild(agentUi.wrap);
       return;
     }
     if (rec.kind === "notice") {
-      container.appendChild(el("div", "notice-bar", rec.content));
+      const notice = el("div", "notice-bar", rec.content);
+      setStageTimestamp(notice, rec.ts);
+      container.appendChild(notice);
       return;
     }
     if (rec.kind === "compaction") {
       // 任务中断遗留的未完成压缩（有 start、无 done）：置为中断态展示，
       // 未覆盖的轮次由后端在下次请求按需重新压缩
       if (rec.interrupted) {
-        appendTimeInto(container, rec.ts);
         const interruptedBar = el("div", "compaction-bar compaction-interrupted is-open");
         const head = el("div", "compaction-head");
         head.appendChild(el("span", "compaction-status-icon", "!"));
@@ -231,6 +272,7 @@
           body.appendChild(pre);
           interruptedBar.appendChild(body);
         }
+        setStageTimestamp(interruptedBar, rec.ts);
         container.appendChild(interruptedBar);
         return;
       }
@@ -238,8 +280,8 @@
         scope: rec.scope,
         phase: rec.phase,
         invalidated: !!rec.invalidated,
-        compress_context: rec.phase === "start" ? rec.content : "",
-        context_summary: rec.phase === "start" ? rec.content : "",
+        compress_context: rec.phase === "start" ? rec.content : (rec.compress_context || ""),
+        context_summary: rec.phase === "start" ? rec.content : (rec.compress_context || ""),
         // done 记录携带最终摘要全文，刷新后仍可在压缩块中回放
         summary_text: rec.phase === "done" ? (rec.summary_text || "") : "",
         compress_usage: rec.scope === "round" ? rec.usage : null,
@@ -269,25 +311,34 @@
       const pendingQueue = pendingCompactions[scope];
       const compactionUsage = compactionPayload.compress_usage || compactionPayload.summary_usage;
       const isMergeEvent = compactionUsage && Number(compactionUsage.merge_block_count) > 0;
+      // 历史窗口重建保持展开选择：start 与其配对 done 共用起始下标 key。
+      const fullRecords = loadOlderState.records;
+      const pairIndex = Number.isInteger(historyIndex) && Array.isArray(fullRecords)
+        ? compactionPairStartIndex(fullRecords, historyIndex)
+        : (Number.isInteger(historyIndex) ? historyIndex : null);
       if (compactionPayload.phase === "aborted") {
         // 失败记录：把此前未闭合的运行块转为失败态（无则直接新建失败块）
-        appendTimeInto(container, rec.ts);
         if (pendingQueue && pendingQueue.length) {
-          pendingQueue.shift().update({ phase: "aborted", error: compactionPayload.error });
+          pendingQueue.shift().update({ phase: "aborted", error: compactionPayload.error },
+            pairIndex !== null ? { choiceIndex: pairIndex, history: true } : undefined);
           pendingCompactions[scope] = [];
         } else {
-          const failedUi = buildCompactionBlock(compactionPayload);
+          const failedUi = buildCompactionBlock(compactionPayload,
+            pairIndex !== null ? { choiceIndex: pairIndex } : undefined);
+          setStageTimestamp(failedUi.wrap, rec.ts);
           container.appendChild(failedUi.wrap);
         }
         return;
       }
       if (compactionPayload.phase === "done" && !isMergeEvent && pendingQueue && pendingQueue.length) {
-        pendingQueue.shift().update(compactionPayload);
+        pendingQueue.shift().update(compactionPayload,
+          pairIndex !== null ? { choiceIndex: pairIndex, history: true } : undefined);
         if (!pendingQueue.length) delete pendingCompactions[scope];
         return;
       }
-      appendTimeInto(container, rec.ts);
-      const compactionUi = buildCompactionBlock(compactionPayload);
+      const compactionUi = buildCompactionBlock(compactionPayload,
+        pairIndex !== null ? { choiceIndex: pairIndex } : undefined);
+      setStageTimestamp(compactionUi.wrap, rec.ts);
       container.appendChild(compactionUi.wrap);
       if (compactionPayload.phase === "start") {
         (pendingCompactions[scope] = pendingCompactions[scope] || []).push(compactionUi);
@@ -302,10 +353,11 @@
     // 初始全量渲染走分段并承担贴底/加载更早消息职责
     const ctx = replayState === null ? { initial: false } : { initial: true };
     if (replayState) Object.assign(ctx, replayState);
+    if (App.processGroups) App.processGroups.indexRecords(ctx.initial ? records : loadOlderState.records || records);
     const pendingTools = {}; // name -> [tool ui]
     const pendingCompactions = {}; // scope -> [尚未完成的压缩 ui]
-    function renderOneRecord(rec) {
-      renderOneRecordInto(chatInner, rec, pendingTools, pendingCompactions);
+    function renderOneRecord(rec, historyIndex) {
+      renderOneRecordInto(chatInner, rec, pendingTools, pendingCompactions, historyIndex);
     }
 
     // 初始全量渲染走分段：只画末尾一段，之前的记录留给「加载更早消息」；
@@ -333,13 +385,15 @@
       for (let i = 0; i < count; i += 1) {
         const rec = slice[rendered + i];
         const before = chatInner.childNodes.length;
-        renderOneRecord(rec);
+        const historyIndex = Number.isInteger(recordOffset) ? recordOffset + rendered + i : undefined;
+        renderOneRecord(rec, historyIndex);
         for (let k = before; k < chatInner.childNodes.length; k += 1) {
           const node = chatInner.childNodes[k];
           if (node.nodeType === 1) {
             if (Number.isInteger(recordOffset)) node.setAttribute("data-history-index", String(recordOffset + rendered + i));
             if (rec.round != null) node.setAttribute("data-round", String(rec.round));
             if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
+            if (App.processGroups) App.processGroups.tagRecord(node, rec);
           }
         }
       }
@@ -355,6 +409,7 @@
     finishUnmatchedTools(pendingTools);
     // 历史渲染完成后刷新提问卡片可答性（带后续对话的旧提问不可再答）
     App.refreshAskBlockStates();
+    if (App.processGroups) App.processGroups.sync(chatInner);
     if (isInitialRender) {
       flushRenderedTail(ctx);
     }
@@ -466,20 +521,21 @@
     const frag = document.createDocumentFragment();
     segment.forEach(function (rec, index) {
       const before = frag.childNodes.length;
-      renderOneRecordInto(frag, rec, pendingTools, pendingCompactions);
-      if (rec.round == null) return;
+      renderOneRecordInto(frag, rec, pendingTools, pendingCompactions, targetStart + index);
       for (let k = before; k < frag.childNodes.length; k += 1) {
         const node = frag.childNodes[k];
         if (node.nodeType === 1) {
           node.setAttribute("data-history-index", String(targetStart + index));
-          node.setAttribute("data-round", String(rec.round));
+          if (rec.round != null) node.setAttribute("data-round", String(rec.round));
           if (Number.isInteger(rec.source_event_index)) node.setAttribute("data-source-event", String(rec.source_event_index));
+          if (App.processGroups) App.processGroups.tagRecord(node, rec);
         }
       }
     });
     // 分段尾部未配对的工具块置完成态
     finishUnmatchedTools(pendingTools);
     chatInner.insertBefore(frag, anchorNode || chatInner.firstChild);
+    if (App.processGroups) App.processGroups.sync(chatInner);
     // 分段回灌时用户消息先在离屏 DocumentFragment 中创建，插入后再测量
     // 附件网格宽度，确保引用/媒体/文档方块按当前聊天区宽度排成一到两行。
     if (App.syncMessageAttachmentBlocks) App.syncMessageAttachmentBlocks();
@@ -529,12 +585,16 @@
     container.appendChild(el("div", "msg-time stage-time", FormatUtils.fmtTime(ts)));
   }
 
+  function setStageTimestamp(node, ts) {
+    if (App.processGroups) App.processGroups.setTimestamp(node, ts);
+  }
+
   // 压缩进度块：与思考/工具块保持一致。开始态可展开查看待压缩内容预览，
   // 并实时追加压缩模型的流式输出（思考过程 / 摘要正文逐帧增量）；
   // 完成态显示最终摘要全文、压缩前后 token、摘要块/轮次和降级信息。
   // SSE delta/done 事件更新同一块；刷新页面后由历史 done 记录的
   // summary_text 重建摘要展示。
-  function buildCompactionBlock(compaction) {
+  function buildCompactionBlock(compaction, opts) {
     const scope = compaction.scope === "session" ? "session" : "round";
     const prefixRounds = Number(compaction.history_prefix_rounds);
     const scopeLabel = scope === "session"
@@ -551,7 +611,14 @@
     head.appendChild(title);
     head.appendChild(chevron);
     const body = el("div", "compaction-body");
+    // 历史窗口重建时恢复用户选择，避免滚动后自动展开；实时块无 choiceIndex，
+    // 同一 DOM 经 tailNodes 保留，无需持久化。
+    let choiceIndex = opts && Number.isInteger(opts.choiceIndex) ? opts.choiceIndex : null;
     let isOpen = compaction.phase !== "done";
+    if (choiceIndex !== null) {
+      const saved = readCompactionChoice(choiceIndex);
+      if (saved !== null) isOpen = saved;
+    }
     let latestCompaction = Object.assign({}, compaction);
     let previewText = String(
       latestCompaction.compress_context || latestCompaction.context_summary || ""
@@ -568,6 +635,7 @@
       box.classList.toggle("open");
       isOpen = box.classList.contains("open");
       head.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      if (choiceIndex !== null) rememberCompactionChoice(choiceIndex, isOpen);
     });
     // 展开态下双击显示区域即可折叠（展开仍走头部按钮）
     body.title = "双击折叠";
@@ -577,6 +645,7 @@
       box.classList.remove("open");
       isOpen = false;
       head.setAttribute("aria-expanded", "false");
+      if (choiceIndex !== null) rememberCompactionChoice(choiceIndex, false);
     });
     box.appendChild(head);
     box.appendChild(body);
@@ -627,7 +696,7 @@
      * 增量追加不改变用户设置的展开状态；done 后到达的残留 delta 直接忽略。
      */
     function appendDelta(delta) {
-      if (!delta || latestCompaction.phase === "done") return;
+      if (!delta || latestCompaction.phase !== "start") return;
       const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
       const ct = typeof delta.content === "string" ? delta.content : "";
       if (!rc && !ct) return;
@@ -649,10 +718,27 @@
       }
     }
 
-    function render(next) {
+    function render(next, updateOpts) {
+      // 重连迟到的 start 不能把已完成/中止的同一块重新变成运行态。
+      if (next && next.phase === "start" && ["done", "aborted", "ended"].includes(latestCompaction.phase)) return;
       latestCompaction = Object.assign({}, latestCompaction, next || {});
       const isAborted = latestCompaction.phase === "aborted";
-      const nextPhase = !isAborted && latestCompaction.phase === "done" ? "done" : (isAborted ? "aborted" : "start");
+      const isEnded = latestCompaction.phase === "ended";
+      const nextPhase = ["done", "aborted", "ended"].includes(latestCompaction.phase) ? latestCompaction.phase : "start";
+      box.dataset.compactionScope = scope;
+      box.dataset.compactionPhase = nextPhase;
+      // 历史配对更新（start→done 同段渲染）：默认折叠完成态，避免滚动重建后
+      // 自动展开；用户显式选择优先。实时流式更新不传 history，保持当前展开态。
+      if (updateOpts && updateOpts.history) {
+        if (Number.isInteger(updateOpts.choiceIndex)) choiceIndex = updateOpts.choiceIndex;
+        if (choiceIndex !== null) {
+          const saved = readCompactionChoice(choiceIndex);
+          if (saved !== null) isOpen = saved;
+          else if (nextPhase === "done") isOpen = false;
+        } else if (nextPhase === "done") {
+          isOpen = false;
+        }
+      }
       const usage = next && (next.compress_usage || next.summary_usage || next.usage);
       const preview = next && (next.compress_context || next.context_summary);
       if (preview) previewText = String(preview);
@@ -676,7 +762,7 @@
         ? "正在压缩 · " + scopeLabel
         : nextPhase === "aborted"
           ? "压缩失败 · " + scopeLabel
-          : "上下文压缩完成 · " + scopeLabel;
+          : isEnded ? "压缩进度已结束 · " + scopeLabel : "上下文压缩完成 · " + scopeLabel;
       body.innerHTML = "";
 
       if (previewText) {
@@ -688,16 +774,19 @@
         body.appendChild(pre);
       }
 
-      if (isAborted) {
+      if (isAborted || isEnded) {
         // 失败态：展示错误信息与已生成部分（若有），原始对话未受影响
-        body.appendChild(el("div", "compaction-detail compaction-error-detail",
-          String(latestCompaction.error || "压缩模型调用失败，本次未写入任何摘要；历史对话保持不变，可稍后重试")));
+        body.appendChild(el("div", "compaction-detail" + (isAborted ? " compaction-error-detail" : ""),
+          String(latestCompaction.error || (isEnded ? "未收到本阶段的最终结果，请以已保存的历史记录为准。"
+            : "压缩模型调用失败，本次未写入任何摘要；历史对话保持不变，可稍后重试"))));
         if (reasoningText) {
-          appendLabeledPre("已生成的思考（未生效）", "compaction-think").textContent = reasoningText;
+          appendLabeledPre(isEnded ? "已接收的思考" : "已生成的思考（未生效）", "compaction-think").textContent = reasoningText;
         }
         if (liveSummaryText) {
-          appendLabeledPre("已生成的摘要（未生效）", "compaction-summary").textContent = liveSummaryText;
+          appendLabeledPre(isEnded ? "已接收的摘要（结果待核实）" : "已生成的摘要（未生效）", "compaction-summary").textContent = liveSummaryText;
         }
+        head.setAttribute("aria-expanded", isOpen ? "true" : "false");
+        box.classList.toggle("open", isOpen && body.children.length > 0);
         return;
       }
 
@@ -868,11 +957,14 @@
     }
 
     render(compaction);
-    return {
+    const ui = {
       wrap: box,
       update: render,
       appendDelta: appendDelta,
+      getState: function () { return Object.assign({}, latestCompaction); },
     };
+    box._compactionUi = ui;
+    return ui;
   }
 
   // ---------- 消息渲染 ----------
@@ -1123,6 +1215,7 @@
   function appendUserMessage(content, ts, sessionId, docs, container, round, quotes, sourceEventIndex) {
     const msg = el("div", "msg msg-user");
     if (ts) msg.appendChild(el("div", "msg-time", FormatUtils.fmtTime(ts)));
+    setStageTimestamp(msg, ts);
     msg.appendChild(buildUserBubble(content, sessionId, docs, quotes));
     // 历史轮次的用户消息：记录原始内容供编辑态回填，并挂 hover「编辑」入口。
     // round 为 null（实时发送）时编辑入口在收尾重载后随历史回放出现
@@ -2081,13 +2174,16 @@
     function setFileTagValue(path) {
       const fileTag = head.querySelector(".tool-block-file");
       if (!fileTag) return;
-      const full = resolveToolPath(path);
+      const group = path && typeof path === "object" && Array.isArray(path.paths) ? path : null;
+      const full = group ? String(group.label || "") : resolveToolPath(path);
       if (!full) return;
+      const copy = group ? group.paths.map(resolveToolPath).join("\n") : full;
       fileTag.textContent = full;
-      fileTag.title = full + "（点击复制）";
-      fileTag.onclick = function () {
+      fileTag.title = copy + "（点击复制）";
+      fileTag.onclick = function (event) {
+        event.stopPropagation();
         try {
-          navigator.clipboard.writeText(full).then(function () {}, function () {});
+          navigator.clipboard.writeText(copy).then(function () {}, function () {});
         } catch (_) { /* 忽略 */ }
       };
       fileTag.hidden = false;
@@ -2161,7 +2257,11 @@
           const added = Number(diff.lines_added) || 0;
           const removed = Number(diff.lines_removed) || 0;
           const skipped = diff.diff_skipped || "";
-          if (skipped === "unchanged") {
+          const noStats = diff.stats_complete === false && Array.isArray(diff.files) &&
+            diff.files.every(file => file.lines_added == null || file.lines_removed == null);
+          if (noStats) {
+            badge.appendChild(el("span", "diff-num", "统计不可用"));
+          } else if (skipped === "unchanged") {
             badge.appendChild(el("span", "diff-num is-add", "无变化"));
           } else if (skipped === "file_too_large") {
             badge.appendChild(el("span", "diff-num is-del", "文件过大"));
@@ -2169,12 +2269,16 @@
             // +N 恒绿、-M 恒红（不再按 add-only/del-only 整体变色）
             badge.appendChild(el("span", "diff-num is-add", "+" + added));
             badge.appendChild(el("span", "diff-num is-del", "-" + removed));
+            if (diff.stats_complete === false) badge.appendChild(el("span", "diff-num", "部分统计"));
           }
           badge.hidden = false;
           wrap.classList.add("has-diff");
         }
         // 头部文件名：完整路径（与参数提取路径共用同一渲染）
-        setFileTagValue(diff.path);
+        if (Array.isArray(diff.files)) {
+          const paths = diff.files.map(item => item.path || item.display_path).filter(Boolean);
+          setFileTagValue(paths.length === 1 ? paths[0] : {label: paths.length + " 个文件", paths: paths});
+        } else setFileTagValue(diff.path);
       },
       clearDiff: function () {
         if (diffView && diffView.parentNode) {
@@ -2315,6 +2419,33 @@
   }
 
   function buildDiffView(diffObj) {
+    if (diffObj && Array.isArray(diffObj.files)) {
+      const batch = el("div", "diff-batch");
+      diffObj.files.forEach(function (file) {
+        if (!file || typeof file !== "object") return;
+        const section = el("details", "diff-file");
+        const head = el("summary", "diff-file-head");
+        const action = {add: "新建", update: "修改", delete: "删除"}[file.action] || "变更";
+        head.appendChild(el("span", "diff-file-path", file.display_path || file.path || "文件"));
+        head.appendChild(el("span", "diff-title", action));
+        if (file.lines_added != null && file.lines_removed != null) {
+          head.appendChild(el("span", "diff-num is-add", "+" + file.lines_added));
+          head.appendChild(el("span", "diff-num is-del", "-" + file.lines_removed));
+        } else head.appendChild(el("span", "diff-title", "统计不可用"));
+        section.appendChild(head);
+        let rendered = false;
+        function show() {
+          if (!section.open || rendered) return;
+          rendered = true;
+          section.appendChild(buildDiffView(file));
+        }
+        section.addEventListener("toggle", show);
+        section.open = diffObj.files.length === 1;
+        show();
+        batch.appendChild(section);
+      });
+      return batch;
+    }
     const box = el("div", "diff-view");
     const statsBits = [];
     const added = Number(diffObj && diffObj.lines_added) || 0;
@@ -2350,7 +2481,7 @@
       const lines = text.split("\n");
       let oldNo = 0;
       let newNo = 0;
-      lines.forEach(function (line) {
+      lines.forEach(function (line, index) {
         if (line.indexOf("@@") === 0) {
           const hunk = el("div", "diff-line is-hunk", line);
           const match = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?/.exec(line);
@@ -2361,7 +2492,7 @@
           pre.appendChild(hunk);
           return;
         }
-        if (line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0) {
+        if (index < 2 && (line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0)) {
           pre.appendChild(el("div", "diff-line is-file", line));
           return;
         }
@@ -2421,7 +2552,7 @@
       }
     }
     if (!obj || typeof obj !== "object") return "";
-    if (name === "search_files") {
+    if (name === "search_files" || name === "list_files") {
       // 目录 + 搜索模式组合展示；未指定目录时回退显示模式（保证有识别信息）
       const dir = String(obj.dir_path || "").trim();
       const pattern = String(obj.pattern || "").trim();
@@ -2486,16 +2617,22 @@
    * 字段的旧数据里兜底提取完整文件路径（path，兼容旧名 full_file_name），以及为 read_file /
    * write_file / search_files 等无 diff 结果在标题栏显示路径/目录信息。 */
   function applyToolResult(block, name, resultText, fileDiff, args) {
-    if (name === "edit_file" || name === "write_file" || name === "run_command" || name === "poll_command" || name === "stop_command") {
+    if (name === "edit_file" || name === "write_file" || name === "apply_patch" || name === "run_command" || name === "poll_command" || name === "write_stdin" || name === "stop_command") {
       const toolIcon = block && block.wrap && block.wrap.querySelector(".tool-block-tool-icon");
       if (toolIcon) {
-        const failed = name === "run_command" || name === "poll_command" || name === "stop_command"
+        const failed = name === "run_command" || name === "poll_command" || name === "write_stdin" || name === "stop_command"
           ? isCommandFailureResult(resultText)
           : isToolFailureResult(resultText);
         toolIcon.classList.toggle("is-failed", failed);
       }
     }
     let parsed = null;
+    let patchResult = null;
+    if (name === "apply_patch") {
+      try { patchResult = JSON.parse(resultText); } catch (_) { /* 旧结果保留原文 */ }
+      if (!patchResult || !Array.isArray(patchResult.files) ||
+          patchResult.files.some(file => !file || typeof file !== "object")) patchResult = null;
+    }
     if (fileDiff && typeof fileDiff === "object") {
       try {
         const obj = JSON.parse(resultText);
@@ -2507,14 +2644,40 @@
           || extractPathFromDiffText(fileDiff.diff) || "";
       }
     }
-    if (name === "run_command" || name === "poll_command" || name === "stop_command") {
+    if (patchResult) {
+      const lines = [String(patchResult.error || patchResult.message || "补丁结果")];
+      const statuses = {applied: "已应用", rolled_back: "已回滚", rollback_failed: "回滚失败", commit_failed: "提交失败", not_applied: "未执行"};
+      patchResult.files.forEach(function (file) {
+        let text = String(file.path || file.display_path || "文件") + " · " + (statuses[file.status] || file.status || "变更");
+        if (file.status === "applied" && file.lines_added != null && file.lines_removed != null) text += " +" + file.lines_added + " -" + file.lines_removed;
+        if (file.diff_skipped === "file_too_large") text += " · 文件过大，diff/统计不可用";
+        if (file.history_recorded === true) text += " · 已记录回退版本";
+        else if (file.history_recorded === false && file.history_reason !== "unchanged" && file.status === "applied") text += " · 未记录回退版本";
+        if (file.needs_attention || file.status === "rollback_failed") text = "⚠ 需核对磁盘状态：" + text;
+        lines.push(text);
+      });
+      if (patchResult.needs_attention) lines.push("请先重新读取标记的文件，核对磁盘内容后再继续修改。");
+      block.setOutput(lines.join("\n"));
+      if (fileDiff && patchResult.success !== false) block.setDiff(fileDiff);
+      else if (block.clearDiff) block.clearDiff();
+      const paths = patchResult.files.map(file => file.path || file.display_path).filter(Boolean);
+      block.setFileTag(paths.length === 1 ? paths[0] : {label: paths.length + " 个文件", paths: paths});
+    } else if (name === "run_command" || name === "poll_command" || name === "write_stdin" || name === "stop_command") {
       let commandResult = null;
       try { commandResult = JSON.parse(resultText); } catch (_) { /* 旧版纯文本 */ }
       if (commandResult && typeof commandResult.message === "string") {
         const parts = [commandResult.message];
+          if (commandResult.input_status) {
+            const labels = {accepted: "已写入", queued: "排队中", writing: "写入中", failed: "失败", not_sent: "未发送"};
+            parts.push("输入：" + (labels[commandResult.input_status] || commandResult.input_status));
+          }
+          if (commandResult.input_error) parts.push("输入错误：" + commandResult.input_error);
+          if (commandResult.output_reset) parts.push("日志已重置，以下从头读取。");
+          if (commandResult.cursor_warning) parts.push(commandResult.cursor_warning);
         if (commandResult.stdout) parts.push("--- stdout ---\n" + commandResult.stdout);
         if (commandResult.stderr) parts.push("--- stderr ---\n" + commandResult.stderr);
         if (commandResult.output_tail) parts.push("--- 输出末尾 ---\n" + commandResult.output_tail);
+        if (commandResult.output) parts.push("--- 新增输出 ---\n" + commandResult.output);
         block.setOutput(parts.join("\n"));
       } else {
         block.setOutput(resultText);
@@ -2526,9 +2689,18 @@
       } else if (parsed.diff_skipped) {
         statsBits.push(parsed.diff_skipped === "unchanged" ? "内容无变化" : "文件过大，跳过 diff");
       } else if (parsed.created != null) {
-        statsBits.push(parsed.created ? "新建文件" : "全文覆盖");
+        statsBits.push(parsed.created ? "新建文件" : parsed.action === "append" ? "追加文件" : "全文覆盖");
       }
-      const head = String(parsed.message || "[write_file] 已写入");
+      if (parsed.history_recorded === true) statsBits.push("已记录回退版本");
+      else if (parsed.history_recorded === false && parsed.history_reason !== "unchanged") {
+        const reasons = {
+          file_too_large: "文件超出版本记录上限，未记录回退版本",
+          history_quota_exceeded: "会话快照配额已满，未记录本次回退版本",
+          history_version_limit: "文件版本数已达上限，未记录本次回退版本",
+        };
+        statsBits.push(reasons[parsed.history_reason] || "版本未记录，无法从本次变更回退");
+      }
+      const head = String(parsed.message || (name === "edit_file" ? "[edit_file] 已修改" : "[write_file] 已写入"));
       const note = statsBits.length ? head + "（" + statsBits.join("，") + "）" : head;
       block.setOutput(note);
       block.setDiff(fileDiff);
@@ -2537,7 +2709,7 @@
     }
     // 标题栏路径：diff 未带路径（含无 diff 的 read_file / search_files /
     // 旧数据 write_file）时从参数补齐；diff 已带路径时 setDiff 已设置
-    if (!fileDiff || !fileDiff.path) {
+    if (!patchResult && (!fileDiff || !fileDiff.path)) {
       block.setFileTag(extractPathFromArgsValue(args, name));
     }
     // 读取媒体：输出文本之外，追加可展开的图片缩略图条
@@ -2565,7 +2737,7 @@
       try {
         const result = JSON.parse(resultText);
         if (result && typeof result === "object") {
-          if (result.error) return true;
+            if (result.error || result.input_error || result.input_status === "failed") return true;
           if (result.timed_out === true) return true;
           if (result.status === "stopped" || result.status === "failed") return true;
           if (typeof result.exit_code === "number") return result.exit_code !== 0;
@@ -4703,6 +4875,7 @@
 
   function revealQuoteSource(target, quoteText, options) {
     if (target && target.closest(".history-live-hidden") && App.showHistoryTail) App.showHistoryTail();
+    if (App.processGroups) App.processGroups.reveal(target);
     options = options || {};
     if (quoteHighlightTimer != null) window.clearTimeout(quoteHighlightTimer);
     if (window.CSS && window.CSS.highlights) window.CSS.highlights.delete("history-search-hit");
@@ -4992,21 +5165,53 @@
   function updateQnavActive() {
     if (!qnavUsers.length) return;
     const scrollRect = chatScroll.getBoundingClientRect();
+    const paging = typeof loadOlderState !== "undefined" ? loadOlderState : null;
+    const entries = typeof qnavEntries !== "undefined" ? qnavEntries : null;
+    function mounted(node) {
+      return node && node.isConnected !== false && !node.closest(".history-live-hidden, .is-process-hidden");
+    }
     // 分页窗口只渲染部分消息：首个已渲染条目之前的全是更早的历史，
     // 逻辑上都在视口上方，基线指向其中最后一个；否则窗口顶部
     // （如尾轮用户消息仍在 120px 线下方时）高亮会钉死第一条
     let current = 0;
     for (let k = 0; k < qnavUsers.length; k++) {
-      if (qnavUsers[k]) {
+      if (mounted(qnavUsers[k])) {
         if (k > 0) current = k - 1;
         break;
       }
     }
-    qnavUsers.forEach(function (userEl, i) {
-      if (!userEl) return;
-      if (userEl.closest(".history-live-hidden")) return;
-      if (userEl.getBoundingClientRect().top - scrollRect.top < 120) current = i;
-    });
+    // 长回答可能占满整个窗口，所属提问早已被卸载。用可见历史记录
+    // 的下标回查完整问题索引，不要求提问气泡仍在 DOM 中。
+    if (paging && paging.records && entries && typeof chatInner !== "undefined") {
+      let recordIndex = paging.start - 1;
+      Array.from(chatInner.children).forEach(function (node) {
+        if (!mounted(node)) return;
+        const raw = node.getAttribute("data-history-index");
+        if (raw == null) return;
+        const rect = node.getBoundingClientRect();
+        if (rect.bottom <= rect.top) return;
+        if (rect.top - scrollRect.top < 120) recordIndex = Math.max(recordIndex, Number(raw));
+      });
+      entries.forEach(function (entry, i) {
+        if (entry.index >= 0 && entry.index <= recordIndex) current = Math.max(current, i);
+      });
+    }
+    // 到底吸附：已滚到真正的底部时，高亮最后一个有效问题。
+    // 尾部是短气泡（刚提问未回复 / 简短收尾）时它仍在 120px 线下方，
+    // 原逻辑会回落到前面的问题（问题少时就是第一条），并在临界线
+    // 附近随布局波动来回跳变。阈值与回底跟随的 keepBottom 同口径。
+    const bottomGap = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight;
+    const tailWindow = !paging || !paging.records || paging.end >= paging.records.length;
+    if (bottomGap <= 24 && tailWindow) {
+      // 最后一个问题也可能在窗口之外，完整索引才是会话末尾的依据。
+      current = qnavUsers.length - 1;
+    } else {
+      qnavUsers.forEach(function (userEl, i) {
+        if (!mounted(userEl)) return;
+        const rect = userEl.getBoundingClientRect();
+        if (rect.bottom > rect.top && rect.top - scrollRect.top < 120) current = Math.max(current, i);
+      });
+    }
     // 高亮当前问题所属的采样段：与 rebuildQnav 同口径计算每段起点，
     // 找最大的 start_j ≤ current 即当前段；一一对应时直接用下标
     const dashes = qnavRail.querySelectorAll(".qnav-dash");
@@ -5138,6 +5343,7 @@
     if (loadOlderState.records && loadOlderState.end < loadOlderState.records.length) {
       renderHistoryWindowAt(loadOlderState.records.length - 1);
     }
+    if (App.historyScroll && App.historyScroll.revealTail) App.historyScroll.revealTail();
   };
   App.appendTime = appendTime;
   App.buildCompactionBlock = buildCompactionBlock;
@@ -5167,6 +5373,7 @@
   App.applyToolResult = applyToolResult;
   App.buildSubAgentBlock = buildSubAgentBlock;
   App.rebuildQnav = rebuildQnav;
+  App.updateQnavActive = updateQnavActive;
   App.jumpToQuoteSource = jumpToQuoteSource;
   App.quoteSourceDisplay = quoteSourceDisplay;
   App.jumpToHistoryMatch = jumpToHistoryMatch;

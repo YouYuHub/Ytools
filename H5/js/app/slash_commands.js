@@ -24,16 +24,28 @@
     changes: svg('<path d="M8 3H4v18h16V7l-4-4H8Zm8 0v4h4M7 12h10M7 16h7"/>'),
     voice: svg('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>'),
     stop: svg('<rect x="5" y="5" width="14" height="14" rx="2"/>'),
+    status: svg('<path d="M3 12h4l3 8 4-16 3 8h4"/>'),
   };
   const themePicker = document.getElementById("themePickerModal");
   const themePickerClose = document.getElementById("themePickerClose");
   const themeOptions = Array.from(themePicker.querySelectorAll(".theme-picker-option"));
+  const accentOptions = Array.from(themePicker.querySelectorAll(".theme-picker-accent"));
   let themePickerReturnFocus = null;
 
   function refreshThemePicker() {
     const preference = ThemeManager.getPreference();
     themeOptions.forEach(function (option) {
       const selected = option.dataset.value === preference;
+      option.classList.toggle("selected", selected);
+      option.setAttribute("aria-pressed", String(selected));
+    });
+    refreshAccentPicker();
+  }
+
+  function refreshAccentPicker() {
+    const accent = ThemeManager.getAccentPreference();
+    accentOptions.forEach(function (option) {
+      const selected = option.dataset.value === accent;
       option.classList.toggle("selected", selected);
       option.setAttribute("aria-pressed", String(selected));
     });
@@ -64,9 +76,17 @@
       closeThemePicker();
     });
   });
+  // 强调色点击后不关窗：即时预览，可连续切换对比
+  accentOptions.forEach(function (option) {
+    option.addEventListener("click", function () {
+      ThemeManager.setAccentPreference(option.dataset.value);
+      refreshAccentPicker();
+    });
+  });
   themePickerClose.addEventListener("click", closeThemePicker);
   document.getElementById("themePickerBackdrop").addEventListener("click", closeThemePicker);
   document.addEventListener("themechange", refreshThemePicker);
+  document.addEventListener("accentchange", refreshAccentPicker);
   themePicker.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -74,7 +94,8 @@
       closeThemePicker();
     } else if (event.key === "Tab") {
       const first = themePickerClose;
-      const last = themeOptions[themeOptions.length - 1];
+      const focusables = themeOptions.concat(accentOptions);
+      const last = focusables[focusables.length - 1];
       if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
@@ -120,6 +141,13 @@
       run: function () { App.archives.open(); } },
     { id: "theme", title: "主题", description: "打开主题选择弹窗", aliases: ["外观", "颜色"], icon: "theme",
       run: function () { App.openThemePicker(); } },
+    { id: "status", title: "会话状态显示", description: "显示/隐藏输入框上方的会话状态", aliases: ["状态", "status", "taskstatus"], icon: "status",
+      run: function () {
+        if (App.taskStatus && App.taskStatus.toggleStatusVisible) {
+          const visible = App.taskStatus.toggleStatusVisible();
+          App.toast(visible ? "已显示会话状态" : "已隐藏会话状态");
+        }
+      } },
     { id: "terminal", title: "后台终端", description: "查看当前会话的终端任务和输出", aliases: ["命令", "终端", "shell"], icon: "terminal",
       disabledReason: function () {
         const button = document.getElementById("terminalJobsBtn");

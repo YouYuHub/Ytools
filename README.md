@@ -17,7 +17,7 @@ python main.py
 
 `main.py` 的 `/` 返回 JSON，`/ui/` 提供 H5 页面。可直接打开 `http://127.0.0.1:48621/ui/`，或在 Edge、Chrome 中打开 `H5/index.html`；权限设置位于“＋ → 聊天设置 → 工具权限”，无需控制码；其他浏览器不保证全部功能正常。如后端使用其他地址，参见 [H5 前端说明](H5/README.md#2-指定后端地址)。
 
-工具权限默认“询问”，支持全局默认与每会话独立覆盖。启动命令、调用 MCP、内置工具访问工作目录外资源前需用户批准；“完全控制”保留原来的自由调用行为。等待确认时关闭服务，重启、重新配对后可在原会话继续或放弃；执行结果未知的工具不会自动重跑。详见 [权限使用与实现说明](docs/tool_permissions.md)。
+工具权限默认“询问”，支持全局默认与每会话独立覆盖。启动命令、调用 MCP、内置工具访问工作目录外资源前需用户批准；“完全控制”保留原来的自由调用行为。等待确认时关闭服务，重启并重新打开原会话后可继续或放弃；执行结果未知的工具不会自动重跑。详见 [权限使用与实现说明](docs/tool_permissions.md)。
 
 首次聊天前需先配置模型与工具（见下文）。不要把真实密钥、`.env`、会话历史或上传文件直接提交到公开仓库。
 
@@ -60,7 +60,7 @@ python main.py
 - 可选 `parameterCapabilities` 用于声明 Messages/Responses 模型不支持的原生参数（例如 `{"temperature": false, "top_p": false, "thinking_budget": false}`）；默认未声明的参数由供应商自行决定。服务端会再次过滤标记为 `false` 的字段，避免旧会话参数发到上游。
 - 角色的 `parameter`（生成参数）按协议分桶存放（`chat_completions` / `messages` / `responses`），`headers` 为自定义请求头；两者均可省略，也可以直接在前端「参数」面板中修改（写入同一份配置）。
 - 可选 `supportDocTypes`（例如 `[".pdf", ".docx"]`）声明模型原生接受的文档扩展名。它独立于 `vision` 图片能力；启用 `read_document` 后按目标扩展名选择读取方式。不支持原生表格的模型会获得保留表头和原始行号的 Markdown 表格，支持工作表选择和按行续读；文本支持 `offset` / `limit`，结果按当前模型预算分页。原生 PDF 支持页区间；原生文件只发送一次。XLSX/XLS 解析分别需要 `openpyxl`/`xlrd`，详见 [文档读取参数](docs/api_docs.md#内置-read_document-工具factoryagent_runtimebuiltin_toolspy)。
-- 内置工具按需勾选，见 [使用简表](docs/builtin_tools.md)。`read_file` 按行续读，局部修改用 `edit_file`；`write_file` 必须明确 `mode=create|overwrite|append`。`search_files` 默认普通文本，正则使用可中断匹配。勾选 `run_command` 同时启用 `poll_command/stop_command`；默认 shell 按平台选择。`ask_user` 暂停同轮其他调用，前台命令随任务停止而取消；后台任务独立管理。媒体部件仅在内存中复用，已回收的视频区间可重读。
+- 内置工具按需勾选，见 [使用简表](docs/builtin_tools.md)。文件工具支持按行读取、精确编辑、多文件补丁及大文本压缩快照回退；`write_file` 必须明确 `mode=create|overwrite|append`。`search_files` 默认按需扫描，并同时启用 `list_files`；可选 `.gitignore`，结果按游标续读。勾选 `run_command` 同时启用 `poll_command/write_stdin/stop_command`，默认短等待，查询只传 job_id 自动续读，支持交互输入及可选 PTY。`ask_user` 暂停同轮其他调用，前台命令随任务停止而取消；后台任务独立管理。
 - 修改保存后自动热重载生效，无需重启服务。
 
 Responses 使用 Python 标准库直接调用 HTTP/JSON/SSE，无需 OpenAI SDK；默认以 `store: true` 和 `previous_response_id` 增量续聊，也可在模型参数面板选择“无状态兼容”，使用 `store: false` 每次发送有效本地上下文。支持图片/文档工具及异常处理；有状态并行保留本地摘要与官方压缩，无状态仅使用本地摘要。前端显示本地上下文；详见 [Responses 使用说明](docs/responses_api_usage.md)、[无状态兼容排查](docs/responses_stateless_2026-10-16.md) 与 [原有状态方案](docs/responses_api_stateful_plan.md)。
@@ -137,6 +137,10 @@ if __name__ == "__main__":
 
 累计 tokens、预估费用、模型调用、工具派发和运行时间均可设为无限制或指定额度。在「＋ → 任务预算与用量」配置全局默认或会话覆盖；主模型、子任务、压缩和标题统一计量。达到额度后可追加额度继续或停止，默认全部无限制。详见 [任务预算与完整用量](docs/task_budgets.md)。
 
+输入框上方显示任务阶段，区分思考、工具、等待确认/预算/回复与结束状态。断线时可重新连接查看后台进度；不会重新发送原提问。实现及维护见 [任务状态与模块拆分](docs/page_maintenance_followup.md)。
+
+侧边栏标题右侧的运行图标可识别前台和后台任务，等待与状态未知使用静态标记，结束后清除。详见 [会话运行标记](docs/session_activity.md)。
+
 ## 使用边界
 
 本项目当前适合在受信任的本机环境中运行。代码默认监听 `0.0.0.0`，允许所有 CORS 来源，HTTP 路由没有统一身份认证；`GET /file/get_local_file` 还允许按绝对路径读取本机文件。仅本机使用时，请将 `.env` 中的 `DEFAULT_SERVICE_HOST` 设为 `127.0.0.1`。在加入认证、限制本地文件读取范围之前，不应把端口开放到不受信任的网络。
@@ -148,6 +152,12 @@ if __name__ == "__main__":
 后端测试位于 `test/`。安装 `pytest` 后，可在项目根目录运行 `python -m pytest test -q`；部分 `manual_*.py` 是需要外部服务或人工操作的脚本，不属于普通单元测试。前端测试位于 `H5/test_h5/`，在 `H5/` 目录执行 `npm test`。样式修改应编辑 `H5/style/scss/`，再按 [H5 文档](H5/README.md#4-scss-构建与测试)编译。
 
 专题文档：[API 接口说明](docs/api_docs.md) · [上下文压缩](docs/compact.md) · [文件 Diff 与历史版本链](docs/file_diff.md) · [子智能体](docs/sub_agent_v1.md) · [引用选中文本](docs/quote_selection.md) · [后台终端管理](docs/terminal_management.md) · [2026-10-12 会话问题修复记录](docs/session_fixes_2026-10-12.md)。
+
+检查快照：[2026-10-23 项目检查与工具能力对比](docs/project_review_2026-10-23.md)。报告保留改进前的判断；已落地能力以 [内置工具简表](docs/builtin_tools.md) 和下方升级记录为准。
+
+工具升级：[首轮记录](docs/tool_improvement_plan.md)、[进一步优化与验证](docs/tool_followup_plan.md)。
+
+维护入口：[项目结构](project_structure.md) · [构建与依赖维护](docs/project_maintenance.md) · [长会话显示修复](docs/frontend_live_tail.md)。
 
 ## 本地凭据配置
 

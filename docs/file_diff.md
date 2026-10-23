@@ -1,4 +1,6 @@
-# 文件变更 Diff 设计文档（内置 write_file / edit_file）
+# 文件变更 Diff 设计文档（内置 write_file / edit_file / apply_patch）
+
+当前多文件补丁契约与 2026-10-23 修复见 [§10](#10-多文件补丁展示与失败回执2026-10-23)。单文件沿用原结构；早期设计与各版本实施记录保留在下文。
 
 > 版本：V2（2026-09 实现并验证；V1 2026-09，V1.1 前端行内高亮追加）
 > 定位：作为文件 diff 功能实现与后续修改的**唯一依据文档**；实现偏差必须回写本文档。
@@ -119,7 +121,7 @@ graph TD
 - 三个工具均返回：
   - `read_file`：**全文**（非本次读取区间）的指纹；三个 return 点（空文件早退 / lines 模式 / char_chunk 模式）都有；
   - `edit_file`：替换后全文的指纹；
-  - `write_file`：写入内容的指纹（仅"追加模式且旧内容不可读（二进制 / 旧文件超 256KB）"时省略；覆盖模式写空内容仍返回空串指纹）；
+  - `write_file`：最终写入内容的指纹（追加模式且无法可靠读取旧全文时为 null；覆盖空文件仍返回空文本指纹）；
 - message 同步附带「内容指纹 xxxx」便于用户/模型肉眼比对；
 - 当前用法：模型把 `read_file.content_hash` 作为 `edit_file.expected_hash` 传入；执行时与当前文件的全文指纹比对，不一致报 `FILE_MODIFIED_EXTERNALLY`，原文件保持不变。
 
@@ -268,12 +270,16 @@ history_files/session_files/<session>/file_diffs/
 └── <key8>/                           # key = sha1(os.path.normcase(normpath(绝对路径))) 前 8 位（Windows 大小写不敏感）
     ├── meta.json                     # 版本链元数据（tmp + os.replace 原子写）
     └── g0/ g1/ ...                   # generation：keep 一次开新代
-        ├── v000_base.txt             # 代基线
-        └── v001.txt v002.txt ...     # 后续版本全文快照
+        ├── v000_base.txt[.gz]        # 代基线
+        └── v001.txt[.gz] ...         # 全文快照；重复内容可复用已有文件
 ```
 
 meta.json 结构：`{version:1, key, path(绝对), display_path, kept, gens:[{gen,at,round,reason,locked}], versions:[...], total:{...缓存}, encoding, eol}`；
-每版本条目：`{v, gen, file, hash(sha256:16 复用 content_hash 口径), bytes, at, round, role, tool, eol, encoding, added, removed, diff(单次diff文本), diff_truncated, diff_skipped, prev_v, undone_hunks[], rollback_from?, rollback_to?}`。
+每版本条目：`{v, gen, file, hash(sha256:16), bytes, stored_bytes, compression, newline_exact, exists, at, round, role, tool, eol, encoding, added, removed, diff, diff_truncated, diff_skipped, prev_v, undone_hunks[], rollback_from?, rollback_to?}`。旧纯文本链继续兼容。
+
+快照与聊天中的 diff 展示分别限额：每端快照最多 64 MiB（UTF-8），大于 256 Ki 字符或含 CR 换行时用 gzip；每会话快照磁盘配额 256 MiB（不含元数据），自动记录每文件最多 512 个版本。配额不足不淘汰旧版本，工具写入结果明确返回 `history_recorded=false/history_reason`；回退可复用已有快照。跨线程/进程使用会话锁，快照和元数据各自原子替换，并非跨磁盘写入事务。
+
+超过 256 Ki 字符时，历史视图返回 `snapshot_only=true`，不执行全文行对齐或生成行编辑 DOM；支持整文件/按轮回退，拒绝逐块操作。此时增删行数是连续变更区间估计。`/file_diff/content` 按字符 `offset/limit` 分页，默认 262144、最大 1048576，返回 `total_chars/next_offset/has_more`。回退前校验快照、内容哈希和磁盘状态，快照损坏或有外部修改时拒绝覆盖；外部文本修改可先从磁盘刷新。
 
 **role 白名单**（`_VALID_ROLES`，共 7 个）：`baseline`（代起点）/ `tool`（write_file、edit_file、sub_agent.*）/ `user_edit`（编辑器保存）/ `hunk_undo` / `hunk_keep` / `rollback` / `external`（外部改动探测，见下）。版本条目另可携带 `source`（如 `disk_sync`）与 `kept_hunks`（hunk_keep 记录保留块）字段。
 
@@ -281,7 +287,7 @@ meta.json 结构：`{version:1, key, path(绝对), display_path, kept, gens:[{ge
 
 ```mermaid
 graph TD
-    A[write_file / edit_file] --> B[builtin_tools 结果附 _file_history 键<br/>path/display_path/encoding/old_text/new_text 各≤256KB]
+    A[write_file / edit_file / apply_patch] --> B[builtin_tools 结果附 _file_history 键<br/>原文/结果及编码、换行、文件存在状态]
     B --> C[chat_factory 主循环 / sub_agent tool_result 消费点<br/>与 file_diff 摘取同构]
     C --> D[file_history.record_change]
     D --> E{首次触碰?}
@@ -304,9 +310,9 @@ graph TD
 
 | 方法 | 路径 | 参数 | 返回 |
 |---|---|---|---|
-| GET | `/file_diff/list` | session_id, hide_clean?(默认 true，只列仍有行数变化的文件) | `{files:[{key,path,display_path,kept,versions,added,removed,updated_at,last_role}], stats:{total,added,removed}}` |
+| GET | `/file_diff/list` | session_id, hide_clean?(默认 true，只列未决内容/存在状态变更) | `{files:[{key,path,display_path,kept,versions,changed,added,removed,updated_at,last_role}], stats:{total,added,removed}}` |
 | GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed,kept}]}` |
-| GET | `/file_diff/content` | session_id, key, v?(缺省最新) | `{...,v,hash,role,tool,round,encoding,eol,kept,content(全文)}` |
+| GET | `/file_diff/content` | session_id, key, v?(缺省最新), offset?(0), limit?(262144，最大1048576) | `{...,v,hash,role,tool,round,encoding,eol,kept,content,total_chars,next_offset,has_more,snapshot_only}`；按字符分页 |
 | GET | `/file_diff/total_diff` | session_id, key | `{key,display_path,baseline_v,current_v,kept,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` |
 | GET | `/file_diff/full_view` | session_id, key, max_rows?(默认 20000) | `{key,path,display_path,baseline_v,current_v,current_hash,current_ends_with_nl,kept,rows:[{t,o,n,s,h?(仅 del/add 行有 h，ctx 行无)}],rows_total（未截断时为 `max(基线行数, 当前行数)`）,hunks:[{index,old_start,old_count,new_start,new_count}],truncated,max_rows,diff,...统计}`（V2.2 全文视图，见 9.8） |
 | GET | `/file_diff/change_diff` | session_id, key, v | `{...,v,prev_v,gen,role,tool,round,at,diff,lines_added,lines_removed}` |
@@ -348,7 +354,7 @@ hunk 序号语义：使用 `SequenceMatcher` 得出的差异块顺序（0 起）
 - 「保存」：前端把 ctx 行原文 + add 行当前值按行序重组全文提交（`composeContent`；undo 快照走 `serializeRows`），走 expected_hash 乐观锁（磁盘被外部修改 → 409 提示刷新），成功后追加 `user_edit` 版本并写回磁盘；
 - 「回退到基线」（Revert file）/「回退到第 N 轮发起时」（下拉框，可选轮次 = 链上出现过的 round 降序）：追加 `rollback` 版本并写回磁盘；
 - 「保留」：当前代锁定（历史代版本拒绝作为回退/撤回目标，409），以当前内容开新代基线；保留后继续变更在新代跟踪；
-- 面板行徽标：`+N` 绿 `-M` 红 / `已保留` 锁标；超大文件（>256KB 未入链）不出现在面板。
+- 面板行徽标：`+N` 绿 `-M` 红 / `已保留` 锁标；大文件快照入链后也展示，编辑器提示整文件回退模式；未入链时工具卡片说明原因。空文件的创建/删除也视为未决变更。
 
 ### 9.7 测试与验证
 
@@ -408,6 +414,65 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **现行移动端布局**：问题导航在窄屏改为顶栏按钮点开列表；文件变更面板在窄主区内左右各留 12px，不再沿用桌面端的右侧偏移。
 - **编辑器页主题切换**：顶栏新增下拉（跟随系统/浅色/深色），复用 `js/theme.js` ThemeManager（同一 `ytools-theme-preference` 偏好、`themechange` 事件、system 跟随 prefers-color-scheme）；页面 `<html data-theme="light">` 初值由 theme.js 首绘前按偏好覆盖，消除"编辑器页只有深色"的不可切换问题。
 
+**V2.6 追加（2026-10，按用户实测反馈）**：
+- **高亮与聊天代码块统一**：此前编辑器高亮层 `pre.eh-hl.language-x` 未被 `_prism.scss` 的 `language-palette` mixin 覆盖，回退到 GitHub 基线配色（红关键字/绿变量/紫函数），与聊天代码块的 VS Code Dark+/Light+ 不一致；现 mixin 新增 `.eh-table.language-x` 选择器，编辑器表格根挂整文件语言类、全表继承同一套变量，一次覆盖 ctx/add/del 全部行；
+- **删除行行内高亮**：del 红块此前纯文本（仅红字+删除线），现同样走 Prism tokenize→encode→stringify 渲染（已转义无 XSS），失败逐行回退纯文本；删除线继承到 token span，选中/复制逻辑不变（del 行只读，文本以 row.text 为准）；
+- **布局微调**：增删行底色减淡（alpha .16→.07）+ 左侧 3px 色条（VS Code 式）；行号列加右分隔线；ctx 行悬停微亮；代码字号 12.5px→13px；顶栏按钮按 [保存][回退/刷新/保留][主题][块导航][关闭] 分组留白，回退按钮悬停红色警示；块头左内边距 0→12px。注意块头仍保持普通文档流（V2.5 教训：sticky 多块叠压错乱）。
+
 阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 快照文本文件的原子写入（当前 JSON 元数据原子替换，但文本快照仍直接写目标文件）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。
+
+## 10. 多文件补丁展示与失败回执（2026-10-23）
+
+复核了更新时间为 17:02:34 的项目会话及当下实现，确认 `apply_patch` 缺少可视 diff、标题文件标签、逐文件增删行数和醒目的回滚失败提示；另修复 unified diff 中以 `++` / `--` 开头的源码行被误认为文件头，导致统计和显示错误。
+
+### 10.1 传输与预算
+
+补丁在全部提交前生成逐文件 diff。沿用 `_file_diff → SSE/JSONL file_diff` 的既有通道，批量形态为对象，不新增平行的 `file_diffs` 字段：
+
+```json
+{
+  "file_count": 2,
+  "lines_added": 3,
+  "lines_removed": 1,
+  "stats_complete": true,
+  "diff_truncated": false,
+  "files": [
+    {"path": "/project/a.py", "display_path": "/project/a.py", "action": "update", "old_exists": true, "new_exists": true,
+     "diff": "...", "lines_added": 1, "lines_removed": 1, "diff_truncated": false, "diff_skipped": "", "history_recorded": true},
+    {"path": "/project/b.py", "action": "add", "diff": "...", "lines_added": 2, "lines_removed": 0}
+  ]
+}
+```
+
+- 仍受单文件 256 Ki 字符的比较上限与 20000 字符的展示上限约束；补丁全批 diff 文本最多 60000 字符，按完整行截断。
+- 文本截断时完整统计仍保留；大文件跳过比较时逐文件行数为 `null`，批量 `stats_complete=false`，汇总只包含可统计文件。界面明确显示“部分统计/统计不可用”，不能把它读作 0 行修改。
+- 模型结果保留精简的 `files[]`：路径、操作、提交状态、增删行数、hash 和版本记录结果；不含原文、最终全文或完整 diff。两种模型结果格式化入口都剥离 `_file_diff/_file_history`。
+- `record_result` 将逐文件的 `history_recorded/history_reason` 同时回填模型结果和批量展示数据。正常主流、附接回放、子任务和历史解析沿用原字段透传。
+
+### 10.2 页面
+
+工具标题：单文件显示完整路径，多文件显示“N 个文件”和汇总 `+N/-M`；悬停/复制可取各文件路径。结果区按文件显示新建、修改、删除和行数，默认折叠；展开该文件才生成 diff DOM 和 Prism 高亮。路径与源码按文本或转义后的 Prism 结果插入，兼容深色、浅色与窄屏。
+
+旧 JSONL 的单文件 `file_diff` 和无 diff 结果仍可显示；不会从不完整的历史补丁参数猜测出完整已应用差异。
+
+### 10.3 提交失败
+
+`files[]` 覆盖已提交、失败和未执行的文件，状态分别为 `applied / rolled_back / rollback_failed / commit_failed / not_applied`。失败返回不附成功 diff 或 `_file_history`，避免把未确认内容写入回退版本链。
+
+回滚失败、写后版本不可确认，或失败操作已改变磁盘时，逐文件和顶层设置 `needs_attention=true`，`rollback_complete=false`。模型与界面都提示先重新读取并核对这些文件；不盲重试旧补丁，不覆盖无法确认的外部修改。成功回滚的条目不保留误导性的写后 hash。
+
+这仍是逐文件提交和尽力回滚，不承诺跨文件或进程崩溃原子事务。
+
+### 10.4 验证入口
+
+```powershell
+python -B -m pytest test/test_context_patch.py test/test_file_diff.py test/test_file_history_result.py -q
+npm.cmd test --prefix H5
+node H5/test_browser/patch_diff_fixture.cjs
+```
+
+验证页使用模拟结果驱动实际 SSE 管线、历史解析、子任务卡片与样式，不修改真实会话或文件。补丁执行、编码、版本与回滚故障由临时目录单测覆盖。
+
+实施验证记录：前端全量 733 项通过；Windows 后端全量 2030 项通过、11 项跳过，最终相关专项另行复核；Linux/WSL 的补丁、diff、版本结果专项 40 项通过。浏览器已核对实时、历史与子任务三条入口、逐文件展开与 Prism 高亮、回滚提示和深浅主题，无控制台错误。
 
 `read_file` 现已在读取前检查 64 MiB 上限，并在读取时再次限制字节数；模型调用链中的返回字符预算还会随当前模型窗口收紧。

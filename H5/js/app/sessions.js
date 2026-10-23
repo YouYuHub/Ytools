@@ -390,6 +390,10 @@
     const nameNode = el("span", "session-name");
     nameNode.appendChild(el("span", "session-name-text", title));
     select.appendChild(nameNode);
+    const activity = el("span", "session-activity");
+    activity.hidden = true;
+    activity.setAttribute("role", "img");
+    select.appendChild(activity);
     select.addEventListener("click", function () {
       if (bulkMode) {
         toggleBulkSelect(id, item);
@@ -416,6 +420,7 @@
       toggleSessionMenu(id, item, actions);
     });
     item.appendChild(actions);
+    if (App.sessionActivity) App.sessionActivity.decorate(item);
     return item;
   }
 
@@ -1225,10 +1230,11 @@
       }
       return false;
     }
-    // 刷新后若同一会话仍有后台生成任务，自动附接续看
+    // 刷新后若同一会话仍有后台生成/压缩任务，自动附接续看
     if (seq === sessionOpenSeq) {
       if (App.permissions && App.permissions.syncPending) App.permissions.syncPending(id);
       App.maybeAttachRunningStream(id);
+      if (App.maybeAttachRunningCompaction) App.maybeAttachRunningCompaction(id);
     }
     return seq === sessionOpenSeq;
   }
@@ -1245,7 +1251,7 @@
 
   function restoreActiveStream(sessionId) {
     const active = state.activeStream;
-    if (!active || active.sessionId !== sessionId || active.completed) return false;
+    if (!active || active.sessionId !== sessionId || active.completed || active.detached) return false;
 
     // 当前轮提问气泡是否已在聊天区：优先按轮次号精确匹配（同文本历史提问
     // 不再误判成本轮；附接回放已按同一规则去重，两处口径一致）。轮次号有效
@@ -1283,6 +1289,11 @@
     if (active.messageNode && active.messageNode.parentNode !== chatInner) {
       chatInner.appendChild(active.messageNode);
     }
+    const view = App.getHistoryWindow && App.getHistoryWindow();
+    const hidden = Boolean(view && view.records && view.end < view.records.length);
+    [active.userNode, active.messageNode].forEach(function (node) {
+      if (node) node.classList.toggle("history-live-hidden", hidden);
+    });
     setEmpty(false);
     App.rebuildQnav();
     // 模型名刷新已提升到 openSession 主流程（此处不再调用，避免同一次打开重复请求）

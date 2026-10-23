@@ -2,7 +2,9 @@
 
 服务地址: `http://<host>:48621` ｜ 在线文档: `/docs`（Swagger）
 
-> 当前后端没有统一身份认证，默认监听地址为 `0.0.0.0`，且 `/file/get_local_file` 可读取任意绝对路径。请只在受信任的本机环境中使用；本机运行建议在 `.env` 中设置 `DEFAULT_SERVICE_HOST=127.0.0.1`。`main.py` 当前不托管 H5 静态页面。
+> 当前后端没有统一身份认证，监听地址的代码回退值为 `0.0.0.0`（实际值由本机配置决定），且 `/file/get_local_file` 支持读取绝对路径。请只在受信任的环境中使用；本机运行建议在 `.env` 中设置 `DEFAULT_SERVICE_HOST=127.0.0.1`。
+
+`main.py` 在 `/ui/` 托管 H5 页面，`/` 返回 JSON，`/docs` 提供 Swagger。推荐打开 `http://127.0.0.1:48621/ui/`；API 地址、前端本地打开方式和构建流程见 [前端说明](../H5/README.md) 与 [维护说明](project_maintenance.md)。内置工具的简短用法见 [工具简表](builtin_tools.md)。
 
 ## 1. 聊天 ChatLLM
 
@@ -29,6 +31,8 @@
 | tools | - | - | 服务端内部字段，勿传 |
 
 **响应** (SSE 事件，每行 `data: {json}`，以 `data: [DONE]` 结束):
+
+H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正常收尾，最终任务状态还要结合错误、停止、挂起或用户提问事件；裸 EOF 或网络异常只表示连接中断。重连先查 `/chat_stream/status`，运行中以空 `messages` 附接，已结束则读取历史，不自动重发原提问。客户端函数契约见 [前端说明](../H5/README.md#apijs--后端接口封装windowapi)。
 - `warning`：提示（如未选工具）
 - `reasoning_content` / `content`：思考与正文增量
 - `tool_calls`：工具调用增量（按 index 合并）
@@ -106,6 +110,10 @@
 查询指定会话当前是否有后台生成任务（前端刷新/切换会话后据此决定是否续接 SSE 续看）。
 - Query: `session_id`（默认 "default"）
 - 返回: `{"running": bool, "session_id": "已规整的会话标识"}`
+
+### GET /chat_stream/statuses
+
+侧边栏的批量运行快照，无参数。返回 `{"sessions":[{"session_id":"example","chat_running":true,"compacting":false}]}`，仅包含聊天生成或手动压缩仍在运行的会话，按 ID 排序，`Cache-Control: no-store`。覆盖 inline、worker 及手动压缩，只读现有注册表，不启动进程或读取历史。前端同步、轮询及错误处理见 [会话运行标记](session_activity.md)。
 
 ### POST /inject_message（运行中消息注入/引导）
 任务运行中把一条用户消息投递给会话 worker：生成循环在下一轮检查点（当前模型响应及工具结果处理完毕后）取出该消息，在下一次模型请求前加入上下文。文本、媒体附件和引用快照均支持；正在进行的模型请求不会被中断。媒体先通过上传接口获取 `media://` 引用，再投递此接口；检查点消费时解析为模型支持的图片/音视频部件（非视觉模型降级为引用占位）。JSONL 与 `message_injected` 事件保存原始引用，不含 base64。任务未运行时返回 `not_running`，前端回退普通发送；队列模式仍等待当前任务结束。
@@ -524,10 +532,10 @@ SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关�
 - **JSONL 落盘**：tool 历史记录附带 `file_diff` 字段，刷新/重开会话历史回放同样渲染；
 - **边界降级**：新旧文本任一超过 256KB 时跳过逐行 diff（`diff_skipped: "file_too_large"`）；diff 文本超过 20000 字符时截断（`diff_truncated: true`）；内容无变化时 `diff_skipped: "unchanged"`；
 - **content_hash**：`read_file` 返回解码后全文的 sha256 前 16 位。`edit_file` 可传 `expected_hash`，与当前内容不一致时返回 `FILE_MODIFIED_EXTERNALLY`，文件不写入；成功后的指纹按实际写入文本计算。`write_file` 覆盖模式返回最终指纹；追加大文件且无法可靠取得旧全文时返回 `null`，避免把本次追加内容的指纹误报为最终文件指纹。覆盖和编辑采用同目录临时文件、`fsync`、`os.replace`；追加保留追加写语义；
-- **读取与搜索限额**：`read_file` 的 `content` 保存本次正文，`message` 仅保存摘要。空文件返回 `total_lines=0`；默认从 `start_line` 起连续读取最多 200 行，可用 `limit` 调整（最多 2000）。新调用统一使用 `start_line + limit` 分页；旧调用传入的 `end_line` 仍兼容，但不再出现在模型可见工具定义中。字符预算不足时只返回连续的前段，并用 `next_start_line` 指示下一行；单行超长时用 `next_char_offset` 续读，不再省略中间内容。`search_files` 只搜索文件内容，`file_pattern` 只筛选待搜索文件、不列出文件名；按文件名查找应使用已启用的 `run_command` 执行终端枚举命令。搜索默认按字面文本查找，正则需设置 `is_regex=true`；默认最多检查 3000 个文件或扫描 10 秒，达到上限返回 `scan_truncated=true`，此时命中统计只覆盖已扫描部分；
+- **读取与搜索限额**：`read_file.content` 保存正文，`message` 仅摘要。空文件 `total_lines=0`；默认从 `start_line` 起读最多 200 行，`limit` 最大 2000。旧 `end_line` 仅兼容执行，不再向模型提供。预算不足时返回连续前段，按 `next_start_line` 续读；单行超长用 `next_char_offset`。`search_files` 只搜内容，`file_pattern` 筛选待搜文件；查路径用同时启用的 `list_files`。搜索默认字面文本，正则显式 `is_regex=true`；默认候选 3000 个、活动扫描 10 秒，预算不足标记 `scan_truncated`，计数只覆盖已扫描部分；按需扫描与可选忽略规则见本页工具补充说明。
 - **子任务块**：sub_agent 内部调用的文件工具同样在 tool_result 子事件中携带 `file_diff`，渲染行为一致。
 
-MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结果，不带 `file_diff`，前端自动回退普通文本渲染，无需处理。
+文件与终端工具已迁入后端内置执行器；当前 MCP `sys_tools_server` 仅提供网页工具。
 
 ### 文件历史版本链（V2，`/file_diff/*`）
 
@@ -546,7 +554,7 @@ MCP sys_tools_server 版同名工具（走外部 MCP 协议）返回纯文本结
 |---|---|---|---|---|
 | GET | `/file_diff/list` | session_id | `{files:[{key,path,display_path,kept,versions,added,removed,updated_at,last_role}], stats:{total,added,removed}}` | — |
 | GET | `/file_diff/versions` | session_id, key | `{key, versions:[{v,gen,role,tool,round,at,hash,added,removed}]}` | 404 |
-| GET | `/file_diff/content` | session_id, key, v?(缺省最新) | `{...,v,gen,hash,role,tool,round,at,encoding,eol,kept,content}` | 404 |
+| GET | `/file_diff/content` | session_id, key, v?(缺省最新), offset?(0), limit?(262144，最大1048576) | `{...,v,gen,hash,role,tool,round,at,encoding,eol,kept,content,total_chars,next_offset,has_more,snapshot_only}`；偏移按字符 | 404/422 |
 | GET | `/file_diff/total_diff` | session_id, key | `{key,display_path,baseline_v,current_v,kept,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` | 404 |
 | GET | `/file_diff/change_diff` | session_id, key, v | `{...,v,prev_v,gen,role,tool,round,at,diff,lines_added,lines_removed,diff_truncated,diff_skipped}` | 404 |
 | POST | `/file_diff/hunk_undo` | `{session_id,key,hunk_index,until_hunk?}` | `{ok,hunk:{old_start,old_count,new_start,new_count},undone_count,version,total}`（撤回差异块并写回磁盘，不可恢复；until_hunk=true 撤回此处及之后） | 400/404 |
@@ -629,7 +637,7 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 
 ### 内置文件与终端工具
 
-- **系统提示词固定含文件工具选择优先级说明**：`search_files` 只搜索文件内容，`file_pattern` 只筛选内容搜索范围、不列出文件名；按文件名查找或枚举文件时，若启用 `run_command` 则使用终端命令，否则说明当前工具无法枚举文件名。找到内容后用 `read_file` 查看必要上下文；局部修改用 `edit_file`，新建或整文件写入用 `write_file`；需要运行命令、构建或检查时用 `run_command`。该说明为静态文本，不随本轮实际注入的工具裁剪（区别于 `read_media` 使用指引按真实注入状态条件化）。
+- **系统提示词固定含文件工具选择优先级说明**：`search_files` 只搜索文件内容，`file_pattern` 只筛选内容搜索范围、不列出文件名；按文件名查找或枚举文件使用同时注入的 `list_files`；文件枚举和内容搜索都可按 `next_cursor` 续读，保留原查询。找到内容后用 `read_file` 查看必要上下文；局部修改用 `edit_file`，新建或整文件写入用 `write_file`；需要运行命令、构建或检查时用 `run_command`。该说明为静态文本，不随本轮实际注入的工具裁剪（区别于 `read_media` 使用指引按真实注入状态条件化）。
 - `write_file` 必须明确 `mode=create|overwrite|append`；缺少模式会拒绝，旧历史不会被隐式重新覆盖。执行函数保留明确的旧 `append=true` / `create_only=true` 兼容入口，新模型调用按当前 Schema 校验。`expected_hash` 与 `read_file.content_hash` 不同时拒绝写入，且不能与 `create` 同用。追加已有文件且未指定 `encoding` 时自动识别；追加结果最多 64 MiB。内置写入/编辑按真实路径使用跨进程锁，提交前再次检查文件版本；外部程序不参与该锁，无法承诺任意并发修改下的绝对互斥。
 - **文件工具状态字段**：`write_file`、`edit_file`、`read_file`、`search_files` 成功返回 `success=true`；由工具分发层捕获的执行错误返回 `success=false` 和 `error`，便于模型统一判断结果。
 - **参数与暂停边界**：内置调用在审批及执行前校验当前 Schema，未知字段和非法类型返回 `INVALID_ARGUMENTS`。同轮出现 `ask_user` 时其他调用返回 `WAITING_USER / executed=false`，收到回答后重新调用；合并问题总数不超过 5。布尔值不接受字符串；整数不接受小数；时间不接受 NaN/Infinity。简短示例见 [内置工具使用简表](builtin_tools.md)。
@@ -638,8 +646,12 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
 - `changed_range` 给出编辑前、编辑后的行号范围；纯插入或删除时没有对应行的一侧为 `null`。批量编辑时该范围是所有改动的包络，因此可能包含未变的中间行；完整分段仍以独立前端 `file_diff` 为准。
 - `read_file`、`search_files`、`read_document` 的文本输出和 `run_command` 的前台输出，在模型调用链中会按当前模型窗口收紧；不足时按工具返回的行号、字符偏移或文件路径继续读取。
 - `read_file` 保留 64 MiB 文件读取上限；底层按 64 KiB 分块读取并检查增长后的实际字节数，避免对小文件预分配整个上限。统计总行数时只保留本页最多 2000 行，不创建全文行列表；仍返回全文内容指纹及精确续读位置。原始字节和解码文本仍受文件上限约束，超大日志请用终端筛选。输出预算使用本会话或子任务实际生效模型的窗口。
-- 选择 `run_command` 时，模型会同时看到 `run_command(command, ...)`、`poll_command(job_id, tail_lines?)` 和 `stop_command(job_id)` 三个窄接口。`run_command(background=true)` 返回 `job_id`；后两者只能管理本工具创建的后台任务。旧 `run_command(action=poll|stop, job_id=...)` 调用仍可执行。结果包含可读 `message` 和结构化的 `status`、`exit_code`、`pid`、`output_path` 等字段；旧会话中的纯文本结果仍可显示。未关闭的后台记录及仍运行任务的日志持续保留；关闭后至少保留 24 小时，过期旧文件会在后续执行命令时清理。关闭记录不立即删除日志，以保留模型工具返回的文件引用。
-- `poll_command.tail_lines` 为 1–200 的整数，默认 30，返回最近的输出行；单次只读取末尾约 256 KiB，返回正文最多 12000 字符且可按模型窗口收紧，`output_truncated=true` 表示不是完整日志。完整日志仍保留在 `output_path`，可用 `read_file(start_line, limit)` 连续读取；此接口不提供字节偏移游标。`stop_command` 不接受 `tail_lines`。
+- 选择 `run_command` 时同时提供 `poll_command`、`write_stdin`、`stop_command`。常用流程为 `run_command(command=...)` → `poll_command(job_id)`；查询自动续取新增输出，无需手动管理游标。`interactive=true` 保持 UTF-8 stdin 可写；`tty=true` 启用伪终端，两者与后台互斥。`write_stdin(job_id, chars?, eof?, cursor?, wait_seconds?, request_id?)` 发送输入/查回执仅限当前任务及代理；无输入且无 request_id 时等同查询日志。输入最多 16384 字符/64KiB，换行须显式包含，EOF 仅用于管道。非空输入/EOF 在 ask 模式须审批。相同 `request_id` 与原文重试去重，只传 job_id/request_id 查回执不重发；`input_status` 区分接受、排队、写入中、失败，接受不表示程序执行成功。旧 `run_command(action=poll|stop, job_id=...)` 仍兼容。
+- 模型 `poll_command` 和 `write_stdin` 共用按会话/任务/代理隔离的持久读取位置，页面查看不消耗该位置。默认无输出时最多等 1 秒，`wait_seconds=0–30` 可调；单次输出最多 12000 字符且按模型窗口收紧。`status=running` 或 `has_more=true` 时继续查询，`next_call` 提供后续查询参数。`cursor=""` 从头重读，显式 `next_cursor` 指定位置；`encoding` 指定后沿用，空字符串恢复自动识别。自动位置遇到日志重置时从头读并返回 `output_reset=true`，显式失效游标则报错；保存失败仍返回输出/回执及 `cursor_saved=false`，可显式传 next_cursor 恢复。`tail_lines=1–200` 选择尾部预览，不推进位置，不能与 cursor/wait_seconds/encoding 同用。HTTP 日志接口和底层 action 保持默认尾部模式；完整日志见 `output_path`，关闭至少 24 小时后才可能清理。
+- `run_command.yield_time_ms` 可选 0–30000 毫秒，模型默认 1000，未结束时返回活动 `job_id/next_cursor`，仍受总超时和所属任务生命周期约束；与 `background=true` 互斥。独立监督进程处理总超时和工作进程消失；启动及回收可能额外耗时。直接调用内部 execute_run_command 保留旧阻塞默认，cmd 本地过滤兜底例外见 [终端说明](terminal_management.md)。
+- 可单独启用 `apply_patch(patch)`，支持上下文补丁的 Add/Update/Delete File（每次最多 20 文件、补丁最多 2 Mi 字符、单文件最多 8 MiB / 20 万行、修改前后内容合计最多 64 MiB）。先校验全部文件再逐文件提交，失败时尝试回滚并返回逐文件状态，不能视为跨文件原子事务。文件写入结果补充 `history_recorded/history_reason`，补丁按文件报告版本记录状态；超出版本链上限仍可能写入成功。
+- 搜索默认按需扫描首批结果，再用 `next_cursor` 续扫；`scan_pending` 表示尚待扫描，`total_matches_exact=false` 时计数只覆盖已扫描部分。`count_total=true` 请求预算内完整计数。搜索/枚举可设 `respect_gitignore=true`，只读取搜索根和下级 `.gitignore`。缓存有时效和内存预算，末页可能无命中；只有 `scan_complete=true` 才能结合搜索范围判断无匹配。
+- 历史快照每端最多 64 MiB（UTF-8），大于 256 Ki 字符或含 CR 时 gzip；会话快照配额 256 MiB，自动记录每文件最多 512 版本。超额明确返回 `history_recorded=false`，不淘汰旧版本。大文件 `snapshot_only=true` 保留整文件回退，避免逐行对齐/逐块编辑；快照缺失、损坏或磁盘外部变更时拒绝覆盖。详见 [文件历史](file_diff.md)。
 - 终端默认 shell 按平台统一选择：Windows 优先可用的 PowerShell，否则 cmd；Linux/macOS 使用 sh。工具调用可显式指定其他 `shell`。旧 `.env` 的 `RUN_COMMAND_DEFAULT_SHELL` 和会话 `_meta.run_command_shell` 不再生效；前端工具选择不再提供默认 shell 配置。旧 `GET /chat_config/run_command_shell` 兼容返回平台默认；旧 POST 返回 400 并提示在工具调用中指定 shell。
 - 页面提供本会话后台终端管理入口，仅在存在运行中任务时显示；模型停止、进程退出或用户关闭后自动移出列表。`/terminal/jobs` 列表、状态/输出、停止/关闭及日志下载接口均要求非空 `session_id` 查询参数并校验会话归属；详见 [后台终端管理](terminal_management.md)。该通道不依赖聊天 SSE，模型端 poll/stop 同样按会话归属校验。
 

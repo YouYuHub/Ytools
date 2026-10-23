@@ -11,9 +11,9 @@ class Node {
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
 }
 function pipeline() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/stream_pipeline.js'), 'utf8');
   const start = source.indexOf('  function createStreamPipeline(');
-  const end = source.indexOf('\n  async function send(', start);
+  const end = source.indexOf('\n  App.createStreamPipeline =', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;
   const cards = [];
   const tools = [];

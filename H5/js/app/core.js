@@ -388,6 +388,7 @@ window.App = window.App || {};
     if (chatScrollbarDragging) return;
     if (App.showHistoryTail) App.showHistoryTail();
     autoScrollPaused = false;
+    if (App.historyScroll && App.historyScroll.clearUserScrolledUp) App.historyScroll.clearUserScrolledUp();
     cancelBottomCorrection();
     const prev = instant ? chatScroll.style.scrollBehavior : null;
     if (instant) chatScroll.style.scrollBehavior = "auto";

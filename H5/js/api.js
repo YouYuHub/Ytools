@@ -166,6 +166,9 @@ const api_url = localStorage.getItem("ytools-api-base")
   function streamStatus(sessionId) {
     return request("/chat_stream/status?session_id=" + encodeURIComponent(sessionId));
   }
+  function streamStatuses(signal) {
+    return request("/chat_stream/statuses", { signal: signal });
+  }
 
   function getSessionMeta(sessionId) {
     return request("/chat_history/meta?session_id=" + encodeURIComponent(sessionId));
@@ -783,14 +786,15 @@ const api_url = localStorage.getItem("ytools-api-base")
         const lines = buffer.split("\n");
         buffer = lines.pop(); // 最后一段可能不完整，留到下次
         for (const raw of lines) {
-          if (dispatch(raw)) return;
+          if (dispatch(raw)) return { completed: true };
         }
         if (done) {
-          if (buffer && dispatch(buffer)) return;
+          if (buffer && dispatch(buffer)) return { completed: true };
           break;
         }
       }
       onEvent({ type: "done", data: null });
+      return { completed: false };
     } finally {
       // [DONE] 或显示异常提前退出时释放读取器，异常交给聊天层展示。
       try { if (!exhausted) await reader.cancel(); }
@@ -881,7 +885,7 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
    * @param {AbortSignal} [signal] 中止信号
    */
-  async function chatStream(payload, onEvent, signal) {
+  async function chatStream(payload, onEvent, signal, options) {
     const res = await fetch(BASE + "/chat_with_tool", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -893,23 +897,27 @@ const api_url = localStorage.getItem("ytools-api-base")
       try {
         detail = JSON.stringify(await res.json());
       } catch (_) { /* ignore */ }
-      throw new Error(detail);
+      const error = new Error(detail); error.status = res.status; throw error;
     }
-    await readSseResponse(res, onEvent);
+    if (options && options.onOpen) options.onOpen();
+    return await readSseResponse(res, onEvent);
   }
 
   /**
    * 手动压缩（流式）：POST /chat_context/compact_manual?stream=true
    * 事件结构与自动压缩一致：context_compaction 的 start/delta/done
    * （done 携带 summary_text），结尾附加 compaction_manual_result 结果帧。
+   * 后台任务与消费端分离：SSE 断开不再取消压缩，刷新后可用 attach 重连。
    * @param {string} sessionId 会话 ID
    * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
-   * @param {AbortSignal} [signal] 中止信号
+   * @param {AbortSignal} [signal] 中止信号（仅断开本地消费，不停止后台任务）
+   * @param {boolean} [attach] 为 true 时只附接到已有任务，不启动新任务
    */
-  async function compactContextStream(sessionId, onEvent, signal) {
+  async function compactContextStream(sessionId, onEvent, signal, attach) {
     const params = new URLSearchParams();
     params.set("session_id", sessionId || "default");
     params.set("stream", "true");
+    if (attach) params.set("attach", "true");
     const res = await fetch(BASE + "/chat_context/compact_manual?" + params.toString(), {
       method: "POST",
       signal: signal,
@@ -917,11 +925,32 @@ const api_url = localStorage.getItem("ytools-api-base")
     if (!res.ok) {
       let detail = res.status + " " + res.statusText;
       try {
-        detail = JSON.stringify(await res.json());
+        const body = await res.json();
+        detail = (body && (body.detail || body.message)) || JSON.stringify(body);
       } catch (_) { /* ignore */ }
-      throw new Error(detail);
+      const error = new Error(detail); error.status = res.status; throw error;
     }
-    await readSseResponse(res, onEvent);
+    return await readSseResponse(res, onEvent);
+  }
+
+  /**
+   * 查询手动压缩是否正在运行（刷新后重连判定）。
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{running:boolean, session_id:string}>}
+   */
+  function manualCompactionStatus(sessionId) {
+    return request("/chat_context/compact_manual/status?session_id=" + encodeURIComponent(sessionId || "default"));
+  }
+
+  /**
+   * 显式停止手动压缩（刷新/断线不再隐式取消，必须经此接口）。
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{stopped:boolean, running:boolean}>}
+   */
+  function stopManualCompaction(sessionId) {
+    return request("/chat_context/compact_manual/stop?session_id=" + encodeURIComponent(sessionId || "default"), {
+      method: "POST",
+    });
   }
 
   // ---------- Skills 提示词库 ----------
@@ -1010,10 +1039,12 @@ const api_url = localStorage.getItem("ytools-api-base")
       + "&key=" + encodeURIComponent(key));
   }
 
-  function fileContent(sessionId, key, v) {
+  function fileContent(sessionId, key, v, page) {
     let path = "/file_diff/content?session_id=" + encodeURIComponent(sessionId || "default")
       + "&key=" + encodeURIComponent(key);
     if (v != null) path += "&v=" + encodeURIComponent(v);
+    if (page && page.offset != null) path += "&offset=" + encodeURIComponent(page.offset);
+    if (page && page.limit != null) path += "&limit=" + encodeURIComponent(page.limit);
     return request(path);
   }
 
@@ -1146,6 +1177,7 @@ const api_url = localStorage.getItem("ytools-api-base")
     setSessionArchived,
     listArchivedSessions,
     streamStatus,
+    streamStatuses,
     getSessionMeta,
     generateSessionTitle,
     getContextTokenStats,
@@ -1210,6 +1242,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     deleteSessionFile,
     chatStream,
     compactContextStream,
+    manualCompactionStatus,
+    stopManualCompaction,
     listPrompts,
     readPrompt,
     createPrompt,

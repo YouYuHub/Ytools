@@ -844,6 +844,13 @@ def peek_worker_proxy(session_id: str) -> Optional[SessionWorkerProxy]:
         return _WORKER_PROXIES.get(session_id)
 
 
+def get_running_worker_session_ids() -> list[str]:
+    """Read the existing registry without creating proxies or starting workers."""
+    with _worker_proxies_lock:
+        proxies = list(_WORKER_PROXIES.items())
+    return [sid for sid, proxy in proxies if proxy.is_generation_running()]
+
+
 def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], None]:
     """把 worker 事件转发进绑定的 _SessionStream（reader 线程执行）。"""
 

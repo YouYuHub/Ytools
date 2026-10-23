@@ -2,6 +2,7 @@
 """V2 文件历史版本链测试（docs/file_diff.md §9）：record_change / diff 视图 / 撤回 / 回退 / 保留 / 保存。"""
 # 标准库
 import hashlib
+import os
 from pathlib import Path
 
 # 第三方库
@@ -26,6 +27,8 @@ SESSION = "pytest-history"
 
 
 def _record(target: Path, old: str, new: str, tool="edit_file", rnd=1):
+    target.parent.mkdir(parents=True,exist_ok=True)
+    target.write_text(new,encoding='utf-8',newline='')
     return store.record_change(
         SESSION,
         path=str(target),
@@ -201,7 +204,8 @@ def test_keep_locks_history_and_opens_new_generation(workdir):
 
 def test_oversized_file_not_recorded(workdir, monkeypatch):
     target = workdir["target"]
-    big = "x" * (store._FILE_HISTORY_MAX_TEXT_CHARS + 1)
+    monkeypatch.setattr(store.file_snapshots,'MAX_BYTES',128)
+    big = "x" * 129
     result = _record(target, "a = 1\n", big)
     assert result["recorded"] is False
     assert result.get("skipped") == "file_too_large"
@@ -209,8 +213,12 @@ def test_oversized_file_not_recorded(workdir, monkeypatch):
 
 
 def test_file_key_stable_case_insensitive(workdir):
-    """Windows 大小写不敏感：同路径不同大小写 → 同一 key。"""
-    assert store.file_key("C:/A/B.py") == store.file_key("c:\\a\\b.py")
+    """Follow platform path semantics; POSIX case-distinct files stay distinct."""
+    if os.name == 'nt':
+        assert store.file_key("C:/A/B.py") == store.file_key("c:\\a\\b.py")
+    else:
+        assert store.file_key('/A/B.py') != store.file_key('/a/b.py')
+        assert store.file_key('/a/./b.py') == store.file_key('/a/b.py')
 
 
 def test_hunk_parsing(workdir):
@@ -398,7 +406,7 @@ def test_cleanup_file_histories_removes_only_clean(workdir):
     dirty_key = store.file_key(str(target))
     # 第二个文件：全部撤回 → clean
     other = workdir["target"].parent / "other.txt"
-    other.write_text("x = 1\n", encoding="utf-8", newline="")
+    other.write_text("x = 2\n", encoding="utf-8", newline="")
     store.record_change(
         SESSION, path=str(other), display_path=str(other),
         old_text="x = 1\n", new_text="x = 2\n", tool="write_file", round_number=1,

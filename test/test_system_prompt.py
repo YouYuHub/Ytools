@@ -137,10 +137,13 @@ class ConditionalNoteTests(unittest.TestCase):
         prompt = sp.build_sys_prompt()
         self.assertIn("search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名", prompt)
         self.assertIn("按文件名查找或列出文件时", prompt)
-        self.assertIn("若 run_command 可用则使用相应终端命令", prompt)
+        self.assertIn("使用 list_files（若本轮可用）", prompt)
+        self.assertIn("多文件修改可用 apply_patch", prompt)
         self.assertIn("用 read_file 核对原文，edit_file 修改局部", prompt)
         self.assertIn("write_file 明确指定新建、覆盖或追加模式", prompt)
-        self.assertIn("长任务后台运行，用 poll_command 查询、stop_command 停止", prompt)
+        self.assertIn("poll_command 只传 job_id 自动续取输出", prompt)
+        self.assertIn("status=running 或 has_more=true", prompt)
+        self.assertIn("独立服务显式 background=true，stop_command 停止", prompt)
         self.assertIn("需要用户回答时单独调用 ask_user", prompt)
 
 

@@ -195,8 +195,9 @@ html[data-theme="dark"] {
 //   Java         → IntelliJ（Light / Darcula，PyCharm 同源）
 //   C / C++      → Visual Studio（Light / Dark）
 // 选择器同时覆盖普通代码块（code.language-x）、diff 行内语法
-// （diff-highlight 插件会给行 token 追加 language-<内层> 类）与工具结果
-// diff 卡片（pre.diff-code.language-<语言>，行内 token 无语言类、按容器继承变量）。
+// （diff-highlight 插件会给行 token 追加 language-<内层> 类）、工具结果
+// diff 卡片（pre.diff-code.language-<语言>，行内 token 无语言类、按容器继承变量）
+// 与独立 diff 编辑器页（.eh-table.language-<语言>，整表继承同一文件语言变量）。
 // 未列出的语言（go/rust/bash）使用基线配色。
 
 @mixin language-palette($langs) {
@@ -205,6 +206,7 @@ html[data-theme="dark"] {
     $sel: list.append($sel, string.unquote(".codeblock code.language-#{$l}"), comma);
     $sel: list.append($sel, string.unquote(".token.language-#{$l}"), comma);
     $sel: list.append($sel, string.unquote(".diff-code.language-#{$l}"), comma);
+    $sel: list.append($sel, string.unquote(".eh-table.language-#{$l}"), comma);
   }
   #{$sel} {
     @content;

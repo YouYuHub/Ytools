@@ -72,6 +72,8 @@ pandas==2.3.3 ; python_full_version < '3.11'
     # via -r requirements.txt
 pandas==3.0.6 ; python_full_version >= '3.11'
     # via -r requirements.txt
+pathspec==1.1.1
+    # via -r requirements.txt
 pillow==12.3.0 ; python_full_version < '3.11'
     # via -r requirements.txt
 pillow==13.0.0 ; python_full_version >= '3.11'
@@ -100,6 +102,8 @@ pytz==2026.5 ; python_full_version < '3.11'
     # via pandas
 pywin32==312 ; sys_platform == 'win32'
     # via mcp
+pywinpty==3.1.0 ; sys_platform == 'win32'
+    # via -r requirements.txt
 referencing==0.37.0
     # via
     #   jsonschema

@@ -242,9 +242,12 @@ def build_sys_prompt(
     tool_note = "你只能调用当前请求 tools 字段提供的工具；此前用过的工具若不在当前列表中，就不可用。"
     tool_choice_note = (
         "search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名；按文件名查找或列出文件时，"
-        "若 run_command 可用则使用相应终端命令，否则说明当前工具无法枚举文件名。"
-        "用 read_file 核对原文，edit_file 修改局部；write_file 明确指定新建、覆盖或追加模式。"
-        "命令语法须与 shell 一致；长任务后台运行，用 poll_command 查询、stop_command 停止。"
+        "使用 list_files（若本轮可用）。搜索按 next_cursor 续读时保留原查询。"
+        "用 read_file 核对原文，edit_file 修改局部；多文件修改可用 apply_patch。write_file 明确指定新建、覆盖或追加模式。"
+        "命令语法须与 shell 一致；run_command 默认短等，poll_command 只传 job_id 自动续取输出；"
+        "status=running 或 has_more=true 时继续查询。"
+        "独立服务显式 background=true，stop_command 停止。"
+        "需要连续输入时设 interactive=true，需终端的程序加 tty=true；write_stdin 的 chars 原样发送，提交一行需包含换行。"
         "需要用户回答时单独调用 ask_user，收到回答后继续。"
         "含替换字符的文本需先核对 encoding。"
     )

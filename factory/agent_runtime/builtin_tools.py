@@ -35,31 +35,44 @@ from factory.agent_runtime.tool_control import (
     ToolCancelledError, check_tool_control, remaining_seconds, tool_deadline,
 )
 from memory import file_memory
-
-
-TODO_TOOL_NAME = "todo_write"
-ASK_USER_TOOL_NAME = "ask_user"
-WRITE_FILE_NAME = "write_file"
-EDIT_FILE_NAME = "edit_file"
-READ_FILE_NAME = "read_file"
-SEARCH_FILES_NAME = "search_files"
-READ_MEDIA_NAME = "read_media"
-READ_DOCUMENT_NAME = "read_document"
-SUB_AGENT_TOOL_NAME = "sub_agent"
-RUN_COMMAND_NAME = "run_command"
-POLL_COMMAND_NAME = "poll_command"
-STOP_COMMAND_NAME = "stop_command"
-COMMAND_TOOL_NAMES = frozenset({RUN_COMMAND_NAME, POLL_COMMAND_NAME, STOP_COMMAND_NAME})
-# 内置工具在工具选择（_meta.tool_selection / mcp_servers.json inputs）中的伪服务键：
-# 前端把它作为“内置工具”分组渲染在工具模态框首位，保存/加载与 MCP 工具走同一链路
-BUILTIN_TOOL_SERVER_KEY = "__builtin__"
-# 用户可在工具选择中显式启用 read_document。
-SELECTABLE_BUILTIN_TOOL_NAMES = (
-    TODO_TOOL_NAME, ASK_USER_TOOL_NAME, WRITE_FILE_NAME, EDIT_FILE_NAME,
-    READ_FILE_NAME, SEARCH_FILES_NAME, READ_MEDIA_NAME, READ_DOCUMENT_NAME,
-    SUB_AGENT_TOOL_NAME, RUN_COMMAND_NAME,
+from .builtin_tool_catalog import (
+    TODO_TOOL_NAME,
+    ASK_USER_TOOL_NAME,
+    WRITE_FILE_NAME,
+    EDIT_FILE_NAME,
+    APPLY_PATCH_NAME,
+    READ_FILE_NAME,
+    SEARCH_FILES_NAME,
+    LIST_FILES_NAME,
+    READ_MEDIA_NAME,
+    READ_DOCUMENT_NAME,
+    SUB_AGENT_TOOL_NAME,
+    RUN_COMMAND_NAME,
+    POLL_COMMAND_NAME,
+    STOP_COMMAND_NAME,
+    WRITE_STDIN_NAME,
+    COMMAND_TOOL_NAMES,
+    BUILTIN_TOOL_SERVER_KEY,
+    SELECTABLE_BUILTIN_TOOL_NAMES,
+    TODO_TOOL_DEFINITION,
+    ASK_USER_TOOL_DEFINITION,
+    SUB_AGENT_TOOL_DEFINITION,
+    WRITE_FILE_TOOL_DEFINITION,
+    EDIT_FILE_TOOL_DEFINITION,
+    APPLY_PATCH_TOOL_DEFINITION,
+    READ_FILE_TOOL_DEFINITION,
+    SEARCH_FILES_TOOL_DEFINITION,
+    LIST_FILES_TOOL_DEFINITION,
+    READ_DOCUMENT_TOOL_DEFINITION,
+    RUN_COMMAND_TOOL_DEFINITION,
+    POLL_COMMAND_TOOL_DEFINITION,
+    STOP_COMMAND_TOOL_DEFINITION,
+    WRITE_STDIN_TOOL_DEFINITION,
 )
-# 前端回答 ask_user 提问时的消息前缀（前端 app.js 中同名拼接，需保持一致）；
+
+
+# 工具名称和 Schema 从 catalog 显式重导出，保留原有导入路径。
+# 前端回答 ask_user 提问时的消息前缀（前端同名拼接，需保持一致）；
 # 后端据此识别"覆盖式重新回答"：截断最新提问轮之后的旧回答轮
 ASK_ANSWER_PREFIX = "【回答模型提问】"
 def inject_builtin_tools(
@@ -76,6 +89,7 @@ def inject_builtin_tools(
     include_read_document: bool = False,
     include_sub_agent: bool = False,
     default_command_shell: str = "auto",
+    include_apply_patch: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """注入用户选择的本地内置工具：todo_write、ask_user、
     write_file、edit_file、read_file、search_files、run_command、
@@ -95,12 +109,18 @@ def inject_builtin_tools(
     if include_edit_file and EDIT_FILE_NAME not in servers:
         tools.append(EDIT_FILE_TOOL_DEFINITION)
         servers[EDIT_FILE_NAME] = BUILTIN_TOOL_SERVER_KEY
+    if include_apply_patch and APPLY_PATCH_NAME not in servers:
+        tools.append(APPLY_PATCH_TOOL_DEFINITION)
+        servers[APPLY_PATCH_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_read_file and READ_FILE_NAME not in servers:
         tools.append(READ_FILE_TOOL_DEFINITION)
         servers[READ_FILE_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_search_files and SEARCH_FILES_NAME not in servers:
         tools.append(SEARCH_FILES_TOOL_DEFINITION)
         servers[SEARCH_FILES_NAME] = BUILTIN_TOOL_SERVER_KEY
+        if LIST_FILES_NAME not in servers:
+            tools.append(LIST_FILES_TOOL_DEFINITION)
+            servers[LIST_FILES_NAME] = BUILTIN_TOOL_SERVER_KEY
     if include_run_command and RUN_COMMAND_NAME not in servers:
         command_definition = copy.deepcopy(RUN_COMMAND_TOOL_DEFINITION)
         command_definition["function"]["description"] += f" 本会话默认 shell={default_command_shell}。"
@@ -108,7 +128,8 @@ def inject_builtin_tools(
         tools.append(command_definition)
         servers[RUN_COMMAND_NAME] = BUILTIN_TOOL_SERVER_KEY
         for definition, name in ((POLL_COMMAND_TOOL_DEFINITION, POLL_COMMAND_NAME),
-                                 (STOP_COMMAND_TOOL_DEFINITION, STOP_COMMAND_NAME)):
+                                 (STOP_COMMAND_TOOL_DEFINITION, STOP_COMMAND_NAME),
+                                 (WRITE_STDIN_TOOL_DEFINITION, WRITE_STDIN_NAME)):
             if name not in servers:
                 tools.append(definition)
                 servers[name] = BUILTIN_TOOL_SERVER_KEY
@@ -127,9 +148,9 @@ def inject_builtin_tools(
 def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in (
         TODO_TOOL_NAME, ASK_USER_TOOL_NAME,
-        WRITE_FILE_NAME, EDIT_FILE_NAME, READ_FILE_NAME, SEARCH_FILES_NAME,
+        WRITE_FILE_NAME, EDIT_FILE_NAME, APPLY_PATCH_NAME, READ_FILE_NAME, SEARCH_FILES_NAME, LIST_FILES_NAME,
         READ_MEDIA_NAME, READ_DOCUMENT_NAME, SUB_AGENT_TOOL_NAME,
-        RUN_COMMAND_NAME, POLL_COMMAND_NAME, STOP_COMMAND_NAME,
+        RUN_COMMAND_NAME, POLL_COMMAND_NAME, STOP_COMMAND_NAME, WRITE_STDIN_NAME,
     )
 
 
@@ -165,33 +186,6 @@ def resolve_default_command_shell(session_id: str | None = None) -> str:
     return _resolve_shell("auto", os.name == "nt")[1]
 
 
-TODO_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'todo_write',
-              'description': '更新多步骤计划；每次提交完整 todos，最多 20 项，空数组清空。保持步骤 id，仅在计划或状态变化时调用。',
-              'parameters': {'type': 'object',
-                             'properties': {'todos': {'type': 'array',
-                                                      'description': '完整计划；最多 20 项，[] 清空。',
-                                                      'maxItems': 20,
-                                                      'items': {'type': 'object',
-                                                                'properties': {'id': {'type': 'string',
-                                                                                      'description': '步骤标识，创建后保持不变；省略时自动分配。',
-                                                                                      'maxLength': 64},
-                                                                               'content': {'type': 'string',
-                                                                                           'description': '步骤内容（一句话，祈使句，≤200 '
-                                                                                                          '字符）',
-                                                                                           'minLength': 1,
-                                                                                           'maxLength': 200},
-                                                                               'status': {'type': 'string',
-                                                                                          'enum': ['pending',
-                                                                                                   'in_progress',
-                                                                                                   'done'],
-                                                                                          'description': 'pending=待办 '
-                                                                                                         'in_progress=进行中 '
-                                                                                                         'done=已完成'}},
-                                                                'required': ['content', 'status'],
-                                                                'additionalProperties': False}}},
-                             'required': ['todos'],
-                             'additionalProperties': False}}}
 
 _TODO_VALID_STATUSES = ("pending", "in_progress", "done")
 _TODO_MAX_ITEMS = 20
@@ -311,37 +305,6 @@ def normalize_todo_items(
 
 
 # --------------------------- ask_user：向用户提问 ---------------------------
-ASK_USER_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'ask_user',
-              'description': '向用户提出 1-5 个必要问题并暂停，回答作为下一条用户消息到达。需确认或缺少必要信息时使用；同轮其他工具会延后。',
-              'parameters': {'type': 'object',
-                             'properties': {'questions': {'type': 'array',
-                                                          'description': '1-5 个问题；每题可自由输入或选择选项。',
-                                                          'minItems': 1,
-                                                          'maxItems': 5,
-                                                          'items': {'type': 'object',
-                                                                    'properties': {'question': {'type': 'string',
-                                                                                                'description': '具体问题，最多 '
-                                                                                                               '200 '
-                                                                                                               '字符。',
-                                                                                                'minLength': 1,
-                                                                                                'maxLength': 200},
-                                                                                   'options': {'type': 'array',
-                                                                                               'description': '可选 '
-                                                                                                              '2-6 '
-                                                                                                              '项；用户也可自由输入。',
-                                                                                               'maxItems': 6,
-                                                                                               'items': {'type': 'string',
-                                                                                                         'minLength': 1,
-                                                                                                         'maxLength': 100}},
-                                                                                   'multiple': {'type': 'boolean',
-                                                                                                'description': '是否多选，默认 '
-                                                                                                               'false。',
-                                                                                                'default': False}},
-                                                                    'required': ['question'],
-                                                                    'additionalProperties': False}}},
-                             'required': ['questions'],
-                             'additionalProperties': False}}}
 
 _ASK_MAX_QUESTIONS = 5
 _ASK_MAX_QUESTION_CHARS = 200
@@ -400,36 +363,6 @@ def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
 # 派发参数长度上限（防超大参数直接进上下文）
 _SUB_AGENT_TASK_MAX_CHARS = 20_000
 
-SUB_AGENT_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'sub_agent',
-              'description': '派发独立子任务；同轮多个调用并发执行，只返回最终报告。子任务看不到对话历史，不能提问或再次派发；task 写全目标、路径、事实和限制。',
-              'parameters': {'type': 'object',
-                             'properties': {'task': {'type': 'string',
-                                                     'maxLength': 20000,
-                                                     'description': '自包含任务：目标、验收标准、绝对路径、已知事实、限制和所需证据。'},
-                                            'todo': {'type': 'array',
-                                                     'description': '可选初始计划，最多 20 项。',
-                                                     'maxItems': 20,
-                                                     'items': {'type': 'object',
-                                                               'properties': {'id': {'type': 'string',
-                                                                                     'description': '步骤标识，创建后保持不变；省略时自动分配。',
-                                                                                     'maxLength': 64},
-                                                                              'content': {'type': 'string',
-                                                                                          'description': '步骤内容（一句话，≤200 '
-                                                                                                         '字符）',
-                                                                                          'minLength': 1,
-                                                                                          'maxLength': 200},
-                                                                              'status': {'type': 'string',
-                                                                                         'enum': ['pending',
-                                                                                                  'in_progress',
-                                                                                                  'done'],
-                                                                                         'description': 'pending=待办 '
-                                                                                                        'in_progress=进行中 '
-                                                                                                        'done=已完成'}},
-                                                               'required': ['content', 'status'],
-                                                               'additionalProperties': False}}},
-                             'required': ['task'],
-                             'additionalProperties': False}}}
 
 def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
     """Require a self-contained task string; return (task, error)."""
@@ -459,77 +392,7 @@ _WRITE_EDIT_MAX_CHARS = 2 * 1024 * 1024   # 单次写入/替换内容上限（�
 _EDIT_FILE_MAX_BYTES = 64 * 1024 * 1024  # 超大文件明确拒绝，不能截取前缀后覆盖原文件
 _EDIT_BATCH_MAX_CHARS = 4 * 1024 * 1024
 
-WRITE_FILE_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'write_file',
-              'description': '写入文本并自动建目录。mode=create 新建、overwrite 整文件覆盖、append 追加；mode 必填。局部修改用 edit_file。',
-              'parameters': {'type': 'object',
-                             'properties': {'path': {'type': 'string',
-                                                     'description': '文件路径；相对路径基于会话工作目录',
-                                                     'maxLength': 4096},
-                                            'content': {'type': 'string',
-                                                        'description': '要写入的完整内容（覆盖模式会清空原内容）',
-                                                        'maxLength': 2097152},
-                                            'encoding': {'type': 'string',
-                                                         'description': '文件编码；新文件默认 utf-8，追加已有文件时自动识别',
-                                                         'maxLength': 256},
-                                            'mode': {'type': 'string',
-                                                     'enum': ['create', 'overwrite', 'append'],
-                                                     'description': '写入模式；新建用 create，覆盖已有文件须明确使用 overwrite',
-                                                     'maxLength': 256},
-                                            'expected_hash': {'type': 'string',
-                                                              'description': '可选：read_file 返回的全文 '
-                                                                             'content_hash，内容变化时拒绝写入',
-                                                              'maxLength': 16,
-                                                              'pattern': '^[0-9a-f]{16}$'}},
-                             'required': ['path', 'content', 'mode'],
-                             'additionalProperties': False}}}
 
-EDIT_FILE_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'edit_file',
-              'description': '按精确原文替换。单次用 old_string/new_string，多处用 edits，二者不可混用。匹配多处需加长原文或 '
-                             'replace_all=true；任一项失败不写入。',
-              'parameters': {'type': 'object',
-                             'properties': {'path': {'type': 'string',
-                                                     'description': '文件路径',
-                                                     'maxLength': 4096},
-                                            'old_string': {'type': 'string',
-                                                           'description': '原文，须与文件内容一致；与 new_string 成对，不可与 '
-                                                                          'edits 同用。',
-                                                           'maxLength': 2097152,
-                                                           'minLength': 1},
-                                            'new_string': {'type': 'string',
-                                                           'description': '替换文本，空串表示删除；与 old_string 成对。',
-                                                           'maxLength': 2097152},
-                                            'replace_all': {'type': 'boolean',
-                                                            'description': '默认 false；多处替换在 edits 各项内设置。',
-                                                            'default': False},
-                                            'encoding': {'type': 'string',
-                                                         'description': '指定文件编码（如 gbk）；留空按 BOM、UTF-8 '
-                                                                        '和常见本地编码自动识别',
-                                                         'default': '',
-                                                         'maxLength': 256},
-                                            'expected_hash': {'type': 'string',
-                                                              'description': '可选：read_file 返回的全文 '
-                                                                             'content_hash，内容变化时拒绝编辑',
-                                                              'maxLength': 16,
-                                                              'pattern': '^[0-9a-f]{16}$'},
-                                            'edits': {'type': 'array',
-                                                      'minItems': 1,
-                                                      'maxItems': 100,
-                                                      'description': '只传 edits：按顺序匹配前项修改后的文本；每项含 '
-                                                                     'old_string/new_string，可选 replace_all。',
-                                                      'items': {'type': 'object',
-                                                                'properties': {'old_string': {'type': 'string',
-                                                                                              'maxLength': 2097152,
-                                                                                              'minLength': 1},
-                                                                               'new_string': {'type': 'string',
-                                                                                              'maxLength': 2097152},
-                                                                               'replace_all': {'type': 'boolean',
-                                                                                               'default': False}},
-                                                                'required': ['old_string', 'new_string'],
-                                                                'additionalProperties': False}}},
-                             'required': ['path'],
-                             'additionalProperties': False}}}
 
 
 def _decode_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> tuple:
@@ -601,6 +464,8 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
         "diff_truncated": False,
         "diff_skipped": "file_too_large",
         "changed_ranges": None,
+        "path": str(path),
+        "display_path": _display_path(path),
     }
     if old_text == new_text:
         return {
@@ -673,7 +538,7 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
             elif not truncated:
                 truncated = True
             continue
-        if line.startswith("+") and not line.startswith("+++"):
+        if line.startswith("+"):
             added += 1
             if not active:
                 active = True
@@ -681,7 +546,7 @@ def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
             new_start = new_line if new_start is None else min(new_start, new_line)
             new_end = new_line if new_end is None else max(new_end, new_line)
             new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-"):
             removed += 1
             if not active:
                 active = True
@@ -973,11 +838,12 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     size_before = path.stat().st_size if existed else 0
     # 旧内容仅用于 diff 生成（成功失败均不中断写入主流程）
     old_text: str | None = ""
-    if existed and size_before <= _FILE_DIFF_MAX_TEXT_CHARS:
+    old_encoding = encoding
+    if existed and size_before <= _EDIT_FILE_MAX_BYTES:
         try:
-            old_data = _read_bytes_with_limit(path, _FILE_DIFF_MAX_TEXT_CHARS)
-            if not _is_probably_binary(old_data):
-                old_text, _ = _decode_bytes_used(old_data, "")
+            old_data = _read_bytes_with_limit(path, _EDIT_FILE_MAX_BYTES)
+            if not _is_probably_binary(old_data, encoding if append else ''):
+                old_text, old_encoding = _decode_bytes_used(old_data, encoding if append else '')
             else:
                 old_text = None
         except (OSError, ValueError):
@@ -1033,11 +899,13 @@ def execute_write_file(tool_args: dict[str, Any]) -> dict[str, Any]:
             "path": str(path.resolve()),
             "display_path": _display_path(path.resolve()),
             "encoding": encoding,
-            "old_text": old_text if file_diff.get("diff_skipped") != "file_too_large" else None,
+            "old_text": old_text,
+            "old_exists": existed, "new_exists": True,
+            "old_encoding": old_encoding,
             # 追加模式的最终全文 = 旧内容 + 新写入内容
             "new_text": (
                 new_text_for_diff
-                if (not append or old_text is not None) and len(new_text_for_diff) <= _FILE_DIFF_MAX_TEXT_CHARS
+                if not append or old_text is not None
                 else None
             ),
         },
@@ -1190,13 +1058,14 @@ def execute_edit_file(tool_args: dict[str, Any]) -> dict[str, Any]:
         "_model_result": _build_edit_model_result(
             path, edits, replaced, file_diff, _content_hash(written_text)
         ),
-        # V2 版本链入链数据（text/updated 均为换行归一化后的全文）
+        # 快照使用精确换行文本，展示 diff 的预算不限制可回退内容。
         _FILE_HISTORY_PAYLOAD_KEY: {
             "path": str(path.resolve()),
             "display_path": _display_path(path.resolve()),
             "encoding": used_encoding,
-            "old_text": original_text if file_diff.get("diff_skipped") != "file_too_large" else None,
-            "new_text": updated if len(updated) <= _FILE_DIFF_MAX_TEXT_CHARS else None,
+            "old_text": original,
+            "new_text": written_text,
+            "old_exists": True, "new_exists": True,
         },
     }
 
@@ -1207,7 +1076,9 @@ def try_execute_builtin_file_tool(tool_name: str, tool_args: dict[str, Any]) -> 
     异常统一转为 {"error": ...} 结构化结果（模型可见的错误反馈），
     与 todo/ask_user 的 builtin_results 错误通道保持同构。
     """
-    if tool_name == WRITE_FILE_NAME:
+    if tool_name == APPLY_PATCH_NAME:
+        from .context_patch import execute as executor
+    elif tool_name == WRITE_FILE_NAME:
         executor = execute_write_file
     elif tool_name == EDIT_FILE_NAME:
         executor = execute_edit_file
@@ -1215,6 +1086,8 @@ def try_execute_builtin_file_tool(tool_name: str, tool_args: dict[str, Any]) -> 
         executor = execute_read_file
     elif tool_name == SEARCH_FILES_NAME:
         executor = execute_search_files
+    elif tool_name == LIST_FILES_NAME:
+        executor = execute_list_files
     else:
         return None
     try:
@@ -1251,102 +1124,86 @@ _SKIP_DIR_NAMES = {
     "history_files", "tmp", "vendor",
 }
 
-READ_FILE_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'read_file',
-              'description': '分段读取文本，默认带行号。按 next_start_line 续读；单行超长时同时传原 start_line 和 next_char_offset。返回全文 '
-                             'content_hash 可用于编辑校验。',
-              'parameters': {'type': 'object',
-                             'properties': {'path': {'type': 'string',
-                                                     'description': '文件路径；相对路径基于会话工作目录；传入目录会报错',
-                                                     'maxLength': 4096},
-                                            'start_line': {'type': 'integer',
-                                                           'description': '起始行（从 1 开始）',
-                                                           'default': 1,
-                                                           'minimum': 1},
-                                            'limit': {'type': 'integer',
-                                                      'minimum': 1,
-                                                      'maximum': 2000,
-                                                      'description': '本次最多读取的连续行数',
-                                                      'default': 200},
-                                            'encoding': {'type': 'string',
-                                                         'description': '指定文件编码（如 utf-8、gbk）；留空按 BOM、UTF-8 '
-                                                                        '和常见本地编码自动识别',
-                                                         'default': '',
-                                                         'maxLength': 256},
-                                            'show_line_numbers': {'type': 'boolean',
-                                                                  'description': '是否显示行号，默认 true；编辑时复制原文即可。',
-                                                                  'default': True},
-                                            'char_offset': {'type': 'integer',
-                                                            'description': '仅单行超长时使用的字符偏移（按返回的 '
-                                                                           'next_char_offset 续读）',
-                                                            'default': 0,
-                                                            'minimum': 0}},
-                             'required': ['path'],
-                             'additionalProperties': False}}}
 
-SEARCH_FILES_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'search_files',
-              'description': '跨文件搜索内容；只搜索内容，不枚举文件名。file_pattern 只筛选待搜索文件。默认普通文本，正则须 '
-                             'is_regex=true；结果不完整时不能判断目标不存在。',
-              'parameters': {'type': 'object',
-                             'properties': {'pattern': {'type': 'string',
-                                                        'description': '要查找的文本；is_regex=true 时为正则表达式',
-                                                        'maxLength': 8192},
-                                            'dir_path': {'type': 'string',
-                                                         'description': '搜索根目录',
-                                                         'default': '.',
-                                                         'maxLength': 4096},
-                                            'file_pattern': {'type': 'string',
-                                                             'description': '按文件名筛选，如 *.py；不返回文件清单。',
-                                                             'default': '',
-                                                             'maxLength': 4096},
-                                            'ignore_case': {'type': 'boolean',
-                                                            'description': '是否忽略大小写',
-                                                            'default': False},
-                                            'is_regex': {'type': 'boolean',
-                                                         'description': 'pattern 是否按正则解析，默认按普通文本匹配',
-                                                         'default': False},
-                                            'context_lines': {'type': 'integer',
-                                                              'description': '每处匹配附带上下文行数（0-5）',
-                                                              'default': 0,
-                                                              'minimum': 0,
-                                                              'maximum': 5},
-                                            'max_results': {'type': 'integer',
-                                                            'description': '最多返回的匹配区块数（1-200）',
-                                                            'default': 50,
-                                                            'minimum': 1,
-                                                            'maximum': 200},
-                                            'max_depth': {'type': 'integer',
-                                                          'description': '递归深度，0=仅当前目录',
-                                                          'default': 6,
-                                                          'minimum': 0},
-                                            'max_scanned_files': {'type': 'integer',
-                                                                  'minimum': 1,
-                                                                  'maximum': 20000,
-                                                                  'default': 3000,
-                                                                  'description': '候选文件扫描上限；未扫完会标记部分结果'},
-                                            'max_scan_seconds': {'type': 'number',
-                                                                 'minimum': 0.1,
-                                                                 'maximum': 120,
-                                                                 'default': 10,
-                                                                 'description': '扫描时间上限（秒）'},
-                                            'max_file_mb': {'type': 'number',
-                                                            'default': 2,
-                                                            'description': '单文件上限 MiB，默认 2；0 使用硬上限 16。',
-                                                            'minimum': 0,
-                                                            'maximum': 16},
-                                            'exclude_dirs': {'type': 'array',
-                                                             'items': {'type': 'string',
-                                                                       'minLength': 1,
-                                                                       'maxLength': 256},
-                                                             'description': '追加排除的目录名，支持通配符；[] 不改变默认排除。',
-                                                             'maxItems': 64},
-                                            'no_default_excludes': {'type': 'boolean',
-                                                                    'default': False,
-                                                                    'description': 'true 关闭默认排除；仍应用 '
-                                                                                   'exclude_dirs。默认 false。'}},
-                             'required': ['pattern'],
-                             'additionalProperties': False}}}
+
+
+
+
+def _path_matches(path, root, pattern):
+    """A basename glob, or an anchored relative glob; **/ also matches zero directories."""
+    if not pattern:
+        return True
+    pattern = pattern.replace('\\', '/')
+    if pattern.startswith('./'):
+        pattern = pattern[2:]
+    if '/' not in pattern:
+        return fnmatch.fnmatch(path.name, pattern)
+    expressions = []
+    parts = pattern.split('/')
+    for i, part in enumerate(parts):
+        if part == '**':
+            expressions.append('(?:[^/]+/)*' if i < len(parts) - 1 else '.*')
+        else:
+            expressions.append(fnmatch.translate(part)[4:-3] + ('/' if i < len(parts) - 1 else ''))
+    flags = re.IGNORECASE if os.name == 'nt' else 0
+    return re.fullmatch(''.join(expressions), path.relative_to(root).as_posix(), flags) is not None
+
+
+def execute_list_files(tool_args):
+    from . import query_pages
+    args = tool_args or {}
+    resumed = query_pages.resume(args, files=True)
+    if resumed is not None:
+        return resumed
+    root = _resolve_dir_path(args.get('dir_path') or '.')
+    guard_path(root)
+    pattern = string_arg(args, 'pattern', '*', required=True, max_length=4096)
+    maximum = int_arg(args, 'max_scanned_files', 3000, minimum=1, maximum=20000)
+    duration = number_arg(args, 'max_scan_seconds', 10, minimum=0.1, maximum=120)
+    depth = int_arg(args, 'max_depth', 6, maximum=128)
+    exclusions = args.get('exclude_dirs')
+    if exclusions is not None and (not isinstance(exclusions, list) or any(not isinstance(x, str) or not x for x in exclusions)):
+        raise ValueError('exclude_dirs 必须为目录名字符串数组')
+    errors, denied = [], []
+    versions = {root: _file_version(root)}
+    paths, scanned, size = [], 0, 0
+    complete = True
+    deadline = time.monotonic() + duration
+    for path, kind in _walk_entries(root, depth, exclusions, errors.append, denied.append,
+                                    _optional_bool(args, 'no_default_excludes'),
+                                    _optional_bool(args, 'respect_gitignore'), versions):
+        check_tool_control()
+        if scanned >= maximum or len(versions) >= 20000 or time.monotonic() >= deadline:
+            complete = False
+            break
+        if not guard_path(path, search=True):
+            denied.append(path)
+            continue
+        try:
+            versions.setdefault(path, _file_version(path))
+        except OSError:
+            errors.append(path)
+            continue
+        if kind != 'file':
+            continue
+        scanned += 1
+        if not _optional_bool(args, 'no_default_excludes') and path.name.startswith('.'):
+            continue
+        if _path_matches(path, root, pattern):
+            shown = _display_path(path)
+            if size + len(shown) > query_pages.MAX_SNAPSHOT_CHARS:
+                complete = False
+                break
+            paths.append(shown)
+            size += len(shown)
+    scan_truncated = not complete
+    complete = complete and not errors and not denied
+    return query_pages.create(args, paths, {
+        'success': True, 'path': _display_path(root), 'files_checked': scanned,
+        'scan_complete': complete, 'scan_truncated': scan_truncated,
+        'skipped_unreadable': len(errors), 'skipped_permission': len(denied),
+        '_prefix': '[list_files] ' + ('扫描完整' if complete else '扫描未完成；未列出的文件不能判定不存在'),
+    }, versions, files=True)
 
 
 def _resolve_dir_path(dir_path: Any) -> Path:
@@ -1361,7 +1218,7 @@ def _resolve_dir_path(dir_path: Any) -> Path:
 
 
 def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, onpermission=None,
-                 no_default_excludes: bool = False):
+                 no_default_excludes: bool = False, respect_gitignore=False, versions=None):
     """遍历目录树，yield (路径, "file"|"dir")。
     exclude_dirs 追加到默认排除（隐藏目录与 _SKIP_DIR_NAMES）之后；
     no_default_excludes=True 时关闭默认排除，只应用 exclude_dirs。
@@ -1372,17 +1229,27 @@ def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, o
         exclusions = user_rules
     else:
         exclusions = list(_SKIP_DIR_NAMES) + [".*"] + user_rules
+    if respect_gitignore:
+        from .search_ignore import IgnoreRules
+        ignore = IgnoreRules(root, versions, onerror, onpermission)
+    else:
+        ignore = None
     for current, dir_names, file_names in os.walk(root, onerror=onerror):
+        check_tool_control()
         current_path = Path(current)
         if not guard_path(current_path, search=True):
             if onpermission:
                 onpermission(current_path)
             dir_names[:] = []
             continue
+        if ignore and not ignore.enter(current_path):
+            dir_names[:] = []
+            continue
         depth = len(current_path.parts) - root_depth
         candidates = sorted(
             name for name in dir_names
             if not any(fnmatch.fnmatch(name.lower(), rule.lower()) for rule in exclusions)
+            and not (ignore and ignore.ignored(current_path / name, True))
         )
         keep_dirs = []
         for name in candidates:
@@ -1395,6 +1262,8 @@ def _walk_entries(root: Path, max_depth: int, exclude_dirs=None, onerror=None, o
         # 深度用尽时剪枝，不再下钻（目录本身已在上面列出）
         dir_names[:] = keep_dirs if depth < max_depth else []
         for name in sorted(file_names):
+            if ignore and ignore.ignored(current_path / name):
+                continue
             yield current_path / name, "file"
 
 
@@ -1409,8 +1278,12 @@ def _iter_text_lines(text):
 
 
 def _read_text_snapshot(path, encoding):
+    from . import text_index
     version = _file_version(path)
     key = (str(path.resolve()), version, encoding)
+    indexed = text_index.get(key)
+    if indexed is not None:
+        return indexed
     with _read_snapshot_lock:
         cached = _read_snapshot_cache.get(key)
         if cached is not None:
@@ -1426,6 +1299,10 @@ def _read_text_snapshot(path, encoding):
     lines = tuple(_iter_text_lines(text)) if small and line_count <= 4096 else None
     weight = len(text) * 4 + (sum(len(line) * 4 + 64 for line in lines) if lines is not None else 0)
     snapshot = (text, used_encoding, _content_hash(text), lines, weight)
+    if lines is None:
+        indexed = text_index.store(key, text, used_encoding, snapshot[2], _iter_text_lines)
+        if indexed is not None:
+            return indexed
     if lines is not None and weight <= _READ_SNAPSHOT_CACHE_WEIGHT:
         with _read_snapshot_lock:
             _read_snapshot_cache[key] = snapshot
@@ -1465,7 +1342,11 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     requested_end = (raw_end if raw_end > 0 else float("inf")) if "end_line" in args else start + limit - 1
     selected = []
     total = 0
-    if cached_lines is not None:
+    from .text_index import TextIndex
+    if isinstance(text, TextIndex):
+        total = text.total
+        selected = text.select(start, min(requested_end, total), _READ_FILE_MAX_LINES)
+    elif cached_lines is not None:
         total = len(cached_lines)
         selected = list(cached_lines[start - 1:min(start - 1 + _READ_FILE_MAX_LINES,
                                                 int(requested_end) if requested_end != float("inf") else total)])
@@ -1567,7 +1448,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int) -> list:
+def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int, offset=0) -> list:
     """把（相邻+上下文合并后的）命中区间格式化为 "路径:行号" 区块。"""
     ranges = []
     for idx in hit_indexes:
@@ -1580,12 +1461,12 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
     for start, end in ranges:
         low = max(0, start - context)
         high = min(len(lines) - 1, end + context)
-        header = f"{_display_path(path)}:{start + 1}" + (f"-{end + 1}" if end != start else "")
+        header = f"{_display_path(path)}:{start + offset + 1}" + (f"-{end + offset + 1}" if end != start else "")
         body = []
         for no in range(low, high + 1):
             marker = ">" if no in hits else " "
             line = lines[no][:300] + ("…[长行请用 read_file 续读]" if len(lines[no]) > 300 else "")
-            body.append(f"{marker}{no + 1}| {line}")
+            body.append(f"{marker}{no + offset + 1}| {line}")
         blocks.append(header + "\n" + "\n".join(body))
     return blocks
 
@@ -1593,6 +1474,13 @@ def _format_match_block(path: Path, lines: list, hit_indexes: list, context: int
 def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     """Search file contents; return bounded snippets, counts and completeness."""
     args = tool_args or {}
+    from . import query_pages
+    resumed = query_pages.resume(args)
+    if resumed is not None:
+        return resumed
+    if not _optional_bool(args, 'count_total'):
+        from .search_scan import execute
+        return execute(args)
     return_max_chars = max(512, min(60000, int(args.get("_max_chars") or 60000)))
     pattern = string_arg(args, "pattern", required=True, max_length=8192)
     if not pattern:
@@ -1619,6 +1507,8 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     if size_limit:
         effective_max_bytes = min(effective_max_bytes, max(1, int(size_limit * 1024 * 1024)))
     blocks = []
+    snapshot_chars = 0
+    versions = {root: _file_version(root)}
     total_matches = 0
     files_scanned = 0
     files_matched = 0
@@ -1632,7 +1522,7 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     max_scan_seconds = number_arg(args, "max_scan_seconds", _SEARCH_DEFAULT_MAX_SCAN_SECONDS, minimum=0.1, maximum=120)
     deadline = started_at + max_scan_seconds
     files_checked = 0
-    max_depth = int_arg(args, "max_depth", _SEARCH_DEFAULT_MAX_DEPTH)
+    max_depth = int_arg(args, "max_depth", _SEARCH_DEFAULT_MAX_DEPTH, maximum=128)
     exclude_dirs = args.get("exclude_dirs")
     if exclude_dirs is not None and (not isinstance(exclude_dirs, list) or
             any(not isinstance(rule, str) or not rule for rule in exclude_dirs)):
@@ -1641,19 +1531,27 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     walk_errors = []
     permission_skips = []
     for path, kind in _walk_entries(root, max(0, max_depth), exclude_dirs, walk_errors.append,
-                                    permission_skips.append, no_default_excludes):
+                                    permission_skips.append, no_default_excludes,
+                                    _optional_bool(args, 'respect_gitignore'), versions):
         check_tool_control()
-        if time.monotonic() - started_at >= max_scan_seconds:
+        if len(versions) >= 20000 or time.monotonic() - started_at >= max_scan_seconds:
             scan_truncated = True
             break
-        if kind != "file":
+        if kind == 'file' and path.name.startswith('.') and not no_default_excludes:
             continue
         if not guard_path(path, search=True):
             permission_skips.append(path)
             continue
-        if name_filter and not fnmatch.fnmatch(path.name, name_filter):
+        try:
+            versions.setdefault(path, _file_version(path))
+        except OSError:
+            skipped_unreadable += 1
             continue
-        if files_checked >= max_scanned_files or time.monotonic() - started_at >= max_scan_seconds:
+        if kind != "file":
+            continue
+        if name_filter and not _path_matches(path, root, name_filter):
+            continue
+        if files_checked >= max_scanned_files or len(versions) >= 20000 or time.monotonic() - started_at >= max_scan_seconds:
             scan_truncated = True
             break
         files_checked += 1
@@ -1692,7 +1590,7 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
                     if previous_hit is None or idx > previous_hit + 2 * context + 1:
                         file_blocks += 1
                     previous_hit = idx
-                    if len(hit_indexes) < max(200, limit * 4):
+                    if len(hit_indexes) < 20000:
                         hit_indexes.append(idx)
                     else:
                         capture_truncated = True
@@ -1706,8 +1604,18 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
         total_matches += file_matches
         block_group = _format_match_block(path, lines, hit_indexes, context)
         total_blocks += file_blocks
-        room = max(0, limit - len(blocks))
-        blocks.extend(block_group[:room])
+        for block in block_group:
+            if snapshot_chars + len(block) > query_pages.MAX_SNAPSHOT_CHARS:
+                capture_truncated = True
+                remaining = query_pages.MAX_SNAPSHOT_CHARS - snapshot_chars
+                if remaining > 0:
+                    cut = block.rfind('\n', 0, remaining)
+                    if cut > 0:
+                        blocks.append(block[:cut])
+                        snapshot_chars += cut
+                break
+            blocks.append(block)
+            snapshot_chars += len(block)
         if scan_truncated:
             break
     search_label = "正则" if isregex else "文本"
@@ -1731,60 +1639,29 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     if len(prefix) > return_max_chars - 180:
         header = f"[search_files] 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处；路径和表达式见返回字段。"
         prefix = "\n".join(warnings + [header])
-    # Reserve the summary and continuation hint; trim on line boundaries so
-    # displayed hit counts remain truthful, even for one enormous match block.
-    room = max(0, return_max_chars - len(prefix) - 180)
-    shown = []
-    used = 0
-    output_truncated = capture_truncated
-    for block in blocks:
-        if used + len(block) + 1 <= room:
-            shown.append(block)
-            used += len(block) + 1
-            continue
-        output_truncated = True
-        if not shown:
-            lines = []
-            for line in block.splitlines():
-                if used + len(line) + 1 > room:
-                    break
-                lines.append(line)
-                used += len(line) + 1
-            if len(lines) > 1:
-                shown.append("\n".join(lines))
-        break
-    displayed_matches = sum(line.startswith(">") for block in shown for line in block.splitlines())
-    result_limited = total_blocks > limit
-    summary = f"[展示 {displayed_matches}/{total_matches} 处命中，{len(shown)}/{total_blocks} 个区块；统计范围为已扫描文件。]"
-    parts = [prefix, summary] + shown
-    if result_limited or output_truncated:
-        parts.append(f"[结果展示已截断（max_results={limit} 或当前模型字符预算）；请缩小 dir_path/file_pattern，或按路径/行号用 read_file 读取。]")
-    elif not total_matches:
-        parts.append("（无匹配结果）" if scan_complete else "（已扫描部分无匹配；尚有未读取内容，不能判定不存在）")
-    message = "\n".join(parts)
-    return {
+    metadata = {
         "success": True,
-        "message": message,
         "path": _display_path(root),
         "pattern": regex.pattern,
         "files_scanned": files_scanned,
         "files_checked": files_checked,
         "files_matched": files_matched,
         "total_matches": total_matches,
-        "displayed_matches": displayed_matches,
-        "displayed_blocks": len(shown),
         "total_blocks": total_blocks,
         "skipped_large": skipped_large,
         "skipped_unreadable": skipped_unreadable,
         "skipped_permission": skipped_permission,
         "scan_complete": scan_complete,
-        "output_truncated": output_truncated or result_limited,
-        "truncated": not scan_complete or output_truncated or result_limited,
         "scan_truncated": scan_truncated,
         "max_depth": max_depth,
         "no_default_excludes": no_default_excludes,
         "exclude_dirs": list(exclude_dirs or []),
+        "capture_truncated": capture_truncated,
+        "total_matches_exact": scan_complete,
+        "scan_pending": False,
+        "_prefix": prefix,
     }
+    return query_pages.create(args, blocks, metadata, versions)
 
 
 # ------------------- read_document：读取文档解析文本（按需/分页） -------------------
@@ -1958,55 +1835,6 @@ def _read_document_int(value: Any, default: int, *, minimum: int, maximum: int) 
     return int_arg({"offset/limit": value}, "offset/limit", default, minimum=minimum, maximum=maximum)
 
 
-READ_DOCUMENT_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'read_document',
-              'description': '读取上传文件或本地文档。auto 自动选择；text 按 offset/limit 字符续读；table 按 next_row/next_sheet '
-                             '续读。PDF 页段须同时指定 page_start/page_count；失败不改变读取范围。原生文件仅供下一次请求。',
-              'parameters': {'type': 'object',
-                             'properties': {'filename': {'type': 'string',
-                                                         'description': '会话上传文件名，或本地相对/绝对路径。',
-                                                         'maxLength': 4096},
-                                            'mode': {'type': 'string',
-                                                     'enum': ['auto', 'text', 'table', 'native'],
-                                                     'description': 'auto 自动选择；text 字符分页；table 表格行分页；native '
-                                                                    '原生文件。',
-                                                     'maxLength': 256,
-                                                     'default': 'auto'},
-                                            'offset': {'type': 'integer',
-                                                       'description': '文本起始字符，从 0 开始；auto 指定后使用文本模式。',
-                                                       'minimum': 0},
-                                            'limit': {'type': 'integer',
-                                                      'description': '文本/表格字符预算，默认 10000，最大 20000；可能按上下文收紧。',
-                                                      'minimum': 1,
-                                                      'maximum': 20000,
-                                                      'default': 10000},
-                                            'sheet': {'type': 'string',
-                                                      'description': '表格工作表名称；默认第一个，返回 sheets 列出全部工作表',
-                                                      'maxLength': 256},
-                                            'header_row': {'type': 'integer',
-                                                           'minimum': 0,
-                                                           'description': '表格表头行号，从 1 开始，默认 1；0 表示无表头，使用列 '
-                                                                          'A/B 等且保留首行数据'},
-                                            'start_row': {'type': 'integer',
-                                                          'minimum': 1,
-                                                          'description': '表格数据起始行号，从 1 开始；默认表头之后，续读用 '
-                                                                         'next_row；与 offset 互斥'},
-                                            'row_limit': {'type': 'integer',
-                                                          'minimum': 1,
-                                                          'maximum': 200,
-                                                          'description': '表格最多读取的数据行数，默认 100，最多 200；同时受 '
-                                                                         'limit 字符预算约束'},
-                                            'page_start': {'type': 'integer',
-                                                           'description': '原生 PDF 起始页码（从 1 开始）；与 page_count '
-                                                                          '同时指定',
-                                                           'minimum': 1},
-                                            'page_count': {'type': 'integer',
-                                                           'description': '原生 PDF 读取页数（1–20）；与 page_start '
-                                                                          '同时指定',
-                                                           'minimum': 1,
-                                                           'maximum': 20}},
-                             'required': ['filename'],
-                             'additionalProperties': False}}}
 
 
 def execute_read_document(
@@ -4600,7 +4428,7 @@ def _background_command_result(message, job_id, session_id):
     from .command_jobs import read_job, snapshot
     _, meta = read_job(job_id, session_id)
     result = snapshot(meta)
-    result.update(message=message, stdout="", stderr="", timed_out=False, truncated=False)
+    result.update(message=message, stdout="", stderr="", timed_out=False, truncated=False, next_cursor="")
     return result
 
 
@@ -4663,9 +4491,11 @@ def _command_output_tail(output_path: Path, tail_lines: int, max_chars: int) -> 
 
 
 def _command_job_action(action: str, job_id: str, session_id: str = "", *,
-                        tail_lines: int = 30, max_chars: int = 12000) -> dict[str, Any]:
+                        tail_lines: int = 30, max_chars: int = 12000,
+                        cursor=None, wait_seconds=0, encoding='') -> dict[str, Any]:
     from factory.agent_runtime.command_jobs import action as job_action
-    result = job_action(job_id, action, session_id, tail_lines=tail_lines, max_chars=max_chars)
+    result = job_action(job_id, action, session_id, tail_lines=tail_lines, max_chars=max_chars,
+                        cursor=cursor, wait_seconds=wait_seconds, encoding=encoding)
     # UI needs command/session metadata; repeated model polls only need status and output.
     for key in ("command", "shell", "cwd", "session_id", "created_at", "can_stop"):
         result.pop(key, None)
@@ -4683,16 +4513,18 @@ def _pid_alive_posix(pid: int) -> bool:
 
 
 def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max_output_chars=None,
-                      structured=False, session_id="") -> str | dict[str, Any]:
+                      structured=False, session_id="", yield_time_ms=None, owner_agent='main',
+                      interactive=False, tty=False, auto_yield=False) -> str | dict[str, Any]:
     command = string_arg({"command": command}, "command", required=True, max_length=200000).strip()
     timeout = number_arg({"timeout_seconds": timeout_seconds}, "timeout_seconds", 120, minimum=1, maximum=1800)
     with tool_deadline(30 if background else timeout):
         return _execute_command_impl(command, shell, work_dir, timeout, background,
-                                     max_output_chars, structured, session_id)
+                                     max_output_chars, structured, session_id, yield_time_ms, owner_agent, interactive, tty, auto_yield)
 
 
 def _execute_command_impl(command, shell, work_dir, timeout, background, max_output_chars,
-                          structured, session_id):
+                          structured, session_id, yield_time_ms=None, owner_agent='main', interactive=False, tty=False,
+                          auto_yield=False):
     output_limit = max(512, min(_RUN_COMMAND_MAX_CHARS, int(max_output_chars or _RUN_COMMAND_MAX_CHARS)))
     is_nt = os.name == "nt"
     # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
@@ -4736,6 +4568,20 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
         guard_notes = guard_notes + pipe_notes
     work_text = string_arg({"work_dir": work_dir}, "work_dir").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
+    if auto_yield and yield_time_ms is None and not background and local_filter is None:
+        yield_time_ms = 1000
+    if yield_time_ms is not None:
+        if background:
+            raise ValueError('yield_time_ms 与 background=true 不能同时指定')
+        if local_filter is not None:
+            raise ValueError('当前管道需要本地过滤，请移除 yield_time_ms 或直接运行上游命令')
+        from .command_leases import start
+        if shell_kind == 'cmd':
+            guard_notes.extend(_cmd_syntax_hints(command, None, '', ''))
+        result = start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id,
+                       remaining_seconds(timeout), yield_time_ms, output_limit, owner_agent, interactive, tty)
+        result['message'] = _append_command_notes(result['message'], guard_notes)
+        return result
     if background:
         result = _run_command_background(
             command, shell_exe, shell_kind, shell_prefix, cwd, is_nt, session_id, structured=structured)
@@ -4842,70 +4688,35 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
 
 # ------------------- run_command 工具定义与执行入口 -------------------
 
-RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'run_command',
-              'description': '运行终端命令；每次新建 shell。短命令前台等待，长任务用 background=true，按 job_id 调用 '
-                             'poll_command/stop_command。文件读写优先用专用工具。',
-              'parameters': {'type': 'object',
-                             'properties': {'command': {'type': 'string',
-                                                        'description': '目标 shell 的命令原文；语法须与 shell 一致。cmd 用 '
-                                                                       '&& 或 & 串联。',
-                                                        'maxLength': 200000},
-                                            'shell': {'type': 'string',
-                                                      'enum': ['auto',
-                                                               'cmd',
-                                                               'powershell',
-                                                               'pwsh',
-                                                               'bash',
-                                                               'sh',
-                                                               'zsh'],
-                                                      'description': '默认 auto：Windows PowerShell（不可用时 '
-                                                                     'cmd），其他平台 sh。',
-                                                      'default': 'auto',
-                                                      'maxLength': 256},
-                                            'work_dir': {'type': 'string',
-                                                         'description': '工作目录；默认会话目录。每次调用独立，cd 不会影响下一次调用。',
-                                                         'default': '',
-                                                         'maxLength': 4096},
-                                            'timeout_seconds': {'type': 'number',
-                                                                'minimum': 1,
-                                                                'maximum': 1800,
-                                                                'description': '仅前台有效，默认 120 秒，范围 '
-                                                                               '1-1800；含预处理和启动，超时终止进程树。',
-                                                                'default': 120.0},
-                                            'background': {'type': 'boolean',
-                                                           'description': 'true 启动后台任务并返回 job_id；不受 '
-                                                                          'timeout_seconds 限制，结束后仍可查询日志。',
-                                                           'default': False}},
-                             'required': ['command'],
-                             'additionalProperties': False}}}
 
-POLL_COMMAND_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'poll_command',
-              'description': '查询后台任务状态和最近输出；仅管理当前会话任务。尾部采样可能遗漏轮询间输出，完整内容见 output_path。',
-              'parameters': {'type': 'object',
-                             'properties': {'job_id': {'type': 'string',
-                                                       'description': 'run_command 返回的 job_id',
-                                                       'maxLength': 256,
-                                                       'pattern': '^bg_[A-Za-z0-9_]+$'},
-                                            'tail_lines': {'type': 'integer',
-                                                           'minimum': 1,
-                                                           'maximum': 200,
-                                                           'default': 30,
-                                                           'description': '最近 1-200 行，默认 30；同时受字符预算限制。'}},
-                             'required': ['job_id'],
-                             'additionalProperties': False}}}
 
-STOP_COMMAND_TOOL_DEFINITION = {'type': 'function',
- 'function': {'name': 'stop_command',
-              'description': '停止当前会话后台任务的进程树并保留日志；任务已结束时返回其当前状态。',
-              'parameters': {'type': 'object',
-                             'properties': {'job_id': {'type': 'string',
-                                                       'description': 'run_command 返回的 job_id',
-                                                       'maxLength': 256,
-                                                       'pattern': '^bg_[A-Za-z0-9_]+$'}},
-                             'required': ['job_id'],
-                             'additionalProperties': False}}}
+
+
+
+def execute_write_stdin(args):
+    from .command_input import send, MAX_INPUT_BYTES
+    allowed = {'job_id', 'chars', 'eof', 'cursor', 'wait_seconds', 'request_id'}
+    if any(key not in allowed and not key.startswith('_') for key in args):
+        raise ValueError('write_stdin 只接受 job_id、chars、eof、cursor、wait_seconds、request_id')
+    chars = string_arg(args, 'chars', max_length=16384)
+    if len(chars.encode('utf-8')) > MAX_INPUT_BYTES:
+        raise ValueError('chars 超出 64KiB')
+    request_id = string_arg(args, 'request_id', max_length=128)
+    if 'request_id' in args and not request_id:
+        raise ValueError('request_id 不能为空')
+    job_id = string_arg(args, 'job_id', required=True, max_length=256)
+    session_id, agent = str(args.get('_session_id') or ''), str(args.get('_command_owner_agent') or 'main')
+    eof = _optional_bool(args, 'eof')
+    cursor = string_arg(args, 'cursor', max_length=512) if 'cursor' in args else None
+    automatic = bool(args.get('_command_auto_defaults'))
+    wait = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=30)
+    limit = max(512, min(12000, int(args.get('_max_chars') or 12000)))
+    if automatic:
+        from .command_reads import read
+        return read(job_id, session_id, agent, cursor=cursor, wait_seconds=wait, max_chars=limit,
+                    send=(lambda position, seconds, codec: send(job_id, session_id, chars, eof, request_id,
+                          position, seconds, agent, limit, codec)) if chars or eof or request_id else None)
+    return send(job_id, session_id, chars, eof, request_id, cursor or '', wait, agent, limit)
 
 
 def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
@@ -4919,22 +4730,54 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
     args = tool_args if isinstance(tool_args, dict) else {}
     action = str(args.get("action") or "run").strip().lower()
     if action in ("poll", "stop"):
-        if any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background")):
+        if any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty")):
             raise ValueError("poll/stop 仅接受 job_id；请移除执行命令专用参数")
         tail_lines = args.get("tail_lines", 30)
+        cursor = args.get('cursor')
+        if cursor is not None and not isinstance(cursor, str):
+            raise ValueError('cursor 必须是字符串')
+        if action == 'stop' and any(key in args for key in ('cursor', 'wait_seconds', 'encoding')):
+            raise ValueError('stop 不接受输出读取参数')
+        if cursor is not None and 'tail_lines' in args:
+            raise ValueError('cursor 与 tail_lines 不能同时指定')
+        automatic = bool(args.get('_command_auto_defaults')) and 'tail_lines' not in args
+        if cursor is None and not automatic and any(key in args for key in ('wait_seconds', 'encoding')):
+            raise ValueError('wait_seconds/encoding 仅用于 cursor 模式')
+        wait_seconds = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=30)
         if action == "stop" and "tail_lines" in args:
             raise ValueError("stop 不接受 tail_lines；请在 poll_command 中使用")
         if not isinstance(tail_lines, int) or isinstance(tail_lines, bool) or not 1 <= tail_lines <= 200:
             raise ValueError("tail_lines 必须是 1-200 之间的整数")
+        if automatic and action == 'poll':
+            from .command_reads import read
+            return read(str(args.get('job_id') or '').strip(), str(args.get('_session_id') or ''),
+                        str(args.get('_command_owner_agent') or 'main'), cursor=cursor, wait_seconds=wait_seconds,
+                        encoding=string_arg(args, 'encoding', max_length=64) if 'encoding' in args else None,
+                        max_chars=max(512, min(12000, int(args.get('_max_chars') or 12000))))
         return _command_job_action(action, str(args.get("job_id") or "").strip(),
                                    str(args.get("_session_id") or ""), tail_lines=tail_lines,
-                                   max_chars=max(512, min(12000, int(args.get("_max_chars") or 12000))))
+                                   max_chars=max(512, min(12000, int(args.get("_max_chars") or 12000))),
+                                   cursor=cursor, wait_seconds=wait_seconds, encoding=string_arg(args, 'encoding'))
     if action != "run":
         raise ValueError("action 仅支持 run、poll、stop")
     if "job_id" in args:
         raise ValueError("run 不接受 job_id；请使用 poll_command 或 stop_command")
     if "tail_lines" in args:
         raise ValueError("run 不接受 tail_lines；请在 poll_command 中使用")
+    if any(key in args for key in ('cursor', 'wait_seconds', 'encoding')):
+        raise ValueError('输出读取参数请在 poll_command 中使用')
+    if any(key in args for key in ('chars', 'eof', 'request_id')):
+        raise ValueError('输入参数请在 write_stdin 中使用')
+    yield_time = int_arg(args, 'yield_time_ms', 1000, maximum=30000) if 'yield_time_ms' in args else None
+    tty = _optional_bool(args, 'tty')
+    interactive = _optional_bool(args, 'interactive') or tty
+    if interactive:
+        if _optional_bool(args, 'background'):
+            raise ValueError('interactive/tty 与 background=true 不能同时指定')
+        if yield_time is None:
+            yield_time = 1000
+    if yield_time is not None and _optional_bool(args, 'background'):
+        raise ValueError('yield_time_ms 与 background=true 不能同时指定')
     return _run_command_impl(
         args.get("command"),
         args.get("shell") or args.get("_default_shell") or "auto",
@@ -4944,6 +4787,9 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         args.get("_max_chars"),
         bool(args.get("_structured_output")),
         str(args.get("_session_id") or ""),
+        yield_time,
+        str(args.get('_command_owner_agent') or 'main'),
+        interactive, tty, bool(args.get('_command_auto_defaults')),
     )
 
 
@@ -4997,13 +4843,24 @@ def try_execute_builtin_command_tool(
     if tool_name not in COMMAND_TOOL_NAMES:
         return None
     try:
-        args = tool_args if isinstance(tool_args, dict) else {}
-        if tool_name != RUN_COMMAND_NAME:
-            if "action" in args or any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background")):
-                raise ValueError(f"{tool_name} 只接受 job_id")
-            args = {**args, "action": "poll" if tool_name == POLL_COMMAND_NAME else "stop"}
-        result = execute_run_command({**args, "_structured_output": True})
-        return result if isinstance(result, dict) else _structured_command_result(result)
+        args = {**(tool_args if isinstance(tool_args, dict) else {}), '_command_auto_defaults': True}
+        if tool_name == WRITE_STDIN_NAME:
+            result = execute_write_stdin(args)
+        else:
+            if tool_name != RUN_COMMAND_NAME:
+                if "action" in args or any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty")):
+                    raise ValueError(f"{tool_name} 只接受 job_id 及相应的输出读取参数")
+                args = {**args, "action": "poll" if tool_name == POLL_COMMAND_NAME else "stop"}
+            result = execute_run_command({**args, "_structured_output": True})
+            result = result if isinstance(result, dict) else _structured_command_result(result)
+            if tool_name == RUN_COMMAND_NAME:
+                from .command_reads import seed
+                seed(result, str(args.get('_session_id') or ''), str(args.get('_command_owner_agent') or 'main'))
+        if result.get('job_id') and (result.get('status') == 'running' or result.get('has_more')):
+            result['next_call'] = {'tool': POLL_COMMAND_NAME, 'arguments': {'job_id': result['job_id']}}
+        for key in ('command', 'session_id', 'created_at', 'can_stop'):
+            result.pop(key, None)
+        return result
     except Exception as exc:
         result = {"success": False, "error": str(exc), "tool": tool_name}
         if isinstance(exc, TimeoutError):

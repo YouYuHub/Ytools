@@ -145,6 +145,171 @@ class ChatRouterTests(unittest.TestCase):
                 self.assertEqual(len(captured), 1)
 
         asyncio.run(run())
+        chat_router._MANUAL_COMPACTION_JOBS.pop("manual_router_test", None)
+
+    def test_manual_compaction_survives_consumer_disconnect_and_reattach(self):
+        """SSE 断开不再取消后台压缩：任务继续执行，attach 可收看剩余进度。"""
+        class ManagerStub:
+            def __init__(self):
+                self.events = []
+
+            async def get_context_token_stats(self, **_kwargs):
+                return {"request_context_tokens": 5000, "messages_tokens": 5000}
+
+            async def get_file_text(self):
+                return ""
+
+            async def get_session_meta(self):
+                return {"usage": {}}
+
+            async def add_context_compaction_event(self, payload):
+                self.events.append(payload)
+
+        manager = ManagerStub()
+
+        async def get_manager(_session_id):
+            return manager
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_compact(_manager, _request, event_emitter=None, **_kwargs):
+            started.set()
+            await event_emitter({"event": "context_compaction", "scope": "session",
+                                 "phase": "start", "context_summary": "preview"})
+            await release.wait()
+            await event_emitter({"event": "context_compaction", "scope": "session",
+                                 "phase": "done", "summary_text": "final"})
+            return 2
+
+        async def run():
+            session = "manual_reattach_test"
+            chat_router._MANUAL_COMPACTION_JOBS.pop(session, None)
+            try:
+                with patch.object(chat_router, "get_chat_memory_manager", get_manager), \
+                        patch.object(chat_router, "load_context_compaction_settings", return_value=_settings()), \
+                        patch.object(chat_router, "resolve_summary_total_budget", return_value=1234), \
+                        patch.object(chat_router, "compact_session_history_if_needed", fake_compact):
+                    first = await chat_router.compact_chat_context_manual(session_id=session, stream=True)
+                    iterator = first.body_iterator.__aiter__()
+                    await started.wait()
+                    # 读取到 start 帧后模拟刷新断开：关闭消费端，不取消后台任务
+                    # （首帧可能是 task_usage 预算事件，跳过直到 start）
+                    first_chunk = ""
+                    for _ in range(5):
+                        first_chunk = await iterator.__anext__()
+                        if '"phase": "start"' in first_chunk or '"phase":"start"' in first_chunk:
+                            break
+                    self.assertIn("context_compaction", first_chunk)
+                    if hasattr(iterator, "aclose"):
+                        await iterator.aclose()
+                    # 后台任务仍在运行（未被取消），状态接口可见
+                    status = await chat_router.manual_compaction_status(session_id=session)
+                    self.assertIn('"running":true', status.body.decode("utf-8"))
+                    # 新建压缩应被拒绝（409），附接应成功
+                    with self.assertRaises(HTTPException) as ctx:
+                        await chat_router.compact_chat_context_manual(session_id=session, stream=True)
+                    self.assertEqual(ctx.exception.status_code, 409)
+                    second = await chat_router.compact_chat_context_manual(
+                        session_id=session, stream=True, attach=True)
+                    # 放行后台任务，附接端应收到 done + 结果帧
+                    release.set()
+                    frames = []
+                    async for chunk in second.body_iterator:
+                        frames.append(chunk)
+                    joined = "".join(frames)
+                    self.assertIn('"phase": "done"', joined)
+                    self.assertIn("compaction_manual_result", joined)
+                    self.assertIn('"compressed_rounds": 2', joined)
+                    # 任务完成后状态恢复空闲
+                    status = await chat_router.manual_compaction_status(session_id=session)
+                    self.assertIn('"running":false', status.body.decode("utf-8"))
+            finally:
+                release.set()
+                job = chat_router._MANUAL_COMPACTION_JOBS.pop(session, None)
+                if job and job.get("task") and not job["task"].done():
+                    job["task"].cancel()
+                    try:
+                        await job["task"]
+                    except Exception:
+                        pass
+
+        asyncio.run(run())
+
+    def test_manual_compaction_stop_cancels_running_task(self):
+        """显式停止取消后台任务并补写 aborted；无任务时返回 stopped=false。"""
+        class ManagerStub:
+            def __init__(self):
+                self.events = []
+
+            async def get_context_token_stats(self, **_kwargs):
+                return {"request_context_tokens": 5000, "messages_tokens": 5000}
+
+            async def get_file_text(self):
+                return ""
+
+            async def get_session_meta(self):
+                return {"usage": {}}
+
+            async def add_context_compaction_event(self, payload):
+                self.events.append(payload)
+
+        manager = ManagerStub()
+
+        async def get_manager(_session_id):
+            return manager
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_compact(_manager, _request, event_emitter=None, **_kwargs):
+            started.set()
+            await event_emitter({"event": "context_compaction", "scope": "session",
+                                 "phase": "start"})
+            await release.wait()
+            return 0
+
+        async def run():
+            session = "manual_stop_test"
+            chat_router._MANUAL_COMPACTION_JOBS.pop(session, None)
+            try:
+                with patch.object(chat_router, "get_chat_memory_manager", get_manager), \
+                        patch.object(chat_router, "load_context_compaction_settings", return_value=_settings()), \
+                        patch.object(chat_router, "resolve_summary_total_budget", return_value=1234), \
+                        patch.object(chat_router, "compact_session_history_if_needed", fake_compact):
+                    # 无任务时停止返回 false
+                    idle = await chat_router.stop_manual_compaction(session_id=session)
+                    self.assertIn('"stopped":false', idle.body.decode("utf-8"))
+                    # 启动任务后停止
+                    response = await chat_router.compact_chat_context_manual(session_id=session, stream=True)
+                    iterator = response.body_iterator.__aiter__()
+                    await started.wait()
+                    await iterator.__anext__()
+                    stopped = await chat_router.stop_manual_compaction(session_id=session)
+                    self.assertIn('"stopped":true', stopped.body.decode("utf-8"))
+                    release.set()
+                    # 消费端应正常结束（sentinel + 结果帧 + DONE），不抛异常
+                    frames = []
+                    try:
+                        async for chunk in response.body_iterator:
+                            frames.append(chunk)
+                    except Exception as exc:
+                        self.fail(f"停止后消费端不应抛异常：{exc}")
+                    self.assertTrue(any("compaction_manual_result" in f for f in frames))
+                    self.assertTrue(any("[DONE]" in f for f in frames))
+                    # 后台补写了 aborted 闭合 start
+                    self.assertTrue(any(e.get("phase") == "aborted" for e in manager.events))
+            finally:
+                release.set()
+                job = chat_router._MANUAL_COMPACTION_JOBS.pop(session, None)
+                if job and job.get("task") and not job["task"].done():
+                    job["task"].cancel()
+                    try:
+                        await job["task"]
+                    except Exception:
+                        pass
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

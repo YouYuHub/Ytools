@@ -52,7 +52,7 @@
   function noteSessionChanged() { if (syncScope()) requestListRefresh(); }
   function noteToolResult(sessionId, name) {
     if (!sessionId || sessionId !== currentSession()) return;
-    if (name === "run_command" || name === "poll_command" || name === "stop_command") return requestListRefresh();
+    if (["run_command", "poll_command", "stop_command", "write_stdin"].includes(name)) return requestListRefresh();
   }
 
   function element(tag, className, text) {

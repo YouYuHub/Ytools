@@ -8,7 +8,11 @@ pydantic
 jsonschema
 
 # Interruptible regex matching for file and web searches
-regex>=2026.9.29
+regex
+# Scoped .gitignore matching
+pathspec
+# Windows interactive pseudo terminal; POSIX uses the standard library
+pywinpty ; sys_platform == 'win32'
 
 # MCP (Model Context Protocol); optional for general use, required for MCP features
 mcp

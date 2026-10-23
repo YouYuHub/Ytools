@@ -1,3 +1,5 @@
+@keyframes session-activity-spin { to { transform: rotate(360deg); } }
+
 // 侧边栏：窄图标栏（折叠态）+ 完整面板（展开态）
 //
 // 嵌套约定：组件内部按 DOM 层级嵌套；.icon-btn 为顶栏/弹窗共用的全局类，
@@ -544,7 +546,7 @@ body.sidebar-resizing {
       display: flex;
       align-items: center;
       width: 100%;
-      min-height: 42px;
+      min-height: 38px;
       padding: 0 4px;
       border-radius: var(--radius-sm);
       font-size: 14px;
@@ -559,21 +561,17 @@ body.sidebar-resizing {
 
       &.active {
         background: var(--bg-active);
+        // 选中态：1px 四边细环 + 柔阴影，替代原来的左侧 2px 色条
+        box-shadow: inset 0 0 0 1px var(--border-strong), var(--shadow-soft);
       }
 
-      // 选中项：默认 --bg-active 在两种主题下都偏淡，这里按主题加深/提亮，并给文字加浅粉色
-      html[data-theme="light"] &.active {
-        background: rgba(0, 0, 0, 0.12);
-        color: #e875a5;
-      }
-
-      html[data-theme="dark"] &.active {
-        background: rgba(255, 255, 255, 0.15);
-        color: #f7a8c4;
+      &.active .session-select {
+        color: var(--tool-icon-pink);
       }
 
       // 悬停 / 菜单打开时显示三点操作按钮
       &:hover .session-actions,
+      &:focus-within .session-actions,
       &.menu-open .session-actions {
         display: flex;
       }
@@ -585,7 +583,7 @@ body.sidebar-resizing {
       min-width: 0;
       flex: 1;
       align-self: stretch;
-      padding: 9px 6px;
+      padding: 7px 6px;
       text-align: left;
     }
 
@@ -647,6 +645,22 @@ body.sidebar-resizing {
           will-change: transform;
         }
       }
+    }
+
+    .session-activity {
+      width: 14px;
+      height: 14px;
+      margin-left: 8px;
+      flex: 0 0 auto;
+      border: 1.5px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      color: var(--text-secondary);
+      animation: session-activity-spin .9s linear infinite;
+      &[hidden] { display: none; }
+      &[data-kind="waiting"] { animation: none; border-style: double; border-width: 4px; border-right-color: currentColor; }
+      &[data-kind="uncertain"] { animation: none; border-style: dashed; border-right-color: currentColor; }
+      @media (prefers-reduced-motion: reduce) { animation: none; }
     }
 
     .session-actions {

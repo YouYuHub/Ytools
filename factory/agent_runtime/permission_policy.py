@@ -5,10 +5,10 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
-FILE_FIELDS = {"read_file": "path", "write_file": "path", "edit_file": "path", "search_files": "dir_path"}
+FILE_FIELDS = {"read_file": "path", "write_file": "path", "edit_file": "path", "search_files": "dir_path", "list_files": "dir_path"}
 # 旧参数名兼容：JSONL 旧历史/重放仍用 full_file_name，规划时迁移到新名
 LEGACY_FILE_FIELDS = {"read_file": "full_file_name", "write_file": "full_file_name", "edit_file": "full_file_name"}
-LOCAL_TOOLS = {*FILE_FIELDS, "read_media", "read_document", "run_command", "poll_command", "stop_command", "todo_write", "ask_user", "sub_agent", "over_task"}
+LOCAL_TOOLS = {*FILE_FIELDS, "apply_patch", "read_media", "read_document", "run_command", "poll_command", "stop_command", "write_stdin", "todo_write", "ask_user", "sub_agent", "over_task"}
 APP_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -56,6 +56,9 @@ def plan_tool(name, args, context, *, server=None, original_name=None):
     reason = ""
     if is_mcp:
         reason = "mcp_call"
+    elif name == 'write_stdin':
+        if args.get('chars') or args.get('eof'):
+            reason = 'terminal_input'
     elif name == "run_command" and str(args.get("action") or "run").strip().lower() == "run":
         reason = "command_execution"
         args["action"] = "run"
@@ -63,13 +66,16 @@ def plan_tool(name, args, context, *, server=None, original_name=None):
         paths.append(args["work_dir"])
         from factory.agent_runtime.builtin_tools import _resolve_shell
         args["shell"] = _resolve_shell(args.get("shell") or "auto", os.name == "nt")[1]
+    elif name == 'apply_patch':
+        from .context_patch import parse
+        paths.extend(resolve_path(op['path'], root) for op in parse(args.get('patch')))
     elif name in FILE_FIELDS:
         field = FILE_FIELDS[name]
         # 旧名迁移：旧调用用 full_file_name，新 schema 用 path；缺新名时从旧名取值
         legacy = LEGACY_FILE_FIELDS.get(name)
         if legacy and not args.get(field) and args.get(legacy):
             args[field] = args.pop(legacy)
-        if not args.get(field) and name != "search_files":
+        if not args.get(field) and name not in {"search_files", "list_files"}:
             raise ValueError(field + " 不能为空")
         args[field] = resolve_path(args.get(field), root)
         paths.append(args[field])
@@ -110,6 +116,11 @@ def plan_tool(name, args, context, *, server=None, original_name=None):
         reason = reason or "external_resource"
     value = {"tool": name, "args": args, "paths": paths, "sources": sources, "root": root,
              "reason": reason, "server": server, "original_name": original_name or name}
+    if name == 'write_stdin' and not is_mcp:
+        from .command_jobs import read_job
+        from .command_input import identity
+        _, meta = read_job(args.get('job_id') or '', context['session'])
+        value['terminal_identity'] = identity(meta)
     value["server_fingerprint"] = server_fingerprint(server)
     value["digest"] = fingerprint(value)
     value["needs_approval"] = context["mode"] == "ask" and bool(reason)

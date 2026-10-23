@@ -25,7 +25,9 @@ def payload(a, decision="approve"):
 @pytest.mark.parametrize("restart", [False, True])
 def test_http_confirmation_returns_real_powershell_result_once(environment, monkeypatch, restart):
     command = 'Get-Date -Format "yyyy年MM月dd日 HH:mm:ss dddd"'
-    calls = configure_model(monkeypatch, {"command": command, "shell": "powershell"})
+    # This approval test expects one completed invocation; minimal short-wait and
+    # subsequent polls are exercised by test_command_leases.
+    calls = configure_model(monkeypatch, {"command": command, "shell": "powershell", "yield_time_ms": 30000})
     monkeypatch.setattr(cf, "_generation_use_worker", lambda: False)
     monkeypatch.setattr(cf, "_SESSION_STREAMS", {})
 
@@ -54,7 +56,9 @@ def test_http_confirmation_returns_real_powershell_result_once(environment, monk
         results = [e for e in rounds[0]["events"] if e.get("role") == "tool"]
         assert len(results) == 1
         result = json.loads(results[0]["result"])
-        assert result["exit_code"] == 0 and "年" in result["stdout"]
+        assert result['status'] == 'completed' and result['job_id']
+        assert result["exit_code"] == 0 and "年" in result["output"]
+        assert "年" not in result['message']
         assert len(calls) == 2 and store.task(a["task"])["state"] == "completed"
     asyncio.run(run())
 

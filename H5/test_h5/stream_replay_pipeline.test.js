@@ -76,9 +76,9 @@ function queryAll(root, sel) {
 }
 
 function harness() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/stream_pipeline.js'), 'utf8');
   const start = source.indexOf('  function createStreamPipeline(');
-  const end = source.indexOf('\n  async function send(', start);
+  const end = source.indexOf('\n  App.createStreamPipeline =', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;
   const chatInner = makeNode('div', 'chat-inner');
   const msg = makeNode('div', 'msg');
@@ -154,6 +154,19 @@ test('续答的实时容器被尾部窗口重建移除后，下一帧恢复原�
   assert.equal(h.chatInner.children[0],h.activeStream.userNode);
   assert.equal(h.chatInner.children[1],h.msg);
   assert.equal(h.toolsIn(h.chatInner).length,1);
+});
+
+for (const detached of [false,true]) test('实时帧恢复尾部节点的可见性及提问气泡：detached='+detached, () => {
+  const h = harness(); h.state.activeStream = h.activeStream;
+  const user = h.activeStream.userNode = makeNode('div','msg-user history-live-hidden','最新提问');
+  if (!detached) h.chatInner.insertBefore(user,h.msg);
+  h.msg.classList.add('history-live-hidden');
+  h.context.App.getHistoryWindow = () => ({records:[1,2,3],end:3});
+  h.send({content:'实时答案'});
+  assert.equal(user.parentNode,h.chatInner);
+  assert.equal(user.classList.contains('history-live-hidden'),false);
+  assert.equal(h.msg.classList.contains('history-live-hidden'),false);
+  assert.equal(h.chatInner.children[0],user);
 });
 
 for (const reason of ['other session','detached','superseded','reading history']) test('实时容器恢复不打断浏览状态：'+reason, () => {

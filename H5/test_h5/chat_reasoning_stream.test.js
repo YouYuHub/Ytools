@@ -5,9 +5,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 function pipeline() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/stream_pipeline.js'), 'utf8');
   const start = source.indexOf('  function createStreamPipeline(');
-  const end = source.indexOf('\n  async function send(', start);
+  const end = source.indexOf('\n  App.createStreamPipeline =', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;
   const root = { children: [], appendChild(node) {
     this.children = this.children.filter(n => n !== node); this.children.push(node);

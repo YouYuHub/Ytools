@@ -138,7 +138,7 @@ def guard_path(path, *, search=False):
     plan = current.active_plan.get()
     if not allowed and plan:
         allowed = plan["needs_approval"] and (target in plan["paths"] or (
-            plan["tool"] == "search_files" and not protected(target)
+            plan["tool"] in {"search_files", "list_files"} and not protected(target)
             and any(inside(target, root) for root in plan["paths"])))
     if target in current.media_grants:
         allowed = True
@@ -347,6 +347,9 @@ class PermissionRuntime:
             db.execute("UPDATE approvals SET state='completed' WHERE task=? AND agent=? AND call_id=? AND epoch=?", (self.id, agent, call_id, self.epoch))
 
     def close(self, state):
+        if state != 'suspended':
+            from .command_leases import cancel_owned
+            cancel_owned(self.id)
         if state in {"failed", "cancelled"}:
             try:
                 close_pending_native(self.id, self.session, "任务异常结束" if state == "failed" else "用户停止任务")
@@ -358,6 +361,8 @@ class PermissionRuntime:
 
     async def retire_agent(self, agent):
         """A finished/stopped child cannot retain actionable tool approvals."""
+        from .command_leases import cancel_owned
+        await asyncio.to_thread(cancel_owned, self.id, agent)
         with store.database() as db:
             ids = [row[0] for row in db.execute(
                 "SELECT id FROM approvals WHERE task=? AND agent=? AND epoch=? AND state IN ('pending','approved','denied')",

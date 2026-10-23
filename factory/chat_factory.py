@@ -56,6 +56,7 @@ from factory.agent_runtime.builtin_tools import (
     ASK_ANSWER_PREFIX,
     ASK_USER_TOOL_NAME,
     EDIT_FILE_NAME,
+    APPLY_PATCH_NAME,
     READ_FILE_NAME,
     RUN_COMMAND_NAME,
     COMMAND_TOOL_NAMES,
@@ -217,29 +218,9 @@ async def _record_file_history(
     raw_result: Any,
     round_number: int,
 ) -> None:
-    """V2 文件历史版本链消费点：摘取 _file_history 入链数据并落链。
-
-    非文件工具 / 数据缺失 / 入链失败一律静默跳过（版本链失败不影响对话主流程，
-    前端仍有 V1 的 file_diff 展示兜底）。
-    """
-    payload = None
-    if isinstance(raw_result, dict):
-        payload = raw_result.get("_file_history")
-    if not isinstance(payload, dict) or not payload.get("path"):
-        return
-    try:
-        _file_history.record_change(
-            session_id,
-            path=str(payload["path"]),
-            display_path=str(payload.get("display_path") or payload["path"]),
-            old_text=payload.get("old_text"),
-            new_text=payload.get("new_text"),
-            tool=tool_name,
-            round_number=int(round_number or 0),
-            encoding=str(payload.get("encoding") or "utf-8"),
-        )
-    except Exception as record_error:
-        logger.warning(f"文件版本链记录失败（不影响对话）: {record_error}")
+    """Record before formatting/caching so UI, model and replay see the same status."""
+    from factory.agent_runtime.file_history_result import record_result
+    await asyncio.to_thread(record_result, raw_result, session_id, tool_name, round_number)
 
 
 def _merge_usage_values(total: dict[str, Any], delta: dict[str, Any]) -> None:
@@ -882,6 +863,11 @@ def is_chat_stream_running(session_id: str) -> bool:
     return bool(stream and stream.is_running())
 
 
+def get_running_chat_session_ids() -> list[str]:
+    """Snapshot active inline/dispatch streams; never load history or start tasks."""
+    return [sid for sid, stream in list(_SESSION_STREAMS.items()) if stream.is_running()]
+
+
 async def _run_chat_generation(
     tool_request: ChatLLMRequest,
     stream: _SessionStream,
@@ -1095,6 +1081,7 @@ async def _run_chat_generation(
         include_ask_user=ask_requested,
         include_write_file=write_file_requested,
         include_edit_file=edit_file_requested,
+        include_apply_patch=APPLY_PATCH_NAME in (requested_names or []),
         include_read_file=read_file_requested,
         include_search_files=search_files_requested,
         include_run_command=run_command_requested,
@@ -2693,15 +2680,15 @@ async def _run_chat_generation(
                             native_doc_pending_parts.append(raw_result["native"]["part"])
                         if tool_name == TODO_TOOL_NAME and isinstance(raw_result.get("todos"), list):
                             await session_chat_memory.update_todos(raw_result["todos"])
-                    permission_runtime.finish_call("main", tool_call_id, raw_result)
-                    ret = _format_tool_result(raw_result)
-                    file_diff = raw_result.get("_file_diff") if isinstance(raw_result, dict) else None
                     # V2 版本链：摘取 _file_history 入链数据（写前/写后全文）落链，
                     # 失败静默（前端展示仍有 file_diff 兜底）；round 号为当前进行中的轮次号
                     if isinstance(raw_result, dict) and "_file_history" in raw_result and not tool_result.get("_permission_cached"):
                         await _record_file_history(
                             session_id, tool_name, raw_result, current_round_number
                         )
+                    permission_runtime.finish_call("main", tool_call_id, raw_result)
+                    ret = _format_tool_result(raw_result)
+                    file_diff = raw_result.get("_file_diff") if isinstance(raw_result, dict) else None
                     # 超大结果拒绝：超过阈值时结果不进入模型上下文，
                     # 改为写入"输出过长"反馈让模型重新考虑工具使用；
                     # 原始结果只保留截断预览到 JSONL，连续超长达到上限后终止任务

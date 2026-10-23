@@ -229,7 +229,7 @@ class ChatRuntimeTests(unittest.TestCase):
             await manager.update_current_round_compaction("已完成目录扫描。", 1)
             checkpoint_rows = [
                 json.loads(line)
-                for line in (await manager.get_file_text()).splitlines()
+                for line in (await manager.get_file_text()).split("\n")
                 if line.strip()
             ]
             await manager.add_chat_history({"role": "assistant", "done": "[DONE]"})

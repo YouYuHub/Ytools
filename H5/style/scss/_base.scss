@@ -40,6 +40,12 @@ a {
   text-decoration: none;
 }
 
+// 保留组件自己的焦点样式；通用按钮和可聚焦节点也能看清键盘位置。
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
 svg {
   display: block;
   flex-shrink: 0;

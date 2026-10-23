@@ -33,6 +33,22 @@ test('settings popup includes archives/theme, supports keyboard, and stays indep
   assert.equal(x.$('#sidebarSettingsMenu').hidden,true);assert.equal(x.w.document.activeElement,anchor);
 });
 
+test('settings popup toggles session status visibility and label follows external changes',t=>{
+  const x=setup();t.after(x.close);
+  let visible=true;
+  x.w.App.taskStatus={isStatusVisible:()=>visible,toggleStatusVisible:()=>{visible=!visible;return visible;}};
+  const anchor=x.$('#profileCard');
+  x.w.App.sidebarSettings.toggle(anchor);
+  assert.equal(x.button('隐藏会话状态',x.$('#sidebarSettingsMenu')).textContent,'隐藏会话状态');
+  x.button('隐藏会话状态',x.$('#sidebarSettingsMenu')).click();
+  assert.equal(visible,false);assert.match(x.notices.at(-1),/已隐藏/);
+  x.w.App.sidebarSettings.toggle(anchor);
+  assert.equal(x.button('显示会话状态',x.$('#sidebarSettingsMenu')).textContent,'显示会话状态');
+  visible=true;
+  x.w.App.sidebarSettings.toggle(anchor);x.w.App.sidebarSettings.toggle(anchor);
+  assert.equal(x.button('隐藏会话状态',x.$('#sidebarSettingsMenu')).textContent,'隐藏会话状态');
+});
+
 test('archive browsing renders titles as text, opens existing history and restores focus/inert state',async t=>{
   const x=setup();t.after(x.close);x.$('#profileCard').focus();await x.open();
   assert.equal(x.$('#archiveList').children.length,2);assert.equal(x.$('#archiveList img'),null);

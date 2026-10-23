@@ -1,0 +1,19 @@
+.task-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+  margin: 0 4px 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  &[hidden] { display: none; }
+  &::before { content: ""; width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+  &[data-tone="active"]::before { color: var(--text); }
+  &[data-tone="error"] { color: var(--danger, #db5c64); }
+  .task-status-label { flex: 0 0 auto; }
+  .task-status-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { flex: 0 0 auto; border: 0; background: transparent; color: var(--text); text-decoration: underline; cursor: pointer; font: inherit; padding: 2px 4px; }
+  button[hidden] { display: none; }
+  button:disabled { cursor: wait; opacity: .6; }
+}

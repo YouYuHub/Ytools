@@ -20,3 +20,6 @@ def test_frontend_asset_hashes_and_script_order():
     bottom = html.split("</head>", 1)[1]
     assert all("defer" in tag for tag in re.findall(r'<script\b[^>]*></script>', bottom))
     assert html.index("js/vendor/dompurify/") < html.index("js/markdown.js")
+    status_scripts = ["js/app/core.js", "js/task_state.js", "js/app/session_activity.js", "js/app/task_status.js", "js/app/stream_pipeline.js", "js/app/chat.js", "js/app.js"]
+    positions = [html.index(path + "?v=") for path in status_scripts]
+    assert positions == sorted(positions)

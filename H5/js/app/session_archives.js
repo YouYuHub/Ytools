@@ -22,10 +22,27 @@
   menuItem("归档会话", "M3 3h18v5H3zM5 8v13h14V8M9 12h6", open);
   menuItem("主题", "M12 3a9 9 0 1 0 9 9c0-2-2-3-4-2s-4 0-3-2 0-5-2-5Z", function () { App.openThemePicker(); });
   menuItem("聊天设置", "M4 4v16M12 4v16M20 4v16M1 8h6M9 16h6M17 10h6", function () { App.openChatSettings(); });
+  function statusToggleLabel() {
+    const visible = !App.taskStatus || !App.taskStatus.isStatusVisible || App.taskStatus.isStatusVisible();
+    return visible ? "隐藏会话状态" : "显示会话状态";
+  }
+  const statusToggleItem = menuItem("隐藏会话状态", "M3 12h4l3 8 4-16 3 8h4", function () {
+    if (App.taskStatus && App.taskStatus.toggleStatusVisible) {
+      const visible = App.taskStatus.toggleStatusVisible();
+      toast(visible ? "已显示会话状态" : "已隐藏会话状态");
+    }
+    syncStatusToggleItem();
+  });
+  function syncStatusToggleItem() {
+    const label = statusToggleItem.querySelector(".menu-item-label");
+    if (label) label.textContent = statusToggleLabel();
+  }
+  syncStatusToggleItem();
   anchors.forEach(function (anchor) { anchor.setAttribute("aria-haspopup", "menu"); anchor.setAttribute("aria-controls", menu.id); anchor.setAttribute("aria-expanded", "false"); });
   App.sidebarSettings = { toggle: function (anchor) {
     if (!menu.hidden && menuAnchor === anchor) { hideSettings(true); return; }
     hideSettings(false); App.closeMenus(); if (App.closeSessionMenus) App.closeSessionMenus();
+    syncStatusToggleItem();
     menuFocus = anchor; menuAnchor = anchor; menu.hidden = false; anchor.setAttribute("aria-expanded", "true");
     const rect = anchor.getBoundingClientRect(), bounds = menu.getBoundingClientRect();
     menu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - bounds.width - 8)) + "px";

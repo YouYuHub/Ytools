@@ -115,7 +115,7 @@ def test_slow_regex_returns_incomplete_result_within_budget(tmp_path):
 
 def test_search_counts_matches_without_storing_all_match_blocks(tmp_path):
     (tmp_path / "many.txt").write_text("needle\n" * 5000)
-    result = bt.execute_search_files({"dir_path": str(tmp_path), "pattern": "needle"})
+    result = bt.execute_search_files({"dir_path": str(tmp_path), "pattern": "needle", "count_total": True})
     assert result["total_matches"] == 5000
     assert result["displayed_matches"] < 5000
     assert result["output_truncated"]
@@ -250,7 +250,7 @@ def test_command_status_uses_actual_exit_code_not_directory_name(tmp_path, monke
     directory = tmp_path / "exit=7"
     directory.mkdir()
     monkeypatch.setattr(bt, "_run_command_foreground", lambda *_: (0, "ok", "", False, 0.1, None))
-    result = bt.try_execute_builtin_command_tool("run_command", {"command": "echo ok", "work_dir": str(directory)})
+    result = bt.execute_run_command({"command": "echo ok", "work_dir": str(directory), '_structured_output': True})
     assert result["status"] == "completed"
     assert result["exit_code"] == 0
 
@@ -265,7 +265,7 @@ def test_cancelled_foreground_command_terminates_child(tmp_path, monkeypatch):
         import shlex
         shell, command = "sh", shlex.join([sys.executable, "-u", "-c", code])
     async def run():
-        running = asyncio.create_task(run_sync_tool(bt.try_execute_builtin_command_tool, "run_command",
+        running = asyncio.create_task(run_sync_tool(bt.execute_run_command,
                                                     {"command": command, "shell": shell, "timeout_seconds": 30}))
         pid = None
         try:
@@ -300,8 +300,8 @@ def test_unsafe_http_paging_does_not_repeat_request():
 def test_powershell_cmdlet_failure_has_nonzero_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(bt, "_BG_LOG_DIR", tmp_path)
     monkeypatch.setattr(bt, "_run_command_foreground", bt._run_foreground_direct)
-    result = bt.try_execute_builtin_command_tool("run_command", {"command": "Write-Error 'audit expected failure'",
-                                                                 "shell": "powershell"})
+    result = bt.execute_run_command({"command": "Write-Error 'audit expected failure'",
+                                     "shell": "powershell", '_structured_output': True})
     assert result["exit_code"] != 0
     assert result["status"] == "failed"
 

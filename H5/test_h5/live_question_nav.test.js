@@ -57,6 +57,9 @@ for (const reused of [false, true]) test(`附接进行中的第三轮提问立�
   context.rebuildQnav();
   const start = chatSource.indexOf('  async function attachStreamSession(');
   const end = chatSource.indexOf('  /** 打开会话后', start);
+  // 附接收尾调用同文件的流中断确认与错误文案助手，一并载入。
+  const helperStart = chatSource.indexOf('  // 流错误的展示文案');
+  vm.runInContext(chatSource.slice(helperStart, chatSource.indexOf('  async function send(direct)', helperStart)), context);
   vm.runInContext(chatSource.slice(start, end), context);
   await context.attachStreamSession('session');
   assert.equal(checked, true);

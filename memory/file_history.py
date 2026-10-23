@@ -25,11 +25,14 @@ import json
 import os
 import re
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 # 自定义模块
 from util.timestamp_utils import now_str
+from util.file_lock import cross_process_lock
+from memory import file_snapshots
 
 try:
     # 同包内复用会话目录命名规则，保证 file_diffs 与 media/files 同居一个会话目录
@@ -42,8 +45,9 @@ except Exception:  # pragma: no cover - 独立测试环境兜底
 HISTORY_DIFF_ROOT = Path(__file__).resolve().parents[1] / "history_files" / "session_files"
 DIFF_DIRECTORY_NAME = "file_diffs"
 
-# 与 builtin_tools._build_file_diff 同口径的护栏（diff 展示层限制，快照同尺寸上限）
-_FILE_HISTORY_MAX_TEXT_CHARS = 256 * 1024   # 任一端全文超过 → 整条变更不入链
+# 逐行展示使用小预算；完整快照由 file_snapshots.MAX_BYTES 单独限制。
+_FILE_HISTORY_MAX_TEXT_CHARS = 256 * 1024   # 逐行 diff/编辑视图预算；更大文本使用压缩快照
+_FILE_HISTORY_MAX_VERSIONS = 512            # 自动记录上限；不自动删除可回退版本
 _FILE_HISTORY_MAX_DIFF_CHARS = 20000        # 单版本 diff 文本上限，超限截断
 _FILE_HISTORY_CONTEXT_LINES = 2             # hunk 上下文行数（difflib n=）
 _FILE_HISTORY_MAX_FULL_ROWS = 20000         # full_view 全文渲染行数上限（超出截断）
@@ -56,14 +60,34 @@ _VALID_ROLES = {"baseline", "tool", "user_edit", "hunk_undo", "rollback", "exter
 
 # 每会话一把进程内互斥锁：同进程 asyncio 单线程调度下防 sub_agent 并发写冲突
 _LOCKS: dict[str, Any] = {}
+_LOCK_DEPTH = threading.local()
 
 
+@contextmanager
 def _session_lock(session_id: str):
     normalized = _safe_session_id(session_id)
     lock = _LOCKS.get(normalized)
     if lock is None:
         lock = _LOCKS.setdefault(normalized, __import__("threading").RLock())
-    return lock
+    with lock:
+        depths = getattr(_LOCK_DEPTH, 'depths', None)
+        if depths is None:
+            depths = _LOCK_DEPTH.depths = {}
+        key = str(_root_dir(session_id).resolve())
+        if depths.get(key):
+            depths[key] += 1
+            try:
+                yield
+            finally:
+                depths[key] -= 1
+        else:
+            lock_path = HISTORY_DIFF_ROOT / '.file_history_locks' / (normalized + '.lock')
+            with cross_process_lock(lock_path):
+                depths[key] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(key,None)
 
 
 def _root_dir(session_id: str) -> Path:
@@ -77,6 +101,8 @@ def file_key(path: str) -> str:
 
 
 def _key_dir(session_id: str, key: str) -> Path:
+    if not re.fullmatch(r'[a-f0-9]{8}', key):
+        raise ValueError('文件历史 key 无效')
     return _root_dir(session_id) / key
 
 
@@ -85,7 +111,11 @@ def _meta_path(session_id: str, key: str) -> Path:
 
 
 def _version_file(meta: dict[str, Any], version: dict[str, Any]) -> Path:
-    return _key_dir(meta["session_id"], meta["key"]) / version["file"]
+    root = _key_dir(meta["session_id"], meta["key"]).resolve()
+    path = (root / version['file']).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError('快照路径无效')
+    return path
 
 
 # ---------------- 磁盘原语：原子写 JSON / 快照文本 ----------------
@@ -108,17 +138,61 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _write_snapshot(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as fp:
-        fp.write(text)
+def _write_snapshot(path: Path, text: str) -> int:
+    return file_snapshots.write(path,text)
 
 
 def _read_snapshot(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
+    return file_snapshots.read(path)
+
+
+def _read_version(meta, version):
+    path = _version_file(meta,version)
+    raw = file_snapshots.read(path,normalize_legacy=False)
+    if hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16] != version['hash']:
+        raise ValueError('历史快照校验失败，当前文件未改动')
+    return raw if version.get('newline_exact') else raw.replace('\r\n','\n').replace('\r','\n')
+
+
+def _disk_state(meta, latest):
+    from factory.agent_runtime.builtin_tools import _file_version
+    target = Path(meta['path'])
+    stamp = _file_version(target)
+    if target.exists():
+        with target.open('rb') as handle:
+            raw = handle.read(file_snapshots.MAX_BYTES+1)
+        if len(raw)>file_snapshots.MAX_BYTES:
+            raise PermissionError('FILE_MODIFIED_EXTERNALLY：磁盘文件已变化，请先从磁盘刷新')
+        try:
+            text = raw.decode(latest.get('encoding') or 'utf-8')
+        except UnicodeError as exc:
+            raise PermissionError('FILE_MODIFIED_EXTERNALLY：磁盘编码已变化，已拒绝覆盖') from exc
+    else:
+        text = ''
+    if not latest.get('newline_exact'):
+        text = text.replace('\r\n','\n').replace('\r','\n')
+    if hashlib.sha256(text.encode('utf-8')).hexdigest()[:16] != latest['hash']:
+        raise PermissionError('FILE_MODIFIED_EXTERNALLY：磁盘文件已变化，请先从磁盘刷新')
+    if 'exists' in latest and target.exists() != latest['exists']:
+        raise PermissionError('FILE_MODIFIED_EXTERNALLY：文件存在状态已变化，请先从磁盘刷新')
+    return stamp
+
+
+def _write_target(meta, version, content, stamp):
+    from factory.agent_runtime.builtin_tools import _assert_file_version
+    from factory.agent_runtime.context_patch import _replace
+    target = Path(meta['path'])
+    _assert_file_version(target,stamp)
+    if not version.get('exists',content!=''):
+        target.unlink(missing_ok=True)
+        return True
+    if not version.get('newline_exact') and version.get('eol')=='CRLF':
+        content = content.replace('\r\n','\n').replace('\r','\n').replace('\n','\r\n')
+    data = content.encode(version.get('encoding') or 'utf-8')
+    target.parent.mkdir(parents=True,exist_ok=True)
+    _replace(target,data,target.stat().st_mode if target.exists() else 0o666,
+             create=not target.exists(),expected_version=stamp)
+    return False
 
 
 # ---------------- diff 计算（与 V1 _build_file_diff 同语义） ----------------
@@ -136,6 +210,24 @@ def _diff_stats(old_text: str, new_text: str, display: str) -> dict[str, Any]:
             "diff": "", "lines_added": 0, "lines_removed": 0,
             "diff_truncated": False, "diff_skipped": "unchanged",
         }
+    if max(len(old_text),len(new_text)) > _FILE_HISTORY_MAX_TEXT_CHARS:
+        # Count changed lines without allocating line arrays or quadratic alignment.
+        prefix = 0
+        size = min(len(old_text),len(new_text))
+        while prefix + 4096 <= size and old_text[prefix:prefix+4096] == new_text[prefix:prefix+4096]:
+            prefix += 4096
+        while prefix < size and old_text[prefix] == new_text[prefix]:
+            prefix += 1
+        suffix = 0
+        while suffix + 4096 <= size-prefix and old_text[len(old_text)-suffix-4096:len(old_text)-suffix] == new_text[len(new_text)-suffix-4096:len(new_text)-suffix]:
+            suffix += 4096
+        while suffix < size-prefix and old_text[-suffix-1] == new_text[-suffix-1]:
+            suffix += 1
+        old_end, new_end = len(old_text)-suffix, len(new_text)-suffix
+        removed = old_text.count('\n',prefix,old_end) + bool(old_end>prefix and old_text[old_end-1]!='\n')
+        added = new_text.count('\n',prefix,new_end) + bool(new_end>prefix and new_text[new_end-1]!='\n')
+        return dict(diff='大文件已保存完整快照；可回退到历史版本，暂不提供逐块编辑。',
+                    lines_added=int(added),lines_removed=int(removed),diff_truncated=True,diff_skipped='snapshot_only')
     diff_gen = difflib.unified_diff(
         _norm_lines(old_text),
         _norm_lines(new_text),
@@ -214,6 +306,8 @@ def _aligned_opcodes(baseline_text: str, current_text: str) -> list[dict[str, An
     """
     import difflib
 
+    if max(len(baseline_text),len(current_text)) > _FILE_HISTORY_MAX_TEXT_CHARS:
+        raise ValueError('大文件请使用完整版本回退，不支持逐块撤回或保留')
     old_lines = _norm_lines(baseline_text)
     new_lines = _norm_lines(current_text)
     hunks: list[dict[str, Any]] = []
@@ -277,6 +371,7 @@ def _refresh_index(meta: dict[str, Any]) -> None:
         "versions": len(meta.get("versions") or []),
         "added": total.get("lines_added", 0),
         "removed": total.get("lines_removed", 0),
+        "changed": bool(total.get("changed")),
         "updated_at": (meta.get("versions") or [{}])[-1].get("at", ""),
         "last_role": (meta.get("versions") or [{}])[-1].get("role", ""),
     }
@@ -286,7 +381,7 @@ def _refresh_index(meta: dict[str, Any]) -> None:
 def list_files(session_id: str, hide_clean: bool = False) -> list[dict[str, Any]]:
     """主页面文件变更列表：读 index.json（缺失时扫描各 meta 兜底重建）。
 
-    hide_clean=True 时隐藏"已全部保留/全部撤回"的文件（Total Diff 无行数变化），
+    hide_clean=True 时隐藏已无未决内容/存在状态变更的文件，
     前端统计面板只展示仍有未决变更的文件；其版本链留档仍在，可经删除接口清理。
     """
     with _session_lock(session_id):
@@ -306,7 +401,7 @@ def list_files(session_id: str, hide_clean: bool = False) -> list[dict[str, Any]
         if hide_clean:
             entries = [
                 item for item in entries
-                if int(item.get("added", 0)) != 0 or int(item.get("removed", 0)) != 0
+                if item.get("changed") or int(item.get("added", 0)) != 0 or int(item.get("removed", 0)) != 0
             ]
         return entries
 
@@ -344,6 +439,12 @@ def _append_version(
     file_name = f"g{gen}/v{v_number:03d}.txt"
     if role == "baseline":
         file_name = f"g{gen}/v{v_number:03d}_base.txt"
+    compressed = len(content_text)>_FILE_HISTORY_MAX_TEXT_CHARS or '\r' in content_text
+    if compressed:
+        file_name += '.gz'
+    reusable = next((item for item in reversed(versions) if item.get('hash') == content_hash),None)
+    if reusable is not None:
+        file_name = reusable['file']
 
     if prev_text is None:
         diff_info = {
@@ -365,6 +466,9 @@ def _append_version(
         "tool": tool,
         "eol": eol,
         "encoding": encoding,
+        "newline_exact": role not in {'hunk_undo','hunk_keep'},
+        "exists": latest.get('exists', content_text != '') if role == 'baseline' and latest else content_text != '',
+        "compression": 'gzip' if file_name.endswith('.gz') else 'none',
         "added": diff_info["lines_added"],
         "removed": diff_info["lines_removed"],
         "diff": diff_info["diff"],
@@ -375,8 +479,13 @@ def _append_version(
     }
     if extra:
         version.update(extra)
+    if reusable is None:
+        version['stored_bytes'] = _write_snapshot(_key_dir(meta["session_id"], meta["key"]) / file_name, content_text)
+    else:
+        _read_version(meta,reusable)
+        version['newline_exact'] = reusable.get('newline_exact',False)
+        version['stored_bytes'] = reusable.get('stored_bytes',0)
     versions.append(version)
-    _write_snapshot(_key_dir(meta["session_id"], meta["key"]) / file_name, content_text)
     meta["encoding"] = encoding
     meta["eol"] = eol
     return version
@@ -394,9 +503,12 @@ def _recompute_total(meta: dict[str, Any]) -> None:
             None,
         )
         if baseline is not None:
-            baseline_text = _read_snapshot(_version_file(meta, baseline))
-            latest_text = _read_snapshot(_version_file(meta, versions[-1]))
+            baseline_text = _read_version(meta, baseline)
+            latest_text = _read_version(meta, versions[-1])
             total = _diff_stats(baseline_text, latest_text, meta["display_path"])
+            latest = versions[-1]
+            total['changed'] = (baseline.get('hash') != latest.get('hash') or
+                baseline.get('exists', bool(baseline_text)) != latest.get('exists', bool(latest_text)))
     meta["total"] = total
 
 
@@ -411,6 +523,9 @@ def record_change(
     round_number: int = 0,
     encoding: str = "utf-8",
     eol: str = "LF",
+    old_exists: bool | None = None,
+    new_exists: bool | None = None,
+    old_encoding: str | None = None,
 ) -> dict[str, Any]:
     """一次文件写入入链（chat_factory / sub_agent 消费点调用）。
 
@@ -425,14 +540,31 @@ def record_change(
         meta = _load_meta(session_id, key)
         result: dict[str, Any] = {"key": key, "path": path, "recorded": False}
 
-        if old_text is None or new_text is None or (
-            len(old_text) > _FILE_HISTORY_MAX_TEXT_CHARS
-            or len(new_text) > _FILE_HISTORY_MAX_TEXT_CHARS
-        ):
+        if old_text is None or new_text is None or max(len(old_text.encode('utf-8')),len(new_text.encode('utf-8'))) > file_snapshots.MAX_BYTES:
             result["skipped"] = "file_too_large"
             return result
-        if old_text == new_text:
+        if old_text == new_text and (old_exists is None or new_exists is None or old_exists == new_exists):
             result["skipped"] = "unchanged"
+            return result
+        existing = (meta or {}).get('versions', [])
+        previous = existing[-1] if existing else None
+        old_hash = hashlib.sha256(old_text.encode('utf-8')).hexdigest()[:16]
+        external_changed = bool(previous and (previous.get('hash') != old_hash or
+            (old_exists is not None and previous.get('exists', bool(old_text)) != old_exists)))
+        required_versions = 1 + (1 if previous is None or external_changed else 0)
+        if len(existing) + required_versions > _FILE_HISTORY_MAX_VERSIONS:
+            result['skipped'] = 'history_version_limit'
+            return result
+        known = {item.get('hash') for item in (meta or {}).get('versions',[])}
+        additional = 0
+        for text in dict.fromkeys((old_text,new_text)):
+            digest = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+            if digest not in known:
+                additional += len(file_snapshots.encode(text,len(text)>_FILE_HISTORY_MAX_TEXT_CHARS or '\r' in text))
+        try:
+            file_snapshots.check_quota(_root_dir(session_id),additional)
+        except ValueError:
+            result['skipped'] = 'history_quota_exceeded'
             return result
 
         if meta is None:
@@ -453,19 +585,15 @@ def record_change(
         latest = (meta.get("versions") or [None])[-1]
         prev_text = old_text
         # 外部改动探测：工具读到的旧内容 ≠ 链上最新版本（用户在两次编辑之间手改）
-        if (
-            latest is not None and old_text
-            and latest.get("hash") != hashlib.sha256(
-                old_text.encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
-        ):
+        if external_changed:
             # 补记 external 版本：diff(最新版本 → 外部状态) 展示"用户改了什么"
             external = _append_version(
                 meta, old_text, role="external", tool=None,
                 round_number=int(round_number),
-                encoding=encoding, eol=eol,
-                prev_text=_read_snapshot(_version_file(meta, latest)),
+                encoding=old_encoding or encoding, eol=eol,
+                prev_text=_read_version(meta, latest),
                 force=True,
+                extra={'exists':old_exists if old_exists is not None else bool(old_text)},
             )
             if external is not None:
                 result["external_snapshot"] = external["v"]
@@ -474,8 +602,9 @@ def record_change(
             # 代基线：记录写前状态（文件已存在才有意义；新建文件记空串基线）
             _append_version(
                 meta, old_text, role="baseline", tool=None,
-                round_number=int(round_number), encoding=encoding, eol=eol,
+                round_number=int(round_number), encoding=old_encoding or encoding, eol=eol,
                 prev_text=None, force=True,
+                extra={'exists':old_exists if old_exists is not None else bool(old_text)},
             )
         else:
             prev_text = old_text
@@ -484,6 +613,8 @@ def record_change(
             meta, new_text, role="tool", tool=tool,
             round_number=int(round_number), encoding=encoding, eol=eol,
             prev_text=prev_text,
+            force=old_exists is not None and new_exists is not None and old_exists != new_exists,
+            extra={'exists':new_exists if new_exists is not None else bool(new_text)},
         )
         if version is None:
             result["skipped"] = "unchanged"
@@ -499,7 +630,7 @@ def record_change(
 
 # ---------------- 读接口 ----------------
 
-def read_content(session_id: str, key: str, v: int | None = None) -> dict[str, Any]:
+def read_content(session_id: str, key: str, v: int | None = None, offset=0, limit=256*1024) -> dict[str, Any]:
     with _session_lock(session_id):
         meta = _load_meta(session_id, key)
         if meta is None:
@@ -513,6 +644,9 @@ def read_content(session_id: str, key: str, v: int | None = None) -> dict[str, A
             version = next((item for item in versions if item["v"] == v), None)
             if version is None:
                 raise KeyError("版本不存在")
+        content = _read_snapshot(_version_file(meta,version))
+        if type(offset) is not int or type(limit) is not int or offset<0 or not 1<=limit<=1024*1024:
+            raise ValueError('offset/limit 无效')
         return {
             "key": key,
             "path": meta["path"],
@@ -527,7 +661,9 @@ def read_content(session_id: str, key: str, v: int | None = None) -> dict[str, A
             "encoding": version.get("encoding", "utf-8"),
             "eol": version.get("eol", "LF"),
             "kept": bool(meta.get("kept")),
-            "content": _read_snapshot(_version_file(meta, version)),
+            "content": content[offset:offset+limit],
+            "total_chars": len(content), "next_offset": min(len(content),offset+limit),
+            "has_more": offset+limit<len(content), "snapshot_only": len(content)>_FILE_HISTORY_MAX_TEXT_CHARS,
         }
 
 
@@ -586,12 +722,18 @@ def full_view(
             raise KeyError("无版本记录")
         current_gen = versions[-1]["gen"]
         baseline = next((item for item in versions if item["gen"] == current_gen), None)
-        latest_text = _read_snapshot(_version_file(meta, versions[-1]))
+        latest_text = _read_version(meta, versions[-1])
         baseline_text = (
-            _read_snapshot(_version_file(meta, baseline)) if baseline is not None else ""
+            _read_version(meta, baseline) if baseline is not None else ""
         )
 
         cap = int(max_rows) if max_rows else _FILE_HISTORY_MAX_FULL_ROWS
+        if max(len(baseline_text),len(latest_text)) > _FILE_HISTORY_MAX_TEXT_CHARS:
+            return dict(key=key,path=meta['path'],display_path=meta['display_path'],
+                        baseline_v=baseline['v'] if baseline else None,current_v=versions[-1]['v'],
+                        current_hash=versions[-1]['hash'],current_ends_with_nl=latest_text.endswith('\n'),
+                        kept=bool(meta.get('kept')),rows=[],hunks=[],rows_total=0,truncated=True,
+                        max_rows=cap,snapshot_only=True,**(meta.get('total') or {}))
         old_lines = _norm_lines(baseline_text)
         new_lines = _norm_lines(latest_text)
         rows: list[dict[str, Any]] = []
@@ -738,9 +880,10 @@ def hunk_undo(
         if baseline is None or baseline["v"] == versions[-1]["v"]:
             raise ValueError("当前代没有变更，无可撤回 hunk")
         _check_locked_target(meta, baseline)
+        stamp = _disk_state(meta, versions[-1])
 
-        baseline_text = _read_snapshot(_version_file(meta, baseline))
-        latest_text = _read_snapshot(_version_file(meta, versions[-1]))
+        baseline_text = _read_version(meta, baseline)
+        latest_text = _read_version(meta, versions[-1])
         hunks = _aligned_opcodes(baseline_text, latest_text)
         if not hunks:
             raise ValueError("当前内容与基线一致，无可撤回 hunk")
@@ -758,23 +901,10 @@ def hunk_undo(
             encoding=versions[-1].get("encoding", "utf-8"),
             eol=versions[-1].get("eol", "LF"),
             prev_text=latest_text, force=True,
-            extra={"undone_hunks": undo_hunks},
+            extra={"undone_hunks": undo_hunks, "exists": baseline.get("exists",False) if restored_text=="" else True},
         )
         _recompute_total(meta)
-        # 磁盘写回：撤回后的内容同步落盘（EOL 按当前版本风格）；
-        # 还原结果为空文本 = 新建文件回退到从未创建 → 删除磁盘空文件
-        latest = versions[-1]
-        target_path = Path(meta["path"])
-        if restored_text == "":
-            try:
-                target_path.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            write_eol = "\r\n" if latest.get("eol") == "CRLF" else "\n"
-            with target_path.open("w", encoding=latest.get("encoding", "utf-8"), newline="") as fp:
-                fp.write(restored_text.replace("\n", write_eol))
+        _write_target(meta,version,restored_text,stamp)
         result = {
             "ok": bool(version),
             "hunk": hunks[hunk_index],
@@ -814,8 +944,8 @@ def hunk_keep(
             raise ValueError("当前代没有变更，无需保留")
         _check_locked_target(meta, baseline)
 
-        baseline_text = _read_snapshot(_version_file(meta, baseline))
-        latest_text = _read_snapshot(_version_file(meta, versions[-1]))
+        baseline_text = _read_version(meta, baseline)
+        latest_text = _read_version(meta, versions[-1])
         hunks = _aligned_opcodes(baseline_text, latest_text)
         if not hunks:
             raise ValueError("当前内容与基线一致，无需保留")
@@ -834,13 +964,14 @@ def hunk_keep(
         content = "\n".join(out) + ("\n" if latest_text.endswith("\n") else "")
 
         latest = versions[-1]
+        stamp = _disk_state(meta, latest)
         version = _append_version(
             meta, content, role="hunk_keep", tool=None,
             round_number=int(latest.get("round") or 0),
             encoding=latest.get("encoding", "utf-8"),
             eol="CRLF" if "\r\n" in content else "LF",
             prev_text=latest_text, force=True,
-            extra={"kept_hunks": keep_hunks},
+            extra={"kept_hunks": keep_hunks, "exists": bool(content) or baseline.get('exists', bool(baseline_text))},
         )
         if version is None:
             raise ValueError("内容无变化，无需保留")
@@ -861,11 +992,7 @@ def hunk_keep(
         )
         _recompute_total(meta)
         # 写回磁盘（保留语义 = 磁盘同步为"仅含被接受变更"的内容）
-        target_path = Path(meta["path"])
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        write_eol = "\r\n" if "\r\n" in content else "\n"
-        with target_path.open("w", encoding=latest.get("encoding", "utf-8"), newline="") as fp:
-            fp.write(content.replace("\n", write_eol))
+        _write_target(meta, version, content, stamp)
         result = {
             "ok": True,
             "version": version,
@@ -897,18 +1024,19 @@ def sync_from_disk(session_id: str, key: str) -> dict[str, Any]:
         if not target_path.is_file():
             raise ValueError("文件已不存在，无法从磁盘刷新")
         with target_path.open("rb") as handle:
-            data = handle.read(_FILE_HISTORY_MAX_TEXT_CHARS + 1)
-        if len(data) > _FILE_HISTORY_MAX_TEXT_CHARS:
-            raise ValueError("文件过大，无法并入版本链（超过 256KB）")
-        if b"\x00" in data:
-            raise ValueError("疑似二进制文件，无法并入文本版本链")
+            data = handle.read(file_snapshots.MAX_BYTES + 1)
+        if len(data) > file_snapshots.MAX_BYTES:
+            raise ValueError("文件超过 64 MiB 快照上限")
         encoding = (versions[-1].get("encoding") or "utf-8")
+        from factory.agent_runtime.builtin_tools import _is_probably_binary
+        if _is_probably_binary(data,encoding):
+            raise ValueError("疑似二进制文件，无法并入文本版本链")
         try:
-            text = data.decode(encoding, errors="replace")
+            text = data.decode(encoding)
         except (LookupError, UnicodeDecodeError):
-            text = data.decode("utf-8", errors="replace")
+            raise ValueError('文件编码已改变，请用文件工具读取并记录变更')
         latest = versions[-1]
-        latest_text = _read_snapshot(_version_file(meta, latest))
+        latest_text = _read_version(meta, latest)
         latest_hash = hashlib.sha256(
             latest_text.encode("utf-8", errors="replace")
         ).hexdigest()[:16]
@@ -924,7 +1052,7 @@ def sync_from_disk(session_id: str, key: str) -> dict[str, Any]:
             encoding=encoding,
             eol="CRLF" if "\r\n" in text else "LF",
             prev_text=latest_text, force=True,
-            extra={"source": "disk_sync"},
+            extra={"source": "disk_sync", "exists":True},
         )
         _recompute_total(meta)
         result = {"synced": True, "version": version, "total": meta.get("total")}
@@ -975,33 +1103,20 @@ def rollback(
             )
         _check_locked_target(meta, target_version)
 
-        content = _read_snapshot(_version_file(meta, target_version))
-        latest_text = _read_snapshot(_version_file(meta, versions[-1]))
+        content = _read_version(meta, target_version)
+        latest_text = _read_version(meta, versions[-1])
+        stamp = _disk_state(meta, versions[-1])
         version = _append_version(
             meta, content, role="rollback", tool=None,
             round_number=int(versions[-1].get("round") or 0),
             encoding=target_version.get("encoding", "utf-8"),
             eol=target_version.get("eol", "LF"),
             prev_text=latest_text, force=True,
-            extra={"rollback_from": versions[-1]["v"], "rollback_to": target_version["v"]},
+            extra={"rollback_from": versions[-1]["v"], "rollback_to": target_version["v"],
+                   "exists": target_version.get("exists",content!="")},
         )
         _recompute_total(meta)
-        # 磁盘写回：恢复真实文件（目录可能已被外部删除，先建目录）
-        target_path = Path(meta["path"])
-        disk_removed = False
-        if content == "":
-            # 目标基线为空文本 = 跟踪起点文件不存在（新建文件）：回退即"恢复到
-            # 从未创建"，此时删除磁盘文件而非留一个 0 字节空文件
-            try:
-                target_path.unlink()
-                disk_removed = True
-            except FileNotFoundError:
-                pass
-        else:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            write_text = content.replace("\n", "\r\n") if target_version.get("eol") == "CRLF" else content
-            with target_path.open("w", encoding=target_version.get("encoding", "utf-8"), newline="") as fp:
-                fp.write(write_text)
+        disk_removed = _write_target(meta,target_version,content,stamp)
         result = {
             "ok": True,
             "version": version,
@@ -1033,22 +1148,19 @@ def user_save(
                 "文件已被外部修改（expected_hash 不匹配），请刷新后重试"
             )
         _check_locked_target(meta, latest)
-        if content == _read_snapshot(_version_file(meta, latest)):
+        stamp = _disk_state(meta, latest)
+        if content == _read_version(meta, latest):
             raise ValueError("内容无变化")
         eol = "CRLF" if "\r\n" in content else "LF"
         version = _append_version(
             meta, content, role="user_edit", tool=None,
             round_number=int(latest.get("round") or 0),
             encoding=latest.get("encoding", "utf-8"),
-            eol=eol, prev_text=_read_snapshot(_version_file(meta, latest)),
-            force=True,
+            eol=eol, prev_text=_read_version(meta, latest),
+            force=True, extra={"exists":True},
         )
         _recompute_total(meta)
-        target_path = Path(meta["path"])
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        write_text = content.replace("\n", "\r\n") if eol == "CRLF" else content
-        with target_path.open("w", encoding=latest.get("encoding", "utf-8"), newline="") as fp:
-            fp.write(write_text)
+        _write_target(meta,version,content,stamp)
         result = {"ok": True, "version": version, "total": meta.get("total")}
         _save_meta(meta)
         return result
@@ -1069,7 +1181,7 @@ def keep(session_id: str, key: str) -> dict[str, Any]:
             if gen.get("gen") == current_gen_number and not gen.get("locked"):
                 gen["locked"] = True
         latest = versions[-1]
-        latest_text = _read_snapshot(_version_file(meta, latest))
+        latest_text = _read_version(meta, latest)
         meta.setdefault("gens", []).append({
             "gen": current_gen_number + 1,
             "at": now_str(),
@@ -1191,16 +1303,16 @@ def cleanup_file_histories(
     session_id: str,
     clean_only: bool = True,
 ) -> dict[str, Any]:
-    """批量清理留档：clean_only=True 只清无行数变化的文件链，False 清全会话。
+    """批量清理留档：clean_only=True 只清已无未决变更的文件链，False 清全会话。
 
-    撤回/保留只改内容不入档，时间长了会留下"已处理完但还占磁盘"的留档目录，
+    撤回/保留也会追加版本，时间长了会留下"已处理完但还占磁盘"的留档目录，
     本函数按当前列表快照逐个删除（内部持锁，外部无需加锁）。
     """
     with _session_lock(session_id):
         files = list_files(session_id, hide_clean=False)
         removed: list[dict[str, Any]] = []
         for item in files:
-            if clean_only and (int(item.get("added", 0)) or int(item.get("removed", 0))):
+            if clean_only and (item.get("changed") or int(item.get("added", 0)) or int(item.get("removed", 0))):
                 continue
             key = item.get("key") or ""
             key_dir = _key_dir(session_id, key)

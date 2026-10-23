@@ -141,7 +141,9 @@ def _add(total, usage):
 def legacy_baseline(text, meta=None):
     """Old main totals already include compression. Add child totals only once."""
     total = normalize_usage((meta or {}).get("usage"))
-    for line in (text or "").splitlines():
+    # 只按 \n 切分：记录内的 U+0085 等字符会让 splitlines() 把合法记录劈开，
+    # 导致该轮的 sub_agent 用量被漏算（与 memory.chat_memory._split_jsonl_lines 同理）。
+    for line in (text or "").split("\n"):
         try:
             entry = json.loads(line)
         except (ValueError, TypeError):

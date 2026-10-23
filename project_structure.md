@@ -1,5 +1,7 @@
 # Ytools 智能体工具使用测试 - 项目结构
 
+核对日期：2026-10-23。本文描述当前结构；工具用法见 [内置工具简表](docs/builtin_tools.md)，接口契约见 [API 说明](docs/api_docs.md)，构建流程见 [维护说明](docs/project_maintenance.md)。带日期的检查报告保留当时快照。
+
 ## 概述
 基于 **FastAPI** 的智能体工具服务平台，核心业务：大模型对话（SSE 流式、后台任务 + 断线重连）、MCP 工具调用、**多模态文件上传**（图片/音频/视频，media:// 引用解析为 OpenAI 兼容格式）、文件解析（含**原生文档**：按模型 supportDocTypes 对单个扩展名的声明，在 read_document 调用时按需发送一次；文本类文件二进制嗅探直收）、会话记忆与历史压缩、模型/工作目录动态配置；另附 **H5 前端**（聊天界面：SSE 流式、多模态附件、富媒体渲染——SVG 生成控件 / KaTeX 数学公式 / Mermaid 图表 / Canvas 沙箱程序块——与历史会话管理）与交互测试脚本。
 
@@ -8,11 +10,13 @@
 ## 一、目录结构（仅业务代码）
 ```
 agent_tool_sse/
-├── main.py                      # FastAPI 入口：init_path → 注册9个路由 → CORS → 自定义 OpenAPI(binary format 补丁) → 配置热重载线程 + Ollama 本地模型发现线程 + MCP 工具注册表预热线程 → uvicorn(48621)；当前未托管 H5 静态页面
+├── main.py                      # FastAPI 入口：环境初始化、业务路由、CORS、OpenAPI、后台恢复/配置监听；/ui/ 托管 H5，/docs 提供接口文档；默认端口 48621
 ├── config.py                    # Pydantic 模型 + 工作目录管理 + mcp_servers.json 读取/规整/写入；压缩失败重试配置 CompactionRetryConfig（默认 2，负数=无限重试）；访客用户显示名常量 DEFAULT_USER_NAME/MAX_USER_NAME_LENGTH；原生文档注入与文本入库上限常量（DEFAULT_NATIVE_DOC_MAX_BYTES/DEFAULT_NATIVE_DOC_TOTAL_MAX_BYTES/DEFAULT_NATIVE_DOC_MAX_ITEMS/DEFAULT_FILE_TEXT_MAX_CHARS）
 ├── env_manager.py               # .env/models.json 加载、模型角色选择（chat/compaction/title/sub_agent 四角色）、DPAPI 加密、models.json 热重载；supportDocTypes 归一化为 support_doc_types（get_model_config / list_available_models 输出）
 ├── requirements.txt             # 依赖清单（fastapi/uvicorn/pydantic/mcp/pillow/imageio-ffmpeg，可选 PyMuPDF/python-docx/pandas/openpyxl/xlrd；DOCX 解析依赖为 python-docx）
-├── .env                         # 本机配置与凭据；当前项目根目录未提供 .gitignore，提交前须显式排除
+├── .env                         # 本机配置与凭据；已由 .gitignore 排除
+├── .gitignore                   # 排除凭据、会话数据、日志、临时文件与依赖目录
+├── requirements.lock.txt        # 固定直接与传递依赖版本，部署优先使用
 ├── project_structure.md         # 本文档
 ├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
 ├── game/                        # 小实验：guess_number.py / snake.html
@@ -21,7 +25,7 @@ agent_tool_sse/
 │   ├── models.json              # 模型目录：provider→models（含 apiKey/url/能力），variables/runtime 全局变量，
 │   │                            #   顶层 model_selection（chat_model/compaction_model/title_model/sub_agent_model 角色选择）
 │   ├── mcp_servers.json         # MCP 服务器注册表：server_id → command/args + 顶层 inputs（工具选择默认，含 __builtin__ 内置工具）
-│   └── models.example.json      # models.json 示例模板；真实配置包含凭据，当前根目录未提供 .gitignore
+│   └── models.example.json      # 模型配置示例；真实 setting/models.json 已由 .gitignore 排除
 │
 ├── chat/
 │   ├── chat_llm.py              # ChatLLM：Chat Completions 协议客户端与统一调用入口
@@ -33,11 +37,24 @@ agent_tool_sse/
 ├── factory/                     # 核心业务逻辑层
 │   ├── agent_runtime/           # Agent 编排所需的可复用运行时组件
 │   │   ├── background_runner.py # 后台 run_command 监督进程入口
-│   │   ├── command_jobs.py      # 按会话隔离的后台命令注册表、日志尾读和生命周期操作
+│   │   ├── command_jobs.py      # 按会话隔离的命令注册表、日志读取和生命周期操作
+│   │   ├── command_leases.py    # 短等待命令的总预算与所属任务生命周期
+│   │   ├── command_input.py     # 交互 stdin 请求、去重回执与归属校验
+│   │   ├── command_pty.py       # Windows ConPTY / POSIX PTY 与输出转发
+│   │   ├── command_lease_runner.py # 独立监督进程：超时、所属进程检查与命令回收
+│   │   ├── command_output.py    # 日志游标、增量读取与编码边界处理
+│   │   ├── command_reads.py     # 模型自动续读：任务/代理隔离、持久位置与并发读取
 │   │   ├── chat_runtime.py      # usage 聚合、token 估算、消息构建、参数解析、回传长度解析、SSE 增量合并与思考回传契约（父/子循环共享纯函数）
 │   │   ├── sub_agent.py         # 子智能体：SubAgentContext（实例身份/工具快照/限额/emit 回调）+ SubAgentRunner（精简 Agent 循环）+ run_sub_agent_batch 并发编排（V1 不嵌套）
 │   │   ├── context_compaction.py # 跨轮/单轮上下文压缩、累计摘要与问题索引、超大结果拒绝阈值；压缩调用可配置重试链（COMPACTION_RETRY_MAX_ATTEMPTS，负数=无限，固定1秒间隔）+ 拼接优先的累计摘要合并（预算内不调模型）+ 保真批次策略（force_all 不做尾部保留、单批源吃满 0.9 窗口、压缩比恒定 12:1、批次诊断字段）+ 历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS，夹取到窗口派生上下限：<500k 时 8% 下限、≥500k 时 40k 下限、40% 上限；目标模式下摘要预算收紧为 min(预算, 目标×0.6) 并走"只保留核心内容"的精简提示词）
-│   │   ├── builtin_tools.py     # 本地内置工具（todo_write 任务计划、ask_user 向用户提问、文件读写检索、run_command 多 shell 命令执行、read_media 读取当前任务媒体、read_document 按需读取文档（offset/limit 文本区间、原生 PDF 页区间；按 supportDocTypes 逐文件选择原生或文本）、sub_agent 并发子任务派发；工具选择中的伪服务 __builtin__；可选内置工具共 10 个，check_tool_exists 已移除）
+│   │   ├── builtin_tool_catalog.py # 内置工具名称、选择常量与静态 Schema
+│   │   ├── builtin_tools.py     # 内置工具注入与执行；兼容重导出 catalog，动态媒体定义仍在本模块
+│   │   ├── context_patch.py     # 严格上下文补丁校验、多文件提交与失败回滚报告
+│   │   ├── text_index.py        # 大文本行索引及有界缓存
+│   │   ├── query_pages.py       # 文件枚举/搜索的有界快照与续读游标
+│   │   ├── search_scan.py       # 按需扫描、上下文与部分计数
+│   │   ├── search_ignore.py     # 可选嵌套 .gitignore、版本及权限校验
+│   │   ├── file_history_result.py # 主任务和子任务共用的版本记录状态反馈
 │   │   ├── responses_compaction.py # 本地可读摘要与 Responses 原生压缩协调
 │   │   ├── responses_context.py # Responses 增量输入队列、作用域、状态推进与重新同步
 │   │   ├── todo_runtime.py      # todo_write 运行时计划校验、归并与提示
@@ -56,10 +73,15 @@ agent_tool_sse/
 │
 ├── memory/                      # 记忆持久化层
 │   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘（锚点行序维护：回答插入/编辑重发等非追加收尾时把锚定压缩行重排到轮次行之前）+ 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
+│   ├── session_archives.py      # 会话归档索引、状态与路径解析
+│   ├── session_listing.py       # 会话摘要列表、筛选与待完成历史恢复
+│   ├── task_cost_store.py       # 任务预算、用量与事件存储
+│   ├── task_template_store.py   # 任务模板存储
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
 │   ├── chat_history_format.py   # 历史格式统一：摘要规整/渲染、历史切分（未压缩轮次全量回传 + 已压缩问题索引，无轮数窗口）、chat_round→上下文消息（含工具结果回传模式）、引用快照前置（<quote_list> 模型视图/压缩源【引用原文】）
 │   ├── quote_format.py          # 选中文本引用：规整/限额校验（5 段/4000 字/12000 字）、XML 转义、<quote_list> 序列化、模型视图前置（前后端同口径）
 │   ├── file_history.py          # 文件版本链 V2：Baseline/Version/Diff/Undo（record_change 入链、rollback/hunk_undo/hunk_keep、file_diffs/ 存储；详见 docs/file_diff.md）
+│   ├── file_snapshots.py        # 有界 gzip/旧文本快照、会话配额及原子写入
 │   └── file_memory.py           # FileMemoryManager：上传文件记录管理；文件清单/索引构建（普通文本内联/大文件节选+按需读取）与记录查找；原生文档内核（supportDocTypes 分流、PDF 页段、请求预算、原生部件一次性回收；预算键 NATIVE_DOC_*）
 │
 ├── routers/                     # API 路由层
@@ -67,7 +89,10 @@ agent_tool_sse/
 │   ├── raw_upload.py            # application/octet-stream 原始请求体读取（媒体/文件上传共用：filename 查询参数、大小上限）
 │   ├── chat_config_router.py    # 模型选择/工作目录/工具选择/历史压缩/回传长度/网络重试/工具并发/视频读取上限/子智能体重试等配置；压缩失败重试 GET/POST /chat_config/compaction_retry；POST /chat_config/generate_title 会话标题自动生成
 │   ├── tools_manage_router.py   # 工具列表（默认返回探测缓存，refresh=1 强制重探）
-│   ├── terminal_router.py       # 按 session_id 管理 run_command 后台任务的 /terminal/jobs/* API
+│   ├── terminal_router.py       # 按 session_id 管理后台/短等待命令的 /terminal/jobs/* API
+│   ├── task_cost_router.py      # 任务预算和用量接口
+│   ├── task_template_router.py  # 任务模板接口
+│   ├── tool_approval_router.py  # 工具权限设置、审批决定及恢复接口
 │   ├── prompt_router.py         # Skills 提示词库接口：md_files 增删改查/重命名（名称白名单+路径逃逸校验）
 │   ├── file_router.py           # 文档上传解析（文本类扩展名+二进制嗅探、超限截断入库、原生文档标记）/媒体上传（视频600MB流式）/Range 读取
 │   ├── file_history_router.py   # 文件版本链与差异块操作接口（/file_diff/*）
@@ -96,9 +121,9 @@ agent_tool_sse/
 │   ├── restart_tools_server.py  # 重启维护 MCP 服务器；当前缺少项目根 restart_helper.py，main.py 的服务快照写入亦被注释，不能按设计完成自动重启
 │   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）
 │
-├── H5/                          # 前端聊天界面（纯静态，本地打开；当前后端未托管静态页面）
+├── H5/                          # 静态前端：推荐访问后端 /ui/，也可在 Edge/Chrome 本地打开
 │   ├── README.md                # 前端使用说明
-│   ├── index.html               # 单页应用入口（Ytools；当前需独立打开）
+│   ├── index.html               # 聊天单页入口；/ui/ 与本地打开共用此文件
 │   ├── editor.html              # 文件 Diff 独立编辑器页面
 │   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
 │   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
@@ -113,20 +138,25 @@ agent_tool_sse/
 │   │                            #   名称校验）/ history_search.js（异步搜索状态）/
 │   │                            #   tool_approval_state.js（审批状态管理）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
 │   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app.js（入口）+
-│   │                            #   app/（22 个功能模块：core/quotes/sessions/history_search/session_groups/
-│   │                            #   stats/workdir/permissions/messages/history/compaction/builtin/
-│   │                            #   user_profile/media/skills/composer/model_panel/tools/chat/filehistory/editor/terminals；session_groups=侧边栏分组区
-│   │                            #   UI/交互；skills=提示词库可拖拽对话框；quotes=引用选区浮钮/
-│   │                            #   草稿卡片/气泡卡片；filehistory=文件版本链徽标与统计面板；
-│   │                            #   editor=文件 diff 编辑器页逻辑（editor.html）；
-│   │                            #   user_profile=访客显示名内联编辑（.env USER_NAME））
+│   │                            #   app/：core 共享状态；sessions/session_archives 管理会话；
+│   │                            #   messages 渲染历史，chat 调度发送/停止，stream_pipeline 渲染实时事件；
+│   │                            #   task_state/task_status 分离任务阶段与网络连接，session_activity 同步侧边栏运行标记；history_scroll/process_groups 管理窗口与过程折叠；
+│   │                            #   其余模块负责引用、设置、任务预算/模板、媒体、diff、终端和快捷命令；完整职责见 H5/README.md
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
 │   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
-│   └── test_h5/                 # 35 个 node:test 测试文件；覆盖语音、历史搜索、权限审批、滚动、子智能体、后台终端等
+│   ├── version_assets.py        # 按 JS/CSS 内容更新 index.html 资源版本
+│   ├── test_browser/            # 浏览器交互脚本与无模型调用的长会话验证页
+│   └── test_h5/                 # node:test 单元测试；npm test 运行当前 *.test.js
 │
 ├── docs/
 │   ├── api_docs.md              # REST 接口、内置工具、SSE 事件及配置说明
+│   ├── builtin_tools.md         # 面向模型的简短工具用法
+│   ├── project_maintenance.md   # 构建、资源版本、依赖与文档维护
+│   ├── page_maintenance_followup.md # 任务状态、断线重连与分步模块拆分
+│   ├── session_activity.md      # 侧边栏会话运行标记、批量状态及生命周期
+│   ├── session_archives.md      # 会话归档的使用与存储
+│   ├── frontend_live_tail.md    # 长会话尾部顺序、可见性与验证入口
 │   ├── chat_memory_template.json # JSONL/会话元数据模板（须与现行格式保持同步）
 │   ├── compact.md               # 上下文压缩逻辑说明
 │   ├── file_diff.md             # 文件变更 Diff 与历史版本链
@@ -183,7 +213,10 @@ agent_tool_sse/
    ├─ ③ 工具白名单过滤：前端只允许传 tool_names，后端实时工具为唯一真相
    │     - 未注册工具名 → 忽略并发 warning 事件
    │     - 未选择工具 → 无工具模式继续
-   │     - 工具选择「内置工具」分组勾选的项按需注入（伪服务 __builtin__，与 MCP 工具共用选择持久化）：todo_write（模型自我规划，状态存侧车 `history_files/sidecars/<session>_chat.jsonl.todo` 并经 SSE todo 事件实时推送）、ask_user（向用户提问，工具结果为 waiting_user 占位并推 SSE ask_user 事件，当轮任务暂停，用户回答作为下一条用户消息开启新一轮）、write_file / edit_file / read_file / search_files（内置文件读写与检索；相对路径基于会话工作目录；edit_file 支持 expected_hash 校验，覆盖写与编辑使用临时文件替换；search_files 有扫描上限）、run_command（勾选后同时注入 poll_command/stop_command 管理后台任务）、read_media（读取当前任务轮用户消息附带的媒体：仅当前任务引用可用、单次 ≤5；数据以 user 多模态部件注入后续请求、仅内存不落盘）、read_document（需在工具配置中勾选；未选中时不注入工具、清单展示解析文本；选中后支持 offset/limit 文本读取，以及按 supportDocTypes 原生读取）、sub_agent（并发派发独立上下文子任务：全轨迹按 agent_id 聚合为 chat_round.events 内 sub_agent 事件块，父模型只见子任务最终回复；V1 不嵌套，详见 docs/sub_agent_v1.md）
+   │     - 内置工具按 __builtin__ 选择注入：todo_write / ask_user / write_file / edit_file / read_file /
+   │       search_files / apply_patch / run_command / read_media / read_document / sub_agent。
+   │       search_files 同时启用 list_files；run_command 同时启用 poll_command/write_stdin/stop_command。
+   │       工具参数、续读、限额及主/子任务差异见 docs/builtin_tools.md 与 docs/sub_agent_v1.md。
    ├─ ④ 上下文构建：
    │     - 可选后端历史拼接（USE_BACKEND_HISTORY / BACKEND_HISTORY_ROUNDS 为兼容参数；
    │       历史轮数窗口已废弃，`max_rounds=0` 表示不限制轮数，摘要-only 模式不限制已完成历史回传；前端提供完整历史则跳过）
@@ -257,8 +290,8 @@ agent_tool_sse/
 ### 1. 聊天客户端（`chat/chat_llm.py`）
 - 纯标准库实现（socket + ssl），不依赖 openai SDK，支持 HTTP/1.1 chunked 传输解析（处理 UTF-8 被切断问题）
 - `chat_completions()` 统一入口：`stream=True` 返回异步生成器，`stream=False` 返回完整字典（供历史压缩用）
-- 模型配置热解析：每次请求从 models.json 解析当前选中模型，按 `NETWORK_RETRY_MAX_ATTEMPTS` 有限重试（默认最多 3 次、固定 1 秒间隔）；设为 0 或负数才无限重试直到用户停止
-- `reasoning_effort` 无条件随请求下发（由 `apply_role_parameter_defaults` 按模型参数桶填充）
+- 模型配置热解析：每次请求从 models.json 解析当前选中模型，按 `NETWORK_RETRY_MAX_ATTEMPTS` 配置重试（默认值 3）；Chat Completions 部分路径按额外重试次数处理，Responses 按总尝试次数处理，目前尚未统一；非正值不限制，仍可手动停止
+- 生成参数由 `apply_role_parameter_defaults` 按角色及协议参数桶填充；各协议的字段兼容性见对应 Messages/Responses 使用说明
 - 统一输出 SSE 事件：content / reasoning_content / tool_calls / usage / finish_reason
 
 ### 2. 工具聊天工厂（`factory/chat_factory.py`）
@@ -267,7 +300,7 @@ agent_tool_sse/
 - **SSE 事件归一化**：流式 `tool_calls` 按 index 增量合并，兼容老模型 `function_call`；透传前过滤 id/type 字段
 - **usage 汇总**：`UsageAccumulator` 按 completion_id + 指纹去重，合并后挂到当前 chat_round
 - **首调用预算检查**：请求发起前估算「消息 + 工具定义」token，超当前模型窗口时优先把文件记忆降级为约 1500 字符的文件索引（仅文件名/类型/大小，发 warning 事件），仍超窗则发 error 并终止，避免上游 400/静默截断
-- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入。`todo_write` 模型自我规划（落盘侧车 `history_files/sidecars/<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；系统提示终态注入收官提醒）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）。未知或未启用的工具调用由执行侧拒绝并返回配对工具结果。
+- **内置工具**：由 `agent_runtime/builtin_tools.py` 本地执行（不经过 MCP），并入工具选择模态框首位的「内置工具」分组（伪服务 `__builtin__`，会话级/全局默认持久化）控制注入。`todo_write` 模型自我规划（落盘侧车 `history_files/sidecars/<session>_chat.jsonl.todo`，免疫 _meta 全量重写竞态；终态工具结果提示收官）；`ask_user` 向用户提问（前端弹卡片，回答作为下一条用户消息，当轮任务暂停）；`sub_agent` 并发派发独立上下文子任务（SubAgentRunner 循环，事件经 emit 回调双写 JSONL+SSE，父模型只见最终回复，V1 禁止嵌套，限额见 SUB_AGENT_* 配置）。未知或未启用的工具调用由执行侧拒绝并返回配对工具结果。
    - **上下文压缩**：由 `agent_runtime/context_compaction.py` 统一负责。压缩模型调用支持**流式接口**：传入 `event_emitter` 时以 `stream=True` 请求，模型思考/正文增量经 `phase="delta"` 事件（`reasoning_content`/`content` 与聊天 SSE 同名字段）实时推 SSE，delta 帧不落盘；done 事件携带 `summary_text` 最终累计摘要全文并随同一 payload 落盘 JSONL，前端刷新后可在压缩块回放摘要。跨轮历史与单轮工具轨迹达到「`min(聊天窗口,压缩窗口)×ratio`」时，使用压缩模型输出普通文本摘要，并归并为一个累计摘要块；已完成原始轮次只存储在 JSONL，不再回传给模型，全部历史原始用户问题保留最近 ≤10k tokens（`context_summary.recent_questions`），渲染为独立 system 消息；单次超大工具结果也会在下一次模型调用前触发；原始结果仍写入 JSONL 与 SSE。
 - **超大结果拒绝**：单次工具结果估算 token 超过 `min(聊天窗口,压缩窗口)×系数`（默认 1.5）时，结果不进入模型上下文，改写"输出过长，请重新考虑工具"反馈并让模型重新规划；JSONL 只落头尾节选预览（`result_preview`）。连续超长拒绝达到上限（默认 3）时终止任务并写入说明。
 - **错误处理**：上游流错误/用户停止/异常分别记录不同状态，避免误记；服务端取消（CancelledError）尽力落盘后重抛。worker 模式下生成任务逃逸异常与 worker 进程崩溃均可见化：补发同构 error SSE 帧、错误说明落盘 JSONL 并合成 task_done 收尾（`session_worker._emit_uncaught_generate_error` / reader 崩溃合成路径），不再出现"任务静默终止无任何提示"。
@@ -326,7 +359,7 @@ agent_tool_sse/
 | 工具 | 业务 |
 |---|---|
 | fetch_url | 抓取网页/HTTP 接口（正文纯文本、按标签/正则抽取、超长截断） |
-| web_search | 网页搜索（解析 Bing 网页版，返回标题/链接/摘要） |
+| web_search | 网页搜索，按当前引擎策略返回标题/链接/摘要；详见 docs/web_tools.md |
 
 **run_command 的 cmd 家族健壮性补丁**（迁移后位于 `factory/agent_runtime/builtin_tools.py`，均为实测复现的真实坑）：
 
@@ -337,25 +370,25 @@ agent_tool_sse/
 | 管道过滤器（`\| tail -N` / `\| head -N`） | PATH 里可能命中"非管道过滤器"实现（实测宝塔 `E:\BtSoft\panel\script\tail.EXE`）：在管道中提前退出且不转发输出 → 上游 `Errno 22` → 整条管道静默"（无输出）" | 用【管道形式 + 独立进程生产者】探针识别（直接调用探测会误判为可用）；不可用时自动替换 PATH 中可用实现，均无则去掉该管道段并在 Python 侧本地取头/尾 N 行 |
 | cmd 语法误用 | `;` 被当普通字符原样输出（exit=0 但后续命令未执行）；Unix 命令名在 cmd 下失败 | 失败或可疑时附提示：`;`/`&&` 等价写法、Unix 命令的 Windows 等价物与 `shell=bash` 建议（按子进程 PATH 判断，避免误报） |
 
-Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐藏中转链执行（脱离宿主受限 Job 与进程树）；非 cmd shell 命令写入独立执行脚本（powershell/pwsh→.run.ps1 以 -File 执行、bash/sh/zsh→.run.sh 以 stdin 喂入），绕开 cmd 解析层对 `\"` 转义的二次破坏；中转临时文件（含超长输出的完整版落盘 fg_*.full.txt）每次调用后即时清理、超 24h 自动回收。
+Windows 普通命令沿用 WMI 隐藏启动链；短等待命令由独立监督进程管理，后台任务持久登记。日志与中转文件的保留、关闭及清理规则见 [终端管理](docs/terminal_management.md)，完整日志不在调用结束后立即删除。
 
 另注册命名管道终端服务器 `PipeIpcMCP.exe`（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）。
 
-**迁移说明（2026-09）**：run_command 已迁移为主项目后端内置工具（`factory/agent_runtime/builtin_tools.py` 的 `RUN_COMMAND_NAME` / `execute_run_command`），并入「内置工具」分组随 `__builtin__` 伪服务保存选择；父循环与子智能体均在服务端本地执行（同步阻塞实现经 `asyncio.to_thread` 放到工作线程），语义与原 MCP 版完全对齐（多 shell / 超时杀进程树 / 超长截断落盘 / 编码自适应 / 后台模式 / cmd 家族补丁）。`mcp_server/sys_tools_server.py` 中原注册块与实现函数整体注释保留，回滚时取消注释即可。
+run_command 与文件工具已迁移到后端内置工具；sys_tools_server.py 中的旧注释实现仅作历史参考。短等待、游标续读、文件枚举和补丁以当前内置实现为准，恢复旧注释不能获得同等能力。
 
 可用 `python test/manual_sys_tools_check.py` 通过真实 MCP 客户端逐工具自检（临时沙箱，自动清理）；run_command 与文件工具的验证见 `test/test_builtin_command_tool.py` / `test/test_builtin_file_tools.py`。
 
 ### 9. H5 前端（`H5/`）
-- 纯静态单页应用（无构建依赖，SCSS 可选编译），直接请求后端接口
+- 纯静态单页应用，仓库包含运行所需的 CSS/vendor；修改 SCSS 需编译，修改 JS/CSS 后更新内容哈希。后端 /ui/ 托管页面，REST/SSE 提供数据
 - 功能：会话列表/搜索/新建、SSE 流式渲染（含 reasoning/工具调用/压缩事件/sub_agent 子任务块聚合）、历史回放（含 sub_agent 事件块按 agent_id 聚合重建）、多模态附件（粘贴/上传图片音频视频与文档，气泡缩略图/首帧，点击模态框预览图片/播放音视频/PDF/文本）、主题切换、代码高亮（prism）、markdown 渲染；文档上传类型放宽——`core.js` 的 `DOC_EXTENSIONS` 包含后端 `TEXT_FILE_EXTENSIONS`，另加 PDF、DOC/DOCX、XLS/XLSX 五种由专用解析器处理的扩展名，未知扩展名交后端二进制嗅探），命中当前模型 `supportDocTypes` 的文档仅在 `read_document` 调用后按需原生发送一次（vision 与文档能力分别判断）
-- **语音输入**：Web Speech API（Chrome/Edge）——点麦克风听写；「聊天设置 → 常规 → 语音输入」手动选择 20 个语言/地区选项，自动保存项目 `.env` 的 `SPEECH_INPUT_LANGUAGE`，浏览器仅缓存；刷新/打开设置同步全局默认，识别器使用对应语言标签；按语种处理空格。键盘编辑复用当前实例，输入法组合期间缓存结果、提交后写入新增语音；发送/切会话隔离迟到事件；自然结束、静默和错误均不自动重启，避免重复申请权限。详见 `docs/speech_input.md`
+- **语音输入**：Chrome/Edge Web Speech API；语言在聊天设置中保存到 .env 的 SPEECH_INPUT_LANGUAGE。自然断开后自动续听，连续两次空白续听后暂停；权限、设备或网络错误停止并提示。发送、切换会话和离开页面隔离迟到结果。详见 [语音输入](docs/speech_input.md)。
 - **会话标题跑马灯**：溢出标题 hover 250ms 后向左滚动（约 80px/s）至末尾文本对齐右缘，滚动期间移除右缘渐隐遮罩，移出即复位
 - **富媒体渲染**：模型输出的 ```svg（双视图：代码/图片 + 复制代码/复制图片）、```mermaid（懒加载 Mermaid.js 异步渲染，代码/图片双视图）、```canvas（**运行确认 + iframe 沙箱**：sandbox="allow-scripts" 隔离执行，postMessage 握手下发源码；沙箱包装 rAF/定时器统计待执行回调数——一次性绘制回传 canvas-done 快照，动画/游戏脚本进入"独活"模式保持运行态可交互（点击/键盘直接玩），console 逐行实时回传，截图随时索要当前帧，脚本自然收尾自动补发最终快照；⛶ 全屏作用于整个控件块，画布 object-fit:contain 等比缩放，全屏内按钮可用；```svg|mermaid|canvas 栅栏与媒体伪标签均独占一行不参与两列并排
 - 公式：KaTeX 0.18.7 本地 vendor（$…$、$$…$$、\(…\)、\[…\] 四种定界符；代码栅栏先遮蔽防误提取；价格文本防误判；无 katex 环境降级原文）
 - 图片视图自适应：SVG 按 viewBox 比例注入 aspect-ratio 内联样式，默认填满控件宽度（仅极竖长 >1.7 屏才按高度收窄），导出图片按实际渲染尺寸超采样 + contain 裁剪
-- 滚动：自动贴底暂停机制（用户上滚阅读时流式 delta 不再强制拉回，滚回底部或点「回到底部」恢复）
+- 滚动与历史：完整 JSONL 仍一次下载，大历史由 Worker 解析；只渲染当前历史窗口，其余用占位保持完整滚动范围。实时尾部按顺序恢复；多项连续过程默认折叠、单项直接展示。上滚暂停贴底，回到底部恢复；详见 [长会话显示](docs/frontend_live_tail.md)。
 - **选中文本引用到提问**：在用户提问正文/助手回答正文中选中文字后浮钮「引用到提问」→ 引用快照卡片进输入框上方（可多段、可移除、随会话草稿保存/恢复、随引导与队列暂存派发）；发送时作为用户消息同级 `quotes` 字段上送（结构化，不打标签进 content），历史回放/流恢复重建引用卡片，编辑可保留或移除引用，复制输出人可读文本（"引用 1：…\n\n问题：…"）；引用快照随消息落盘，模型视图由后端序列化为 `<quote_list>`（见 `memory/quote_format.py`）
-- 工具函数均有对应单元测试（`H5/test_h5/`，node --test 运行）
+- 前端纯函数和交互状态回归位于 `H5/test_h5/`，由 node:test 运行；浏览器交互脚本另在 `H5/test_browser/`
 
 ### 10. API 接口总览
 > 完整出入参数说明见 `docs/api_docs.md`，在线文档见 `/docs`
@@ -364,13 +397,10 @@ Windows 上命令经「WMI → wscript → VBS(vbHide) → cmd 启动器」隐�
 
 ---
 
-## 四、已知问题（代码缺陷与平台限制，2026-09 文档核对时确认，代码未修复仅如实记录）
+## 四、当前边界与维护入口
 
-> 2026-09-29 复核：原第 1 条（read_file 读取侧无大小上限）已随 64 MiB 读取上限（超限直接拒绝，读取改用限量读取）修复，原第 2 条（requirements.txt `docx` 包名有误）已改用 `python-docx`，两条均修复并移出本表。
-
-| # | 位置 | 问题 |
-|---|---|---|
-| 1 | `env_manager.py` `_decrypt_dpapi_secret` | `enc:dpapi:` 凭据仅在 Windows 可解密；非 Windows 加载时按原样返回密文（跨平台部署不可用） |
-| 2 | `mcp_server/sys_tools_server.py` | 文件四件套与 run_command 的大量旧实现以注释保留（已迁移为内置工具），仅 fetch_url/web_search 为活跃代码；`_truncate_text` 等少量辅助函数仍被活跃路径共用 |
-| 3 | `mcp_server/restart_tools_server.py` | 孤儿模块：未在 setting/mcp_servers.json 注册，main.py 的服务快照写入被注释，根目录无 restart_helper.py，内部固定 `cmd /c` 无 POSIX 分支——不要依赖其完成自动重启 |
-| 4 | `setting/mcp_servers.json` | SysServer 以 `"command": "python"` 启动；Windows 可用，Linux 上通常需 `python3`（跨平台部署注意） |
+- 历史窗口减少 DOM 数量，但下载与解析仍使用完整文件，尚未实现服务端历史分页。
+- 文件版本链任一端超过 256 Ki 字符时跳过记录；修改结果返回 history_recorded 和原因。补丁不承诺跨文件崩溃事务。
+- 命令默认短等待，模型可按 job_id 自动续取输出，支持交互式 stdin/PTY；页面只列运行任务，日志容量策略仍待完善。详见 [终端管理](docs/terminal_management.md)。
+- enc:dpapi: 凭据依赖 Windows 用户环境，跨平台迁移需重新配置；旧重启模块缺少 restart_helper.py，不应依赖其恢复服务。
+- 已实现能力及验证快照见 [工具升级记录](docs/tool_improvement_plan.md)；构建、依赖更新和文档约定见 [维护说明](docs/project_maintenance.md)。

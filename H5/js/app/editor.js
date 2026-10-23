@@ -174,6 +174,7 @@
         currentLines: currentText.split("\n"),
         skipped: view.diff_skipped || "",
         truncated: !!view.truncated,
+        snapshotOnly: !!view.snapshot_only || !!content.snapshot_only,
         lang: langOf(content.display_path || content.path),
         versions: versions,
         rounds: buildRoundChoices(versions),
@@ -265,6 +266,10 @@
     paintedRows = [];
     renderTitle();
     renderBar();
+    if (st.snapshotOnly) {
+      dom.body.appendChild(el("div", "eh-skip fh-skip", "此文件已保存完整压缩快照，可回退基线或指定历史轮次。为保持页面流畅，此处不加载全文编辑和逐块操作；修改请使用文件工具或本地编辑器。"));
+      return;
+    }
     if (st.skipped === "file_too_large") {
       dom.body.appendChild(el("div", "eh-skip fh-skip", "文件过大，未生成行级 diff"));
       return;
@@ -278,7 +283,7 @@
         return { kind: "ctx", oldNo: i + 1, newNo: i + 1, text: text };
       });
     }
-    const table = el("div", "eh-table");
+    const table = el("div", "eh-table" + (st.lang ? " language-" + st.lang : ""));
     let pendingHunk = -1;
     for (const row of st.rows) {
       if (row.kind === "hunk") {
@@ -313,7 +318,7 @@
   }
 
   function renderBar() {
-    dom.save.disabled = false;
+    dom.save.disabled = !!st.snapshotOnly;
     dom.save.textContent = "保存";
     // 回退轮次下拉
     if (st.rounds.length) {
@@ -448,7 +453,13 @@
     row.lineEl = line;
 
     if (row.kind === "del") {
-      line.appendChild(el("span", "eh-text", row.text === "" ? " " : row.text));
+      // 删除行只读：同样做行内语法高亮（与聊天代码块同一套调色板），失败回退纯文本
+      const text = el("span", "eh-text");
+      const src = row.text === "" ? " " : row.text;
+      const html = highlight(src, st.lang);
+      if (html != null) text.innerHTML = html;
+      else text.textContent = src;
+      line.appendChild(text);
       return line;
     }
     // ctx / add：可编辑 overlay（高亮层 + 透明 textarea）
@@ -1136,7 +1147,7 @@
     st.rows = snapshot.map(function (item) {
       return Object.assign({}, item);
     });
-    const table = el("div", "eh-table");
+    const table = el("div", "eh-table" + (st.lang ? " language-" + st.lang : ""));
     let pendingHunk = -1;
     for (const row of st.rows) {
       if (row.kind === "hunk") {
@@ -1184,6 +1195,7 @@
 
   // ---------- 操作 ----------
   function saveEditor() {
+    if (st && st.snapshotOnly) { toast("大文件请使用文件工具或本地编辑器修改"); return; }
     const content = composeContent();
     dom.save.disabled = true;
     dom.save.textContent = "保存中...";

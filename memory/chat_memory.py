@@ -194,6 +194,19 @@ def _read_jsonlines(file_path: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _split_jsonl_lines(text: str) -> list[str]:
+    """按物理换行切分 jsonl 文本（只认 \\n）。
+
+    禁止用 str.splitlines() 切 jsonl：JSON 字符串内可能含有 U+0085（NEL）
+    等 Unicode 行边界字符（工具输出把 UTF-8 字节按 latin-1 误解码时会产生，
+    json.dumps(ensure_ascii=False) 不会转义 C1 控制字符），splitlines() 会
+    把一条合法记录从中间劈开，导致 json.loads 报 Unterminated string。
+    写路径（_write_meta_and_entries / json.dumps）只用 \\n 作记录分隔，
+    因此读路径只按 \\n 切分才与写路径对称；行尾 \\r 由调用方 strip 处理。
+    """
+    return text.split("\n")
+
+
 def _default_title(session_id: str) -> str:
     return f"session_{session_id}"
 
@@ -1418,7 +1431,16 @@ class ChatMemoryManager:
             text = self._file_path.read_text(encoding="utf-8")
             pending = self._saved_permission_round()
             if pending:
-                entries = [json.loads(line) for line in text.splitlines() if line.strip()]
+                # 只按 \n 切分（见 _split_jsonl_lines）：记录内的 U+0085 等字符
+                # 会让 splitlines() 把合法记录劈开；坏行跳过，与 _read_jsonlines
+                # 保持一致的容错口径，避免历史文件加载 500。
+                entries = [
+                    parsed
+                    for line in _split_jsonl_lines(text)
+                    if line.strip()
+                    for parsed in (_safe_parse_jsonl_line(line),)
+                    if isinstance(parsed, dict)
+                ]
                 if not self._round_already_recorded(entries, pending):
                     text += ("" if text.endswith("\n") else "\n") + json.dumps(pending, ensure_ascii=False) + "\n"
             return text
@@ -3666,7 +3688,9 @@ def _parse_jsonl_payload(raw_bytes: bytes) -> tuple[dict[str, Any] | None, list[
     except UnicodeDecodeError:
         # 兼容 GBK/UTF-8-sig 等常见中文编码
         text = raw_bytes.decode("utf-8-sig", errors="replace")
-    lines = [line for line in text.splitlines() if line.strip()]
+    # 只按 \n 切分（见 _split_jsonl_lines）：splitlines() 会把含 U+0085 等
+    # 字符的合法记录劈成两行，导致导入时整轮被当作坏行丢弃。
+    lines = [line for line in _split_jsonl_lines(text) if line.strip()]
     total_lines = len(lines)
     base_meta: dict[str, Any] | None = None
     candidate_entries: list[dict[str, Any]] = []
@@ -3820,7 +3844,10 @@ def _portable_history_value(value):
 def _portable_responses_history(text: str) -> str:
     """Portable history for all protocols; keep the existing helper entry point."""
     lines = []
-    for line in text.splitlines():
+    # 只按 \n 切分（见 _split_jsonl_lines）：splitlines() 劈开含 U+0085 的记录后，
+    # 两个碎片都会走“原样保留”分支再用 \n 拼回去，等于把记录内的 U+0085 替换成
+    # 真实换行，导出的包就变成真损坏（重新导入时该轮无法解析）。
+    for line in _split_jsonl_lines(text):
         row = _safe_parse_jsonl_line(line)
         if isinstance(row, dict):
             if row.get("event") in ("model_response", "tool_approval"):
