@@ -1,9 +1,17 @@
 import asyncio
 import threading
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+
+# 先初始化 .env 路径，再导入任何读取配置的模块：
+# config.py 在 import 时就把 DEFAULT_SERVICE_HOST / DEFAULT_SERVICE_PORT 等
+# 环境变量固化为模块常量，若在此之前导入，.env 中的端口/监听地址会被忽略。
+from env_manager import init_path
+
+init_path(Path(__file__).resolve().parent)
 
 # 加载 env 环境变量
 from config import (
@@ -14,13 +22,10 @@ from config import (
 from util import config_watcher, ollama_model_watcher
 from util.ui_cache import ui_cache_headers
 from factory.agent_runtime import tool_registry
-from env_manager import init_path
 
 from util.logger import get_logger, setup_logging
 
 logger = get_logger("main")
-
-init_path(PROJECT_ROOT)
 # 启动日志系统：init_path 之后才能读到 .env 的 LOG_LEVEL（后端启动日志等级配置项）
 setup_logging(force=True)
 apply_persisted_work_dir()
@@ -48,7 +53,7 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI(
     title="智能体工具使用测试",
     description="工具类测试",
-    version="v0.1"
+    version="v0.2"
 )
 
 
