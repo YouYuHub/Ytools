@@ -8,6 +8,8 @@
 
 ## 1. 聊天 ChatLLM
 
+发送准备、流式首帧、连接复用与 `API latency` 分段日志见 [API 发送性能](api_send_performance.md)。
+
 ### POST /chat_with_tool
 聊天主接口，**SSE 流式**响应（`text/event-stream`）。
 

@@ -25,6 +25,9 @@ from contextlib import suppress
 
 from util.media_limits import limit_media_messages, learn_media_limit
 from util.logger import get_logger
+from util.token_estimate import text_token_estimate
+from .http_pool import default_ssl_context, configure_response
+from util import api_timing
 
 logger = get_logger("chat.chat_llm")
 
@@ -167,9 +170,7 @@ def _estimate_payload_input_tokens(payload: dict[str, Any]) -> int:
             text = str(value)
         if not text:
             return 0
-        ascii_chars = sum(1 for char in text if ord(char) < 128)
-        non_ascii_chars = len(text) - ascii_chars
-        return max(1, ascii_chars // 4 + non_ascii_chars)
+        return text_token_estimate(text)
 
     def _part_tokens(part):
         if not isinstance(part, dict):
@@ -444,7 +445,7 @@ class ChatLLM:
         return payload
 
     @staticmethod
-    def _precheck_hard_limit(payload: dict[str, Any]) -> str | None:
+    def _precheck_hard_limit(payload: dict[str, Any], *, estimated_input: int | None = None) -> str | None:
         """发送前硬限制预检（input + max_tokens 不得超过供应商上限）。
 
         返回 None = 通过（必要时已就地降级 payload["max_tokens"]，日志提示）；
@@ -455,7 +456,8 @@ class ChatLLM:
         if hard_limit <= 0:
             return None
         try:
-            estimated_input = _estimate_payload_input_tokens(payload)
+            if estimated_input is None:
+                estimated_input = _estimate_payload_input_tokens(payload)
         except Exception:
             return None  # 估算失败不阻断发送（保守放行）
         raw_max_tokens = payload.get("max_tokens")
@@ -503,16 +505,11 @@ class ChatLLM:
         if meter_attempt:
             from factory.agent_runtime.task_costs import network_attempt
             await network_attempt()
-        connection_kwargs: dict[str, Any] = {}
-        if use_ssl:
-            connection_kwargs["ssl"] = ssl.create_default_context()
-            connection_kwargs["server_hostname"] = host
-            connection_kwargs["ssl_handshake_timeout"] = timeout_connect
-        return await ChatLLM._wait_with_stop(
-            asyncio.open_connection(host, port, **connection_kwargs),
-            timeout_connect,
-            stop_checker,
-        )
+        from .http_pool import open_connection
+        api_timing.mark("connect_start")
+        connection = await open_connection(host, port, use_ssl, timeout_connect, stop_checker, ChatLLM._wait_with_stop)
+        api_timing.mark("connected", connection_reused=bool(getattr(connection[1], "reused", False)))
+        return connection
 
     @staticmethod
     def _iter_sse_body_lines(f, is_chunked: bool):
@@ -532,16 +529,19 @@ class ChatLLM:
                     break
                 if size == 0:
                     break  # 最后一个 chunk，忽略 trailers
-                data = f.read(size)
-                if not data:
-                    break
+                remaining = size
+                while remaining:
+                    data = f.read1(min(remaining, 65536)) if hasattr(f, "read1") else f.read(min(remaining, 65536))
+                    if not data:
+                        if buffer:
+                            yield buffer
+                        return
+                    remaining -= len(data)
+                    buffer += data
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        yield line
                 f.read(2)  # chunk 数据末尾的 CRLF
-                buffer += data
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    yield line
-                if len(data) < size:
-                    break  # 连接提前关闭
         else:
             while True:
                 data = f.read1(65536) if hasattr(f, "read1") else f.read(65536)
@@ -579,16 +579,21 @@ class ChatLLM:
                     break
                 if size == 0:
                     break  # 最后一个 chunk，忽略 trailers
-                data = await ChatLLM._wait_with_stop(
-                    reader.readexactly(size), timeout_read, stop_checker
-                )
+                remaining = size
+                while remaining:
+                    data = await ChatLLM._wait_with_stop(
+                        reader.read(min(remaining, 65536)), timeout_read, stop_checker
+                    )
+                    if not data:
+                        raise asyncio.IncompleteReadError(b"", remaining)
+                    remaining -= len(data)
+                    buffer += data
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        yield line
                 await ChatLLM._wait_with_stop(
                     reader.readexactly(2), timeout_read, stop_checker
                 )  # chunk 数据末尾的 CRLF
-                buffer += data
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    yield line
         else:
             while True:
                 data = await ChatLLM._wait_with_stop(
@@ -736,7 +741,7 @@ class ChatLLM:
                 sock = socket.create_connection((host, port), timeout=timeout_connect)
                 if use_ssl:
                     sock.settimeout(timeout_connect)
-                    ctx = ssl.create_default_context()
+                    ctx = default_ssl_context()
                     sock = ctx.wrap_socket(sock, server_hostname=host)
                 f = None
                 try:
@@ -1019,6 +1024,7 @@ class ChatLLM:
                     yield "data: [DONE]\n\n"
                     return
             try:
+                api_timing.attempt("chat-completions")
                 chat_config = ChatLLM._resolve_chat_config(model_config)
                 url = ChatLLM.confirm_completions_url(chat_config["url"])
                 api_key = chat_config.get("apiKey") or "not-needed"
@@ -1046,6 +1052,7 @@ class ChatLLM:
                     yield "data: [DONE]\n\n"
                     return
                 body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                api_timing.mark("request_ready", payload_bytes=len(body_bytes))
                 last_step = "connect"
                 reader, writer = await ChatLLM._open_connection(
                     host,
@@ -1065,12 +1072,13 @@ class ChatLLM:
                         # 需要的会话头在参数面板按角色自行配置）
                         f"{_build_custom_header_lines(chat_config)}"
                         f"Content-Length: {len(body_bytes)}\r\n"
-                        f"Connection: close\r\n"
+                        f"Connection: keep-alive\r\n"
                         f"\r\n"
                     )
                     last_step = "send_request"
                     writer.write((request_line + header_lines).encode("utf-8") + body_bytes)
                     await ChatLLM._wait_with_stop(writer.drain(), timeout_drain, stop_checker)
+                    api_timing.mark("request_sent")
                     last_step = "read_status"
                     status_line = await ChatLLM._wait_with_stop(reader.readline(), timeout_read, stop_checker)
                     status_str = status_line.decode("utf-8", errors="replace").strip()
@@ -1094,6 +1102,7 @@ class ChatLLM:
                             h_key, h_val = header_str.split(":", 1)
                             resp_headers[h_key.strip().lower()] = h_val.strip()
                     is_chunked = "chunked" in resp_headers.get("transfer-encoding", "").lower()
+                    configure_response(reader, resp_headers)
                     if not 200 <= _http_status_code(status_str) < 300:
                         # 网关偶发 4xx/5xx（如瞬时 400 Bad Request）与网络错误同源：
                         # 纳入 NETWORK_RETRY_MAX_ATTEMPTS 重试。未达上限发
@@ -1155,6 +1164,7 @@ class ChatLLM:
                             chunk = json.loads(data_str)
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
+                        api_timing.mark("first_upstream_event")
                         error_frame = _upstream_error(chunk)
                         if error_frame is None and sse_event in {b"error", b"response.failed"}:
                             error_frame = chunk
@@ -1296,10 +1306,14 @@ class ChatLLM:
     ):
         from factory.agent_runtime.task_costs import current, tracked_call
         invoke = lambda: ChatLLM._unmetered_chat_completions(request, stream, stop_checker, model_config)
-        if request is None or current(request) is None:
+        if request is None:
             return invoke()
-        return tracked_call(invoke, request, request.stream if stream is None else stream,
-                            stop_checker, ChatLLM._resolve_chat_config(model_config))
+        streaming = request.stream if stream is None else stream
+        def metered():
+            if current(request) is None:
+                return invoke()
+            return tracked_call(invoke, request, streaming, stop_checker, ChatLLM._resolve_chat_config(model_config))
+        return api_timing.traced_call(metered, request, streaming)
 
     @staticmethod
     def _unmetered_chat_completions(
@@ -1380,7 +1394,7 @@ class ChatLLM:
             sock = socket.create_connection((host, port), timeout=timeout_connect)
             if use_ssl:
                 sock.settimeout(timeout_connect)
-                ctx = ssl.create_default_context()
+                ctx = default_ssl_context()
                 sock = ctx.wrap_socket(sock, server_hostname=host)
             try:
                 request_line = f"POST {path} HTTP/1.1\r\n"

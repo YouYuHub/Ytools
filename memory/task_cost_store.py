@@ -248,8 +248,10 @@ def update_round(task_id, number):
         db.execute("BEGIN IMMEDIATE")
         data = _task(db, task_id)
         if data:
-            data["round"] = max(0, int(number or 0))
-            _put_task(db, data)
+            number = max(0, int(number or 0))
+            if data.get("round") != number:
+                data["round"] = number
+                _put_task(db, data)
 
 
 def _pause(db, data, reason):

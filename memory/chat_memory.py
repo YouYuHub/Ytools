@@ -2,6 +2,7 @@
 # from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -422,23 +423,64 @@ def read_session_meta_value(session_id: str, key: str) -> Any:
         return None
     if not file_path.exists():
         return None
-    rows = _read_jsonlines(file_path)
-    if rows and _is_meta_record(rows[0]):
-        meta = rows[0].get("_meta")
-        if isinstance(meta, dict):
-            return meta.get(key)
-    return None
+    meta = _read_meta_first_line(file_path)
+    return meta.get(key) if meta else None
+
+
+def _responses_meta_path(file_path: Path) -> Path:
+    return HISTORY_ROOT / "sidecars" / (file_path.name + ".responses")
+
+
+def _meta_digest(meta: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(meta, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _with_responses_meta(file_path: Path, meta: dict[str, Any]) -> dict[str, Any]:
+    """Overlay only the exact metadata revision the sidecar was written against."""
+    try:
+        record = json.loads(_responses_meta_path(file_path).read_text(encoding="utf-8"))
+        if (record.get("base") == _meta_digest(meta) and isinstance(record.get("state"), dict)):
+            return {**meta, "responses_state": record["state"]}
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return meta
 
 
 def update_responses_session_meta(session_id: str, state: dict[str, Any]) -> None:
-    """Mirror the private journal index without constructing/recovering a manager."""
+    """Mirror the private journal index without rewriting the transcript.
+
+    Normal history writes fold the overlay into the next JSONL metadata. The
+    digest prevents an old overlay from surviving history replacement/editing.
+    The protocol journal remains the authoritative recovery record.
+    """
     path = _get_chat_history_file(session_id)
     if not path.exists():
         return
     with cross_process_lock(LOCK_ROOT / (path.name + ".lock")):
-        meta, entries = _load_meta_and_entries(path, session_id)
-        meta["responses_state"] = dict(state)
-        _write_meta_and_entries(path, meta, entries)
+        # Read the persisted first line, not an already overlaid metadata value.
+        with path.open("r", encoding="utf-8") as fp:
+            row = _safe_parse_jsonl_line(fp.readline())
+        if not _is_meta_record(row):
+            meta, entries = _load_meta_and_entries(path, session_id)
+            meta["responses_state"] = dict(state)
+            _write_meta_and_entries(path, meta, entries)
+            return
+        meta = row["_meta"]
+        if _with_responses_meta(path, meta).get("responses_state") == state:
+            return
+        record = {"base": _meta_digest(meta), "state": dict(state)}
+        target = _responses_meta_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp")
+        for attempt in range(len(_ATOMIC_WRITE_RETRY_DELAYS) + 1):
+            try:
+                temporary.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+                os.replace(temporary, target)
+                return
+            except OSError:
+                if attempt == len(_ATOMIC_WRITE_RETRY_DELAYS):
+                    raise
+                time.sleep(_ATOMIC_WRITE_RETRY_DELAYS[attempt])
 
 
 # ---------- 会话分组（分组注册表 + 会话归属） ----------
@@ -1100,6 +1142,7 @@ def _load_meta_and_entries(
     else:
         base_meta = _default_meta(session_id)
         entries = [row for row in rows if isinstance(row, dict)]
+    base_meta = _with_responses_meta(file_path, base_meta)
     meta = _recompute_meta_from_entries(session_id, base_meta, entries, bump_updated_at=False)
     return meta, entries
 
@@ -1125,7 +1168,7 @@ def _read_meta_first_line(file_path: Path) -> dict[str, Any] | None:
     if not _is_meta_record(row):
         return None
     meta = row.get("_meta")
-    return meta if isinstance(meta, dict) else None
+    return _with_responses_meta(file_path, meta) if isinstance(meta, dict) else None
 
 
 # 原子写重试退避序列（秒）：Windows 上刚写入的文件可能被搜索索引、杀软或
@@ -3444,6 +3487,11 @@ class ChatMemoryManager:
         """
         chat_history_file = _get_chat_history_file(session_id)
         if chat_history_file.exists():
+            # A requested raw export includes the current mirrored state too.
+            if _responses_meta_path(chat_history_file).exists():
+                with cross_process_lock(LOCK_ROOT / (chat_history_file.name + ".lock")):
+                    meta, entries = _load_meta_and_entries(chat_history_file, session_id)
+                    _write_meta_and_entries(chat_history_file, meta, entries)
             return FileResponse(chat_history_file, filename=chat_history_file.name)
         else:
             raise HTTPException(status_code=404, detail="Chat session file not found")
@@ -3507,7 +3555,8 @@ class ChatMemoryManager:
             deleted_parts.append(f"会话文件 {chat_history_file.name}")
         from memory.session_archives import forget
         forget(session_id)
-        for suffix, label in ((".pending", "检查点"), (".todo", "任务计划"), (".bak", "备份")):
+        for suffix, label in ((".pending", "检查点"), (".todo", "任务计划"), (".bak", "备份"),
+                              (".responses", "Responses 状态"), (".responses.tmp", "Responses 状态临时文件")):
             sidecar = _sidecar_dir() / (chat_history_file.name + suffix)
             if sidecar.exists():
                 _delete_path_with_retry(sidecar)

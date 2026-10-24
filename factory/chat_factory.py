@@ -1694,7 +1694,8 @@ async def _run_chat_generation(
             # print(f"[DEBUG] messages: {str(messages)}")
             # 调试打印改为单行概要：不再整包 str(messages)（带图轮次会刷出
             # MB 级 base64，且任务循环每轮重复打印同一张图，易误判为重复携带）
-            logger.debug(f"模型调用消息概要：{_messages_debug_summary(messages)}")
+            if logger.isEnabledFor(10):
+                logger.debug("模型调用消息概要：%s", _messages_debug_summary(messages))
             # 大上下文下整包转储会向控制台刷 MB 级文本并拖慢循环，只打印概要
             # print(f"[DEBUG] 本轮模型调用：消息 {len(messages)} 条")
             full_response = ""
@@ -2783,6 +2784,8 @@ async def _run_chat_generation(
                         # 轨迹数据已由 sub_agent 事件流渲染，这里只带状态聚合
                         tool_ret["tool_return"]["sub_agent"] = tool_result["_sub_agent"]
                     await _stream_emit(stream, f"data: {json.dumps(tool_ret)}\n\n")
+                    from util.api_timing import tool_result_emitted
+                    tool_result_emitted(tool_request)
                     # 以 tool role 添加工具结果消息（符合 OpenAI API 规范）
                     tool_message = {
                         "role": "tool",

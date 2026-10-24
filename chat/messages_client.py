@@ -16,6 +16,7 @@ from .protocols.messages import (
     build_payload, endpoint, headers, normalize_response,
 )
 from .protocols.messages_content import validate_payload
+from .http_pool import default_ssl_context, configure_response
 
 
 class HTTPFailure(RuntimeError):
@@ -60,11 +61,11 @@ def _media_warning():
         '供应商限制媒体类型或数量，已按限制降级并重新请求；未发送内容会明确告知模型。'}})
 
 
-def _wire(config, payload, session_id=None):
+def _wire(config, payload, session_id=None, *, keep_alive=False):
     # Also check resumed requests, which include partial text added after errors.
-    validate_payload(payload, config)
-    url = urlsplit(endpoint(config["url"]))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    validate_payload(payload, config, encoded_body=body)
+    url = urlsplit(endpoint(config["url"]))
     port = url.port or (443 if url.scheme == "https" else 80)
     host_header = url.netloc
     path = url.path + ("?" + url.query if url.query else "")
@@ -81,7 +82,7 @@ def _wire(config, payload, session_id=None):
             request_headers["x-opencode-session"] = stable_id
     lines = [f"POST {path} HTTP/1.1", f"Host: {host_header}"]
     lines.extend(f"{key}: {value}" for key, value in request_headers.items())
-    lines.extend([f"Content-Length: {len(body)}", "Connection: close", "", ""])
+    lines.extend([f"Content-Length: {len(body)}", "Connection: " + ("keep-alive" if keep_alive else "close"), "", ""])
     return url, port, "\r\n".join(lines).encode("utf-8") + body
 
 
@@ -165,19 +166,21 @@ def _commit(request, config, payload, state, parent, appended):
 
 
 def _prepare(transport, request, config, stream):
-    payload, parent, appended = build_payload(request, config, stream)
-    _precheck(transport, payload, config)
-    return payload, parent, appended
+    # Each attempt validates the final payload in _wire, including continuations.
+    return build_payload(request, config, stream, validate=False)
 
 
 def _precheck(transport, payload, config=None):
-    error = transport._precheck_hard_limit(payload)
-    if error:
-        raise MessagesProtocolError(error)
     window = (config or {}).get("maxInputTokens") or (config or {}).get("max_input_tokens")
     if window:
         from .chat_llm import _estimate_payload_input_tokens
         estimated = _estimate_payload_input_tokens(payload)
+        error = transport._precheck_hard_limit(payload, estimated_input=estimated)
+    else:
+        error = transport._precheck_hard_limit(payload)
+    if error:
+        raise MessagesProtocolError(error)
+    if window:
         if estimated >= int(window):
             raise MessagesProtocolError(f"Messages 实际回放上下文约 {estimated} tokens，超过模型窗口 {window}，请压缩历史后重试")
         payload["max_tokens"] = min(payload["max_tokens"], int(window) - estimated)
@@ -254,7 +257,7 @@ def sync_stream(transport, request, config, stop=None):
             sock = socket.create_connection((url.hostname, port), timeout=connect)
             try:
                 if url.scheme == "https":
-                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=url.hostname)
+                    sock = default_ssl_context().wrap_socket(sock, server_hostname=url.hostname)
                 sock.settimeout(drain)
                 step = "send_request"
                 sock.sendall(wire)
@@ -326,6 +329,7 @@ def sync_stream(transport, request, config, stop=None):
 
 
 async def async_stream(transport, request, config, stop=None):
+    from util import api_timing
     connect, read, drain = transport._resolve_timeouts(request, 300, 1800, 120)
     maximum, attempt = _retry_limit(), 0
     prepared = None
@@ -333,18 +337,22 @@ async def async_stream(transport, request, config, stop=None):
         content, output = [], False
         state, step, writer = MessagesStream(), "precheck", None
         try:
+            api_timing.attempt("messages")
             if prepared is None:
                 prepared = _prepare(transport, request, config, True)
             payload, parent, appended = prepared
             _precheck(transport, payload, config)
-            url, port, wire = _wire(config, payload, request.session_id)
+            url, port, wire = _wire(config, payload, request.session_id, keep_alive=True)
+            api_timing.mark("request_ready", payload_bytes=len(wire) - wire.index(b"\r\n\r\n") - 4)
             step = "connect"
             reader, writer = await transport._open_connection(url.hostname, port, url.scheme == "https", connect, stop)
             step = "send_request"
             writer.write(wire)
             await transport._wait_with_stop(writer.drain(), drain, stop)
+            api_timing.mark("request_sent")
             step = "read_status"
             status, response_headers = await _async_head(reader, transport, read, stop)
+            configure_response(reader, response_headers)
             chunked = "chunked" in response_headers.get("transfer-encoding", "").lower()
             if not 200 <= status < 300:
                 body = await transport._aread_full_response_body(reader, chunked, read, stop)
@@ -355,6 +363,7 @@ async def async_stream(transport, request, config, stop=None):
                 frame = frames.feed(line)
                 if frame is None:
                     continue
+                api_timing.mark("first_upstream_event")
                 for event in state.feed(*frame):
                     if event.get("response_complete"):
                         final = _commit(request, config, payload, state.response, parent, appended)
@@ -437,7 +446,7 @@ def nonstream(transport, request, config, stop=None):
             sock = socket.create_connection((url.hostname, port), timeout=connect)
             try:
                 if url.scheme == "https":
-                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=url.hostname)
+                    sock = default_ssl_context().wrap_socket(sock, server_hostname=url.hostname)
                 step = "send_request"
                 sock.settimeout(drain); sock.sendall(wire); sock.settimeout(read)
                 with sock.makefile("rb") as file:

@@ -41,7 +41,7 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(messages_client, "_retry_delay", lambda exc: 0)
     # Never allow a test with an incomplete mock to call an actual provider.
     monkeypatch.setattr(messages_client.socket, "create_connection", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unmocked network")))
-    monkeypatch.setattr(ChatLLM, "_precheck_hard_limit", staticmethod(lambda payload: None))
+    monkeypatch.setattr(ChatLLM, "_precheck_hard_limit", staticmethod(lambda payload, **kwargs: None))
 
 
 def request(**overrides):

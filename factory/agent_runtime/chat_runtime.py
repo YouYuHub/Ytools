@@ -12,7 +12,8 @@ import json
 import uuid
 from typing import Any, Dict, List
 
-from util.logger import get_logger
+from util.logger import get_logger, is_debug_enabled
+from util.token_estimate import text_token_estimate
 
 logger = get_logger("factory.agent_runtime.chat_runtime")
 
@@ -119,9 +120,7 @@ def estimate_text_tokens(value: Any) -> int:
         text = str(value)
     if not text:
         return 0
-    ascii_chars = sum(1 for char in text if ord(char) < 128)
-    non_ascii_chars = len(text) - ascii_chars
-    return max(1, ascii_chars // 4 + non_ascii_chars)
+    return text_token_estimate(text)
 
 
 # 多模态部件只做固定占位估算，避免把 base64/data URL 当普通文本计算。
@@ -205,6 +204,8 @@ def log_upstream_assistant_messages(
     source: str,
 ) -> None:
     """打印实际上游请求中 assistant 消息的序列化内容，便于核对思考回传字段。"""
+    if not is_debug_enabled():
+        return
     assistant_messages = [
         {"index": index, "message": message}
         for index, message in enumerate(serialized_messages)

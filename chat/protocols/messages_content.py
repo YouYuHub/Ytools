@@ -229,7 +229,7 @@ def walk_blocks(messages):
                 yield from walk_blocks([{"content": nested}])
 
 
-def validate_payload(payload, config):
+def validate_payload(payload, config, *, encoded_body=None):
     """Check the actual replay payload. Never trim a signature-bound prefix."""
     window = config.get("maxInputTokens") or config.get("max_input_tokens") or 200000
     limits = config.get("messagesLimits") or {}
@@ -295,7 +295,7 @@ def validate_payload(payload, config):
         raise MessagesProtocolError("同一次请求中的所有文档必须同时启用或关闭 citations")
     if any(enabled) and ((payload.get("output_config") or {}).get("format") or payload.get("output_format")):
         raise MessagesProtocolError("文档 citations 与结构化输出 format 不能同时启用")
-    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    size = len(encoded_body) if encoded_body is not None else len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     maximum = cap("max_request_bytes", MAX_REQUEST_BYTES)
     if size > maximum:
         raise MessagesProtocolError(f"Messages 请求体 {size / 1048576:.1f}MB 超过 {maximum / 1048576:g}MB 上限；请减少附件或分批读取")

@@ -238,7 +238,7 @@ def _json(data):
     return value
 
 
-def _wire(url, headers, method, payload):
+def _wire(url, headers, method, payload, *, keep_alive=False):
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
         raise ResponsesProtocolError("Responses API 地址无效")
@@ -256,7 +256,7 @@ def _wire(url, headers, method, payload):
     for name, value in values.values():
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or any(char in value for char in "\r\n"):
             raise ResponsesProtocolError("Responses 请求头无效，不能包含换行")
-    lines = [f"{method} {path} HTTP/1.1", f"Host: {authority}", "Connection: close", f"Content-Length: {len(body)}"]
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {authority}", "Connection: " + ("keep-alive" if keep_alive else "close"), f"Content-Length: {len(body)}"]
     lines.extend(name + ": " + value for name, value in values.values())
     try:
         packet = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
@@ -392,7 +392,8 @@ class SyncClient(_ClientBase):
             try:
                 sock = socket.create_connection((host, parts.port or (443 if parts.scheme == "https" else 80)), self.request.timeout_connect)
                 if parts.scheme == "https":
-                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                    from .http_pool import default_ssl_context
+                    sock = default_ssl_context().wrap_socket(sock, server_hostname=host)
                 with handoff:
                     if abandoned.is_set():
                         sock.close()
@@ -560,7 +561,11 @@ async def _async_body(headers, io):
 class AsyncClient(_ClientBase):
     async def _call(self, method, suffix, payload, extra_query):
         from .chat_llm import ChatLLM
-        parts, host, packet = _wire(self._url(suffix, extra_query), self.headers, method, payload)
+        from .http_pool import configure_response
+        from util import api_timing
+        api_timing.attempt("responses")
+        parts, host, packet = _wire(self._url(suffix, extra_query), self.headers, method, payload, keep_alive=True)
+        api_timing.mark("request_ready", payload_bytes=len(packet) - packet.index(b"\r\n\r\n") - 4, method=method)
         # Responses 的生成/压缩尝试已在协议客户端登记；底层连接不再登记一遍。
         # GET 查询恢复结果也不是一次新的模型生成。
         reader, writer = await ChatLLM._open_connection(host, parts.port or (443 if parts.scheme == "https" else 80),
@@ -571,7 +576,9 @@ class AsyncClient(_ClientBase):
         try:
             writer.write(packet)
             await ChatLLM._wait_with_stop(writer.drain(), self.request.timeout_drain, self.stop)
+            api_timing.mark("request_sent")
             status, headers = await _async_plan(_head_plan(), io)
+            configure_response(reader, headers)
             chunks = _async_body(headers, io)
             if not 200 <= status < 300 or not (payload and payload.get("stream")) or "application/json" in headers.get("content-type", ""):
                 data = bytearray()
@@ -644,6 +651,9 @@ class _AsyncStream:
                 self.pending.extend(self.decoder.feed(final=True))
             else:
                 self.pending.extend(self.decoder.feed(chunk))
+                if self.pending:
+                    from util.api_timing import mark
+                    mark("first_upstream_event")
         return self.pending.pop(0)
 
     async def close(self):

@@ -1,5 +1,7 @@
 # Messages API 使用说明
 
+发送前重复估算/校验已合并，重试仍重新校验最终请求；增量 SSE、连接复用及耗时日志见 [API 发送性能](api_send_performance.md)。
+
 项目可按模型的有效 `apiType` 调用 Chat Completions、Anthropic 风格的 Messages API 或有状态 Responses API。本文只说明 Messages 的请求格式与能力；聊天、标题、压缩和子智能体四个角色均可选择 Messages，原有 `ChatLLM` 方法名和业务 SSE 格式继续使用。
 
 2026-10-11 更新：已接通图片、PDF、纯文本和自定义内容文档。本文描述当前实现；最初的实施方案保留在 `messages_api_compatibility_plan.md`。

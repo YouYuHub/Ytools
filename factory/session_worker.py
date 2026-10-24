@@ -507,6 +507,8 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                 pass
         from util.mcp_client import close_persistent_mcp_clients
         await asyncio.to_thread(close_persistent_mcp_clients)
+        from chat.http_pool import close_idle_connections
+        close_idle_connections()
         evt_queue.put(None)  # 让 evt 写线程退出
 
 

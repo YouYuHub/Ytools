@@ -192,7 +192,7 @@ def _tool_choice(request, tools):
     return choice
 
 
-def build_payload(request, config, stream):
+def build_payload(request, config, stream, *, validate=True):
     source = []
     for message in request.messages:
         data = _dump(message)
@@ -322,7 +322,8 @@ def build_payload(request, config, stream):
         if payload.get("tool_choice", {}).get("type") in {"any", "tool"}:
             raise MessagesProtocolError("manual thinking 不支持强制工具选择")
     _validate_thinking_sampling(payload)
-    validate_payload(payload, config)
+    if validate:
+        validate_payload(payload, config)
     return payload, parent, appended
 
 

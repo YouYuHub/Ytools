@@ -154,6 +154,8 @@ async def permission_ui_shutdown():
                 await stream.task
             except (asyncio.CancelledError, Exception):
                 pass
+    from chat.http_pool import close_idle_connections
+    close_idle_connections()
 
 
 # ---------- 配置文件热重载（全局轮询线程，不依赖 uvicorn --reload） ----------
