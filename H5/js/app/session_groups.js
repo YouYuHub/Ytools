@@ -36,6 +36,7 @@
   function writePinned(value) {
     try { localStorage.setItem(OPEN_KEY, value ? "1" : "0"); } catch (_) { /* 忽略 */ }
   }
+  window.addEventListener("ytools-preferences-change", () => { pinned = readPinned(); applyOpenState(); });
   function isOpen() { return pinned || hoverOpen; }
 
   function applyOpenState() {

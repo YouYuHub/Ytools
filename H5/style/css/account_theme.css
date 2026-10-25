@@ -1,0 +1,9 @@
+/* Authenticated account pages follow the same saved theme as the workspace. */
+:root[data-theme="light"]{color-scheme:light;--panel:#fff;--line:#dfd9e2;--text:#2c2630;--muted:#746d79;--field:#faf8fb;--button:#f4eff5;--page:#f7f6f9}
+:root[data-theme="dark"]{color-scheme:dark;--panel:#19191d;--line:#36363e;--text:#f0edf1;--muted:#aaa5b0;--field:#101013;--button:#29272e;--page:#111114}
+:root[data-accent="blue"]{--accent:#92bcf5}:root[data-accent="green"]{--accent:#8dd5b2}:root[data-accent="purple"]{--accent:#c4acf3}:root[data-accent="pink"]{--accent:#f4b8d5}:root[data-accent="yellow"]{--accent:#edcf7b}:root[data-accent="none"]{--accent:#b8b8b8}
+:root[data-theme] body.auth-page{background:var(--page)}
+:root[data-theme] .account-shell input,:root[data-theme] .account-shell select,:root[data-theme] .auth-secret{background:var(--field)}
+:root[data-theme] button{background:var(--button);color:var(--text)}
+:root[data-theme] .account-shell .primary{background:var(--accent);color:#281c25}
+@media(max-width:600px){.account-shell nav{flex-wrap:wrap;gap:8px}.account-shell nav h1{font-size:21px}.account-shell nav #logout{margin-left:auto}}

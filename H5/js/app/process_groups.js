@@ -7,6 +7,8 @@
   const controllers = new WeakMap();
   const choices = new Map();
   const recordKeys = new WeakMap();
+  const recordGroups = new WeakMap();
+  let historyGroups = new Map(), choiceRevision = 0;
   let indexedRecords = null, indexedLength = 0, indexedSession = null;
   let sequence = 0;
 
@@ -26,6 +28,7 @@
     return key(node.dataset.round, node.dataset.sourceEvent, node.dataset.historyIndex);
   }
   function remember(group) {
+    if (choices.get(group.key) !== group.open) choiceRevision++;
     choices.set(group.key, group.open);
     if (choices.size > 500) choices.delete(choices.keys().next().value);
   }
@@ -72,6 +75,11 @@
   function openGroup(group, open, user) {
     group.open = open;
     if (user) remember(group);
+    const history = historyGroups.get(group.key);
+    if (history && !open) group.header.dataset.historyIndex = String(history.start);
+    else if (open && group.members[0] && group.members[0].dataset.historyIndex != null) {
+      group.header.dataset.historyIndex = group.members[0].dataset.historyIndex;
+    }
     applyVisibility(group);
     if (App.historyScroll) App.historyScroll.refresh({ preserve: false });
     if (App.updateCodeblockCopyButtons) App.updateCodeblockCopyButtons();
@@ -92,6 +100,12 @@
       if (node.matches(".is-error, .is-failed, .compaction-interrupted") ||
           node.querySelector(".tool-block-tool-icon.is-failed")) failures++;
     });
+    const history = historyGroups.get(group.key);
+    if (history) {
+      think = Math.max(think, history.counts.think || 0);
+      tools = Math.max(tools, history.counts.tool || 0);
+      agents = Math.max(agents, history.counts.agentBlock || 0);
+    }
     const counts = [];
     if (think) counts.push(think + " 段思考");
     if (tools) counts.push(tools + " 次工具调用");
@@ -181,6 +195,8 @@
           if (first.dataset[name] != null) group.header.dataset[name] = first.dataset[name];
           else delete group.header.dataset[name];
         });
+        const history = historyGroups.get(group.key);
+        if (history && !group.open) group.header.dataset.historyIndex = String(history.start);
         members.forEach(function (node) {
           node._processGroup = group;
           node.classList.add("process-stage");
@@ -260,29 +276,50 @@
     if (indexedRecords === records && indexedLength === records.length && indexedSession === App.state.sessionId) return;
     indexedRecords = records; indexedLength = records.length; indexedSession = App.state.sessionId;
     let group = null, round = null;
+    historyGroups = new Map();
     const assigned = [];
     records.forEach(function (record, index) {
-      if (record.kind === "approval" || record.kind === "toolResult") return;
+      recordKeys.delete(record); recordGroups.delete(record);
+      if (record.kind === "approval" || record.kind === "toolResult") {
+        if (round != null && record.round != null && round !== record.round) group = null;
+        if (group) {
+          const info = historyGroups.get(group); info.end = index + 1;
+          assigned.push([record, group]);
+        }
+        return;
+      }
       if (!["think", "tool", "agentBlock", "compaction", "notice"].includes(record.kind)) {
         group = null; return;
       }
       if (!group || round != null && record.round != null && round !== record.round) {
         group = key(record.round, record.source_event_index, index);
+        historyGroups.set(group, {start:index, end:index + 1, counts:{}, stages:0});
       }
       round = record.round;
+      const info = historyGroups.get(group); info.end = index + 1; info.stages++;
+      info.counts[record.kind] = (info.counts[record.kind] || 0) + 1;
       assigned.push([record, group]);
       if (record.kind === "tool" && record.name === "ask_user") group = null;
     });
     // 只有一项的过程直接展示，不参与折叠分组（与 sync 的建组规则一致）
-    const counts = new Map();
-    assigned.forEach(function (pair) { counts.set(pair[1], (counts.get(pair[1]) || 0) + 1); });
     assigned.forEach(function (pair) {
-      if (counts.get(pair[1]) > 1) recordKeys.set(pair[0], pair[1]);
-      else recordKeys.delete(pair[0]);
+      const info = historyGroups.get(pair[1]);
+      if (info.stages > 1) {
+        recordKeys.set(pair[0], pair[1]); recordGroups.set(pair[0], info);
+      } else { recordKeys.delete(pair[0]); recordGroups.delete(pair[0]); }
     });
+  }
+  function windowBounds(records, start, end) {
+    indexRecords(records);
+    const first = records[start], last = records[end - 1];
+    const left = first && recordGroups.get(first), right = last && recordGroups.get(last);
+    if (left && choices.get(recordKeys.get(first)) !== true) start = left.start;
+    if (right && choices.get(recordKeys.get(last)) !== true) end = right.end;
+    return {start, end};
   }
   function tagRecord(node, record) {
     if (recordKeys.has(record)) node._processHistoryKey = recordKeys.get(record);
   }
-  App.processGroups = { sync, reveal, setTimestamp, estimateHeights, indexRecords, tagRecord };
+  App.processGroups = { sync, reveal, setTimestamp, estimateHeights, indexRecords, tagRecord, windowBounds,
+    revision: function () { return choiceRevision; } };
 })(window.App);

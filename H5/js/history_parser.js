@@ -243,7 +243,8 @@
   // 解析 jsonl：首行 _meta，其余为 chat_round 记录或跨轮压缩事件
   // 每条渲染 record 附带 round（1-based 轮次号，与后端 delete_rounds 的
   // start_round 同口径）：供用户消息编辑/删除定位 JSONL 轮次
-  function parseHistory(text) {
+  function parseHistory(text, options) {
+    const offset = options && Number.isInteger(options.roundOffset) && options.roundOffset > 0 ? options.roundOffset : 0;
     const records = [];
     const pendingRoundCompactions = Object.create(null);
     // 带 display_round 锚点的压缩行按轮次号预收集（保持文件顺序）。
@@ -253,12 +254,12 @@
     const anchoredCompactionLines = Object.create(null);
     let metaUsageTotal = 0;
     let metaUsage = {};
-    let roundCounter = 0;
+    let roundCounter = offset;
 
     // 预读轮次时间窗：修复旧 JSONL 中尚无 display_round 锚点的任务内历史压缩事件。
     const parsedLines = [];
     const roundTimeWindows = [];
-    let candidateRoundNo = 0;
+    let candidateRoundNo = offset;
     text.split("\n").forEach(function (line, idx) {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -447,6 +448,7 @@
           };
           // 内置文件工具的展示用 diff（write_file/edit_file）：透传给渲染层
           if (evt.file_diff) toolRec.file_diff = evt.file_diff;
+          if (evt._history_detail) toolRec.history_detail = evt._history_detail;
           records.push(toolRec);
           return;
         }

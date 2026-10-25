@@ -55,7 +55,7 @@
     migrateLegacyBuiltinFlags();
     // List loading and initial navigation are independent. A lightweight lookup
     // validates the target without waiting for every sidebar row to render.
-    const target = new URLSearchParams(location.search).get("session") || "default";
+    const target = new URLSearchParams(location.search).get("session");
     loadSessions();
     if (App.sessionActivity) App.sessionActivity.start();
     App.openInitialSession(target);

@@ -66,8 +66,13 @@ def config(session=None):
         default = _setting(db, "global", dict(LIMITS))
         override = _setting(db, "session:" + session, None) if session else None
         pricing = _setting(db, "pricing", {"currency": "CNY", "models": {}})
+    from security.principal import current
+    personal = current() is not None
+    if personal:
+        from security.preferences import read
+        default = read()["data"].get("task_limits", {}).get("limits", default)
     return {"global": default, "override": override, "limits": override if override is not None else default,
-            "defaults": dict(LIMITS), "pricing": pricing}
+            "defaults": dict(LIMITS), "pricing": pricing, "scope": "account" if personal else "instance"}
 
 
 def save_config(limits, session=None):
@@ -75,6 +80,11 @@ def save_config(limits, session=None):
     if limits is None and not session:
         raise ValueError("全局预算不能为 null")
     normalized = validate_limits(limits) if limits is not None else None
+    from security.principal import current
+    if current() is not None and not session:
+        from security.preferences import update
+        update("task_limits", {"limits": normalized})
+        return config()
     with database() as db:
         if normalized is None:
             db.execute("DELETE FROM settings WHERE scope=?", (scope,))

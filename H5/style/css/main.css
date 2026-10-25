@@ -1181,21 +1181,6 @@ html[data-theme=dark] .panel .session-groups.pinned .session-groups-head .sessio
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.panel .panel-foot .profile-card .profile-info .profile-name-editor {
-  width: 100%;
-  min-width: 0;
-  padding: 1px 6px;
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  outline: none;
-  background: var(--bg-elevated);
-  color: var(--text);
-  font: inherit;
-  font-size: 13px;
-}
-.panel .panel-foot .profile-card .profile-info .profile-name-editor:focus {
-  border-color: #0b84d8;
-}
 .panel .panel-foot .profile-card .profile-info .profile-sub {
   font-size: 12px;
   color: var(--text-tertiary);
@@ -3579,6 +3564,9 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .history-windowed .qnav-load-older {
   display: none;
 }
+.history-windowed .history-page-gap {
+  display: block;
+}
 .history-windowed .history-live-hidden {
   display: none !important;
 }
@@ -3613,6 +3601,27 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 }
 .qnav-load-older.is-hidden {
   display: none;
+}
+
+.history-page-gap {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  font-size: 12px;
+  line-height: 20px;
+}
+.history-page-gap:hover {
+  background: var(--bg-hover);
+}
+.history-page-gap:disabled {
+  cursor: progress;
+  opacity: 0.65;
 }
 
 @keyframes qnav-load-pulse {
@@ -11931,6 +11940,7 @@ body.task-template-open {
 .sidebar-settings-menu .menu-item {
   width: 100%;
   min-width: 0;
+  color: var(--text);
 }
 .sidebar-settings-menu[hidden] {
   display: none !important;
@@ -12256,4 +12266,60 @@ body.task-template-open {
 .task-status button:disabled {
   cursor: wait;
   opacity: 0.6;
+}
+
+.account-panel {
+  width: min(1140px, 100vw - 40px);
+  height: min(900px, 100dvh - 40px);
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  margin: auto;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+.account-panel::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+.account-panel iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.account-panel [hidden] {
+  display: none !important;
+}
+
+.account-panel-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid rgba(136, 136, 136, 0.4);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.account-panel-loading {
+  padding: 60px 28px;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .account-panel {
+    width: 100vw;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
 }

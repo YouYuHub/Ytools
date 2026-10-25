@@ -35,7 +35,11 @@ def write(path, text):
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        from security.resource_limits import storage_write
+        # The temporary file is excluded from the metadata scan. A snapshot
+        # reservation protects concurrent uploads and other session workers.
+        with storage_write(len(data)):
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return len(data)

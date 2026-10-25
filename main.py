@@ -1,17 +1,11 @@
+if __name__ == "__main__":
+    # Import the ASGI module only once; validation runs before runtime watchers.
+    from scripts.serve import main as serve_main
+    serve_main()
+    raise SystemExit(0)
+
 import asyncio
 import threading
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
-
-# 先初始化 .env 路径，再导入任何读取配置的模块：
-# config.py 在 import 时就把 DEFAULT_SERVICE_HOST / DEFAULT_SERVICE_PORT 等
-# 环境变量固化为模块常量，若在此之前导入，.env 中的端口/监听地址会被忽略。
-from env_manager import init_path
-
-init_path(Path(__file__).resolve().parent)
 
 # 加载 env 环境变量
 from config import (
@@ -20,108 +14,26 @@ from config import (
     PROJECT_ROOT,
 )
 from util import config_watcher, ollama_model_watcher
-from util.ui_cache import ui_cache_headers
 from factory.agent_runtime import tool_registry
+from env_manager import init_path
 
 from util.logger import get_logger, setup_logging
 
 logger = get_logger("main")
+
+init_path(PROJECT_ROOT)
 # 启动日志系统：init_path 之后才能读到 .env 的 LOG_LEVEL（后端启动日志等级配置项）
 setup_logging(force=True)
 apply_persisted_work_dir()
 # 初始化 env 路径后才能正确加载到变量
 from config import DEFAULT_SERVICE_HOST, DEFAULT_SERVICE_PORT
 
-# 引入路由，需要在 init_path() 之后
-from routers.chat_router import api_chat_router
-from routers.task_cost_router import api_task_cost_router
-from routers.task_template_router import api_task_template_router
-from routers.chat_config_router import api_chat_config_router, sync_tool_selection_memory
-from routers.tools_manage_router import api_tools_manage_router
-from routers.file_router import api_file_router
-from routers.prompt_router import api_prompt_router
-from routers.export_router import api_export_router
-from routers.file_history_router import api_file_history_router
-from routers.user_profile_router import api_user_profile_router
-from routers.speech_config_router import api_speech_config_router
-from routers.terminal_router import api_terminal_router
-from routers.tool_approval_router import api_permission_router
-from fastapi.staticfiles import StaticFiles
+from routers.chat_config_router import sync_tool_selection_memory
 
 
-# FastAPI 实例化
-app = FastAPI(
-    title="智能体工具使用测试",
-    description="工具类测试",
-    version="v0.2"
-)
+from app_factory import create_app
 
-
-app.middleware("http")(ui_cache_headers)
-
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    
-    def patch_binary_format(schema_part):
-        if isinstance(schema_part, dict):
-            if schema_part.get("type") == "string" and schema_part.get("contentMediaType"):
-                schema_part.setdefault("format", "binary")
-            for value in schema_part.values():
-                patch_binary_format(value)
-        elif isinstance(schema_part, list):
-            for item in schema_part:
-                patch_binary_format(item)
-                
-    patch_binary_format(openapi_schema)
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
-# 跨域设置
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # 允许所有来源
-    allow_credentials=True, # 允许携带 cookie
-    allow_methods=["*"], # 允许所有方法
-    allow_headers=["*"], # 允许所有头部
-    # 暴露非 CORS 安全白名单的响应头：下载接口把文件名放在
-    # Content-Disposition（Content-Type 之外的头默认对 JS 不可见），
-    # file:// 等跨源前端读不到它会把 zip 包错名存成 .jsonl；
-    # X-Skipped-Sessions（批量分享跳过的会话列表）同理需要显式暴露
-    expose_headers=["Content-Disposition", "X-Skipped-Sessions"],
-)
-
-
-@app.get("/", tags=["Root"])
-async def root():
-    """ 根路由 """
-    return {"message": "欢迎使用智能体工具项目(Ytools)接口"}
-
-
-# 包含路由
-app.include_router(api_chat_router, tags=["ChatLLM"])
-app.include_router(api_task_cost_router, tags=["TaskCosts"])
-app.include_router(api_task_template_router, tags=["TaskTemplates"])
-app.include_router(api_chat_config_router, tags=["ChatConfig"])
-app.include_router(api_tools_manage_router, tags=["ToolsManage"])
-app.include_router(api_file_router, tags=["FileUpload"])
-app.include_router(api_prompt_router, tags=["Skills"])
-app.include_router(api_export_router, tags=["Export"])
-app.include_router(api_file_history_router, tags=["FileDiffHistory"])
-app.include_router(api_user_profile_router, tags=["UserProfile"])
-app.include_router(api_speech_config_router, tags=["ChatConfig"])
-app.include_router(api_terminal_router, tags=["Terminal"])
-app.include_router(api_permission_router, tags=["Permissions"])
-app.mount("/ui", StaticFiles(directory=str(PROJECT_ROOT / "H5"), html=True), name="ui")
+app = create_app()
 
 
 @app.on_event("startup")
@@ -129,13 +41,17 @@ async def permission_ui_startup():
     from memory.permission_store import prepare_database
     await asyncio.to_thread(prepare_database)
     from memory.session_listing import recover_pending_sessions
+    def recover():
+        from memory.storage_layout import system_access
+        with system_access(app.state.identity_store, reason="startup checkpoint recovery"):
+            recover_pending_sessions(app.state.history_recovery_stop)
     app.state.history_recovery_stop = threading.Event()
     app.state.history_recovery_thread = threading.Thread(
-        target=recover_pending_sessions, args=(app.state.history_recovery_stop,),
+        target=recover,
         name="history-checkpoint-recovery", daemon=True,
     )
     app.state.history_recovery_thread.start()
-    print(f"聊天页面：http://127.0.0.1:{DEFAULT_SERVICE_PORT}/ui/", flush=True)
+    print(f"聊天页面：{app.state.identity_store.settings.origin}/ui/", flush=True)
 
 
 @app.on_event("shutdown")

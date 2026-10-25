@@ -83,4 +83,10 @@
   applyAccent(ACCENTS.includes(urlAccent) ? urlAccent : getAccentPreference());
 
   global.ThemeManager = { getPreference, setPreference, resolve, getAccentPreference, setAccentPreference, ACCENTS };
+  global.addEventListener("ytools-preferences-change", function () {
+    if (!VALID.includes(urlTheme)) apply(getPreference());
+    if (!ACCENTS.includes(urlAccent)) applyAccent(getAccentPreference());
+    document.dispatchEvent(new CustomEvent("themechange", { detail: { preference: getPreference(), effective: resolve(getPreference()) } }));
+    document.dispatchEvent(new CustomEvent("accentchange", { detail: { accent: getAccentPreference() } }));
+  });
 })(window);

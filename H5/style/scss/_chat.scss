@@ -2296,6 +2296,7 @@ html[data-theme="dark"] {
   }
   .chat-inner > .msg { animation: none; }
   .qnav-load-older { display: none; }
+  .history-page-gap { display: block; }
   .history-live-hidden { display: none !important; }
 }
 
@@ -2332,6 +2333,23 @@ html[data-theme="dark"] {
   }
 
   &.is-hidden { display: none; }
+}
+
+// Server-page gaps remain actionable when the local DOM window is active.
+.history-page-gap {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  font-size: 12px;
+  line-height: 20px;
+  &:hover { background: var(--bg-hover); }
+  &:disabled { cursor: progress; opacity: 0.65; }
 }
 
 @keyframes qnav-load-pulse {

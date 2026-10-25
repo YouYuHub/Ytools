@@ -141,11 +141,15 @@
       if (sequence !== settingsSequence || state.sessionId !== sid) return;
       mode = config.mode; globalMode.value = config.global_mode; sessionMode.value = config.session_mode || "";
       settings = { sid, global: globalMode.value, session: sessionMode.value };
-      globalMode.disabled = false; sessionMode.disabled = !sid;
+      const readonly = window.YtoolsAuth && !window.YtoolsAuth.executionAllowed;
+      settings.readonly = !!readonly;
+      globalMode.disabled = !!readonly; sessionMode.disabled = !!readonly || !sid;
+      if (readonly) status.textContent = "当前账号未获工具执行授权，权限模式只读。";
       await refreshPending(sid);
     } catch (error) { if (sequence === settingsSequence) problem(error); }
   }
   async function saveSettings() {
+    if (settings && settings.readonly) return;
     if (!settings || settings.sid !== state.sessionId) throw new Error("权限配置尚未加载，请重新打开聊天设置");
     const saved = settings, global = globalMode.value, session = sessionMode.value;
     try {

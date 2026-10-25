@@ -278,7 +278,42 @@ def _complete_worker_generation(task: "asyncio.Task", adapter: "_WorkerStreamAda
         asyncio.get_running_loop().create_task(adapter.finish())
 
 
-async def _worker_generate(
+def _security_identity():
+    from memory.storage_layout import require_identity
+    require_identity()
+    from security.principal import current
+    principal = current()
+    return {"user_id": principal.user_id, "directory": str(principal.store.root)} if principal else None
+
+
+async def _worker_generate(session_id, request_data, adapter, runtime_ollama_models=None,
+                           permission_resume_id=None, security_identity=None):
+    """Only the parent IPC supplies identity; it never comes from model JSON."""
+    token = None
+    from memory.storage_layout import _REQUIRED
+    required_token = _REQUIRED.set(bool(security_identity))
+    if security_identity:
+        from dataclasses import replace
+        from memory.identity_store import IdentityStore
+        from security.settings import SecuritySettings
+        from security.principal import CURRENT, Principal
+        store = IdentityStore(replace(SecuritySettings.from_env(), directory=Path(security_identity["directory"])))
+        user = store.user(security_identity["user_id"])
+        if not user or not user["enabled"] or store.owner("session", session_id) != user["id"]:
+            raise PermissionError("后台任务账号或资源授权已失效")
+        token = CURRENT.set(Principal(user["id"], user["username"], user["role"], "", 0, True, "", store))
+    try:
+        if security_identity:
+            from security.preferences import read as read_preferences
+            read_preferences()
+        await _worker_generate_authorized(session_id, request_data, adapter, runtime_ollama_models, permission_resume_id)
+    finally:
+        _REQUIRED.reset(required_token)
+        if token is not None:
+            CURRENT.reset(token)
+
+
+async def _worker_generate_authorized(
     session_id: str,
     request_data: dict,
     adapter: _WorkerStreamAdapter,
@@ -418,6 +453,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                             adapter,
                             raw.get("runtime_ollama_models"),
                             raw.get("permission_resume_id"),
+                            raw.get("security_identity"),
                         )
                     )
 
@@ -726,6 +762,7 @@ class SessionWorkerProxy:
             "request": request_data or {},
             "runtime_ollama_models": runtime_ollama_models,
             "permission_resume_id": permission_resume_id,
+            "security_identity": _security_identity(),
         })
         if not sent:
             with self._state_lock:

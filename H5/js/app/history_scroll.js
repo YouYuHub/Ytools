@@ -180,8 +180,9 @@
     if (view.end === model.records.length) model.live = info.liveHeight;
     model.offsets = Geometry.prefix(model.heights);
   }
-  function normalSpaces(view, gap) {
-    write("--history-prefix-space",model.offsets[view.start]);
+  function normalSpaces(view, gap, info) {
+    const first = info && info.keys.length ? Math.min(view.start, info.keys[0]) : view.start;
+    write("--history-prefix-space",model.offsets[first]);
     write("--history-suffix-space",model.offsets[model.records.length]-model.offsets[view.end]+gap+(view.end<model.records.length ? model.live : 0));
     write("--history-window-shift",0);
   }
@@ -203,6 +204,7 @@
     refreshing = true;
     try {
       const fresh = !model || model.records !== view.records || model.heights.length !== view.records.length;
+      const revision = App.processGroups && App.processGroups.revision ? App.processGroups.revision() : 0;
       const d = dimensions();
       if (fresh) {
         tailNodes = new Set();
@@ -212,12 +214,14 @@
           if (App.exitUserMessageEdit) App.exitUserMessageEdit(node);
           node.remove(); editCache.delete(record);
         });
+      }
+      if (fresh || model.groupRevision !== revision) {
         const fallback = rec => Geometry.estimate(rec,chatInner.clientWidth-48);
         model = {records:view.records, heights:App.processGroups
           ? App.processGroups.estimateHeights(view.records, fallback, measured)
-          : Array.from(view.records, rec => measured.has(rec) ? measured.get(rec) : fallback(rec)), live:0};
+          : Array.from(view.records, rec => measured.has(rec) ? measured.get(rec) : fallback(rec)), live:fresh ? 0 : model.live, groupRevision:revision};
         model.offsets = Geometry.prefix(model.heights);
-        if (frozen) { frozen.offsets = model.offsets.slice(); frozen.live = 0; }
+        if (fresh && frozen) { frozen.offsets = model.offsets.slice(); frozen.live = 0; }
       }
       chatScroll.classList.add("history-windowed");
       rememberTail(); restoreTail(view); restoreEdits();
@@ -226,7 +230,7 @@
       const saved = options && (options.initial || options.preserve === false) ? null : anchor(info);
       const atBottom = view.end === model.records.length && chatScroll.scrollHeight-chatScroll.scrollTop-chatScroll.clientHeight <= 2;
       updateHeights(info,view,d.gap);
-      normalSpaces(view,d.gap);
+      normalSpaces(view,d.gap,info);
       if (options && options.initial) scroll(d.top+model.offsets[view.start]);
       // 用户刚主动上滚时不强制吸底，否则 1~2px 的上滚会被拉回到底，
       // 滚轮继续推又到底、高亮也在首尾跳，体感就是抖动。锚点分支会
@@ -292,6 +296,8 @@
     }
     rendering = true;
     try {
+      const currentAnchor = !frozen && anchor(info);
+      const anchoredIndex = currentAnchor && Number(currentAnchor.node.getAttribute('data-history-index'));
       let options;
       if (frozen) {
         const offsets = frozen.offsets;
@@ -300,15 +306,29 @@
           : Math.min(Math.max(0,wanted.index-8),Geometry.locate(offsets,Math.max(0,offsets[wanted.index]-chatScroll.clientHeight)));
         const end = Math.max(first+48,Geometry.locate(offsets,offsets[wanted.index]+chatScroll.clientHeight*2)+1);
         options = {size:end-first,before:wanted.index-first};
+      } else {
+        // A folded run can contain hundreds of records but only one visible row.
+        // Plan by pixels, so a short raw-record slice cannot strand a blank viewport.
+        const offsets = model.offsets;
+        const unit = wanted.isLive ? offsets[offsets.length-1] + wanted.fraction*model.live
+          : offsets[wanted.index] + wanted.fraction*model.heights[wanted.index];
+        const first = Geometry.locate(offsets, Math.max(0, unit-chatScroll.clientHeight*1.5));
+        const end = Math.max(wanted.index+1, Geometry.locate(offsets, unit+chatScroll.clientHeight*2.5)+1);
+        options = {size:end-first, before:wanted.index-first};
       }
       App.renderHistoryWindowAt(wanted.index,options);
       const after = snapshot(); restoreTail(after); restoreEdits();
       const layout = inspect(), d = dimensions();
       if (frozen) { updateHeights(layout,after,d.gap); placeFrozen(layout,after,wanted); }
       else {
-        updateHeights(layout,after,d.gap); normalSpaces(after,d.gap);
+        updateHeights(layout,after,d.gap); normalSpaces(after,d.gap,layout);
         if (wanted.head) scroll(0);
         else if (wanted.tail) scroll(chatScroll.scrollHeight);
+        else if (currentAnchor && layout.groups.has(anchoredIndex)) {
+          const replacement = layout.groups.get(anchoredIndex)[0];
+          // Spacers were just updated; pre-update rectangles are stale here.
+          scroll(chatScroll.scrollTop+replacement.getBoundingClientRect().top-currentAnchor.y);
+        }
         else {
           const unit = wanted.isLive ? model.offsets[model.records.length]+wanted.fraction*model.live
             : model.offsets[wanted.index]+wanted.fraction*model.heights[wanted.index];
@@ -333,7 +353,7 @@
     const wanted = release ? release.wanted : desiredPosition(), info = release ? release.info : inspect();
     const saved = anchor(info), view = snapshot(), d = dimensions();
     frozen = null;
-    updateHeights(info,view,d.gap); normalSpaces(view,d.gap);
+    updateHeights(info,view,d.gap); normalSpaces(view,d.gap,info);
     if (wanted.head) scroll(0);
     else if (wanted.tail && !cancelled) scroll(chatScroll.scrollHeight);
     else if (saved && saved.node.isConnected) scroll(chatScroll.scrollTop+saved.node.getBoundingClientRect().top-saved.y);

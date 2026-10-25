@@ -13,7 +13,8 @@
     "sass": "^1.102.0"
   },
   "dependencies": {
-    "dompurify": "3.4.17"
+    "dompurify": "3.4.17",
+    "qrcode-generator": "2.0.4"
   },
   "overrides": {
     "source-map-js": "1.2.2"

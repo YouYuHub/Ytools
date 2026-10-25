@@ -13,20 +13,9 @@ from env_manager import load_var       # 环境变量加载
 
 # 程序的根目录，通常用于相对路径的计算
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-
-def _load_service_port(default: int = 48621) -> int:
-    """读取服务端口；.env 里是字符串，非法值回退默认，避免传给 uvicorn/日志时类型不符。"""
-    raw = load_var("DEFAULT_SERVICE_PORT", default)
-    try:
-        return int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-
-
 # 默认服务启动宿主、端口
-DEFAULT_SERVICE_HOST = load_var("DEFAULT_SERVICE_HOST", "0.0.0.0")
-DEFAULT_SERVICE_PORT = _load_service_port()
+DEFAULT_SERVICE_HOST = os.environ.get("DEFAULT_SERVICE_HOST", load_var("DEFAULT_SERVICE_HOST", "127.0.0.1"))
+DEFAULT_SERVICE_PORT = int(os.environ.get("DEFAULT_SERVICE_PORT", load_var("DEFAULT_SERVICE_PORT", 48621)))
 
 # 兼容旧版原始历史上下文与统计的默认轮数；摘要-only 模式下已完成轮次不再按轮回传。
 # 历史轮次窗口（keep_rounds / HISTORY_COMPACT_KEEP_ROUNDS）已废弃：历史规模由
@@ -390,7 +379,7 @@ def get_current_dir() -> str:
 
 
 def get_persisted_work_dir() -> str | None:
-    value = load_var("DEFAULT_CHAT_WORK_DIR", None)
+    value = os.environ.get("DEFAULT_CHAT_WORK_DIR", load_var("DEFAULT_CHAT_WORK_DIR", None))
     if not isinstance(value, str):
         return None
     normalized = value.strip()

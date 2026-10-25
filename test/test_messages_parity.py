@@ -119,7 +119,7 @@ def test_completed_empty_response_retries_before_saving_native_record(monkeypatc
     assert len(sent) == 2
     assert sent[1]['messages'][:-1] == sent[0]['messages']
     assert '上一轮没有返回正文' in sent[1]['messages'][-1]['content'][0]['text']
-    assert len(list((tmp_path / 'native').rglob('*.json'))) == 1
+    assert len(list(native_store._root().rglob('*.json'))) == 1
     if mode == 'nonstream':
         assert result['content'] == '你好'
     else:
@@ -136,7 +136,7 @@ def test_completed_empty_response_retry_limit_is_bounded(monkeypatch, mode, tmp_
         result, sent = run_transport(monkeypatch, request(), [success(mode, []), success(mode, [])], mode)
         assert len(sent) == 2
         assert [event['retrying'] for event in result] == [True, False]
-    assert not list((tmp_path / 'native').rglob('*.json'))
+    assert not list(native_store._root().rglob('*.json'))
 
 
 @pytest.mark.parametrize('reason', ['refusal', 'max_tokens', 'model_context_window_exceeded', 'stop_sequence'])

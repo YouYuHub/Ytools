@@ -102,7 +102,7 @@
     const limits = section("任务预算", "所有额度均为整个任务累计，主模型与子任务共享；全设为无限制即关闭预算限制。保存后用于后续任务，正在等待的任务请在下方单独追加额度。");
     limits.append(node("p", "task-cost-hint", "达到阈值后，在后续模型请求或工具批次派发前等待。已发出的请求与命令仍会完成，可能超出额度；同一工具批次整体放行。费用为本地估算，不能替代供应商账单。"));
     const scope = node("select"); scope.setAttribute("aria-label", "预算配置范围");
-    [["global", "全局默认"], ...(session ? [["session", "仅当前会话"], ["inherit", "当前会话跟随全局"]] : [])].forEach(([value, text]) => {
+    [["global", cfg.scope === "account" ? "账号默认" : "全局默认"], ...(session ? [["session", "仅当前会话"], ["inherit", cfg.scope === "account" ? "当前会话跟随账号默认" : "当前会话跟随全局"]] : [])].forEach(([value, text]) => {
       const option = node("option", "", text); option.value = value; scope.append(option);
     }); scope.value = session ? (cfg.override ? "session" : "inherit") : "global";
     let form;
@@ -138,6 +138,10 @@
       const next = { currency: currency.value, models: Object.assign({}, cfg.pricing.models, { [models.value]: price }) };
       await API.saveTaskPricing(next); App.toast("模型价格已保存"); await load();
     })));
+    if (window.YtoolsAuth && window.YtoolsAuth.user.role !== "admin") {
+      pricing.querySelectorAll("input,select,button").forEach(input => { input.disabled = true; });
+      pricing.append(node("p", "task-cost-hint", "模型价格由管理员统一维护；上方任务预算保存到当前账号。"));
+    }
     if (snapshot && snapshot.tracked) {
       const total = section("当前会话累计", "历史用量作为初始值保留；旧记录中未保存的标题消耗与费用无法追溯。");
       total.append(node("p", "", FormatUtils.fmtNum(snapshot.usage.total_tokens) + " tokens；已计价部分约 " + money(snapshot.cost) + " " + snapshot.currency));

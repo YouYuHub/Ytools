@@ -15,6 +15,9 @@
     if (saved === "0" || saved === "false") statusVisible = false;
   } catch (_) { /* 私密模式等无法访问本地存储时默认显示 */ }
   function current(handle) { return handle && rows.get(handle.sessionId) === handle; }
+  window.addEventListener("ytools-preferences-change", () => {
+    try { statusVisible = !["0", "false"].includes(localStorage.getItem(VIS_KEY)); refresh(); } catch (_) { /* restricted storage */ }
+  });
   function publish(handle) {
     if (App.sessionActivity) App.sessionActivity.note(handle.sessionId, handle.value, handle.id);
   }

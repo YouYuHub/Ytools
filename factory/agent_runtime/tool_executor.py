@@ -193,8 +193,9 @@ def execute_tool_round(
             return index, tool_call, tool_name, tool_args, ret, exc
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        import contextvars
         futures = {
-            executor.submit(execute_tool, idx, tc, tn, ta): (idx, tc, tn, ta)
+            executor.submit(contextvars.copy_context().run, execute_tool, idx, tc, tn, ta): (idx, tc, tn, ta)
             for idx, tc, tn, ta in parsed_tools
         }
         for future in as_completed(futures):

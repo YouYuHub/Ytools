@@ -14,11 +14,11 @@
 
 ### 1. 运行方式
 
-前端为纯静态页面，`main.py` 在 `/ui/` 提供页面。可直接打开 `/ui/` 或在 Edge/Chrome 中打开 `index.html`；无需控制码与配对。全局和每会话权限均在聊天设置配置；允许/拒绝在工具标题栏右侧，子任务顶部与内部提供同步按钮。后端重启后未决定的审批和任务检查点保留。使用说明见 [工具权限](../docs/tool_permissions.md)。后端当前允许跨域请求；如更改后端地址，按下节设置 API 地址。
+`main.py` 在 `/ui/` 提供登录与聊天页面。首管理员由服务器 CLI 创建，账号入口位于侧栏左下角“设置 → 账号与安全”。所有业务 API 使用同源登录 Cookie；写操作自动携带 CSRF。工具审批仍校验执行代次和会话，使用说明见 [工具权限](../docs/tool_permissions.md)。账号与旧数据迁移见 [安全实施说明](../docs/security_implementation.md)。
 
 ### 2. 指定后端地址
 
-API 地址按以下顺序确定：浏览器的 `ytools-api-base` 显式设置 → 通过 HTTP(S) 访问 `/ui/` 时使用当前页面同源地址 → 本地文件或其他路径回退 `http://127.0.0.1:48621`。需要覆盖时在浏览器控制台设置：
+认证页面固定使用当前页面的同源 API，忽略历史 `ytools-api-base` 覆盖。直接打开本地文件不具备登录上下文，仅供独立组件开发；该模式仍保留原有开发覆盖方式：
 
 ```js
 localStorage.setItem('ytools-api-base', 'http://192.168.1.10:48621')
@@ -55,7 +55,7 @@ npm.cmd test           # 运行 test_h5/*.test.js 单元测试
 - 正文之间连续的思考、工具调用、子任务和压缩记录归入“处理过程”，默认折叠，摘要显示数量、运行状态和异常。点击展开后仍可逐项查看详情；当前页面内保留展开选择，包括历史窗口切换。轮次用量行不折叠，直接展示；连续过程只有一项时同样直接展示，不套折叠条。
 - 提问卡片独立展示；新审批到达时自动展开所在过程，允许/拒绝按钮仍在原工具标题栏。搜索定位也会先展开目标所在过程。
 - 过程标题采用紧凑高度；折叠与展开会更新滚动高度，并尽量保留摘要条的位置。触屏设备展开单项后可查看标题时间。
-- 历史仍整份下载，大历史优先通过 Worker 解析。聊天区只渲染当前窗口，其余用占位维持滚动范围；上滚暂停自动贴底，回到底部恢复。窗口重建按原顺序补回实时节点并恢复可见性，详见 [长会话显示修复](../docs/frontend_live_tail.md)。
+- 历史先取最近完整轮次，滚动或导航时按需取页，大工具结果展开后读取。问题导航保留完整轻量索引；大页面优先通过 Worker 解析。聊天区仍按窗口渲染并保持阅读位置，详见 [历史按需加载](../docs/history_paging.md)。
 
 ---
 
@@ -116,7 +116,7 @@ H5/
 │   │   ├── history.js          # 分享导出/加载 JSONL/文件上传 chips
 │   │   ├── compaction.js       # 手动压缩对话（含状态条进度同步）
 │   │   ├── builtin.js          # 内置工具列表、todo 任务计划卡片、ask_user 提问弹窗与工具模态框内置分组；媒体格式转换由后端 read_media 处理
-│   │   ├── user_profile.js     # 访客用户显示名：侧边栏名字点击内联编辑（全局存 .env USER_NAME）
+│   │   ├── user_profile.js     # 当前账号显示名：侧栏内联编辑
 │   │   ├── media.js            # 附件与图片/音视频/文档预览
 │   │   ├── skills.js           # Skills 提示词库：可拖拽对话框（列表/预览/编辑/保存/加载到输入框）
 │   │   ├── composer.js         # 输入区/聊天设置弹窗/功能菜单
@@ -271,7 +271,7 @@ H5/
 | 状态条模型名（app/stats.js） | 状态条中部显示当前会话生效的聊天模型名（hover 显示「当前聊天模型：名称」）：数据源为服务端 `role_info.selection`（会话独立选择 → 全局默认已由后端合并）；切换会话/新建会话强制拉取、其余复用缓存，序号防竞态丢弃过期响应。缓存更新走单一入口 `App.setChatModelConfig(data)`（写缓存 + 原子重绘，杜绝"缓存已换新、状态条仍旧名"的窗口；纯渲染入口 `App.renderChatModelLabel` 供流程整体写缓存后调用），同时同步 `state.chatModelVision`（read_media 可用性与附件提示判定）。**每轮 tokens 行的模型名**另由 `round_model` 帧 / 回放 marker.model 提供（app/chat.js `setRoundModel` 统一入口，附接回放不丢） |
 | 上下文统计条（app/stats.js） | composer 下方常显「30.1k/100k (30.1%)」；容器宽度 ≤420px 时仅显示百分比；ratio≥0.8 黄色警告、≥1 红色危险；详细构成放 hover 提示。不做轮询，仅在 usage 到达/压缩完成/切会话/发消息等事件后 120ms 防抖刷新，in-flight 期间新请求排队合并 |
 | 工作路径（app/workdir.js） | 常显工作目录（会话未覆盖时显示「默认 · 」前缀），双击内联编辑，hover tooltip 显示完整路径：**新对话**（无 sessionId）保存为全局默认（`changeChatDir` → POST /change_chat_dir）；**已有会话**保存为会话独立目录（`API.setSessionWorkDir` → POST /chat_config/work_dir，写 `_meta.work_dir`），清空输入恢复跟随全局默认 |
-| 访客用户显示名（app/user_profile.js） | 侧边栏底部名字点击即内联编辑（Enter/失焦保存、Esc 取消，值未变不发请求），经 `POST /user/profile` 全局保存到项目 `.env` 的 `USER_NAME` 键（非会话级）；首屏 `GET /user/profile` 拉取一次，读取失败保持 HTML 默认文案；留空恢复默认「访客用户」 |
+| 账号显示名（app/user_profile.js） | 侧栏名字可内联编辑，保存到当前账号；空白恢复用户名。“设置 → 账号与安全”提供密码、MFA、登录设备及管理员账号管理。浏览器缓存按账号分区 |
 | 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接。**重复点击跳过重载**：视图就绪跟踪（`readySessionId` / `loadingSessionId`）+ `session_list_utils.shouldOpenSessionOnClick` 判定——点击已完整显示的当前会话（或加载中的会话）不再重新加载，点击其他会话照常切换；显式 `App.openSession(...)`（删除轮次后重载、流失败对齐、深链启动等）不受影响始终真实重载；加载失败不置就绪，可再次点击重试 |
 | 历史渲染（app/messages.js） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对；`read_media` 结果额外附加可展开的图片缩略图条，见下）、轮次 usage 行（含「模型 provider/name」，由轮次 `model` 字段提供）、提示/出错横幅、压缩块（含中断态）；历史轮用户气泡 hover 操作行（复制/编辑/删除/插入对话）：编辑面板支持「重新生成该轮」target_round 原地替换 /「删除该轮及之后」truncate 预演确认；编辑框可直接粘贴剪贴板图片（含截图），显示缩略图并支持移除，确认发送后才上传；新媒体附件上限 6 个，连续粘贴与文件选择共用处理队列，取消编辑释放预览且丢弃未完成的图片处理；「插入对话」同样支持粘贴图片，在所选用户消息之前打开空白编辑面板，发送时带 `insert_round=该轮号-1`，仅用此前的历史作为上下文，后续轮次保留并后移；运行中确认发送会先停止生成；「删除」以 `single` 模式删除该轮整轮；任务启动后端推 `round_started` 和 `round_model`，前端就地补挂操作行并显示本轮模型 |
 | 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——默认复制按钮写入 TSV 与 text/html 两种剪贴板格式，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
@@ -356,7 +356,7 @@ H5/
 
 ## 六、测试
 
-纯逻辑模块均配套 `node:test` 单元测试（无第三方依赖）：
+测试使用 `node:test`，覆盖纯逻辑与 DOM 交互；DOM 用例使用开发依赖 `jsdom`：
 
 ```bash
 npm test          # 全部
@@ -364,6 +364,8 @@ node --test test_h5/markdown.test.js   # 单个
 ```
 
 覆盖范围以 `test_h5/` 的实际用例为准；`npm test` 运行全部 `*.test.js`。历史测试通过数量仅代表对应日期，不替代当前回归结果。浏览器交互脚本需单独执行，长会话验证方式见 [显示修复记录](../docs/frontend_live_tail.md)。
+
+项目根目录执行 `python -m pytest test/test_web_page_flows.py -q` 可用真实 Chromium 验证登录、编辑器保存/回退、跨账号隔离、MFA 凭证轮换及流式刷新恢复。测试使用临时服务和数据；依赖准备、页面清单与拆分记录见 [跨页验证与模块拆分](../docs/refactor_validation_2026-10-25.md)。
 ## 后台终端入口
 
 当前会话存在内置 `run_command` 创建的运行任务时，“+”后显示终端入口，可查看输出、停止、关闭记录或下载日志；最后一条任务结束后隐藏。模型默认短等并按 job_id 自动续读；页面尾部预览不推进模型位置。列表和输出按页面/面板可见性轮询，向上浏览可暂停跟随。交互输入通过模型 `write_stdin` 完成，面板不提供输入框或终端屏幕模拟。完整规则见 [终端管理](../docs/terminal_management.md)。

@@ -12,16 +12,33 @@
     if (restore && menuFocus && menuFocus.isConnected) menuFocus.focus({ preventScroll: true });
     menuAnchor = null;
   }
-  function menuItem(text, path, action) {
-    const item = el("button", "menu-item"); item.type = "button"; item.setAttribute("role", "menuitem");
+  function menuItem(text, path, action, href) {
+    const item = el(href ? "a" : "button", "menu-item");
+    if (href) item.href = href; else item.type = "button";
+    item.setAttribute("role", "menuitem");
     item.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="' + path + '"/></svg>';
     item.append(el("span", "menu-item-label", text));
-    item.addEventListener("click", function () { const anchor = menuAnchor; hideSettings(false); if (anchor) anchor.focus({ preventScroll: true }); action(); });
+    item.addEventListener("click", function (event) { const anchor = menuAnchor; hideSettings(false); if (anchor) anchor.focus({ preventScroll: true }); if (action) action(event); });
     menu.append(item); return item;
   }
   menuItem("归档会话", "M3 3h18v5H3zM5 8v13h14V8M9 12h6", open);
   menuItem("主题", "M12 3a9 9 0 1 0 9 9c0-2-2-3-4-2s-4 0-3-2 0-5-2-5Z", function () { App.openThemePicker(); });
   menuItem("聊天设置", "M4 4v16M12 4v16M20 4v16M1 8h6M9 16h6M17 10h6", function () { App.openChatSettings(); });
+  let accountItem = null;
+  function syncAccountLink() {
+    if (accountItem) accountItem.href = "/ui/account.html" + (state.sessionId ? "?session=" + encodeURIComponent(state.sessionId) : "");
+  }
+  if (window.YtoolsAuth) accountItem = menuItem("账号与安全", "M12 3 3 7v5c0 5 9 9 9 9s9-4 9-9V7zM9 12l2 2 4-4", function (event) {
+    syncAccountLink(); if (App.saveSessionDraft) App.saveSessionDraft();
+    // Keep browser Back correct even if the chat page cannot use bfcache.
+    if (/^https?:$/.test(location.protocol)) {
+      const current = new URL(location.href);
+      if (state.sessionId) current.searchParams.set("session", state.sessionId);
+      else current.searchParams.delete("session");
+      history.replaceState(history.state, "", current.href);
+    }
+    if (event && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey && App.accountPanel && App.accountPanel.open()) event.preventDefault();
+  }, "/ui/account.html");
   function statusToggleLabel() {
     const visible = !App.taskStatus || !App.taskStatus.isStatusVisible || App.taskStatus.isStatusVisible();
     return visible ? "隐藏会话状态" : "显示会话状态";
@@ -42,18 +59,23 @@
   App.sidebarSettings = { toggle: function (anchor) {
     if (!menu.hidden && menuAnchor === anchor) { hideSettings(true); return; }
     hideSettings(false); App.closeMenus(); if (App.closeSessionMenus) App.closeSessionMenus();
-    syncStatusToggleItem();
+    syncStatusToggleItem(); syncAccountLink();
     menuFocus = anchor; menuAnchor = anchor; menu.hidden = false; anchor.setAttribute("aria-expanded", "true");
     const rect = anchor.getBoundingClientRect(), bounds = menu.getBoundingClientRect();
     menu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - bounds.width - 8)) + "px";
     menu.style.top = Math.max(8, Math.min(rect.top - bounds.height - 8, window.innerHeight - bounds.height - 8)) + "px";
-    menu.querySelector("button").focus({ preventScroll: true });
+    menu.querySelector('[role="menuitem"]').focus({ preventScroll: true });
   } };
   document.addEventListener("click", function (event) { if (!menu.hidden && !menu.contains(event.target) && !anchors.some(anchor => anchor.contains(event.target))) hideSettings(false); });
   window.addEventListener("resize", function () { hideSettings(true); });
-  window.addEventListener("scroll", function (event) { if (!menu.hidden && !menu.contains(event.target)) hideSettings(false); }, true);
+  window.addEventListener("scroll", function (event) {
+    const target = event.target;
+    if (menu.hidden || (target && target.nodeType && menu.contains(target))) return;
+    // Independent chat/history scrolling does not move the fixed sidebar anchor.
+    if (target === document || target === window || (menuAnchor && target && target.contains && target.contains(menuAnchor))) hideSettings(false);
+  }, true);
   menu.addEventListener("keydown", function (event) {
-    const items = Array.from(menu.querySelectorAll("button")), at = items.indexOf(document.activeElement);
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]')), at = items.indexOf(document.activeElement);
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); hideSettings(true); }
     if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); items[(at + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length].focus(); }
     if (event.key === "Tab") hideSettings(true);

@@ -4,7 +4,7 @@
   width: min(232px, calc(100vw - 16px));
   max-height: calc(100dvh - 16px);
   overflow-y: auto;
-  .menu-item { width: 100%; min-width: 0; }
+  .menu-item { width: 100%; min-width: 0; color: var(--text); }
   &[hidden] { display: none !important; }
 }
 .archive-modal {

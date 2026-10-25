@@ -17,14 +17,16 @@
  * 主页面同窗口写入不触发自身 storage 事件，靠 BroadcastChannel 覆盖；
  * 两者同时到达时由订阅方防抖合并。
  *
- * 存储键与通道名固定（不区分会话）：标记只表示"发生过文件链写操作"，
+ * 存储键与通道名按账号隔离（不区分会话）：标记只表示"发生过文件链写操作"，
  * 刷新时按当前会话拉取，天然多会话安全。
  */
 (function (global) {
   "use strict";
 
   const STORAGE_KEY = "ytools-file-history-dirty";
-  const CHANNEL_NAME = "ytools-file-history";
+  const scopedKey = name => global.YtoolsAuth && typeof global.YtoolsAuth.storageKey === "function" ? global.YtoolsAuth.storageKey(name) : name;
+  const STORAGE_EVENT_KEY = scopedKey(STORAGE_KEY);
+  const CHANNEL_NAME = scopedKey("ytools-file-history");
 
   let memoryDirty = false; // localStorage 不可用（Node 单测/隐私模式）时的内存降级
 
@@ -113,7 +115,8 @@
     let storageListener = null;
     if (typeof global.addEventListener === "function") {
       storageListener = function (event) {
-        if (!event || event.key !== STORAGE_KEY) return;
+        if (!event || event.key !== STORAGE_EVENT_KEY || event.newValue === null) return;
+        if (event.storageArea && storageAvailable() && event.storageArea !== global.localStorage) return;
         try {
           handler({ type: "dirty", at: Date.now() });
         } catch (_) {

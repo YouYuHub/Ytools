@@ -40,13 +40,19 @@ def resolve_path(value, root):
 def protected(path):
     path = Path(path).resolve()
     from memory.permission_store import ROOT as control_root
+    from security.principal import current
+    principal = current()
+    if principal and inside(path, principal.store.root):
+        return True
     return (inside(path, control_root) or inside(path, APP_ROOT / "history_files" / "sidecars")
             or (inside(path, APP_ROOT) and (path.name.startswith("permission_") or "tool_approval" in path.name))
-            or path in {APP_ROOT / ".env", APP_ROOT / "setting" / "mcp_servers.json",
+            or path in {APP_ROOT / ".env", APP_ROOT / "models.json", APP_ROOT / "setting" / "models.json", APP_ROOT / "setting" / "mcp_servers.json",
                         APP_ROOT / "H5" / "js" / "app" / "permissions.js"})
 
 
 def plan_tool(name, args, context, *, server=None, original_name=None):
+    from security.authorization import tool_boundary
+    tool_boundary(name, args, context)
     args = json.loads(json.dumps(args))
     is_mcp = bool(server and server != "__builtin__") or name not in LOCAL_TOOLS
     if not is_mcp and any(str(key).startswith("_permission") or key == "permission_mode" for key in args):

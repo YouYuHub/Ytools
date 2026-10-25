@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .venv/
+.venv-security/
 venv/
 .vs/
 .playwright-mcp/
@@ -19,6 +20,7 @@ setting/models.json
 setting/key-*.txt
 agents_message_board.txt
 prompt/md_files/git推送Ytools项目说明.md
+prompt/md_files/*/
 test/123.py
 tmp_*.py
 _tmp_*.txt

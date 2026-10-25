@@ -16,8 +16,13 @@ class Conflict(ValueError):
 
 @contextmanager
 def database():
-    ROOT.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(ROOT / "templates.sqlite3", timeout=20)
+    from memory.storage_layout import require_identity
+    require_identity()
+    from security.principal import current
+    principal = current()
+    directory = ROOT / principal.user_id if principal else ROOT
+    directory.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(directory / "templates.sqlite3", timeout=20)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
@@ -54,8 +59,9 @@ def save(definition, identifier=None, version=None):
     if len(body.encode("utf-8")) > 262144:
         raise ValueError("单个模板不能超过 256KB")
     now = now_str()
+    from security.resource_limits import storage_write
     try:
-        with database() as db:
+        with storage_write(len(body.encode("utf-8")) + 8192), database() as db:
             if identifier:
                 changed = db.execute("UPDATE templates SET name=?,name_key=?,description=?,body=?,version=version+1,updated_at=? WHERE id=? AND version=?",
                                      (definition["name"], definition["name"].casefold(), definition["description"], body, now, identifier, version)).rowcount

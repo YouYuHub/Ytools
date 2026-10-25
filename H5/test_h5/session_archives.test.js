@@ -5,9 +5,10 @@ const path = require('node:path');
 const { JSDOM } = require('jsdom');
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function setup() {
-  const dom = new JSDOM('<body><main><button id="profileCard">设置</button><button id="railAvatar">Y</button><div id="sessionActionsMenu"></div><div class="composer-wrap"></div></main></body>', { runScripts:'outside-only', pretendToBeVisual:true });
+function setup(authenticated=false) {
+  const dom = new JSDOM('<body><main><button id="profileCard">设置</button><button id="railAvatar">Y</button><div id="sessionActionsMenu"></div><div class="composer-wrap"></div></main></body>', { url:'http://localhost/ui/?session=previous', runScripts:'outside-only', pretendToBeVisual:true });
   const w=dom.window, calls=[], notices=[], archived=new Set(['old','other']), opened=[];
+  if(authenticated)w.YtoolsAuth={};
   w.CSS={escape:String};
   const rows=[{id:'old',title:'已归档 <img src=x>',updated_at:'2026-10-21'}, {id:'other',title:'另一条历史',updated_at:'2026-10-20'}];
   w.App={state:{sessionId:'old',hasConversation:true},el(tag,cls,text){const n=w.document.createElement(tag);if(cls)n.className=cls;if(text!=null)n.textContent=text;return n;},toast:text=>notices.push(text),
@@ -31,6 +32,16 @@ test('settings popup includes archives/theme, supports keyboard, and stays indep
   assert.equal(x.$('#sidebarSettingsMenu').hidden,true);
   x.w.App.sidebarSettings.toggle(anchor);x.$('#sidebarSettingsMenu').dispatchEvent(new x.w.KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
   assert.equal(x.$('#sidebarSettingsMenu').hidden,true);assert.equal(x.w.document.activeElement,anchor);
+});
+
+test('account navigation carries only the current session and refreshes after choosing new chat',t=>{
+  const x=setup(true);t.after(x.close);let saved=0;x.w.App.saveSessionDraft=()=>saved++;
+  const anchor=x.$('#profileCard');x.w.App.state.sessionId='会话 A & B';x.w.App.sidebarSettings.toggle(anchor);
+  const link=x.$('#sidebarSettingsMenu a');assert.equal(link.getAttribute('href'),'/ui/account.html?session='+encodeURIComponent('会话 A & B'));
+  link.addEventListener('click',event=>event.preventDefault());link.click();assert.equal(saved,1);
+  assert.equal(new URL(x.w.location.href).searchParams.get('session'),'会话 A & B');
+  x.w.App.state.sessionId=null;x.w.App.sidebarSettings.toggle(anchor);assert.equal(link.getAttribute('href'),'/ui/account.html');
+  link.click();assert.equal(new URL(x.w.location.href).searchParams.has('session'),false);
 });
 
 test('settings popup toggles session status visibility and label follows external changes',t=>{
@@ -88,4 +99,14 @@ test('query change and closing cancel stale lists; late responses cannot overwri
   pending[0].resolve({sessions:[{id:'stale',title:'Stale'}],total:1,archived_count:1,next_offset:null});await settle();assert.equal(x.$('.archive-row').dataset.session,'new');
   x.w.App.archives.close();x.w.App.archives.open();x.w.App.archives.close();assert.equal(pending[2].signal.aborted,true);
   pending[2].resolve({sessions:[{id:'late',title:'Late'}],total:1,archived_count:1,next_offset:null});await settle();assert.equal(x.$('.archive-row').dataset.session,'new');
+});
+
+test('independent chat scrolling keeps sidebar settings usable; moving the anchor closes it',t=>{
+  const x=setup(true);t.after(x.close);
+  const chat=x.w.document.createElement('div');chat.id='chatScroll';x.w.document.body.append(chat);
+  x.w.App.sidebarSettings.toggle(x.$('#profileCard'));
+  chat.dispatchEvent(new x.w.Event('scroll'));assert.equal(x.$('#sidebarSettingsMenu').hidden,false);
+  x.$('main').dispatchEvent(new x.w.Event('scroll'));assert.equal(x.$('#sidebarSettingsMenu').hidden,true);
+  x.w.App.sidebarSettings.toggle(x.$('#profileCard'));
+  x.w.dispatchEvent(new x.w.Event('scroll'));assert.equal(x.$('#sidebarSettingsMenu').hidden,true);
 });

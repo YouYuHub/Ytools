@@ -71,6 +71,7 @@ from memory.file_memory import (
 from routers.chat_config_router import get_chat_work_dir_config  # noqa: F401 — 兼容历史导入路径
 
 from util.logger import get_logger
+from security.authorization import visible_session as _visible_session
 
 logger = get_logger("routers.chat_router")
 
@@ -131,6 +132,9 @@ async def chat_with_tool(request: Request):
     直接 400 可读错误，不默默截断。旧请求无该字段时行为完全不变。
     """
     body = await request.json()
+    from security.authorization import can_execute
+    if not can_execute():
+        body["tool_names"] = []
     if isinstance(body, dict):
         for key in ("responses_context", "wire_protocol", "protocol_config"):
             body.pop(key, None)
@@ -297,7 +301,7 @@ async def chat_stream_statuses():
     compactions = {sid for sid in list(_MANUAL_COMPACTION_JOBS) if _manual_compaction_running(sid)}
     return JSONResponse(headers={"Cache-Control": "no-store"}, content={"sessions": [
         {"session_id": sid, "chat_running": sid in chats, "compacting": sid in compactions}
-        for sid in sorted(chats | compactions)
+        for sid in sorted(chats | compactions) if _visible_session(sid)
     ]})
 
 
@@ -427,7 +431,35 @@ async def get_chat_history_file(session_id: str = "default"):
         raise HTTPException(status_code=500, detail="读取会话历史文件失败")
     if text is None:
         raise HTTPException(status_code=404, detail="Chat session file not found")
-    return Response(content=text, media_type="text/plain; charset=utf-8")
+    from security.redaction import history
+    return Response(content=history(text), media_type="text/plain; charset=utf-8")
+
+
+@api_chat_router.get('/chat_history/page')
+async def get_chat_history_page(session_id: str, before: int | None = Query(None, ge=1),
+                                around: int | None = Query(None, ge=1), limit: int = Query(20, ge=1, le=100),
+                                revision: str | None = Query(None, max_length=64), include_questions: bool = True):
+    """Read-only pages of complete rounds; stale snapshots fail explicitly."""
+    if before is not None and around is not None:
+        raise HTTPException(422, "before 和 around 不能同时指定")
+    from security.authorization import session
+    canonical = await asyncio.to_thread(session, normalize_session_id(session_id))
+    from memory.permission_store import has_restorable_round
+    if await asyncio.to_thread(has_restorable_round, canonical):
+        # Preserve the existing saved-checkpoint overlay for active/suspended
+        # approvals and edit/insert recovery; it is not an ordinary disk page.
+        return {"fallback_full": True}
+    from memory.history_pages import page
+    return await asyncio.to_thread(page, canonical, before=before, around=around,
+                                   limit=limit, revision=revision, include_questions=include_questions)
+
+
+@api_chat_router.get('/chat_history/event')
+async def get_chat_history_event(session_id: str, round_no: int = Query(..., ge=1),
+                                  event_index: int = Query(..., ge=0), revision: str = Query(..., min_length=64, max_length=64)):
+    """Read one deferred tool result from an unchanged, owned snapshot."""
+    from memory.history_pages import detail
+    return await asyncio.to_thread(detail, normalize_session_id(session_id), round_no, event_index, revision)
 
 
 @api_chat_router.get('/chat_history/meta')
@@ -446,7 +478,8 @@ async def get_chat_history_meta(session_id: str = "default"):
         meta = await manager.get_session_meta()
         from memory.session_archives import status
         archive = await asyncio.to_thread(status, normalize_session_id(session_id))
-        return JSONResponse(content={**meta, **archive})
+        from security.redaction import for_member
+        return JSONResponse(content=for_member({**meta, **archive}))
     except HTTPException as e:
         raise e
     except Exception:
@@ -820,7 +853,8 @@ async def preview_chat_import(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         base_id = normalize_session_id(filename)
-        exists = _get_chat_history_file(base_id).exists()
+        from memory.chat_memory import import_target_exists
+        exists = import_target_exists(base_id)
         upload_dir_name = ""
         if isinstance(base_meta, dict) and isinstance(base_meta.get("upload_id"), str):
             upload_dir_name = _safe_session_id(base_meta["upload_id"])

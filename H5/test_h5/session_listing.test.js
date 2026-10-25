@@ -64,6 +64,12 @@ test('initial navigation is independent of the slow list and protects user navig
   releaseTarget([{id:'other'}]);await typing;assert.deepEqual(x.opened,['s100']);
 });
 
+test('homepage without an explicit session starts a new chat without lookup or errors',async()=>{
+  const x=setup();x.ctx.API.listSessionSummaries=()=>assert.fail('an empty target must not request default');
+  for(const value of [null,undefined,'','   '])await x.ctx.openInitialSession(value);
+  assert.equal(x.ctx.state.sessionId,null);assert.equal(x.opened.length,0);assert.equal(x.notices.length,0);
+});
+
 test('missing/failed startup lookup does not open/create a phantom session; old servers avoid N meta calls',async()=>{
   const x=setup();x.ctx.API.listSessionSummaries=async()=>[];
   await x.ctx.openInitialSession('missing');assert.equal(x.opened.length,0);

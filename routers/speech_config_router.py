@@ -1,4 +1,4 @@
-"""Low-frequency, project-wide browser speech preference persisted in .env."""
+"""Account speech preference; standalone calls retain instance defaults."""
 from threading import RLock
 
 from fastapi import APIRouter, HTTPException
@@ -24,20 +24,25 @@ class SpeechInputRequest(BaseModel):
 
 
 def _stored_language() -> str | None:
-    # This preference belongs to .env, not models.json's runtime overrides.
-    raw = env_manager.env_vars.get(ENV_KEY)
+    from security.principal import current
+    from security.preferences import runtime_value
+    raw = runtime_value(ENV_KEY) if current() else env_manager.env_vars.get(ENV_KEY)
     value = raw.strip() if isinstance(raw, str) else ""
     return value if value in SUPPORTED_LANGUAGES else None
 
 
 def _payload() -> dict:
     stored = _stored_language()
+    from security.principal import current
+    fallback = env_manager.env_vars.get(ENV_KEY, DEFAULT_LANGUAGE)
+    if fallback not in SUPPORTED_LANGUAGES:
+        fallback = DEFAULT_LANGUAGE
     return {
-        "language": stored or DEFAULT_LANGUAGE,
+        "language": stored or fallback,
         "default_language": DEFAULT_LANGUAGE,
         "persisted": stored is not None,
         "env_name": ENV_KEY,
-        "source": "project .env",
+        "source": "account" if current() else "project .env",
     }
 
 
@@ -54,6 +59,12 @@ def update_speech_input_config(request: SpeechInputRequest):
     language = request.language.strip()
     if language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail="不支持的语音识别语言，请从语言列表中选择")
+    from security.principal import current
+    if current() is not None:
+        from security.preferences import set_runtime
+        previous = _stored_language()
+        set_runtime({ENV_KEY: language}, only_if_unset=request.only_if_unset)
+        return {**_payload(), "updated": not (request.only_if_unset and previous is not None)}
     with _lock:
         if request.only_if_unset and _stored_language() is not None:
             return {**_payload(), "updated": False}

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>登录 · Ytools</title>
+  <link rel="icon" href="favicon-squid.svg"><link rel="stylesheet" href="login.css?v=cfc07dd9fd3f">
+  <script defer src="js/vendor/qrcode-generator/qrcode.js?v=79ec86f82856"></script>
+  <script defer src="js/mfa_enrollment.js?v=18320bf58bfb"></script>
+  <script defer src="js/recovery_codes.js?v=9bda765794be"></script>
+  <script defer src="js/login_mfa_management.js?v=2aefa866a961"></script>
+  <script defer src="login.js?v=9caa859fd17a"></script>
+</head>
+<body class="auth-page">
+  <main class="auth-card">
+    <header><img src="favicon-squid.svg" alt="" width="42" height="42"><div><h1>Ytools</h1><p>登录你的工作区</p></div></header>
+    <p id="authMessage" class="auth-message" role="status" aria-live="polite">正在确认服务状态…</p>
+    <section id="setupHelp" hidden><h2>首次使用</h2><p>请在服务器的项目目录创建管理员：</p><code>python scripts/manage_accounts.py init-admin --username admin</code><p>随后刷新此页。公开注册已关闭。</p></section>
+    <form id="loginForm" hidden>
+      <label>用户名<input name="username" autocomplete="username" required maxlength="64" autofocus></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required maxlength="128"></label>
+      <button type="submit">登录</button>
+    </form>
+    <form id="mfaForm" hidden>
+      <p class="auth-step">密码已验证，5 分钟内可直接重试验证码。</p>
+      <p>打开 Google Authenticator 或 Microsoft Authenticator 中的 Ytools 条目，输入当前动态码；已绑定后无需重复扫码。</p>
+      <label><span id="mfaCodeLabelText">验证器验证码或恢复码</span><input name="code" autocomplete="one-time-code" required maxlength="64"></label>
+      <button type="submit">验证并进入</button>
+      <details id="mfaRecoveryHelp" class="mfa-manual">
+        <summary>设备丢失／无法使用验证器？</summary>
+        <p>可使用另一台已绑定的验证器，或绑定时保存的一条未使用恢复码。</p>
+        <button id="useRecoveryCode" type="button" class="secondary">使用恢复码登录</button>
+        <button id="replaceLostDevice" type="button" class="secondary" hidden>用恢复码更换丢失设备</button>
+        <p>没有备用设备和恢复码时，请联系服务器管理员核验身份，在服务器项目目录执行：</p>
+        <code id="mfaResetCommand">python scripts/manage_accounts.py reset-mfa --username YOUR_ACCOUNT</code>
+        <small>使用与服务相同的 Python 环境和配置。恢复后用原密码登录并重新扫码；账号和聊天数据保留。仅有网页访问权限无法执行此命令。</small>
+      </details>
+    </form>
+    <button id="loginMfaOpen" type="button" class="secondary" hidden>扫码添加／更换验证器</button>
+    <section id="loginMfaManage" hidden aria-labelledby="loginMfaTitle">
+      <h2 id="loginMfaTitle">添加／更换验证器</h2>
+      <form id="loginMfaForm">
+        <fieldset id="loginMfaProof" class="mfa-proof">
+          <p>先验证当前动态码或恢复码，再生成新的二维码；本次已验证的密码无需重复输入。</p>
+          <label>操作<select name="mode"><option value="add">添加另一验证器（保留现有）</option><option value="replace">更换验证器（停用全部旧的）</option></select></label>
+          <label>新验证器名称<input name="label" value="Google Authenticator" required maxlength="32"></label>
+          <label>当前验证器动态码或恢复码<input name="code" autocomplete="one-time-code" required maxlength="64"></label>
+        </fieldset>
+        <p id="loginMfaHint" class="auth-step">添加后，新旧验证器都可登录。</p>
+        <div id="loginMfaEnrollment" hidden></div>
+        <label id="loginMfaNewCode" hidden>新验证器中的 6 位动态码<input name="new_code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label>
+        <button id="loginMfaSubmit" type="submit">验证身份并生成二维码</button>
+        <button id="loginMfaCancel" type="button" class="secondary">返回验证码登录</button>
+      </form>
+      <small>无法使用当前验证器时，可填写恢复码；两者都丢失请联系服务器管理员恢复。</small>
+    </section>
+    <form id="enrollForm" hidden>
+      <p id="enrollIntro">首次绑定：使用 Google Authenticator 或 Microsoft Authenticator 扫码，再输入 6 位动态码确认。</p>
+      <div id="mfaEnrollment" hidden></div>
+      <label id="enrollPassword">确认当前密码<input name="password" type="password" autocomplete="current-password" maxlength="128" required></label>
+      <label id="enrollCode" hidden>验证器中的 6 位动态码<input name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label>
+      <button type="submit" id="enrollButton">生成验证二维码</button>
+    </form>
+    <section id="recovery" hidden><h2>保存恢复码</h2><p>仅显示这一次；每条只能使用一次。请保存到密码管理器或下载备份，与验证器分开保管。</p><pre id="recoveryCodes" class="auth-secret"></pre><button id="recoveryCopy" type="button">复制恢复码</button><button id="recoveryDownload" type="button">下载恢复码</button><button id="enterApp" type="button">已安全保存，进入工作区</button></section>
+    <section id="loginComplete" hidden><button id="loginCompleteEnter" type="button">进入工作区</button><a class="account-link" href="/ui/account.html#mfaManage">进入账号与安全</a></section>
+    <button id="changeAccount" type="button" class="secondary" hidden>使用其他账号登录</button>
+    <footer>账号由管理员创建 · 登录凭证不存入浏览器本地存储</footer>
+  </main>
+</body>
+</html>

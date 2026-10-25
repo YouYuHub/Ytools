@@ -1,14 +1,5 @@
 # coding: utf-8
-"""访客用户配置接口：全局显示名的读取与保存（项目 .env 的 USER_NAME 键）。
-
-账号 / 数据库体系落地前的过渡实现——显示名不挂在任何会话上，全局唯一，
-持久化在项目 .env（env_manager.set_env_vars 写盘 + 同步内存 env_vars，
-配置热重载线程也会把外部直接改文件的改动同步回内存）。前端侧边栏点击名字
-即可编辑；留空 = 清空该键值，界面回退默认「访客用户」。
-
-后续接入数据库管理用户时，只需替换本路由的数据源（读写 USER_NAME 的两端），
-对外的 GET/POST /user/profile 契约保持不变。
-"""
+"""HTTP 资料读写当前账号；无身份的内部组件调用保留旧 .env 兼容分支。"""
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -59,6 +50,12 @@ def _current_user_name() -> str:
 
 def _profile_payload() -> dict:
     """组装用户资料响应体（读写接口共用，保证字段一致）。"""
+    from security.principal import current
+    principal = current()
+    if principal:
+        user = principal.store.user(principal.user_id)
+        return {"state": "succeed", "name": user["name"], "default_name": user["username"],
+                "max_length": MAX_USER_NAME_LENGTH, "persisted": True, "source": "account"}
     raw_value = load_var(USER_NAME_ENV_KEY)
     stored, _ = _normalize_user_name(raw_value)
     return {
@@ -105,6 +102,11 @@ async def update_user_profile(req: UserProfileRequest):
         normalized, error = _normalize_user_name(req.name)
         if error:
             raise HTTPException(status_code=400, detail=error)
+        from security.principal import current
+        principal = current()
+        if principal:
+            principal.store.profile(principal.user_id, normalized or principal.username[:MAX_USER_NAME_LENGTH])
+            return {**_profile_payload(), "message": "显示名已更新"}
 
         previous_raw = load_var(USER_NAME_ENV_KEY)
         # 空值也写入（清空语义）：键位保留为空串，读取侧回退默认名

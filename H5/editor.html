@@ -1,14 +1,16 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="light" data-ytools-auth-required>
 
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>文件 diff 编辑器 · Ytools</title>
+  <script src="js/security_client.js?v=1134f5f8effb"></script>
+<script src="js/account_preferences.js?v=91859faccf0d"></script>
   <link rel="icon" href="favicon-editor.png" type="image/x-icon" />
   <!-- 主题初始化（读 localStorage ytools-theme-preference，避免闪白） -->
-  <script src="js/theme.js"></script>
-  <link rel="stylesheet" href="style/css/main.css" />
+  <script src="js/theme.js?v=4e162c450c69"></script>
+  <link rel="stylesheet" href="style/css/main.css?v=6076ff5f5d65" />
 </head>
 
 <body class="eh-page">
@@ -51,38 +53,38 @@
     </section>
   </div>
 
-  <script src="js/api.js"></script>
-  <script src="js/file_history_sync.js"></script>
+  <script src="js/api.js?v=fe8215a2efd6"></script>
+  <script src="js/file_history_sync.js?v=c503f9e598e4"></script>
   <!-- Prism 语法高亮（与主应用同一套语言包） -->
-  <script src="js/vendor/prism/prism-core.min.js"></script>
-  <script src="js/vendor/prism/prism-clike.min.js"></script>
-  <script src="js/vendor/prism/prism-c.min.js"></script>
-  <script src="js/vendor/prism/prism-csharp.min.js"></script>
-  <script src="js/vendor/prism/prism-javascript.min.js"></script>
-  <script src="js/vendor/prism/prism-qml.min.js"></script>
-  <script src="js/vendor/prism/prism-typescript.min.js"></script>
-  <script src="js/vendor/prism/prism-css.min.js"></script>
-  <script src="js/vendor/prism/prism-less.min.js"></script>
-  <script src="js/vendor/prism/prism-scss.min.js"></script>
-  <script src="js/vendor/prism/prism-sass.min.js"></script>
-  <script src="js/vendor/prism/prism-markup.min.js"></script>
-  <script src="js/vendor/prism/prism-markup-embed.js"></script>
-  <script src="js/vendor/prism/prism-python.min.js"></script>
-  <script src="js/vendor/prism/prism-python-imports.js"></script>
-  <script src="js/vendor/prism/prism-java.min.js"></script>
-  <script src="js/vendor/prism/prism-cpp.min.js"></script>
-  <script src="js/vendor/prism/prism-go.min.js"></script>
-  <script src="js/vendor/prism/prism-rust.min.js"></script>
-  <script src="js/vendor/prism/prism-bash.min.js"></script>
-  <script src="js/vendor/prism/prism-json.min.js"></script>
-  <script src="js/vendor/prism/prism-cmake.min.js"></script>
-  <script src="js/vendor/prism/prism-makefile.min.js"></script>
-  <script src="js/vendor/prism/prism-docker.min.js"></script>
-  <script src="js/vendor/prism/prism-yaml.min.js"></script>
-  <script src="js/vendor/prism/prism-ini.min.js"></script>
-  <script src="js/vendor/prism/prism-ignore.min.js"></script>
-  <script src="js/vendor/prism/prism-diff.min.js"></script>
-  <script src="js/app/editor.js"></script>
+  <script src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
+  <script src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
+  <script src="js/vendor/prism/prism-c.min.js?v=9e05cf21207b"></script>
+  <script src="js/vendor/prism/prism-csharp.min.js?v=f4eca14394e5"></script>
+  <script src="js/vendor/prism/prism-javascript.min.js?v=0345ea83e12b"></script>
+  <script src="js/vendor/prism/prism-qml.min.js?v=726421a5868b"></script>
+  <script src="js/vendor/prism/prism-typescript.min.js?v=852f5513bb9c"></script>
+  <script src="js/vendor/prism/prism-css.min.js?v=8c9760dba7f2"></script>
+  <script src="js/vendor/prism/prism-less.min.js?v=25fdec342714"></script>
+  <script src="js/vendor/prism/prism-scss.min.js?v=149a0fb3381c"></script>
+  <script src="js/vendor/prism/prism-sass.min.js?v=4602dab08d39"></script>
+  <script src="js/vendor/prism/prism-markup.min.js?v=879fc9d256c3"></script>
+  <script src="js/vendor/prism/prism-markup-embed.js?v=6f0d576c0df2"></script>
+  <script src="js/vendor/prism/prism-python.min.js?v=ed4385685bcf"></script>
+  <script src="js/vendor/prism/prism-python-imports.js?v=d4a283db4fa1"></script>
+  <script src="js/vendor/prism/prism-java.min.js?v=4c2dc81dfc9e"></script>
+  <script src="js/vendor/prism/prism-cpp.min.js?v=12077d9ea678"></script>
+  <script src="js/vendor/prism/prism-go.min.js?v=1225b4afb593"></script>
+  <script src="js/vendor/prism/prism-rust.min.js?v=8ca261bb9643"></script>
+  <script src="js/vendor/prism/prism-bash.min.js?v=6260814110e5"></script>
+  <script src="js/vendor/prism/prism-json.min.js?v=5d2da0b8f4fc"></script>
+  <script src="js/vendor/prism/prism-cmake.min.js?v=85e8381e765e"></script>
+  <script src="js/vendor/prism/prism-makefile.min.js?v=09ee00312ffe"></script>
+  <script src="js/vendor/prism/prism-docker.min.js?v=1fc4a810d2de"></script>
+  <script src="js/vendor/prism/prism-yaml.min.js?v=b0e2b0579050"></script>
+  <script src="js/vendor/prism/prism-ini.min.js?v=139dcc920987"></script>
+  <script src="js/vendor/prism/prism-ignore.min.js?v=b7b21eb5b7fa"></script>
+  <script src="js/vendor/prism/prism-diff.min.js?v=f16816fb2242"></script>
+  <script src="js/app/editor.js?v=bd39d9607374"></script>
 </body>
 
 </html>

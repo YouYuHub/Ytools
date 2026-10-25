@@ -91,7 +91,10 @@ def _session_lock(session_id: str):
 
 
 def _root_dir(session_id: str) -> Path:
-    return HISTORY_DIFF_ROOT / _safe_session_id(session_id) / DIFF_DIRECTORY_NAME
+    from security.authorization import session as authorize_session
+    authorize_session(session_id)
+    from memory.storage_layout import files_path
+    return files_path(HISTORY_DIFF_ROOT.parent, session_id, legacy_root=HISTORY_DIFF_ROOT) / DIFF_DIRECTORY_NAME
 
 
 def file_key(path: str) -> str:

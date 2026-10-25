@@ -160,7 +160,10 @@ def _fingerprint(path: Path) -> str:
 
 def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event, *, archive_scope="all", archives=None):
     known = {row[0]: row[1] for row in db.execute("SELECT filename,fingerprint FROM sessions")}
-    paths = [path for path in root.glob("*.jsonl") if path.is_file() and not path.is_symlink()]
+    from memory.storage_layout import iter_chat_paths
+    paths = [path for path in iter_chat_paths(root) if path.is_file() and not path.is_symlink()]
+    from security.authorization import visible_session
+    paths = [path for path in paths if visible_session(path.name[:-11] if path.name.endswith("_chat.jsonl") else path.stem)]
     filenames = {path.name for path in paths}
     archives = archives or {}
     changed, skipped_files, checked_files, indexed_files, excluded_files = False, 0, 0, 0, 0
@@ -254,7 +257,10 @@ def search_history(query: str, *, limit: int = 40, offset: int = 0,
         archives = archive_snapshot(root)
         index_dir = root / "sidecars"
         index_dir.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(index_dir / "history_search.sqlite3", timeout=15)
+        from security.principal import current
+        principal = current()
+        index_name = "history_search" + ("_" + principal.user_id if principal else "") + ".sqlite3"
+        db = sqlite3.connect(index_dir / index_name, timeout=15)
         db.row_factory = sqlite3.Row
         db.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         _schema(db)

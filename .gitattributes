@@ -1,0 +1,2 @@
+# Asset URLs contain hashes of exact bytes. Keep them stable on Windows/Linux.
+H5/** -text whitespace=cr-at-eol

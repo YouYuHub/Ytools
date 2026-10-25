@@ -36,7 +36,12 @@ def isolated(monkeypatch, tmp_path):
     from collections import OrderedDict
     from util import media_limits
     monkeypatch.setattr(media_limits, '_cache', OrderedDict())
-    monkeypatch.setattr(native_store, "_root", lambda: tmp_path / "native")
+    # Exercise the real managed layout. Overriding only _root() no longer
+    # redirects account-aware protocol_path() and can escape this test's tree.
+    from memory import chat_memory
+    monkeypatch.setattr(chat_memory, "HISTORY_ROOT", tmp_path / "history")
+    monkeypatch.setattr(chat_memory, "LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr(chat_memory, "_session_managers", {})
     monkeypatch.setattr(messages_client, "_retry_limit", lambda: 1)
     monkeypatch.setattr(messages_client, "_retry_delay", lambda exc: 0)
     # Never allow a test with an incomplete mock to call an actual provider.

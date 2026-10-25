@@ -14,7 +14,7 @@ def _root(root=None):
     return chat_memory.HISTORY_ROOT
 
 
-def snapshot(root=None):
+def snapshot(root=None, *, filtered=True):
     path = _root(root) / "sidecars" / "session_archives.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -25,6 +25,13 @@ def snapshot(root=None):
     if any(not isinstance(sid, str) or not isinstance(item, dict) or not isinstance(item.get("archived_at"), str)
            for sid, item in raw["sessions"].items()):
         raise ValueError("归档状态条目异常，请检查 sidecars/session_archives.json")
+    if filtered:
+        from security.authorization import owned_sessions
+        allowed = owned_sessions()
+        if allowed is not None:
+            from security.principal import current
+            principal = current()
+            return {sid: value for sid, value in raw["sessions"].items() if principal.store.resource_key("session", sid) in allowed}
     return raw["sessions"]
 
 
@@ -43,7 +50,7 @@ def set_archived(session_id, archived):
         path = chat_memory._get_chat_history_file(sid)
         if path.is_symlink() or not path.is_file():
             raise FileNotFoundError("会话不存在，无法更改归档状态")
-        entries = snapshot(root)
+        entries = snapshot(root, filtered=False)
         if archived:
             entries.setdefault(sid, {"archived_at": datetime.now(timezone.utc).isoformat()})
         else:
@@ -59,7 +66,7 @@ def forget(session_id):
     if not (root / "sidecars" / "session_archives.json").exists():
         return
     with cross_process_lock(root / "sidecars" / "session_archives.lock"):
-        entries = snapshot(root)
+        entries = snapshot(root, filtered=False)
         if entries.pop(normalize_session_id(session_id), None) is not None:
             write_json(root / "sidecars" / "session_archives.json", {"version": 1, "sessions": entries})
 

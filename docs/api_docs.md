@@ -2,7 +2,7 @@
 
 服务地址: `http://<host>:48621` ｜ 在线文档: `/docs`（Swagger）
 
-> 当前后端没有统一身份认证，监听地址的代码回退值为 `0.0.0.0`（实际值由本机配置决定），且 `/file/get_local_file` 支持读取绝对路径。请只在受信任的环境中使用；本机运行建议在 `.env` 中设置 `DEFAULT_SERVICE_HOST=127.0.0.1`。
+> 业务 API 强制账号认证、CSRF 和会话归属校验，默认监听 `127.0.0.1`。页面与 API 必须同源；生产模式强制 HTTPS。首管理员由本地 CLI 创建，公开注册关闭。完整设置、权限与 Linux 部署步骤见 [安全实施说明](security_implementation.md)。
 
 `main.py` 在 `/ui/` 托管 H5 页面，`/` 返回 JSON，`/docs` 提供 Swagger。推荐打开 `http://127.0.0.1:48621/ui/`；API 地址、前端本地打开方式和构建流程见 [前端说明](../H5/README.md) 与 [维护说明](project_maintenance.md)。内置工具的简短用法见 [工具简表](builtin_tools.md)。
 
@@ -146,6 +146,8 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
 | /chat_history/summaries | GET | session_id?, archive_scope=active/archived/all（默认active）, with_archive_state? | 批量轻量摘要 `[{id, filename, title, updated_at, created_at, group_id}]`；范围过滤后只读对应首行，在后台线程执行，不初始化管理器。with_archive_state=true 返回 `{sessions, archived_ids}`，不下载归档摘要。指定 session_id 只查该会话，打开归档需传 all；不存在返回空数组，不创建文件。详见 [归档说明](session_archives.md) |
 | /chat_history/search | GET | q(1–200字符), limit(1–100,默认40), offset(默认0), revision?, archive_scope=active/archived/all（默认active） | 所选范围内的会话文字搜索；范围外跳过正文索引更新及文字匹配，返回文件名、片段与轮次/事件定位，详见 [会话全文搜索](history_search.md)。分页期间记录或归档状态变化返回409 |
 | /chat_history/file | GET | session_id | 下载会话 JSONL 文件（首行 `_meta` 元数据） |
+| /chat_history/page | GET | session_id；limit 默认 20（1–100）；before 或 around；revision?；include_questions? | 完整轮次分页、绝对轮次偏移、轻量问题索引；内容版本改变返回 409；检查点合并回退原路径。见 [历史分页](history_paging.md) |
+| /chat_history/event | GET | session_id、round_no、event_index、revision | 从当前账号的原快照读取一条按需工具结果；其他账号或非工具事件拒绝访问 |
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
@@ -980,32 +982,13 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
   （复制图片 canvas：列宽两轮收敛 + 行高自适应，长文本逐字换行不再截断）。
   测试: `test/test_table_export.py`（17 用例）、`H5/test_h5/table_export.test.js`。
 
-## 11. 访客用户 UserProfile
+## 11. 账号资料 UserProfile
 
-账号 / 数据库体系落地前的过渡实现：全局唯一的「显示名」存项目 `.env` 的 `USER_NAME` 键，
-前端侧边栏底部点击名字即可就地编辑（Enter / 失焦保存，Esc 取消）。
+`GET /user/profile` 返回当前账号的 `{state,name,default_name,max_length,persisted,source:"account"}`，不返回主机配置路径。`POST /user/profile` 接受 `{name}`，保存到当前账号记录；去首尾空白、最多 32 字符、拒绝控制字符，空白恢复为用户名。侧栏仍支持就地编辑。
 
-> 后续接入数据库管理用户时，只需替换 `routers/user_profile_router.py` 中读写 `USER_NAME`
-> 的两端（`load_var` / `set_env_vars`），对外契约保持不变。
+账号安全 API：`/auth/status`、`/auth/login`、`/auth/me`、`/auth/csrf`、`/auth/logout`、`/auth/logout_all`、`/auth/sessions`、`/auth/mfa/start|confirm|verify`、`/auth/reauthenticate`、`/user/password`、`/user/usage`；管理员使用 `/admin/users`、`/admin/users/{id}`、`/admin/users/{id}/password`、`/admin/users/{id}/limits`、`/admin/audit`。具体方法和请求结构以受保护的 OpenAPI 为准。
 
-### GET /user/profile
-- 返回: `{"state","name","default_name","max_length","persisted","env_name","env_value","env_file","source"}`
-  - `name`：当前生效显示名；`.env` 未设置 / 被清空 / 存量值非法时回退 `default_name`（默认「访客用户」，常量 `config.DEFAULT_USER_NAME`）
-  - `persisted`：`.env` 是否显式保存过有效显示名（`false` = 正在使用默认值）
-  - `max_length`：显示名长度上限（`config.MAX_USER_NAME_LENGTH`，默认 32）
-
-### POST /user/profile
-- Body: `{"name": "新的显示名"}`
-  - 去首尾空白后保存；**空白串 = 清空该键值**，界面回退默认名（键位保留为空串）
-  - 校验（400）：超长（> `MAX_USER_NAME_LENGTH`）、含换行/制表等控制字符
-- 行为: 经 `env_manager.set_env_vars` 写回项目 `.env`（读入原文件 → 整体重写 + 同步内存
-  `env_vars`，下一次请求立即生效）；`.env` 被外部直接编辑时由配置热重载线程同步。
-- **读回校验**：保存后立即读回比对，若值因 `.env` 语法被改写（`#` 注释截断、已定义
-  `${VAR}` 变量引用展开、引号被 `strip` 去除等）则**回滚为保存前的值并返回 400**，
-  避免出现「保存成功但显示不对」。含未定义 `${VAR}` 的输入不会被展开，属可保存内容。
-- 返回: 同 GET 结构 + `message`（如「显示名已更新为「张三」」/「显示名已恢复默认「访客用户」」）
-- 前端: `H5/js/app/user_profile.js`（内联编辑交互）、`H5/js/api.js`
-  （`getUserProfile` / `updateUserProfile`）。测试: `test/test_user_profile_router.py`（13 用例）。
+新会话可先 `POST /chat_history/ensure_session` `{session_id}` 登记归属，服务不会因此创建空 JSONL。已有未归属历史不能被在线认领，必须由 CLI 明确迁移。普通成员 `/chat_with_tool` 强制 `tool_names=[]`；显式请求主机工具返回 403。账号级额度跨会话、重试、辅助模型和 worker 累计。
 
 
 ### 子智能体全局限制与独立停止
@@ -1035,7 +1018,7 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
 | `/tool_approvals/preview` | POST | `{session_id, source}`；返回预览审批或绑定来源的短期票据 |
 | `/permissions/media` | GET | `session_id/source/grant?`；未经批准的外部来源 403，支持本地媒体 Range |
 
-按后续需求已移除权限控制码；上述接口无需 Bearer 认证，启动后直接访问 `/ui/`。审批决定仍校验会话、审批 ID 和执行代次。媒体仍使用绑定来源/会话的短期读取票据，内部签名密钥每次服务启动更换，用户无需配对。
+这些接口使用服务端登录 Cookie；写操作还需匹配 Origin 与 `X-CSRF-Token`。审批决定校验账号、会话、审批 ID 和执行代次。媒体读取票据绑定账号、登录设备、认证版本、会话与来源，5 分钟到期；撤销登录立即失效。主机文件与外部预览仅向具备工具执行权限的账号开放。
 
 SSE 新增 `{event:"tool_approval",phase:"requested"|"resolved"|"cancelled",approval:{id,task_id,epoch,session_id,agent_id,tool_call_id,state,tool,args,paths,sources,root,reason,server,original_name,round,tool_index,seq?,parent_tool_call_id?,...}}`。`round` 为父会话轮次，子任务附带模型调用轮次 `seq` 及父派发调用 ID，用于绑定主工具、子任务内部工具与顶部的同步审批按钮。事件落在 `chat_round.events`，审批事件仅用于落盘审计，不单独生成展示块；刷新时从 pending 接口恢复原工具块上的有效按钮。原有正文和思考格式保留，`tool_return` 补充 `tool_call_id` 防止同名并发工具结果串位；拒绝生成带原 tool call ID 的配对错误结果。
 

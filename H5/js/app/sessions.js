@@ -1005,6 +1005,8 @@
   let sessionOpenSeq = 0;
 
   async function openInitialSession(rawId) {
+    // An ordinary homepage is a new conversation, never an implicit shared ID.
+    if (rawId == null || !String(rawId).trim()) { startNewChat(); return false; }
     const id = SessionUtils.sanitizeSessionId(rawId), seq = sessionOpenSeq, previous = state.sessionId;
     const initialInput = input.value;
     try {
@@ -1181,12 +1183,15 @@
     // 刷新引导/队列暂存指示器：只显示属于当前会话的条目
     App.renderPendingOutbox();
     try {
-      const text = await API.fetchSessionFile(id);
+      let parsed = App.historyPages ? await App.historyPages.open(id,options) : null;
       // 等待期间用户已切到其他会话，丢弃过期响应，避免误覆盖
       if (seq !== sessionOpenSeq) return false;
-      const parsed = await (typeof HistoryParseAsync !== "undefined"
-        ? HistoryParseAsync.parse(text)
-        : HistoryParser.parseHistory(text));
+      if(!parsed) {
+        const text = await API.fetchSessionFile(id);
+        parsed = await (typeof HistoryParseAsync !== "undefined"
+          ? HistoryParseAsync.parse(text)
+          : HistoryParser.parseHistory(text));
+      }
       if (seq !== sessionOpenSeq) return false;
       const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
       // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay

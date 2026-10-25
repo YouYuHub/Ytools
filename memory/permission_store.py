@@ -131,6 +131,10 @@ def policy(session=None):
     with database() as db:
         rows = {row[0]: row[1] for row in db.execute("SELECT scope,mode FROM policies")}
     default = rows.get("global", "ask")
+    from security.principal import current
+    if current() is not None:
+        from security.preferences import read
+        default = read()["data"].get("permission", {}).get("mode", default)
     override = rows.get("session:" + session) if session else None
     if default not in {"ask", "full_control"}:
         default = "ask"
@@ -142,6 +146,14 @@ def policy(session=None):
 def set_policy(mode, session=None):
     if mode not in {None, "ask", "full_control"} or (session is None and mode is None):
         raise ValueError("权限模式必须为 ask 或 full_control；会话可用 null 跟随全局")
+    from security.principal import current
+    if current() is not None:
+        from security.authorization import require_execution
+        require_execution()
+        if not session:
+            from security.preferences import update
+            update("permission", {"mode": mode})
+            return policy()
     scope = "session:" + session if session else "global"
     with database() as db:
         if mode is None:
@@ -158,6 +170,9 @@ def export_session_policies(sessions):
     included, while global policy, requests, checkpoints and grants stay local.
     """
     sessions = list(dict.fromkeys(sessions))
+    from security.authorization import session as authorize_session
+    for identifier in sessions:
+        authorize_session(identifier)
     scopes = ["session:" + session for session in sessions]
     with database() as db:
         modes = dict(db.execute(
@@ -243,6 +258,8 @@ def merge_shared_policy(session, mode):
     """Merge one validated override; never touch the global or other sessions."""
     if not session or mode not in {None, "ask", "full_control"}:
         raise ValueError("分享包会话权限配置无效")
+    from security.authorization import session as authorize_session
+    authorize_session(session)
     with database() as db:
         if mode is None:
             db.execute("DELETE FROM policies WHERE scope=?", ("session:" + session,))

@@ -563,7 +563,7 @@
       return;
     }
     const version = ++speechConfigVersion;
-    setSpeechConfigStatus("正在同步项目默认语种…");
+    setSpeechConfigStatus(window.YtoolsAuth ? "正在同步账号语音设置…" : "正在同步项目默认语种…");
     try {
       let data = await speechConfigRequest("getSpeechInputConfig");
       if (version !== speechConfigVersion) return;
@@ -573,7 +573,7 @@
         if (version !== speechConfigVersion) return;
       }
       adoptSpeechConfig(data);
-      setSpeechConfigStatus(speechDeferredLanguage
+      setSpeechConfigStatus(data.source === "account" ? "已同步账号语音设置，登录其他设备后也会恢复" : speechDeferredLanguage
         ? "已同步项目默认；当前听写保持原语种，下次启动生效"
         : data.persisted ? "已从项目 .env 同步；清除浏览器网站数据后仍可恢复"
           : "项目未设置语种，使用默认普通话；选择后会保存到 .env");
@@ -602,11 +602,11 @@
     }
     speechConfigSaving = true;
     if (speechLanguageSelect) speechLanguageSelect.disabled = true;
-    setSpeechConfigStatus("正在保存到项目 .env…");
+    setSpeechConfigStatus(window.YtoolsAuth ? "正在保存到账号…" : "正在保存到项目 .env…");
     try {
       const data = await speechConfigRequest("updateSpeechInputConfig", next, false);
       adoptSpeechConfig(data);
-      setSpeechConfigStatus(speechDeferredLanguage
+      setSpeechConfigStatus(data.source === "account" ? "已保存到当前账号，登录其他设备后也会恢复" : speechDeferredLanguage
         ? "已保存到项目 .env；下次启动听写时使用新语种"
         : "已保存到项目 .env，所有浏览器共用默认语种");
       if (wasActive) toast("语音语言已保存，请点击麦克风继续；草稿已保留");
@@ -1132,6 +1132,7 @@
 
   async function openChatSettings() {
     if (App.chatSettingsSaving) return;
+    if (typeof window !== "undefined" && window.YtoolsAuth && !window.YtoolsAuth.preferences) { toast("服务正在升级账号设置，请稍后刷新页面再试"); return; }
     const version = App.chatSettingsLoadVersion = (App.chatSettingsLoadVersion || 0) + 1;
     const sid = state.sessionId;
     chatSettingsModal.classList.remove("hidden");

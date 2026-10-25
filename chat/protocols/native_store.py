@@ -22,16 +22,12 @@ def _root():
 def _path(session_id, record_id):
     if not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{32}", record_id):
         raise ValueError("Invalid native replay reference")
-    session_key = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()
-    return _root() / session_key / (record_id + ".json")
+    return session_directory(session_id) / (record_id + ".json")
 
 
 def session_directory(session_id):
-    root = _root().resolve()
-    directory = (root / hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()).resolve()
-    if directory.parent != root:
-        raise ValueError("Native session path escaped its storage root")
-    return directory
+    from memory.storage_layout import protocol_path
+    return protocol_path(_root().parent.parent, session_id, "messages")
 
 
 def source_key(config):

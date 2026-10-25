@@ -1099,12 +1099,17 @@ def _persist_env_values(updated_vars: dict[str, Any], coding: str = "utf-8") -> 
 
 
 def set_env_vars(values: dict[str, Any], coding: str = "utf-8") -> dict[str, str]:
-    """批量写入 .env 并同步更新内存中的 env_vars。
+    """登录身份的聊天行为参数保存到账号；其他配置写入实例 .env。
 
     返回 {key: 写入磁盘的实际字符串}，调用方可用于响应体展示。
     函数末尾会通过 ``global env_vars`` 显式绑定全局字典，
     以防 hot-reload 或并发场景下 env_vars 被上游 ``init_path()`` 重建。
     """
+    if isinstance(values, dict) and values:
+        from security.principal import current
+        from security.preferences import RUNTIME_KEYS, set_runtime
+        if current() is not None and set(values) & RUNTIME_KEYS:
+            return set_runtime(values)
     if not isinstance(values, dict):
         raise TypeError("values 必须是字典")
     # 显式声明全局，保证调用方通过 env_manager.env_vars 取到的就是本函数更新后的字典。
@@ -1281,11 +1286,15 @@ def load_var(var_name: str, default: str = None,
     #coding: str = "utf-8"
 ) -> str | None:
     """
-    加载.env文件中的变量值
+    优先读取账号聊天参数快照，再读取实例配置；非个人参数不查询账号库。
     :param var_name: 变量名
     :param default: 默认值
     :return: 变量值
     """
+    from security.preferences import runtime_value
+    personal = runtime_value(var_name)
+    if personal is not None:
+        return personal
     if env_file is None and setting_file is None:
         return default
         # raise ValueError("env_file is not set, please call init_path() first")

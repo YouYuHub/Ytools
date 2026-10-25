@@ -625,6 +625,13 @@ window.App = window.App || {};
   function saveSidebarWidth() {
     try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarPreferredWidth)); } catch (_) { /* 存储不可用时仍允许本次拖动 */ }
   }
+  window.addEventListener("ytools-preferences-change", () => {
+    if (sidebarResizePointer !== null) return;
+    try {
+      const width = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+      if (Number.isInteger(width) && width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH) { sidebarPreferredWidth = width; applySidebarWidth(); }
+    } catch (_) { /* restricted storage */ }
+  });
 
   function finishSidebarResize(commit) {
     if (sidebarResizePointer === null) return;

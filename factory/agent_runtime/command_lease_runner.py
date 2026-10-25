@@ -72,7 +72,10 @@ def run(spec_path):
         if process:
             process.finish()
         if writer:
-            writer.join(0.25)
+            # EOF can let the child exit before its accepted receipt commits.
+            # Give bounded metadata retries time to finish; never resend input.
+            from util.atomic_json import RETRY_DELAYS
+            writer.join(sum(RETRY_DELAYS) + 1.0)
         from util.file_lock import cross_process_lock
         with cross_process_lock(spec_path.with_suffix('.input.lock'), timeout=3):
             command_jobs.write_metadata(outcome_path, outcome)

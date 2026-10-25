@@ -253,3 +253,26 @@ def test_input_to_closed_pipe_fails_without_replay(logs):
     result=json.loads(ack.read_text(encoding='utf-8'))
     assert result['status']=='failed' and 'closed' in result['error']
     assert not request.exists()
+
+
+def test_receipt_commit_retries_windows_occupation_without_replaying_input(logs,monkeypatch):
+    from factory.agent_runtime import command_input
+    spec=logs/'bg_lease_receipt.json'
+    request=logs/'bg_lease_receipt.input.abc.json'
+    command_jobs.write_metadata(request,{'fingerprint':'hash','chars':'exactly once','eof':False})
+    original=os.replace;delivered=[];failures=[];alive=[True]
+    def replace(source,target):
+        # The initial 'writing' marker is durable. Only its final accepted
+        # replacement collides, after stdin has already been delivered.
+        if str(target).endswith('.ack.json') and delivered and len(failures)<2:
+            failures.append(True)
+            raise PermissionError('simulated Windows reader holds receipt')
+        return original(source,target)
+    monkeypatch.setattr(command_jobs.os,'replace',replace)
+    def write(chars):
+        delivered.append(chars);alive[0]=False
+    command_input.serve(spec,write,lambda:None,lambda:alive[0])
+    receipt=json.loads(request.with_name(request.stem+'.ack.json').read_text(encoding='utf8'))
+    assert failures==[True,True] and delivered==['exactly once']
+    assert receipt['status']=='accepted' and receipt['accepted_bytes']==12
+    assert not request.exists() and not list(logs.glob('*.tmp'))

@@ -1310,7 +1310,8 @@ class ChatLLM:
             return invoke()
         streaming = request.stream if stream is None else stream
         def metered():
-            if current(request) is None:
+            from security.principal import current as identity
+            if current(request) is None and identity() is None:
                 return invoke()
             return tracked_call(invoke, request, streaming, stop_checker, ChatLLM._resolve_chat_config(model_config))
         return api_timing.traced_call(metered, request, streaming)

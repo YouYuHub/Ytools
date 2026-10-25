@@ -113,8 +113,13 @@ def _normalized_dir_for_compare(directory: str | None) -> str | None:
         return directory.replace("\\", "/").casefold()
 
 
+def _setting_memory_value(name):
+    from security.principal import current
+    return load_var(name) if current() else env_manager.env_vars.get(name)
+
+
 def _history_compaction_memory_state() -> dict[str, str | None]:
-    """动态读取 env_manager.env_vars，避免 init_path 重绑定字典后的陈旧引用。"""
+    """读取当前账号的有效值；无身份的维护调用读取实例配置。"""
     env_names = (
         "HISTORY_COMPACT_KEEP_ROUNDS",
         "HISTORY_COMPACT_TRIGGER_RATIO",
@@ -122,7 +127,7 @@ def _history_compaction_memory_state() -> dict[str, str | None]:
         "HISTORY_COMPACT_REJECT_OVERSIZED_FACTOR",
         "HISTORY_COMPACT_MAX_OVERSIZED_REJECTIONS",
     )
-    return {name: env_manager.env_vars.get(name) for name in env_names}
+    return {name: _setting_memory_value(name) for name in env_names}
 
 
 _CONTEXT_RETURN_ENV_NAMES = {
@@ -132,8 +137,8 @@ _CONTEXT_RETURN_ENV_NAMES = {
 
 
 def _context_return_memory_state() -> dict[str, str | None]:
-    """动态读取 env_manager.env_vars，确保实时修改后内存值与 .env 保持一致。"""
-    return {name: env_manager.env_vars.get(name) for name in _CONTEXT_RETURN_ENV_NAMES.values()}
+    """读取当前账号的有效配置，未设置时继承实例默认值。"""
+    return {name: _setting_memory_value(name) for name in _CONTEXT_RETURN_ENV_NAMES.values()}
 
 
 def _context_return_config_payload() -> dict:
@@ -450,7 +455,7 @@ async def get_context_return_config():
 async def update_context_return_config(payload: ContextReturnConfig):
     """实时更新两个回传长度并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下次聊天请求立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下次聊天请求立即生效
     - 0 表示不回传，负数表示全部回传
     """
     try:
@@ -500,7 +505,7 @@ def _mcp_tool_config_payload() -> dict:
             "call_timeout_seconds": _MCP_TOOL_ENV_NAME,
         },
         "memory_state": {
-            _MCP_TOOL_ENV_NAME: env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+            _MCP_TOOL_ENV_NAME: _setting_memory_value(_MCP_TOOL_ENV_NAME),
         },
     }
 
@@ -515,7 +520,7 @@ async def get_mcp_tool_config():
 async def update_mcp_tool_config(payload: McpToolConfig):
     """实时更新 MCP 工具执行超时并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下次调用立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下次调用立即生效
     - 0 表示不限制（保持旧行为，工具卡死时只能靠手动停止取消任务）
     """
     timeout_seconds = _parse_tool_call_timeout(
@@ -538,7 +543,7 @@ async def update_mcp_tool_config(payload: McpToolConfig):
         "config": _mcp_tool_config_payload(),
         # 与其他配置接口一致：返回内存 env 中的原始值，便于调用方核对落盘结果
         "memory_state": {
-            _MCP_TOOL_ENV_NAME: env_manager.env_vars.get(_MCP_TOOL_ENV_NAME),
+            _MCP_TOOL_ENV_NAME: _setting_memory_value(_MCP_TOOL_ENV_NAME),
         },
     })
 
@@ -571,7 +576,7 @@ def _network_retry_config_payload() -> dict:
             "positive": "同一轮请求连续失败达到 N 次后终止当前任务",
         },
         "env_names": {"max_attempts": _NETWORK_RETRY_ENV_NAME},
-        "memory_state": env_manager.env_vars.get(_NETWORK_RETRY_ENV_NAME),
+        "memory_state": _setting_memory_value(_NETWORK_RETRY_ENV_NAME),
     }
 
 
@@ -585,7 +590,7 @@ async def get_network_retry_config():
 async def update_network_retry_config(payload: NetworkRetryConfig):
     """实时更新网络请求失败重试次数并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次模型请求立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下一次模型请求立即生效
     - 0 或负数表示不限制（保持旧行为，一直重试直到手动停止）
     """
     max_attempts = _parse_network_retry_max_attempts(
@@ -623,7 +628,7 @@ def _compaction_retry_config_payload() -> dict:
         },
         "env_names": {"max_attempts": _COMPACTION_RETRY_ENV_NAME},
         "memory_state": {
-            _COMPACTION_RETRY_ENV_NAME: env_manager.env_vars.get(_COMPACTION_RETRY_ENV_NAME),
+            _COMPACTION_RETRY_ENV_NAME: _setting_memory_value(_COMPACTION_RETRY_ENV_NAME),
         },
     }
 
@@ -638,7 +643,7 @@ async def get_compaction_retry_config():
 async def update_compaction_retry_config(payload: CompactionRetryConfig):
     """实时更新上下文压缩失败重试次数并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次压缩调用立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下一次压缩调用立即生效
     - 一次"尝试"=一条完整降级链（压缩模型 -> 失败时聊天模型重试）
     - 0 或负数表示不限制（整条降级链一直重试直到手动停止）；重试间隔固定 1 秒
     """
@@ -657,7 +662,7 @@ async def update_compaction_retry_config(payload: CompactionRetryConfig):
         "updated": updated,
         "config": _compaction_retry_config_payload(),
         "memory_state": {
-            _COMPACTION_RETRY_ENV_NAME: env_manager.env_vars.get(_COMPACTION_RETRY_ENV_NAME),
+            _COMPACTION_RETRY_ENV_NAME: _setting_memory_value(_COMPACTION_RETRY_ENV_NAME),
         },
     })
 
@@ -745,7 +750,7 @@ def _sub_agent_retry_config_payload() -> dict:
         },
         "env_names": dict(_SUB_AGENT_RETRY_ENV_NAMES),
         "memory_state": {
-            env_name: env_manager.env_vars.get(env_name)
+            env_name: _setting_memory_value(env_name)
             for env_name in _SUB_AGENT_RETRY_ENV_NAMES.values()
         },
     }
@@ -761,7 +766,7 @@ async def get_sub_agent_retry_config():
 async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
     """实时更新子智能体交付保障重试配置并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次子任务立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下一次子任务立即生效
     - final_reply / stream_error：0 或负数=不限制（仍受已启用的轮次/超时限制约束）
     - todo_remind_max：0=关闭提醒，负数=不限制，正数=成功执行其他工具后额度重置的提醒次数（单纯更新计划不重置）
     """
@@ -780,7 +785,7 @@ async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
         "updated": updated,
         "config": _sub_agent_retry_config_payload(),
         "memory_state": {
-            env_name: env_manager.env_vars.get(env_name)
+            env_name: _setting_memory_value(env_name)
             for env_name in _SUB_AGENT_RETRY_ENV_NAMES.values()
         },
     })
@@ -828,7 +833,7 @@ def _tool_concurrency_config_payload() -> dict:
         "env_names": dict(_TOOL_CONCURRENCY_ENV_NAMES),
         # 与其他配置端点一致：memory_state 以 .env 变量名为键
         "memory_state": {
-            env_name: env_manager.env_vars.get(env_name)
+            env_name: _setting_memory_value(env_name)
             for env_name in _TOOL_CONCURRENCY_ENV_NAMES.values()
         },
     }
@@ -844,7 +849,7 @@ async def get_tool_concurrency_config():
 async def update_tool_concurrency_config(payload: ToolConcurrencyConfig):
     """实时更新工具并发执行配置并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次工具执行立即生效
+    - 登录请求保存到账号；维护调用写回实例 .env，下一次工具执行立即生效
     - 两个并发数都必须 >= 1（Pydantic ge=1 与后端读取时的下限裁剪共同保证）
     """
     update_env = {
@@ -912,7 +917,7 @@ def _video_read_limit_config_payload() -> dict:
             ),
         },
         "env_names": {"max_seconds": VIDEO_MAX_READ_SECONDS_ENV},
-        "memory_state": env_manager.env_vars.get(VIDEO_MAX_READ_SECONDS_ENV),
+        "memory_state": _setting_memory_value(VIDEO_MAX_READ_SECONDS_ENV),
     }
 
 
@@ -926,7 +931,7 @@ async def get_video_read_limit_config():
 async def update_video_read_limit_config(payload: VideoReadLimitConfig):
     """实时更新视频区间读取最大秒数并持久化。
 
-    - 写回项目 .env（set_env_vars 同时同步内存 env_vars），下一次 read_media
+    - 登录请求保存到账号；维护调用写回实例 .env，下一次 read_media
       工具调用即按新值读取（video_max_read_seconds 现读 + 工具描述动态构建）
     - 读取端统一钳制 5–3600（越界值保存原样、生效值钳制，响应回显 effective_seconds）
     """
@@ -1094,7 +1099,8 @@ async def update_tool_selection(payload: McpToolSelection):
                 message = f"会话 [{session_id}] 工具选择已保存（{sum(len(names) for names in effective.values())} 项）"
             else:
                 message = f"会话 [{session_id}] 工具选择已保存（空）"
-        return JSONResponse(content={
+        from security.redaction import for_member
+        return JSONResponse(content=for_member({
             "state": "succeed",
             "message": message,
             "session_id": session_id,
@@ -1102,7 +1108,7 @@ async def update_tool_selection(payload: McpToolSelection):
             "effective_selection": effective or {},
             "is_overridden": bool(session_selection),
             "updated_at": meta.get("updated_at"),
-        })
+        }))
     data = _read_mcp_servers_file()
     servers = _configured_server_names(data)
     # 仅勾选内置工具时也允许保存（此时可以没有配置任何 MCP 服务器）
@@ -1249,7 +1255,8 @@ async def list_chat_models(role: str = "chat_model", session_id: str | None = No
             "effective_selection": effective_selection,
             "warning": warnings or None,
         })
-    return JSONResponse(content=payload)
+    from security.redaction import for_member
+    return JSONResponse(content=for_member(payload))
 
 
 @api_chat_config_router.post("/chat_config/models/select")
@@ -1319,7 +1326,8 @@ async def select_active_chat_model(payload: ChatModelSelection):
             role_info = _role_info_payload(payload.role, is_overridden=not payload.clear)
         finally:
             reset_ambient_model_selection(ambient_token)
-        return JSONResponse(content={
+        from security.redaction import for_member
+        return JSONResponse(content=for_member({
             "state": "succeed",
             "message": message,
             "session_id": session_id,
@@ -1328,7 +1336,7 @@ async def select_active_chat_model(payload: ChatModelSelection):
             "warning": warnings or None,
             "role": payload.role,
             "role_info": role_info,
-        })
+        }))
     try:
         selection = select_chat_model(
             payload.provider,

@@ -23,11 +23,8 @@ def _root():
 
 
 def session_directory(session_id):
-    root = (_root() / "sidecars" / "responses").resolve()
-    result = (root / hashlib.sha256(str(session_id).encode()).hexdigest()).resolve()
-    if result.parent != root:
-        raise ResponsesProtocolError("Responses 会话路径无效")
-    return result
+    from memory.storage_layout import protocol_path
+    return protocol_path(_root(), session_id, "responses")
 
 
 def _scope_key(scope):

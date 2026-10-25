@@ -153,16 +153,50 @@ class ModelMeter:
 
     def call(self):
         self.id = uuid.uuid4().hex
+        self.network_started = False
         self.events, self.output_ascii, self.output_non_ascii, self.completed = {}, 0, 0, False
         return {"id": self.id, "role": self.role, "agent": self.agent, "model": self.model,
                 "price": self.price, "currency": self.currency, "usage": store.normalize_usage({"prompt_tokens": self.input_estimate}),
                 "cost": None, "source": "unknown", "state": "running"}
 
     async def start(self):
-        await self.tracker.gate(call=self.call())
+        call = self.call()
+        from security import quotas
+        output = getattr(self.request, "max_output_tokens", None) or getattr(self.request, "max_tokens", 0) or 0
+        await asyncio.to_thread(quotas.reserve, self.id, self.input_estimate + output)
+        try:
+            await self.tracker.gate(call=call)
+            from security.resource_limits import acquire
+            await acquire(self.id, self.tracker.stop)
+        except BaseException:
+            await asyncio.to_thread(self.cancel_start)
+            raise
 
     def start_sync(self):
-        self.tracker.gate_sync(call=self.call())
+        call = self.call()
+        from security import quotas
+        output = getattr(self.request, "max_output_tokens", None) or getattr(self.request, "max_tokens", 0) or 0
+        quotas.reserve(self.id, self.input_estimate + output)
+        try:
+            self.tracker.gate_sync(call=call)
+            from security.resource_limits import acquire_sync
+            acquire_sync(self.id, self.tracker.stop)
+        except BaseException:
+            self.cancel_start()
+            raise
+
+    def cancel_start(self):
+        """Waiting for a slot never consumes a provider or task token budget."""
+        from security import quotas
+        from security.resource_limits import release
+        try:
+            store.settle(self.id, {}, source="not_sent", state="cancelled")
+        finally:
+            try:
+                quotas.settle(self.id, 0, sent=False, complete=False)
+            finally:
+                release(self.id)
+                self.id = None
 
     def feed(self, frame):
         if not isinstance(frame, dict):
@@ -201,18 +235,37 @@ class ModelMeter:
         if not self.events:
             total = store.normalize_usage({"prompt_tokens": self.input_estimate,
                                           "completion_tokens": (self.output_ascii + 3) // 4 + self.output_non_ascii})
-        store.settle(self.id, total, source=source, state=state)
-        self.id = None
+        from security import quotas
+        from security.resource_limits import release
+        try:
+            store.settle(self.id, total, source=source, state=state)
+            quotas.settle(self.id, total["total_tokens"], sent=self.network_started,
+                          complete=bool(self.events and (self.completed or state == "completed")))
+        finally:
+            release(self.id)
+            self.id = None
 
 
 def tracked_call(invoke, request, stream, stop_checker, config):
     tracker = current(request)
     if tracker is None:
-        return invoke()
+        from security.principal import current as identity
+        if identity() is None:
+            return invoke()
+        # Auxiliary calls outside a task still count toward the account limit.
+        class AccountOnly:
+            id = session = ""
+            emit = permission = None
+            stop = staticmethod(lambda: bool(stop_checker and stop_checker()))
+            async def gate(self, **kwargs): pass
+            def gate_sync(self, **kwargs): pass
+            async def notify(self): pass
+        tracker = AccountOnly()
     meter = ModelMeter(tracker, request, config)
     # Preserve child-specific stop checks during a budget pause.
-    effective = BudgetTracker(tracker.id, tracker.session,
+    effective = (BudgetTracker(tracker.id, tracker.session,
         lambda: tracker.stop() or bool(stop_checker and stop_checker()), tracker.emit, tracker.permission)
+        if tracker.id else tracker)
     meter.tracker = effective
     if not stream:
         meter.start_sync()

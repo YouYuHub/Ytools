@@ -7,6 +7,11 @@ uvicorn
 pydantic
 jsonschema
 
+# Account passwords, multi-factor authentication and encrypted MFA secrets
+argon2-cffi
+pyotp
+cryptography
+
 # Interruptible regex matching for file and web searches
 regex
 # Scoped .gitignore matching

@@ -1105,7 +1105,9 @@ async def _run_chat_generation(
     incoming_messages = list(messages)
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
-    stop_checker = lambda: bool(getattr(stream, "stop_requested", False) or getattr(stream, "user_stop_requested", False))  # noqa: E731
+    from security.authorization import execution_active
+    stop_checker = lambda: bool(getattr(stream, "stop_requested", False) or getattr(stream, "user_stop_requested", False)
+                                or not execution_active(session_id))  # noqa: E731
     async def permission_emit(event):
         await session_chat_memory.add_chat_history(event)
         await _stream_emit(stream, "data: " + json.dumps(event, ensure_ascii=False) + "\n\n")

@@ -1,14 +1,16 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-ytools-auth-required>
 
 <head>
+    <script src="js/security_client.js?v=1134f5f8effb"></script>
+<script src="js/account_preferences.js?v=91859faccf0d"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ytools</title>
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
-    <script src="js/theme.js?v=f5a8a8dc7528"></script>
-    <link rel="stylesheet" href="style/css/main.css?v=050a3d5d3580">
+    <script src="js/theme.js?v=4e162c450c69"></script>
+    <link rel="stylesheet" href="style/css/main.css?v=6076ff5f5d65">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -144,7 +146,7 @@
                     <button class="profile-card" id="profileCard" title="设置">
                         <span class="avatar">Y</span>
                         <span class="profile-info">
-                            <span class="profile-name" id="profileName" title="点击修改显示名">访客用户</span>
+                            <span class="profile-name" id="profileName">访客用户</span>
                             <span class="profile-sub" id="profileSub">跟随系统</span>
                         </span>
                         <span class="profile-plan">设置</span>
@@ -519,27 +521,27 @@
             </nav>
             <div class="chat-settings-body">
                 <section class="chat-settings-section" id="permissionSettings" role="tabpanel" aria-labelledby="chatSettingsPermissionsTab" tabindex="0" hidden>
-                    <div class="chat-settings-section-head"><h3>工具权限</h3><span class="chat-settings-badge">全局 / 当前会话</span></div>
+                    <div class="chat-settings-section-head"><h3>工具权限</h3><span class="chat-settings-badge">账号 / 当前会话</span></div>
                     <p class="chat-settings-intro">询问模式下，执行命令、访问工作目录外的路径或调用 MCP 工具前需要确认；完全控制模式下，模型可自由使用工具。</p>
-                    <label class="chat-setting-field"><span>全局默认<small>未单独设置的会话使用此模式</small></span><select id="permissionGlobal"><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
-                    <label class="chat-setting-field"><span>当前会话<small>可独立配置，也可跟随全局</small></span><select id="permissionSession"><option value="">跟随全局</option><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
+                    <label class="chat-setting-field"><span>账号默认<small>未单独设置的会话使用此模式</small></span><select id="permissionGlobal"><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
+                    <label class="chat-setting-field"><span>当前会话<small>可独立配置，也可跟随账号默认</small></span><select id="permissionSession"><option value="">跟随账号默认</option><option value="ask">询问</option><option value="full_control">完全控制</option></select></label>
                     <p class="chat-settings-note">权限选择点击「确定」后保存，从下一次任务生效。需要确认的操作在工具标题栏右侧显示「允许 / 拒绝」。</p>
                     <div id="permissionStatus" role="status" aria-live="polite"></div>
                     <div id="permissionRequests"></div>
                 </section>
                 <section class="chat-settings-section" id="chatSettingsGeneral" role="tabpanel" aria-labelledby="chatSettingsGeneralTab" tabindex="0">
                     <div class="speech-settings">
-                        <div class="chat-settings-section-head"><h3>语音输入</h3><span class="chat-settings-badge">全局默认 · .env</span></div>
+                        <div class="chat-settings-section-head"><h3>语音输入</h3><span class="chat-settings-badge">账号默认</span></div>
                         <label class="chat-setting-field speech-language-field">
-                            <span>识别语言<small id="speechLanguageHint">手动选择默认语种，连接同一后端的所有会话共用。</small></span>
+                            <span>识别语言<small id="speechLanguageHint">选择此账号的默认语种，登录其他设备后也会恢复。</small></span>
                             <select id="speechLanguage" aria-describedby="speechLanguageHint speechLanguageNote"></select>
                         </label>
-                        <p class="chat-settings-intro" id="speechLanguageNote">切换后自动保存到项目 .env，无需点击「确定」。正在听写时会保留草稿并停止旧识别，请点击麦克风使用新语言。语种由浏览器语音服务决定。</p>
+                        <p class="chat-settings-intro" id="speechLanguageNote">切换后自动保存到当前账号，无需点击「确定」。正在听写时会保留草稿并停止旧识别，请点击麦克风使用新语言。语种由浏览器语音服务决定。</p>
                         <p class="chat-settings-intro" id="speechLanguageStatus" role="status" aria-live="polite"></p>
                     </div>
-                    <div class="chat-settings-section-head"><h3>模型与工具配置</h3><span class="chat-settings-badge">全局</span></div>
+                    <div class="chat-settings-section-head"><h3>模型与工具配置</h3><span class="chat-settings-badge">当前账号</span></div>
                     <button class="menu-item" id="taskBudgetSettingsItem" type="button">任务预算与用量：设置额度、无限制和模型价格</button>
-                    <p class="chat-settings-intro">数值设置对所有会话生效，点击「确定」保存。</p>
+                    <p class="chat-settings-intro">数值设置对当前账号的后续任务生效，点击「确定」保存。实例模型和密钥仍由管理员管理。</p>
                     <div class="tool-retitle-row" id="settingsRetitleRow" hidden>
                         <label class="tool-retitle-label" title="开启后本会话每条消息发送完成都会重新生成会话标题；关闭则仅首个任务尝试一次">
                             <input type="checkbox" id="settingsRetitleToggle">
@@ -565,7 +567,7 @@
                     </label>
                 </section>
                 <section class="chat-settings-section" id="chatSettingsAgents" role="tabpanel" aria-labelledby="chatSettingsAgentsTab" tabindex="0" hidden>
-                    <div class="chat-settings-section-head"><h3>子智能体</h3><span class="chat-settings-badge">全局</span></div>
+                    <div class="chat-settings-section-head"><h3>子智能体</h3><span class="chat-settings-badge">当前账号</span></div>
                     <p class="chat-settings-intro">保存后用于后续任务，运行中的子任务沿用原限制。停止或达到限制时会向父智能体返回进展报告。</p>
                     <label class="chat-setting-field">
                         <span>模型调用轮次上限<small>单个子任务最多调用模型的次数；0=不限制</small></span>
@@ -593,7 +595,7 @@
                     </label>
                 </section>
                 <section class="chat-settings-section" id="chatSettingsCompaction" role="tabpanel" aria-labelledby="chatSettingsCompactionTab" tabindex="0" hidden>
-                    <div class="chat-settings-section-head"><h3>历史压缩策略</h3><span class="chat-settings-badge">全局</span></div>
+                    <div class="chat-settings-section-head"><h3>历史压缩策略</h3><span class="chat-settings-badge">当前账号</span></div>
                     <p class="chat-settings-intro">预算提示按当前会话的模型窗口计算，本地与远程上下文处理沿用所选接口的策略。</p>
                     <label class="chat-setting-field chat-setting-field-with-hint">
                         <span>触发比例<small>历史上下文达到压缩阈值时触发压缩；阈值=两模型窗口较小者×该比例</small><small id="effectiveThresholdHint" class="chat-setting-inline-hint" hidden></small></span>
@@ -1077,8 +1079,8 @@
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script defer src="js/api.js?v=7dab13fcad32"></script>
-    <script defer src="js/file_history_sync.js?v=efb6ad30eb91"></script>
+    <script defer src="js/api.js?v=fe8215a2efd6"></script>
+    <script defer src="js/file_history_sync.js?v=c503f9e598e4"></script>
     <script defer src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
     <script defer src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
     <script defer src="js/vendor/prism/prism-c.min.js?v=9e05cf21207b"></script>
@@ -1119,8 +1121,8 @@
     <script defer src="js/session_group_utils.js?v=affad180441e"></script>
     <script defer src="js/session_utils.js?v=f43255f766b9"></script>
     <script defer src="js/format_utils.js?v=d96a1dee8dff"></script>
-    <script defer src="js/history_parser.js?v=ed1a918e6e14"></script>
-    <script defer src="js/history_parse_async.js?v=52648ac313f2"></script>
+    <script defer src="js/history_parser.js?v=a1f33616c31b"></script>
+    <script defer src="js/history_parse_async.js?v=8235742456bd"></script>
     <script defer src="js/history_search.js?v=2e813eadce4f"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script defer src="js/quote_utils.js?v=a49a584363fe"></script>
@@ -1130,31 +1132,34 @@
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=bf43ad8636c7"></script>
+    <script defer src="js/app/core.js?v=fba2af5f5c09"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=4f7d7d2208ab"></script>
-    <script defer src="js/app/sessions.js?v=c9b19e683a2b"></script>
-    <script defer src="js/app/session_archives.js?v=423700aa2847"></script>
+    <script defer src="js/app/sessions.js?v=7242684343a4"></script>
+    <script defer src="js/app/account_panel.js?v=30e61c55c489"></script>
+    <script defer src="js/app/session_archives.js?v=c27ae7845200"></script>
     <script defer src="js/app/history_search.js?v=fca634fa8815"></script>
-    <script defer src="js/app/session_groups.js?v=e17b7b2add01"></script>
+    <script defer src="js/app/session_groups.js?v=701633c7f721"></script>
     <script defer src="js/app/stats.js?v=30c84f899b75"></script>
     <script defer src="js/app/context_panel.js?v=fe39183cf9a8"></script>
     <script defer src="js/app/workdir.js?v=1a073e7f603e"></script>
     <script defer src="js/tool_approval_state.js?v=d301678b67f4"></script>
     <script defer src="js/stream_replay_dedup.js?v=8dfebe7055e9"></script>
     <script defer src="js/read_media_strip.js?v=bfdeaabc3b3c"></script>
-    <script defer src="js/app/permissions.js?v=b64fa99611be"></script>
+    <script defer src="js/app/permissions.js?v=9147d04cd95b"></script>
     <script defer src="js/history_scroll_model.js?v=5341fda4b6e5"></script>
-    <script defer src="js/app/process_groups.js?v=78c61550db4f"></script>
-    <script defer src="js/app/messages.js?v=469c0a236e9f"></script>
-    <script defer src="js/app/history_scroll.js?v=969793fe4cc9"></script>
-    <script defer src="js/app/history.js?v=37f5d95cf865"></script>
+    <script defer src="js/app/process_groups.js?v=3fb84aaf270a"></script>
+    <script defer src="js/app/message_diff.js?v=cb1fb0ba2ab9"></script>
+    <script defer src="js/app/messages.js?v=5e17a52bbf7c"></script>
+    <script defer src="js/app/history_scroll.js?v=6918fda5102c"></script>
+    <script defer src="js/app/history_pages.js?v=e03618944205"></script>
+    <script defer src="js/app/history.js?v=9415f293c9ca"></script>
     <script defer src="js/app/compaction.js?v=52a5369b931d"></script>
     <script defer src="js/app/builtin.js?v=6ee9f8d92033"></script>
-    <script defer src="js/app/user_profile.js?v=3708d7c2ce32"></script>
+    <script defer src="js/app/user_profile.js?v=aa33ff9bc49f"></script>
     <script defer src="js/app/media.js?v=ec9af7059aeb"></script>
     <script defer src="js/app/skills.js?v=782b52f8971e"></script>
-    <script defer src="js/app/composer.js?v=d7f77f41937f"></script>
+    <script defer src="js/app/composer.js?v=61f7de11e843"></script>
     <script defer src="js/app/chat_settings_modal.js?v=5092ffb42645"></script>
     <script defer src="js/app/model_panel_modal.js?v=c5776d195fd4"></script>
     <script defer src="js/app/model_panel.js?v=8a6b6c6f34b7"></script>
@@ -1164,14 +1169,14 @@
     <script defer src="js/app/task_templates.js?v=f5a4c7debcdb"></script>
     <script defer src="js/task_state.js?v=3b31e198ccb0"></script>
     <script defer src="js/app/session_activity.js?v=df91293787c3"></script>
-    <script defer src="js/app/task_status.js?v=635fe3b81e6d"></script>
+    <script defer src="js/app/task_status.js?v=cb00983d15e1"></script>
     <script defer src="js/app/stream_pipeline.js?v=f8377a19a022"></script>
     <script defer src="js/app/chat.js?v=26f8f86d37de"></script>
     <script defer src="js/app/filehistory.js?v=8a5da583b0c3"></script>
     <script defer src="js/app/terminals.js?v=a30b6ca89011"></script>
-    <script defer src="js/app/task_costs.js?v=8905a42033a3"></script>
+    <script defer src="js/app/task_costs.js?v=e1d70c5beb46"></script>
     <script defer src="js/app/slash_commands.js?v=b5d7a8487a82"></script>
-    <script defer src="js/app.js?v=e877d0b76ea2"></script>
+    <script defer src="js/app.js?v=1c108706ba00"></script>
 </body>
 
 </html>

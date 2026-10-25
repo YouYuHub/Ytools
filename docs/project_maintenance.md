@@ -1,13 +1,13 @@
 # 项目维护与依赖更新
 
-核对日期：2026-10-23。以下为当前维护约定；带日期的报告与测试数量保留为历史快照。
+核对日期：2026-10-24。以下为当前维护约定；带日期的报告与测试数量保留为历史快照。
 
 ## 当前实现与使用入口
 
-- 服务启动后推荐访问 `/ui/`，`/` 返回 JSON，`/docs` 为接口文档。Edge/Chrome 仍可直接打开 `H5/index.html`；同源地址与覆盖规则见 [前端说明](../H5/README.md#2-指定后端地址)。
+- 服务启动后访问 `/ui/` 登录；`/` 返回 JSON，`/docs` 仅管理员可读。账号、旧数据归属和 Linux HTTPS 部署见 [安全实施说明](security_implementation.md)。登录页面与 API 保持同源，直接打开本地文件只用于开发页面检查。
 - 聊天中的静态 SVG 图片预览交给 DOMPurify 的 SVG 白名单净化；包含 SMIL/CSS 动画、样式或 `<use>` 等本地引用的 SVG 使用 `data:image/svg+xml` 图片环境显示，以保留动画并隔离脚本。若净化器不可用，预览显示提示，源码仍可在代码视图查看和复制。动画 SVG 的「复制图片」导出单帧 PNG 快照。`H5/js/vendor/dompurify/` 保留运行文件和许可证。
 - `/chat_history/file` 与 `/chat_history/meta` 只打开已存在的会话。未知 ID 返回 404，不创建历史文件；只读查询不进入长期管理器缓存。可写管理器缓存最多保留 128 个空闲实例，活跃轮次与编辑状态不会被淘汰。
-- 大历史优先通过 Web Worker 解析，不支持 Worker 或本地文件受限时回退同步解析；历史仍一次下载并驻留内存。DOM 使用可视历史窗口与首尾占位，实时尾部按原顺序恢复；尚未实现服务端历史分页，详见 [长会话显示](frontend_live_tail.md)。
+- 历史先加载最近完整轮次，早期区间及大工具结果按需读取，保留全量问题导航；大页面使用带版本的 Worker。DOM 继续使用可视窗口与占位，详见 [历史按需加载](history_paging.md)。检查点恢复和旧后端保留完整历史兼容路径。
 - 侧栏主题入口与 `/主题` 共用选择弹窗；侧栏旧菜单已移除。
 - 主任务状态区分执行阶段与网络连接；断线先确认后台状态再附接。流式渲染管线与内置工具静态定义已独立成模块，职责与验证见 [任务状态与模块拆分](page_maintenance_followup.md)。
 - 侧边栏通过本地事件和一次批量状态查询标记前后台运行会话；等待/未知状态不持续转圈，结束后清除。轮询随页面可见性暂停，详见 [会话运行标记](session_activity.md)。
@@ -27,11 +27,13 @@ npm.cmd run build:css --prefix H5
 python -B H5/version_assets.py
 ```
 
-版本脚本按文件内容哈希更新 `H5/index.html` 中 JS/CSS URL，重复运行结果相同。底部经典脚本统一 `defer`，保持声明顺序加载。`/ui/` 页面和未版本化资源每次校验；带内容哈希的资源可长期缓存。直接打开本地 `index.html` 时浏览器仍可读取同一组相对文件。
+版本脚本按文件内容哈希更新 `H5/index.html`、`login.html`、`account.html` 中的 JS/CSS URL，重复运行结果相同。身份命名空间脚本和主题脚本同步执行，其他经典脚本 `defer` 并保持声明顺序。带身份数据的页面及 API 禁止缓存，版本化公共资源可长期缓存。
 
 `watch:css` 只生成 CSS，不更新页面哈希。发布前同时核对 `python -B -m pytest test/test_frontend_asset_versions.py -q`；功能单元测试为 `npm.cmd test --prefix H5`，浏览器交互脚本另行运行。
 
 ## Python 依赖
+
+日常检查与完整发布优先使用 [统一验收入口](release_validation.md)：`python scripts/release_check.py --profile quick` 或 `--profile release`；完整发布还检查浏览器实际运行、恢复用例与源码未改变。
 
 `requirements.txt` 是可编辑的直接依赖清单；`requirements.lock.txt` 是以 Python 3.10 为最低目标、通用平台解析出的精确版本。部署优先用锁文件。升级时执行：
 

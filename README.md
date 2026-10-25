@@ -10,12 +10,13 @@ Ytools 是一个基于 FastAPI 的本地智能体工具项目，包含流式聊�
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.lock.txt
+python scripts/manage_accounts.py init-admin --username admin
 python main.py
 ```
 
 `requirements.lock.txt` 固定直接与传递依赖版本；升级流程见 [维护说明](docs/project_maintenance.md)。上传接口接收单文件 `application/octet-stream` 原始请求体，通过 `filename` 查询参数传文件名；多文件由前端逐个请求，无需 `python-multipart`。文档解析依赖在 `requirements.txt` 中列为可选项，按实际需要安装和验证；DOCX 解析所需的可选依赖名称是 `python-docx`。服务端口默认是 `48621`；启动后可访问 `http://127.0.0.1:48621/docs` 查看 API 文档。
 
-`main.py` 的 `/` 返回 JSON，`/ui/` 提供 H5 页面。可直接打开 `http://127.0.0.1:48621/ui/`，或在 Edge、Chrome 中打开 `H5/index.html`；权限设置位于“＋ → 聊天设置 → 工具权限”，无需控制码；其他浏览器不保证全部功能正常。如后端使用其他地址，参见 [H5 前端说明](H5/README.md#2-指定后端地址)。
+`main.py` 的 `/` 返回 JSON，`/ui/` 提供登录与 H5 页面。打开 `http://127.0.0.1:48621/ui/`，首次管理员登录需设置 MFA；页面使用同源 Cookie 和 CSRF，不再支持直接从本地文件访问业务 API。账号管理位于侧栏“账号与安全”，接口文档仅管理员可访问。旧数据需明确迁移归属，详见 [安全设置与部署](docs/security_implementation.md)。
 
 工具权限默认“询问”，支持全局默认与每会话独立覆盖。启动命令、调用 MCP、内置工具访问工作目录外资源前需用户批准；“完全控制”保留原来的自由调用行为。等待确认时关闭服务，重启并重新打开原会话后可继续或放弃；执行结果未知的工具不会自动重跑。详见 [权限使用与实现说明](docs/tool_permissions.md)。
 
@@ -143,7 +144,7 @@ if __name__ == "__main__":
 
 ## 使用边界
 
-本项目当前适合在受信任的本机环境中运行。代码默认监听 `0.0.0.0`，允许所有 CORS 来源，HTTP 路由没有统一身份认证；`GET /file/get_local_file` 还允许按绝对路径读取本机文件。仅本机使用时，请将 `.env` 中的 `DEFAULT_SERVICE_HOST` 设为 `127.0.0.1`。在加入认证、限制本地文件读取范围之前，不应把端口开放到不受信任的网络。
+服务默认监听 `127.0.0.1`，业务 API 强制登录、CSRF 和资源归属校验；公开注册关闭。普通成员只可进行无工具聊天；管理员及明确授权的可信操作员可以使用主机工具。账号隔离不等于操作系统执行隔离，当前不对相互不信任的账号开放主机工具。Linux 远程部署使用同机 HTTPS 代理和专用低权限账号，入口及验证步骤见 [安全实施说明](docs/security_implementation.md) 和 [部署模板](deploy/linux/)。
 
 上传接口在读取原始请求体时执行大小限制；文档和小型媒体在限制内读入内存，视频及 GIF 写入临时文件后保存。不要把当前实现当作面向公网的上传服务。重启维护工具所依赖的服务快照写入在 `main.py` 中被注释，项目根目录也没有 `restart_helper.py`，因此不要依赖该工具完成自动重启。
 
@@ -195,3 +196,9 @@ if __name__ == "__main__":
 ### 会话归档
 
 会话菜单支持归档；侧栏底部「设置 → 归档会话」可查找、打开、取消归档和删除，归档后仍可继续聊天。侧栏和常规搜索默认只处理未归档会话，可切换为已归档或全部范围；会话文件无需搬迁。使用及备份说明见 [会话归档文档](docs/session_archives.md)。
+
+### 验证与发布
+
+开发检查：`python scripts/release_check.py --profile quick`；完整发布验收：`python scripts/release_check.py --profile release`。门禁包含前后端、必需浏览器流程、备份恢复用例及容量统计基准，结果写入 `tmp/validation/`。安装依赖、Windows/Linux CI 与上线检查见 [统一验收说明](docs/release_validation.md)。
+
+长会话默认先取最近完整轮次，保留完整问题导航，早期记录与大工具结果按需读取；原始历史、模型上下文及导出保持完整，见 [历史分页](docs/history_paging.md)。

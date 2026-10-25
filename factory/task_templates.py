@@ -153,6 +153,12 @@ def prepare(definition, source=None):
 def start(definition, source, request_id, expected_fingerprint):
     """Only creates a fresh UUID session; never mutates an existing conversation."""
     session = "task-" + request_id.hex
+    from security.principal import current
+    principal = current()
+    if principal:
+        session = "task-" + digest({"user": principal.user_id, "request": request_id.hex})[:32]
+        from security.authorization import session as authorize_session
+        authorize_session(session, create=True)
     signature = digest({"template": definition, "source": source})
     filename = memory.HISTORY_ROOT / (session + "_chat.jsonl")
     with cross_process_lock(memory.LOCK_ROOT / (filename.name + ".lock")):

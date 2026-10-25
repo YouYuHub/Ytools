@@ -51,12 +51,20 @@ print("代码块支持语言高亮")
 """
 
 
+def _directory():
+    from memory.storage_layout import require_identity
+    require_identity()
+    from security.principal import current
+    principal = current()
+    return MD_FILES_DIR / principal.user_id if principal else MD_FILES_DIR
+
+
 def ensure_prompt_dir() -> None:
     """确保 md_files 目录存在（首次使用自动创建，并播种一个示例提示词）。"""
-    MD_FILES_DIR.mkdir(parents=True, exist_ok=True)
-    if not any(MD_FILES_DIR.glob("*.md")):
+    _directory().mkdir(parents=True, exist_ok=True)
+    if not any(_directory().glob("*.md")):
         try:
-            (MD_FILES_DIR / "示例提示词.md").write_text(SAMPLE_PROMPT, encoding="utf-8")
+            (_directory() / "示例提示词.md").write_text(SAMPLE_PROMPT, encoding="utf-8")
         except OSError:
             pass  # 示例播种失败不影响功能
 
@@ -86,8 +94,8 @@ def _normalize_name(name: str) -> str:
 
 def _resolve_path(name: str) -> Path:
     """把文件名解析为 md_files 内的绝对路径，并拦截目录逃逸。"""
-    path = (MD_FILES_DIR / _normalize_name(name)).resolve()
-    if MD_FILES_DIR.resolve() not in path.parents:
+    path = (_directory() / _normalize_name(name)).resolve()
+    if _directory().resolve() not in path.parents:
         raise ValueError("非法文件路径")
     return path
 
@@ -111,9 +119,11 @@ def _meta_of(path: Path) -> dict:
 def list_prompts() -> list[dict]:
     """列出全部提示词文件（按更新时间倒序）。"""
     ensure_prompt_dir()
-    items = [_meta_of(path) for path in MD_FILES_DIR.glob("*.md") if path.is_file()]
-    items.sort(key=lambda item: item["updated_at"], reverse=True)
-    return items
+    paths = [path for path in _directory().glob("*.md") if path.is_file()]
+    # Display timestamps have second precision; sort by the actual filesystem
+    # timestamp so two edits within one second retain their real order.
+    paths.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    return [_meta_of(path) for path in paths]
 
 
 def read_prompt(name: str) -> dict:
@@ -137,7 +147,7 @@ def create_prompt(name: str, content: str = "") -> dict:
         raise FileExistsError(path.name)
     _check_content(content)
     ensure_prompt_dir()
-    path.write_text(content, encoding="utf-8")
+    _write_prompt(path, content, create=True)
     return {"name": path.name}
 
 
@@ -146,8 +156,31 @@ def save_prompt(name: str, content: str) -> dict:
     path = _resolve_path(name)
     _check_content(content)
     ensure_prompt_dir()
-    path.write_text(content, encoding="utf-8")
+    _write_prompt(path, content)
     return {"name": path.name}
+
+
+def _write_prompt(path, content, *, create=False):
+    import os
+    import uuid
+    from security.resource_limits import storage_write
+    from memory.identity_store import Throttled
+    data = content.encode("utf-8")
+    with storage_write() as available:
+        if create and path.exists():
+            raise FileExistsError(path.name)
+        previous = path.stat().st_size if path.exists() else 0
+        if available is not None and max(0, len(data) - previous) > available:
+            raise Throttled("账号存储额度不足，提示词原内容未修改")
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def delete_prompt(name: str) -> None:

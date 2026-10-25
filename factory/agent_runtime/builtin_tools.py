@@ -35,6 +35,8 @@ from factory.agent_runtime.tool_control import (
     ToolCancelledError, check_tool_control, remaining_seconds, tool_deadline,
 )
 from memory import file_memory
+from . import file_diff_result as _file_diff_result
+from . import tool_inputs as _tool_inputs
 from .builtin_tool_catalog import (
     TODO_TOOL_NAME,
     ASK_USER_TOOL_NAME,
@@ -187,197 +189,41 @@ def resolve_default_command_shell(session_id: str | None = None) -> str:
 
 
 
-_TODO_VALID_STATUSES = ("pending", "in_progress", "done")
-_TODO_MAX_ITEMS = 20
-_TODO_MAX_CONTENT_CHARS = 200
+_TODO_VALID_STATUSES = _tool_inputs.TODO_VALID_STATUSES
+_TODO_MAX_ITEMS = _tool_inputs.TODO_MAX_ITEMS
+_TODO_MAX_CONTENT_CHARS = _tool_inputs.TODO_MAX_CONTENT_CHARS
 
 
 def _next_todo_id(existing: set[str]) -> str:
-    """分配下一个未占用的自增数字 id（字符串形式，"1"、"2"...）。"""
-    num = 1
-    while str(num) in existing:
-        num += 1
-    return str(num)
+    return _tool_inputs.next_todo_id(existing)
 
 
-def normalize_todo_items(
-    raw: Any,
-    prev_items: list[dict[str, Any]] | None = None,
-) -> tuple[list[dict[str, str]] | None, list[str] | None, str | None]:
-    """校验并规整模型提交的 todo 列表（唯一校验入口）。
-
-    返回 ``(items, notices, error_reason)``：
-    - 成功：items 为规整后的计划（保证 id 唯一且非空、in_progress ≤ 1），
-      notices 为自动修正告警，error_reason 为 None；
-    - 失败：items/notices 为 None，error_reason 描述首个硬性错误（含条目
-      序号与具体值），供工具结果直接回传，帮助模型一次性纠正。
-
-    硬性校验（拒绝并给原因）：非数组/条目非对象/content 为空或超长/
-    status 非法/超过 20 项。自动修复（放行并告警）：id 缺失或为空
-    （同 content+status 匹配上一版计划则继承其 id，否则本地自增分配）、
-    id 重复（为重复者重新分配）、多个 in_progress（保留首个，其余改
-    pending）。兼容旧模型不按新 Schema 提交时缺失 id 的情况。
-    """
-    if not isinstance(raw, list):
-        return None, None, "todos 需要是对象数组，且每次调用提交完整列表（全量覆盖）"
-    if len(raw) > _TODO_MAX_ITEMS:
-        return None, None, (
-            f"todo 数量超过上限：收到 {len(raw)} 项，最多 {_TODO_MAX_ITEMS} 项，"
-            "请合并同类步骤或拆分任务"
-        )
-    # 状态变化时也要继承同一步骤的 id；先匹配内容与状态，再匹配内容。
-    prev_by_key: dict[tuple[str, str], str] = {}
-    prev_by_content: dict[str, list[str]] = {}
-    prev_ids: set[str] = set()
-    for prev in prev_items or []:
-        if not isinstance(prev, dict):
-            continue
-        prev_id = str(prev.get("id") or "").strip()
-        prev_content = str(prev.get("content") or "").strip()
-        prev_status = str(prev.get("status") or "pending").strip()
-        if prev_id and prev_content:
-            prev_by_key[(prev_content, prev_status)] = prev_id
-            prev_by_content.setdefault(prev_content, []).append(prev_id)
-            prev_ids.add(prev_id)
-    items: list[dict[str, str]] = []
-    notices: list[str] = []
-    used_ids: set[str] = set()
-    id_missing = id_duplicated = in_progress_fixed = 0
-    for index, entry in enumerate(raw, start=1):
-        if not isinstance(entry, dict):
-            return None, None, f"第 {index} 项必须是对象（含 id/content/status 字段）"
-        if not isinstance(entry.get("content"), str):
-            return None, None, f"第 {index} 项 content 不能为空且必须是字符串"
-        content = entry["content"].strip()
-        if not content:
-            return None, None, f"第 {index} 项 content 不能为空"
-        if len(content) > _TODO_MAX_CONTENT_CHARS:
-            return None, None, (
-                f"第 {index} 项 content 超长（{len(content)} > "
-                f"{_TODO_MAX_CONTENT_CHARS} 字符），请压缩为一句祈使句"
-            )
-        if not isinstance(entry.get("status", "pending"), str):
-            return None, None, f"第 {index} 项 status 必须是字符串"
-        status = entry.get("status", "pending").strip().lower()
-        if status not in _TODO_VALID_STATUSES:
-            return None, None, (
-                f"第 {index} 项 status 非法：{status!r}，"
-                "仅支持 pending / in_progress / done"
-            )
-        if not isinstance(entry.get("id", ""), str) or len(entry.get("id", "")) > 64:
-            return None, None, f"第 {index} 项 id 必须是最多 64 字符的字符串"
-        raw_id = entry.get("id", "").strip()
-        if raw_id:
-            if raw_id in used_ids:
-                id_duplicated += 1
-                raw_id = _next_todo_id(used_ids | prev_ids)
-        else:
-            inherited = prev_by_key.get((content, status))
-            if not inherited or inherited in used_ids:
-                inherited = next(
-                    (item_id for item_id in prev_by_content.get(content, [])
-                     if item_id not in used_ids), None
-                )
-            if inherited and inherited not in used_ids:
-                raw_id = inherited
-            else:
-                raw_id = _next_todo_id(used_ids | prev_ids)
-            id_missing += 1
-        used_ids.add(raw_id)
-        if status == "in_progress" and any(i["status"] == "in_progress" for i in items):
-            in_progress_fixed += 1
-            status = "pending"
-        items.append({"id": raw_id, "content": content, "status": status})
-    if id_missing:
-        notices.append(
-            f"{id_missing} 个步骤未携带 id，已自动分配/继承"
-            "（下次调用请保持相同步骤的 id 不变）"
-        )
-    if id_duplicated:
-        notices.append(f"{id_duplicated} 个步骤 id 重复，已为重复项重新分配")
-    if in_progress_fixed:
-        notices.append(
-            f"{in_progress_fixed} 个步骤多余地标记为 in_progress"
-            "（同一时间最多一个），仅保留首个，其余已改为 pending"
-        )
-    return items, notices, None
+def normalize_todo_items(raw: Any, prev_items: list[dict[str, Any]] | None=None) -> tuple[list[dict[str, str]] | None, list[str] | None, str | None]:
+    return _tool_inputs.normalize_todo_items(raw, prev_items, max_items=_TODO_MAX_ITEMS,
+        max_content_chars=_TODO_MAX_CONTENT_CHARS, valid_statuses=_TODO_VALID_STATUSES, id_factory=_next_todo_id)
 
 
 
 # --------------------------- ask_user：向用户提问 ---------------------------
 
-_ASK_MAX_QUESTIONS = 5
-_ASK_MAX_QUESTION_CHARS = 200
-_ASK_MAX_OPTIONS = 6
-_ASK_MAX_OPTION_CHARS = 100
+_ASK_MAX_QUESTIONS = _tool_inputs.ASK_MAX_QUESTIONS
+_ASK_MAX_QUESTION_CHARS = _tool_inputs.ASK_MAX_QUESTION_CHARS
+_ASK_MAX_OPTIONS = _tool_inputs.ASK_MAX_OPTIONS
+_ASK_MAX_OPTION_CHARS = _tool_inputs.ASK_MAX_OPTION_CHARS
 
 
 def normalize_ask_questions(raw: Any) -> list[dict[str, Any]] | None:
-    """校验并规整模型提交的提问列表；整体非法返回 None。
-
-    规整规则：question 非空且 ≤200 字符；options 可选，规整后保留 0-6 个
-    非空选项（每项 ≤100 字符），全部无效时视为未提供选项。
-    容错：questions 传成单个对象时自动包一层数组；传成 JSON 字符串时尝试解析。
-    """
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return None
-    if not raw or len(raw) > _ASK_MAX_QUESTIONS:
-        return None
-    questions: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            return None
-        if not isinstance(entry.get("question"), str) or not isinstance(entry.get("multiple", False), bool):
-            return None
-        question = entry["question"].strip()
-        if not question or len(question) > _ASK_MAX_QUESTION_CHARS:
-            return None
-        raw_options = entry.get("options")
-        if raw_options is not None and (not isinstance(raw_options, list) or any(not isinstance(item, str) for item in raw_options)):
-            return None
-        options: list[str] = []
-        if isinstance(raw_options, list):
-            for option in raw_options:
-                text = str(option or "").strip()
-                if not text or len(text) > _ASK_MAX_OPTION_CHARS:
-                    continue
-                if text not in options:
-                    options.append(text)
-            options = options[:_ASK_MAX_OPTIONS]
-        questions.append({
-            "question": question,
-            "options": options,
-            "multiple": entry.get("multiple", False),
-        })
-    return questions
+    return _tool_inputs.normalize_ask_questions(raw, max_questions=_ASK_MAX_QUESTIONS,
+        max_question_chars=_ASK_MAX_QUESTION_CHARS, max_options=_ASK_MAX_OPTIONS, max_option_chars=_ASK_MAX_OPTION_CHARS)
 
 
 # --------------------------- sub_agent：子智能体派发 ---------------------------
 # 派发参数长度上限（防超大参数直接进上下文）
-_SUB_AGENT_TASK_MAX_CHARS = 20_000
+_SUB_AGENT_TASK_MAX_CHARS = _tool_inputs.SUB_AGENT_TASK_MAX_CHARS
 
 
 def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
-    """Require a self-contained task string; return (task, error)."""
-    if isinstance(raw, str):
-        task_text = raw.strip()
-    else:
-        return None, "task 必须是非空字符串"
-    if not task_text:
-        return None, "task 参数无效：需要一段非空的子任务描述（自包含目标、路径、约束与期望回复）"
-    if len(task_text) > _SUB_AGENT_TASK_MAX_CHARS:
-        return None, (
-            f"task 超长（{len(task_text)} > {_SUB_AGENT_TASK_MAX_CHARS} 字符）；"
-            "请精简子任务描述，或拆分为多个子任务"
-        )
-    return task_text, None
+    return _tool_inputs.normalize_sub_agent_task(raw, max_chars=_SUB_AGENT_TASK_MAX_CHARS)
 
 
 
@@ -450,225 +296,16 @@ _FILE_HISTORY_PAYLOAD_KEY = "_file_history"   # {path, display_path, old_text, n
 
 
 def _build_file_diff(old_text: str, new_text: str, path: Path) -> dict:
-    """生成 unified diff 与行数统计（前端展示用）。
-
-    返回 {diff, lines_added, lines_removed, diff_truncated, diff_skipped}：
-    - 文本超限时整体跳过（diff 置空，diff_skipped=file_too_large）；
-    - diff 超过字符上限时提前截断（diff_truncated=True）；
-    - 新旧文本在比较前统一换行为 \n，展示行不含行尾符。
-    """
-    skipped = {
-        "diff": "",
-        "lines_added": None,
-        "lines_removed": None,
-        "diff_truncated": False,
-        "diff_skipped": "file_too_large",
-        "changed_ranges": None,
-        "path": str(path),
-        "display_path": _display_path(path),
-    }
-    if old_text == new_text:
-        return {
-            "diff": "",
-            "lines_added": 0,
-            "lines_removed": 0,
-            "diff_truncated": False,
-            "diff_skipped": "unchanged",
-            "path": str(path),
-            "display_path": _display_path(path),
-            "changed_ranges": [],
-        }
-    if len(old_text) > _FILE_DIFF_MAX_TEXT_CHARS or len(new_text) > _FILE_DIFF_MAX_TEXT_CHARS:
-        return skipped
-
-    def _norm(text: str) -> list:
-        unified = text.replace("\r\n", "\n").replace("\r", "\n")
-        return unified.splitlines(keepends=True)
-
-    display = _display_path(path)
-    diff_gen = difflib.unified_diff(
-        _norm(old_text),
-        _norm(new_text),
-        fromfile=f"a/{display}",
-        tofile=f"b/{display}",
-        n=_FILE_DIFF_CONTEXT_LINES,
-        lineterm="",
-    )
-    parts: list = []
-    added = removed = 0
-    truncated = False
-    diff_chars = 0
-    changed_ranges: list[dict[str, int | None]] = []
-    old_line = new_line = 0
-    active = False
-    old_start = old_end = new_start = new_end = None
-    old_anchor = new_anchor = 0
-
-    def flush_changed_range() -> None:
-        nonlocal active, old_start, old_end, new_start, new_end
-        if active:
-            if old_start is not None and old_end is not None and old_end < old_start:
-                old_start = old_end = None
-            if new_start is not None and new_end is not None and new_end < new_start:
-                new_start = new_end = None
-            changed_ranges.append({
-                "old_start_line": old_start,
-                "old_end_line": old_end,
-                "new_start_line": new_start,
-                "new_end_line": new_end,
-            })
-        active = False
-        old_start = old_end = new_start = new_end = None
-
-    for index, line in enumerate(diff_gen):
-        if index < 2:
-            # --- a/path / +++ b/path 文件头（仅内容有变化时输出）
-            parts.append(line.rstrip("\r\n"))
-            diff_chars += len(parts[-1]) + 1
-            continue
-        hunk = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        if hunk:
-            flush_changed_range()
-            old_line, new_line = int(hunk.group(1)), int(hunk.group(2))
-            rendered = line.rstrip("\r\n")
-            line_chars = len(rendered) + 1
-            if not truncated and diff_chars + line_chars <= _FILE_DIFF_MAX_DIFF_CHARS:
-                parts.append(rendered)
-                diff_chars += line_chars
-            elif not truncated:
-                truncated = True
-            continue
-        if line.startswith("+"):
-            added += 1
-            if not active:
-                active = True
-                old_anchor, new_anchor = old_line, new_line
-            new_start = new_line if new_start is None else min(new_start, new_line)
-            new_end = new_line if new_end is None else max(new_end, new_line)
-            new_line += 1
-        elif line.startswith("-"):
-            removed += 1
-            if not active:
-                active = True
-                old_anchor, new_anchor = old_line, new_line
-            old_start = old_line if old_start is None else min(old_start, old_line)
-            old_end = old_line if old_end is None else max(old_end, old_line)
-            old_line += 1
-        elif line.startswith(" "):
-            flush_changed_range()
-            old_line += 1
-            new_line += 1
-        elif line.startswith("\\"):
-            # unified diff 的 no-newline 标记不占文件行号。
-            pass
-        else:
-            continue
-        if active:
-            if old_start is None:
-                old_start, old_end = old_anchor, old_anchor - 1
-            if new_start is None:
-                new_start, new_end = new_anchor, new_anchor - 1
-        rendered = line.rstrip("\r\n")
-        line_chars = len(rendered) + 1
-        if not truncated and diff_chars + line_chars <= _FILE_DIFF_MAX_DIFF_CHARS:
-            parts.append(rendered)
-            diff_chars += line_chars
-        elif not truncated:
-            truncated = True
-    flush_changed_range()
-    if not parts:
-        return {
-            "diff": "",
-            "lines_added": 0,
-            "lines_removed": 0,
-            "diff_truncated": False,
-            "diff_skipped": "unchanged",
-            "path": str(path),
-            "display_path": display,
-            "changed_ranges": [],
-        }
-    return {
-        "diff": "\n".join(parts),
-        "lines_added": added,
-        "lines_removed": removed,
-        "diff_truncated": truncated,
-        "diff_skipped": "",
-        "path": str(path),
-        "display_path": display,
-        "changed_ranges": changed_ranges,
-    }
+    return _file_diff_result.build_file_diff(old_text, new_text, path, display_path=_display_path(path),
+        max_text_chars=_FILE_DIFF_MAX_TEXT_CHARS, max_diff_chars=_FILE_DIFF_MAX_DIFF_CHARS, context_lines=_FILE_DIFF_CONTEXT_LINES)
 
 
 _EDIT_MODEL_DIFF_MAX_CHARS = 1200
 
 
-def _build_edit_model_result(
-    path: Path,
-    edits: list[dict[str, Any]],
-    replacements: int,
-    file_diff: dict[str, Any],
-    content_hash: str,
-) -> dict[str, Any]:
-    """Build a compact result for the model; UI diff stays in the separate _file_diff field."""
-    changed_ranges = file_diff.get("changed_ranges")
-    changed_range = None
-    if changed_ranges:
-        bounds: dict[str, int | None] = {}
-        for key in ("old_start_line", "old_end_line", "new_start_line", "new_end_line"):
-            present = [item.get(key) for item in changed_ranges if item.get(key) is not None]
-            bounds[key] = (min(present) if key.endswith("start_line") else max(present)) if present else None
-        changed_range = bounds
-
-    result: dict[str, Any] = {
-        "success": True,
-        "path": _display_path(path),
-        "replacements": replacements,
-        "changed_range": changed_range,
-        "stats": {
-            "added_lines": file_diff.get("lines_added"),
-            "removed_lines": file_diff.get("lines_removed"),
-        },
-        "content_hash": content_hash,
-        "diff_truncated": bool(file_diff.get("diff_truncated")),
-    }
-
-    diff_text = str(file_diff.get("diff") or "")
-    if file_diff.get("diff_skipped") == "file_too_large":
-        result["diff_truncated"] = False
-        result["diff_omitted_reason"] = "file_too_large"
-        return result
-    if file_diff.get("diff_skipped") == "unchanged":
-        result["diff_omitted_reason"] = "no_content_changes"
-        return result
-    if len(diff_text) > _EDIT_MODEL_DIFF_MAX_CHARS:
-        result["diff_truncated"] = True
-        result["diff_omitted_reason"] = "over_model_budget"
-        # The full diff is retained separately for the UI. Keep an actual diff
-        # excerpt (including hunk location), rather than echoing requested edits
-        # which may have been normalized or applied in multiple places.
-        lines = diff_text.splitlines()
-        location = "\n".join(line for line in lines[:4] if line.startswith(("---", "+++", "@@")))[:200]
-        removed = [line for line in lines if line.startswith("-") and not line.startswith("---")]
-        added = [line for line in lines if line.startswith("+") and not line.startswith("+++")]
-        result["diff_preview"] = (location + "\n" + "\n".join(removed[:3])[:200] +
-                                  "\n" + "\n".join(added[:3])[:200] + "\n[仅展示部分修改行]")
-        result["message"] = "编辑成功；diff_preview 仅为实际修改的开头预览，完整 diff 已留给前端。可按 changed_range 用 read_file 核验。"
-        return result
-
-    removed_lines = [line[1:] for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---")]
-    added_lines = [line[1:] for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++")]
-    requested_old_lines = {line for edit in edits for line in str(edit["old_string"]).replace("\r\n", "\n").splitlines()}
-    requested_new_lines = {line for edit in edits for line in str(edit["new_string"]).replace("\r\n", "\n").splitlines()}
-    if (removed_lines or added_lines) and all(line in requested_old_lines for line in removed_lines) and all(
-        line in requested_new_lines for line in added_lines
-    ):
-        result["diff_omitted_reason"] = "duplicates_edit_request"
-        result["message"] = "编辑成功；diff 仅重复本次替换文本，已省略。修改位置和数量见 changed_range、stats。"
-    elif diff_text:
-        result["diff"] = diff_text
-    else:
-        result["diff_omitted_reason"] = "no_diff_available"
-    return result
+def _build_edit_model_result(path: Path, edits: list[dict[str, Any]], replacements: int, file_diff: dict[str, Any], content_hash: str) -> dict[str, Any]:
+    return _file_diff_result.build_edit_model_result(path, edits, replacements, file_diff, content_hash,
+        display_path=_display_path(path), max_diff_chars=_EDIT_MODEL_DIFF_MAX_CHARS)
 
 
 def _content_hash(text: str) -> str:
@@ -1318,7 +955,8 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     file_path = _tool_path(args)
     if not file_path:
         raise ValueError("path 不能为空")
-    path = Path(file_path).expanduser()
+    from memory.storage_layout import remap_legacy_attachment
+    path = remap_legacy_attachment(file_path)
     guard_path(path)
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在")
@@ -1763,7 +1401,8 @@ def _native_document_byte_limit() -> int:
 def _load_local_document(filename: str, *, parse_text: bool = True,
                          max_bytes: int | None = None) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
     """读取显式指定的本地文档并复用上传链路解析器。"""
-    path = Path(filename).expanduser()
+    from memory.storage_layout import remap_legacy_attachment
+    path = remap_legacy_attachment(filename)
     guard_path(path)
     if not path.is_absolute():
         path = Path.cwd() / path

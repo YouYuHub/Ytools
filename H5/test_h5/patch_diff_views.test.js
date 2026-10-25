@@ -12,6 +12,7 @@ function setup(t){
     FormatUtils:{prettyJson:JSON.stringify,fmtNum:String,fmtTime:String,roundSummaryText:()=>''},
     Markdown:{render:()=>''},renderPreservingWidgets(){},
     buildThinkBlock(){return {wrap:el('div','think-block'),textContent:()=>'',done(){},streaming(){},setText(){},add(){}};}});
+  w.eval(fs.readFileSync(path.join(__dirname,'../js/app/message_diff.js'),'utf8'));
   const end=messages.indexOf('  // 代码块复制（事件委托）',messages.indexOf('  function buildSubAgentBlock('));
   w.eval(messages.slice(messages.indexOf('  function buildToolBlock('),end)+'\nObject.assign(App,{buildToolBlock,applyToolResult,buildDiffView,buildSubAgentBlock});');
   const start=messages.indexOf('  function renderOneRecordInto(');
@@ -50,8 +51,21 @@ test('实时 SSE 管线和历史 JSONL 工具结果都保留多文件 diff',t=>{
     {role:'tool',tool_name:'apply_patch',tool_call_id:'p',result:h.result,file_diff:h.diff}]};
   const parsed=parser.parseHistory(JSON.stringify(round)),tools={},compactions={};h.root.replaceChildren();
   for(const rec of parsed.records)if(['tool','toolResult'].includes(rec.kind))h.w.renderOneRecordInto(h.root,rec,tools,compactions);
+  assert.equal(h.root.querySelectorAll('.diff-file').length,0,'closed history tools defer diff DOM');
+  h.root.querySelector('.tool-block-head').click();
   assert.equal(h.root.querySelectorAll('.diff-file').length,2);
   assert.equal(h.root.querySelectorAll('.tool-block').length,1);
+});
+
+test('延迟历史差异保留标题统计，首次展开只渲染最新结果，清除后不恢复旧差异',t=>{
+  const h=setup(t),ui=h.App.buildToolBlock('apply_patch',null,{deferDetails:true});h.root.append(ui.wrap);
+  h.App.applyToolResult(ui,'apply_patch',h.result,h.diff,{patch:'...'});ui.finish();
+  assert.equal(ui.wrap.querySelector('.tool-block-diff').textContent,'+2-1');
+  assert.equal(ui.wrap.querySelectorAll('.diff-batch').length,0);
+  ui.wrap.querySelector('.tool-block-head').click();
+  assert.equal(ui.wrap.querySelectorAll('.diff-batch').length,1);
+  ui.clearDiff();ui.wrap.querySelector('.tool-block-head').click();ui.wrap.querySelector('.tool-block-head').click();
+  assert.equal(ui.wrap.querySelectorAll('.diff-batch').length,0);
 });
 
 test('子任务实时及历史聚合事件都回填多文件 diff',t=>{

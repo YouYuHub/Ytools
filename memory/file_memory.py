@@ -107,8 +107,10 @@ def _safe_session_id(session_id: str) -> str:
 
 
 def _get_session_dir(session_id: str) -> Path:
-    safe_id = _safe_session_id(session_id)
-    return HISTORY_ROOT / safe_id
+    from security.authorization import session as authorize_session
+    authorize_session(session_id)
+    from memory.storage_layout import files_path
+    return files_path(HISTORY_ROOT.parent, session_id, legacy_root=HISTORY_ROOT)
 
 
 def get_upload_dir_name(session_id: str) -> str:
@@ -136,8 +138,8 @@ def _get_history_path(session_id: str, filename: str) -> Path:
 
 
 def _write_json_file(file_path: Path, data: dict[str, Any]) -> None:
-    with file_path.open("w", encoding="utf-8") as fp:
-        fp.write(json.dumps(data, ensure_ascii=False, indent=2))
+    from util.atomic_json import write_json
+    write_json(file_path, data)
 
 
 def _read_json_file(file_path: Path) -> dict[str, Any] | None:
@@ -145,7 +147,14 @@ def _read_json_file(file_path: Path) -> dict[str, Any] | None:
         return None
     try:
         with file_path.open("r", encoding="utf-8") as fp:
-            return json.load(fp)
+            record = json.load(fp)
+        if isinstance(record, dict) and isinstance(record.get("stored_name"), str):
+            name = record["stored_name"]
+            if Path(name).name == name and "/" not in name and "\\" not in name:
+                source = file_path.parent / DOC_DIRECTORY_NAME / name
+                if source.is_file():
+                    record["abs_path"] = str(source.resolve()).replace("\\", "/")
+        return record
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -1592,7 +1601,9 @@ def save_session_document(session_id: str, filename: str, data: bytes) -> dict[s
     base = _safe_filename(Path(filename).stem) or "document"
     stored_name = f"{base}_{uuid.uuid4().hex[:8]}{suffix}"
     path = _doc_dir(session_id) / stored_name
-    path.write_bytes(data)
+    from security.resource_limits import storage_write
+    with storage_write(len(data), session_id=session_id):
+        path.write_bytes(data)
     return {
         "stored_name": stored_name,
         "mime": media_mime_type(stored_name),
@@ -1690,7 +1701,9 @@ def save_session_media(session_id: str, filename: str, data: bytes) -> dict[str,
     # 同名覆盖会串图：加短随机后缀保证唯一
     stored_name = f"{base}_{uuid.uuid4().hex[:8]}{suffix}"
     path = _media_dir(session_id) / stored_name
-    path.write_bytes(data)
+    from security.resource_limits import storage_write
+    with storage_write(len(data), session_id=session_id):
+        path.write_bytes(data)
     return {
         "filename": filename,
         "stored_name": stored_name,
@@ -2060,12 +2073,16 @@ def save_session_media_stream(session_id: str, filename: str, file_obj: Any) -> 
     path = _media_dir(session_id) / stored_name
     written = 0
     try:
-        with path.open("wb") as out:
+        from security.resource_limits import storage_write
+        with storage_write(session_id=session_id) as available, path.open("wb") as out:
             while True:
                 chunk = file_obj.read(1024 * 1024)
                 if not chunk:
                     break
                 written += len(chunk)
+                if available is not None and written > available:
+                    from memory.identity_store import Throttled
+                    raise Throttled("账号存储额度不足，上传已停止且半成品已清理")
                 if written > size_limit:
                     raise ValueError(
                         f"文件大小超过限制（"
@@ -2521,6 +2538,8 @@ async def get_file_memory_manager(session_id: str) -> FileMemoryManager:
     Returns:
         FileMemoryManager实例
     """
+    from security.authorization import session as authorize_session
+    session_id = authorize_session(session_id)
     with _session_lock:
         if session_id not in _session_managers:
             _session_managers[session_id] = FileMemoryManager(session_id)
@@ -2533,6 +2552,10 @@ async def cleanup_file_memory_manager(session_id: str) -> None:
     Args:
         session_id: 会话ID
     """
+    from security.principal import current
+    principal = current()
+    if principal:
+        session_id = principal.store.resource_key("session", session_id)
     with _session_lock:
         if session_id in _session_managers:
             del _session_managers[session_id]

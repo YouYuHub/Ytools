@@ -21,9 +21,23 @@ def write_metadata(path, metadata):
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         temporary.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
+        # A concurrent Windows reader/AV can briefly hold the destination
+        # without delete-sharing. Retry the commit, never the stdin delivery.
+        from util.atomic_json import RETRY_DELAYS
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as error:
+                occupied = isinstance(error, PermissionError) or getattr(error, 'winerror', None) in {5, 32, 33}
+                if not occupied or attempt == len(RETRY_DELAYS):
+                    raise
+                time.sleep(RETRY_DELAYS[attempt])
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # Cleanup must not turn a committed receipt into a failure.
 
 
 def read_job(job_id, session_id=None):
@@ -37,6 +51,9 @@ def read_job(job_id, session_id=None):
         raise ValueError(f"后台任务 {job_id} 不存在或记录已过期") from exc
     if meta.get("job_id") != job_id:
         raise ValueError("后台任务记录无效")
+    from security.authorization import visible_session
+    if not visible_session(meta.get("session_id") or ""):
+        raise ValueError("后台任务不存在或无权访问")
     if session_id is not None and (meta.get("session_id") or "") != session_id:
         raise ValueError("后台任务不属于当前会话")
     # Never let registry metadata turn HTTP output/download into arbitrary file reads.

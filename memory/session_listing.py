@@ -12,6 +12,9 @@ MAX_SUMMARY_HEADER_BYTES = 2 * 1024 * 1024
 
 
 def _summary(path: Path, session_id: str) -> dict | None:
+    from security.authorization import visible_session
+    if not visible_session(session_id):
+        return None
     try:
         if path.is_symlink() or not path.is_file():
             return None
@@ -66,8 +69,12 @@ def list_session_summaries(session_id: str | None = None, archive_scope: str = "
         row = _summary(chat_memory._get_chat_history_file(sid), sid)
         return [row] if visible(row) else []
     rows = []
-    for path in chat_memory.HISTORY_ROOT.glob("*.jsonl"):
+    from memory.storage_layout import iter_chat_paths
+    for path in iter_chat_paths(chat_memory.HISTORY_ROOT):
         sid = chat_memory.normalize_session_id(path.name)
+        from security.authorization import visible_session
+        if not visible_session(sid):
+            continue
         if not selected(sid):
             continue  # 归档过滤必须在打开文件/读取首行之前完成。
         row = _summary(path, sid)
@@ -86,7 +93,9 @@ def recover_pending_sessions(stop: threading.Event) -> None:
     from util.logger import get_logger
     logger = get_logger(__name__)
     root = chat_memory.HISTORY_ROOT
+    from memory.storage_layout import iter_chat_paths, sidecar_path
     candidates = list((root / "sidecars").glob("*_chat.jsonl.pending")) + list(root.glob("*_chat.jsonl.pending"))
+    candidates += [sidecar_path(root, p) / (p.name + ".pending") for p in iter_chat_paths(root)]
     seen = set()
     for path in candidates:
         if stop.is_set():

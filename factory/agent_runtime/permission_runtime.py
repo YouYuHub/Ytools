@@ -154,6 +154,15 @@ def permission_urlopen(request, *, timeout):
     import urllib.request
     from urllib.parse import urlsplit
     current = CURRENT.get()
+    from security.principal import current as account_principal
+    if account_principal() is not None:
+        source = request.full_url if isinstance(request, urllib.request.Request) else request
+        if current and current.context["mode"] != "full_control":
+            plan = current.active_plan.get()
+            if source not in current.network_grants and (not plan or source not in plan["sources"]):
+                raise PermissionError("网络媒体来源未获本次授权")
+        from security.network import account_urlopen
+        return account_urlopen(request, timeout=timeout)
     if not current or current.context["mode"] == "full_control":
         return urllib.request.urlopen(request, timeout=timeout)
     source = request.full_url if isinstance(request, urllib.request.Request) else request

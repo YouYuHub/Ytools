@@ -3,8 +3,8 @@
  * 默认指向文档约定端口 48621；如需改动可在 localStorage 设置 ytools-api-base 覆盖，
  * 例如 localStorage.setItem('ytools-api-base', 'http://192.168.1.10:48621')
  */
-const api_url = localStorage.getItem("ytools-api-base")
-  || (typeof location !== "undefined" && /^https?:$/.test(location.protocol) && String(location.pathname).startsWith("/ui") ? location.origin : "http://127.0.0.1:48621");
+const api_url = (typeof window !== "undefined" && window.YtoolsAuth) ? location.origin : (localStorage.getItem("ytools-api-base")
+  || (typeof location !== "undefined" && /^https?:$/.test(location.protocol) && String(location.pathname).startsWith("/ui") ? location.origin : "http://127.0.0.1:48621"));
 
 (function (global) {
   const BASE_KEY = "ytools-api-base";
@@ -18,7 +18,7 @@ const api_url = localStorage.getItem("ytools-api-base")
       localStorage.removeItem(LEGACY_KEY);
     }
   }
-  const BASE = (storedBase || api_url).replace(/\/$/, "");
+  const BASE = (global.YtoolsAuth ? location.origin : (storedBase || api_url)).replace(/\/$/, "");
   async function request(path, options) {
     const res = await fetch(BASE + path, options);
     if (!res.ok) {
@@ -77,6 +77,7 @@ const api_url = localStorage.getItem("ytools-api-base")
 
   // XHR 的 upload 事件提供真实的已发送字节数；100% 后等待服务端解析/保存。
   function uploadRaw(path, file, onProgress, signal) {
+    if (global.YtoolsAuth && global.YtoolsAuth.upload) return global.YtoolsAuth.upload(BASE + path,file,onProgress,signal);
     return new Promise(function (resolve, reject) {
       const xhr = new XMLHttpRequest();
       let settled = false;
@@ -228,6 +229,20 @@ const api_url = localStorage.getItem("ytools-api-base")
       if (!res.ok) throw new Error("加载会话失败");
       return res.text();
     });
+  }
+
+  function fetchSessionPage(sessionId, options) {
+    options = options || {};
+    const params = new URLSearchParams({session_id:sessionId,limit:String(options.limit || 20)});
+    ["before","around","revision","include_questions"].forEach(function (key) {
+      if (options[key] != null) params.set(key,String(options[key]));
+    });
+    return request("/chat_history/page?"+params.toString(),{signal:options.signal});
+  }
+
+  function fetchHistoryEvent(sessionId, ref, signal) {
+    const params=new URLSearchParams({session_id:sessionId,round_no:String(ref.round),event_index:String(ref.event_index),revision:ref.revision});
+    return request("/chat_history/event?"+params.toString(),{signal:signal});
   }
 
   function searchHistory(query, options) {
@@ -886,6 +901,7 @@ const api_url = localStorage.getItem("ytools-api-base")
    * @param {AbortSignal} [signal] 中止信号
    */
   async function chatStream(payload, onEvent, signal, options) {
+    if (window.YtoolsAuth && !window.YtoolsAuth.executionAllowed) payload = Object.assign({}, payload, { tool_names: [] });
     const res = await fetch(BASE + "/chat_with_tool", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -994,27 +1010,13 @@ const api_url = localStorage.getItem("ytools-api-base")
     });
   }
 
-  // ---------- 用户资料（全局显示名，账号体系接入前的过渡实现） ----------
+  // ---------- 当前账号显示名（侧边栏读取；编辑位于账号设置页） ----------
   /**
-   * 读取全局用户资料（当前仅显示名）
-   * @returns {Promise<{state, name, default_name, max_length, persisted, env_name, env_value, env_file}>}
-   *   name：当前生效显示名（.env USER_NAME 未设置/被清空时回退 default_name）
+   * 读取当前账号资料（当前仅显示名）
+   * @returns {Promise<{state, name, default_name, max_length, persisted, source}>}
    */
   function getUserProfile() {
     return request("/user/profile");
-  }
-
-  /**
-   * 保存全局显示名（写入项目 .env 的 USER_NAME 键，写盘 + 内存同步，立即生效）
-   * @param {string} name 新显示名；空白串 = 清空，界面回退默认名
-   * @returns {Promise<{state, name, message, persisted, ...}>}
-   */
-  function updateUserProfile(name) {
-    return request("/user/profile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name == null ? "" : String(name) }),
-    });
   }
 
   function getSpeechInputConfig(options) {
@@ -1184,6 +1186,8 @@ const api_url = localStorage.getItem("ytools-api-base")
     getContextOverview,
     updateSessionTitle,
     fetchSessionFile,
+    fetchSessionPage,
+    fetchHistoryEvent,
     searchHistory,
     getPermissions, setPermissions, pendingApprovals, decideApproval, previewPermission, permissionMediaUrl, cancelPermissionTask, resumePermissionTask,
     deleteSession,
@@ -1251,7 +1255,6 @@ const api_url = localStorage.getItem("ytools-api-base")
     renamePrompt,
     deletePrompt,
     getUserProfile,
-    updateUserProfile,
     getSpeechInputConfig,
     updateSpeechInputConfig,
     listFileChanges,

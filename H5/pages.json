@@ -1,0 +1,8 @@
+{
+  "pages": [
+    {"file": "index.html", "authenticated": true, "defer_scripts": true},
+    {"file": "account.html", "authenticated": true, "password_change": true},
+    {"file": "editor.html", "authenticated": true},
+    {"file": "login.html", "authenticated": false}
+  ]
+}

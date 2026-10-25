@@ -6,7 +6,7 @@ import urllib.error
 
 from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import Response, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from memory import permission_store as store
 from memory.chat_memory import normalize_session_id, resolve_session_work_dir
 from factory.agent_runtime.permission_policy import plan_tool, inside, protected, resolve_path
@@ -28,7 +28,7 @@ class DecisionPayload(BaseModel):
 
 class PreviewPayload(BaseModel):
     session_id: str
-    source: str
+    source: str = Field(max_length=4096)
 
 
 class TaskPayload(BaseModel):
@@ -220,6 +220,13 @@ async def media(request: Request, session_id: str, source: str, grant: str = "")
     if not allowed and not verify_ticket(grant, session, actual):
         raise HTTPException(403, "外部媒体需要用户确认")
     if network and full_control:
+        from security.principal import current
+        if current():
+            from security.network import resolve_target
+            try:
+                await asyncio.to_thread(resolve_target, actual, allowed_origins=current().store.settings.allowed_media_origins)
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from error
         return RedirectResponse(actual, status_code=302)
     if not network:
         from routers.file_router import _file_response_with_range
@@ -232,7 +239,10 @@ async def media(request: Request, session_id: str, source: str, grant: str = "")
         def redirect_request(self, *args, **kwargs):
             return None
     def download():
-        with urllib.request.build_opener(NoRedirect).open(actual, timeout=30) as response:
+        from security.principal import current
+        from security.network import account_urlopen
+        opener = account_urlopen if current() else urllib.request.build_opener(NoRedirect).open
+        with opener(actual, timeout=30) as response:
             data = response.read(32 * 1024 * 1024 + 1)
             if len(data) > 32 * 1024 * 1024:
                 raise ValueError("媒体超过32MB预览上限")
