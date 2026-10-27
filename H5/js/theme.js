@@ -5,23 +5,13 @@
  */
 (function (global) {
   const STORAGE_KEY = "ytools-theme-preference";
-  const LEGACY_KEY = "theme-preference";
   const ACCENT_KEY = "ytools-accent-preference";
   const MEDIA = global.matchMedia("(prefers-color-scheme: dark)");
   const VALID = ["system", "light", "dark"];
   const ACCENTS = ["blue", "green", "purple", "pink", "yellow", "none"];
 
   function readStored() {
-    const current = localStorage.getItem(STORAGE_KEY);
-    if (current != null) return current;
-    // 迁移旧键名（避免与其他同名网页项目共用键值互相影响）
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (legacy != null) {
-      localStorage.setItem(STORAGE_KEY, legacy);
-      localStorage.removeItem(LEGACY_KEY);
-      return legacy;
-    }
-    return null;
+    return localStorage.getItem(STORAGE_KEY);
   }
 
   function getPreference() {

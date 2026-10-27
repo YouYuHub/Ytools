@@ -27,6 +27,22 @@
   const scopedKey = name => global.YtoolsAuth && typeof global.YtoolsAuth.storageKey === "function" ? global.YtoolsAuth.storageKey(name) : name;
   const STORAGE_EVENT_KEY = scopedKey(STORAGE_KEY);
   const CHANNEL_NAME = scopedKey("ytools-file-history");
+  // 显式经账户命名空间读写，不依赖 Storage 包装链的隐式前缀。
+  const rawOf = () => global.YtoolsAuth && global.YtoolsAuth.rawStorage;
+  function rawGet(key) {
+    const raw = rawOf();
+    return raw ? raw.get.call(global.localStorage, key) : global.localStorage.getItem(key);
+  }
+  function rawSet(key, value) {
+    const raw = rawOf();
+    if (raw) raw.set.call(global.localStorage, key, value);
+    else global.localStorage.setItem(key, value);
+  }
+  function rawRemove(key) {
+    const raw = rawOf();
+    if (raw) raw.remove.call(global.localStorage, key);
+    else global.localStorage.removeItem(key);
+  }
 
   let memoryDirty = false; // localStorage 不可用（Node 单测/隐私模式）时的内存降级
 
@@ -42,7 +58,7 @@
   function peekDirty() {
     if (storageAvailable()) {
       try {
-        return global.localStorage.getItem(STORAGE_KEY) != null;
+        return rawGet(STORAGE_EVENT_KEY) != null;
       } catch (_) {
         return memoryDirty;
       }
@@ -55,7 +71,7 @@
     memoryDirty = true;
     if (storageAvailable()) {
       try {
-        global.localStorage.setItem(STORAGE_KEY, String(Date.now()));
+        rawSet(STORAGE_EVENT_KEY, String(Date.now()));
       } catch (_) {
         /* 存储满/隐私模式：内存标记仍生效（同窗口），跨窗口由广播承担 */
       }
@@ -69,7 +85,7 @@
     memoryDirty = false;
     if (storageAvailable()) {
       try {
-        global.localStorage.removeItem(STORAGE_KEY);
+        rawRemove(STORAGE_EVENT_KEY);
       } catch (_) {
         /* 忽略 */
       }

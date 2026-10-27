@@ -135,7 +135,7 @@ def test_delete_removes_archive_flag_before_reusing_session_id(root, monkeypatch
 
 def test_corrupt_archive_state_is_reported_without_overwriting_or_revealing_hidden_sessions(root, api):
     history(root, "one")
-    path = root / "sidecars" / "session_archives.json"; path.parent.mkdir(); path.write_text("broken", encoding="utf-8")
+    path = root / "session_archives.json"; path.write_text("broken", encoding="utf-8")
     assert api.get("/chat_history/archives").status_code == 503
     assert api.get("/chat_history/summaries").status_code == 503
     assert api.put("/chat_history/archive", json={"session_id": "one", "archived": True}).status_code == 503

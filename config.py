@@ -20,9 +20,7 @@ DEFAULT_SERVICE_PORT = int(os.environ.get("DEFAULT_SERVICE_PORT", load_var("DEFA
 # 兼容旧版原始历史上下文与统计的默认轮数；摘要-only 模式下已完成轮次不再按轮回传。
 # 历史轮次窗口（keep_rounds / HISTORY_COMPACT_KEEP_ROUNDS）已废弃：历史规模由
 # 压缩触发阈值与历史压缩目标（HISTORY_COMPACT_TARGET_TOKENS）控制。
-DEFAULT_CONTEXT_HISTORY_ROUNDS = 20         # 兼容旧字段的默认值（当前不再参与压缩决策）
 DEFAULT_HISTORY_TRIGGER_RATIO = 0.8         # 历史压缩触发比例
-DEFAULT_HISTORY_CHUNK_ROUNDS = 3            # 历史压缩每次处理的轮数
 DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
 # 历史压缩目标（tokens）：>0 时把"历史部分"压到该值以内（与触发阈值无关），
 # 用于压低长任务的单次输入成本；0 表示不设目标（仅按触发阈值/可用空间压缩）。

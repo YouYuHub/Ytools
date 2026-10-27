@@ -248,6 +248,8 @@ def read_shared_policies(raw, sessions):
 
 def assert_session_importable(session):
     """Replacing history must not leave a resumable task for the old history."""
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         active = db.execute("SELECT 1 FROM tasks WHERE session=? AND state IN ('running','suspended') LIMIT 1", (session,)).fetchone()
     if active:
@@ -273,11 +275,15 @@ def task(task_id):
     if not row:
         return None
     value = dict(row)
+    from security.authorization import session as authorize_session
+    authorize_session(value["session"])
     value["data"] = json.loads(value["data"])
     return value
 
 
 def create_task(session, data):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     task_id, epoch = uuid.uuid4().hex, uuid.uuid4().hex
     with database() as db:
         db.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?,?)", (task_id, session, "running", os.getpid(), epoch, encode(data), time.time()))
@@ -317,9 +323,11 @@ def execution(task_id, agent, call_id):
 
 def claim_execution(task_id, epoch, agent, call_id):
     with database() as db:
-        row = db.execute("SELECT state,epoch FROM tasks WHERE id=?", (task_id,)).fetchone()
+        row = db.execute("SELECT state,epoch,session FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or row[0] != "running" or row[1] != epoch:
             raise ValueError("任务已停止或执行代次已失效")
+        from security.authorization import session as authorize_session
+        authorize_session(row[2])
         if db.execute("SELECT 1 FROM executions WHERE task=? AND agent=? AND call_id=?", (task_id, agent, call_id)).fetchone():
             raise ValueError("本次工具调用已有执行记录，禁止重复执行")
         db.execute("INSERT INTO executions VALUES(?,?,?,'executing',NULL)", (task_id, agent, call_id))
@@ -346,6 +354,8 @@ def approval(approval_id):
     if not row:
         return None
     value = dict(row)
+    from security.authorization import session as authorize_session
+    authorize_session(value["session"])
     value["plan"] = json.loads(value["plan"])
     return value
 
@@ -397,6 +407,8 @@ def pid_alive(pid):
 
 
 def pending(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         rows = db.execute("SELECT id FROM tasks WHERE session=? AND state IN ('running','suspended')", (session,)).fetchall()
     for row in rows:
@@ -473,6 +485,8 @@ def adopt(task_id):
 
 
 def has_restorable_round(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         return bool(db.execute("SELECT 1 FROM tasks t JOIN checkpoints c ON c.task=t.id WHERE session=? AND state IN ('running','suspended') AND c.agent='main' AND COALESCE(json_extract(t.data,'$.preview'),0)=0 LIMIT 1", (session,)).fetchone())
 
@@ -483,6 +497,8 @@ def suspend_session(session):
 
 
 def delete_session(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         for table in ("approvals", "executions", "checkpoints"):
             db.execute(f"DELETE FROM {table} WHERE task IN (SELECT id FROM tasks WHERE session=?)", (session,))

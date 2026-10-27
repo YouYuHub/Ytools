@@ -4,7 +4,7 @@
 
 项目可按模型的有效 `apiType` 调用 Chat Completions、Anthropic 风格的 Messages API 或有状态 Responses API。本文只说明 Messages 的请求格式与能力；聊天、标题、压缩和子智能体四个角色均可选择 Messages，原有 `ChatLLM` 方法名和业务 SSE 格式继续使用。
 
-2026-10-11 更新：已接通图片、PDF、纯文本和自定义内容文档。本文描述当前实现；最初的实施方案保留在 `messages_api_compatibility_plan.md`。
+2026-10-11 更新：已接通图片、PDF、纯文本和自定义内容文档。本文描述当前实现；最初的实施方案保留在 `archive/messages_api_compatibility_plan.md`。
 
 ## 配置和参数
 
@@ -46,7 +46,7 @@
 
 参数面板在选择 Messages 模型时显示最大输出 token、Messages 专属参数控件以及通用「高级供应商参数 / extra_body」JSON 区域。可选字段为 `thinking`、`output_config`、`stop_sequences`、`temperature`、`top_p`、`extra_body`；留空不发送采样和思考配置，使用供应商默认值。`stop_sequences` 是自定义停止串数组：模型生成到其中任一项即停止，响应的 `stop_reason` 为 `stop_sequence`，`stop_sequence` 字段给出命中的那一个。`extra_body` 必须为对象，可承载模型支持的 `cache_control`、`metadata` 等扩展；调整输出预算会保留这些字段。
 
-旧调用参数 `extra_body.stop`（字符串或字符串数组）转换为 `stop_sequences`，`extra_body.response_format.type=json_schema` 转为 `output_config.format`，保留 schema；显式原生字段优先。`json_object` 等无法保真转换的格式发送前报错。工具定义中的显式 `function.strict` 会传给上游；不自动修改 schema。完整对照与本次补齐见 [功能检查记录](messages_api_parity_audit.md)。
+旧调用参数 `extra_body.stop`（字符串或字符串数组）转换为 `stop_sequences`，`extra_body.response_format.type=json_schema` 转为 `output_config.format`，保留 schema；显式原生字段优先。`json_object` 等无法保真转换的格式发送前报错。工具定义中的显式 `function.strict` 会传给上游；不自动修改 schema。完整对照与本次补齐见 [功能检查记录](archive/messages_api_parity_audit.md)。
 
 支持 adaptive thinking 的模型可填写：
 

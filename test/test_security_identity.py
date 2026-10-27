@@ -120,12 +120,12 @@ def test_totp_enrollment_encryption_and_replay_protection(identity):
 def test_ownership_is_exclusive_and_unknown_is_unowned(identity):
     store, admin = identity
     member = store.create_user("member", PASSWORD, actor=admin["id"])
-    assert store.owner("session", "legacy") is None
-    store.register("session", "new", member["id"])
-    assert store.owned("session", member["id"]) == {"new"}
-    assert not store.owned("session", admin["id"])
+    assert store.owner("legacy") is None
+    store.register("new", member["id"])
+    assert store.owned(member["id"]) == {"new"}
+    assert not store.owned(admin["id"])
     with pytest.raises(Denied):
-        store.register("session", "new", admin["id"])
+        store.register("new", admin["id"])
 
 
 def test_rate_limits_are_persistent_and_bounded(identity):

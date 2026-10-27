@@ -747,5 +747,4 @@
 
   // ---------- 导出 ----------
   App.openSkills = openSkills;
-  App.closeSkills = closeSkills;
 })(App);

@@ -32,7 +32,7 @@
 - `read_file` 返回 `content_hash`（全文指纹，可传给 `edit_file.expected_hash`）；
 - 完整 `_file_diff` 不进模型上下文，仅随 SSE 事件与 JSONL 落盘分发；edit_file 另生成精简的模型结果，小型且非重复的 diff 可按需附带；
 - 前端工具块输出区渲染彩色 diff 视图（实时 + 历史回放 + 子任务块三挂点）；
-- `sys_tools_server.py` 中同名文件工具已迁移到后端内置工具，MCP 注册块目前注释保留；外部 MCP 同名工具若仍由用户自行注册，则返回纯文本，前端回退普通渲染。
+- `web_tools_server.py` 中同名文件工具已迁移到后端内置工具；外部 MCP 同名工具若仍由用户自行注册，则返回纯文本，前端回退普通渲染。
 
 ### 1.2 V1 明确不做（阶段 2 预留）——后续版本已陆续落地
 > 原「阶段 2 预留」的前三项（原子写入 / 版本校验 / history 版本快照）已分别在 V1.x 与 V2 实现；本表仅作历史记录。
@@ -138,7 +138,7 @@ graph TD
 
 这样设计的原因：
 1. 旧 JSONL 历史无 `file_diff` 字段 → 自动回退，无需迁移；
-2. MCP sys_tools_server 版同名工具返回纯文本 → 自动回退；
+2. MCP web_tools_server 版同名工具返回纯文本 → 自动回退；
 3. 识别条件只看结构特征（file_diff 存在 + parse 成功 + 有 path），将来 MCP 版若对齐结构可直接复用。
 
 ### 4.2 摘要文本
@@ -304,7 +304,7 @@ graph TD
 - write_file **追加模式** new_text = old_text + content（最终全文，保证版本链内容真实）；
 - **外部改动探测**：工具读到的 old_text hash ≠ 链上最新版本 hash → 先补记 `role=external` 版本（diff = 最新版本→外部状态，即"用户改了什么"），再入 tool 版本；时间线形如 `[base, tool, external, tool]`；
 - record_change 不写工作文件（工具已写完磁盘），rollback / user_save 会写回磁盘并按版本 eol/encoding 还原；
-- 会话目录命名复用 `memory.file_memory._safe_session_id`；进程内每会话一把 `threading.RLock`（生成任务在 worker 进程内由 asyncio 单线程调度；FastAPI 路由直接调用 store 函数、无额外路由级锁，跨进程互斥依赖单 worker 部署形态）。
+- 会话目录命名复用 `memory.storage_layout.safe_session_id`（会话 ID 清洗唯一真源）；进程内每会话一把 `threading.RLock`（生成任务在 worker 进程内由 asyncio 单线程调度；FastAPI 路由直接调用 store 函数、无额外路由级锁，跨进程互斥依赖单 worker 部署形态）。
 
 ### 9.4 REST 接口（`routers/file_history_router.py`，前缀 `/file_diff`）
 

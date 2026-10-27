@@ -27,7 +27,7 @@ class TimestampUtilsTests(unittest.TestCase):
             "memory/chat_memory.py",
             "memory/chat_round_store.py",
             "memory/file_memory.py",
-            "mcp_server/sys_tools_server.py",
+            "mcp_server/web_tools_server.py",
         ):
             with open(path, "r", encoding="utf-8") as fp:
                 content = fp.read()

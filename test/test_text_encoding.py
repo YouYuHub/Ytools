@@ -11,7 +11,7 @@ from unittest.mock import patch
 from util.text_encoding import decode_text, powershell_text_prelude
 from factory import file_factory as ff
 from factory.agent_runtime import builtin_tools as bt
-from mcp_server import sys_tools_server as web
+from mcp_server import web_tools_server as web
 
 
 class TextEncodingTests(unittest.TestCase):
@@ -37,11 +37,11 @@ class TextEncodingTests(unittest.TestCase):
             self.assertEqual(ff._parse_csv(source.encode(encoding)), source)
 
     def test_csv_preserves_headers_quoted_fields_and_headerless_first_row(self):
+        # file_factory 已移除 pandas 依赖，CSV 解析恒走无损文本路径（无需再 patch ff.pd）。
         for source in ('name,score,comment\r\nAlice,95,"优秀,稳定"\r\nBob,,"两行\n评价"\r\n',
                        'Alice,95\nBob,87\n', ''):
-            with patch.object(ff, 'pd', None):
-                self.assertEqual(ff._parse_csv(source.encode()), source)
-                self.assertEqual(ff._parse_csv_with_pages(source.encode())[0]['content'], source)
+            self.assertEqual(ff._parse_csv(source.encode()), source)
+            self.assertEqual(ff._parse_csv_with_pages(source.encode())[0]['content'], source)
 
     def test_local_csv_document_pagination_includes_header(self):
         source = 'name,score,comment\nAlice,95,优秀\nBob,87,良好\n'

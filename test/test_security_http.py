@@ -130,11 +130,11 @@ def test_long_bracket_text_is_not_treated_as_nested_json(secured):
 
 def test_identity_is_not_a_chat_id_and_other_owner_is_denied(secured):
     client, store, admin, member = secured
-    store.register("session", "private-a", admin["id"])
+    store.register("private-a", admin["id"])
     login(client, "member")
     assert client.get("/chat_history/file?session_id=private-a").status_code == 404
     assert client.get("/chat_history/file?session_id=unknown").status_code == 404
-    store.register("session", "private-b", member["id"])
+    store.register("private-b", member["id"])
     assert client.get("/chat_history/file?session_id=private-b").json()["actor"] == member["id"]
     assert client.get("/chat_history/file?session_id=private-a", headers={"Authorization": "Bearer private-a"}).status_code == 404
 
@@ -147,7 +147,7 @@ def test_members_cannot_elevate_or_execute_and_admin_can_register_new(secured):
     assert client.post("/chat_with_tool", json={"session_id": "member-new", "tool_names": []}, headers=headers).status_code == 200
     headers = login(client)
     assert client.post("/chat_with_tool", json={"session_id": "admin-new"}, headers=headers).status_code == 200
-    assert store.owner("session", "admin-new") == admin["id"]
+    assert store.owner("admin-new") == admin["id"]
 
 
 def test_unknown_routes_fail_closed_and_bad_hosts_are_rejected(secured):
@@ -222,8 +222,8 @@ def test_mfa_pending_cannot_reach_business_or_admin(secured):
 
 def test_conflicting_body_and_duplicate_query_cannot_bypass_owner_check(secured):
     client, store, admin, member = secured
-    store.register("session", "mine", admin["id"])
-    store.register("session", "theirs", member["id"])
+    store.register("mine", admin["id"])
+    store.register("theirs", member["id"])
     headers = login(client)
     assert client.get("/chat_history/file?session_id=mine&session_id=theirs").status_code == 404
     assert client.post("/chat_with_tool?session_id=theirs", json={"session_id": "mine"}, headers=headers).status_code == 404
@@ -232,8 +232,8 @@ def test_conflicting_body_and_duplicate_query_cannot_bypass_owner_check(secured)
 @pytest.mark.parametrize("content_type", ["application/JSON", "application/vendor+json", ""])
 def test_alternate_json_headers_cannot_hide_body_ownership(secured, content_type):
     client, store, admin, member = secured
-    store.register("session", "mine", admin["id"])
-    store.register("session", "theirs", member["id"])
+    store.register("mine", admin["id"])
+    store.register("theirs", member["id"])
     headers = login(client)
     if content_type:
         headers["Content-Type"] = content_type
@@ -251,7 +251,7 @@ def test_empty_json_logout_is_valid_and_raw_json_disguise_is_rejected(secured):
 
 def test_query_scope_cannot_authorize_global_config_body(secured):
     client, store, _, member = secured
-    store.register("session", "mine", member["id"])
+    store.register("mine", member["id"])
     headers = login(client, "member")
     for path in ("/chat_config/models/select",):
         assert client.post(path + "?session_id=mine", json={}, headers=headers).status_code == 403
@@ -266,7 +266,7 @@ def test_force_tool_refresh_uses_framework_boolean_semantics(secured, query):
 
 def test_active_content_is_downloaded_and_pdf_keeps_same_origin_preview(secured):
     client, store, admin, _ = secured
-    store.register("session", "s", admin["id"])
+    store.register("s", admin["id"])
     login(client)
     html = client.get("/file/get_session_document?session_id=s")
     assert html.headers["Content-Disposition"] == "attachment"

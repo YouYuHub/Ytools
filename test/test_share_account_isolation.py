@@ -59,6 +59,15 @@ def payload(text="shared public fixture", **meta):
         "events":[{"role":"user","content":text},{"role":"assistant","content":text}]} ) + "\n").encode()
 
 
+def seed(store, root, sid, user_id, data):
+    store.register(sid, user_id)
+    directory = root / "users" / user_id / "sessions" / sid
+    directory.mkdir(parents=True)
+    path = directory / (sid + "_chat.jsonl")
+    path.write_bytes(data)
+    return path
+
+
 def post_file(client, endpoint, name, data, **query):
     return client.post("/chat_history/" + endpoint, params={"filename":name, **query},
                        content=data, headers={"Content-Type":"application/octet-stream"})
@@ -98,15 +107,14 @@ def test_foreign_reserved_identifier_is_copied_without_claiming_it(accounts):
     data=imported.json()
     assert data["imported"], data
     sid=data["imported"][0]["session_id"]
-    assert sid!="reserved" and store.owner("session","reserved")==users[0]["id"]
-    assert store.owner("session",sid)==users[1]["id"]
+    assert sid!="reserved" and store.owner("reserved")==users[0]["id"]
+    assert store.owner(sid)==users[1]["id"]
     assert second.get("/chat_history/file",params={"session_id":sid}).status_code==200
 
 
 def test_foreign_share_preview_is_not_a_local_overwrite_conflict(accounts):
     store, users, (first, second), root = accounts
-    store.register("session","source",users[0]["id"])
-    source=root/"source_chat.jsonl";source.write_bytes(payload("source shared content"))
+    source = seed(store, root, "source", users[0]["id"], payload("source shared content"))
     archive=first.get("/chat_history/export_zip?session_ids=source")
     assert archive.status_code==200
     preview=post_file(second,"import_preview","shared.zip",archive.content)
@@ -117,7 +125,7 @@ def test_foreign_share_preview_is_not_a_local_overwrite_conflict(accounts):
     assert result.status_code==200,result.text
     assert result.json()["imported"] and not result.json()["failed"]
     sid=result.json()["imported"][0]["session_id"]
-    assert sid!="source" and store.owner("session",sid)==users[1]["id"]
+    assert sid!="source" and store.owner(sid)==users[1]["id"]
     assert source.read_bytes()==payload("source shared content")
     assert second.get("/chat_history/file?session_id=source").status_code==404
     assert second.get("/chat_history/file",params={"session_id":sid}).status_code==200
@@ -126,9 +134,8 @@ def test_foreign_share_preview_is_not_a_local_overwrite_conflict(accounts):
 def test_untrusted_jsonl_cannot_rebind_a_legacy_session_to_foreign_attachments(accounts):
     store, users, (first, second), root=accounts
     for sid, user in (("victim",users[0]),("mine",users[1])):
-        store.register("session",sid,user["id"])
-        (root/(sid+"_chat.jsonl")).write_bytes(payload(sid,upload_id=sid))
-    secret=root/"session_files/victim/files/private.txt"
+        seed(store, root, sid, user["id"], payload(sid,upload_id=sid))
+    secret=root/"users"/users[0]["id"]/"sessions/victim/files/files/private.txt"
     secret.parent.mkdir(parents=True);secret.write_text("other account attachment",encoding="utf-8")
     result=post_file(second,"import_package","mine_chat.jsonl",payload("imported",upload_id="victim"),conflict_strategy="overwrite")
     assert result.status_code==200,result.text
@@ -139,22 +146,24 @@ def test_untrusted_jsonl_cannot_rebind_a_legacy_session_to_foreign_attachments(a
         assert b"other account attachment" not in b"".join(archive.read(name) for name in archive.namelist())
 
 
-def test_existing_conflicting_legacy_headers_are_blocked_without_reading_attachments(accounts):
+def test_conflicting_upload_headers_stay_in_separate_account_directories(accounts):
     store,users,(first,second),root=accounts
     for sid,user in (("victim",users[0]),("mine",users[1])):
-        store.register("session",sid,user["id"])
-        (root/(sid+"_chat.jsonl")).write_bytes(payload(sid,upload_id="victim"))
-    secret=root/"session_files/victim/files/private.txt";secret.parent.mkdir(parents=True);secret.write_text("legacy private bytes")
-    assert second.get("/file/get_session_document?session_id=mine&name=private.txt").status_code==403
-    assert second.get("/chat_history/export_zip?session_ids=mine").status_code!=200
+        seed(store, root, sid, user["id"], payload(sid,upload_id="victim"))
+    secret=root/"users"/users[0]["id"]/"sessions/victim/files/files/private.txt";secret.parent.mkdir(parents=True);secret.write_text("legacy private bytes")
+    # mine 的 uploads/victim/ 与 victim 的 files/ 物理隔离，读不到对方附件。
+    assert second.get("/file/get_session_document?session_id=mine&name=private.txt").status_code!=200
+    export=second.get("/chat_history/export_zip?session_ids=mine")
+    assert export.status_code==200,export.text
+    with zipfile.ZipFile(io.BytesIO(export.content)) as archive:
+        assert b"legacy private bytes" not in b"".join(archive.read(name) for name in archive.namelist())
 
 
 def test_zip_copy_keeps_attachments_groups_and_permission_scoped_to_receiver(accounts):
     from memory import chat_memory as cm,permission_store
     store,users,(first,second),root=accounts
-    store.register("session","source",users[0]["id"])
-    (root/"source_chat.jsonl").write_bytes(payload("shared content",upload_id="source"))
-    document=root/"session_files/source/files/document.txt";document.parent.mkdir(parents=True);document.write_text("shared document")
+    seed(store, root, "source", users[0]["id"], payload("shared content",upload_id="source"))
+    document=root/"users"/users[0]["id"]/"sessions/source/files/files/document.txt";document.parent.mkdir(parents=True);document.write_text("shared document")
     group=first.post("/chat_history/groups",json={"name":"shared group"}).json()["group"]
     assert first.put("/chat_history/group_assign",json={"session_id":"source","group_id":group["id"]}).status_code==200
     with as_user(store,users[0]):
@@ -163,8 +172,8 @@ def test_zip_copy_keeps_attachments_groups_and_permission_scoped_to_receiver(acc
     result=post_file(second,"import_package","shared.zip",archive).json()
     assert not result["failed"] and len(result["imported"])==1,result
     imported=result["imported"][0];sid=imported["session_id"]
-    assert sid!="source" and store.owner("session",sid)==users[1]["id"]
-    assert store.owner("group",imported["group_id"])==users[1]["id"]
+    assert sid!="source" and store.owner(sid)==users[1]["id"]
+    assert imported["group_id"] in {g["id"] for g in second.get("/chat_history/groups").json()["groups"]}
     assert second.get("/file/get_session_document",params={"session_id":sid,"name":"document.txt"}).text=="shared document"
     document.write_text("sender later changed")
     assert second.get("/file/get_session_document",params={"session_id":sid,"name":"document.txt"}).text=="shared document"
@@ -199,10 +208,9 @@ def test_import_history_is_subject_to_account_storage_quota(accounts):
 
 def test_export_removes_model_credentials_inside_protocol_parameter_buckets(accounts):
     store,users,clients,root=accounts
-    store.register("session","source",users[0]["id"])
     model={"chat_model":{"ownership_name":"fixture","model_name":"fixture","headers":[{"key":"Authorization","value":"TOP-PRIVATE"}],
         "parameter":{"chat_completions":{"temperature":0.2,"headers":{"Authorization":"NESTED-PRIVATE"},"api_key":"KEY-PRIVATE"}}}}
-    (root/"source_chat.jsonl").write_bytes(payload(model_selection=model))
+    seed(store, root, "source", users[0]["id"], payload(model_selection=model))
     response=clients[0].get("/chat_history/export_zip?session_ids=source")
     assert response.status_code==200,response.text
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
@@ -213,8 +221,8 @@ def test_export_removes_model_credentials_inside_protocol_parameter_buckets(acco
 @pytest.mark.parametrize("package", [False, True], ids=["jsonl", "zip"])
 def test_package_with_only_invalid_rounds_cannot_erase_existing_history(accounts, package):
     store,users,clients,root=accounts
-    store.register("session","mine",users[0]["id"])
-    original=payload("keep this");(root/"mine_chat.jsonl").write_bytes(original)
+    original=payload("keep this")
+    mine_path=seed(store, root, "mine", users[0]["id"], original)
     data=b'{"_meta":{}}\ninvalid garbage\n'
     if package:
         buffer=io.BytesIO()
@@ -226,15 +234,14 @@ def test_package_with_only_invalid_rounds_cannot_erase_existing_history(accounts
         assert result.status_code==200 and not result.json()["imported"] and result.json()["failed"]
     else:
         assert result.status_code==400
-    assert (root/"mine_chat.jsonl").read_bytes()==original
+    assert mine_path.read_bytes()==original
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows session IDs are case insensitive")
 def test_case_sensitive_exports_reject_portable_path_collision_without_omitting_sessions(accounts):
     store,users,clients,root=accounts
     for sid in ("lower", "LOWER"):
-        store.register("session",sid,users[0]["id"])
-        (root/(sid+"_chat.jsonl")).write_bytes(payload(sid))
+        seed(store, root, sid, users[0]["id"], payload(sid))
     combined=clients[0].get("/chat_history/export_zip",params={"session_ids":"lower,LOWER"})
     assert combined.status_code==400 and "分别分享" in combined.text
     for sid in ("lower", "LOWER"):
@@ -252,7 +259,7 @@ def test_uppercase_unicode_package_and_attachment_paths_are_canonical_and_reexpo
     result=post_file(first,"import_package","unicode.zip",buffer.getvalue()).json()
     assert result["imported"] and not result["failed"],result
     sid=result["imported"][0]["session_id"]
-    assert sid==store.resource_key("session",source)
+    assert sid==store.resource_key(source)
     assert first.get("/file/get_session_document",params={"session_id":source,"name":"document.txt"}).text=="portable document"
     with as_user(store,users[0]):
         assert asyncio.run(cm.get_chat_memory_manager(source)) is asyncio.run(cm.get_chat_memory_manager(sid))
@@ -272,8 +279,7 @@ def test_normal_member_reads_and_exports_only_own_history_and_does_not_gain_impo
     member=store.create_user("member",PASSWORD,actor=users[0]["id"])
     with store.database(True) as db:
         db.execute("UPDATE users SET must_change=0 WHERE id=?",(member["id"],))
-    store.register("session","member-session",member["id"])
-    (root/"member-session_chat.jsonl").write_bytes(payload("member own content"))
+    seed(store, root, "member-session", member["id"], payload("member own content"))
     client=TestClient(clients[0].app,base_url=store.settings.origin)
     login=client.post("/auth/login",json={"username":"member","password":PASSWORD},headers={"Origin":store.settings.origin})
     client.headers.update({"Origin":store.settings.origin,"X-CSRF-Token":login.json()["csrf"]})
@@ -286,9 +292,8 @@ def test_normal_member_reads_and_exports_only_own_history_and_does_not_gain_impo
 def test_export_size_limit_is_checked_before_reading_large_attachments(accounts,monkeypatch):
     from memory import chat_memory as cm
     store,users,clients,root=accounts
-    store.register("session","large",users[0]["id"])
-    (root/"large_chat.jsonl").write_bytes(payload())
-    directory=root/"session_files/large/files";directory.mkdir(parents=True)
+    seed(store, root, "large", users[0]["id"], payload())
+    directory=root/"users"/users[0]["id"]/"sessions/large/files/files";directory.mkdir(parents=True)
     first=directory/"one.bin";first.write_bytes(b"x"*100)
     monkeypatch.setattr(cm,"IMPORT_PACKAGE_MAX_BYTES",4*1024*1024+50)
     response=clients[0].get("/chat_history/export_zip?session_ids=large")

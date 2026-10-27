@@ -16,6 +16,7 @@ import io
 # 第三方库
 from PIL import Image
 # 自定义模块
+from memory.storage_layout import safe_session_id
 from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str as _timestamp_now
 
 # 会话上传数据的存储根目录（由 history_files/upload/ 改名而来，
@@ -96,32 +97,22 @@ MEDIA_PART_LABELS = {
 
 DOC_DIRECTORY_NAME = "files"
 
-def _safe_session_id(session_id: str) -> str:
-    """与 memory.chat_memory._safe_session_id 保持一致：无损保留中文等合法文件名字符。
-
-    仅把路径分隔符等危险字符替换为下划线，并拦截 `..` 防止路径穿越。
-    """
-    value = re.sub(r"[^\w .-]+", "_", session_id)
-    value = value.replace("..", "_")
-    return value.strip(" ._-")
-
-
 def _get_session_dir(session_id: str) -> Path:
     from security.authorization import session as authorize_session
     authorize_session(session_id)
     from memory.storage_layout import files_path
-    return files_path(HISTORY_ROOT.parent, session_id, legacy_root=HISTORY_ROOT)
+    return files_path(HISTORY_ROOT.parent, session_id)
 
 
 def get_upload_dir_name(session_id: str) -> str:
     """返回该会话上传文件所在目录名（history_files/session_files/ 下的文件夹名）。
 
-    上传目录按上传时前端传入的 session_id 命名（`_safe_session_id` 后的结果），
+    上传目录按上传时前端传入的 session_id 命名（`safe_session_id` 后的结果），
     可能与聊天会话文件名不一致，因此调用方会把它记录到会话 _meta.upload_id，
     供删除会话时连带清理上传目录。字段名沿用 upload_id 不变（仅指目录名，
     与物理路径无关）。
     """
-    return _safe_session_id(session_id)
+    return safe_session_id(session_id)
 
 
 def _safe_filename(filename: str) -> str:
@@ -2494,13 +2485,6 @@ class FileMemoryManager:
             read_document_available=read_document_available,
             native_doc_types=native_doc_types,
         )
-        """构建「文件索引」文本（首调用超窗时的最小降级形态）。"""
-        with self._lock:
-            records = list_session_file_records(self._session_id)
-        records.reverse()
-        return build_file_index_text(
-            records, read_document_available=read_document_available
-        )
 
     def delete_file_memory(self, filename: str) -> int:
         """
@@ -2555,7 +2539,7 @@ async def cleanup_file_memory_manager(session_id: str) -> None:
     from security.principal import current
     principal = current()
     if principal:
-        session_id = principal.store.resource_key("session", session_id)
+        session_id = principal.store.resource_key(session_id)
     with _session_lock:
         if session_id in _session_managers:
             del _session_managers[session_id]

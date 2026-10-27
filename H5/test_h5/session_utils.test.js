@@ -23,10 +23,6 @@ test("sanitizeSessionId: 空值回退 default", function () {
   assert.equal(sessionUtils.sanitizeSessionId(undefined), "default");
 });
 
-test("fileNameToSessionId: 与 sanitize 一致", function () {
-  assert.equal(sessionUtils.fileNameToSessionId("web-xyz_chat.jsonl"), "web-xyz");
-});
-
 test("generateSessionId: yt-前缀 + 系统时间戳 + 三位随机数", function () {
   const id = sessionUtils.generateSessionId(new Date(2000, 0, 1, 0, 0, 0));
   assert.match(id, /^yt-\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}_\d{3}$/);
@@ -42,8 +38,4 @@ test("generateSessionId: 随机数在合法范围内且两次生成可不同", f
   const seen = new Set();
   for (let i = 0; i < 20; i++) seen.add(sessionUtils.generateSessionId());
   assert.ok(seen.size > 1, "随机数应使同一秒内生成的 ID 大概率不同");
-});
-
-test("getSessionTitle: 返回兜底标题", function () {
-  assert.equal(sessionUtils.getSessionTitle("s1", "标题"), "标题");
 });

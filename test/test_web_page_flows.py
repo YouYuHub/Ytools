@@ -89,19 +89,22 @@ def browser_app(tmp_path, monkeypatch, request):
     if request.node.callspec.params['flow'] == 'lost_device_rebind':
         store.local_recover('alice', reset_mfa=True)
     for sid, user in [('alpha', alice), ('beta', bob)]:
-        store.register('session', sid, user['id'])
+        store.register(sid, user['id'])
         meta = chat_memory._default_meta(sid)
         meta['title'] = 'Fixture ' + sid
-        chat_memory._write_meta_and_entries(history / (sid + '_chat.jsonl'), meta, [{
+        directory = history / 'users' / user['id'] / 'sessions' / sid
+        directory.mkdir(parents=True)
+        chat_memory._write_meta_and_entries(directory / (sid + '_chat.jsonl'), meta, [{
             'event': 'chat_round', 'question': 'Fixture ' + sid, 'status': 'done',
             'events': [{'role':'user','content':'Fixture '+sid},{'role': 'assistant', 'content': 'Fixture reply ' + sid}],
             'timestamp': '2026-10-25 00:00:00'}])
+    alpha_file = history / 'users' / alice['id'] / 'sessions' / 'alpha' / 'alpha_chat.jsonl'
     if request.node.callspec.params['flow'] == 'account_panel_performance':
         entries = [{'event':'chat_round','question':f'Large question {number}','status':'completed',
                     'events':[{'role':'assistant','reasoning_content':'fixture thought ' * 50},
                               {'role':'assistant','content':f'Large reply {number}\n\n' + 'Long fixture paragraph. ' * 80}],
                     'timestamp':'2026-10-25 00:00:00'} for number in range(1,81)]
-        chat_memory._write_meta_and_entries(history / 'alpha_chat.jsonl', chat_memory._default_meta('alpha'), entries)
+        chat_memory._write_meta_and_entries(alpha_file, chat_memory._default_meta('alpha'), entries)
     if request.node.callspec.params['flow'] == 'history_pages':
         meta=chat_memory._default_meta('alpha');meta['title']='Paged history'
         entries=[{'event':'chat_round','question':f'Page question {number}','status':'done','events':[
@@ -110,18 +113,23 @@ def browser_app(tmp_path, monkeypatch, request):
             {'role':'assistant','tool_calls':[{'id':f'tool-{number}','function':{'name':'read_file','arguments':'{}'}}]},
             {'role':'tool','tool_call_id':f'tool-{number}','tool_name':'read_file','result':'fixture result '+('x'*(1300000 if number==180 else 8000))},
             {'role':'assistant','content':f'Page answer {number}'}]} for number in range(1,181)]
-        chat_memory._write_meta_and_entries(history / 'alpha_chat.jsonl',meta,entries)
+        chat_memory._write_meta_and_entries(alpha_file,meta,entries)
     if request.node.callspec.params['flow'] == 'account_return':
-        # Simulate a pre-account legacy default history, which cannot be claimed
-        # by whichever account happens to open the homepage first.
+        # Simulate a stray root file, which is invisible to every account
+        # and cannot be claimed by whichever account opens the homepage first.
         chat_memory._write_meta_and_entries(history / 'default_chat.jsonl', chat_memory._default_meta('default'), [{
             'event':'chat_round','question':'Legacy fixture','status':'completed',
             'events':[{'role':'assistant','content':'Legacy private fixture'}]}])
     target = tmp_path / 'workspace' / 'example.txt'
     target.parent.mkdir()
     target.write_bytes(b'changed\n')
-    file_history.record_change('alpha', path=str(target), display_path='example.txt', old_text='original\n',
-                               new_text='changed\n', tool='edit_file', round_number=1)
+    from security.principal import CURRENT, Principal
+    fixture_token = CURRENT.set(Principal(alice['id'], alice['username'], alice['role'], 'fixture', 0, True, '', store))
+    try:
+        file_history.record_change('alpha', path=str(target), display_path='example.txt', old_text='original\n',
+                                   new_text='changed\n', tool='edit_file', round_number=1)
+    finally:
+        CURRENT.reset(fixture_token)
     runtime = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=0, log_level='critical',
                                           access_log=False, lifespan='off', timeout_keep_alive=1,
                                           timeout_graceful_shutdown=2))

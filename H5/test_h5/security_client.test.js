@@ -125,7 +125,7 @@ function entry(protocol, pathname, stored) {
 }
 test('local and standalone index redirect to the authenticated backend', () => {
   assert.deepEqual(entry('file:', '/C:/project/H5/index.html'), ['http://127.0.0.1:48621/ui/?session=example']);
-  assert.deepEqual(entry('http:', '/H5/index.html', 'https://chat.example.test'), ['https://chat.example.test/ui/?session=example']);
+  assert.deepEqual(entry('http:', '/H5/index.html', 'https://chat.example.test'), ['http://127.0.0.1:48621/ui/?session=example']);
   assert.deepEqual(entry('file:', '/index.html', 'javascript:alert(1)'), ['http://127.0.0.1:48621/ui/?session=example']);
 });
 test('missing server identity redirects to login instead of silently disabling auth', () => {

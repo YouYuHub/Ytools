@@ -1,13 +1,9 @@
-"""Offline account bootstrap, recovery and explicit legacy ownership migration."""
+"""Offline account bootstrap and recovery."""
 import argparse
-import contextlib
 import getpass
-import hashlib
 import json
 import os
-import shutil
 import secrets
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -42,73 +38,14 @@ def bootstrap_temporary_admin(store, name, password_file):
     return {**store.user(user["id"]), "credential_file": str(path)}
 
 
-def adopt_legacy(store, user, apply=False):
-    """Only explicitly selected account can own unowned legacy data."""
-    from memory import chat_memory
-    from memory import task_template_store
-    from prompt import prompt_manager
-    sessions, groups, skipped = [], [], []
-    for path in chat_memory.HISTORY_ROOT.glob("*_chat.jsonl"):
-        if path.is_symlink() or not path.is_file():
-            continue
-        identifier = chat_memory.normalize_session_id(path.name)
-        owner = store.owner("session", identifier)
-        if owner is None:
-            sessions.append(identifier)
-        else:
-            skipped.append(identifier)
-    for group in chat_memory._read_session_groups_raw():
-        if store.owner("group", group["id"]) is None:
-            groups.append(group["id"])
-    template_source = task_template_store.ROOT / "templates.sqlite3"
-    template_target = task_template_store.ROOT / user["id"] / "templates.sqlite3"
-    prompts = [path for path in prompt_manager.MD_FILES_DIR.glob("*.md") if not path.is_symlink()]
-    conflicts = []
-    for source in prompts:
-        target = prompt_manager.MD_FILES_DIR / user["id"] / source.name
-        if target.exists() and target.read_bytes() != source.read_bytes():
-            conflicts.append(source.name)
-    if template_source.exists() and template_target.exists():
-        conflicts.append("private templates already exist")
-    result = {"owner": user["username"], "sessions": sessions, "groups": groups, "already_owned": len(skipped),
-              "prompts": len(prompts), "templates": template_source.exists(), "conflicts": conflicts, "applied": False}
-    if not apply:
-        return result
-    if conflicts:
-        raise ValueError("迁移存在冲突，请先整理私有提示词/模板；未修改归属")
-    # Metadata adoption leaves JSONL/media/version/provider-state bytes in place.
-    # Save a durable manifest before assigning anything. Unknown items stay denied
-    # after interruption; repeating the command safely skips already-owned IDs.
-    manifest = store.root / ("adoption-" + user["id"] + ".json")
-    manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    for kind, identifiers in (("session", sessions), ("group", groups)):
-        for identifier in identifiers:
-            store.register(kind, identifier, user["id"])
-    if template_source.exists():
-        template_target.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.closing(sqlite3.connect(f"file:{template_source.as_posix()}?mode=ro", uri=True)) as source:
-            destination = sqlite3.connect(template_target)
-            try:
-                source.backup(destination)
-            finally:
-                destination.close()
-    for source in prompts:
-        target = prompt_manager.MD_FILES_DIR / user["id"] / source.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():
-            shutil.copy2(source, target)
-    store.audit("local-cli", "legacy.adopt", user["id"], sessions=len(sessions), groups=len(groups))
-    result["applied"] = True
-    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["init-admin", "create-user", "list", "reset-password", "reset-mfa", "adopt-legacy"])
+    parser.add_argument("action", choices=["init-admin", "create-user", "list", "reset-password", "reset-mfa"])
     parser.add_argument("--username")
     parser.add_argument("--role", choices=["admin", "operator", "member"], default="member")
     parser.add_argument("--trusted", action="store_true", help="确认管理员/操作员属于可信实例操作者")
-    parser.add_argument("--apply", action="store_true", help="实际执行旧数据归属迁移；默认只预览")
     parser.add_argument("--temporary-password-file", help="init-admin 专用：随机临时密码写入仅当前用户可读的新文件，首次登录强制改密")
     args = parser.parse_args()
     if args.temporary_password_file and args.action != "init-admin":
@@ -142,10 +79,7 @@ def main():
         result = store.local_recover(args.username, reset_mfa=True)
         result["next_step"] = "使用原密码登录，按页面重新扫码绑定验证器并保存恢复码；完成前不能进入工作区。"
     else:
-        user = next((item for item in store.users() if item["username"] == username(args.username)), None)
-        if user is None:
-            raise ValueError("账号不存在")
-        result = adopt_legacy(store, user, args.apply)
+        parser.error("未知操作")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

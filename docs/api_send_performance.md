@@ -41,7 +41,7 @@
 
 ## 离线性能对比
 
-运行 `python scripts/benchmark_api_send.py`，结果写入 `tmp/api-send-perf-after.json`。参考流程重建原字符统计与重复校验顺序，不调用服务商；导入时间不计。以下为本机中位数，公共流程和 Messages 流程有重叠，不能相加：
+运行 `python scripts/archive/benchmark_api_send.py`，结果写入 `tmp/api-send-perf-after.json`。参考流程重建原字符统计与重复校验顺序，不调用服务商；导入时间不计。以下为本机中位数，公共流程和 Messages 流程有重叠，不能相加：
 
 | 合成样本 | 参考流程 | 优化后 |
 | --- | ---: | ---: |

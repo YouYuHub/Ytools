@@ -16,7 +16,7 @@ async def stop_known_jobs(store, identifier):
     try:
         from routers.chat_router import _session_generation_busy
         from factory.chat_factory import stop_chat_task
-        for session in await asyncio.to_thread(store.owned, "session", identifier):
+        for session in await asyncio.to_thread(store.owned, identifier):
             if _session_generation_busy(session):
                 try:
                     await asyncio.wait_for(stop_chat_task(session), timeout=10)

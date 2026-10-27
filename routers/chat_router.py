@@ -597,7 +597,7 @@ async def list_chat_session_groups():
 
     返回:
         {"groups": [...], "assignments": {session_id: group_id}}
-        分组定义在 history_files/session_groups.json；归属真源在各会话
+        分组定义在本账户目录；归属真源在各会话
         JSONL 首行 _meta.group_id（扫描时只读首行，损坏文件跳过）。
     """
     try:
@@ -846,7 +846,8 @@ async def preview_chat_import(
         sessions = preview.get("sessions") or []
     elif lower.endswith(".jsonl"):
         raw_bytes = await read_upload(request, _UPLOAD_CHAT_FILE_MAX_BYTES, "jsonl 文件")
-        from memory.chat_memory import _parse_jsonl_payload, _get_chat_history_file, _safe_session_id
+        from memory.chat_memory import _parse_jsonl_payload, _get_chat_history_file
+        from memory.storage_layout import safe_session_id
 
         try:
             base_meta, round_entries, total_lines, skipped_lines = _parse_jsonl_payload(raw_bytes)
@@ -857,7 +858,7 @@ async def preview_chat_import(
         exists = import_target_exists(base_id)
         upload_dir_name = ""
         if isinstance(base_meta, dict) and isinstance(base_meta.get("upload_id"), str):
-            upload_dir_name = _safe_session_id(base_meta["upload_id"])
+            upload_dir_name = safe_session_id(base_meta["upload_id"])
         sessions = [{
             "session_id": base_id,
             "filename": f"{base_id}_chat.jsonl",

@@ -9,26 +9,14 @@ import stat
 import time
 
 
-def _paths(store, user_id):
+def _paths(user_id):
     from memory.chat_memory import HISTORY_ROOT
-    from memory.session_catalog import rows
-    from memory.storage_layout import chat_path, files_path, protocol_path, sidecar_path
     from prompt.prompt_manager import MD_FILES_DIR
     from memory.task_template_store import ROOT as templates
     root = Path(HISTORY_ROOT)
     yield root / "users" / user_id
     yield MD_FILES_DIR / user_id
     yield templates / user_id
-    for row in rows(store, user_id):
-        if row["layout"]:
-            continue
-        sid = row["id"]
-        history = chat_path(root, sid, store=store)
-        yield history
-        yield files_path(root, sid, store=store)
-        yield from sidecar_path(root, history).glob(history.name + ".*")
-        for protocol in ("messages", "responses"):
-            yield protocol_path(root, sid, protocol, store=store)
 
 
 def measure(store, user_id):
@@ -54,7 +42,7 @@ def measure(store, user_id):
         return False
 
     pending = []
-    for path in _paths(store, user_id):
+    for path in _paths(user_id):
         try:
             if accept(path, os.stat(path, follow_symlinks=False)):
                 pending.append(path)

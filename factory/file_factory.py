@@ -33,11 +33,7 @@ except Exception:
 
 # DOC (binary) - 使用命令行工具解析，无需 textract
 
-# CSV / Excel
-try:
-    import pandas as pd
-except Exception:
-    pd = None
+# CSV / Excel 解析已迁移到 factory/table_document.py（openpyxl/xlrd），无需 pandas。
 
 
 def _parse_txt(data: bytes, encoding: Optional[str] = 'utf-8') -> str:

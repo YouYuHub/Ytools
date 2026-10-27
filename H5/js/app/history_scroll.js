@@ -284,7 +284,14 @@
     const last = info.nodes[info.nodes.length-1];
     const contentBottom = last ? info.boxes.get(last).bottom+info.trailing+
       (view.end === model.records.length ? d.bottom+d.gap : 0) : 0;
-    const covered = info.nodes.length && contentTop <= rect.top+2 && contentBottom >= rect.bottom-2;
+    // 预取边距：视口接近窗口边缘即提前换窗（此时视口仍被已挂载内容完全
+    // 覆盖，重建+锚点补偿用户无感知）。等到边缘真正露出空白占位才换窗，
+    // 滚动中会闪现空白并伴随滚动条跳动；工具密集的长会话窗口小、重建频繁，
+    // 体感就是“一下跳过一些渲染块”。首尾无更多内容的一侧不预取，避免原地空转。
+    const prefetch = Math.min(400, chatScroll.clientHeight*0.5);
+    const needTop = view.start > 0 ? prefetch : 0;
+    const needBottom = view.end < model.records.length ? prefetch : 0;
+    const covered = info.nodes.length && contentTop <= rect.top+2-needTop && contentBottom >= rect.bottom-2+needBottom;
     if (frozen && wanted.index >= view.start && wanted.index < view.end && (!wanted.isLive || view.end === model.records.length)) {
       placeFrozen(info,view,wanted); syncNavigation(); return;
     }

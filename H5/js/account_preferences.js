@@ -11,7 +11,12 @@
     groups_expanded: ["ytools-session-groups-open", false, v => typeof v === "boolean"]
   };
   const outboxKey = "ytools-preference-outbox";
-  const native = { get: Storage.prototype.getItem, set: Storage.prototype.setItem, remove: Storage.prototype.removeItem };
+  // 显式经账户命名空间读写，不依赖 Storage 包装链的隐式前缀。
+  const raw = auth.rawStorage || (global.Storage && {
+    get: Storage.prototype.getItem, set: Storage.prototype.setItem, remove: Storage.prototype.removeItem });
+  const scoped = key => auth.storageKey ? auth.storageKey(key) : key;
+  const rawGet = key => raw.get.call(global.localStorage, scoped(key));
+  const rawSet = (key, value) => raw.set.call(global.localStorage, scoped(key), value);
   let pending = {}, version = -1, applying = false, timer = null, sending = null, refreshing = null;
   const enabled = auth.preferences != null;
   function decode(key, text) {
@@ -39,13 +44,13 @@
   function cachePending() {
     try {
       const text = JSON.stringify(pending);
-      if (native.get.call(localStorage, outboxKey) !== text) native.set.call(localStorage, outboxKey, text);
+      if (rawGet(outboxKey) !== text) rawSet(outboxKey, text);
     } catch (_) { /* Server saving still works without Web Storage. */ }
   }
   function write(field, value) {
     const text = typeof value === "boolean" ? (value ? "1" : "0") : String(value);
     try {
-      if (native.get.call(localStorage, fields[field][0]) !== text) native.set.call(localStorage, fields[field][0], text);
+      if (rawGet(fields[field][0]) !== text) rawSet(fields[field][0], text);
     } catch (_) { /* restricted storage */ }
   }
   function adopt(data) {
@@ -71,13 +76,15 @@
     pending[decoded.field] = { value: decoded.value, seed: false };
     cachePending(); schedule();
   }
-  Storage.prototype.setItem = function (key, value) {
-    const result = native.set.call(this, key, value);
+  // 捕获 UI 偏好变更：链式调用已有 prototype 实现（security_client 的隔离层），只监听 localStorage。
+  const prevSet = global.Storage.prototype.setItem, prevRemove = global.Storage.prototype.removeItem;
+  global.Storage.prototype.setItem = function (key, value) {
+    const result = prevSet.call(this, key, value);
     if (this === global.localStorage) changed(String(key), String(value));
     return result;
   };
-  Storage.prototype.removeItem = function (key) {
-    const result = native.remove.call(this, key);
+  global.Storage.prototype.removeItem = function (key) {
+    const result = prevRemove.call(this, key);
     if (this === global.localStorage) changed(String(key), null);
     return result;
   };
@@ -114,16 +121,16 @@
   }
   global.AccountPreferences = {
     flush, refresh,
-    retain(key, text) { return key === outboxKey ? Object.keys(readOutbox(text)).length > 0 : !!decode(key, text); }
+    retain(key, text) { return key === outboxKey ? Object.keys(readOutbox(text)).length > 0 : !!decode(key, text); },
   };
-  try { pending = readOutbox(native.get.call(localStorage, outboxKey)); } catch (_) { /* restricted storage */ }
+  try { pending = readOutbox(rawGet(outboxKey)); } catch (_) { /* restricted storage */ }
   if (enabled) {
     const initial = auth.preferences;
     for (const [field, [key]] of Object.entries(fields)) {
       if (pending[field] || (initial.ui && Object.hasOwn(initial.ui, field))) continue;
       try {
-        const cached = native.get.call(localStorage, key);
-        const legacy = decode(key, cached == null && field === "theme" ? native.get.call(localStorage, "theme-preference") : cached);
+        const cached = rawGet(key);
+        const legacy = decode(key, cached == null && field === "theme" ? rawGet("theme-preference") : cached);
         if (legacy) pending[field] = { value: legacy.value, seed: true };
       } catch (_) { /* Only this account's namespaced cache is eligible for migration. */ }
     }
@@ -131,7 +138,7 @@
   }
   global.addEventListener("online", refresh);
   global.addEventListener("focus", refresh);
-  global.addEventListener("pagehide", flush);
+  global.addEventListener("pagehide", () => { flush(); });
   global.addEventListener("storage", event => {
     if (event.storageArea === localStorage && event.key && event.key.startsWith(auth.storageKey(""))) refresh();
   });

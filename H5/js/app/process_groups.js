@@ -266,7 +266,7 @@
       if (!processKey) return measured.has(record) ? measured.get(record) : fallback(record);
       const expanded = choices.get(processKey) === true;
       const cached = measured.get(record);
-      if (!expanded) return same ? 0 : cached > 0 ? Math.min(58, cached) : 58;
+      if (!expanded) return same ? 0 : cached > 0 ? Math.min(36, cached) : 36;
       const compact = ["think", "tool", "agentBlock", "compaction"].includes(record.kind) ? 42 : fallback(record);
       return cached > 0 ? cached : compact + (same ? 0 : 34);
     });

@@ -30,12 +30,10 @@
         id: id,
         name: name.slice(0, GROUP_NAME_MAX),
         collapsed: Boolean(item.collapsed),
-        order: Number.isFinite(item.order) ? item.order : 0,
         createdAt: String(item.created_at == null ? "" : item.created_at),
       });
     });
     out.sort(function (a, b) {
-      if (a.order !== b.order) return a.order - b.order;
       if (a.createdAt === b.createdAt) return 0;
       return a.createdAt < b.createdAt ? -1 : 1;
     });

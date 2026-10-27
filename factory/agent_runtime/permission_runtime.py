@@ -28,6 +28,19 @@ def denied(message="用户拒绝本次调用", code="PERMISSION_DENIED"):
     return {"success": False, "code": code, "executed": False, "error": message}
 
 
+def current_policy_mode(session):
+    """读取当前生效权限模式，绕过任务启动时的偏好缓存。
+
+    全局模式存在账号偏好里并缓存在 principal 上；进行中任务必须绕过
+    缓存才能让用户刚改的权限立即生效。会话级覆盖走 DB，天然实时。
+    """
+    from security.principal import current
+    principal = current()
+    if principal is not None:
+        principal.resource_cache.pop("account_preferences", None)
+    return store.policy(session)["mode"]
+
+
 def interrupted_tool_result(task_id, agent, call_id, reason):
     """Describe a durable result without re-executing a tool after a crash."""
     execution = store.execution(task_id, agent, call_id)
@@ -129,6 +142,13 @@ def reset_unexecuted_native(task_id):
 
 def guard_path(path, *, search=False):
     current = CURRENT.get()
+    if current is not None:
+        # 进行中任务权限变更立即生效：路径守卫每次都刷新模式，
+        # 切到完全控制后长任务内的后续文件访问不再被旧快照拦截。
+        try:
+            current.refresh_mode()
+        except Exception:
+            pass
     if not current or current.context["mode"] == "full_control":
         return True
     target = str(Path(path).resolve())
@@ -157,12 +177,22 @@ def permission_urlopen(request, *, timeout):
     from security.principal import current as account_principal
     if account_principal() is not None:
         source = request.full_url if isinstance(request, urllib.request.Request) else request
+        if current:
+            try:
+                current.refresh_mode()
+            except Exception:
+                pass
         if current and current.context["mode"] != "full_control":
             plan = current.active_plan.get()
             if source not in current.network_grants and (not plan or source not in plan["sources"]):
                 raise PermissionError("网络媒体来源未获本次授权")
         from security.network import account_urlopen
         return account_urlopen(request, timeout=timeout)
+    if current:
+        try:
+            current.refresh_mode()
+        except Exception:
+            pass
     if not current or current.context["mode"] == "full_control":
         return urllib.request.urlopen(request, timeout=timeout)
     source = request.full_url if isinstance(request, urllib.request.Request) else request
@@ -244,10 +274,36 @@ class PermissionRuntime:
         try:
             # Register before checking the committed decision (early IPC is safe).
             current = store.approval(request["id"])
+            def _auto_approve_on_full_control():
+                # 用户在等待期间切换为完全控制：自动放行本次审批，立即生效。
+                # 任务已停止时不放行；读库失败则保持等待。
+                if self.stop():
+                    return False
+                try:
+                    if current_policy_mode(self.session) != "full_control":
+                        return False
+                except Exception:
+                    return False
+                try:
+                    with store.database() as db:
+                        db.execute("UPDATE approvals SET state='approved',updated=? WHERE id=? AND state='pending'",
+                                   (time.time(), request["id"]))
+                except Exception:
+                    return False
+                try:
+                    self.refresh_mode()
+                except Exception:
+                    pass
+                return True
             while current["state"] == "pending" and current["task_state"] == "running" and not self.stop():
+                # 先检查一次：authorize 与 wait 之间切换权限也能立即放行，不用等 1 秒。
+                if _auto_approve_on_full_control():
+                    break
                 # IPC wakes promptly; the durable decision also wakes a worker
                 # when a notification was lost during process startup/reconnect.
                 await asyncio.wait({future}, timeout=1.0)
+                if _auto_approve_on_full_control():
+                    break
                 current = store.approval(request["id"])
                 if future.done():
                     break
@@ -269,7 +325,28 @@ class PermissionRuntime:
                 + (time.monotonic() - self.agent_waits[agent] if agent in self.agent_waits else 0)
                 + (budget.paused_seconds(agent) if budget and include_budget else 0))
 
+    def refresh_mode(self):
+        """进行中任务刷新权限模式：每批工具调用前调用，变更立即生效。"""
+        try:
+            mode = current_policy_mode(self.session)
+        except Exception:
+            return
+        if mode == self.context.get("mode"):
+            return
+        self.context["mode"] = mode
+        try:
+            with store.database() as db:
+                row = db.execute("SELECT data FROM tasks WHERE id=?", (self.id,)).fetchone()
+                if row:
+                    data = json.loads(row[0])
+                    data["mode"] = mode
+                    db.execute("UPDATE tasks SET data=?,updated=? WHERE id=?",
+                               (store.encode(data), time.time(), self.id))
+        except Exception:
+            pass
+
     async def authorize(self, calls, servers, originals=None, agent="main"):
+        self.refresh_mode()
         allowed, rejected, requests = [], [], []
         pending = []
         for item in calls:
@@ -335,6 +412,7 @@ class PermissionRuntime:
         return sorted(allowed, key=lambda item: item[0]), rejected
 
     def begin_call(self, agent, call_id):
+        self.refresh_mode()
         plan = self.plans[(agent, call_id)]
         if plan["server_fingerprint"] != server_fingerprint(plan["server"]):
             raise PermissionError("MCP 服务配置已变化，请重新发起调用并确认")

@@ -39,7 +39,6 @@ imageio-ffmpeg
 # Document parsing
 PyMuPDF
 python-docx
-pandas
 openpyxl
 xlrd
 

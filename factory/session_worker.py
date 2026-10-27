@@ -299,7 +299,7 @@ async def _worker_generate(session_id, request_data, adapter, runtime_ollama_mod
         from security.principal import CURRENT, Principal
         store = IdentityStore(replace(SecuritySettings.from_env(), directory=Path(security_identity["directory"])))
         user = store.user(security_identity["user_id"])
-        if not user or not user["enabled"] or store.owner("session", session_id) != user["id"]:
+        if not user or not user["enabled"] or store.owner(session_id) != user["id"]:
             raise PermissionError("后台任务账号或资源授权已失效")
         token = CURRENT.set(Principal(user["id"], user["username"], user["role"], "", 0, True, "", store))
     try:

@@ -161,9 +161,8 @@ def _fingerprint(path: Path) -> str:
 def _sync(db: sqlite3.Connection, root: Path, cancel: threading.Event, *, archive_scope="all", archives=None):
     known = {row[0]: row[1] for row in db.execute("SELECT filename,fingerprint FROM sessions")}
     from memory.storage_layout import iter_chat_paths
+    # iter_chat_paths 已按本账户 catalog + 非删除状态过滤，不再逐个鉴权。
     paths = [path for path in iter_chat_paths(root) if path.is_file() and not path.is_symlink()]
-    from security.authorization import visible_session
-    paths = [path for path in paths if visible_session(path.name[:-11] if path.name.endswith("_chat.jsonl") else path.stem)]
     filenames = {path.name for path in paths}
     archives = archives or {}
     changed, skipped_files, checked_files, indexed_files, excluded_files = False, 0, 0, 0, 0

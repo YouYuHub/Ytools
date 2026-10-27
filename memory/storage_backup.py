@@ -107,11 +107,12 @@ def _sqlite(path):
 def security_fingerprint(database):
     queries = [
         "SELECT id,password_hash,role,enabled,auth_version,mfa_secret,must_change FROM users ORDER BY id",
-        "SELECT * FROM resources ORDER BY kind,id",
+        "SELECT id,owner,state FROM session_catalog ORDER BY id",
         "SELECT id,user_id,label,secret FROM mfa_devices ORDER BY id",
         "SELECT * FROM mfa_state ORDER BY user_id",
         "SELECT * FROM recovery_codes ORDER BY user_id,hash",
         "SELECT * FROM mfa_recovery_required ORDER BY user_id",
+        "SELECT user_id,data FROM account_limits ORDER BY user_id",
     ]
     with contextlib.closing(sqlite3.connect(Path(database).resolve().as_uri() + "?mode=ro", uri=True)) as db:
         rows = [db.execute(sql).fetchall() for sql in queries]
@@ -174,23 +175,6 @@ def backup(root, security_dir, destination):
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
     verify(destination)
     return {"files": len(manifest["files"]), "bytes": sum(f["size"] for f in manifest["files"]), "archive": str(destination)}
-
-
-def validate_migration_archive(archive_path, root, security_dir):
-    """Reject another instance's or stale backup before any directory move."""
-    verify(archive_path)
-    with zipfile.ZipFile(archive_path) as archive:
-        manifest = _members(archive)
-    if manifest.get("security_fingerprint") != security_fingerprint(Path(security_dir) / "identity.sqlite3"):
-        raise ValueError("备份的账号或归属与当前实例不匹配，拒绝迁移")
-    expected = {row["path"]: row for row in manifest["files"]}
-    actual = dict(inventory(root, security_dir))
-    if set(actual) != set(expected):
-        raise ValueError("备份后文件清单发生变化，请重新备份")
-    for name, path in actual.items():
-        record = expected[name]
-        if not record["sqlite"] and digest(path) != record["sha256"]:
-            raise ValueError("备份后文件内容发生变化，请重新备份：" + name)
 
 
 def _members(archive):

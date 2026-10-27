@@ -467,6 +467,10 @@
         // 顺序一致；同时清除消息框上方的待注入提示
         sealTextBlocks();
         App.clearInjectedPending(sessionId, data.message_id);
+        hasStage = true;
+        // 后台会话的消费事件：只清提示，切回该会话时历史回放显示气泡，
+        // 不向当前会话的消息流插入他人引导。
+        if (state.sessionId !== sessionId) return;
         App.appendUserMessage(
           data.content || (typeof data.text === "string" ? data.text : ""),
           null,
@@ -476,9 +480,8 @@
           null,
           data.quotes || []
         );
-        hasStage = true;
         App.rebuildQnav();
-        if (state.sessionId === sessionId) stickToBottom();
+        stickToBottom();
         return;
       }
       if (data.event === "ask_user") {

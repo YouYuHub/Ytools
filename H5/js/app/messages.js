@@ -180,7 +180,8 @@
       return;
     }
     if (rec.kind === "think") {
-      const think = buildThinkBlock();
+      const think = buildThinkBlock({ sessionId: state.sessionId, round: rec.round,
+        sourceEvent: rec.source_event_index, historyIndex: historyIndex });
       think.setText(rec.content);
       if (think.done) think.done();
       setStageTimestamp(think.wrap, rec.ts);
@@ -199,7 +200,7 @@
       return;
     }
     if (rec.kind === "tool") {
-      const ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round }, {deferDetails:true});
+      const ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round, historyIndex: historyIndex }, {deferDetails:true});
       ui.setInput(FormatUtils.prettyJson(rec.args));
       setStageTimestamp(ui.wrap, rec.ts);
       container.appendChild(ui.wrap);
@@ -216,7 +217,7 @@
       const index = queue && rec.tool_call_id ? queue.findIndex(ui => ui.toolCallId === rec.tool_call_id) : 0;
       let ui = queue && index >= 0 ? queue.splice(index, 1)[0] : null;
       if (!ui) {
-        ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round });
+        ui = buildToolBlock(rec.name, { sessionId: state.sessionId, toolCallId: rec.tool_call_id, round: rec.round, historyIndex: historyIndex });
         ui.setInput(FormatUtils.prettyJson(rec.args));
         setStageTimestamp(ui.wrap, rec.ts);
         container.appendChild(ui.wrap);
@@ -1935,19 +1936,49 @@
     updateCodeblockCopyButtons();
   }
 
-  function buildThinkBlock() {
+  function buildThinkBlock(identity) {
     const wrap = el("div", "think-block");
     const toggle = el("button", "think-toggle");
     toggle.innerHTML = '<span class="think-dots"><i></i><i></i><i></i></span><svg class="icon" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg><span>思考过程</span>';
+    // 展开态持久化：历史窗口滚动重建会销毁 DOM；用户显式点按记录到 App
+    // 随页面存活的 Map，重建后按“会话+轮次+事件”稳定键恢复展开，滚动
+    // 回看长任务时不再一滚全收起。流式/子任务等无稳定身份的不记录。
+    function stageKey() {
+      if (!identity) return null;
+      const session = identity.sessionId != null ? identity.sessionId : state.sessionId;
+      if (identity.round != null && identity.sourceEvent != null) {
+        return "think:" + session + ":" + identity.round + ":e" + identity.sourceEvent;
+      }
+      if (identity.historyIndex != null) return "think:" + session + ":h" + identity.historyIndex;
+      return null;
+    }
+    function rememberStage(open) {
+      const key = stageKey();
+      if (!key) return;
+      const map = App.__stageOpenChoices || (App.__stageOpenChoices = new Map());
+      if (open) map.set(key, true);
+      else map.delete(key);
+      while (map.size > 800) map.delete(map.keys().next().value);
+    }
     // 实时预览行：流式期间在「思考过程」右侧显示最新一行思考（0.2s 节流，
     // 新行替换旧行）；思考结束/权威回放时清除，收尾保持折叠头原样
     const preview = el("span", "think-preview");
     toggle.appendChild(preview);
     const content = el("div", "think-content");
-    toggle.addEventListener("click", function () { wrap.classList.toggle("open"); });
+    toggle.addEventListener("click", function () {
+      wrap.classList.toggle("open");
+      rememberStage(wrap.classList.contains("open"));
+    });
     // 展开态下双击显示区域即可折叠（展开仍走头部按钮）
     content.title = "双击折叠";
-    content.addEventListener("dblclick", function () { wrap.classList.remove("open"); });
+    content.addEventListener("dblclick", function () {
+      wrap.classList.remove("open");
+      rememberStage(false);
+    });
+    const restoredKey = stageKey();
+    if (restoredKey && App.__stageOpenChoices && App.__stageOpenChoices.get(restoredKey)) {
+      wrap.classList.add("open");
+    }
     wrap.appendChild(toggle);
     wrap.appendChild(content);
 
@@ -2173,13 +2204,40 @@
       }
     }
 
+    // 展开态持久化（与 buildThinkBlock 同机制）：tool_call_id 全局唯一，
+    // 无调用 ID 的旧记录回退“会话+轮次+历史下标”键。identity 会被
+    // bindPermission 原地更新，点按时读取最新值，流式绑定后点按同样记录。
+    function toolStageKey() {
+      if (identity.toolCallId) return "tool:" + (identity.agentId || "main") + ":" + identity.toolCallId;
+      if (identity.sessionId != null && identity.round != null && identity.historyIndex != null) {
+        return "tool:" + identity.sessionId + ":" + identity.round + ":h" + identity.historyIndex;
+      }
+      return null;
+    }
+    function rememberToolStage(open) {
+      const key = toolStageKey();
+      if (!key) return;
+      const map = App.__stageOpenChoices || (App.__stageOpenChoices = new Map());
+      if (open) map.set(key, true);
+      else map.delete(key);
+      while (map.size > 800) map.delete(map.keys().next().value);
+    }
+
     head.addEventListener("click", function () {
       wrap.classList.toggle("open");
+      rememberToolStage(wrap.classList.contains("open"));
       if (wrap.classList.contains("open")) ensureDiffView();
     });
     // 展开态下双击主体区域即可折叠（展开仍走头部按钮）
     body.title = "双击折叠";
-    body.addEventListener("dblclick", function () { wrap.classList.remove("open"); });
+    body.addEventListener("dblclick", function () {
+      wrap.classList.remove("open");
+      rememberToolStage(false);
+    });
+    const restoredToolKey = toolStageKey();
+    if (restoredToolKey && App.__stageOpenChoices && App.__stageOpenChoices.get(restoredToolKey)) {
+      wrap.classList.add("open");
+    }
     header.appendChild(head);
     header.appendChild(approvalHost);
     wrap.appendChild(header);
@@ -2196,9 +2254,10 @@
       if (!full) return;
       const copy = group ? group.paths.map(resolveToolPath).join("\n") : full;
       fileTag.textContent = full;
-      fileTag.title = copy + "（点击复制）";
-      fileTag.onclick = function (event) {
-        event.stopPropagation();
+      fileTag.title = copy + "（点击复制并展开/折叠）";
+      fileTag.onclick = function () {
+        // 点击文件名：复制路径，同时冒泡到 head 触发展开/折叠
+        //（不再 stopPropagation，否则该区域单击无法展开）。
         try {
           navigator.clipboard.writeText(copy).then(function () {}, function () {});
         } catch (_) { /* 忽略 */ }

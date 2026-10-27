@@ -6,14 +6,9 @@
     // Real entry pages must be served by the authenticated backend. Independent
     // component fixtures omit this marker and keep their existing test setup.
     if (document.documentElement.hasAttribute("data-ytools-auth-required")) {
-      let base = "http://127.0.0.1:48621";
-      try {
-        const stored = global.localStorage.getItem("ytools-api-base") || global.localStorage.getItem("api-base");
-        const candidate = new URL(stored || base);
-        if ((candidate.protocol === "https:" || (candidate.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(candidate.hostname))) && !candidate.username && !candidate.password) base = candidate.origin;
-      } catch (_) { /* file:// may disable Web Storage */ }
       const sameBackend = /^https?:$/.test(location.protocol) && location.pathname.startsWith("/ui/");
-      const target = sameBackend ? location.origin + "/ui/login.html" : base + "/ui/" + location.search + location.hash;
+      const target = sameBackend ? location.origin + "/ui/login.html"
+        : "http://127.0.0.1:48621/ui/" + location.search + location.hash;
       global.YtoolsAuthPending = true;
       location.replace(target);
     }
@@ -25,15 +20,23 @@
   const prefix = "ytools:user:" + config.user.id + ":";
   function storageKey(key) { return prefix + key; }
   const raw = global.Storage && { get: Storage.prototype.getItem, set: Storage.prototype.setItem,
-    remove: Storage.prototype.removeItem, key: Storage.prototype.key };
+    remove: Storage.prototype.removeItem, key: Storage.prototype.key, clear: Storage.prototype.clear };
+  // 账户命名空间隔离是唯一的 Storage.prototype 补丁点：key/length 保持原生语义
+  // （返回实际键/全局长度），get/set/remove/clear 按账户隔离。rawStorage 供偏好、
+  // 文件标记等模块显式读写，避免隐式依赖包装链。
   if (raw) {
     Storage.prototype.getItem = function (key) { return raw.get.call(this, storageKey(key)); };
     Storage.prototype.setItem = function (key, value) { return raw.set.call(this, storageKey(key), value); };
     Storage.prototype.removeItem = function (key) { return raw.remove.call(this, storageKey(key)); };
+    Storage.prototype.clear = function () {
+      const keys = []; for (let i = 0; i < this.length; i++) { const key = raw.key.call(this, i); if (key && key.startsWith(prefix)) keys.push(key); }
+      keys.forEach(key => raw.remove.call(this, key));
+    };
   }
   function clearLocal() {
     if (!raw) return;
     [global.localStorage, global.sessionStorage].forEach(storage => {
+      if (!storage) return;
       const keys = []; for (let i = 0; i < storage.length; i++) { const key = raw.key.call(storage, i); if (key && key.startsWith(prefix)) keys.push(key); }
       keys.forEach(key => {
         const retained = storage === global.localStorage && global.AccountPreferences &&
@@ -42,10 +45,6 @@
       });
     });
   }
-  if (raw) Storage.prototype.clear = function () {
-    const keys = []; for (let i = 0; i < this.length; i++) { const key = raw.key.call(this, i); if (key && key.startsWith(prefix)) keys.push(key); }
-    keys.forEach(key => raw.remove.call(this, key));
-  };
   let redirecting = false;
   function lost(reason) {
     if (redirecting) return; redirecting = true; clearLocal();
@@ -163,6 +162,6 @@
     update(data) { config = Object.assign({}, config, data); },
     refresh:refreshIdentity, upload,
     async logout() { if (global.AccountPreferences) await global.AccountPreferences.flush(); const response = await global.fetch("/auth/logout", { method: "POST" }); if (!response.ok) throw new Error("退出失败，请稍后重试"); lost(); },
-    storageKey, clearLocal, lost };
+    storageKey, clearLocal, lost, rawStorage: raw || null };
   if (document.documentElement) document.documentElement.dataset.accountRole = config.user.role;
 })(window);

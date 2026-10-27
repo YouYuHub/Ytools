@@ -228,7 +228,7 @@ def normalize_sub_agent_task(raw: Any) -> tuple[str | None, str | None]:
 
 
 # ------------------- write_file / edit_file：内置文件编辑工具 -------------------
-# 与 MCP sys_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录，
+# 与 MCP web_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录，
 # worker 进程已 os.chdir），但结果为结构化 dict：除人类可读 message 外携带
 # path/action/changed_bytes 等机器可读字段；edit/写改类结果另带 _file_diff
 # 顶级键（unified diff + 行数统计，仅前端展示与 JSONL 落盘，不进模型上下文）
@@ -734,7 +734,7 @@ def try_execute_builtin_file_tool(tool_name: str, tool_args: dict[str, Any]) -> 
 
 
 # ------------------- read_file / search_files：内置读取与检索工具 -------------------
-# 与 MCP sys_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录）；
+# 与 MCP web_tools_server 的同名工具保持语义一致（相对路径基于会话工作目录）；
 # read_file 返回结构化结果（含 path/total_lines/range 等字段），search_files
 # 返回纯文本（与 MCP 版相同的区块格式，便于模型直接阅读）。
 
@@ -955,8 +955,7 @@ def execute_read_file(tool_args: dict[str, Any]) -> dict[str, Any]:
     file_path = _tool_path(args)
     if not file_path:
         raise ValueError("path 不能为空")
-    from memory.storage_layout import remap_legacy_attachment
-    path = remap_legacy_attachment(file_path)
+    path = Path(file_path).expanduser()
     guard_path(path)
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在")
@@ -1401,8 +1400,7 @@ def _native_document_byte_limit() -> int:
 def _load_local_document(filename: str, *, parse_text: bool = True,
                          max_bytes: int | None = None) -> tuple[dict[str, Any] | None, bytes | None, str | None]:
     """读取显式指定的本地文档并复用上传链路解析器。"""
-    from memory.storage_layout import remap_legacy_attachment
-    path = remap_legacy_attachment(filename)
+    path = Path(filename).expanduser()
     guard_path(path)
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -2598,7 +2596,7 @@ def execute_read_media(
 
 
 # ------------------- run_command：终端命令执行（多 shell） -------------------
-# 由 mcp_server/sys_tools_server.py 的 run_command 迁移而来（服务端本地执行，
+# 由 mcp_server/web_tools_server.py 的 run_command 迁移而来（服务端本地执行，
 # 语义完全对齐：多 shell 解析、超时杀进程树、超长输出截断并落盘、gbk/utf-8
 # 编码自适应、后台分离模式、cmd 家族健壮性补丁——内联代码（多行或含 %）改写
 # 为临时脚本 /

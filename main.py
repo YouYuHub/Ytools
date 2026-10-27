@@ -41,10 +41,12 @@ async def permission_ui_startup():
     from memory.permission_store import prepare_database
     await asyncio.to_thread(prepare_database)
     from memory.session_listing import recover_pending_sessions
+
     def recover():
         from memory.storage_layout import system_access
         with system_access(app.state.identity_store, reason="startup checkpoint recovery"):
             recover_pending_sessions(app.state.history_recovery_stop)
+
     app.state.history_recovery_stop = threading.Event()
     app.state.history_recovery_thread = threading.Thread(
         target=recover,
@@ -150,51 +152,12 @@ _prewarm_tool_registry()
 
 
 
-# # ---------- 服务自我快照（restart_service 重启工具的定位依据） ----------
-# # mcp_server/restart_tools_server.py 与 restart_helper.py 靠该文件定位主进程
-# # pid / 端口 / 项目根 / 解释器，实现模型自驱动的跨进程重启。helper 杀-启之间
-# # 不重写此文件：新旧 pid 语义由 pending（old_pid）区分，重启后新进程会覆盖更新。
-# def _write_service_state_snapshot() -> None:
-#     """把主进程 pid/port/project_root/python_exe 快照到 history_files/lock/。"""
-#     try:
-#         lock_dir = PROJECT_ROOT / "history_files" / "lock"
-#         lock_dir.mkdir(parents=True, exist_ok=True)
-#         payload = {
-#             "pid": os.getpid(),
-#             "port": DEFAULT_SERVICE_PORT,
-#             "project_root": str(PROJECT_ROOT),
-#             "python_exe": sys.executable,
-#         }
-#         snapshot = lock_dir / "service_state.json"
-#         tmp = snapshot.with_suffix(".json.tmp")
-#         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-#         os.replace(tmp, snapshot)
-#         print(f"[INFO] 服务快照已写入: {snapshot}")
-#     except Exception as exc:
-#         # 快照失败不阻断启动；restart_service 调用时会给"未找到快照"的可读报错
-#         print(f"[WARNING] 写入服务快照失败（restart_service 将不可用）: {exc}")
-
-
 if __name__ == '__main__':
     import uvicorn
     from pathlib import Path
 
-    # _write_service_state_snapshot()
     setup_file = Path(__file__).stem
     uvicorn.run(app=f'{setup_file}:app',
         host=DEFAULT_SERVICE_HOST, port=DEFAULT_SERVICE_PORT,
         timeout_graceful_shutdown=5,
-        # reload=True, reload_dirs=[str(PROJECT_ROOT)],
-        # reload_excludes=[
-        #     # "mcp_server/*",     # 排除 generated 子目录
-        #     "mcp_server/**",
-        #     "test/**",          # 递归排除 test 下所有层级
-        #     "setting/**",
-        #     "history_files/**",
-        #     "docs/**",
-        #     "H5/**",
-        #     # "*.pyc",            # 也可按模式排除文件
-        #     "*.md",
-        #     "*.txt",
-        # ],
     )

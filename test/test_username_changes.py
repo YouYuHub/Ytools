@@ -30,7 +30,7 @@ def accounts(tmp_path, monkeypatch):
     member = store.create_user("member", PASSWORD, actor=admin["id"])
     with store.database(True) as db:
         db.execute("UPDATE users SET must_change=0")
-    store.register("session", "fixed-session", member["id"])
+    store.register("fixed-session", member["id"])
     return store, admin, member, now
 
 
@@ -64,7 +64,7 @@ def test_member_rename_keeps_id_data_limits_and_password_but_revokes_all_logins(
     result = usernames.change(store, principal, "Member.New", PASSWORD)
     assert result["username"] == "member.new" and result["relogin_required"]
     assert store.authenticate(first) is None and store.authenticate(second) is None
-    assert store.owner("session", "fixed-session") == member["id"]
+    assert store.owner("fixed-session") == member["id"]
     assert store.user(member["id"])["name"] == "member"
     assert quotas.limits(store, store.user(member["id"]))["daily_calls"] == 7
     assert data.read_bytes() == b"unchanged history and versions"

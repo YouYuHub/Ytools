@@ -370,8 +370,8 @@ class SecurityMiddleware:
             authorization.session(identifier.strip(), create=path in CREATE_SESSION and method == "POST",
                                   cleanup=path == "/chat_history/delete_file" and method == "DELETE")
         for group_id in [params.get("group_id"), data.get("group_id"), *query.get("group_id", [])]:
-            if group_id and principal.store.owner("group", str(group_id)) != principal.user_id:
-                raise HTTPException(404, "分组不存在或无权访问")
+            if group_id:
+                authorization.require_group(str(group_id))
         # Imports carry opaque raw bodies; storage validates every target before
         # replacing it. An ordinary role cannot import execution policy snapshots.
         if path == "/chat_with_tool":

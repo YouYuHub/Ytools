@@ -560,7 +560,6 @@
   App.clearPendingMedia = clearPendingMedia;
   App.openMediaPreview = openMediaPreview;
   App.resolveMediaSrc = resolveMediaSrc;
-  App.resolveMediaTagSrc = resolveMediaTagSrc;
   App.openMediaPreviewForDocument = openMediaPreviewForDocument;
 
   // 注册 markdown 伪标签 src 解析器（markdown.js 先于本模块加载）

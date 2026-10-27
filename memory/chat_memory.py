@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse
 
 from factory.agent_runtime.builtin_tools import ASK_ANSWER_PREFIX, ASK_USER_TOOL_NAME
 from memory import file_memory
+from memory.storage_layout import safe_session_id
 from memory.chat_round_store import (
     ChatRoundStore,
     compression_usage_values,
@@ -65,66 +66,9 @@ LOCK_ROOT = HISTORY_ROOT / "lock"
 # 指向临时目录，模块级常量快照会绕过该替换
 def _sidecar_dir(file_path=None) -> Path:
     from memory.storage_layout import sidecar_path
-    root = sidecar_path(HISTORY_ROOT, file_path) if file_path else HISTORY_ROOT / "sidecars"
+    root = sidecar_path(file_path) if file_path else HISTORY_ROOT / "sidecars"
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def _migrate_legacy_sidecar_files() -> None:
-    """把旧版散落在 history_files 根目录的会话侧车文件迁移到 sidecars/ 子目录。
-
-    覆盖 <session>_chat.jsonl.todo / .pending / .bak / .tmp（与 lock/ 迁移
-    同款策略）。个别文件正被其他进程持有时 Windows 会拒绝移动，静默跳过
-    留待下次启动再迁；迁移后旧路径不再被读取（重启部署后所有进程统一新路径）。
-    """
-    try:
-        for legacy in HISTORY_ROOT.glob("*_chat.jsonl.*"):
-            if not legacy.is_file():
-                continue
-            try:
-                legacy.replace(_sidecar_dir() / legacy.name)
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-_migrate_legacy_sidecar_files()
-
-
-def _migrate_legacy_lock_files() -> None:
-    """把旧版散落在 history_files 根目录的 *.lock 迁移到 lock/ 子目录。
-
-    锁文件内容为空、只承载句柄互斥语义，迁移后新旧路径不要求互通：
-    服务重启（部署本改动）后所有进程统一使用新路径。个别文件正被
-    其他进程持有时 Windows 会拒绝移动，静默跳过留待下次启动再迁。
-    """
-    try:
-        LOCK_ROOT.mkdir(parents=True, exist_ok=True)
-        for legacy in HISTORY_ROOT.glob("*.lock"):
-            try:
-                legacy.replace(LOCK_ROOT / legacy.name)
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-_migrate_legacy_lock_files()
-
-
-
-def _safe_session_id(session_id: str) -> str:
-    """把 session_id 规整为安全文件名片段。
-
-    会话标识以文件名为准，因此必须无损保留合法的文件名字符：
-    - 保留 Unicode 字母/数字（含中文）、空格、下划线、点、横线
-    - 路径分隔符等其余字符替换为下划线
-    - 拦截 `..` 防止路径穿越
-    """
-    value = re.sub(r"[^\w .-]+", "_", session_id)
-    value = value.replace("..", "_")
-    return value.strip(" ._-")
 
 
 def _get_chat_history_file(session_id: str) -> Path:
@@ -392,11 +336,11 @@ def _default_meta(session_id: str) -> dict[str, Any]:
 def normalize_session_id(raw: Any) -> str:
     """把任意输入规整为合法 session_id。
 
-    会话标识以文件名为准（`history_files/<session_id>_chat.jsonl`），
+    会话标识以文件名为准（`history_files/users/<user_id>/sessions/<session_id>/<session_id>_chat.jsonl`），
     因此这里会：
     - 兼容直接传入文件名（去掉 `_chat.jsonl` / `.jsonl` 后缀）
     - 无损保留合法的文件名字符（中文等 Unicode 字符、空格、`_ . -`），
-      仅把路径分隔符等危险字符替换为下划线（与 _safe_session_id 一致）
+      仅把路径分隔符等危险字符替换为下划线（与 safe_session_id 一致）
     - 空值回退为 "default"
     """
     if raw is None:
@@ -405,7 +349,7 @@ def normalize_session_id(raw: Any) -> str:
     # 兼容直接传入文件名（如 web-xxx_chat.jsonl / web-xxx.jsonl）
     value = re.sub(r"_chat\.jsonl$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\.jsonl$", "", value, flags=re.IGNORECASE)
-    value = _safe_session_id(value).strip(" ._-")
+    value = safe_session_id(value).strip(" ._-")
     return value or "default"
 
 
@@ -432,7 +376,7 @@ def read_session_meta_value(session_id: str, key: str) -> Any:
 
 def _responses_meta_path(file_path: Path) -> Path:
     from memory.storage_layout import sidecar_path
-    return sidecar_path(HISTORY_ROOT, file_path) / (file_path.name + ".responses")
+    return sidecar_path(file_path) / (file_path.name + ".responses")
 
 
 def _meta_digest(meta: dict[str, Any]) -> str:
@@ -489,8 +433,8 @@ def update_responses_session_meta(session_id: str, state: dict[str, Any]) -> Non
 
 # ---------- 会话分组（分组注册表 + 会话归属） ----------
 # 归属真源：会话 JSONL 首行 _meta.group_id（None/缺失 = 未分组）。
-# 分组定义真源：history_files/session_groups.json（单文件小 JSON，跨进程锁 +
-# 原子写）。双写一致性规则：删除分组时解除其全部成员归属；会话删除时注册表
+# 分组定义真源：history_files/users/<user_id>/session_groups.json（按账户分文件，
+# 跨进程锁 + 原子写）。删除分组时解除其全部成员归属；会话删除时注册表
 # 不记录成员、天然一致；重命名分组只动注册表。
 
 SESSION_GROUPS_FILENAME = "session_groups.json"
@@ -499,12 +443,20 @@ SESSION_GROUP_ID_PREFIX = "g-"
 
 
 def _session_groups_file() -> Path:
-    """分组注册表文件路径（惰性求值：测试会把 HISTORY_ROOT 指向临时目录）。"""
-    return HISTORY_ROOT / SESSION_GROUPS_FILENAME
+    """分组注册表路径：有身份走本账户文件，离线库回退根目录单文件。"""
+    from security.principal import current
+    principal = current()
+    if principal is None:
+        return HISTORY_ROOT / SESSION_GROUPS_FILENAME
+    return HISTORY_ROOT / "users" / principal.user_id / SESSION_GROUPS_FILENAME
 
 
 def _session_groups_lock_path() -> Path:
-    return LOCK_ROOT / f"{SESSION_GROUPS_FILENAME}.lock"
+    from security.principal import current
+    principal = current()
+    if principal is None:
+        return LOCK_ROOT / f"{SESSION_GROUPS_FILENAME}.lock"
+    return LOCK_ROOT / f"{principal.user_id}.{SESSION_GROUPS_FILENAME}.lock"
 
 
 def _new_group_id() -> str:
@@ -520,17 +472,17 @@ def _normalize_group_name(raw: Any) -> str:
 
 
 def _read_session_groups_raw() -> list[dict[str, Any]]:
-    """读注册表原始条目；文件缺失/损坏返回空列表（尽力而为，不抛错）。"""
+    """读本账户注册表条目；文件缺失返回空列表，损坏抛 ValueError（不静默吞错）。"""
     path = _session_groups_file()
-    try:
-        if not path.exists():
-            return []
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    if not path.exists():
         return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"分组注册表损坏：{path.name}，请从备份恢复") from exc
     groups = raw.get("groups") if isinstance(raw, dict) else raw
     if not isinstance(groups, list):
-        return []
+        raise ValueError(f"分组注册表格式异常：{path.name}")
     cleaned: list[dict[str, Any]] = []
     for item in groups:
         if not isinstance(item, dict):
@@ -544,16 +496,15 @@ def _read_session_groups_raw() -> list[dict[str, Any]]:
             "name": name[:SESSION_GROUP_NAME_MAX],
             "created_at": str(item.get("created_at") or ""),
             "collapsed": bool(item.get("collapsed")),
-            "order": item.get("order") if isinstance(item.get("order"), int) else 0,
         })
     return cleaned
 
 
 def _write_session_groups_raw(groups: list[dict[str, Any]]) -> None:
-    """原子写注册表（tmp + os.replace + 占用重试，与 _meta 写同口径）。"""
+    """原子写本账户注册表（tmp + os.replace + 占用重试，与 _meta 写同口径）。"""
     path = _session_groups_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = _sidecar_dir() / f"{SESSION_GROUPS_FILENAME}.tmp"
+    tmp_path = path.parent / f"{SESSION_GROUPS_FILENAME}.tmp"
     payload = json.dumps({"groups": groups}, ensure_ascii=False, indent=2)
     last_error: OSError | None = None
     for delay in _ATOMIC_WRITE_RETRY_DELAYS:
@@ -568,14 +519,10 @@ def _write_session_groups_raw(groups: list[dict[str, Any]]) -> None:
 
 
 def list_session_groups() -> list[dict[str, Any]]:
-    """列出全部分组（按 order、created_at 排序）。"""
+    """列出本账户全部分组（按 created_at、id 排序）。"""
     groups = _read_session_groups_raw()
-    from security.authorization import visible_group
-    groups = [group for group in groups if visible_group(group["id"])]
-    groups.sort(key=lambda g: (g.get("order") or 0, g.get("created_at") or ""))
-    from security.principal import current
-    if current():
-        groups = [{**group, "order": index} for index, group in enumerate(groups)]
+    # 稳定排序：同秒创建的分组保持注册表文件顺序（即创建顺序）。
+    groups.sort(key=lambda g: g.get("created_at") or "")
     return groups
 
 
@@ -599,8 +546,8 @@ def list_session_group_assignments() -> dict[str, str]:
             continue
         name = file_path.name
         session_id = name[:-len("_chat.jsonl")] if name.endswith("_chat.jsonl") else file_path.stem
-        from security.authorization import visible_session, visible_group
-        if not visible_session(session_id) or not visible_group(gid.strip()):
+        from security.authorization import visible_group
+        if not visible_group(gid.strip()):
             continue
         assignments[session_id] = gid.strip()
     return assignments
@@ -611,23 +558,21 @@ def create_session_group(name: str) -> dict[str, Any]:
     clean_name = _normalize_group_name(name)
     with cross_process_lock(_session_groups_lock_path()):
         groups = _read_session_groups_raw()
-        from security.authorization import visible_group
         for item in groups:
-            if item.get("name") == clean_name and visible_group(item["id"]):
+            if item.get("name") == clean_name:
                 return item
         group = {
             "id": _new_group_id(),
             "name": clean_name,
             "created_at": now_str(),
             "collapsed": False,
-            "order": sum(visible_group(item["id"]) for item in groups),
         }
         groups.append(group)
         _write_session_groups_raw(groups)
         from security.principal import current
         principal = current()
         if principal:
-            principal.store.register("group", group["id"], principal.user_id)
+            principal.resource_cache.pop("group_ids", None)
     return group
 
 
@@ -652,6 +597,10 @@ def update_session_group(
         if collapsed is not None:
             target["collapsed"] = bool(collapsed)
         _write_session_groups_raw(groups)
+        from security.principal import current
+        principal = current()
+        if principal:
+            principal.resource_cache.pop("group_ids", None)
     return target
 
 
@@ -702,6 +651,10 @@ def delete_session_group(group_id: str) -> dict[str, Any]:
         removed = len(groups) - len(remaining)
         if removed:
             _write_session_groups_raw(remaining)
+            from security.principal import current
+            principal = current()
+            if principal:
+                principal.resource_cache.pop("group_ids", None)
     return {"state": "succeed", "group_id": gid, "removed": removed, "released_sessions": released}
 
 
@@ -1341,14 +1294,12 @@ class ChatMemoryManager:
         self._recover_pending_round_checkpoint()
 
     def _sidecar_path(self, suffix: str) -> Path:
-        """会话附属侧车文件路径：统一放 history_files/sidecars/ 子目录。
+        """会话附属侧车文件路径：统一放会话目录 sidecars/ 子目录。
 
-        suffix 形如 ".pending" / ".todo" / ".bak"。旧版同目录侧车文件在
-        服务启动时由 _migrate_legacy_sidecar_files 一次性搬迁；文件仍被
-        占用等迁移失败场景下旧位置可能仍有残留，读取类路径做旧位置回退。
+        suffix 形如 ".pending" / ".todo" / ".bak"。
         """
         from memory.storage_layout import sidecar_path
-        directory = sidecar_path(HISTORY_ROOT, self._file_path) if self._read_only else _sidecar_dir(self._file_path)
+        directory = sidecar_path(self._file_path) if self._read_only else _sidecar_dir(self._file_path)
         return directory / (self._file_path.name + suffix)
 
     @property
@@ -3586,28 +3537,41 @@ class ChatMemoryManager:
     @staticmethod
     def _delete_session_data(session_id: str) -> dict:
         """
-        删除指定 session_id 的 jsonl 文件，并连同该会话上传文件所在目录一并删除。
+        删除指定 session_id 的整个账号会话目录（含 jsonl、附件、侧车、协议记录）。
 
-        - 上传目录名优先取 jsonl 首行 _meta 记录的 upload_id；
-          旧记录无该字段时回退为按 session_id 推导的目录名；
-        - jsonl 与上传目录互不依赖：任一侧存在都会被删除
-          （可顺带清理有上传目录但无聊天文件的孤儿会话）；
-        - 任一删除步骤失败（如 Windows 上文件被占用）都会抛出 OSError，
-          由路由层转换为 HTTP 异常返回给前端。
+        任一删除步骤失败（如 Windows 上文件被占用）都会抛出 OSError，
+        由路由层转换为 HTTP 异常返回给前端。
 
         :param session_id: 会话 ID
         :return: 操作结果字典
         :raises OSError: 删除失败时抛出
         """
+        from memory.session_archives import forget
+        forget(session_id)
+        from memory.storage_layout import session_root
+        directory = session_root(HISTORY_ROOT, session_id)
+        if directory is None:
+            # 离线库模式：逐个删除根目录布局的会话文件。
+            return ChatMemoryManager._delete_session_data_offline(session_id)
+        resolved = directory.resolve()
+        if (directory.is_symlink() or getattr(directory, "is_junction", lambda: False)()
+                or not resolved.is_relative_to((HISTORY_ROOT / "users").resolve())):
+            raise ValueError("会话目录越界，拒绝删除")
+        if not directory.exists():
+            return {
+                "state": "succeed",
+                "describe": f"会话 {session_id} 的账号目录不存在",
+            }
+        _delete_path_with_retry(directory, recursive=True)
+        return {
+            "state": "succeed",
+            "describe": f"已删除账号会话目录 {directory.name}",
+        }
+
+    @staticmethod
+    def _delete_session_data_offline(session_id: str) -> dict:
+        """离线库模式删除：逐个删除根目录布局的 jsonl、侧车、附件与协议记录。"""
         chat_history_file = _get_chat_history_file(session_id)
-        recorded_upload_id: Any = None
-        if chat_history_file.exists():
-            # 先读 _meta 里记录的 upload_id（jsonl 即将删除，需先取出）
-            try:
-                meta, _ = _load_meta_and_entries(chat_history_file, session_id)
-                recorded_upload_id = meta.get("upload_id")
-            except OSError:
-                recorded_upload_id = None
         deleted_parts: list[str] = []
         from chat.protocols.native_store import session_directory
         native_directory = session_directory(session_id)
@@ -3619,54 +3583,22 @@ class ChatMemoryManager:
         if response_dir.exists():
             _delete_path_with_retry(response_dir, recursive=True)
             deleted_parts.append("Responses 原生状态记录")
-        # 1) 删除 jsonl 历史文件与其 pending 检查点/todo 计划/.bak 备份侧车
-        #    （侧车统一在 sidecars/ 子目录，旧版残留同目录文件也一并清理）
         if chat_history_file.exists():
             _delete_path_with_retry(chat_history_file)
             deleted_parts.append(f"会话文件 {chat_history_file.name}")
-        from memory.session_archives import forget
-        forget(session_id)
-        for suffix, label in ((".pending", "检查点"), (".todo", "任务计划"), (".bak", "备份"),
-                              (".responses", "Responses 状态"), (".responses.tmp", "Responses 状态临时文件")):
+        for suffix in (".pending", ".todo", ".bak", ".responses", ".responses.tmp"):
             sidecar = _sidecar_dir(chat_history_file) / (chat_history_file.name + suffix)
             if sidecar.exists():
                 _delete_path_with_retry(sidecar)
                 deleted_parts.append(f"侧车 {sidecar.name}")
-            legacy = chat_history_file.with_name(chat_history_file.name + suffix)
-            if legacy.exists():
-                _delete_path_with_retry(legacy)
-                deleted_parts.append(f"旧版侧车 {legacy.name}")
-        # 2) 删除上传目录：优先用记录的 upload_id（需重新清洗，避免畸形值逃逸），
-        #    否则回退为按 session_id 推导的目录名
-        upload_dir_name = ""
-        if recorded_upload_id:
-            upload_dir_name = _safe_session_id(str(recorded_upload_id))
-        if not upload_dir_name:
-            upload_dir_name = _safe_session_id(session_id)
-        if upload_dir_name:
-            from memory.storage_layout import files_path
-            upload_dir = files_path(HISTORY_ROOT, session_id, legacy_root=UPLOAD_HISTORY_ROOT, upload_id=upload_dir_name)
-            if upload_dir.exists():
-                _delete_path_with_retry(upload_dir, recursive=True)
-                deleted_parts.append(f"上传目录 history_files/session_files/{upload_dir_name}")
-        from memory.storage_layout import session_root
-        directory = session_root(HISTORY_ROOT, session_id)
-        if directory and directory.exists():
-            resolved = directory.resolve()
-            if (directory.is_symlink() or getattr(directory, "is_junction", lambda: False)()
-                    or not resolved.is_relative_to((HISTORY_ROOT / "users").resolve())):
-                raise ValueError("会话目录越界，拒绝删除")
-            _delete_path_with_retry(directory, recursive=True)
-            deleted_parts.append("账号会话目录")
+        from memory.storage_layout import files_path
+        upload_dir = files_path(HISTORY_ROOT, session_id)
+        if upload_dir.exists():
+            _delete_path_with_retry(upload_dir, recursive=True)
+            deleted_parts.append(f"上传目录 {upload_dir.name}")
         if not deleted_parts:
-            return {
-                "state": "succeed",
-                "describe": f"会话文件 {session_id}_chat.jsonl 及其上传目录均不存在",
-            }
-        return {
-            "state": "succeed",
-            "describe": "已删除：" + "、".join(deleted_parts),
-        }
+            return {"state": "succeed", "describe": f"会话文件 {session_id}_chat.jsonl 及其上传目录均不存在"}
+        return {"state": "succeed", "describe": "已删除：" + "、".join(deleted_parts)}
 
     @staticmethod
     def replace_content_in_chat_session(
@@ -3774,7 +3706,7 @@ def import_target_exists(session_id: str) -> bool:
     session_id = normalize_session_id(session_id)
     from security.principal import current
     principal = current()
-    if principal and principal.store.owner("session", session_id) != principal.user_id:
+    if principal and principal.store.owner(session_id) != principal.user_id:
         return False
     return _get_chat_history_file(session_id).is_file()
 
@@ -3782,7 +3714,7 @@ def import_target_exists(session_id: str) -> bool:
 def _resolve_import_target(
     session_id: str,
     overwrite: bool,
-) -> tuple[str, Path, bool]:
+) -> tuple[str, Path | None, bool]:
     """解析导入目标文件，处理同名冲突。
 
     Returns:
@@ -3801,14 +3733,20 @@ def _resolve_import_target(
     foreign = bool(principal and row and row["owner"] != principal.user_id)
     # Source IDs are labels, never authority to overwrite another account.
     # Do not inspect another account's files to decide whether to make a copy.
-    target_file = None if foreign else _get_chat_history_file(base_id)
-    unowned_file = bool(principal and row is None and target_file.is_file())
     retired = bool(row and row["state"] in BLOCKED)
-    if overwrite and not foreign and not unowned_file:
+    target_file = None if (foreign or row is None) else _get_chat_history_file(base_id)
+    if overwrite and not foreign and row is not None:
         if retired:
             raise ValueError("已删除会话 ID 不能覆盖复用，请选择另存")
         return base_id, target_file, False
-    if not foreign and not unowned_file and not target_file.exists() and not retired:
+    if row is None and not foreign:
+        if store is not None:
+            # 全新 ID：调用方随后 authorize(create=True) 注册；路径在注册后才有效。
+            return base_id, None, False
+        # 离线库模式：按文件存在性判定冲突。
+        if overwrite or not _get_chat_history_file(base_id).exists():
+            return base_id, None, False
+    elif not foreign and not target_file.exists() and not retired:
         return base_id, target_file, False
     # 同名冲突：追加时间戳（同一秒再次冲突时递增序号）
     counter = 0
@@ -3817,13 +3755,13 @@ def _resolve_import_target(
         if counter:
             suffix = f"{suffix}_{counter}"
         candidate_id = f"{base_id}_{suffix}"
-        if store is not None and store.owner("session", candidate_id) is not None:
+        if store is not None and store.owner(candidate_id) is not None:
             counter += 1
             continue
-        candidate_file = _get_chat_history_file(candidate_id)
-        if not candidate_file.exists():
-            return candidate_id, candidate_file, True
-        counter += 1
+        if store is None and _get_chat_history_file(candidate_id).exists():
+            counter += 1
+            continue
+        return candidate_id, None, True
 
 
 def _parse_jsonl_payload(raw_bytes: bytes) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int, int]:
@@ -3891,7 +3829,7 @@ def _import_jsonl_payload(
         if staged_upload_id is None:
             # ZIP staging already holds this source lock. Bare JSONL imports
             # must also serialize collision resolution, registration and write.
-            guard.enter_context(cross_process_lock(LOCK_ROOT / ("import-" + _safe_session_id(normalize_session_id(session_id)) + ".lock")))
+            guard.enter_context(cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(normalize_session_id(session_id)) + ".lock")))
         base_meta, candidate_entries, total_lines, skipped_lines = _parse_jsonl_payload(raw_bytes)
         if not candidate_entries and skipped_lines:
             raise ValueError("文件中没有有效轮次，已拒绝用无效记录覆盖或创建会话")
@@ -3963,9 +3901,9 @@ def _export_session_payload(session_id: str, *, max_bytes: int = IMPORT_PACKAGE_
     if isinstance(meta, dict) and isinstance(meta.get("upload_id"), str) and meta["upload_id"].strip():
         recorded_upload_id = str(meta["upload_id"])
     if recorded_upload_id:
-        upload_dir_name = _safe_session_id(recorded_upload_id)
+        upload_dir_name = safe_session_id(recorded_upload_id)
     else:
-        upload_dir_name = _safe_session_id(session_id)
+        upload_dir_name = safe_session_id(session_id)
     from memory.storage_layout import files_path
     session_data_root = files_path(HISTORY_ROOT, session_id, upload_id=upload_dir_name)
     files: list[tuple[str, bytes]] = []
@@ -4169,7 +4107,7 @@ def list_zip_sessions(raw_bytes: bytes) -> dict[str, Any]:
         exists = import_target_exists(item["session_id"])
         upload_dir_name = ""
         if isinstance(meta, dict) and isinstance(meta.get("upload_id"), str) and meta["upload_id"].strip():
-            upload_dir_name = _safe_session_id(str(meta["upload_id"]))
+            upload_dir_name = safe_session_id(str(meta["upload_id"]))
         media_count = sum(1 for rel in item["file_names"] if rel.startswith("media/"))
         group_id = ""
         if isinstance(meta, dict) and isinstance(meta.get("group_id"), str) and meta["group_id"].strip():
@@ -4273,7 +4211,7 @@ def _read_import_zip(zf, names):
         data = zf.read(jsonl_name)
         meta, _rounds, _lines, _skipped = _parse_jsonl_payload(data)
         upload_id = entry.get("upload_id") or (meta or {}).get("upload_id") or session_id
-        if not isinstance(upload_id, str) or not upload_id or _safe_session_id(upload_id) != upload_id:
+        if not isinstance(upload_id, str) or not upload_id or safe_session_id(upload_id) != upload_id:
             raise ValueError("分享包附件目录无效")
         prefix = f"session_files/{upload_id}/"
         file_items = [(n[len(prefix):], zf.read(n)) for n in names if n.startswith(prefix) and not n.endswith("/")]
@@ -4334,7 +4272,7 @@ def _write_imported_session(
                 if _is_meta_record(first):
                     previous_meta = first.get("_meta") or {}
             upload_id = staged_upload_id or previous_meta.get("upload_id") or actual_session_id
-            merged_meta["upload_id"] = _safe_session_id(str(upload_id)) or _safe_session_id(actual_session_id)
+            merged_meta["upload_id"] = safe_session_id(str(upload_id)) or safe_session_id(actual_session_id)
         if isinstance(base_meta, dict) and isinstance(base_meta.get("title"), str) and base_meta["title"].strip():
             merged_meta["title"] = base_meta["title"].strip()
         imported_summary = (
@@ -4585,18 +4523,19 @@ async def _import_session_with_data(
     base_id = normalize_session_id(session_id)
     from memory.storage_layout import session_root as account_session_root, files_path
     from security.authorization import session as authorize_session
-    with cross_process_lock(LOCK_ROOT / ("import-" + _safe_session_id(base_id) + ".lock")):
+    with cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(base_id) + ".lock")):
         actual_session_id, _path, collision = _resolve_import_target(base_id, overwrite)
         actual_session_id = authorize_session(actual_session_id, create=True)
         _assert_import_target_idle(actual_session_id)
-        session_root = (account_session_root(HISTORY_ROOT, actual_session_id) or file_memory.HISTORY_ROOT).resolve()
-        old_data_dir = files_path(HISTORY_ROOT, actual_session_id, legacy_root=file_memory.HISTORY_ROOT)
+        account_root = account_session_root(HISTORY_ROOT, actual_session_id)
+        session_root = (account_root if account_root is not None else file_memory.HISTORY_ROOT).resolve()
+        old_data_dir = files_path(HISTORY_ROOT, actual_session_id)
         local_dir_name = _session_upload_directory(actual_session_id)
-        final_dir_name = _safe_session_id(actual_session_id)
-        target_dir = files_path(HISTORY_ROOT, actual_session_id, legacy_root=file_memory.HISTORY_ROOT, upload_id=final_dir_name)
+        final_dir_name = safe_session_id(actual_session_id)
+        target_dir = files_path(HISTORY_ROOT, actual_session_id, upload_id=final_dir_name)
         while target_dir.exists():
-            final_dir_name = _safe_session_id(actual_session_id) + "_" + uuid.uuid4().hex[:12]
-            target_dir = files_path(HISTORY_ROOT, actual_session_id, legacy_root=file_memory.HISTORY_ROOT, upload_id=final_dir_name)
+            final_dir_name = safe_session_id(actual_session_id) + "_" + uuid.uuid4().hex[:12]
+            target_dir = files_path(HISTORY_ROOT, actual_session_id, upload_id=final_dir_name)
         if not target_dir.resolve().is_relative_to(session_root):
             raise ValueError("分享包附件目录越界")
         published = False
@@ -4639,10 +4578,10 @@ def _session_upload_directory(session_id):
             with path.open(encoding="utf-8") as file:
                 row = _safe_parse_jsonl_line(file.readline())
             if _is_meta_record(row) and row["_meta"].get("upload_id"):
-                return _safe_session_id(str(row["_meta"]["upload_id"]))
+                return safe_session_id(str(row["_meta"]["upload_id"]))
         except (OSError, UnicodeError):
             return ""
-    return _safe_session_id(session_id)
+    return safe_session_id(session_id)
 
 
 def _upload_directory_referenced(directory):
@@ -4751,7 +4690,7 @@ async def cleanup_chat_memory_manager(session_id: str) -> None:
     from security.principal import current
     principal = current()
     if principal:
-        session_id = principal.store.resource_key("session", session_id)
+        session_id = principal.store.resource_key(session_id)
     with _session_lock:
         if session_id in _session_managers:
             del _session_managers[session_id]

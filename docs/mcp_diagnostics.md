@@ -90,7 +90,7 @@
 
 ```json
 {
-  "server_id": "SysServer",
+  "server_id": "WebServer",
   "action": "call",
   "tool_name": "fetch_url",
   "arguments": {"url": "https://example.com"},

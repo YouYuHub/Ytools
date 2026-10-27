@@ -154,9 +154,15 @@ def _build(path, wanted):
     return Index(wanted, revision, header, tuple(units), tuple(questions), rounds, weight)
 
 
+def _owner():
+    from security.principal import current
+    principal = current()
+    return principal.user_id if principal else "system"
+
+
 def _index(path):
     wanted = _fingerprint(path.stat())
-    key = str(path)
+    key = (_owner(), str(path))
     with _LOCK:
         cached = _CACHE.get(key)
         if cached and cached.fingerprint == wanted:

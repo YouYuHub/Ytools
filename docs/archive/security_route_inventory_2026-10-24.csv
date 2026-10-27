@@ -1,0 +1,130 @@
+﻿method,path,file,line,handler,current_auth,proposed_scope
+GET,/,main.py,99,root,No account authentication found in reviewed app/router layer,public-minimal
+POST,/cancel_inject_message,routers/chat_router.py,255,cancel_inject_message,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/change_chat_dir,routers/chat_config_router.py,246,change_chat_dir,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_config/compaction_retry,routers/chat_config_router.py,631,get_compaction_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/compaction_retry,routers/chat_config_router.py,637,update_compaction_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/context_return,routers/chat_config_router.py,443,get_context_return_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/context_return,routers/chat_config_router.py,449,update_context_return_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/generate_title,routers/chat_config_router.py,1363,generate_session_title_frontend,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/history_compaction,routers/chat_config_router.py,372,get_history_compaction_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/history_compaction,routers/chat_config_router.py,383,update_history_compaction_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/mcp_tools,routers/chat_config_router.py,508,get_mcp_tool_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/mcp_tools,routers/chat_config_router.py,514,update_mcp_tool_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/models,routers/chat_config_router.py,1187,list_chat_models,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/models/select,routers/chat_config_router.py,1255,select_active_chat_model,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/network_retry,routers/chat_config_router.py,578,get_network_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/network_retry,routers/chat_config_router.py,584,update_network_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/permissions,routers/tool_approval_router.py,44,get_permissions,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/permissions,routers/tool_approval_router.py,51,set_permissions,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/retitle_setting,routers/chat_config_router.py,1408,get_retitle_setting,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/retitle_setting,routers/chat_config_router.py,1437,update_retitle_setting,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/run_command_shell,routers/chat_config_router.py,93,get_run_command_shell,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/run_command_shell,routers/chat_config_router.py,99,update_run_command_shell,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/speech_input,routers/speech_config_router.py,44,get_speech_input_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/speech_input,routers/speech_config_router.py,51,update_speech_input_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/sub_agent_limits,routers/chat_config_router.py,680,get_sub_agent_limits_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/sub_agent_limits,routers/chat_config_router.py,685,update_sub_agent_limits_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/sub_agent_retry,routers/chat_config_router.py,754,get_sub_agent_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/sub_agent_retry,routers/chat_config_router.py,760,update_sub_agent_retry_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/tool_concurrency,routers/chat_config_router.py,837,get_tool_concurrency_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/tool_concurrency,routers/chat_config_router.py,843,update_tool_concurrency_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/tool_selection,routers/chat_config_router.py,1012,get_tool_selection,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/tool_selection,routers/chat_config_router.py,1052,update_tool_selection,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/video_read_limit,routers/chat_config_router.py,919,get_video_read_limit_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/video_read_limit,routers/chat_config_router.py,925,update_video_read_limit_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+GET,/chat_config/work_dir,routers/chat_config_router.py,279,get_chat_work_dir_config,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_config/work_dir,routers/chat_config_router.py,332,set_chat_session_work_dir,No account authentication found in reviewed app/router layer,admin-platform / owner-preferences (field-level split)
+POST,/chat_context/compact_manual,routers/chat_router.py,1222,compact_chat_context_manual,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_context/compact_manual/status,routers/chat_router.py,1188,manual_compaction_status,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_context/compact_manual/stop,routers/chat_router.py,1199,stop_manual_compaction,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_context/responses_rebuild,routers/chat_router.py,1100,rebuild_responses_context,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_context/responses_state,routers/chat_router.py,1093,get_responses_state,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_context/token_stats,routers/chat_router.py,934,get_chat_context_token_stats,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+PUT,/chat_history/archive,routers/chat_router.py,344,update_chat_session_archive,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/archives,routers/chat_router.py,356,list_archived_chat_sessions,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+DELETE,/chat_history/delete_file,routers/chat_router.py,486,delete_chat_history,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/delete_rounds,routers/chat_router.py,654,delete_chat_history_rounds,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/export_zip,routers/chat_router.py,761,export_chat_sessions_zip,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/file,routers/chat_router.py,410,get_chat_history_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+PUT,/chat_history/group_assign,routers/chat_router.py,620,assign_chat_session_group,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/groups,routers/chat_router.py,561,list_chat_session_groups,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/groups,routers/chat_router.py,580,create_chat_session_group,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+DELETE,/chat_history/groups/{group_id},routers/chat_router.py,608,delete_chat_session_group,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+PUT,/chat_history/groups/{group_id},routers/chat_router.py,592,update_chat_session_group,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/import_package,routers/chat_router.py,852,import_chat_package,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/import_preview,routers/chat_router.py,791,preview_chat_import,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/meta,routers/chat_router.py,433,get_chat_history_meta,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/remove_media_tag,routers/chat_router.py,521,remove_media_tag_from_history,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/search,routers/chat_router.py,365,search_chat_history,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/sessions,routers/chat_router.py,304,list_chat_history_sessions,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_history/summaries,routers/chat_router.py,319,list_chat_history_summaries,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+PUT,/chat_history/title,routers/chat_router.py,457,update_chat_history_title,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_history/upload_chat_file,routers/chat_router.py,705,upload_chat_history_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_stream/status,routers/chat_router.py,278,chat_stream_status,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/chat_stream/statuses,routers/chat_router.py,293,chat_stream_statuses,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/chat_with_tool,routers/chat_router.py,121,chat_with_tool,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/export/table/xlsx,routers/export_router.py,38,export_table_xlsx,No account authentication found in reviewed app/router layer,authenticated-export-quota
+DELETE,/file/delete_session_file_memory,routers/file_router.py,557,delete_file_history,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file/get_local_file,routers/file_router.py,471,get_local_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file/get_session_document,routers/file_router.py,454,get_session_document,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file/get_session_file_memory,routers/file_router.py,505,get_file_history,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file/get_session_file_text,routers/file_router.py,530,get_file_history_text,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file/get_session_media,routers/file_router.py,436,get_session_media,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file/upload_session_files,routers/file_router.py,143,upload_files,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file/upload_session_media,routers/file_router.py,316,upload_session_media,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/change_diff,routers/file_history_router.py,149,get_change_diff,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/cleanup,routers/file_history_router.py,234,cleanup_histories,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/content,routers/file_history_router.py,116,get_content,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+DELETE,/file_diff/delete,routers/file_history_router.py,225,delete_tracked_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/full_view,routers/file_history_router.py,140,get_full_view,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/hunk_keep,routers/file_history_router.py,171,keep_hunk,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/hunk_undo,routers/file_history_router.py,158,undo_hunk,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/keep,routers/file_history_router.py,218,keep_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/keep_all,routers/file_history_router.py,241,keep_all_files,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/list,routers/file_history_router.py,88,list_changed_files,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/revert_all,routers/file_history_router.py,248,revert_all_files,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/rollback,routers/file_history_router.py,191,rollback_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/save,routers/file_history_router.py,205,save_edited_file,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/file_diff/sync,routers/file_history_router.py,184,sync_from_disk,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/total_diff,routers/file_history_router.py,131,get_total_diff,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/file_diff/versions,routers/file_history_router.py,107,list_versions,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/inject_message,routers/chat_router.py,212,inject_message,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/permissions/media,routers/tool_approval_router.py,212,media,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/prompts/create,routers/prompt_router.py,66,api_create_prompt,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+POST,/prompts/delete,routers/prompt_router.py,93,api_delete_prompt,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+GET,/prompts/list,routers/prompt_router.py,43,api_list_prompts,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+GET,/prompts/read,routers/prompt_router.py,57,api_read_prompt,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+POST,/prompts/rename,routers/prompt_router.py,84,api_rename_prompt,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+POST,/prompts/save,routers/prompt_router.py,75,api_save_prompt,No account authentication found in reviewed app/router layer,owner-workspace / admin-global
+POST,/stop_chat,routers/chat_router.py,163,stop_chat,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/stop_sub_agent,routers/chat_router.py,178,stop_sub_agent,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/task_costs/config,routers/task_cost_router.py,33,get_config,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+POST,/task_costs/config,routers/task_cost_router.py,43,set_config,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+POST,/task_costs/pricing,routers/task_cost_router.py,51,set_pricing,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+GET,/task_costs/usage,routers/task_cost_router.py,60,get_usage,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+POST,/task_costs/{task_id}/continue,routers/task_cost_router.py,80,continue_task,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+POST,/task_costs/{task_id}/stop,routers/task_cost_router.py,99,stop_task,No account authentication found in reviewed app/router layer,owner-task / admin-global-pricing
+GET,/task_templates,routers/task_template_router.py,127,listing,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/task_templates,routers/task_template_router.py,164,create,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/task_templates/options,routers/task_template_router.py,135,options,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/task_templates/preview,routers/task_template_router.py,143,preview,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/task_templates/start,routers/task_template_router.py,156,start,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/task_templates/validate,routers/task_template_router.py,151,validate,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+DELETE,/task_templates/{identifier},routers/task_template_router.py,188,delete,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/task_templates/{identifier},routers/task_template_router.py,172,read,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+PUT,/task_templates/{identifier},routers/task_template_router.py,180,update,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/terminal/jobs,routers/terminal_router.py,9,list_jobs,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/terminal/jobs/{job_id},routers/terminal_router.py,14,get_job,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/terminal/jobs/{job_id}/log/download,routers/terminal_router.py,32,download_log,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/terminal/jobs/{job_id}/{operation},routers/terminal_router.py,22,operate_job,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/tool_approvals/pending,routers/tool_approval_router.py,59,pending,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/tool_approvals/preview,routers/tool_approval_router.py,194,preview,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/tool_approvals/tasks/{task_id}/cancel,routers/tool_approval_router.py,100,cancel_task,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/tool_approvals/tasks/{task_id}/resume,routers/tool_approval_router.py,81,resume_task,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+POST,/tool_approvals/{approval_id}/decision,routers/tool_approval_router.py,152,decide,No account authentication found in reviewed app/router layer,authenticated-resource-owner / explicit-workspace-grant
+GET,/tools/diagnostics,routers/tools_manage_router.py,33,diagnostic_servers,No account authentication found in reviewed app/router layer,admin-diagnostics / authorized-catalog
+POST,/tools/diagnostics,routers/tools_manage_router.py,41,test_mcp_server,No account authentication found in reviewed app/router layer,admin-diagnostics / authorized-catalog
+GET,/tools/list,routers/tools_manage_router.py,65,api_list_tools,No account authentication found in reviewed app/router layer,admin-diagnostics / authorized-catalog
+GET,/user/profile,routers/user_profile_router.py,78,get_user_profile,No account authentication found in reviewed app/router layer,authenticated-self
+POST,/user/profile,routers/user_profile_router.py,94,update_user_profile,No account authentication found in reviewed app/router layer,authenticated-self

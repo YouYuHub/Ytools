@@ -71,7 +71,7 @@ def test_add_preserves_old_factor_and_activates_independent_key_only_after_confi
 
 def test_replace_is_atomic_revokes_old_sessions_and_refreshes_recovery_codes(account):
     store, owner, _, secrets, clock, client, advance, login, begin, confirm = account
-    store.register('session', 'private-chat', owner['id'])
+    store.register('private-chat', owner['id'])
     advance(); other_session, response = login(secret=secrets[owner['id']]); assert response.status_code == 200
     binding = begin('replace').json()['binding']
     with store.database() as db:
@@ -89,7 +89,7 @@ def test_replace_is_atomic_revokes_old_sessions_and_refreshes_recovery_codes(acc
     assert client.get('/auth/me').status_code == 200
     advance(); _, old = login(secret=secrets[owner['id']]); assert old.status_code == 403
     _, new = login(secret=binding['secret']); assert new.status_code == 200
-    assert store.owner('session', 'private-chat') == owner['id']
+    assert store.owner('private-chat') == owner['id']
     with store.database() as db:
         assert not db.execute('SELECT 1 FROM recovery_codes WHERE user_id=? AND hash=?', (owner['id'], crypto.digest('a' * 24))).fetchone()
 
@@ -303,7 +303,7 @@ def test_offline_lost_device_recovery_requires_new_enrollment_for_every_role(acc
     with store.database(True) as db:
         db.execute('UPDATE users SET must_change=0,mfa_secret=? WHERE id=?', (store.encrypt(old_secret), user['id']))
         original = tuple(db.execute('SELECT password_hash,role FROM users WHERE id=?', (user['id'],)).fetchone())
-    store.register('session', 'preserved-recovery-chat', user['id'])
+    store.register('preserved-recovery-chat', user['id'])
     old, response = login(user, old_secret); assert response.status_code == 200
     recovered = store.local_recover('recover', reset_mfa=True)
     assert recovered['mfa_setup_required'] and not recovered['mfa_enabled']
@@ -315,7 +315,7 @@ def test_offline_lost_device_recovery_requires_new_enrollment_for_every_role(acc
     response = pending.post('/auth/mfa/confirm', json={'code': pyotp.TOTP(binding['secret']).at(clock[0])})
     assert response.status_code == 200 and response.json()['mfa_verified']
     assert not response.json()['user']['mfa_setup_required']
-    assert store.owner('session', 'preserved-recovery-chat') == user['id']
+    assert store.owner('preserved-recovery-chat') == user['id']
     with store.database() as db:
         assert tuple(db.execute('SELECT password_hash,role FROM users WHERE id=?', (user['id'],)).fetchone()) == original
         assert db.execute('SELECT count(*) FROM mfa_recovery_required WHERE user_id=?', (user['id'],)).fetchone()[0] == 0

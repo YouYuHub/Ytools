@@ -1,6 +1,6 @@
 # 账号与 Linux 远程访问安全
 
-实施日期：2026-10-24。设计依据见 [安全方案](security_account_remote_access_plan_2026-10-24.md)。本文件记录当前行为；原方案及 CSV 的“无认证”等描述保留为实施前快照。
+实施日期：2026-10-24。设计依据见 [安全方案](archive/security_account_remote_access_plan_2026-10-24.md)。本文件记录当前行为；原方案及 CSV 的“无认证”等描述保留为实施前快照。
 
 ## 适用范围与边界
 
@@ -8,7 +8,7 @@
 
 **尚未提供相互不信任用户的 OS 执行沙箱**。终端、文件工具和 MCP 仍使用服务账号的 OS 权限，工作目录与审批不能替代容器/虚拟机。陌生用户不可提升为管理员/操作员；需要此类执行时使用独立虚拟机及独立服务配置。普通成员的所有主机工具调用由后端拒绝。
 
-初次代码实施未改动运行服务。后续已按用户授权完成本地管理员初始化、备份、旧数据迁移与重启，详见 [启用记录](account_activation_2026-10-24.md) 和 [账号操作指南](account_quickstart.md)。目标 Linux 服务器的域名、证书、防火墙及 Docker 没有在本机操作中配置。
+初次代码实施未改动运行服务。后续已按用户授权完成本地管理员初始化、备份、旧数据迁移与重启，详见 [启用记录](archive/account_activation_2026-10-24.md) 和 [账号操作指南](account_quickstart.md)。目标 Linux 服务器的域名、证书、防火墙及 Docker 没有在本机操作中配置。
 
 ## 已实现
 
@@ -33,23 +33,18 @@ token 额度使用服务估算及上游回执，不是供应商账单。发送�
 
 禁用不会撤销已发生的外部效果。脱离监督器的独立进程及无法核对身份的旧终端需人工检查；停止失败记入审计的 `needs_attention`，不会盲目按 PID 杀进程。
 
-## 本地启用与旧数据
+## 本地启用
 
-备份 `.env`、`setting/`、`history_files/`、`prompt/md_files/`；在没有历史写入任务时迁移。使用独立虚拟环境，避免改动运行中的解释器：
+备份 `.env`、`setting/`、`history_files/`、`prompt/md_files/`；在没有历史写入任务时操作。使用独立虚拟环境，避免改动运行中的解释器：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.lock.txt
 .\.venv\Scripts\python scripts/manage_accounts.py init-admin --username admin
-.\.venv\Scripts\python scripts/manage_accounts.py adopt-legacy --username admin
-# 核对预览后执行：
-.\.venv\Scripts\python scripts/manage_accounts.py adopt-legacy --username admin --apply
 .\.venv\Scripts\python scripts/serve.py
 ```
 
 密码由终端隐藏输入并二次核对，无默认口令。打开 `/ui/`，首次管理员登录绑定验证器、保存恢复码。侧栏左下角“设置 → 账号与安全”可创建/启停账号、调整角色与额度、重设其他账号初始密码、撤销设备和查看审计。新建/重设初始密码首次登录后必须更改。
-
-迁移默认预览，只登记指定账号的未归属会话/分组，并复制旧模板、提示词到私有目录；不重写 JSONL、附件、版本、协议侧车或压缩数据。已有归属不转移。提示词/模板冲突中止；中途失败时，依据 `adoption-<用户ID>.json` 清单核对，不要覆盖已有私有数据。
 
 离线维护：
 

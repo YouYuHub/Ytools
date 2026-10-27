@@ -6,11 +6,11 @@
       "args": [],
       "version": "2.0.0"
     },
-    "SysServer": {
+    "WebServer": {
       "type": "stdio",
       "command": "python",
       "args": [
-        "mcp_server/sys_tools_server.py"
+        "mcp_server/web_tools_server.py"
       ],
       "version": "1.0.0"
     },
@@ -90,8 +90,11 @@
       "write_file"
     ],
     "PipeIpcMcp": [],
-    "SysServer": [
+    "WebServer": [
       "fetch_url",
+      "web_click",
+      "web_find",
+      "web_open",
       "web_search"
     ],
     "Browser": [

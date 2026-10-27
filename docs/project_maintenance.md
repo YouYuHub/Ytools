@@ -13,8 +13,8 @@
 - 侧边栏通过本地事件和一次批量状态查询标记前后台运行会话；等待/未知状态不持续转圈，结束后清除。轮询随页面可见性暂停，详见 [会话运行标记](session_activity.md)。
 - 手动压缩完成时同步卡片、历史窗口缓存与任务状态；重连复用运行块，过程标题由内容重建，详见 [压缩收尾修复](compaction_lifecycle.md)。
 - 多文件补丁沿现有 `file_diff` 通道展示逐文件差异与汇总；异常回滚明确标记需核对文件，详见 [文件差异 §10](file_diff.md#10-多文件补丁展示与失败回执2026-10-23)。
-- MCP `sys_tools_server.py` 仅保留网页抓取和搜索。文件与终端工具由 `factory/agent_runtime/builtin_tools.py` 提供。
-- 工具支持按需内容扫描与可选 `.gitignore`、文件枚举/搜索游标、多文件补丁、大文本压缩快照回退、终端短等待/增量输出及交互 stdin/PTY。用法见 [工具简表](builtin_tools.md)，实施及验证见 [首轮记录](tool_improvement_plan.md)、[进一步优化](tool_followup_plan.md)。
+- MCP `web_tools_server.py` 仅保留网页抓取和搜索。文件与终端工具由 `factory/agent_runtime/builtin_tools.py` 提供。
+- 工具支持按需内容扫描与可选 `.gitignore`、文件枚举/搜索游标、多文件补丁、大文本压缩快照回退、终端短等待/增量输出及交互 stdin/PTY。用法见 [工具简表](builtin_tools.md)，实施及验证见 [首轮记录](archive/tool_improvement_plan.md)、[进一步优化](archive/tool_followup_plan.md)。
 - 模型终端默认短等，查询只传 job_id 自动续读，输入只传 job_id/chars；按需重放、尾部采样与回执查询见 [终端说明](terminal_management.md)。
 
 ## 前端资源版本
@@ -48,7 +48,7 @@ npm test
 
 ## 数据与排查产物
 
-`.gitignore` 排除密钥配置、历史、上传、临时文件、日志及依赖目录。现有 `history_files/` 和 `tmp/` 没有自动删除；清理前应先确认备份和外部脚本引用。原分析报告保留在项目根目录的 [PROJECT_ANALYSIS_2026-10-18.md](../PROJECT_ANALYSIS_2026-10-18.md)。
+`.gitignore` 排除密钥配置、历史、上传、临时文件、日志及依赖目录。现有 `history_files/` 和 `tmp/` 没有自动删除；清理前应先确认备份和外部脚本引用。原分析报告保留在 [docs/archive/PROJECT_ANALYSIS_2026-10-18.md](archive/PROJECT_ANALYSIS_2026-10-18.md)。
 
 ## 文档维护
 

@@ -19,8 +19,6 @@ def install_security(app, settings=None):
     check_maintenance(HISTORY_ROOT.parent)
     store = IdentityStore(settings or SecuritySettings.from_env())
     store.prepare()
-    from memory.storage_layout import install
-    install(store)
     app.state.identity_store = store
     from routers.auth_router import router
     app.include_router(router, tags=["Accounts"])

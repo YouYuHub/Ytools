@@ -31,20 +31,9 @@
     return "yt-" + timestamp + "_" + rand;
   }
 
-  function fileNameToSessionId(name) {
-    return sanitizeSessionId(name);
-  }
-
-  // 会话标题优先使用本地重命名覆盖（由调用方管理 localStorage），否则取后端标题
-  function getSessionTitle(sessionId, fallback) {
-    return fallback;
-  }
-
   const api = {
     sanitizeSessionId: sanitizeSessionId,
     generateSessionId: generateSessionId,
-    fileNameToSessionId: fileNameToSessionId,
-    getSessionTitle: getSessionTitle,
   };
 
   if (typeof module !== "undefined" && module.exports) {

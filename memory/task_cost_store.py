@@ -174,6 +174,8 @@ def legacy_baseline(text, meta=None):
 
 
 def create_task(task_id, session, *, baseline=None, round_no=0, kind="chat"):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?)", (session, _dump(normalize_usage(baseline))))
@@ -199,6 +201,8 @@ def create_task(task_id, session, *, baseline=None, round_no=0, kind="chat"):
 
 
 def has_session(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         return db.execute("SELECT 1 FROM sessions WHERE session=?", (session,)).fetchone() is not None
 
@@ -210,6 +214,15 @@ def _put_task(db, data):
 def _task(db, task_id):
     row = db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def _owned_task(db, task_id):
+    """按 task 查出归属会话并鉴权；直查 task_id 不再绕过会话归属。"""
+    data = _task(db, task_id)
+    if data is not None:
+        from security.authorization import session as authorize_session
+        authorize_session(data["session_id"])
+    return data
 
 
 def _elapsed(data):
@@ -241,13 +254,15 @@ def _summary(db, task_id):
 
 def status(task_id):
     with database() as db:
-        data = _task(db, task_id)
+        data = _owned_task(db, task_id)
         if data:
             data = {**data, **_summary(db, task_id), "elapsed": _elapsed(data)}
         return data
 
 
 def latest(session, kind=None):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         rows = [json.loads(r[0]) for r in db.execute("SELECT data FROM tasks WHERE session=?", (session,))]
     return max((row for row in rows if kind is None or row["kind"] == kind), key=lambda t: t["started"], default=None)
@@ -256,7 +271,7 @@ def latest(session, kind=None):
 def update_round(task_id, number):
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        data = _task(db, task_id)
+        data = _owned_task(db, task_id)
         if data:
             number = max(0, int(number or 0))
             if data.get("round") != number:
@@ -275,7 +290,7 @@ def reserve(task_id, *, call=None, tools=None, waiting_seconds=0):
     """One transaction serializes concurrent parent/child dispatch decisions."""
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        data = _task(db, task_id)
+        data = _owned_task(db, task_id)
         if not data:
             raise ValueError("任务用量记录不存在")
         late_title = bool(call and call.get("role") == "title" and data["state"] == "completed")
@@ -313,6 +328,9 @@ def reserve(task_id, *, call=None, tools=None, waiting_seconds=0):
 def settle(call_id, usage, *, source="reported", state="completed"):
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
+        owner = db.execute("SELECT task FROM calls WHERE id=?", (call_id,)).fetchone()
+        if owner:
+            _owned_task(db, owner[0])
         row = db.execute("SELECT data FROM calls WHERE id=?", (call_id,)).fetchone()
         if not row:
             return
@@ -332,7 +350,7 @@ def continue_task(task_id, session, version, limits):
     limits = validate_limits(limits)
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        data = _task(db, task_id)
+        data = _owned_task(db, task_id)
         if not data or data["session_id"] != session:
             raise ValueError("任务不属于当前会话")
         if data["state"] != "paused" or data["version"] != version:
@@ -354,7 +372,7 @@ def continue_task(task_id, session, version, limits):
 def finish(task_id, state):
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        data = _task(db, task_id)
+        data = _owned_task(db, task_id)
         if data:
             elapsed = _elapsed(data)
             data.update(elapsed=elapsed, state=state, version=data["version"] + 1)
@@ -368,6 +386,8 @@ def finish(task_id, state):
 
 
 def session_summary(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         baseline = db.execute("SELECT baseline FROM sessions WHERE session=?", (session,)).fetchone()
         if not baseline:
@@ -390,6 +410,8 @@ def session_summary(session):
 
 
 def delete_session(session):
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         for row in db.execute("SELECT id FROM tasks WHERE session=?", (session,)).fetchall():

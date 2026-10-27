@@ -42,9 +42,10 @@ def storage_write(additional=0, *, session_id=None):
         yield None
         return
     if session_id is not None:
-        from memory.chat_memory import LOCK_ROOT, _safe_session_id
+        from memory.chat_memory import LOCK_ROOT
+        from memory.storage_layout import safe_session_id
         from util.file_lock import cross_process_lock
-        with cross_process_lock(LOCK_ROOT / (_safe_session_id(session_id) + "_chat.jsonl.lock")):
+        with cross_process_lock(LOCK_ROOT / (safe_session_id(session_id) + "_chat.jsonl.lock")):
             from memory.session_catalog import get, BLOCKED
             row = get(principal.store, session_id)
             if row is None or row["owner"] != principal.user_id or row["state"] in BLOCKED:

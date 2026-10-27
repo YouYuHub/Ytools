@@ -29,7 +29,7 @@
 
 ## 实现与存储
 
-归档标记保存在 `history_files/sidecars/session_archives.json`：
+归档标记按账户保存在 `history_files/users/<user_id>/session_archives.json`：
 
 ```json
 {
@@ -54,7 +54,7 @@
 - SQL 先选出范围内的会话，再通过文件索引访问对应文档；不只在最终结果阶段排除归档。计数和分页使用相同范围，归档状态纳入 revision，范围变化会使旧分页失效。索引期间归档状态变化则返回 409，要求重新搜索，避免提供不完整快照。
 - JSONL、附件和运行中任务均不搬迁。归档可读可写、可取消、可继续聊天，不需要目录迁移；它节省常规列表/搜索的读取与匹配开销，不以删除聊天数据或缩小现有缓存文件为目标。
 
-完整备份请保留整个 `history_files`，包括 `sidecars/session_archives.json`。该文件与可重建的 `history_search.sqlite3` 搜索缓存作用不同，不应将归档状态当缓存清理。若状态损坏，先备份再恢复此文件；历史 JSONL 内容不受归档文件损坏影响。
+完整备份请保留整个 `history_files`，包括各账户目录下的 `session_archives.json`。该文件与可重建的 `history_search_<user_id>.sqlite3` 搜索缓存作用不同，不应将归档状态当缓存清理。若状态损坏，先备份再恢复此文件；历史 JSONL 内容不受归档文件损坏影响。
 
 ## 接口
 

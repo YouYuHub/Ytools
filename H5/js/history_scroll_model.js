@@ -7,14 +7,17 @@
   function estimate(record, width) {
     if (!record || record.kind === "approval" || record.kind === "toolResult") return 0;
     if (record.kind === "tool" || record.kind === "think" || record.kind === "compaction") return 112;
-    if (record.kind === "usage") return 52;
+    if (record.kind === "usage") return 24;
     const content = record.content;
     const text = typeof content === "string" ? content : Array.isArray(content)
       ? content.map(part => typeof part === "string" ? part : part && part.text || "").filter(Boolean).join("\n") : "";
     const media = Array.isArray(content) ? content.filter(part => part && /image|video|audio|file/.test(part.type||"")).length : 0;
     const columns = Math.max(20, Math.floor((width || 800) / 10));
     const lines = Math.max(1, Math.ceil(text.length / columns), (text.match(/\n/g) || []).length + 1);
-    return (record.kind === "user" ? 100 : 64) + media*128 + Math.min(2000000, lines * 26);
+    // 常量按真实渲染校准（1300px 视口实测：用户气泡 chrome 约 86px、助手正文
+    // chrome 约 38px、行高约 22px；旧值 100/64/26 系统性偏大约 1.3–1.9 倍，
+    // 导致窗口覆盖像素不足、滚动中频繁重建窗口并跳动滚动条）。
+    return (record.kind === "user" ? 72 : 28) + media*128 + Math.min(2000000, lines * 22);
   }
   function prefix(heights) {
     const result = new Float64Array(heights.length + 1);

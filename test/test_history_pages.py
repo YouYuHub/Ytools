@@ -5,8 +5,9 @@ import json
 from test_security_resources import accounts
 
 
-def write_rounds(root, count=80):
-    path = root / "chat-a_chat.jsonl"
+def write_rounds(accounts, count=80):
+    _, _, users, _, root = accounts
+    path = root / "users" / users[0]["id"] / "sessions" / "chat-a" / "chat-a_chat.jsonl"
     rows = [{"_meta": {"title": "paged", "usage": {"total_tokens": 123}}}]
     rows += [{"event":"chat_round","question":f"question-{n}","events":[
         {"role":"user","content":f"question-{n}"},
@@ -18,7 +19,7 @@ def write_rounds(root, count=80):
 
 def test_round_pages_are_read_only_and_complete_without_overlaps(accounts):
     _,_,_,(first,_,_),root=accounts
-    path=write_rounds(root)
+    path=write_rounds(accounts)
     original=hashlib.sha256(path.read_bytes()).hexdigest()
     numbers=[];before=None;revision=None
     while True:
@@ -42,7 +43,7 @@ def test_round_pages_are_read_only_and_complete_without_overlaps(accounts):
 
 def test_jump_snapshot_change_and_foreign_read(accounts):
     _,_,_,(first,second,_),root=accounts
-    path=write_rounds(root)
+    path=write_rounds(accounts)
     response=first.get("/chat_history/page?session_id=chat-a&around=12&limit=5").json()
     assert response["start_round"]<=12<=response["end_round"]
     assert response["total_rounds"]==80
@@ -58,7 +59,7 @@ def test_jump_snapshot_change_and_foreign_read(accounts):
 def test_budget_never_splits_a_round_or_drops_external_compaction(accounts,monkeypatch):
     from memory import history_pages
     _,_,_,(first,_,_),root=accounts
-    path=write_rounds(root,4)
+    path=write_rounds(accounts,4)
     with path.open("a",encoding="utf-8") as stream:
         stream.write(json.dumps({"event":"context_compaction","scope":"session","phase":"done",
                                  "display_round":2,"display_event_index":0,"summary_text":"summary"})+"\n")
@@ -79,7 +80,7 @@ def test_saved_permission_checkpoints_keep_the_full_overlay_path(accounts,monkey
 
 def test_large_tool_result_is_complete_on_demand_and_stale_or_foreign_refs_are_rejected(accounts):
     _,_,_,(first,second,_),root=accounts
-    path=write_rounds(root,2)
+    path=write_rounds(accounts,2)
     rows=[json.loads(line) for line in path.read_text(encoding='utf8').splitlines()]
     large='complete-result-'+('x'*100000)
     rows[-1]['events'].append({'role':'tool','tool_name':'read_file','tool_call_id':'large','result':large})
@@ -100,7 +101,7 @@ def test_large_tool_result_is_complete_on_demand_and_stale_or_foreign_refs_are_r
 
 def test_header_only_changes_rebuild_offsets_without_invalidating_identical_rounds(accounts):
     _,_,_,(first,_,_),root=accounts
-    path=write_rounds(root,4)
+    path=write_rounds(accounts,4)
     original=first.get('/chat_history/page?session_id=chat-a&limit=2').json()
     path.write_text(path.read_text(encoding='utf8').replace('"title": "paged"','"title": "a much longer new title"'),encoding='utf8')
     updated=first.get('/chat_history/page',params={'session_id':'chat-a','before':original['start_round'],'revision':original['revision']})

@@ -37,5 +37,4 @@
 
   // ---------- 导出（供 app.js 初始化与其它模块经 App.* 调用） ----------
   App.loadUserProfile = loadUserProfile;
-  App.renderUserName = renderName;
 })(window.App);

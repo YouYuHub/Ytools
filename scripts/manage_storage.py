@@ -10,11 +10,10 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["reconcile", "backup", "verify", "restore", "migrate", "rollback-journal"])
+    parser.add_argument("command", choices=["reconcile", "backup", "verify", "restore"])
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--target", type=Path)
-    parser.add_argument("--journal", type=Path)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     import env_manager
@@ -38,26 +37,12 @@ def main():
                     parser.error("backup needs --archive outside history_files")
                 result = backup.backup(args.root, settings.directory, args.archive)
             else:
-                if args.command == "migrate" and args.apply:
-                    if not args.archive:
-                        parser.error("migrate --apply requires a verified full --archive")
-                    backup.validate_migration_archive(args.archive, args.root, settings.directory)
                 store = IdentityStore(settings)
                 store.prepare()
                 from memory.storage_layout import system_access
                 with system_access(store, reason="offline " + args.command):
-                    if args.command == "reconcile":
-                        from memory.session_catalog import reconcile
-                        result = reconcile(store, args.root / "history_files", apply=args.apply)
-                    elif args.command == "migrate":
-                        from memory.storage_migration import migrate
-                        result = migrate(store, args.root / "history_files", apply=args.apply)
-                    else:
-                        if not args.journal:
-                            parser.error("rollback-journal needs --journal")
-                        from memory.storage_migration import rollback
-                        rollback(store, args.root / "history_files", args.journal)
-                        result = {"rolled_back": True}
+                    from memory.session_catalog import reconcile
+                    result = reconcile(store, args.root / "history_files", apply=args.apply)
     print(json.dumps(result, ensure_ascii=False))
 
 

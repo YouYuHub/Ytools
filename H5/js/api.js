@@ -1,24 +1,12 @@
 /**
  * 后端 API 封装（见 docs/api_docs.md）
- * 默认指向文档约定端口 48621；如需改动可在 localStorage 设置 ytools-api-base 覆盖，
- * 例如 localStorage.setItem('ytools-api-base', 'http://192.168.1.10:48621')
+ * 同源部署：直接使用 location.origin；独立 fixture 回退文档约定地址。
  */
-const api_url = (typeof window !== "undefined" && window.YtoolsAuth) ? location.origin : (localStorage.getItem("ytools-api-base")
-  || (typeof location !== "undefined" && /^https?:$/.test(location.protocol) && String(location.pathname).startsWith("/ui") ? location.origin : "http://127.0.0.1:48621"));
+const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.protocol))
+  ? location.origin : "http://127.0.0.1:48621";
 
 (function (global) {
-  const BASE_KEY = "ytools-api-base";
-  const LEGACY_KEY = "api-base";
-  let storedBase = localStorage.getItem(BASE_KEY);
-  if (storedBase == null) {
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (legacy != null) {
-      storedBase = legacy;
-      localStorage.setItem(BASE_KEY, legacy);
-      localStorage.removeItem(LEGACY_KEY);
-    }
-  }
-  const BASE = (global.YtoolsAuth ? location.origin : (storedBase || api_url)).replace(/\/$/, "");
+  const BASE = api_url.replace(/\/$/, "");
   async function request(path, options) {
     const res = await fetch(BASE + path, options);
     if (!res.ok) {

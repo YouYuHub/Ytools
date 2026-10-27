@@ -86,7 +86,7 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
                     "sysServer": {
                         "type": "stdio",
                         "command": "python",
-                        "args": ["mcp_server/sys_tools_server.py"],
+                        "args": ["mcp_server/web_tools_server.py"],
                         "version": "1.0.0",
                     },
                 },

@@ -4,14 +4,17 @@
 
 | 路径 | 内容 | 性质 |
 |---|---|---|
-| `history_files/*_chat.jsonl` | 聊天历史与会话元数据 | 持久数据 |
-| `history_files/session_files/<session>/` | 上传文件、媒体、解析记录和文件修改记录 | 会话数据 |
+| `history_files/users/<user_id>/sessions/<session_id>/<session_id>_chat.jsonl` | 聊天历史与会话元数据 | 持久数据 |
+| `history_files/users/<user_id>/sessions/<session_id>/files/` 或 `uploads/<upload_id>/` | 上传文件、媒体、解析记录和文件修改记录 | 会话数据 |
+| `history_files/users/<user_id>/sessions/<session_id>/sidecars/` | 待落盘轮次、摘要/协议相关记录、历史备份等 | 会话侧车 |
+| `history_files/users/<user_id>/session_groups.json` | 本账户会话分组定义 | 持久数据 |
+| `history_files/users/<user_id>/session_archives.json` | 本账户归档标记 | 持久数据 |
 | `history_files/state/permission_runtime.sqlite3` | 权限选项、审批、任务恢复和工具执行台账 | 持久控制数据 |
 | `history_files/state/task_costs.sqlite3` | 任务预算、模型价格、完整用量和预算等待状态 | 持久计量数据；见[任务预算](task_budgets.md) |
-| `history_files/state/backups/permission_runtime.legacy-*.sqlite3` | 从旧路径迁移时生成的完整权限库快照 | 迁移备份 |
-| `history_files/sidecars/history_search.sqlite3` | 从聊天 JSONL 提取的搜索文本和位置 | 可重建缓存 |
-| `history_files/sidecars/` 中其他文件 | 待落盘轮次、摘要/协议相关记录、历史备份等 | 应按具体文件用途保留，不能把整个目录视作缓存删除 |
-| `history_files/lock/` | 跨进程写锁与迁移锁 | 协调文件，进程退出后系统释放锁 |
+| `history_files/sidecars/history_search_<user_id>.sqlite3` | 从本账户聊天 JSONL 提取的搜索文本和位置 | 可重建缓存 |
+| `history_files/lock/` | 跨进程写锁 | 协调文件，进程退出后系统释放锁 |
+
+无身份离线库调用回退根目录单用户布局（`history_files/*_chat.jsonl`、`history_files/session_files/` 等），生产 HTTP 请求恒使用账号目录。
 
 ## 权限数据库
 

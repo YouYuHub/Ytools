@@ -121,7 +121,7 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
 任务运行中把一条用户消息投递给会话 worker：生成循环在下一轮检查点（当前模型响应及工具结果处理完毕后）取出该消息，在下一次模型请求前加入上下文。文本、媒体附件和引用快照均支持；正在进行的模型请求不会被中断。媒体先通过上传接口获取 `media://` 引用，再投递此接口；检查点消费时解析为模型支持的图片/音视频部件（非视觉模型降级为引用占位）。JSONL 与 `message_injected` 事件保存原始引用，不含 base64。任务未运行时返回 `not_running`，前端回退普通发送；队列模式仍等待当前任务结束。
 - Body: `{"session_id": "default", "content": <非空字符串或多模态部件列表>, "quotes": <可选引用数组，限制同聊天接口>, "message_id": <可选唯一 ID，最多128字符>}`
 - 返回: 成功 `{"ok": true}`；任务未运行 `{"ok": false, "reason": "not_running"}`；worker 接收确认超时 `{"ok":false,"reason":"ack_timeout"}`；content/quotes 非法 400。worker 模式确认当前任务仍在运行并实际入队后才返回成功，避免上传期间任务已经结束却被误判为已注入。
-- 消费事件：`{"event":"message_injected","text":<正文>,"content":<原始字符串或媒体引用部件>,"quotes":[],"message_id":<ID或null>}`。前端据此显示图片和引用，并清除对应待消费条目。每条引导单独投递，按后端接收顺序消费；支持消费事件先于 HTTP 响应到达。
+- 消费事件：`{"event":"message_injected","text":<正文>,"content":<原始字符串或媒体引用部件>,"quotes":[],"message_id":<ID或null>}`。前端据此显示图片和引用，并清除对应待消费条目。每条引导单独投递，按后端接收顺序消费；支持消费事件先于 HTTP 响应到达。消费事件严格按会话隔离：后台会话的消费只清除该会话的待注入提示，不向当前正在浏览的其他会话消息流插入气泡；切回原会话时由历史回放显示气泡。
 
 ### POST /cancel_inject_message（撤回未消费的注入消息）
 优先按 `message_id` 移除一条尚未消费的消息（支持纯图片与同文本多消息）；未传 ID 时兼容按正文文本匹配。worker 模式等待实际撤回确认后返回，前端仅成功撤回时恢复正文、附件与引用。
@@ -156,16 +156,16 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
 | /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | 始终返回 ZIP；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；manifest v3 携带分组和仅所选会话配置的权限 SQLite 快照；详见下方「会话分享 / 导入」 |
 | /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
 | /chat_history/import_package | POST | 见下方说明 | 见下方说明 |
-| /chat_history/groups | GET | - | `{groups: [{id, name, created_at, collapsed, order}], assignments: {session_id: group_id}}`；分组定义读 `history_files/session_groups.json`，归属扫描各会话首行 `_meta.group_id`（只读首行，损坏文件跳过） |
+| /chat_history/groups | GET | - | `{groups: [{id, name, created_at, collapsed}], assignments: {session_id: group_id}}`；分组定义读本账户 `history_files/users/<user_id>/session_groups.json`，归属扫描各会话首行 `_meta.group_id`（只读首行，损坏文件跳过） |
 | /chat_history/groups | POST | `{name}` | `{state, group}`；新建分组，**同名幂等**（返回既有分组）；空名报 400；名称折叠控制字符并截断 40 字 |
 | /chat_history/groups/{group_id} | PUT | `{name?, collapsed?}` | `{state, group}`；重命名分组 / 更新折叠状态（字段省略 = 不修改）；分组不存在报 400 |
 | /chat_history/groups/{group_id} | DELETE | - | `{state, group_id, removed, released_sessions}`；删除分组并**连带解除其全部成员会话的 `_meta.group_id`**（成员回到未分组，不删会话本身） |
 | /chat_history/group_assign | PUT | `{session_id, group_id}` | `{state, session_id, group_id}`；把会话加入分组；`group_id` 传 null/空串 = 移出分组；分组或会话不存在报 400 |
 | /chat_history/remove_media_tag | POST | `{tag(必填), replacement?(默认"用户已删除/文件不存在"), session_id?(默认"default")}` | 在会话历史 JSONL 中把指定媒体伪标签原文替换为占位说明文本；前端删除消息中渲染的 `<image>/<audio>/<video>/<pdf>` 控件时调用，替换后该轮历史回传给模型时只看到占位说明；tag 为空 400 |
 
-> **会话分组（`_meta.group_id` + `history_files/session_groups.json`）**：归属真源为会话首行 `_meta.group_id`（缺失/None = 未分组，由 `_recompute_meta_from_entries` 做格式规范化：非字符串/空白自动清除）；分组定义真源为单文件小 JSON `history_files/session_groups.json`（`{"groups": [...]}`，跨进程锁 + 原子写）。归组写入**不改动 `updated_at`**（不扰乱「最近」排序）；会话删除时归属随文件消失、无需维护注册表；分组删除时先解除全部成员归属再移除条目（双写一致性）。分组名上限 40 字符（控制字符折叠为空格）。前端分组区位于侧边栏「最近」上方：悬停/点击标题展开，右上角 + 新建，分组可折叠/重命名/删除，会话菜单「分组」选择器可移入/移出/新建并移入。
+> **会话分组（`_meta.group_id` + 按账户 `session_groups.json`）**：归属真源为会话首行 `_meta.group_id`（缺失/None = 未分组，由 `_recompute_meta_from_entries` 做格式规范化：非字符串/空白自动清除）；分组定义真源为本账户小 JSON `history_files/users/<user_id>/session_groups.json`（`{"groups": [...]}`，按账户锁 + 原子写，损坏抛错不静默）。归组写入**不改动 `updated_at`**（不扰乱「最近」排序）；会话删除时归属随文件消失、无需维护注册表；分组删除时先解除全部成员归属再移除条目。分组名上限 40 字符（控制字符折叠为空格），列表按创建时间排序。前端分组区位于侧边栏「最近」上方：悬停/点击标题展开，右上角 + 新建，分组可折叠/重命名/删除，会话菜单「分组」选择器可移入/移出/新建并移入。
 >
-> **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（`history_files/session_files/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此，供 `/chat_history/delete_file` 连带清理。仅从新记录开始维护，已有旧会话无此字段（删除时按 session_id 推导兜底）。目录原名 `history_files/upload/`（upload 改名为 session_files）。
+> **`_meta.upload_id`（可选字段）**：本会话上传文件所在目录名（账号会话目录下 `files/` 或 `uploads/<upload_id>/`，字段名沿用 upload_id）。上传目录按**上传时前端传入的 `session_id`** 命名，可能与聊天会话文件名不一致，故记录于此。删除会话时删除整个账号会话目录。
 
 ### POST /chat_history/delete_rounds（按轮次号删除，用户消息编辑重发）
 
@@ -539,7 +539,7 @@ SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关�
 - **读取与搜索限额**：`read_file.content` 保存正文，`message` 仅摘要。空文件 `total_lines=0`；默认从 `start_line` 起读最多 200 行，`limit` 最大 2000。旧 `end_line` 仅兼容执行，不再向模型提供。预算不足时返回连续前段，按 `next_start_line` 续读；单行超长用 `next_char_offset`。`search_files` 只搜内容，`file_pattern` 筛选待搜文件；查路径用同时启用的 `list_files`。搜索默认字面文本，正则显式 `is_regex=true`；默认候选 3000 个、活动扫描 10 秒，预算不足标记 `scan_truncated`，计数只覆盖已扫描部分；按需扫描与可选忽略规则见本页工具补充说明。
 - **子任务块**：sub_agent 内部调用的文件工具同样在 tool_result 子事件中携带 `file_diff`，渲染行为一致。
 
-文件与终端工具已迁入后端内置执行器；当前 MCP `sys_tools_server` 仅提供网页工具。
+文件与终端工具已迁入后端内置执行器；当前 MCP `web_tools_server` 仅提供网页工具。
 
 ### 文件历史版本链（V2，`/file_diff/*`）
 
@@ -629,7 +629,7 @@ Responses 上下文模式：角色参数 `responses_mode` 为 `stateful` 或 `st
   "inputs": {
     "__builtin__": ["ask_user", "read_media"],
     "PipeIpcMcp": ["setup_pipe", "run_pipe_command"],
-    "SysServer": []
+    "WebServer": []
   }
 }
 ```

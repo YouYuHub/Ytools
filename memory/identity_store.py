@@ -60,9 +60,6 @@ class IdentityStore:
               CREATE INDEX IF NOT EXISTS login_user ON login_sessions(user_id);
               CREATE TABLE IF NOT EXISTS recovery_codes(user_id TEXT, hash TEXT, PRIMARY KEY(user_id,hash));
               CREATE TABLE IF NOT EXISTS login_limits(key TEXT PRIMARY KEY, started REAL, count INTEGER);
-              CREATE TABLE IF NOT EXISTS resources(kind TEXT, id TEXT, owner TEXT NOT NULL, created REAL,
-                PRIMARY KEY(kind,id));
-              CREATE INDEX IF NOT EXISTS resource_owner ON resources(owner,kind);
               CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT, action TEXT NOT NULL,
                 resource TEXT, result TEXT NOT NULL, details TEXT NOT NULL, created REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS account_limits(user_id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -412,34 +409,34 @@ class IdentityStore:
             with self.database(True) as db:
                 return self._rotate_login(db, principal, verified=principal.mfa_verified)
 
-    def owner(self, kind, identifier):
-        identifier = self.resource_key(kind, identifier)
+    def owner(self, identifier):
+        """会话归属唯一真源是 session_catalog。"""
+        identifier = self.resource_key(identifier)
         with self.database() as db:
-            row = db.execute("SELECT owner FROM resources WHERE kind=? AND id=?", (kind, identifier)).fetchone()
+            row = db.execute("SELECT owner FROM session_catalog WHERE id=?", (identifier,)).fetchone()
             return row[0] if row else None
 
-    def register(self, kind, identifier, user_id):
-        identifier = self.resource_key(kind, identifier)
+    def register(self, identifier, user_id):
+        """单事务注册会话为 reserved；他人的 ID 直接拒绝。"""
+        identifier = self.resource_key(identifier)
         with self.database(True) as db:
-            row = db.execute("SELECT owner FROM resources WHERE kind=? AND id=?", (kind, identifier)).fetchone()
+            row = db.execute("SELECT owner FROM session_catalog WHERE id=?", (identifier,)).fetchone()
             if row and row[0] != user_id:
                 raise Denied("资源不存在或无权访问")
-            db.execute("INSERT OR IGNORE INTO resources VALUES(?,?,?,?)", (kind, identifier, user_id, time.time()))
-            if kind == "session":
-                db.execute("INSERT OR IGNORE INTO session_catalog VALUES(?,?,'reserved',0,?)",
-                           (identifier, user_id, time.time()))
+            db.execute("INSERT OR IGNORE INTO session_catalog VALUES(?,?,'reserved',?)",
+                       (identifier, user_id, time.time()))
         from security.principal import current
         principal = current()
         if principal and principal.user_id == user_id:
-            principal.resource_cache.pop(kind, None)
+            principal.resource_cache.pop("session", None)
 
-    def owned(self, kind, user_id):
+    def owned(self, user_id):
         with self.database() as db:
-            return {row[0] for row in db.execute("SELECT id FROM resources WHERE kind=? AND owner=?", (kind, user_id))}
+            return {row[0] for row in db.execute("SELECT id FROM session_catalog WHERE owner=?", (user_id,))}
 
     @staticmethod
-    def resource_key(kind, identifier):
-        return str(identifier).casefold() if os.name == "nt" and kind == "session" else str(identifier)
+    def resource_key(identifier):
+        return str(identifier).casefold() if os.name == "nt" else str(identifier)
 
     def audit_entries(self, limit=100):
         with self.database() as db:

@@ -45,8 +45,10 @@ def accounts(tmp_path, monkeypatch):
         client.headers.update({"Origin": store.settings.origin, "X-CSRF-Token": response.json()["csrf"]})
         clients.append(client)
     for identifier, user, text in (("chat-a", first, "shared alpha confidential"), ("chat-b", second, "shared beta confidential")):
-        store.register("session", identifier, user["id"])
-        chat_memory._write_meta_and_entries(history / (identifier + "_chat.jsonl"), chat_memory._default_meta(identifier), [
+        store.register(identifier, user["id"])
+        directory = history / "users" / user["id"] / "sessions" / identifier
+        directory.mkdir(parents=True)
+        chat_memory._write_meta_and_entries(directory / (identifier + "_chat.jsonl"), chat_memory._default_meta(identifier), [
             {"event": "chat_round", "question": text, "status": "completed",
              "events": [{"role": "assistant", "content": text}], "timestamp": "2026-10-24 12:00:00"}])
     return app, store, (first, second, member), clients, history
@@ -99,14 +101,15 @@ def test_profile_is_account_data_and_no_env_paths(accounts):
     assert second.get("/user/profile").json()["name"] != "私人名字"
 
 
-def test_unowned_existing_history_cannot_be_claimed(accounts):
+def test_stray_root_files_are_invisible_to_all_accounts(accounts):
     _, store, _, (first, second, _), history = accounts
     (history / "legacy_chat.jsonl").write_text('{"_meta":{}}\n', encoding="utf-8")
-    assert first.post("/chat_history/ensure_session", json={"session_id": "legacy"}).status_code == 404
-    assert store.owner("session", "legacy") is None
+    assert "legacy" not in str(first.get("/chat_history/summaries").json())
+    assert first.get("/chat_history/file", params={"session_id": "legacy"}).status_code == 404
+    assert store.owner("legacy") is None
     assert first.post("/chat_history/ensure_session", json={"session_id": "fresh"}).status_code == 200
     assert second.post("/chat_history/ensure_session", json={"session_id": "fresh"}).status_code == 404
-    assert not (history / "fresh_chat.jsonl").exists()
+    assert not list((history / "users").rglob("fresh_chat.jsonl"))
 
 
 def test_mixed_batch_export_and_state_controls_are_denied(accounts):
@@ -257,7 +260,7 @@ def test_plain_member_chat_forces_empty_tools_at_real_route(accounts, monkeypatc
 def test_plain_member_worker_cannot_cross_any_tool_boundary(accounts):
     from security.authorization import tool_boundary, execution_active
     _, store, users, _, _ = accounts
-    store.register("session", "plain-chat", users[2]["id"])
+    store.register("plain-chat", users[2]["id"])
     token = CURRENT.set(store.authenticate(store.login("member", PASSWORD)))
     try:
         assert execution_active("plain-chat")

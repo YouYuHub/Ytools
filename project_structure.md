@@ -18,8 +18,7 @@ agent_tool_sse/
 ├── .gitignore                   # 排除凭据、会话数据、日志、临时文件与依赖目录
 ├── requirements.lock.txt        # 固定直接与传递依赖版本，部署优先使用
 ├── project_structure.md         # 本文档
-├── remove_pycache.py            # 工具：递归清理 __pycache__ 目录
-├── game/                        # 小实验：guess_number.py / snake.html
+├── game/                        # 小实验：snake.html（guess_number.py 已删除）
 │
 ├── setting/
 │   ├── models.json              # 模型目录：provider→models（含 apiKey/url/能力），variables/runtime 全局变量，
@@ -73,8 +72,10 @@ agent_tool_sse/
 │
 ├── memory/                      # 记忆持久化层
 │   ├── chat_memory.py           # ChatMemoryManager：会话 JSONL + 元数据 + 轮次聚合 + 导入/删除/压缩事件落盘（锚点行序维护：回答插入/编辑重发等非追加收尾时把锚定压缩行重排到轮次行之前）+ 会话配置快照（首次任务固化全局模型/工具/工作目录，之后不再跟随全局）
-│   ├── session_archives.py      # 会话归档索引、状态与路径解析
-│   ├── session_listing.py       # 会话摘要列表、筛选与待完成历史恢复
+│   ├── session_archives.py      # 按账户会话归档标记、状态与路径解析
+│   ├── session_listing.py       # 会话摘要列表（单次登记表查询+首行读取）、筛选与待完成历史恢复
+│   ├── session_catalog.py       # 会话归属与生命周期唯一真源（单表）
+│   ├── storage_layout.py        # 账号目录路径权威 + 会话 ID 清洗唯一真源
 │   ├── task_cost_store.py       # 任务预算、用量与事件存储
 │   ├── task_template_store.py   # 任务模板存储
 │   ├── chat_round_store.py      # ChatRoundStore：chat_round 轮次状态机（聚合消息/usage/压缩状态/sub_agent 子任务事件块）
@@ -117,7 +118,7 @@ agent_tool_sse/
 │   └── ollama_model_watcher.py  # Ollama 本地模型周期发现（30s 轮询/3s 超时，供模型选择列表）
 │
 ├── mcp_server/
-│   ├── sys_tools_server.py      # 系统 MCP 服务器（仅网页抓取与搜索；文件四件套/run_command 注册块已注释保留，已迁移为后端内置工具）
+│   ├── web_tools_server.py      # 网页 MCP 服务器（仅 fetch_url 与 web_search；文件/终端工具已迁移为后端内置工具）
 │   ├── restart_tools_server.py  # 重启维护 MCP 服务器；当前缺少项目根 restart_helper.py，main.py 的服务快照写入亦被注释，不能按设计完成自动重启
 │   └── PipeIpcMCP.exe           # 命名管道终端 MCP 服务器（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）
 │
@@ -182,12 +183,11 @@ agent_tool_sse/
 │   ├── tool_test_review_2026-10-06.md # 带日期的工具测试复核记录
 │   └── web_tools.md              # 网页搜索与抓取说明
 │
-├── history_files/               # 运行时数据：<session>_chat.jsonl（会话历史）+ lock/（跨进程写锁）
-│                                 #   session_groups.json（会话分组注册表，含 collapsed/order；随分享包
-│                                 #   manifest v2 的 groups 携带，导入端按组名映射还原归属）
-│                                 #   上传记录目录 history_files/session_files/<session>/（upload 改名而来）：文件解析 JSON + media/ + files/ + file_diffs/
-│                                 #   state/permission_runtime.sqlite3：全局/会话权限、审批、任务恢复与执行台账；state/backups/ 为迁移备份
-│                                 #   sidecars/：会话 pending/todo/bak 等侧车与 history_search.sqlite3 搜索缓存；与权限数据库独立
+├── history_files/               # 运行时数据：users/<user_id>/sessions/<session_id>/（会话历史 JSONL + files/uploads 附件 + sidecars 侧车）
+│                                 #   users/<user_id>/session_groups.json（本账户分组注册表，含 collapsed；随分享包携带，导入端按组名映射还原归属）
+│                                 #   users/<user_id>/session_archives.json（本账户归档标记）
+│                                 #   state/permission_runtime.sqlite3：全局/会话权限、审批、任务恢复与执行台账；state/task_costs.sqlite3：任务预算与用量
+│                                 #   sidecars/history_search_<user_id>.sqlite3：按账户搜索缓存（可重建）；lock/：跨进程写锁
 │
 └── test/                        # 单元测试（test_chat_llm / test_tool_executor / test_chat_runtime /
                                  #   test_context_compaction / test_chat_router / test_sub_agent / test_messages_api / test_responses_api /
@@ -353,8 +353,8 @@ agent_tool_sse/
 - `set_env_vars`：写回 .env 并保持内存 env_vars 一致（防 hot-reload 覆盖）
 - **supportDocTypes（原生文档能力）**：models.json 各模型可选字段 `supportDocTypes`（如 `[".pdf", ".docx"]`），`_normalize_support_doc_types` 归一化为小写含点扩展名列表（容错非法条目）；`get_model_config` / `list_available_models` 输出顶层 `support_doc_types`，供上传链路（原生标记/解析失败容错接收）与生成链路（read_document 按需原生判定）使用
 
-### 8. 系统 MCP 服务器（`mcp_server/sys_tools_server.py`）
-当前注册 2 个工具（read/write/edit/search 文件四件套与 run_command 已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`，list_items 已停用）：
+### 8. 网页 MCP 服务器（`mcp_server/web_tools_server.py`）
+当前注册 5 个工具：`fetch_url`、`web_search`、`web_open`、`web_click`、`web_find`（read/write/edit/search 文件四件套与 run_command 已迁移为主项目后端内置工具 `factory/agent_runtime/builtin_tools.py`）：
 
 | 工具 | 业务 |
 |---|---|
@@ -374,7 +374,7 @@ Windows 普通命令沿用 WMI 隐藏启动链；短等待命令由独立监督�
 
 另注册命名管道终端服务器 `PipeIpcMCP.exe`（工具：setup_pipe / run_pipe_command / read_pipe_output / get_pipe_status）。
 
-run_command 与文件工具已迁移到后端内置工具；sys_tools_server.py 中的旧注释实现仅作历史参考。短等待、游标续读、文件枚举和补丁以当前内置实现为准，恢复旧注释不能获得同等能力。
+run_command 与文件工具已迁移到后端内置工具；web_tools_server.py 内无旧实现残留。短等待、游标续读、文件枚举和补丁以当前内置实现为准。
 
 可用 `python test/manual_sys_tools_check.py` 通过真实 MCP 客户端逐工具自检（临时沙箱，自动清理）；run_command 与文件工具的验证见 `test/test_builtin_command_tool.py` / `test/test_builtin_file_tools.py`。
 

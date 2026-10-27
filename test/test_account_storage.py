@@ -49,14 +49,16 @@ def storage(tmp_path, monkeypatch):
         CURRENT.reset(token)
 
 
-def legacy(storage, sid="old"):
+def seeded(storage, sid="old"):
     _, root, store, _, member, _ = storage
-    store.register("session", sid, member["id"])
-    (root / (sid + "_chat.jsonl")).write_text(json.dumps({"_meta": {"title": "legacy", "upload_id": sid}}) + "\n", encoding="utf-8")
-    folder = root / "session_files" / sid / "media"
+    store.register(sid, member["id"])
+    directory = root / "users" / member["id"] / "sessions" / sid
+    directory.mkdir(parents=True)
+    (directory / (sid + "_chat.jsonl")).write_text(json.dumps({"_meta": {"title": "legacy", "upload_id": sid}}) + "\n", encoding="utf-8")
+    folder = directory / "files" / "media"
     folder.mkdir(parents=True)
     (folder / "picture.png").write_bytes(b"original-media")
-    folder = root / "sidecars"
+    folder = directory / "sidecars"
     folder.mkdir(exist_ok=True)
     (folder / (sid + "_chat.jsonl.todo")).write_text("[]", encoding="utf-8")
     return sid
@@ -74,23 +76,25 @@ def test_fresh_session_paths_and_owner_tombstone(storage):
     assert [r["id"] for r in list_session_summaries()] == ["fresh"]
     manager.delete_chat_session_file("fresh")
     assert catalog.get(store, "fresh")["state"] == "deleted"
-    assert store.owner("session", "fresh") == member["id"]
+    assert store.owner("fresh") == member["id"]
     with pytest.raises(HTTPException):
         session("fresh", create=True)
     with pytest.raises(Denied):
-        store.register("session", "fresh", admin["id"])
+        store.register("fresh", admin["id"])
 
 
 def test_reconcile_keeps_reserved_ids_and_reports_missing_and_unowned(storage):
     _, root, store, _, member, _ = storage
-    legacy(storage)
-    store.register("session", "empty", member["id"])
-    (root / "unowned_chat.jsonl").write_text("{}\n")
+    seeded(storage)
+    store.register("empty", member["id"])
+    stray = root / "users" / member["id"] / "sessions" / "unowned"
+    stray.mkdir(parents=True)
+    (stray / "unowned_chat.jsonl").write_text("{}\n")
     result = catalog.reconcile(store, root)
     assert result["unowned"] == ["unowned"]
     assert catalog.get(store, "old")["state"] == "reserved"
     catalog.reconcile(store, root, apply=True)
-    (root / "old_chat.jsonl").unlink()
+    (root / "users" / member["id"] / "sessions" / "old" / "old_chat.jsonl").unlink()
     catalog.reconcile(store, root, apply=True)
     assert catalog.get(store, "old")["state"] == "missing"
     assert catalog.get(store, "empty")["state"] == "reserved"
@@ -123,46 +127,6 @@ def test_parallel_tool_pool_keeps_authenticated_storage_identity(storage, monkey
     assert result[0]["result"] == principal.user_id
 
 
-def test_migrate_preserves_history_media_sidecars_and_protocols(storage):
-    from memory.storage_migration import migrate
-    from memory.session_listing import list_session_summaries
-    from chat.protocols import native_store, responses_store
-    _, root, store, _, _, _ = storage
-    legacy(storage)
-    for module in (native_store, responses_store):
-        path = module.session_directory("old")
-        path.mkdir(parents=True)
-        (path / "state.json").write_text('{"state":"original"}')
-    catalog.reconcile(store, root, apply=True)
-    assert migrate(store, root)["sessions"] == 1
-    result = migrate(store, root, apply=True)
-    assert result["sessions"] == 1
-    assert not (root / "old_chat.jsonl").exists()
-    assert layout.chat_path(root, "old").is_file()
-    assert (layout.files_path(root, "old") / "media/picture.png").read_bytes() == b"original-media"
-    assert (native_store.session_directory("old") / "state.json").is_file()
-    assert (responses_store.session_directory("old") / "state.json").is_file()
-    assert [r["id"] for r in list_session_summaries()] == ["old"]
-    assert migrate(store, root, apply=True)["sessions"] == 0
-
-
-def test_migration_failure_rolls_back_without_releasing_owner(storage, monkeypatch):
-    from memory import storage_migration as migration
-    _, root, store, _, member, _ = storage
-    legacy(storage)
-    original = os.replace
-    def fail(source, target):
-        if Path(source).name == "old" and Path(target).name == "files":
-            raise OSError("injected interrupted move")
-        return original(source, target)
-    monkeypatch.setattr(migration.os, "replace", fail)
-    with pytest.raises(OSError):
-        migration.migrate(store, root, apply=True)
-    assert (root / "old_chat.jsonl").exists()
-    assert (root / "session_files/old/media/picture.png").exists()
-    assert catalog.get(store, "old")["layout"] == 0
-    assert store.owner("session", "old") == member["id"]
-
 
 def test_account_layout_import_overwrite_uses_published_attachment_generation(storage):
     from memory import chat_memory, file_memory
@@ -180,21 +144,10 @@ def test_account_layout_import_overwrite_uses_published_attachment_generation(st
     assert not old.exists()
 
 
-def test_migrated_absolute_attachment_reference_still_resolves(storage):
-    from memory.storage_migration import migrate
-    from memory.storage_layout import remap_legacy_attachment
-    _, root, store, *_ = storage
-    legacy(storage)
-    old_path = root / "session_files/old/media/picture.png"
-    catalog.reconcile(store, root, apply=True)
-    migrate(store, root, apply=True)
-    assert remap_legacy_attachment(old_path).read_bytes() == b"original-media"
-
-
 def test_backup_restore_includes_wal_and_excludes_credentials_history(storage):
     from memory import storage_backup as backup
     project, root, store, *_ = storage
-    legacy(storage)
+    seeded(storage)
     (store.root / "mfa.key").write_bytes(b"test-key-not-real")
     (store.root / "old-initial-password.txt").write_text("must-not-copy")
     (project / ".env").write_text("TEST_ONLY=true\n")
@@ -252,11 +205,11 @@ def test_storage_identity_fails_closed_in_request_and_allows_explicit_system(sto
         CURRENT.reset(token)
 
 
-def test_account_quota_counts_legacy_and_new_data_and_preserves_old_limits(storage):
+def test_account_quota_counts_account_data_and_preserves_old_limits(storage):
     from security import quotas
     from security.resource_limits import storage_usage, storage_write
     _, root, store, admin, member, _ = storage
-    legacy(storage)
+    seeded(storage)
     used = storage_usage(store, member["id"])
     assert used > 14
     quotas.update(store, admin["id"], member["id"], {"storage_bytes": used + 5})
@@ -332,27 +285,12 @@ def test_waiting_accounts_rotate_instead_of_one_account_reentering(storage, monk
     release("member-next")
 
 
-def test_stale_or_other_instance_backup_cannot_authorize_migration(storage):
-    from memory import storage_backup as backup
-    project, root, store, *_ = storage
-    legacy(storage)
-    archive = project / "backup.zip"
-    backup.backup(project, store.root, archive)
-    backup.validate_migration_archive(archive, project, store.root)
-    (root / "old_chat.jsonl").write_text("changed")
-    with pytest.raises(ValueError, match="内容发生变化"):
-        backup.validate_migration_archive(archive, project, store.root)
-
-
-def test_recursive_cleanup_and_migration_refuse_external_targets(storage):
-    from memory.storage_migration import _inside
+def test_recursive_cleanup_refuses_external_targets(storage):
     from memory.chat_memory import _delete_path_with_retry
     project, root, *_ = storage
     outside = project / "unmanaged"
     outside.mkdir()
     (outside / "keep.txt").write_text("keep")
-    with pytest.raises(ValueError):
-        _inside(root, outside)
     with pytest.raises(ValueError):
         _delete_path_with_retry(outside, recursive=True)
     assert (outside / "keep.txt").read_text() == "keep"
@@ -386,8 +324,8 @@ def test_restored_fixture_account_can_login_and_read_history_without_source(stor
     from app_factory import create_app
     from fastapi.testclient import TestClient
     from memory import storage_backup as backup, chat_memory, file_memory, file_history
-    project, root, store, *_ = storage
-    legacy(storage)
+    project, root, store, _, member, _ = storage
+    seeded(storage)
     # This fixture represents an account that has completed first-login setup;
     # restore must preserve that flag rather than bypass the HTTP password gate.
     with store.database(True) as db:
@@ -396,7 +334,7 @@ def test_restored_fixture_account_can_login_and_read_history_without_source(stor
     backup.backup(project, store.root, archive)
     target = project / "http-restored"
     backup.restore(archive, target)
-    (root / "old_chat.jsonl").unlink()
+    (root / "users" / member["id"] / "sessions" / "old" / "old_chat.jsonl").unlink()
     restored = target / "history_files"
     monkeypatch.setattr(chat_memory, "HISTORY_ROOT", restored)
     monkeypatch.setattr(chat_memory, "LOCK_ROOT", restored / "lock")

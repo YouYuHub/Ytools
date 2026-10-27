@@ -54,7 +54,7 @@
     // Legacy servers use filename/local-title labels, never N meta requests.
     const files = await API.listSessions();
     return (Array.isArray(files) ? files : []).map(function (filename) {
-      const id = SessionUtils.fileNameToSessionId(filename);
+      const id = SessionUtils.sanitizeSessionId(filename);
       return { id: id, filename: filename, title: knownSessionTitle(id) || (state.sessionRecency[id] || {}).title || id };
     }).filter(function (row) { return sessionId == null || row.id === sessionId; });
   }
@@ -91,7 +91,7 @@
     summaries.forEach(function (row) {
       const id = SessionUtils.sanitizeSessionId(row.id || row.filename);
       const changedTitle = currentTitles.get(id) !== titlesBefore.get(id) ? knownSessionTitle(id) : "";
-      const title = changedTitle || SessionUtils.getSessionTitle(id, row.title || knownSessionTitle(id) || id);
+      const title = changedTitle || row.title || knownSessionTitle(id) || id;
       rememberSessionTitle(id, title);
       fetchedIds.add(id);
       if (archivedSessionIds.has(id)) { delete state.sessionRecency[id]; return; }
@@ -1098,6 +1098,8 @@
     if (isMobile()) setSidebarCollapsed(true);
     input.focus();
     App.refreshComposerButtons();
+    // 新对话不属于任何会话：清空旧会话残留的引导/队列暂存指示器
+    App.renderPendingOutbox();
   }
 
   $("#newChatBtn").addEventListener("click", startNewChat);
@@ -1333,7 +1335,6 @@
   App.isSessionArchived = function (id) { return archivedSessionIds.has(id); };
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
-  App.clearSessionItems = clearSessionItems;
   App.loadSessions = loadSessions;
   App.buildSessionItem = buildSessionItem;
   App.closeSessionMenus = closeSessionMenus;

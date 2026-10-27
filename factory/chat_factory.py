@@ -281,15 +281,6 @@ def _messages_debug_summary(messages: List[dict[str, Any]]) -> str:
     return "[\n\t" + ";\n\t".join(lines) + "\n]"
 
 
-def _replace_todo_context(messages: List[dict[str, Any]], todos: list[dict[str, str]]) -> None:
-    """兼容入口：保留最近一次原生计划交互，不再创建 system 计划摘要。
-
-    todos 是旧调用方的兼容参数；模型计划状态以真实工具返回为准。
-    删除旧交互时同步清理声明与结果，避免悬空调用触发供应商 400。
-    """
-    TodoContext().sync(messages)
-
-
 # 当前工作路径为<{_format_tool_result(get_current_dir())}>
 # 本轮工具集合由用户选择并由系统注入，你只能调用当前可见工具（如果用户提供了）；禁止臆造、改名或扩展工具。
 # 如果任务已完成，直接给最终答复。

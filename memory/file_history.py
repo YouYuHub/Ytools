@@ -33,14 +33,7 @@ from typing import Any
 from util.timestamp_utils import now_str
 from util.file_lock import cross_process_lock
 from memory import file_snapshots
-
-try:
-    # 同包内复用会话目录命名规则，保证 file_diffs 与 media/files 同居一个会话目录
-    from memory.file_memory import _safe_session_id
-except Exception:  # pragma: no cover - 独立测试环境兜底
-    def _safe_session_id(session_id: str) -> str:
-        value = re.sub(r"[^\w .-]+", "_", session_id)
-        return value.replace("..", "_").strip(" ._-" ) or "default"
+from memory.storage_layout import safe_session_id
 
 HISTORY_DIFF_ROOT = Path(__file__).resolve().parents[1] / "history_files" / "session_files"
 DIFF_DIRECTORY_NAME = "file_diffs"
@@ -65,7 +58,7 @@ _LOCK_DEPTH = threading.local()
 
 @contextmanager
 def _session_lock(session_id: str):
-    normalized = _safe_session_id(session_id)
+    normalized = safe_session_id(session_id)
     lock = _LOCKS.get(normalized)
     if lock is None:
         lock = _LOCKS.setdefault(normalized, __import__("threading").RLock())
@@ -94,7 +87,7 @@ def _root_dir(session_id: str) -> Path:
     from security.authorization import session as authorize_session
     authorize_session(session_id)
     from memory.storage_layout import files_path
-    return files_path(HISTORY_DIFF_ROOT.parent, session_id, legacy_root=HISTORY_DIFF_ROOT) / DIFF_DIRECTORY_NAME
+    return files_path(HISTORY_DIFF_ROOT.parent, session_id) / DIFF_DIRECTORY_NAME
 
 
 def file_key(path: str) -> str:
@@ -348,7 +341,7 @@ def _undo_one_hunk(baseline_text: str, current_text: str, hunk: dict[str, int]) 
 def _load_meta(session_id: str, key: str) -> dict[str, Any] | None:
     meta = _read_json(_meta_path(session_id, key))
     if isinstance(meta, dict):
-        meta.setdefault("session_id", _safe_session_id(session_id))
+        meta.setdefault("session_id", safe_session_id(session_id))
         return meta
     return None
 
@@ -396,7 +389,7 @@ def list_files(session_id: str, hide_clean: bool = False) -> list[dict[str, Any]
                 for child in sorted(root.iterdir()):
                     meta = _read_json(child / "meta.json")
                     if isinstance(meta, dict):
-                        meta["session_id"] = _safe_session_id(session_id)
+                        meta["session_id"] = safe_session_id(session_id)
                         meta["key"] = child.name
                         _refresh_index(meta)
             index = _read_json(root / "index.json") or {}
@@ -574,7 +567,7 @@ def record_change(
             meta = {
                 "version": _META_VERSION,
                 "key": key,
-                "session_id": _safe_session_id(session_id),
+                "session_id": safe_session_id(session_id),
                 "path": path,
                 "display_path": display_path,
                 "kept": False,

@@ -3,11 +3,11 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const utils = require("../js/session_group_utils.js");
 
-test("normalizeGroups: 过滤非法条目并按 order 排序", function () {
+test("normalizeGroups: 过滤非法条目并按创建时间排序", function () {
   const groups = utils.normalizeGroups([
-    { id: "g-b", name: "乙", order: 2 },
+    { id: "g-b", name: "乙", created_at: "2026-10-02 00:00:00" },
     { id: "", name: "无id" },
-    { id: "g-a", name: "甲", order: 1 },
+    { id: "g-a", name: "甲", created_at: "2026-10-01 00:00:00" },
     { id: "g-c", name: "" },
     null,
     "bad",
@@ -49,8 +49,8 @@ test("normalizeAssignments: 过滤空值/非字符串并去空白", function () 
 
 test("bucketSessions: 按归属分桶，未知分组归未分组", function () {
   const groups = utils.normalizeGroups([
-    { id: "g-a", name: "甲", order: 1 },
-    { id: "g-b", name: "乙", order: 2 },
+    { id: "g-a", name: "甲" },
+    { id: "g-b", name: "乙" },
   ]);
   const assignments = utils.normalizeAssignments({
     "s1": "g-a",
@@ -94,8 +94,8 @@ test("validateGroupName: 空名拒绝、控制字符折叠、超长截断", func
 
 test("bucketForBulk: 已定义分组按注册顺序 + 未分组殿后", function () {
   const groups = utils.normalizeGroups([
-    { id: "g-a", name: "甲", order: 1 },
-    { id: "g-b", name: "乙", order: 2 },
+    { id: "g-a", name: "甲" },
+    { id: "g-b", name: "乙" },
   ]);
   const assignments = utils.normalizeAssignments({
     "s1": "g-a",
@@ -122,7 +122,7 @@ test("bucketForBulk: 已定义分组按注册顺序 + 未分组殿后", function
 });
 
 test("bucketForBulk: 无未分组会话时不产生未分组桶", function () {
-  const groups = utils.normalizeGroups([{ id: "g-a", name: "甲", order: 1 }]);
+  const groups = utils.normalizeGroups([{ id: "g-a", name: "甲" }]);
   const assignments = utils.normalizeAssignments({ "s1": "g-a" });
   const rows = [{ id: "s1", title: "1" }];
   const buckets = utils.bucketForBulk(rows, groups, assignments);
@@ -131,8 +131,8 @@ test("bucketForBulk: 无未分组会话时不产生未分组桶", function () {
 
 test("bucketForBulk: 空分组保留（可显示空组头），全空输入安全", function () {
   const groups = utils.normalizeGroups([
-    { id: "g-a", name: "甲", order: 1 },
-    { id: "g-empty", name: "空组", order: 2 },
+    { id: "g-a", name: "甲" },
+    { id: "g-empty", name: "空组" },
   ]);
   const assignments = utils.normalizeAssignments({ "s1": "g-a" });
   const rows = [{ id: "s1", title: "1" }];

@@ -23,6 +23,7 @@ import pytest
 
 from memory import chat_memory as cm
 from memory import file_memory as fm
+from memory.storage_layout import safe_session_id
 _TEST_SESSION = "share_roundtrip_ut"
 _TEST_SESSION_B = "share_roundtrip_ut_b"
 
@@ -117,7 +118,7 @@ class SessionShareTests(unittest.TestCase):
                     except OSError:
                         pass
             for base in (fm.HISTORY_ROOT,):
-                data_dir = base / cm._safe_session_id(sid)
+                data_dir = base / safe_session_id(sid)
                 if data_dir.is_dir():
                     shutil.rmtree(data_dir, ignore_errors=True)
 

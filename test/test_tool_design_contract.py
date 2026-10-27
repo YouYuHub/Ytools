@@ -12,7 +12,7 @@ import pytest
 from factory.agent_runtime import builtin_tools as bt
 from factory.agent_runtime.tool_control import run_sync_tool
 from factory.agent_runtime.tool_validation import argument_error, prepare_builtin_calls
-from mcp_server import sys_tools_server as web
+from mcp_server import web_tools_server as web
 
 
 def call(index, name, args):

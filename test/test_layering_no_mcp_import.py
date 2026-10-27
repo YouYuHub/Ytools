@@ -4,17 +4,17 @@
 架构约定：
 - mcp_server/ 下的文件是 MCP 协议层工具（由 MCP 客户端按 stdio 协议以子进程
   方式拉起，通过协议交互）；主程序运行时代码不得 import 其实现（含
-  sys_tools_server.py / restart_tools_server.py 的辅助函数）；
+  web_tools_server.py / restart_tools_server.py 的辅助函数）；
 - 内置工具（factory/agent_runtime/builtin_tools.py）必须自包含：历史上
   read/write/edit/search 文件四件套与 run_command 已先后从
-  sys_tools_server.py 迁移为内置工具，迁移方式均为「复制实现」；
+  web_tools_server.py 迁移为内置工具，迁移方式均为「复制实现」；
 - 如需在主程序与 MCP 层间共享工具函数，公共实现应放在主程序侧
   （util/ 或 factory/agent_runtime/），由 MCP 层按需自行引用/复制，
   而不是主程序反向依赖 MCP 层文件。
 
 本测试做两类静态校验：
 1. 扫描主程序运行时代码，禁止出现对 mcp_server 实现层的导入/动态加载
-   （import sys_tools_server / from mcp_server... / importlib 动态加载 /
+   （import web_tools_server / from mcp_server... / importlib 动态加载 /
    sys.path 注入 mcp_server 目录等模式）；
 2. 对 builtin_tools.py 做 AST 未定义名检查（自包含证明）：任何被引用但
    从未在本文件定义/导入的全局名字都会导致失败——若迁移代码曾引用 MCP
@@ -41,9 +41,9 @@ MAIN_PROGRAM_FILES = ("config.py", "env_manager.py", "main.py")
 
 # 违规模式：对 mcp_server 实现层的导入 / 动态加载 / 路径注入
 _VIOLATION_PATTERNS = (
-    # import sys_tools_server / from sys_tools_server import ...
+    # import web_tools_server / from web_tools_server import ...
     # import mcp_server / from mcp_server import ... / from mcp_server.xxx import ...
-    re.compile(r"(?m)^\s*(?:from|import)\s+(?:mcp_server|sys_tools_server)\b"),
+    re.compile(r"(?m)^\s*(?:from|import)\s+(?:mcp_server|web_tools_server)\b"),
     # importlib.import_module("mcp_server...") / import_module('mcp_server...')
     re.compile(r"import_module\s*\(\s*[\"']mcp_server"),
     # importlib.util.spec_from_file_location(..., "...mcp_server/xxx.py")
@@ -146,12 +146,12 @@ class LayeringGuardTests(unittest.TestCase):
     def test_scanner_detects_known_violation_samples(self):
         """扫描器有效性：合成违规样本必须被检出，合法写法不得误报。"""
         violation_samples = (
-            "import sys_tools_server",
-            "from sys_tools_server import _run_command_impl",
-            "from mcp_server.sys_tools_server import _run_command_impl",
+            "import web_tools_server",
+            "from web_tools_server import _run_command_impl",
+            "from mcp_server.web_tools_server import _run_command_impl",
             "import mcp_server.restart_tools_server",
-            "import importlib\nmod = importlib.import_module('mcp_server.sys_tools_server')",
-            'spec = importlib.util.spec_from_file_location("x", "mcp_server/sys_tools_server.py")',
+            "import importlib\nmod = importlib.import_module('mcp_server.web_tools_server')",
+            'spec = importlib.util.spec_from_file_location("x", "mcp_server/web_tools_server.py")',
             'sys.path.insert(0, str(ROOT / "mcp_server"))',
         )
         for sample in violation_samples:
@@ -161,8 +161,8 @@ class LayeringGuardTests(unittest.TestCase):
         clean_samples = (
             "import os\nfrom util.mcp_client import call_mcp_tool",
             "from factory.agent_runtime.builtin_tools import execute_run_command",
-            "# 注释里提到 mcp_server/sys_tools_server.py 是允许的（非导入）",
-            'config = {"command": "python", "args": ["mcp_server/sys_tools_server.py"]}',
+            "# 注释里提到 mcp_server/web_tools_server.py 是允许的（非导入）",
+            'config = {"command": "python", "args": ["mcp_server/web_tools_server.py"]}',
         )
         for sample in clean_samples:
             with self.subTest(sample=sample):

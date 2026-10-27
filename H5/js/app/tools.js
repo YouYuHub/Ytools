@@ -701,5 +701,4 @@
   App.loadTools = loadTools;
   App.loadToolSelection = loadToolSelection;
   App.openToolModal = openToolModal;
-  App.positionToolTip = positionToolTip;
 })(window.App);

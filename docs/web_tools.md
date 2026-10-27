@@ -2,7 +2,7 @@
 
 ## 工具位置
 
-两个工具在 `mcp_server/sys_tools_server.py` 注册，由 MCP 执行。模型使用 `web_search` 找候选链接，再用 `fetch_url` 核验原文。
+五个工具在 `mcp_server/web_tools_server.py` 注册，由 MCP 执行。推荐流程：模型使用 `web_search` 找候选链接，再用 `web_open` 打开页面看正文与编号链接，用 `web_click` 跟进编号、用 `web_find` 定位正文关键词；`fetch_url` 保留给 HTML/tag/regex 精细抽取与 API 接口调用。
 
 `fetch_url.timeout_seconds` 是请求预算（默认 30 秒，1–120 秒），连接和后续读取共用截止时间；`web_search` 的跨引擎总预算为 45 秒。正则使用支持执行超时的 `regex` 依赖（见 [项目说明](https://pypi.org/project/regex/#timeout)），单次匹配超时会明确标记结果不完整。
 
@@ -31,14 +31,31 @@
 - DDG 没有结果锚点且没有明确无结果标记时，提示验证码/访问限制/页面结构变化，不再静默返回成功的零结果。有效候选可保留，同时标注补充引擎的失败原因。
 - 当前不存在搜索结果缓存；测试中的无关结果不能据此归因于缓存键。结果需用原始链接核验，零结果不代表目标网页不存在。
 
+## web_open / web_click / web_find
+
+- `web_open(url)`：返回标题、静态正文（字符分页，`offset` 续读）、最多 50 个编号链接。链接只保留 http(s)、去重、跳过带账号口令与指向本页自身的纯片段链接；编号只对本次返回的页面内容有效。
+- `web_click(url, link_id)`：按 `web_open` 的编号打开目标页。无状态设计：每次重新读取来源页解析编号（MCP 服务按调用拉起子进程，内存状态不可跨调用），页面变动时请重新 `web_open`；目标页默认同样返回编号链接，可连续跟进。
+- `web_find(url, query)`：正文内字面查找（忽略大小写），只返回匹配行、每处对应的正文字符 `offset` 与上下文；`offset` 可直接喂给 `web_open` 跳转续读。
+- 三者与 `fetch_url` 共用同一套请求/解压/编码/截断与超时预算实现，不执行 JavaScript。
+
+## PDF 与 JS 页面
+
+- 抓取到 `application/pdf`（或 `%PDF` 魔数）时，`fetch_url`（仅 `text` 模式）与 `web_open`/`web_find`/`web_click` 自动切换为逐页文本提取：按物理页输出并标注页码（最多前 200 页），PDF 内嵌的 http(s) 链接同样编号可跟进。扫描版图片型 PDF 无可提取文本时会明确说明（暂不支持 OCR）。
+- 静态正文为空且命中 JS 应用特征（`react-root`、`__NEXT_DATA__`、`ng-app`、`/_next/static/`、`vite/client`、“请启用 JavaScript”等）时，不再只说“可能依赖 JavaScript”，而是明确指引模型改用 `browser_navigate` 打开该 URL 后用 `browser_snapshot` 读取渲染后内容。
+
+## 搜索改版兜底
+
+- Bing/DDG 的结构化解析（结果块 class）一个都命中不了时，不再直接判空/报错，而是回退为“非结构化链接提取”：取页面全部站外链接，按查询关键词过滤重排。输出会明确标注 `非结构化兜底` 并提示用 `fetch_url` 核验；无关键词命中时仍返回空，不伪造结果。
+- 明确的无结果页面（`no results` 等标记）不受影响，仍直接返回空。
+
 ## 2026-10-05 测试记录核实与改进
 
 依据 `history_files/yt-2026-10-05_15.47.54_293_chat.jsonl` 核对后，修复了正则标签抽取的嵌套/伪标签问题、DDG 属性顺序依赖、HTTP 错误正文缺失及搜索诊断不足。没有接入完整 CSS/XPath、浏览器渲染或额外搜索服务，以保持参数与部署简单。
 
 原报告中部分推测不成立：实现没有搜索结果缓存，也没有 XPath；当前 example.com 原始 HTML 没有 h1，选择 h1 返回空是正常结果。回归测试覆盖嵌套元素、脚本伪标签、空 head、多 class、DDG 重定向与验证码、site 过滤、固定候选池、错误响应上限、真实本地 HTTP 429 等。外网冒烟验证了 example.com 的 p 抽取、DDG Python 文档查询及 Bing site 查询；外网站点仍可能不稳定或访问受限。
 
-执行：`python -m pytest test/test_sys_tools_web.py test/test_sys_tools_http_limits.py -q`。
+执行：`python -m pytest test/test_web_tools_web.py test/test_web_tools_http_limits.py test/test_web_tools_navigation.py -q`。
 
 ## 2026-10-06 测试记录核实与改进
 
-依据当天 DeepSeek Flash 测试记录增加了版本号/年份排序、缺少精确匹配的警告、DDG Lite 备用尝试、完整候选池合并修正及 tag 多选择器。没有接入第三家引擎、完整 CSS 或新的标签探查模式；页面结构仍可通过现有 `mode=html` 核对。详见 [测试报告核实与改进](tool_test_review_2026-10-06.md)。
+依据当天 DeepSeek Flash 测试记录增加了版本号/年份排序、缺少精确匹配的警告、DDG Lite 备用尝试、完整候选池合并修正及 tag 多选择器。没有接入第三家引擎、完整 CSS 或新的标签探查模式；页面结构仍可通过现有 `mode=html` 核对。详见 [测试报告核实与改进](archive/tool_test_review_2026-10-06.md)。
