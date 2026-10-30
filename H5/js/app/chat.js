@@ -9,7 +9,7 @@
   const {
     state, el, toast, input,
     chatInner, sessionList, scrollToBottom, nearBottom, stickToBottom,
-    setEmpty, sendBtn, stopBtn
+    setEmpty, sendBtn, stopBtn, resumeBtn
   } = App;
 
   // ---------- 发送 / 停止 ----------
@@ -528,6 +528,8 @@
     // 收尾后强制重载会话恢复真实状态；成功路径不重载，保持视口停在发起位置
     let streamFailed = false;
     let streamResult = null, streamError = null;
+    // 新轮开跑：▶ 让位（预检已过，此处必发起请求；失败后收尾重同步）
+    if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, false);
     try {
       streamResult = await API.chatStream(payload, pipe.handle, state.abort.signal,
         {onOpen: () => { if (App.taskStatus) App.taskStatus.connected(activeStream.taskHandle); }});
@@ -568,6 +570,13 @@
         state.abort = null;
       }
       if (state.sessionId === streamSessionId) App.clearContextStatsTimer();
+      // 可用性重同步：失败/中断后末轮仍可继续则恢复 ▶；自然完成保持隐藏
+      // （用户停止已确认时跳过：停止按钮已直接同步，后端 stopped 落盘窗口
+      // 内的查询会把 true 覆盖回 false；切走会话由查询守卫丢弃）
+      if (activeStream.stopConfirmed !== true) {
+        if (streamFailed && App.refreshResumeAvailability) await App.refreshResumeAvailability(streamSessionId);
+        else if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, false);
+      }
       App.refreshComposerButtons();
       if (shouldReloadVisibleSession) {
         setTimeout(function () { App.openSession(streamSessionId); }, 0);
@@ -589,7 +598,146 @@
     }
   }
 
+  // ---------- 暂停后继续（无用户消息续跑） ----------
+
+  // 设置 ▶ 继续可用性并刷新输入区按钮。后端是真源（空闲 + 末轮
+  // stopped/interrupted）；暂停成功/任务完成等本地确定态直接同步，
+  // 中断等不确定态经 refreshResumeAvailability 向后端查询。
+  function setResumeAvailable(sessionId, available) {
+    state.resumeAvailable = !!available;
+    state.resumeSessionId = sessionId;
+    App.refreshComposerButtons();
+  }
+
+  // 向后端查询 ▶ 可用性（会话打开/任务异常结束/继续被拒后重同步）。
+  // 竞态守卫：只接受仍停留在查询会话时的结果，切走则丢弃不碰状态。
+  function refreshResumeAvailability(sessionId) {
+    const sid = SessionUtils.sanitizeSessionId(sessionId || state.sessionId);
+    if (!sid) return Promise.resolve(false);
+    return API.streamStatus(sid).then(function (status) {
+      if (state.sessionId !== sid) return false;
+      const ok = !!(status && status.can_resume);
+      setResumeAvailable(sid, ok);
+      return ok;
+    }).catch(function () { return false; });
+  }
+
+  // 暂停/中断后继续：不渲染用户气泡、不写新问题，后端以内部 nudge
+  // 另起一轮续跑（等价于服务端代发的"继续"）。流式消费与收尾同 send()。
+  async function resume() {
+    const streamSessionId = state.sessionId;
+    if (!streamSessionId) return;
+    // 仅当"当前会话"空闲时可继续；其他会话在后台流式先放弃本地监听
+    if (state.streaming) {
+      if (state.streamingSession === streamSessionId) return;
+      detachAttachedStream();
+    }
+    // "连接已中断"不确定态：先向后端确认；仍在运行则自动重连并放弃继续
+    if (!(await ensureSendable())) return;
+    // 手动压缩进行中：仅压缩会话禁止继续（续跑会打断压缩并交错写历史）
+    if (state.manualCompactRunning && state.manualCompactSession === streamSessionId) {
+      toast("正在压缩对话上下文，请稍后再继续");
+      return;
+    }
+    // 先落可用性再开跑：防重复点击；409 被拒后经重同步恢复
+    if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, false);
+    state.streaming = true;
+    state.streamingSession = streamSessionId;
+    state.abort = new AbortController();
+    setEmpty(false);
+    App.refreshComposerButtons();
+    App.refreshContextTokenStats(streamSessionId);
+
+    // 本轮回复容器（无用户气泡）：思考/回答/工具按到达顺序分块
+    const msg = el("div", "msg");
+    const activeStream = {
+      sessionId: streamSessionId,
+      userText: "",
+      replayComplete: true,
+      round: null,
+      userContent: null,
+      questionParts: null,
+      quotes: null,
+      userNode: null,
+      messageNode: msg,
+      completed: false,
+      usage: null,
+      resumed: true,
+    };
+    state.activeStream = activeStream;
+    if (App.taskStatus) activeStream.taskHandle = App.taskStatus.begin(streamSessionId);
+    chatInner.appendChild(msg);
+    scrollToBottom();
+    const pipe = createStreamPipeline(msg, streamSessionId, activeStream);
+
+    const payload = { session_id: streamSessionId };
+    // 工具选择与发送同口径：随本轮 tool_names 上送（视觉兜底过滤一致）
+    if (state.selectedTools.size > 0) {
+      let toolNames = Array.from(state.selectedTools);
+      if (!App.getChatModelVision()) {
+        toolNames = toolNames.filter(function (name) { return name !== "read_media"; });
+      }
+      if (toolNames.length > 0) payload.tool_names = toolNames;
+    }
+
+    let streamFailed = false;
+    let streamResult = null, streamError = null;
+    try {
+      streamResult = await API.resumeChat(payload, pipe.handle, state.abort.signal,
+        {onOpen: () => { if (App.taskStatus) App.taskStatus.connected(activeStream.taskHandle); }});
+    } catch (err) {
+      streamFailed = true;
+      streamError = err;
+      if (err.name !== "AbortError") {
+        msg.appendChild(el("div", "notice-bar", "请求失败：" + streamErrorText(err)));
+      }
+    } finally {
+      const completed = !streamError && (!streamResult || streamResult.completed !== false);
+      const canFlush = App.taskStatus
+        ? await App.taskStatus.end(activeStream.taskHandle, completed, streamError, activeStream.detached)
+        : completed;
+      await reconcileStreamInterruption(streamSessionId);
+      const fin = pipe.finish();
+      if (typeof App.finalizeMermaidBlocks === "function") App.finalizeMermaidBlocks();
+      const wasDetached = activeStream.detached === true;
+      const shouldReloadVisibleSession = !wasDetached
+        && state.sessionId === streamSessionId
+        && activeStream.messageNode.parentNode !== chatInner;
+      if (fin.empty && !msg.querySelector(".msg-user")) msg.remove();
+      const usageReconciled = await App.refreshSessionUsage(streamSessionId);
+      if (!usageReconciled && fin.roundUsage && fin.roundUsage.total_tokens) {
+        if (state.sessionId === streamSessionId) App.addSessionUsage(fin.roundUsage);
+      }
+      activeStream.completed = true;
+      const wasAttached = state.activeStream === activeStream;
+      if (wasAttached) {
+        state.activeStream = null;
+        state.streaming = false;
+        state.streamingSession = null;
+        state.abort = null;
+      }
+      if (state.sessionId === streamSessionId) App.clearContextStatsTimer();
+      // 可用性重同步：失败/中断后末轮仍可继续则恢复 ▶；自然完成保持隐藏
+      // （用户停止已确认时跳过，原因同发送流收尾）
+      if (activeStream.stopConfirmed !== true) {
+        if (streamFailed && App.refreshResumeAvailability) await App.refreshResumeAvailability(streamSessionId);
+        else if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, false);
+      }
+      App.refreshComposerButtons();
+      if (shouldReloadVisibleSession) {
+        setTimeout(function () { App.openSession(streamSessionId); }, 0);
+      }
+      if (state.sessionId === streamSessionId) {
+        App.scheduleContextTokenStatsRefresh(App.CONTEXT_STATS_EVENT_DEBOUNCE_MS, streamSessionId);
+      }
+      App.refreshAskBlockStates();
+      if (canFlush) setTimeout(function () { App.flushPendingMessages(streamSessionId); }, 0);
+    }
+  }
+
   sendBtn.addEventListener("click", function () { send(); });
+
+  resumeBtn.addEventListener("click", function () { resume(); });
 
   stopBtn.addEventListener("click", async function () {
     // 手动压缩进行中：显式停止后台任务（先调 stop 接口再断开本地 SSE，
@@ -611,12 +759,18 @@
       try {
         await API.stopChat(streamSessionId);
         if (App.taskStatus) App.taskStatus.stopped(streamSessionId, taskHandle);
+        // 暂停成功：末轮即 stopped，可继续（本地确定态，直接同步免查询）；
+        // 同时给本地流打停止确认标记，其中断收尾跳过重同步，避免落盘
+        // 窗口内的查询把 true 覆盖回 false（停止按钮不显示恢复按钮的根因）。
+        if (active) active.stopConfirmed = true;
+        if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, true);
       } catch (error) {
         // 后端不可用（网络层错误）且本地已无活动流：任务大概率已随后端中断
         // 而消失，本地收尾为已停止以便重启后端后直接继续；若后端任务实际仍在，
         // 下一次发送会按“新消息打断旧任务”语义平滑接管，不会产生双任务。
         if (!active && error && error.name !== "AbortError" && error.status == null) {
           if (App.taskStatus) App.taskStatus.stopped(streamSessionId, taskHandle);
+          if (App.setResumeAvailable) App.setResumeAvailable(streamSessionId, true);
           toast("后端无响应，已在本地停止；请确认后端状态后继续");
           App.refreshComposerButtons();
           return;
@@ -808,6 +962,12 @@
         state.abort = null;
       }
       if (state.sessionId === sessionId) App.clearContextStatsTimer();
+      // 可用性重同步（附接流收尾同口径）：失败/中断恢复 ▶，自然完成隐藏
+      // （用户停止已确认时跳过，原因同发送流收尾）
+      if (activeStream.stopConfirmed !== true) {
+        if (!completed && App.refreshResumeAvailability) await App.refreshResumeAvailability(sessionId);
+        else if (App.setResumeAvailable) App.setResumeAvailable(sessionId, false);
+      }
       App.refreshComposerButtons();
       // 附接流结束：同样用防抖合并刷新一次统计增量
       if (state.sessionId === sessionId) {
@@ -827,6 +987,8 @@
       .then(function (status) {
         if (state.sessionId !== sid) return;
         if (App.taskStatus) App.taskStatus.checked(sid, status);
+        // 会话打开时零成本同步 ▶ 可用性（状态接口已捎带 can_resume）
+        if (App.setResumeAvailable) App.setResumeAvailable(sid, !!(status && status.can_resume));
         if (status && status.running && !(state.streaming && state.streamingSession === sid)) {
           attachStreamSession(sid);
         } else if (!status || !status.running) {
@@ -1102,6 +1264,9 @@
 
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.send = send;
+  App.resume = resume;
+  App.setResumeAvailable = setResumeAvailable;
+  App.refreshResumeAvailability = refreshResumeAvailability;
   App.confirmEditResend = confirmEditResend;
   App.maybeAttachRunningStream = maybeAttachRunningStream;
   App.attachStreamSession = attachStreamSession;

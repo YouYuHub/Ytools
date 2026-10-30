@@ -173,9 +173,9 @@ manual budget 至少 1024，必须小于实际 `max_tokens`，且不能强制选
 
 ## 实现边界和验证
 
-Messages 当前覆盖文本、图片、PDF/文本文档、工具、原生思考和四角色。Messages 服务器工具及原生音频/视频输入不在支持范围；Word/Excel 使用已有解析工具。项目另有独立 Responses 实现，其能力与限制见 [Responses API 使用说明](responses_api_usage.md)。
+Messages 当前覆盖文本、图片、PDF/文本文档、工具、原生思考和四角色。原生音频输入不在支持范围（精确到类型的拒收说明）；视频无原生块，有视觉模型自动转为关键帧拼图（单图，随附区间说明）发送，无视觉模型只留引用占位；Word/Excel 使用已有解析工具。项目另有独立 Responses 实现，其能力与限制见 [Responses API 使用说明](responses_api_usage.md)。
 
-Messages 的 `read_media` 工具定义只向模型声明图片读取和可选质量参数，移除视频时间区间参数，并明确 GIF 首帧语义；Chat Completions 保持原有媒体工具定义。
+Messages 的 `read_media` 工具向模型声明图片读取、可选质量参数与视频关键帧拼图（含视频时间区间参数）；GIF 首帧语义不变；Chat Completions 保持原有媒体工具定义（含原生视频/音频）。
 
 压缩发生跨协议回退时，按实际调用模型重新取角色参数，隔离 Messages 思考/扩展参数与 Chat 参数。`tool_choice=none` 不发送并行控制；强制选择未声明工具在发送前报错。
 

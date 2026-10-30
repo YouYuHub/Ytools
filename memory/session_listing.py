@@ -127,7 +127,9 @@ def recover_pending_sessions(stop: threading.Event) -> None:
         seen.add(sid)
         history = chat_memory._get_chat_history_file(sid)
         try:
-            if path.is_symlink() or history.is_symlink() or not history.is_file():
+            # 无检查点是正常态（.pending 随轮次完成即删）：静默跳过，只有
+            # 真实存在但读/解析失败的检查点文件才告警。
+            if path.is_symlink() or not path.is_file() or history.is_symlink() or not history.is_file():
                 continue
             pending = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(pending, dict) or pending.get("event") != "chat_round":

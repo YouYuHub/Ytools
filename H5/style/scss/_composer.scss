@@ -334,6 +334,7 @@
 
     #voiceBtn,
     #sendBtn,
+    #resumeBtn,
     #stopGroup {
       order: 6;
     }
@@ -377,9 +378,10 @@
       order: 2;
     }
 
-    // 语音 / 发送 / 停止组 保持在功能条右侧（列布局下生效）
+    // 语音 / 发送 / 继续 / 停止组 保持在功能条右侧（列布局下生效）
     &.grow #voiceBtn,
     &.grow #sendBtn,
+    &.grow #resumeBtn,
     &.grow #stopGroup {
       order: 6;
     }
@@ -422,7 +424,9 @@
     &.grow #boostBtn,
     &:not(.grow) #voiceBtn,
     &:not(.grow) #sendBtn,
+    &:not(.grow) #resumeBtn,
     &:not(.grow) #stopGroup,
+    &.grow #resumeBtn,
     &.grow #stopGroup {
       order: 6;
     }
@@ -507,12 +511,18 @@
   flex-shrink: 0;
   transition: opacity 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 
-  .stop-square {
-    width: 16px;
-    height: 16px;
-    border-radius: 2px;
+  .pause-bars {
+    display: flex;
+    align-items: center;
+    gap: 5px;
     margin-left: 2px;
-    background: currentColor;
+
+    i {
+      width: 5px;
+      height: 16px;
+      border-radius: 2px;
+      background: currentColor;
+    }
   }
 
   .icon {

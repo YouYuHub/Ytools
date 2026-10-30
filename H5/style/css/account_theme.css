@@ -6,4 +6,4 @@
 :root[data-theme] .account-shell input,:root[data-theme] .account-shell select,:root[data-theme] .auth-secret{background:var(--field)}
 :root[data-theme] button{background:var(--button);color:var(--text)}
 :root[data-theme] .account-shell .primary{background:var(--accent);color:#281c25}
-@media(max-width:600px){.account-shell nav{flex-wrap:wrap;gap:8px}.account-shell nav h1{font-size:21px}.account-shell nav #logout{margin-left:auto}}
+@media(max-width:600px){.account-shell nav{flex-wrap:wrap;gap:8px}.account-shell nav h1{font-size:21px}.account-shell nav #logout{margin-left:auto}body.auth-page{padding:16px}.account-shell section{padding:16px;margin:12px 0}.account-shell .grid{grid-template-columns:minmax(0,1fr)}.account-shell .grid>*{min-width:0}.mfa-device-row span{min-width:0;flex:1}.mfa-device-row button{flex-shrink:0}#devices>div{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}#devices span{min-width:0;flex:1;overflow-wrap:anywhere}#devices button{flex-shrink:0;margin:0}dialog{max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);padding:18px}}

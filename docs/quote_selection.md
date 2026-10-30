@@ -112,6 +112,7 @@
 5. **历史回放**：`history_parser.js` 把用户事件的 `quotes` 与轮内事件序号（`source_event_index`）透传给渲染层；`messages.js` 在用户气泡中把引用卡片放在问题正文之前，用 `textContent` 绘制所选文字，绝不交给 `innerHTML`。旧记录无 `quotes` 字段时正常回放、不显示卡片。
 6. **编辑与复制**：编辑历史用户消息时回填问题正文及引用列表，可移除或继续编辑；重发、原位替换和删除后重发沿用编辑后的 `quotes`。复制消息得到人可读的"引用 1：…\n\n问题：…"文本（`composeCopyText`），不含协议标签。
 7. **刷新恢复**：后台流恢复事件携带本轮 `question_quotes`；`sessions.js` 的 `recordsBeforeActiveRound` 按规范化后的问题与引用比较去重，避免刷新后出现两个用户气泡。
+8. **气泡引用浮层层级**（2026-10-27 修复）：用户气泡内的引用卡片 hover/聚焦时展开原文浮层（`msg-quote-popover`，默认向下、上方空间更大时翻转向上，视口钳制见 `quotes.js`）；浮层 `z-index` 只在所属消息的层叠上下文内有效，长会话开启历史窗口后每条消息因 `translate` 各自成上下文，向下展开会被更靠后的兄弟消息盖住（向上展开因盖的是更早兄弟而正常）。修复：`.chat-inner > *:has(.msg-quote-tile:hover, .msg-quote-tile:focus-within)` 把整条消息抬到 `z-index: 40`，纯 CSS、无残留态；真机浏览器以 `elementFromPoint` 在重叠区验证通过。
 
 ## 验收场景（测试覆盖）
 

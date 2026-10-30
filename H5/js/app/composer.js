@@ -9,7 +9,7 @@
   const {
     state, toast, $, closeMenus, el,
     updateScrollBottomOffset, input, composer, composerWrap,
-    sendBtn, voiceBtn, stopBtn, scrollBottomBtn, app,
+    sendBtn, voiceBtn, stopBtn, resumeBtn, scrollBottomBtn, app,
     stopGroup, stopMenuBtn, queueMenu, pendingOutbox,
     enhancePanel, plusMenu, plusBtn, boostBtn,
     fileInput, CHAT_SETTINGS_DEFAULTS, chatSettingsModal,
@@ -42,6 +42,9 @@
     // 仅当前会话流式/压缩时随发送钮一起让位给停止钮
     composer.classList.toggle("has-text", hasText);
     sendBtn.classList.toggle("hidden", !hasText || currentStreaming || compacting);
+    // ▶ 继续：当前会话空闲 + 后端可继续 + 输入区无文本（有文本时发送优先）
+    const canResume = state.resumeAvailable && state.resumeSessionId === state.sessionId;
+    resumeBtn.classList.toggle("hidden", hasText || showStopGroup || !canResume);
     voiceBtn.classList.toggle("hidden", currentStreaming || compacting);
     stopGroup.classList.toggle("hidden", !showStopGroup);
     stopGroup.classList.toggle("compact-only", compacting);

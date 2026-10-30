@@ -908,6 +908,32 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
   }
 
   /**
+   * SSE 继续：POST /resume_chat（暂停/中断后无用户消息续跑）
+   * @param {object} payload 请求体（session_id/tool_names...）
+   * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
+   * @param {AbortSignal} [signal] 中止信号
+   */
+  async function resumeChat(payload, onEvent, signal, options) {
+    if (window.YtoolsAuth && !window.YtoolsAuth.executionAllowed) payload = Object.assign({}, payload, { tool_names: [] });
+    const res = await fetch(BASE + "/resume_chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: signal,
+    });
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const body = await res.json();
+        detail = (body && (body.detail || body.message)) || JSON.stringify(body);
+      } catch (_) { /* ignore */ }
+      const error = new Error(detail); error.status = res.status; throw error;
+    }
+    if (options && options.onOpen) options.onOpen();
+    return await readSseResponse(res, onEvent);
+  }
+
+  /**
    * 手动压缩（流式）：POST /chat_context/compact_manual?stream=true
    * 事件结构与自动压缩一致：context_compaction 的 start/delta/done
    * （done 携带 summary_text），结尾附加 compaction_manual_result 结果帧。
@@ -1233,6 +1259,7 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
     getSessionFiles,
     deleteSessionFile,
     chatStream,
+    resumeChat,
     compactContextStream,
     manualCompactionStatus,
     stopManualCompaction,

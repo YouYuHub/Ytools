@@ -62,7 +62,7 @@ from factory.agent_runtime.builtin_tools import (
     resolve_default_command_shell,
     normalize_todo_items,
     retire_prior_video_parts,
-    cap_video_parts_in_batch,
+    assemble_injected_media_parts,
     try_execute_builtin_command_tool,
     try_execute_builtin_file_tool,
 )
@@ -1771,7 +1771,7 @@ class SubAgentRunner:
                 # 视频一次性消费：与父级注入同口径——先回收旧 video 部件，
                 # 同批多视频仅第一个带画面数据（供应商单请求仅 1 个视频）
                 retire_prior_video_parts(self.messages)
-                media_parts = []
+                loaded_infos = []
                 for reference, quality, start_time, end_time, _key in self.read_media_pending_parts:
                     info = self._loaded_media_parts.pop(_key, None)
                     if info is None:
@@ -1780,26 +1780,16 @@ class SubAgentRunner:
                             start_time=start_time, end_time=end_time,
                             **({"api_type": self._api_type} if getattr(self, "_api_type", None) in {"messages", "responses"} else {}),
                         )
-                    if info is not None and info.get("part") is not None:
-                        media_parts.append(info["part"])
-                    elif isinstance(info, dict) and info.get("error"):
-                        media_parts.append({
-                            "type": "text",
-                            "text": f"[媒体 {reference} 读取失败：{info['error']}]",
-                        })
-                    else:
-                        media_parts.append({
-                            "type": "text",
-                            "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
-                        })
-                media_parts = cap_video_parts_in_batch(media_parts)
-                if getattr(self, "_is_responses", False):
-                    for pending, part in zip(self.read_media_pending_parts, media_parts):
-                        if isinstance(part, dict):
-                            part["_responses_call_id"] = self._responses_media_calls.get(pending[4])
+                    loaded_infos.append((_key, reference, info))
+                # 组装（含 caption 配键、responses 回放归属）与单批视频配额裁剪走共用
+                # helper，与主任务注入同口径；retained_keys 与最终部件逐项对齐。
+                media_parts, media_keys = assemble_injected_media_parts(
+                    loaded_infos,
+                    responses_calls=self._responses_media_calls if getattr(self, "_is_responses", False) else None,
+                )
                 retained_keys = [
                     key if isinstance(part, dict) and part.get("type") in {"image_url", "input_audio"} else None
-                    for (_ref, _quality, _start, _end, key), part in zip(self.read_media_pending_parts, media_parts)
+                    for key, part in zip(media_keys, media_parts)
                 ]
                 self.messages.append({
                     "role": "user",

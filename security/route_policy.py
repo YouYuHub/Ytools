@@ -110,6 +110,7 @@ LEGACY_ROUTES = frozenset({
     ('POST', '/prompts/delete'),
     ('POST', '/prompts/rename'),
     ('POST', '/prompts/save'),
+    ('POST', '/resume_chat'),
     ('POST', '/stop_chat'),
     ('POST', '/stop_sub_agent'),
     ('POST', '/task_costs/config'),

@@ -74,6 +74,8 @@ def content_parts(content, session_id=None, *, role="user"):
                 resolved = load_session_media_model_part(session_id, url, api_type="responses")
                 if not resolved:
                     raise ResponsesProtocolError("Responses 图片引用无法读取")
+                if resolved.get("caption"):
+                    result.append({"type": "input_text", "text": resolved["caption"]})
                 result.extend(content_parts([resolved.get("part", resolved)], session_id))
                 continue
             if not url.startswith(("data:", "http://", "https://")):
@@ -113,7 +115,13 @@ def content_parts(content, session_id=None, *, role="user"):
             result.append({key: copy.deepcopy(value) for key, value in part.items()
                            if key in {"type", "image_url", "file_id", "detail"}})
         elif kind in {"video_url", "input_audio"}:
-            raise ResponsesProtocolError("Responses 此模型调用路径不支持原生音频/视频，请使用图片或文本输入")
+            # 与 Messages 路径统一口径：降级为精确类型通知（此前直接抛错，
+            # 单个视频附件会导致整轮请求失败）。正常流程经 resolve 层已提前
+            # 处理（有视觉走视频帧拼图），到这里的多为历史回放中的残留部件。
+            from memory.file_memory import media_part_display_name, media_unsupported_notice
+            media_kind = "audio" if kind == "input_audio" else "video"
+            result.append({"type": "input_text", "text": media_unsupported_notice(
+                media_kind, media_part_display_name(part), "responses")})
         else:
             raise ResponsesProtocolError("Responses 不支持内容类型 " + str(kind))
     if role == "assistant":

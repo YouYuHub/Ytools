@@ -1,5 +1,5 @@
 /* 大历史解析移出 UI 线程。与主页面共用同一份解析逻辑。 */
-importScripts("history_parser.js?v=a1f33616c31b");
+importScripts("history_parser.js?v=31fc7f2a388f");
 
 self.onmessage = function (event) {
   try {

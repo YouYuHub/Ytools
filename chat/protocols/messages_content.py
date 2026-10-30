@@ -183,7 +183,10 @@ def content_blocks(content, *, role="user", session_id=None):
                                **_metadata(part, ("cache_control", "citations"))})
             continue
         if kind in {"input_audio", "video_url"}:
-            result.append({"type": "text", "text": "[未发送附件：Messages API 不支持原生音频/视频输入。]"})
+            from memory.file_memory import media_part_display_name, media_unsupported_notice
+            media_kind = "audio" if kind == "input_audio" else "video"
+            result.append({"type": "text", "text": media_unsupported_notice(
+                media_kind, media_part_display_name(part), "messages")})
             continue
         if role != "user":
             raise MessagesProtocolError("图片和文档只能放在 Messages user 消息或工具结果内")
@@ -195,6 +198,8 @@ def content_blocks(content, *, role="user", session_id=None):
                 info = load_session_media_model_part(session_id, url, api_type="messages")
                 if not info or info.get("error"):
                     raise MessagesProtocolError("图片引用读取失败：" + str((info or {}).get("error") or url))
+                if info.get("caption"):
+                    result.append({"type": "text", "text": info["caption"]})
                 url = info["part"]["image_url"]["url"]
             source = data_source(url) if isinstance(url, str) and url.startswith("data:") else {"type": "url", "url": url}
             result.append({"type": "image", "source": _source(source, "image"),

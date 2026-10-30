@@ -127,7 +127,7 @@
   content-visibility: visible;
   contain-intrinsic-size: none;
 }
-.chat-inner > .process-stage { margin-top: -18px; margin-bottom: 0; }
+.chat-inner > .process-stage { margin-top: -6px; margin-bottom: 0; }
 .msg > .process-stage { margin-top: 0; margin-bottom: 0; }
 .msg > .stage-time { margin: 6px 0 0; }
 
@@ -135,6 +135,81 @@
 @media (prefers-reduced-motion: reduce) {
   .process-group-spinner { animation: none; }
   .process-group-chevron, .process-group-toggle { transition: none; }
+}
+
+// ---------- 轮级大折叠（每轮只保留最新一段正文，Codex 同款） ----------
+.round-fold-summary {
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+.round-fold-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-code);
+  color: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  text-align: left;
+
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+  &:hover { background: var(--bg-hover); border-color: var(--border-strong); color: var(--text); }
+  &:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  .icon { width: 13px; height: 13px; flex-shrink: 0; }
+}
+
+.round-fold-duration {
+  flex-shrink: 0;
+  font-weight: 500;
+  &:empty { display: none; }
+}
+.round-fold-counts {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  &:empty { display: none; }
+}
+.round-fold-chevron { transition: transform 0.15s ease; }
+.round-fold-summary.is-open .round-fold-chevron { transform: rotate(90deg); }
+.round-fold-spinner {
+  display: none;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: process-group-spin 0.9s linear infinite;
+}
+.round-fold-summary.is-running {
+  .round-fold-spinner { display: block; color: var(--status-running); }
+  .round-fold-duration { color: var(--status-running); }
+}
+.round-fold-summary.is-waiting {
+  .round-fold-toggle {
+    border-color: color-mix(in srgb, var(--status-waiting) 45%, var(--border));
+    background: color-mix(in srgb, var(--status-waiting) 8%, var(--bg-code));
+  }
+  .round-fold-duration, .round-fold-counts { color: var(--status-waiting); }
+}
+.round-fold-summary.has-error .round-fold-counts { color: var(--danger); }
+.is-roundfold-hidden { display: none !important; }
+.chat-inner > .round-fold-summary,
+.msg > .round-fold-summary {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .round-fold-spinner { animation: none; }
+  .round-fold-chevron, .round-fold-toggle { transition: none; }
 }
 
 // ---------- 思考块 ----------
@@ -1030,8 +1105,8 @@ html[data-theme="dark"] {
 
 .stage-time {
   align-self: flex-start;
-  margin-top: -16px;
-  margin-bottom: -18px;
+  margin-top: -4px;
+  margin-bottom: -6px;
   line-height: 1.35;
 }
 
@@ -1041,10 +1116,10 @@ html[data-theme="dark"] {
   padding: 2px 4px 0;
 }
 
-// 历史回放把用量行直接放在 chat-inner 下；抵消一部分 24px 的消息间距，
+// 历史回放把用量行直接放在 chat-inner 下；抵消一部分 12px 的消息间距，
 // 让它贴近所属轮次的最后一条内容。流式消息内已有 6px 的子项间距。
 .chat-inner > :not(.qnav-load-older) + .round-usage {
-  margin-top: -16px;
+  margin-top: -4px;
 }
 
 // ---------- 上下文压缩进度块 ----------
@@ -1771,6 +1846,16 @@ html[data-theme="dark"] {
 .msg.msg-user:hover,
 .msg.msg-user:focus-within {
   content-visibility: visible;
+}
+
+// 引用浮层层级：浮层 z-index 只在所属消息的层叠上下文内有效；长会话开启
+// 历史窗口后（.history-windowed 下每条消息带 translate → 各自成层叠上下文），
+// 向下展开的浮层会被 DOM 更靠后的兄弟消息盖住（向上展开因盖的是更早的兄弟
+// 而天然正常——这正是“下拉不行、上拉可以”的根因）。hover/聚焦引用 tile 时
+// 把整条消息抬到兄弟之上；tile 失活选择器即失效，无需 JS 同步、无残留态。
+.chat-inner > *:has(.msg-quote-tile:hover, .msg-quote-tile:focus-within) {
+  position: relative;
+  z-index: 40;
 }
 
 @container main-area (max-width: 420px) {

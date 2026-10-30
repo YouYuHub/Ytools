@@ -10,7 +10,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js?v=38c5d55ef599"></script>
-    <link rel="stylesheet" href="style/css/main.css?v=6076ff5f5d65">
+    <link rel="stylesheet" href="style/css/main.css?v=39c4793a6958">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -196,6 +196,12 @@
                     <div class="fh-panel-foot hidden" id="fileChangesFoot">
                         <span class="fh-foot-hint">点击文件在新窗口打开编辑器（全文可编辑 / 撤回差异块 / 回退 / 保留）</span>
                         <span class="fh-foot-actions">
+                            <span class="fh-filter-wrap">
+                                <button type="button" class="fh-act-btn fh-filter-btn" id="fileChangesFilterBtn"
+                                    title="按文件后缀筛选列表" aria-haspopup="true" aria-controls="fileChangesFilterMenu"
+                                    aria-expanded="false">全部后缀 ▾</button>
+                                <div class="fh-filter-menu hidden" id="fileChangesFilterMenu" role="menu"></div>
+                            </span>
                             <button type="button" class="fh-act-btn fh-keep-all" id="fileChangesKeepAll"
                                 title="接受全部文件的未决变更并封版为基线（之后不可再撤回）">全部保留</button>
                             <button type="button" class="fh-act-btn fh-revert-all" id="fileChangesRevertAll"
@@ -374,11 +380,16 @@
                                     <path d="M12 19V5m-7 7 7-7 7 7" />
                                 </svg>
                             </button>
-                            <!-- 运行中组合按钮：停止（方形）+ 发送选项上拉钮（消息引导/加入队列）；
-                                 压缩期间仅显示停止（终止压缩），上拉钮隐藏 -->
+                            <button class="round-btn hidden" id="resumeBtn" title="继续任务">
+                                <svg class="icon" viewBox="0 0 24 24">
+                                    <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" />
+                                </svg>
+                            </button>
+                            <!-- 运行中组合按钮：暂停（双竖条，点击后可继续）+ 发送选项上拉钮（消息引导/加入队列）；
+                                 压缩期间仅显示暂停（终止压缩），上拉钮隐藏 -->
                             <div class="stop-group hidden" id="stopGroup">
-                                <button class="round-btn" id="stopBtn" title="停止生成">
-                                    <span class="stop-square"></span>
+                                <button class="round-btn" id="stopBtn" title="暂停任务">
+                                    <span class="pause-bars" aria-hidden="true"><i></i><i></i></span>
                                 </button>
                                 <button class="round-btn round-btn-sub stop-menu-btn hidden" id="stopMenuBtn"
                                     title="发送选项">
@@ -1079,7 +1090,7 @@
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script defer src="js/api.js?v=e9acd1aaa171"></script>
+    <script defer src="js/api.js?v=68e666e3ffe4"></script>
     <script defer src="js/file_history_sync.js?v=dc20a0c0424e"></script>
     <script defer src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
     <script defer src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
@@ -1120,8 +1131,8 @@
     <script defer src="js/session_group_utils.js?v=3dd10daa60ba"></script>
     <script defer src="js/session_utils.js?v=35878da55495"></script>
     <script defer src="js/format_utils.js?v=d96a1dee8dff"></script>
-    <script defer src="js/history_parser.js?v=a1f33616c31b"></script>
-    <script defer src="js/history_parse_async.js?v=8235742456bd"></script>
+    <script defer src="js/history_parser.js?v=31fc7f2a388f"></script>
+    <script defer src="js/history_parse_async.js?v=26205f219020"></script>
     <script defer src="js/history_search.js?v=2e813eadce4f"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script defer src="js/quote_utils.js?v=a49a584363fe"></script>
@@ -1131,12 +1142,12 @@
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=fba2af5f5c09"></script>
+    <script defer src="js/app/core.js?v=81e34d4253ed"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=4f7d7d2208ab"></script>
     <script defer src="js/app/sessions.js?v=47fe5047055b"></script>
     <script defer src="js/app/account_panel.js?v=30e61c55c489"></script>
-    <script defer src="js/app/session_archives.js?v=c27ae7845200"></script>
+    <script defer src="js/app/session_archives.js?v=8d49140169d0"></script>
     <script defer src="js/app/history_search.js?v=fca634fa8815"></script>
     <script defer src="js/app/session_groups.js?v=701633c7f721"></script>
     <script defer src="js/app/stats.js?v=30c84f899b75"></script>
@@ -1144,21 +1155,22 @@
     <script defer src="js/app/workdir.js?v=1a073e7f603e"></script>
     <script defer src="js/tool_approval_state.js?v=d301678b67f4"></script>
     <script defer src="js/stream_replay_dedup.js?v=8dfebe7055e9"></script>
-    <script defer src="js/read_media_strip.js?v=bfdeaabc3b3c"></script>
+    <script defer src="js/read_media_strip.js?v=a56c898a275c"></script>
     <script defer src="js/app/permissions.js?v=9147d04cd95b"></script>
     <script defer src="js/history_scroll_model.js?v=2066507ba1d3"></script>
-    <script defer src="js/app/process_groups.js?v=67eb7d340bd3"></script>
+    <script defer src="js/app/process_groups.js?v=993934428d46"></script>
+    <script defer src="js/app/round_fold.js?v=c404caecc035"></script>
     <script defer src="js/app/message_diff.js?v=cb1fb0ba2ab9"></script>
     <script defer src="js/app/messages.js?v=e849852d7a71"></script>
-    <script defer src="js/app/history_scroll.js?v=a9021d55b59b"></script>
-    <script defer src="js/app/history_pages.js?v=e03618944205"></script>
+    <script defer src="js/app/history_scroll.js?v=a89f40c5b91a"></script>
+    <script defer src="js/app/history_pages.js?v=555ed81f263c"></script>
     <script defer src="js/app/history.js?v=9415f293c9ca"></script>
     <script defer src="js/app/compaction.js?v=52a5369b931d"></script>
     <script defer src="js/app/builtin.js?v=6ee9f8d92033"></script>
     <script defer src="js/app/user_profile.js?v=ae1c4a6fc233"></script>
     <script defer src="js/app/media.js?v=69e3e64525d7"></script>
     <script defer src="js/app/skills.js?v=6ad8a08bbd09"></script>
-    <script defer src="js/app/composer.js?v=61f7de11e843"></script>
+    <script defer src="js/app/composer.js?v=fe8b67469d2d"></script>
     <script defer src="js/app/chat_settings_modal.js?v=5092ffb42645"></script>
     <script defer src="js/app/model_panel_modal.js?v=c5776d195fd4"></script>
     <script defer src="js/app/model_panel.js?v=8a6b6c6f34b7"></script>
@@ -1168,10 +1180,10 @@
     <script defer src="js/app/task_templates.js?v=f5a4c7debcdb"></script>
     <script defer src="js/task_state.js?v=3b31e198ccb0"></script>
     <script defer src="js/app/session_activity.js?v=df91293787c3"></script>
-    <script defer src="js/app/task_status.js?v=cb00983d15e1"></script>
+    <script defer src="js/app/task_status.js?v=f03ee64a5d92"></script>
     <script defer src="js/app/stream_pipeline.js?v=1dd2737767a6"></script>
-    <script defer src="js/app/chat.js?v=26f8f86d37de"></script>
-    <script defer src="js/app/filehistory.js?v=8a5da583b0c3"></script>
+    <script defer src="js/app/chat.js?v=9913cd77d447"></script>
+    <script defer src="js/app/filehistory.js?v=057974e12605"></script>
     <script defer src="js/app/terminals.js?v=a30b6ca89011"></script>
     <script defer src="js/app/task_costs.js?v=e1d70c5beb46"></script>
     <script defer src="js/app/slash_commands.js?v=b5d7a8487a82"></script>

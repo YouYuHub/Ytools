@@ -43,3 +43,106 @@ test('parser uses page offsets for anchored compaction and user rounds',()=>{
   assert(parsed.records.some(r=>r.kind==='compaction'&&r.round===61));
   assert.equal(parsed.records.filter(r=>r.kind==='user')[0].round,61);
 });
+function pageRange(start,end,total){
+  return {revision:'r1',start_round:start,end_round:end,total_rounds:total,round_offset:start-1,
+    text:JSON.stringify({_meta:{usage:{total_tokens:5}}})+'\n'+Array.from({length:end-start+1},(_,i)=>JSON.stringify({event:'chat_round',events:[{role:'user',content:'q'+(start+i)},{role:'assistant',content:'answer'+(start+i)}]})).join('\n')};
+}
+function setupCatchUp(reply){
+  const f=setup(reply);let lastAll=[];
+  f.w.App.getHistoryWindow=()=>({records:lastAll});
+  f.w.App.renderRecords=records=>{lastAll=records;const chat=f.w.document.querySelector('#chat');
+    records.forEach((r,i)=>{if(r.kind!=='user')return;const d=f.w.document.createElement('div');
+      d.setAttribute('data-history-index',i);d.dataset.round=r.round;d.textContent='q'+r.round;chat.appendChild(d);});};
+  return f;
+}
+async function settleCalls(f,ms=400){
+  const t0=Date.now();let last=-1,stable=0;
+  while(Date.now()-t0<ms){await new Promise(r=>setTimeout(r,20));
+    if(f.calls.length===last){if(++stable>=3)break;}else{stable=0;last=f.calls.length;}}
+  return f.calls.length;
+}
+function rangeReply(failBefore){
+  return (id,options)=>{
+    if(options&&(options.before||options.around)){
+      const before=options.before||options.around+20;
+      if(before===failBefore){const error=new Error('boom');error.status=500;throw error;}
+      const end=Math.min(before-1,60),start=Math.max(1,end-19);
+      return pageRange(start,end,62);
+    }
+    return page();
+  };
+}
+async function openWithGap(f){
+  const opened=await f.pages.open('a');
+  f.w.App.renderRecords(opened.records);
+  await new Promise(r=>setTimeout(r,60)); // 等 MutationObserver 调度的 sync 建出缺口按钮
+  const scroll=f.w.document.querySelector('#scroll');
+  Object.defineProperty(scroll,'scrollHeight',{get:()=>1000,configurable:true});
+  Object.defineProperty(scroll,'clientHeight',{get:()=>600,configurable:true});
+  scroll.getBoundingClientRect=()=>({top:0,bottom:600,left:0,right:800,width:800,height:600});
+  return scroll;
+}
+test('松手贴顶且缺口可见时补载一页',async()=>{
+  const f=setupCatchUp(rangeReply());try{
+    const scroll=await openWithGap(f);
+    const btn=f.w.document.querySelector('.history-page-gap');
+    assert.ok(btn);btn.getBoundingClientRect=()=>({top:10,bottom:50,left:0,right:100,width:100,height:40});
+    scroll.scrollTop=0;
+    f.w.dispatchEvent(new f.w.MouseEvent('mouseup',{bubbles:true}));
+    assert.equal(await settleCalls(f),2); // 初载 + 补载 before=61
+    assert.equal(f.calls[1].options.before,61);
+    assert.equal(f.pages.hasRound(41),true);assert.equal(f.pages.hasRound(1),false);
+  }finally{f.dom.window.close();}
+});
+test('松手贴顶级联补载直到第一轮后停止',async()=>{
+  const f=setupCatchUp(rangeReply());try{
+    const scroll=await openWithGap(f);
+    f.w.HTMLElement.prototype.getBoundingClientRect=function(){
+      if(this.id==='scroll')return {top:0,bottom:600,left:0,right:800,width:800,height:600};
+      if(this.classList&&this.classList.contains('history-page-gap'))return {top:10,bottom:50,left:0,right:100,width:100,height:40};
+      return {top:0,bottom:0,left:0,right:0,width:0,height:0};
+    };
+    scroll.scrollTop=0;
+    f.w.dispatchEvent(new f.w.MouseEvent('mouseup',{bubbles:true}));
+    assert.equal(await settleCalls(f),4); // 初载 + before=61/41/21 三页
+    assert.deepEqual(f.calls.slice(1).map(c=>c.options.before),[61,41,21]);
+    assert.equal(f.pages.hasRound(1),true);
+  }finally{f.dom.window.close();}
+});
+test('松手不在边缘时不补载',async()=>{
+  const f=setupCatchUp(rangeReply());try{
+    const scroll=await openWithGap(f);
+    const btn=f.w.document.querySelector('.history-page-gap');
+    btn.getBoundingClientRect=()=>({top:10,bottom:50,left:0,right:100,width:100,height:40});
+    scroll.scrollTop=300; // 上下都不贴边
+    f.w.dispatchEvent(new f.w.MouseEvent('mouseup',{bubbles:true}));
+    assert.equal(await settleCalls(f),1);
+  }finally{f.dom.window.close();}
+});
+test('补载失败后停止接力不再空转',async()=>{
+  const f=setupCatchUp(rangeReply(41));try{
+    const scroll=await openWithGap(f);
+    f.w.HTMLElement.prototype.getBoundingClientRect=function(){
+      if(this.id==='scroll')return {top:0,bottom:600,left:0,right:800,width:800,height:600};
+      if(this.classList&&this.classList.contains('history-page-gap'))return {top:10,bottom:50,left:0,right:100,width:100,height:40};
+      return {top:0,bottom:0,left:0,right:0,width:0,height:0};
+    };
+    scroll.scrollTop=0;
+    f.w.dispatchEvent(new f.w.MouseEvent('mouseup',{bubbles:true}));
+    assert.equal(await settleCalls(f),3); // 初载 + 成功一页 + 失败一页，随后停止
+    assert.equal(f.pages.hasRound(1),false);
+  }finally{f.dom.window.close();}
+});
+test('到货零进展时停止接力不再空转',async()=>{
+  const f=setupCatchUp(()=>page());try{ // before 查询也只返回已加载的 61-62
+    const scroll=await openWithGap(f);
+    f.w.HTMLElement.prototype.getBoundingClientRect=function(){
+      if(this.id==='scroll')return {top:0,bottom:600,left:0,right:800,width:800,height:600};
+      if(this.classList&&this.classList.contains('history-page-gap'))return {top:10,bottom:50,left:0,right:100,width:100,height:40};
+      return {top:0,bottom:0,left:0,right:0,width:0,height:0};
+    };
+    scroll.scrollTop=0;
+    f.w.dispatchEvent(new f.w.MouseEvent('mouseup',{bubbles:true}));
+    assert.equal(await settleCalls(f),2); // 初载 + 一次零进展，随后停止
+  }finally{f.dom.window.close();}
+});

@@ -2114,6 +2114,45 @@ def cap_video_parts_in_batch(
     return capped
 
 
+def assemble_injected_media_parts(items, responses_calls=None):
+    """read_media 数据注入的部件+键组装（主任务/子任务共用，保证两者同口径）。
+
+    items: [(injected_key, reference, info)]，info 为 load_any 结果（part/error/None）。
+    返回 (media_parts, media_keys)：caption 文本与所属媒体同键（文本类型天然
+    不计入保留/去重/回收口径，回放归属与图片一致）；调用方按最终部件类型过滤
+    出 retained_keys（_media_injected_keys 与 content[1:] 逐项对齐）。
+    responses_calls：子任务 responses 回放归属映射（{injected_key: call_id}），
+    有则给各部件打 _responses_call_id（含 caption，与所属媒体同键）。
+    """
+    media_parts = []
+    media_keys = []
+    for key, reference, info in items:
+        if isinstance(info, dict) and info.get("part") is not None:
+            if info.get("caption"):
+                media_parts.append({"type": "text", "text": info["caption"]})
+                media_keys.append(key)
+            media_parts.append(info["part"])
+            media_keys.append(key)
+        elif isinstance(info, dict) and info.get("error"):
+            media_parts.append({
+                "type": "text",
+                "text": f"[媒体 {reference} 读取失败：{info['error']}]",
+            })
+            media_keys.append(None)
+        else:
+            media_parts.append({
+                "type": "text",
+                "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
+            })
+            media_keys.append(None)
+    media_parts = cap_video_parts_in_batch(media_parts)
+    if responses_calls is not None:
+        for key, part in zip(media_keys, media_parts):
+            if isinstance(part, dict):
+                part["_responses_call_id"] = responses_calls.get(key)
+    return media_parts, media_keys
+
+
 def _media_filename_from_reference(source: str, data: bytes) -> str:
     """从媒体来源推导入库文件名；扩展名缺失/可疑时按魔数嗅探校准。"""
     # 提取文件名：URL 取路径末段（去掉 query）；本地路径取完整文件名
@@ -2294,7 +2333,9 @@ def load_any_media_model_part(
         mime = file_memory.media_mime_type(name) if file_memory.media_kind(name) else "image/jpeg"
         image_only = api_type in {"messages", "responses"}
         if image_only and kind != "image":
-            return {"error": "当前 API 不支持音频或视频，仅支持图片输入", "source_type": "network", "source": source}
+            if kind == "video":
+                return {"error": f"[未发送附件（视频）：{name}。网络视频不会自动下载，请下载到本地后读取；本地视频可转为关键帧拼图查看。]", "source_type": "network", "source": source}
+            return {"error": file_memory.media_unsupported_notice(kind, name, api_type), "source_type": "network", "source": source}
         part: dict[str, Any]
         if kind == "image":
             part = {"type": "image_url", "image_url": {"url": source}}
@@ -2320,7 +2361,7 @@ def load_any_media_model_part(
                 tmp_path.write_bytes(data)
                 try:
                     if image_only:
-                        info = file_memory._messages_image_model_part(tmp_path, quality)
+                        info = file_memory._messages_image_model_part(tmp_path, quality, api_type=api_type)
                         return {**info, "source_type": "network", "source": source}
                     converted_result = file_memory._load_converted_media_base64(
                         file_memory._transcode_cache_dir("network_media"), tmp_path

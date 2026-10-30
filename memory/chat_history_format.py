@@ -9,6 +9,7 @@
 """
 # from __future__ import annotations
 # 标准库
+import copy
 import json
 import re
 from typing import Any
@@ -17,6 +18,7 @@ from factory.agent_runtime.chat_runtime import estimate_text_tokens, sanitize_to
 from memory.chat_round_store import merge_usage_dict
 from memory.file_memory import content_part_to_text
 from memory.quote_format import (
+    content_with_quotes,
     round_entry_user_quotes,
     serialize_quotes_for_model,
 )
@@ -81,6 +83,9 @@ def _round_question(round_entry: Any) -> str | None:
     if isinstance(events, list):
         for event in events:
             if not isinstance(event, dict) or event.get("role") != "user":
+                continue
+            if event.get("_internal"):
+                continue
                 continue
             # 多模态消息 content 为部件列表：取文本部件（不带媒体占位符，
             # 问题/标题口径保持纯文本）
@@ -295,6 +300,8 @@ def _resolve_round_user_content(round_entry: dict[str, Any]) -> str | None:
                 continue
             if event.get("role") != "user":
                 continue
+            if event.get("_internal"):
+                continue
             # 多模态消息 content 为部件列表：取文本部件
             normalized_user = content_part_to_text(event.get("content")).strip()
             if normalized_user and normalized_user != "停止任务":
@@ -324,7 +331,73 @@ def _round_user_content_for_model(round_entry: dict[str, Any]) -> str | None:
     return block + ("\n\n" + content if content else "")
 
 
-def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[dict[str, Any]]:
+# 续跑可继续的轮次状态（与 factory/chat_factory.py RESUMABLE_ROUND_STATUSES 同口径；
+# memory 层不能反向依赖 factory，此处独立定义，修改时保持同步）
+RESUMABLE_ROUND_STATUSES = frozenset({"stopped", "interrupted"})
+
+# 历史用户事件中视为媒体的多部件类型（与 file_memory.resolve_media_content_parts
+# 可解析的类型对齐；命中任一即保留原始部件列表供发送前解析）
+_MEDIA_PART_TYPES = frozenset({"image_url", "image", "video_url", "input_audio"})
+
+
+def _round_user_media_parts(round_entry: dict[str, Any]) -> list[Any] | None:
+    """提取轮次内首条真实用户消息的原始多部件 content（深拷贝，不碰落盘数据）。
+
+    选择口径与 _resolve_round_user_content 一致：跳过 _internal 与“停止任务”；
+    仅当部件列表含媒体部件时返回（含引用快照前置），否则返回 None 走纯文本口径。
+    """
+    events = round_entry.get("events")
+    if not isinstance(events, list):
+        return None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("role") != "user" or event.get("_internal"):
+            continue
+        content = event.get("content")
+        normalized = content_part_to_text(content).strip()
+        if not normalized or normalized == "停止任务":
+            continue
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") in _MEDIA_PART_TYPES for part in content
+        ):
+            return content_with_quotes(copy.deepcopy(content), round_entry_user_quotes(round_entry))
+        return None
+    return None
+
+
+def _round_user_message_content(round_entry: dict[str, Any], retain_user_media: bool) -> Any:
+    """历史轮次用户消息的模型视图内容：默认纯文本口径；retain_user_media 且该轮
+    用户消息含媒体部件时返回原始多部件列表（调用方发送前解析为 base64）。"""
+    if retain_user_media:
+        parts = _round_user_media_parts(round_entry)
+        if parts is not None:
+            return parts
+    return _round_user_content_for_model(round_entry)
+
+
+def find_resume_media_round_index(round_entries: list[Any]) -> int:
+    """续跑时定位应保留完整媒体的轮次下标；无命中返回 -1。
+
+    从末尾向前：跳过无真实用户消息的轮次（内部 nudge 轮）；首个有真实用户消息的
+    轮次若处于 stopped/interrupted 且含媒体部件则命中——更早的轮次即使被停过也已是
+    真正的历史（用户已用新问题移过注意力），不再回溯。
+    """
+    if not isinstance(round_entries, list):
+        return -1
+    for index in range(len(round_entries) - 1, -1, -1):
+        entry = round_entries[index]
+        if not isinstance(entry, dict):
+            continue
+        if not _resolve_round_user_content(entry):
+            continue
+        if entry.get("status") in RESUMABLE_ROUND_STATUSES and _round_user_media_parts(entry) is not None:
+            return index
+        return -1
+    return -1
+
+
+def _round_entry_to_text_context_messages(round_entry: dict[str, Any], retain_user_media: bool = False) -> list[dict[str, Any]]:
     """默认模式：工具结果不回传，仅把工具调用参数渲染成 assistant 文本行。
 
     用户消息为纯文本口径：多模态消息的媒体部件替换为 [图片] 等占位引用
@@ -332,6 +405,9 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
     原始多部件 content 并在发送上游前解析为 base64。media:// 落盘引用
     不膨胀历史 JSONL。带引用快照的轮次在用户消息前置 <quote_list>
     （模型视图，见 memory.quote_format；JSONL 原始历史不含标签）。
+
+    retain_user_media=True（仅续跑时对被续轮次使用）：该轮用户消息含媒体部件
+    时保留原始多部件列表（调用方发送前解析），等价于该轮仍是当前轮。
     """
     events = round_entry.get("events")
     if not isinstance(events, list):
@@ -377,7 +453,7 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
         # 数据已落盘（含崩溃恢复的 interrupted 轮），丢掉它会让"请继续上面的
         # 任务"这类后续提问在模型侧完全失忆。仅剩"停止任务"等无效内容时
         # round_user_content 为空，仍返回空列表。
-        round_user_model_content = _round_user_content_for_model(round_entry)
+        round_user_model_content = _round_user_message_content(round_entry, retain_user_media)
         if round_user_model_content:
             return [{"role": "user", "content": round_user_model_content}]
         return []
@@ -389,7 +465,7 @@ def _round_entry_to_text_context_messages(round_entry: dict[str, Any]) -> list[d
     # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用）；轮次无 events
     # 中的 user 消息时回退 question 字段的纯文本。带引用快照的轮次前置
     # <quote_list>（模型视图；JSONL 原始历史不含标签，标题/索引不受影响）
-    round_user_model_content = _round_user_content_for_model(round_entry)
+    round_user_model_content = _round_user_message_content(round_entry, retain_user_media)
     if round_user_model_content:
         messages.append({"role": "user", "content": round_user_model_content})
     messages.append({"role": "assistant", "content": "\n".join(merged_assistant_fragments)})
@@ -443,11 +519,13 @@ def _format_tool_calls_for_context(tool_calls: list[Any]) -> list[dict[str, Any]
 def _round_entry_to_tool_result_context_messages(
     round_entry: dict[str, Any],
     max_tool_result_length: int,
+    retain_user_media: bool = False,
 ) -> list[dict[str, Any]]:
     """工具结果回传模式：按 Chat Completions 规范展开为有序消息。
 
     顺序：user → assistant(tool_calls) → tool(tool_call_id, 截断结果) → assistant(最终答复)。
     tool 事件缺少 tool_call_id 或无法匹配时，回退挂到最近一次工具调用上。
+    retain_user_media 口径同 _round_entry_to_text_context_messages（仅续跑被续轮次）。
     """
     events = round_entry.get("events")
     if not isinstance(events, list):
@@ -456,7 +534,7 @@ def _round_entry_to_tool_result_context_messages(
     # 用户消息为纯文本口径（媒体部件为 [图片] 等占位引用），历史轮次不回传
     # 图片数据；仅当前轮用户消息保留原始多部件 content 并在发送前解析。
     # 带引用快照的轮次前置 <quote_list>（模型视图；JSONL 原始历史不含标签）
-    round_user_model_content = _round_user_content_for_model(round_entry)
+    round_user_model_content = _round_user_message_content(round_entry, retain_user_media)
     if round_user_model_content:
         messages.append({"role": "user", "content": round_user_model_content})
     compression_content, compress_index = _round_compression_state(round_entry)
@@ -1239,6 +1317,7 @@ def round_entry_to_minimal_messages(round_entry: dict[str, Any]) -> list[dict[st
 def round_entry_to_context_messages(
     round_entry: dict[str, Any],
     max_tool_result_length: int = 0,
+    retain_user_media: bool = False,
 ) -> list[dict[str, Any]]:
     """把一个 `chat_round` 条目展平成可用于模型上下文的消息列表。
 
@@ -1251,6 +1330,9 @@ def round_entry_to_context_messages(
     - 0：不回传工具结果（默认，仅保留工具调用参数行）
     - 负数：完整回传每个工具结果
     - 正数：每个工具结果最多回传前 N 个字符，超出部分以省略标记结尾
+
+    `retain_user_media=True`（仅续跑时对被续轮次使用）：该轮用户消息含媒体部件
+    时保留原始多部件列表供发送前解析，不转文本占位。
     """
     if not isinstance(round_entry, dict):
         return []
@@ -1258,7 +1340,7 @@ def round_entry_to_context_messages(
     if not isinstance(events, list):
         return []
     if max_tool_result_length == 0:
-        messages = _round_entry_to_text_context_messages(round_entry)
+        messages = _round_entry_to_text_context_messages(round_entry, retain_user_media)
         references = [event["provider_state"] for event in events
                       if isinstance(event, dict) and event.get("role") == "assistant" and event.get("provider_state")]
         if references:
@@ -1270,7 +1352,7 @@ def round_entry_to_context_messages(
                 messages.append(target)
             target["provider_state"] = state
         return messages
-    return _round_entry_to_tool_result_context_messages(round_entry, max_tool_result_length)
+    return _round_entry_to_tool_result_context_messages(round_entry, max_tool_result_length, retain_user_media)
 
 
 def round_entry_to_compaction_text(round_entry: dict[str, Any]) -> str:
@@ -1309,6 +1391,8 @@ def round_entry_to_compaction_text(round_entry: dict[str, Any]) -> str:
             continue
         role = event.get("role")
         if role == "user":
+            if event.get("_internal"):
+                continue
             # 多模态消息 content 为部件列表：取文本部件
             normalized = content_part_to_text(event.get("content")).strip()
             if normalized and normalized != question:

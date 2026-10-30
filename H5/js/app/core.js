@@ -88,6 +88,10 @@ window.App = window.App || {};
     // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，
     // 该轮 send 结束后不触发引导/队列 flush（消费后自动复位）
     suppressFlushOnce: false,
+    // ▶继续可用性（暂停/中断后可续跑）：归属会话 + 是否可继续；
+    // 真源在后端（空闲 + 末轮 stopped/interrupted），前端经状态接口同步
+    resumeAvailable: false,
+    resumeSessionId: null,
     // 每会话独立的输入草稿：{ text, media } —— 切换会话时保存/恢复，
     // 文本与待发附件都不丢失；key 为会话 ID，"" 对应"新对话"未建号状态
     sessionDrafts: {},
@@ -151,6 +155,7 @@ window.App = window.App || {};
   const contextTokenWorkdir = $("#contextTokenWorkdir");
   const sendBtn = $("#sendBtn");
   const stopBtn = $("#stopBtn");
+  const resumeBtn = $("#resumeBtn");
   const voiceBtn = $("#voiceBtn");
   const stopGroup = $("#stopGroup");
   const stopMenuBtn = $("#stopMenuBtn");
@@ -373,11 +378,36 @@ window.App = window.App || {};
   }
 
   // 自动跟随与用户滚动共用一份状态；用户意图优先于流式更新。
+  // 上滚意图按位移累计：触控板抖动、滚动锚定回跳、高亮重排等都会产生零星
+  // 小位移上滚，若直接暂停会让快速生成时无故脱离底部；800ms 内累计上滚
+  // 超过阈值才视为用户要脱离底部。鼠标滚轮一格约 100px，仍是单次即停。
   let autoScrollPaused = false;
   let chatScrollbarDragging = false;
   function isChatScrollbarDragging() { return chatScrollbarDragging; }
   let lastScrollTop = chatScroll.scrollTop;
   let bottomScrollFrame = null;
+  let upScrollIntentPx = 0;
+  let upScrollIntentAt = 0;
+  const UP_SCROLL_INTENT_PX = 48;
+  const UP_SCROLL_INTENT_WINDOW_MS = 800;
+  function noteUpScrollIntent(px) {
+    if (!(px > 0)) return;
+    const now = Date.now();
+    if (now - upScrollIntentAt > UP_SCROLL_INTENT_WINDOW_MS) upScrollIntentPx = 0;
+    upScrollIntentAt = now;
+    upScrollIntentPx += px;
+    if (upScrollIntentPx >= UP_SCROLL_INTENT_PX) {
+      upScrollIntentPx = 0;
+      pauseAutoScroll();
+    }
+  }
+  // 累计只由明确的用户下滚输入（滚轮/触摸下滚、主动回底）清零：流式跟随的
+  // 程序化置底同样产生向下的 scroll 事件，不能用它清零，否则快速生成时
+  // 跟随置底会反复吞掉用户的上滚累计，导致用户永远无法暂停。
+  function resetUpScrollIntent() {
+    upScrollIntentPx = 0;
+    upScrollIntentAt = 0;
+  }
 
   function cancelBottomCorrection() {
     if (bottomScrollFrame != null) cancelAnimationFrame(bottomScrollFrame);
@@ -388,6 +418,7 @@ window.App = window.App || {};
     if (chatScrollbarDragging) return;
     if (App.showHistoryTail) App.showHistoryTail();
     autoScrollPaused = false;
+    resetUpScrollIntent();
     if (App.historyScroll && App.historyScroll.clearUserScrolledUp) App.historyScroll.clearUserScrolledUp();
     cancelBottomCorrection();
     const prev = instant ? chatScroll.style.scrollBehavior : null;
@@ -414,6 +445,7 @@ window.App = window.App || {};
 
   function pauseAutoScroll() {
     autoScrollPaused = true;
+    resetUpScrollIntent();
     cancelBottomCorrection();
     // 立即终止此前的 smooth 置底动画，避免它在上滚输入后继续推进。
     const behavior = chatScroll.style.scrollBehavior;
@@ -425,7 +457,8 @@ window.App = window.App || {};
 
   // 捕获阶段在 scroll 事件及内部控件阻止冒泡之前响应上滚意图。
   chatScroll.addEventListener("wheel", function (event) {
-    if (event.deltaY < 0) pauseAutoScroll();
+    if (event.deltaY < 0) noteUpScrollIntent(-event.deltaY);
+    else if (event.deltaY > 0) resetUpScrollIntent();
   }, { passive: true, capture: true });
   let lastTouchY = null;
   chatScroll.addEventListener("touchstart", function (event) {
@@ -433,7 +466,10 @@ window.App = window.App || {};
   }, { passive: true });
   chatScroll.addEventListener("touchmove", function (event) {
     const y = event.touches.length ? event.touches[0].clientY : null;
-    if (y != null && lastTouchY != null && y > lastTouchY) pauseAutoScroll();
+    if (y != null && lastTouchY != null) {
+      if (y > lastTouchY) noteUpScrollIntent(y - lastTouchY);
+      else if (y < lastTouchY) resetUpScrollIntent();
+    }
     lastTouchY = y;
   }, { passive: true });
   chatScroll.addEventListener("keydown", function (event) {
@@ -449,8 +485,9 @@ window.App = window.App || {};
     const movingUp = top < lastScrollTop - 1;
     const movingDown = top > lastScrollTop + 1;
     if (movingUp) {
-      autoScrollPaused = true;
-      cancelBottomCorrection();
+      // 程序化置底会同步更新 lastScrollTop，能走到这里的上移基本来自用户
+      // 或布局抖动；累计到阈值才暂停，零星小位移不打断快速生成时的跟随。
+      noteUpScrollIntent(lastScrollTop - top);
     } else if (!chatScrollbarDragging && autoScrollPaused && movingDown &&
       chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
       autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
@@ -859,7 +896,7 @@ window.App = window.App || {};
   compactSessionItem, main, chatScroll,
   chatInner, input, composer,
   composerWrap, contextTokenStatus, contextTokenSummary,
-  contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn,
+  contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn, resumeBtn,
   voiceBtn, stopGroup, stopMenuBtn, queueMenu,
   composerAttachments, pendingOutbox, contextTokenTodoSlot,
   composerQuotes, composerAttachmentBlocks, syncComposerAttachmentBlocks, fitAttachmentBlockGrid,

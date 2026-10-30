@@ -3,12 +3,13 @@
   "use strict";
   const {state,chatInner,chatScroll}=App;
   let model=null, generation=0, loading=null, observer=null, frame=null, dragging=false;
+  let catchUpFloor=0;
   const buttons=new Map(), failed=new Set();
   function supported() { return !!(window.YtoolsAuth && YtoolsAuth.historyPagingAllowed && API.fetchSessionPage); }
   function reset() {
     generation++;
     if(model && model.abort)model.abort.abort();
-    model=null;loading=null;failed.clear();
+    model=null;loading=null;failed.clear();catchUpFloor=0;
     if(observer)observer.disconnect();observer=null;
     buttons.forEach(button=>button.remove());buttons.clear();
     if(frame!=null)cancelAnimationFrame(frame);frame=null;
@@ -109,7 +110,7 @@
         failed.add(round);App.toast("历史加载失败，可点击重试："+error.message);return false;
       }
     })();
-    try{return await loading;}finally{loading=null;schedule();}
+    try{return await loading;}finally{loading=null;schedule();catchUp();}
   }
   function gaps(saved) {
     const loaded=Array.from(saved.rounds.keys()).filter(n=>n>0).sort((a,b)=>a-b),result=[];
@@ -149,6 +150,35 @@
       button.disabled=!!loading;
     });
     buttons.forEach((button,key)=>{if(!wanted.has(key)){if(observer)observer.unobserve(button);button.remove();buttons.delete(key);}});
+  }
+  // 拖动松手（或单次到货）后若已贴边且缺口按钮可见，补点一次；到货后仍贴边则
+  // 经 load 收尾继续接力，直到缺口补完、用户介入或到货无进展。拖动中禁止自动
+  // 点（滑块会乱跳），松手前 Observer 也不重算，因此松手时必须显式补一次，
+  // 否则拖到顶永远停在已加载内容的边界上（2026-10-28 用户实测）。
+  // 有界性：每次接力要求轮次数严格增长（catchUpFloor 单调），总轮数有限故必终止；
+  // 失败轮次由 failed 集合跳过，用户滚动/拖动/切会话会打破贴边或 current 校验而停下。
+  function catchUp() {
+    const saved=model;
+    if(!saved||!current(saved)||loading||dragging)return;
+    if(saved.rounds.size<=catchUpFloor)return;
+    const view=chatScroll.getBoundingClientRect();
+    const nearTop=chatScroll.scrollTop<=4;
+    const nearBottom=chatScroll.scrollHeight-chatScroll.clientHeight-chatScroll.scrollTop<=4;
+    if(!nearTop&&!nearBottom)return;
+    sync();
+    let pick=null,pickEdge=nearTop?Infinity:-Infinity;
+    buttons.forEach(button=>{
+      if(!button.isConnected)return;
+      const rect=button.getBoundingClientRect();
+      if(rect.bottom<=view.top||rect.top>=view.bottom)return;
+      const [a,b]=button.dataset.pageGap.split(":").map(Number);
+      if(failed.has(a)&&failed.has(b))return;
+      const edge=nearTop?rect.top:rect.bottom;
+      if(nearTop?edge<pickEdge:edge>pickEdge){pick=button;pickEdge=edge;}
+    });
+    if(!pick)return;
+    catchUpFloor=saved.rounds.size;
+    pick.disabled=false;pick.click();
   }
   function schedule() {
     if(frame!=null)return;
@@ -202,6 +232,6 @@
     deferResult,
     active:()=>!!model};
   chatScroll.addEventListener("mousedown",event=>{if(event.target===chatScroll)dragging=true;},{passive:true});
-  window.addEventListener("mouseup",()=>{dragging=false;schedule();},{passive:true});
+  window.addEventListener("mouseup",()=>{dragging=false;schedule();catchUp();},{passive:true});
   if(typeof MutationObserver!=="undefined")new MutationObserver(schedule).observe(chatInner,{childList:true});
 })(window.App);

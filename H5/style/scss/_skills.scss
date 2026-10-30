@@ -231,7 +231,7 @@
       font-size: 13px;
       color: var(--text);
       background: var(--bg-input, var(--bg-elevated));
-      border: 1px solid #0b84d8;
+      border: 1px solid var(--focus-ring);
       border-radius: var(--radius-sm);
       outline: none;
     }
@@ -314,13 +314,12 @@
     }
 
     &.skills-act-primary {
-      background: #0b84d8;
-      border-color: #0b84d8;
-      color: #fff;
+      background: var(--focus-ring);
+      border-color: var(--focus-ring);
+      color: var(--accent-contrast);
 
       &:hover {
-        background: #0d93ef;
-        color: #fff;
+        filter: brightness(1.08);
       }
     }
 
@@ -430,8 +429,8 @@
           cursor: pointer;
 
           &.lit {
-            background: #0b84d8;
-            border-color: #0b84d8;
+            background: var(--focus-ring);
+            border-color: var(--focus-ring);
           }
         }
       }

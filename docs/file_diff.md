@@ -343,7 +343,7 @@ hunk 序号语义：使用 `SequenceMatcher` 得出的差异块顺序（0 起）
 |---|---|
 | `js/api.js` | listFileChanges / fileVersions / fileContent / fileTotalDiff / fileFullView / fileChangeDiff / fileHunkUndo / fileHunkKeep / fileSyncFromDisk / fileRollback / fileSave / fileKeep / fileHistoryDelete / fileCleanup / fileKeepAll / fileRevertAll |
 | `js/file_history_sync.js` | 跨页徽标脏标记同步：BroadcastChannel + storage + localStorage 三通道，主页面 / 编辑器页共享（配套测试 `H5/test_h5/file_history_sync.test.js`） |
-| `js/app/filehistory.js` | 顶栏徽标（文件数，纯事件驱动刷新：`noteSessionChanged` 会话切换事件 + `FileHistorySync` 脏标记，`BADGE_REFRESH_MIN_INTERVAL_MS=1500` 节流；不再保留定时轮询）+ 统计面板（全部保留 / 全部撤回 / 清理留档按钮，均二次确认）；点击文件新窗口打开 `editor.html` |
+| `js/app/filehistory.js` | 顶栏徽标（文件数，纯事件驱动刷新：`noteSessionChanged` 会话切换事件 + `FileHistorySync` 脏标记，`BADGE_REFRESH_MIN_INTERVAL_MS=1500` 节流；不再保留定时轮询）+ 统计面板（后缀筛选框 + 全部保留 / 全部撤回 / 清理留档按钮，批量操作均二次确认）；点击文件新窗口打开 `editor.html` |
 | `editor.html` + `js/app/editor.js` | **V2.3 独立 diff 编辑器页**：URL 参数 `?session_id&key`；全文视图 ctx/add 行均可编辑（overlay：Prism 高亮层 + 透明 textarea）；del 红块只读；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留；顶栏固定「↑上一块 / ↓下一块」差异块跳转（V2.5，滚动位置锚定）；顶栏主题下拉（跟随系统/浅色/深色，与主应用共用 ThemeManager / ytools-theme-preference），API 指向同源 localStorage `ytools-api-base` |
 | `js/app/chat.js` | tool_return 处挂 `scheduleFileChangesBadgeRefresh` |
 | `style/scss/_filehistory.scss` | 面板/编辑器样式（add/del 色值与 V1 diff-view 同口径；dark 主题变量） |
@@ -418,6 +418,9 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 - **高亮与聊天代码块统一**：此前编辑器高亮层 `pre.eh-hl.language-x` 未被 `_prism.scss` 的 `language-palette` mixin 覆盖，回退到 GitHub 基线配色（红关键字/绿变量/紫函数），与聊天代码块的 VS Code Dark+/Light+ 不一致；现 mixin 新增 `.eh-table.language-x` 选择器，编辑器表格根挂整文件语言类、全表继承同一套变量，一次覆盖 ctx/add/del 全部行；
 - **删除行行内高亮**：del 红块此前纯文本（仅红字+删除线），现同样走 Prism tokenize→encode→stringify 渲染（已转义无 XSS），失败逐行回退纯文本；删除线继承到 token span，选中/复制逻辑不变（del 行只读，文本以 row.text 为准）；
 - **布局微调**：增删行底色减淡（alpha .16→.07）+ 左侧 3px 色条（VS Code 式）；行号列加右分隔线；ctx 行悬停微亮；代码字号 12.5px→13px；顶栏按钮按 [保存][回退/刷新/保留][主题][块导航][关闭] 分组留白，回退按钮悬停红色警示；块头左内边距 0→12px。注意块头仍保持普通文档流（V2.5 教训：sticky 多块叠压错乱）。
+
+**V2.7 追加（2026-10-27，按用户实测反馈）**：
+- **面板后缀筛选（V2.7 初版单选，2026-10-27 当日按反馈改为多选）**：footer 操作行左侧新增筛选按钮（`#fileChangesFilterBtn`，`margin-right:auto` 把三个批量按钮顶到右侧）——点击上弹下拉菜单（`#fileChangesFilterMenu`，面板底部空间不足故向上弹出），选项从当前列表现算（`collectFileExts`：各后缀个数，字母序 + “(无后缀)”沉底，另有“全部后缀”），点选即切换该后缀的选中态（打 ✓，`menuitemcheckbox` + `aria-checked`），菜单保持打开可连续多选，“全部后缀”清空并关闭；按钮文案分级（0 项“全部后缀”/ 1~2 项列出如 `py, md` / 3 项以上“已选 N 项”），筛选中加 `is-active` 高亮。纯前端过滤（`matchExtFilter`，直接重渲染 `panelFiles` 缓存，不发请求）；保留/撤回/清理后数据变化：消失的已选项剔除、剩余项保持（全消失才回到全部）；点菜单外部收起；Esc 三级处理（关菜单 → 回到全部 → 放行关面板）。菜单视口钳制（选项多时实测自然高度：上方放不下且下方更大则翻转向下开，空间不足限高内部滚动，选中项滚入可见；resize / visualViewport / 侧栏拖动后 rAF 节流重算，CSS 另以 `min(240px, 100vh-16px)` 兜底菜单永不超视口高；渲染顺序必须是先挂列表行后钳制——先钳制会量到清空列表时的按钮高位，多次点选必现底部溢出，另复验跳过时必须恢复测量解除的限高，回归见同文件后两个用例）。窄屏/触屏（安卓）：菜单限高 `40vh`、宽不顶出面板（`min(230px, 100vw-60px)`），`pointer:coarse` 下选项触摸目标放大；另给 DOM 初始化加 `domInitDone` 防重入（脚本重复执行不再导致事件翻倍）。前端回归 `H5/test_h5/file_history_filter.test.js` 10 用例。
 
 阶段 3 预留：词级 diff（VS Code 行内字符级高亮）/ 双栏对比视图 / 快照文本文件的原子写入（当前 JSON 元数据原子替换，但文本快照仍直接写目标文件）/ 删除文件（delete_file）入链 / external 快照自动探测（当前为手动"从磁盘刷新"）。任务级整体回滚（会话全部文件一次性 Revert）已于 V2.4 以 `revert_all` 落地；编辑器行内 Prism 语法高亮已于 V2.3 落地（见上）。
 

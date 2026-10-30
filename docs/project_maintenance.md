@@ -31,6 +31,8 @@ python -B H5/version_assets.py
 
 `watch:css` 只生成 CSS，不更新页面哈希。发布前同时核对 `python -B -m pytest test/test_frontend_asset_versions.py -q`；功能单元测试为 `npm.cmd test --prefix H5`，浏览器交互脚本另行运行。
 
+若版本测试报哈希不一致，执行 `python -B H5/version_assets.py` 修复后重跑，不要手工改 `?v=`（2026-10-27 曾因手工遗漏导致线上跑旧缓存：按钮可见但点击无反应）。打戳脚本自测见 `test/test_version_assets.py`（合成目录验证打戳/幂等/worker 依赖链）。
+
 ## Python 依赖
 
 日常检查与完整发布优先使用 [统一验收入口](release_validation.md)：`python scripts/release_check.py --profile quick` 或 `--profile release`；完整发布还检查浏览器实际运行、恢复用例与源码未改变。

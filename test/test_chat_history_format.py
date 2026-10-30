@@ -2,6 +2,7 @@ import unittest
 
 from memory.chat_history_format import (
     adjust_context_summary_for_deleted_rounds,
+    find_resume_media_round_index,
     format_tool_call_history_line,
     extract_recent_questions,
     normalize_context_summary,
@@ -497,6 +498,119 @@ class AdjustSummaryForDeletedRoundsTests(unittest.TestCase):
         rendered = render_context_summary(adjusted)
         self.assertIn("覆盖轮次 1-2", rendered)
         self.assertIn("覆盖轮次 3-4", rendered)
+
+
+class ResumeMediaRetentionTests(unittest.TestCase):
+    """续跑保留被续轮次完整媒体（等价于未停止），而非文本占位。"""
+
+    def _media_round(self, status="stopped", quotes=None):
+        user_event = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这是什么图"},
+                {"type": "image_url", "image_url": {"url": "media://abc_def123456.png"}},
+            ],
+        }
+        if quotes is not None:
+            user_event["quotes"] = quotes
+        return {
+            "event": "chat_round",
+            "question": "这是什么图",
+            "status": status,
+            "events": [
+                user_event,
+                {"role": "assistant", "content": "这是一张"},
+            ],
+        }
+
+    def test_retain_user_media_keeps_image_parts_text_mode(self):
+        messages = round_entry_to_context_messages(self._media_round(), retain_user_media=True)
+        self.assertEqual(messages[0]["role"], "user")
+        content = messages[0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "这是什么图"})
+        self.assertEqual(
+            content[1], {"type": "image_url", "image_url": {"url": "media://abc_def123456.png"}}
+        )
+        # 默认口径不变：转带引用的文本占位
+        default_messages = round_entry_to_context_messages(self._media_round())
+        self.assertEqual(
+            default_messages[0]["content"], "这是什么图\n[图片 media://abc_def123456.png]"
+        )
+
+    def test_retain_user_media_keeps_image_parts_tool_result_mode(self):
+        entry = self._media_round()
+        entry["events"].insert(1, {
+            "role": "assistant", "tool_calls": [{"id": "call_0", "function": {"name": "read_media", "arguments": "{}"}}],
+        })
+        entry["events"].insert(2, {
+            "role": "tool", "tool_call_id": "call_0", "tool_name": "read_media", "result": "ok",
+        })
+        messages = round_entry_to_context_messages(
+            entry, max_tool_result_length=-1, retain_user_media=True
+        )
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertIsInstance(messages[0]["content"], list)
+        self.assertEqual(messages[0]["content"][1]["type"], "image_url")
+
+    def test_retain_without_media_falls_back_to_text(self):
+        entry = {
+            "event": "chat_round", "question": "纯文本问题", "status": "stopped",
+            "events": [
+                {"role": "user", "content": "纯文本问题"},
+                {"role": "assistant", "content": "回答一半"},
+            ],
+        }
+        messages = round_entry_to_context_messages(entry, retain_user_media=True)
+        self.assertEqual(messages[0], {"role": "user", "content": "纯文本问题"})
+
+    def test_retain_skips_internal_nudge_round(self):
+        entry = {
+            "event": "chat_round", "question": "", "status": "stopped",
+            "events": [{"role": "user", "content": "上次任务被中断了，请继续。", "_internal": True}],
+        }
+        self.assertEqual(round_entry_to_context_messages(entry, retain_user_media=True), [])
+
+    def test_retain_keeps_quotes_prefix(self):
+        messages = round_entry_to_context_messages(
+            self._media_round(quotes=[{"text": "被选中的原文"}]), retain_user_media=True
+        )
+        content = messages[0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn("<quote_list>", content[0]["text"])
+        self.assertIn("被选中的原文", content[0]["text"])
+        self.assertEqual(content[2]["type"], "image_url")
+
+    def test_retain_does_not_mutate_history(self):
+        entry = self._media_round()
+        messages = round_entry_to_context_messages(entry, retain_user_media=True)
+        messages[0]["content"][1]["image_url"]["url"] = "data:mutated"
+        self.assertEqual(
+            entry["events"][0]["content"][1]["image_url"]["url"], "media://abc_def123456.png"
+        )
+
+    def test_find_resume_media_round_index(self):
+        stopped_media = self._media_round(status="stopped")
+        done_media = self._media_round(status="done")
+        stopped_text = {
+            "event": "chat_round", "question": "q", "status": "stopped",
+            "events": [{"role": "user", "content": "q"}],
+        }
+        nudge = {
+            "event": "chat_round", "question": "", "status": "stopped",
+            "events": [{"role": "user", "content": "上次任务被中断了，请继续。", "_internal": True}],
+        }
+        # 常规：末轮被停且带图
+        self.assertEqual(find_resume_media_round_index([done_media, stopped_media]), 1)
+        # 末轮被停但无图：不回溯更早轮次
+        self.assertEqual(find_resume_media_round_index([stopped_media, stopped_text]), -1)
+        # 链式续跑：跳过内部 nudge 轮，命中更早的被停媒体轮
+        self.assertEqual(find_resume_media_round_index([stopped_media, nudge]), 0)
+        # 无被停轮次
+        self.assertEqual(find_resume_media_round_index([done_media]), -1)
+        self.assertEqual(find_resume_media_round_index([]), -1)
+        self.assertEqual(find_resume_media_round_index(None), -1)
 
 
 if __name__ == "__main__":

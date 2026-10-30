@@ -455,7 +455,7 @@
   .tool-row-check {
     width: 18px;
     height: 18px;
-    accent-color: #0b84d8;
+    accent-color: var(--focus-ring);
     flex-shrink: 0;
   }
 
@@ -514,9 +514,9 @@ body.tool-settings-open { overflow: hidden; }
   .tool-selected {
     flex-shrink: 0;
     padding: 4px 9px;
-    border: 1px solid color-mix(in srgb, #0b84d8 20%, var(--border));
+    border: 1px solid color-mix(in srgb, var(--focus-ring) 24%, var(--border));
     border-radius: 20px;
-    background: color-mix(in srgb, #0b84d8 8%, transparent);
+    background: color-mix(in srgb, var(--focus-ring) 10%, transparent);
     color: var(--text-secondary);
     font-size: 12px;
     white-space: nowrap;
@@ -535,7 +535,7 @@ body.tool-settings-open { overflow: hidden; }
       height: 40px;
       border-color: var(--border-strong);
       background: var(--bg-code);
-      &:focus-within { border-color: #0b84d8; box-shadow: 0 0 0 2px color-mix(in srgb, #0b84d8 12%, transparent); }
+      &:focus-within { border-color: var(--focus-ring); box-shadow: 0 0 0 2px var(--focus-halo); }
       input { font-size: 14px; }
     }
     .tool-refresh, .tool-collapse-all { flex: 0 0 40px; width: 40px; height: 40px; background: var(--bg-code); }
@@ -557,11 +557,11 @@ body.tool-settings-open { overflow: hidden; }
     .tool-group {
       border-color: var(--border-strong);
       border-radius: 12px;
-      &.has-selection { border-color: color-mix(in srgb, #0b84d8 28%, var(--border-strong)); }
+      &.has-selection { border-color: color-mix(in srgb, var(--focus-ring) 32%, var(--border-strong)); }
       .tool-group-head { min-height: 56px; gap: 10px; padding: 0 12px; background: var(--bg-code); }
       &:hover .tool-group-head, &.open .tool-group-head { background: color-mix(in srgb, var(--bg-elevated) 94%, var(--text)); }
       .tool-group-toggle { min-height: 56px; height: auto; gap: 10px; padding: 6px 0; }
-      .tool-group-icon { width: 28px; height: 28px; padding: 5px; border-radius: 8px; background: color-mix(in srgb, #0b84d8 8%, transparent); color: #0b84d8; }
+      .tool-group-icon { width: 28px; height: 28px; padding: 5px; border-radius: 8px; background: color-mix(in srgb, var(--focus-ring) 10%, transparent); color: var(--focus-ring); }
       .tool-group-arrow { width: 14px; height: 14px; color: var(--text-tertiary); }
       .tool-group-name { font-weight: 500; }
       .tool-group-id { font-family: var(--font); font-size: 11px; }
@@ -573,13 +573,13 @@ body.tool-settings-open { overflow: hidden; }
         min-height: 32px; padding: 5px 9px; border: 1px solid var(--border-strong); border-radius: 7px;
         background: var(--bg-code); color: var(--text-secondary); font: inherit; font-size: 12px; white-space: nowrap;
         &[aria-pressed="true"], &:hover { background: var(--bg-hover); color: var(--tool-icon-pink); border-color: var(--tool-icon-pink); }
-        &:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+        &:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
         &:disabled { opacity: 0.6; }
       }
       .tool-browser-note { margin: 0; padding: 3px 12px 8px; color: var(--text-tertiary); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
       .tool-row { align-items: center; min-height: 34px; gap: 8px; padding: 5px 12px 5px 28px; cursor: pointer; }
       .tool-row + .tool-row { border-top: 1px solid var(--border); }
-      .tool-row.is-selected { background: color-mix(in srgb, #0b84d8 5%, transparent); }
+      .tool-row.is-selected { background: color-mix(in srgb, var(--focus-ring) 7%, transparent); }
       .tool-row:hover { background: var(--bg-hover); }
       .tool-row.is-disabled { opacity: 0.55; cursor: not-allowed; }
       .tool-row-check { margin-top: 0; }
@@ -605,11 +605,11 @@ body.tool-settings-open { overflow: hidden; }
     button:disabled { opacity: 0.6; cursor: wait; }
     .tool-follow-global { color: var(--text-secondary); }
     .tool-cancel:hover, .tool-follow-global:hover { background: var(--bg-hover); }
-    .tool-confirm { min-width: 76px; border-color: #0b84d8; background: #0b84d8; color: #fff; font-weight: 500; }
-    .tool-confirm:hover { background: #096fb7; }
+    .tool-confirm { min-width: 76px; border-color: var(--focus-ring); background: var(--focus-ring); color: var(--accent-contrast); font-weight: 500; }
+    .tool-confirm:hover { filter: brightness(1.08); }
   }
   .tool-config-actions { display: flex; flex-shrink: 0; gap: 8px; margin-left: auto; }
-  button:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+  button:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
   @media (max-width: 640px) {
     padding: 0;
@@ -1641,7 +1641,7 @@ body.chat-settings-open { overflow: hidden; }
       font-size: 13px;
       white-space: nowrap;
       &:hover { background: var(--bg-hover); color: var(--text); }
-      &[aria-selected="true"] { background: color-mix(in srgb, #0b84d8 10%, var(--bg-elevated)); color: #0b84d8; font-weight: 600; }
+      &[aria-selected="true"] { background: color-mix(in srgb, var(--focus-ring) 12%, var(--bg-elevated)); color: var(--focus-ring); font-weight: 600; }
     }
   }
 
@@ -1668,7 +1668,7 @@ body.chat-settings-open { overflow: hidden; }
       .tool-retitle-label { white-space: normal; min-height: 28px; }
       .tool-retitle-status { flex-basis: 100%; padding-left: 24px; white-space: normal; }
       .tool-retitle-label > span small { display: block; font-size: 11px; color: var(--text-secondary); font-weight: 400; }
-      input { accent-color: #0b84d8; width: 16px; height: 16px; flex-shrink: 0; }
+      input { accent-color: var(--focus-ring); width: 16px; height: 16px; flex-shrink: 0; }
     }
 
     h3 {
@@ -1724,8 +1724,8 @@ body.chat-settings-open { overflow: hidden; }
       outline: none;
 
       &:focus {
-        border-color: #0b84d8;
-        box-shadow: 0 0 0 2px color-mix(in srgb, #0b84d8 12%, transparent);
+        border-color: var(--focus-ring);
+        box-shadow: 0 0 0 2px var(--focus-halo);
       }
       &:disabled { opacity: 0.55; cursor: not-allowed; }
     }
@@ -1808,9 +1808,9 @@ body.chat-settings-open { overflow: hidden; }
   }
 
   .chat-settings-confirm {
-    border: 1px solid #0b84d8;
-    background: #0b84d8;
-    color: #fff;
+    border: 1px solid var(--focus-ring);
+    background: var(--focus-ring);
+    color: var(--accent-contrast);
 
     &:hover {
       filter: brightness(1.08);
@@ -1821,7 +1821,7 @@ body.chat-settings-open { overflow: hidden; }
       cursor: wait;
     }
   }
-  button:focus-visible, [role="tabpanel"]:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid #0b84d8; outline-offset: 2px; }
+  button:focus-visible, [role="tabpanel"]:focus-visible, input[type="checkbox"]:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
   @media (max-width: 600px) {
     padding: 0;

@@ -110,8 +110,9 @@ class ChatRoundStore:
                 return None
             # 多模态消息 content 为部件列表：取文本部件作为轮次问题
             # （不带媒体占位符，保证会话标题是纯文本）
+            # 内部 nudge（暂停/中断后继续）不开问题：轮次 question 留空。
             initial_question = None
-            if role == "user":
+            if role == "user" and not record.get("_internal"):
                 initial_question = (
                     content_part_to_text(record.get("content"), include_media_labels=False).strip() or None
                 )
@@ -123,7 +124,7 @@ class ChatRoundStore:
         record = json.loads(json.dumps(record, ensure_ascii=False))
 
         self.pending_round["events"].append(record)
-        if role == "user" and not self.pending_round.get("question"):
+        if role == "user" and not record.get("_internal") and not self.pending_round.get("question"):
             question_text = content_part_to_text(
                 record.get("content"), include_media_labels=False
             ).strip()

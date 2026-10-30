@@ -19,6 +19,8 @@ from env_manager import (
     set_ambient_model_selection,
 )
 from factory.chat_factory import (
+    RESUME_NUDGE,
+    RESUMABLE_ROUND_STATUSES,
     build_runtime_system_text,
     tool_chat_server,
     stop_chat_task,
@@ -284,14 +286,80 @@ async def chat_stream_status(session_id: str = "default"):
     """
     查询指定会话当前是否仍在后台生成（前端刷新后据此决定是否重连 SSE）
     返回:
-        {"running": bool}
+        {"running": bool, "can_resume": bool, "last_round_status": str | None}
+        can_resume：空闲且末轮 stopped/interrupted 时为 True，前端据此显示 ▶ 继续按钮
     """
     try:
         normalized_session_id = normalize_session_id(session_id)
         running = _session_generation_busy(normalized_session_id)
-        return JSONResponse(content={"running": running, "session_id": normalized_session_id})
+        last_status = await _last_round_status_for_resume(normalized_session_id)
+        can_resume = (not running) and last_status in RESUMABLE_ROUND_STATUSES
+        return JSONResponse(content={
+            "running": running,
+            "can_resume": can_resume,
+            "last_round_status": last_status,
+            "session_id": normalized_session_id,
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+async def _last_round_status_for_resume(session_id: str) -> str | None:
+    """只读末轮状态；会话不存在/无轮次/读取失败一律返回 None（不可继续）。"""
+    try:
+        if not chat_memory_file_exists(session_id):
+            return None
+        manager = await get_existing_chat_memory_manager(session_id)
+        if manager is None:
+            return None
+        return manager.get_last_round_status()
+    except Exception:
+        return None
+
+
+class ResumeChatRequest(BaseModel):
+    session_id: str
+    tool_names: Optional[List[str]] = None
+
+
+@api_chat_router.post('/resume_chat')
+async def resume_chat(payload: ResumeChatRequest):
+    """暂停/中断后继续：服务端合成内部 nudge 新轮，等价于代发一条"继续"。
+
+    不渲染用户气泡、不计入问题/标题/索引；流式消费与 /chat_with_tool 完全一致。
+    仅当会话空闲且末轮 stopped/interrupted 时可继续，否则 409。
+    """
+    from security.authorization import can_execute
+    session_id = normalize_session_id(payload.session_id or "default")
+    if not chat_memory_file_exists(session_id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if _session_generation_busy(session_id):
+        raise HTTPException(status_code=409, detail="任务正在运行，无需继续")
+    last_status = await _last_round_status_for_resume(session_id)
+    if last_status not in RESUMABLE_ROUND_STATUSES:
+        raise HTTPException(status_code=409, detail="末轮已完成或无可继续的任务")
+    tool_names = [] if not can_execute() else payload.tool_names
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "messages": [{"role": "user", "content": RESUME_NUDGE}],
+        "resume": True,
+        "use_backend_history": True,
+    }
+    if tool_names is not None:
+        body["tool_names"] = tool_names
+    # 会话级模型选择：与 /chat_with_tool 同口径按会话生效模型填充参数默认值
+    ambient_token = None
+    try:
+        effective_selection, _ = resolve_session_model_selection(session_id)
+        ambient_token = set_ambient_model_selection(effective_selection)
+    except Exception:
+        ambient_token = None
+    try:
+        tool_request = ChatLLMRequest(**apply_role_parameter_defaults(body))
+    finally:
+        if ambient_token is not None:
+            reset_ambient_model_selection(ambient_token)
+    return StreamingResponse(tool_chat_server(tool_request), media_type='text/event-stream')
 
 
 @api_chat_router.get('/chat_stream/statuses')

@@ -128,3 +128,15 @@ def test_real_orphan_recovery_preserves_partial_events_and_is_idempotent(tmp_pat
     saved = path.read_bytes()
     session_listing.recover_pending_sessions(threading.Event())
     assert path.read_bytes() == saved
+
+
+def test_recovery_silent_without_checkpoint_but_warns_on_corrupt_one(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(chat_memory, "HISTORY_ROOT", tmp_path)
+    write_history(tmp_path, "clean")
+    write_history(tmp_path, "broken")
+    (tmp_path / "sidecars").mkdir()
+    (tmp_path / "sidecars" / "broken_chat.jsonl.pending").write_text("{not json", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="memory.session_listing"):
+        session_listing.recover_pending_sessions(threading.Event())
+    assert "clean_chat.jsonl.pending" not in caplog.text
+    assert "broken_chat.jsonl.pending" in caplog.text

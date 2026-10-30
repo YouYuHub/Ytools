@@ -65,7 +65,7 @@ Responses API 本身是 HTTP 接口，SDK 只提供调用封装，不是协议�
 
 Responses 原生推理密文及 compaction 密文只保存在私有侧车；可见推理摘要映射为原来的 reasoning_content，不把 done 中的完整文本再追加一次。不同响应的用量分别计数。
 
-支持文本、图片、原生文件输入，以及 read_media/read_document。读取工具产生的图片或文档归入对应 function_call_output 的内容数组。文件仍按模型 supportDocTypes 决定原生或文本读取。Responses 路径不接收原生音频/视频；GIF 使用静态图片处理，不沿用 Chat 的视频部件。Messages 的音视频限制也相同，但对应错误提示由 Messages 适配器生成。
+支持文本、图片、原生文件输入，以及 read_media/read_document。读取工具产生的图片或文档归入对应 function_call_output 的内容数组。文件仍按模型 supportDocTypes 决定原生或文本读取。Responses 路径无原生音频块（精确拒收说明）；视频无原生块，有视觉模型自动转为关键帧拼图（单图）发送；GIF 使用静态图片处理，不沿用 Chat 的视频部件。Messages 的音视频口径相同（视频帧拼图回退 + 分类型拒收文案），对应转换由 Messages 适配器生成。
 
 ## 本地上下文与双份压缩
 

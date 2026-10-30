@@ -21,7 +21,7 @@
     item.addEventListener("click", function (event) { const anchor = menuAnchor; hideSettings(false); if (anchor) anchor.focus({ preventScroll: true }); if (action) action(event); });
     menu.append(item); return item;
   }
-  menuItem("归档会话", "M3 3h18v5H3zM5 8v13h14V8M9 12h6", open);
+  menuItem("搜索归档", "M3 3h18v5H3zM5 8v13h14V8M9 12h6", open);
   menuItem("主题", "M12 3a9 9 0 1 0 9 9c0-2-2-3-4-2s-4 0-3-2 0-5-2-5Z", function () { App.openThemePicker(); });
   menuItem("聊天设置", "M4 4v16M12 4v16M20 4v16M1 8h6M9 16h6M17 10h6", function () { App.openChatSettings(); });
   let accountItem = null;

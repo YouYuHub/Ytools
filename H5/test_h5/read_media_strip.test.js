@@ -133,6 +133,27 @@ test('buildStripItems 组装条目模型', () => {
   assert.match(model.items[3].reason, /未找到/);
 });
 
+test('视频帧拼图按视频展示并注记转换说明', () => {
+  const API = {
+    sessionMediaUrl: (sid, name) => `media:${sid}/${name}`,
+    localFileUrl: (sid, p) => `local:${sid}/${p}`,
+  };
+  const model = Strip.buildStripItems(API, {
+    loaded: [
+      { reference: 'media://demo.mp4', kind: 'image', mime: 'image/jpeg',
+        converted: { converted_kind: 'image', from_video: true, frames: 6 },
+        video: { duration: 63.2 } },
+    ],
+    skipped: [],
+  }, 's');
+  assert.equal(model.headerText, '已查看 1 个视频');
+  assert.equal(model.items.length, 1);
+  assert.equal(model.items[0].tile, 'video');
+  assert.equal(model.items[0].previewType, 'video');
+  assert.equal(model.items[0].duration, '1:03');
+  assert.match(model.items[0].reason, /关键帧拼图/);
+});
+
 test('图片条默认折叠，点击展开后才设置 src，再点收起', () => {
   const previews = [];
   const strip = Strip.buildMediaStrip({ el, onPreview: item => previews.push(item) }, '已查看 2 张图像', [

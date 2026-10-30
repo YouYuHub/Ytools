@@ -76,7 +76,7 @@
     padding: calc(var(--chat-top-padding) + var(--history-prefix-space, 0px)) 24px calc(var(--chat-bottom-padding, 56px) + var(--history-suffix-space, 0px));
     display: flex;
     flex-direction: column;
-    gap: 24px;
+    gap: 12px;
 
     @container main-area (max-width: 768px) {
       --chat-top-padding: 60px;

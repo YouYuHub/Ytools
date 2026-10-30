@@ -21,6 +21,70 @@
   function publish(handle) {
     if (App.sessionActivity) App.sessionActivity.note(handle.sessionId, handle.value, handle.id);
   }
+  // 不确定态有界自动确认：后端突然中断后不再永远停在“运行中”等待用户
+  // 手动处理。进入不确定态即退避重试（5s/15s/30s，共 3 次）：后端恢复且无
+  // 任务 → 自动收尾并重载对齐；任务仍在 → 保持不确定态停查；后端仍不可
+  // 达 → 耗尽后停查，保留手动停止/重连/发送入口。与 session_activity 的
+  // 退避同步同构，但只在不确定态存续期间生效，不做常驻轮询。
+  const UNCERTAIN_RETRY_DELAYS = [5000, 15000, 30000];
+  const uncertainWatches = new Map();
+  function cancelUncertainWatch(sid) {
+    if (sid) {
+      const watch = uncertainWatches.get(sid);
+      if (watch) clearTimeout(watch.timer);
+      uncertainWatches.delete(sid);
+      return;
+    }
+    uncertainWatches.forEach(function (watch) { clearTimeout(watch.timer); });
+    uncertainWatches.clear();
+  }
+  function watchUncertain(sid) {
+    if (!sid || uncertainWatches.has(sid)) return;
+    const watch = { timer: 0, attempt: 0 };
+    uncertainWatches.set(sid, watch);
+    const tick = async function () {
+      if (uncertainWatches.get(sid) !== watch || !isUncertain(sid)) return;
+      try {
+        const resolved = await reconcileUncertain(sid);
+        cancelUncertainWatch(sid);
+        if (!resolved) { refresh(); return; }
+        if (App.state.sessionId === sid) {
+          if (App.refreshComposerButtons) App.refreshComposerButtons();
+          if (typeof App.openSession === "function") setTimeout(function () { App.openSession(sid); }, 0);
+        } else {
+          refresh();
+        }
+      } catch (_) {
+        // 后端仍不可达：有剩余次数则继续退避，否则停查（保持手动入口）
+        if (uncertainWatches.get(sid) === watch) {
+          if (watch.attempt < UNCERTAIN_RETRY_DELAYS.length && isUncertain(sid)) {
+            watch.timer = setTimeout(tick, UNCERTAIN_RETRY_DELAYS[watch.attempt++]);
+          } else {
+            cancelUncertainWatch(sid);
+          }
+        }
+        refresh();
+      }
+    };
+    watch.timer = setTimeout(tick, UNCERTAIN_RETRY_DELAYS[watch.attempt++]);
+  }
+  // 回到页面时补一次确认：后端已恢复则自动收尾，无需手动点重连。
+  // 观察器运行中则交由它处理，避免重复确认。
+  async function recheckVisibleUncertain() {
+    const sid = App.state.sessionId;
+    if (!sid || !isUncertain(sid) || uncertainWatches.has(sid)) return;
+    try {
+      const resolved = await reconcileUncertain(sid);
+      if (resolved && App.state.sessionId === sid) {
+        if (App.refreshComposerButtons) App.refreshComposerButtons();
+        if (typeof App.openSession === "function") App.openSession(sid);
+      }
+    } catch (_) { /* 后端仍不可用：保持不确定态 */ }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) recheckVisibleUncertain();
+  });
+  window.addEventListener("focus", recheckVisibleUncertain);
   function refresh() {
     if (!statusVisible) {
       if (!host.hidden) host.hidden = true;
@@ -33,7 +97,11 @@
     if (host.dataset.phase !== v.phase) host.dataset.phase = v.phase;
     if (host.dataset.tone !== v.tone) host.dataset.tone = v.tone;
     if (label.textContent !== v.label) label.textContent = v.label;
-    if (detail.textContent !== v.detail) detail.textContent = v.detail;
+    let detailText = v.detail;
+    if (v.phase === "disconnected" && uncertainWatches.has(App.state.sessionId)) {
+      detailText += "，正在自动重试连接";
+    }
+    if (detail.textContent !== detailText) detail.textContent = detailText;
     const title = [v.detail, v.error].filter(Boolean).join("；");
     if (host.title !== title) host.title = title;
     if (reconnect.hidden !== !v.reconnect) reconnect.hidden = !v.reconnect;
@@ -45,9 +113,13 @@
     if (!current(handle)) return;
     handle.value = TaskState.reduce(handle.value, action);
     publish(handle);
+    // 不确定态存续 ⟺ 自动确认生效：进入启动退避重试，收尾/新任务即停
+    if (isUncertain(handle.sessionId)) watchUncertain(handle.sessionId);
+    else cancelUncertainWatch(handle.sessionId);
     refresh();
   }
   function begin(sessionId) {
+    cancelUncertainWatch(sessionId);
     const entry = {sessionId, id: ++serial, value: TaskState.initial()};
     rows.set(sessionId, entry);
     publish(entry);

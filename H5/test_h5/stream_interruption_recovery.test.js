@@ -140,6 +140,8 @@ function attachSetup(t, { chatImpl, statusImpl }) {
   const w = dom.window;
   w.TaskState = require('../js/task_state');
   const calls = { opened: [], flushed: [] };
+  // 不确定态退避定时器需手动驱动，见下方的 setTimeout mock。
+  const held = [];
   w.App = {
     state: { sessionId: 's', streaming: false },
     toast() {},
@@ -161,11 +163,12 @@ function attachSetup(t, { chatImpl, statusImpl }) {
     refreshSessionUsage: async () => true, clearContextStatsTimer() {}, scheduleContextTokenStatsRefresh() {},
     flushPendingMessages: sid => calls.flushed.push(sid),
   });
-  w.setTimeout = fn => { fn(); return 1; };
+  w.setTimeout = (fn, ms) => { if (!ms) { fn(); return 1; } held.push({ fn, ms }); return held.length + 100; };
+  w.clearTimeout = (id) => { if (id > 100) delete held[id - 101]; };
   w.eval(helperSource);
   const start = chatSource.indexOf('  async function attachStreamSession(');
   w.eval(chatSource.slice(start, chatSource.indexOf('  /** 打开会话后', start)) + '\nwindow.attachForTest=attachStreamSession;');
-  return { w, calls, host: w.document.querySelector('#taskStatus'), status: w.App.taskStatus };
+  return { w, calls, host: w.document.querySelector('#taskStatus'), status: w.App.taskStatus, held };
 }
 
 test('附接流 network error 且后端无任务：自动收尾并重载，不再卡运行中', async t => {
@@ -190,6 +193,7 @@ test('附接流 network error 但后端不可达：保持连接中断，不重�
   assert.equal(x.status.isUncertain('s'), true);
   assert.equal(x.host.dataset.phase, 'disconnected');
   assert.deepEqual(x.calls.opened, []);
+  assert.deepEqual(x.held.filter(Boolean).map(o => o.ms), [5000]);
 });
 
 // ---------- 停止按钮：后端不可用时的本地兜底 ----------

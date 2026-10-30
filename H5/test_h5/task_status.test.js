@@ -2,7 +2,13 @@ const test=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs');const path=require('node:path');const {JSDOM}=require('jsdom');
 function setup(t){
   const dom=new JSDOM('<div id="chat"></div><div id="taskStatus" hidden><span class="task-status-label"></span><span class="task-status-detail"></span><button hidden>重新连接</button></div>',{runScripts:'outside-only'});
-  t.after(()=>dom.window.close());const w=dom.window,host=w.document.querySelector('#taskStatus');
+  const w=dom.window,host=w.document.querySelector('#taskStatus');
+  // 跟踪模块调度的定时器，测试结束时清理，防止不确定态重试跨用例触发
+  const pendingTimers=new Set();
+  const rawSetTimeout=w.setTimeout.bind(w),rawClearTimeout=w.clearTimeout.bind(w);
+  w.setTimeout=function(fn,ms){const id=rawSetTimeout(function(){pendingTimers.delete(id);fn();},ms);pendingTimers.add(id);return id;};
+  w.clearTimeout=function(id){pendingTimers.delete(id);return rawClearTimeout(id);};
+  t.after(()=>{pendingTimers.forEach(id=>{try{rawClearTimeout(id);}catch(_){}});pendingTimers.clear();dom.window.close();});
   const calls={attached:[],opened:[],toasts:[],flushed:[]};
   w.TaskState=require('../js/task_state');w.App={state:{sessionId:'s',streaming:false},
     toast:m=>calls.toasts.push(m),attachStreamSession:async sid=>calls.attached.push(sid),openSession:async sid=>calls.opened.push(sid)};
@@ -115,4 +121,73 @@ test('真实附接流程区分 EOF 与 DONE，断线不自动派发队列',async
   assert.equal(state.streaming,false);assert.equal(payloads[0].messages.length,0);
   completed=true;await w.attachForTest('s');assert.equal(x.host.dataset.phase,'completed');assert.deepEqual(x.calls.flushed,['s']);
   assert.ok(payloads.every(p=>p.messages.length===0));
+});
+function stubTimers(x){
+  const timers=[];
+  x.w.setTimeout=(fn,ms)=>{timers.push({fn,ms});return timers.length;};
+  x.w.clearTimeout=(id)=>{delete timers[id-1];};
+  return timers;
+}
+async function firePending(timers){
+  const idx=timers.findIndex(Boolean);
+  assert.notEqual(idx,-1,'应有待触发的重试定时器');
+  const entry=timers[idx];timers[idx]=null; // 消费掉，避免重复触发
+  await entry.fn();await settle();await settle();
+  return entry.ms;
+}
+test('不确定态自动退避确认：后端恢复无任务时收尾并重载',async t=>{
+  const x=setup(t),timers=stubTimers(x);
+  const h=x.status.begin('s');x.status.connected(h);await x.status.end(h,false,new Error('boom'));
+  assert.equal(x.status.isUncertain('s'),true);
+  assert.deepEqual(timers.filter(Boolean).map(o=>o.ms),[5000]);
+  assert.match(x.host.querySelector('.task-status-detail').textContent,/正在自动重试/);
+  x.w.API.streamStatus=async()=>({running:false});
+  x.w.App.refreshComposerButtons=()=>{};
+  await firePending(timers);
+  assert.equal(x.status.isUncertain('s'),false);
+  assert.equal(x.host.dataset.phase,'ended');
+  await firePending(timers); // 重载定时器（ms 0）
+  assert.deepEqual(x.calls.opened,['s']);
+  assert.equal(timers.filter(Boolean).length,0);
+});
+test('后端任务仍在运行时停止自动确认，保持不确定态',async t=>{
+  const x=setup(t),timers=stubTimers(x);
+  const h=x.status.begin('s');x.status.connected(h);await x.status.end(h,false,new Error('boom'));
+  assert.equal(timers.filter(Boolean).length,1);
+  await firePending(timers); // 默认 mock 返回 running:true
+  assert.equal(x.status.isUncertain('s'),true);
+  assert.equal(timers.filter(Boolean).length,0);
+  assert.doesNotMatch(x.host.querySelector('.task-status-detail').textContent,/正在自动重试/);
+  assert.deepEqual(x.calls.opened,[]);
+});
+test('后端持续不可达时退避耗尽停查，保留手动重连入口',async t=>{
+  const x=setup(t),timers=stubTimers(x);
+  const h=x.status.begin('s');x.status.connected(h);await x.status.end(h,false,new Error('boom'));
+  x.w.API.streamStatus=async()=>{throw new Error('down');};
+  const delays=[];
+  for(let i=0;i<3;i++) delays.push(await firePending(timers));
+  assert.deepEqual(delays,[5000,15000,30000]);
+  assert.equal(x.status.isUncertain('s'),true);
+  assert.equal(timers.filter(Boolean).length,0);
+  assert.equal(x.host.querySelector('button').hidden,false);
+});
+test('新任务开始即取消旧会话的不确定态观察',async t=>{
+  const x=setup(t),timers=stubTimers(x);
+  const h=x.status.begin('s');x.status.connected(h);await x.status.end(h,false,new Error('boom'));
+  assert.equal(timers.filter(Boolean).length,1);
+  x.status.begin('s');
+  assert.equal(timers.filter(Boolean).length,0);
+});
+test('回到页面时补一次确认，后端恢复则自动收尾',async t=>{
+  const x=setup(t),timers=stubTimers(x);
+  const h=x.status.begin('s');x.status.connected(h);await x.status.end(h,false,new Error('boom'));
+  x.w.API.streamStatus=async()=>{throw new Error('down');};
+  for(let i=0;i<3;i++) await firePending(timers);
+  assert.equal(timers.filter(Boolean).length,0);
+  x.w.API.streamStatus=async()=>({running:false});
+  x.w.App.refreshComposerButtons=()=>{};
+  x.w.dispatchEvent(new x.w.Event('focus'));
+  await settle();await settle();await settle();
+  assert.equal(x.status.isUncertain('s'),false);
+  assert.deepEqual(x.calls.opened,['s']);
 });

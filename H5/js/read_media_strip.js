@@ -61,8 +61,15 @@
     return minutes + ":" + (rest < 10 ? "0" + rest : rest);
   }
 
+  function effectiveKind(entry) {
+    // 视频关键帧拼图（converted.from_video）：注入的是图片，但来源是视频，
+    // 展示口径按视频算（视频磁贴+时长徽标），避免 <img> 去加载 mp4 原片挂错。
+    if (entry && entry.converted && entry.converted.from_video) return "video";
+    return (entry && entry.kind) || "image";
+  }
+
   function headerTextForCounts(loaded, skipped) {
-    const kinds = loaded.map(function (item) { return (item && item.kind) || "image"; });
+    const kinds = loaded.map(function (item) { return effectiveKind(item); });
     const count = function (kind) { return kinds.filter(function (k) { return k === kind; }).length; };
     const parts = [];
     if (count("image")) parts.push(count("image") + " 张图像");
@@ -87,9 +94,11 @@
     const items = [];
     for (const entry of parsed.loaded) {
       const ref = entry && entry.reference;
-      const kind = (entry && entry.kind) || "image";
+      const kind = effectiveKind(entry);
       const url = resolveReferenceUrl(API, ref, sessionId);
       const name = displayNameForReference(ref);
+      const framesNote = entry && entry.converted && entry.converted.from_video
+        ? "已转为关键帧拼图发送给模型" : "";
       if (!url) {
         items.push({ tile: "missing", name: name, url: null, previewType: null, reason: "无法解析该引用", duration: "" });
         continue;
@@ -97,7 +106,7 @@
       const tile = kind === "video" ? "video" : kind === "audio" ? "audio" : "image";
       items.push({ tile: tile, name: name, url: url,
         previewType: previewTypeForKind(kind, entry && entry.mime),
-        reason: "", duration: tile === "video" ? videoDurationOf(entry) : "" });
+        reason: framesNote, duration: tile === "video" ? videoDurationOf(entry) : "" });
     }
     for (const entry of parsed.skipped) {
       const reason = (entry && (entry.reason || entry.message)) || "未读取";

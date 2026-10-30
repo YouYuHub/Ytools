@@ -79,8 +79,8 @@ from factory.agent_runtime.builtin_tools import (
     execute_read_media,
     execute_read_document,
     load_any_media_model_part,
+    assemble_injected_media_parts,
     retire_prior_video_parts,
-    cap_video_parts_in_batch,
     try_execute_builtin_command_tool,
     try_execute_builtin_file_tool,
 )
@@ -859,6 +859,12 @@ def get_running_chat_session_ids() -> list[str]:
     return [sid for sid, stream in list(_SESSION_STREAMS.items()) if stream.is_running()]
 
 
+# 暂停/中断后继续的内部 nudge：随 resume 请求作为 user 消息发给模型（当轮有效），
+# 落盘时标记 _internal——不渲染用户气泡、不计入轮次问题/标题/索引、不进入后轮回放。
+RESUME_NUDGE = "上次任务被中断了，请从停止的地方继续完成它，不要重复已经完成的工作。"
+RESUMABLE_ROUND_STATUSES = frozenset({"stopped", "interrupted"})
+
+
 async def _run_chat_generation(
     tool_request: ChatLLMRequest,
     stream: _SessionStream,
@@ -1286,6 +1292,11 @@ async def _run_chat_generation(
                 latest_user_message.get("quotes"), strict=False
             )
             history_message = dict(latest_user_message)
+            # 暂停/中断后继续：内部 nudge 照常开轮，但标记 _internal——展示层
+            # 不渲染用户气泡，问题/标题/索引/后轮回放统一跳过（当轮模型请求保留）。
+            is_resume_nudge = bool(getattr(tool_request, "resume", False))
+            if is_resume_nudge:
+                history_message["_internal"] = True
             if latest_user_quotes:
                 history_message["quotes"] = latest_user_quotes
             else:
@@ -1306,13 +1317,14 @@ async def _run_chat_generation(
                     stream,
                     f"data: {json.dumps({'round_model': round_model}, ensure_ascii=False)}\n\n",
                 )
-            if not stream.question_text:
+            if not stream.question_text and not is_resume_nudge:
                 stream.question_text = latest_user_text
             # 提问原始部件（多模态时含 media:// 引用）保存副本供回放补气泡：
             # 必须在下方 resolve_message_media_refs 就地改写为 base64 之前克隆，
             # 否则副本会被污染成巨型 data URL（仅引用串很小）。
             # getattr 防御：测试替身等最小 stream 桩可能没有该属性
-            if getattr(stream, "question_parts", None) is None:
+            # 续跑轮无用户气泡：跳过部件快照，回放 marker 不补建提问气泡。
+            if getattr(stream, "question_parts", None) is None and not is_resume_nudge:
                 stream.question_parts = _normalize_question_parts(
                     latest_user_message.get("content")
                 )
@@ -1378,7 +1390,9 @@ async def _run_chat_generation(
                 await _stream_emit(stream, _sse_error_payload(detail))
                 return
             backend_messages = await session_chat_memory.get_context_messages(
-                max_rounds=backend_history_rounds
+                max_rounds=backend_history_rounds,
+                # 续跑：被续轮次的用户媒体保留完整部件（发送前解析），等价于未停止
+                retain_stopped_round_media=bool(getattr(tool_request, "resume", False)),
             )
             if backend_messages:
                 # 主 system 保持在首位：累计摘要/最近问题/历史轮次排在其后
@@ -1405,6 +1419,7 @@ async def _run_chat_generation(
         try:
             unresolved_media = await asyncio.to_thread(
                 resolve_message_media_refs, session_id, messages, vision_enabled=vision_enabled,
+                media_limits=get_media_limits(chat_config_effective),
                 **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
             )
             if unresolved_media:
@@ -1554,6 +1569,7 @@ async def _run_chat_generation(
                         candidate_backend = await session_chat_memory.get_context_messages(
                             max_rounds=backend_history_rounds,
                             recent_questions_token_budget=question_budget,
+                            retain_stopped_round_media=bool(getattr(tool_request, "resume", False)),
                         )
                         candidate = _assemble_candidate(candidate_backend)
                         candidate_tokens = estimate_send_context_tokens(candidate, tool_request.tools)
@@ -1564,6 +1580,18 @@ async def _run_chat_generation(
                             break
                     if degraded_messages is not None:
                         messages = degraded_messages
+                        if bool(getattr(tool_request, "resume", False)):
+                            # 降级重建的后端历史是新拉取的：续跑保留的媒体引用尚未解析
+                            # （主流程的解析发生在预算检查之前），此处补解析；已解析
+                            # 部件幂等保留（data:/http 原样透传）。
+                            try:
+                                await asyncio.to_thread(
+                                    resolve_message_media_refs, session_id, messages, vision_enabled=vision_enabled,
+                                    media_limits=get_media_limits(chat_config_effective),
+                                    **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
+                                )
+                            except Exception as media_error:
+                                logger.warning(f"降级上下文媒体引用解析失败（按原始引用发送）: {media_error}")
                         first_call_tokens = estimate_send_context_tokens(messages, tool_request.tools)
                         history_tokens = max(
                             0, first_call_tokens - system_tokens - tools_tokens - frontend_tokens
@@ -1634,6 +1662,7 @@ async def _run_chat_generation(
             if quotes:
                 model_message["content"] = content_with_quotes(model_message["content"], quotes)
             unresolved = resolve_message_media_refs(session_id, [model_message], vision_enabled=vision_enabled,
+                                                     media_limits=get_media_limits(chat_config_effective),
                                                      **({"api_type": api_type} if api_type in {"messages", "responses"} else {}))
             if unresolved:
                 logger.warning(f"引导消息有 {len(unresolved)} 个媒体引用解析失败")
@@ -2822,7 +2851,7 @@ async def _run_chat_generation(
                     # 部件（供应商单请求仅 1 个视频；多段切片滞留也会撑爆
                     # token）——占位文本替代数据，工具结果文本不受影响
                     retire_prior_video_parts(messages)
-                    media_parts = []
+                    loaded_infos = []
                     for reference, quality, start_time, end_time, _key in read_media_pending_parts:
                         info = loaded_media_parts.pop(_key, None)
                         if info is None:
@@ -2831,25 +2860,13 @@ async def _run_chat_generation(
                                 start_time=start_time, end_time=end_time,
                                 **({"api_type": api_type} if api_type in {"messages", "responses"} else {}),
                             )
-                        if info is not None and info.get("part") is not None:
-                            media_parts.append(info["part"])
-                        elif isinstance(info, dict) and info.get("error"):
-                            # 加载器带错误说明（如"未找到，可能已删除"）：原样告知模型
-                            media_parts.append({
-                                "type": "text",
-                                "text": f"[媒体 {reference} 读取失败：{info['error']}]",
-                            })
-                        else:
-                            media_parts.append({
-                                "type": "text",
-                                "text": f"[媒体 {reference} 未找到，可能已删除或读取失败]",
-                            })
-                    # 单请求视频配额≤1：同批并行读多个视频时仅第一个带画面
-                    # 数据，其余转为占位（工具结果已含各自读取元信息，可按序补读）
-                    media_parts = cap_video_parts_in_batch(media_parts)
+                        loaded_infos.append((_key, reference, info))
+                    # 组装（含 caption 配键）与单批视频配额裁剪走共用 helper，
+                    # 与子任务注入同口径；retained_keys 与最终部件逐项对齐。
+                    media_parts, media_keys = assemble_injected_media_parts(loaded_infos)
                     retained_keys = [
                         key if isinstance(part, dict) and part.get("type") in {"image_url", "input_audio"} else None
-                        for (_ref, _quality, _start, _end, key), part in zip(read_media_pending_parts, media_parts)
+                        for key, part in zip(media_keys, media_parts)
                     ]
                     media_message: dict[str, Any] = {
                         "role": "user",

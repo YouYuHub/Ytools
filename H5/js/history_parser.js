@@ -420,7 +420,7 @@
           return;
         }
 
-        if (evt.role === "user" && evt.content && evt.content !== "停止任务") {
+        if (evt.role === "user" && evt.content && evt.content !== "停止任务" && !evt._internal) {
           const userRec = {
             kind: "user", content: evt.content, ts: ts, round: roundNo,
             source_event_index: eventIndex,

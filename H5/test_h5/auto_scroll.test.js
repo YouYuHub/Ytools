@@ -26,11 +26,11 @@ function setup() {
     flush() { const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach(fn => fn()); },
   };
 }
-test('首次上滚即取消待执行置底，离底部不足24px也保持暂停', () => {
+test('达到阈值的上滚即取消待执行置底，离底部不足24px也保持暂停', () => {
   const { scroll, context, frames, fire, flush } = setup();
   context.stickToBottom();
   assert.equal(frames.size, 1);
-  fire('wheel', { deltaY: -5 });
+  fire('wheel', { deltaY: -50 });
   assert.equal(frames.size, 0);
   scroll.scrollTop = 895;
   fire('scroll');
@@ -50,7 +50,7 @@ test('取消失败的旧帧也不会将暂停的页面拉回底部', () => {
 });
 test('用户下滚到底部或主动回底恢复跟随，接近底部时不提前恢复', () => {
   const { scroll, context, fire, flush } = setup();
-  fire('wheel', { deltaY: -20 }); scroll.scrollTop = 880; fire('scroll');
+  fire('wheel', { deltaY: -60 }); scroll.scrollTop = 880; fire('scroll');
   scroll.scrollTop = 890; fire('scroll'); context.stickToBottom();
   assert.equal(scroll.scrollTop, 890);
   scroll.scrollTop = 900; fire('scroll'); scroll.scrollTop = 880; context.stickToBottom(); flush();
@@ -61,7 +61,7 @@ test('用户下滚到底部或主动回底恢复跟随，接近底部时不提�
 test('触摸向下滑和向上翻页均暂停跟随，输入框按键不干扰', () => {
   const { scroll, context, fire } = setup();
   fire('touchstart', { touches: [{ clientY: 100 }] });
-  fire('touchmove', { touches: [{ clientY: 120 }] });
+  fire('touchmove', { touches: [{ clientY: 160 }] });
   scroll.scrollTop = 880; context.stickToBottom(); assert.equal(scroll.scrollTop, 880);
   context.scrollToBottom(true);
   fire('keydown', { key: 'PageUp', target: { tagName: 'DIV' } });
@@ -76,5 +76,41 @@ test('主动回底先恢复历史尾部窗口再读取滚动位置', () => {
   context.App.showHistoryTail = () => { restored++; scroll.scrollHeight = 5000; };
   context.scrollToBottom(true);
   assert.equal(restored, 1);
+  assert.equal(scroll.scrollTop, 900);
+});
+test('零星小位移不打断跟随，抖动后仍能贴底', () => {
+  const { scroll, context, fire, flush } = setup();
+  fire('wheel', { deltaY: -5 });
+  scroll.scrollTop = 895; fire('scroll');
+  fire('wheel', { deltaY: -8 });
+  fire('touchstart', { touches: [{ clientY: 100 }] });
+  fire('touchmove', { touches: [{ clientY: 112 }] });
+  context.stickToBottom(); flush();
+  assert.equal(scroll.scrollTop, 900);
+});
+test('800ms内累计上滚达到阈值暂停跟随', () => {
+  const { scroll, context, fire } = setup();
+  fire('wheel', { deltaY: -20 });
+  scroll.scrollTop = 880; fire('scroll');
+  fire('wheel', { deltaY: -10 });
+  context.stickToBottom();
+  assert.equal(scroll.scrollTop, 880);
+});
+test('下滚输入清零累计，换向后需重新累计才暂停', () => {
+  const { scroll, context, fire } = setup();
+  fire('wheel', { deltaY: -20 });
+  fire('wheel', { deltaY: 60 });
+  fire('wheel', { deltaY: -20 });
+  scroll.scrollTop = 880;
+  context.stickToBottom();
+  assert.equal(scroll.scrollTop, 900);
+});
+test('累计窗口过期后重新计数，旧位移不参与暂停', () => {
+  const { scroll, context, fire } = setup();
+  fire('wheel', { deltaY: -40 });
+  vm.runInContext('upScrollIntentAt = Date.now() - 1000', context);
+  fire('wheel', { deltaY: -20 });
+  scroll.scrollTop = 880;
+  context.stickToBottom();
   assert.equal(scroll.scrollTop, 900);
 });

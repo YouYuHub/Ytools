@@ -91,6 +91,48 @@ MEDIA_PART_LABELS = {
     "file": "[文档]",
 }
 
+# 音视频拒收统一口径：类型绝不混写（视频/音频各说各的），并带文件名与接口名，
+# 避免“视频说成音频”误导模型（2026-10-28 用户实测：mp4 附件被转述为音频附件）。
+_MEDIA_KIND_CN_LABELS = {"video": "视频", "audio": "音频", "image": "图片"}
+_API_TYPE_CN_LABELS = {"messages": "Messages", "responses": "Responses"}
+
+
+def media_unsupported_notice(kind: str | None, name: str | None = None, api_type: str | None = None) -> str:
+    """三协议统一的音视频拒收文案：[未发送附件（视频）：demo.mp4。当前接口（Responses）仅支持图片与文本输入。]"""
+    label = _MEDIA_KIND_CN_LABELS.get(kind or "", "媒体")
+    api_label = _API_TYPE_CN_LABELS.get(api_type or "")
+    api_text = f"当前接口（{api_label}）" if api_label else "当前接口"
+    target = f"：{name}" if name else ""
+    return f"[未发送附件（{label}）{target}。{api_text}仅支持图片与文本输入。]"
+
+
+def media_part_display_name(part: dict[str, Any]) -> str | None:
+    """从 video_url/input_audio 部件提取可展示名（media:// 取基名，http 取路径末段；内联数据无名可取返回 None）。"""
+    if not isinstance(part, dict):
+        return None
+    kind = part.get("type")
+    if kind == "video_url":
+        value = part.get("video_url")
+        url = value.get("url") if isinstance(value, dict) else None
+        if not isinstance(url, str) or not url or url.startswith("data:"):
+            return None
+        if url.startswith(MEDIA_URL_SCHEME):
+            return Path(url[len(MEDIA_URL_SCHEME):]).name or None
+        if url.startswith(("http://", "https://")):
+            from urllib.parse import urlsplit
+
+            return Path(urlsplit(url).path).name or None
+        return Path(url).name or None
+    if kind == "input_audio":
+        value = part.get("input_audio")
+        if not isinstance(value, dict):
+            return None
+        data = value.get("data")
+        if isinstance(data, str) and data.startswith(MEDIA_URL_SCHEME):
+            return Path(data[len(MEDIA_URL_SCHEME):]).name or None
+        return None
+    return None
+
 # ---------- 可解析文档的原始字节（用于点击预览/下载） ----------
 # 上传解析流程历来只保存解析后的文本 JSON；原始文件（如 PDF）字节另存一份在
 # history_files/session_files/<session>/files/ 下，前端消息/附件区的文档可点击预览。
@@ -1275,6 +1317,194 @@ def _build_video_range_part(
     }
 
 
+# 视频关键帧拼图（Messages/Responses 无原生视频部件时的回退口径）：
+# 均匀抽 N 帧拼成一张标注时间戳的网格图，以普通图片部件发送——有视觉
+# 的模型即可看到视频画面内容（无音频）。单图形态天然兼容三协议的图片
+# 转换链路，无需改动转换器；token 开销约等于一张详图。
+_VIDEO_FRAMES_SHEET_COUNT = 6
+_VIDEO_FRAMES_SHEET_COLS = 3
+_VIDEO_FRAMES_CELL_MAX_EDGE = 480
+_VIDEO_FRAMES_TIMEOUT_SECONDS = 60
+
+
+def _extract_video_frame_png(ffmpeg: str, source_path: Path, at_seconds: float, out_path: Path) -> None:
+    """抽单帧 PNG（关键帧拼图用）：-ss 前置快速定位，短边压到格子尺寸。"""
+    vf = (
+        f"scale=trunc(min(iw\\,{_VIDEO_FRAMES_CELL_MAX_EDGE})/2)*2:"
+        f"trunc(min(ih\\,{_VIDEO_FRAMES_CELL_MAX_EDGE})/2)*2"
+    )
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{at_seconds:.3f}", "-i", str(source_path),
+        "-frames:v", "1", "-vf", vf, str(out_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=_VIDEO_FRAMES_TIMEOUT_SECONDS)
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffmpeg（视频关键帧抽取需要可用的 ffmpeg：系统安装，或 pip install imageio-ffmpeg）") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg 抽帧超时（>{_VIDEO_FRAMES_TIMEOUT_SECONDS}s）") from exc
+    if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+        stderr_tail = decode_text(proc.stderr or b"")[0][-300:]
+        raise RuntimeError(f"ffmpeg 抽帧失败: {stderr_tail or proc.returncode}")
+
+
+def _compose_frames_sheet(frame_files: list[tuple[Path, float]], out_path: Path, quality: int) -> tuple[str, str, int]:
+    """N 帧 PNG 按时间顺序拼成标注时间戳的网格拼图（JPEG 直存）。返回 (mime, b64, 字节数)。"""
+    from PIL import ImageDraw
+
+    cells = []
+    for frame_path, at in frame_files:
+        with Image.open(frame_path) as img:
+            cells.append((img.convert("RGB"), f"{at:.1f}s"))
+    cols = min(_VIDEO_FRAMES_SHEET_COLS, len(cells))
+    rows = (len(cells) + cols - 1) // cols
+    cell_w = max(img.width for img, _ in cells)
+    label_h = 22
+    cell_h = max(img.height for img, _ in cells) + label_h
+    gap, margin = 4, 8
+    sheet = Image.new(
+        "RGB",
+        (margin * 2 + cols * cell_w + (cols - 1) * gap,
+         margin * 2 + rows * cell_h + (rows - 1) * gap),
+        (17, 17, 17),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (img, stamp) in enumerate(cells):
+        row, col = divmod(index, cols)
+        x = margin + col * (cell_w + gap)
+        y = margin + row * (cell_h + gap)
+        sheet.paste(img, (x + (cell_w - img.width) // 2, y + (cell_h - label_h - img.height) // 2))
+        draw.text((x + 6, y + cell_h - label_h + 4), stamp, fill=(255, 255, 255))
+    sheet.save(out_path, format="JPEG", quality=max(1, min(100, int(quality))))
+    data = out_path.read_bytes()
+    return "image/jpeg", base64.b64encode(data).decode("ascii"), len(data)
+
+
+def _build_video_frames_sheet(
+    source_path: Path,
+    cache_dir: Path,
+    start_time: float | None,
+    end_time: float | None,
+    quality: int | None,
+    api_type: str | None,
+) -> dict[str, Any]:
+    """视频转关键帧拼图：均匀抽帧 → 网格拼图 → 以普通图片部件返回。
+
+    语义（与区间读取管线对齐）：默认读 [0, min(时长, VIDEO_MAX_READ_SECONDS)]；
+    start/end 指定区间（end 缺省同默认）；start==end 仅探测元数据（委托区间
+    构建器，与 read_media 工具约定一致）；超限截断并标记 truncated。
+    失败一律返回 {"error": 精确到视频的原因}，绝不静默回退。
+    """
+    import tempfile
+
+    try:
+        size = source_path.stat().st_size
+        fingerprint = f"{size}-{int(source_path.stat().st_mtime)}"
+    except OSError as exc:
+        return {"error": f"视频读取失败: {exc}"}
+    limit = media_send_size_limit_bytes(source_path)
+    if size > limit:
+        return {"error": (
+            f"{source_path.name}（{size / (1024 * 1024):.1f}MB）超过"
+            f"视频读取上限 {limit // (1024 * 1024)}MB，未注入；请压缩后再读取"
+        )}
+    ffmpeg = _locate_ffmpeg()
+    if ffmpeg is None:
+        return {"error": f"视频关键帧抽取需要可用的 ffmpeg（系统安装，或 pip install imageio-ffmpeg）：{source_path.name}"}
+    probed = _probe_video_metadata(source_path, cache_dir)
+    if probed is None:
+        return {"error": f"视频元信息探测失败（需可用的 ffmpeg）: {source_path.name}"}
+    duration = probed.get("duration")
+    cap = video_max_read_seconds()
+    s = max(0.0, float(start_time)) if start_time is not None else 0.0
+    e = float(end_time) if end_time is not None else None
+    if start_time is not None and end_time is not None and abs(e - s) < 1e-9:
+        return _build_video_range_part(source_path, cache_dir, start_time, end_time, False)
+    if duration is not None and s >= duration:
+        return {"error": f"start_time({start_time}) 超出视频时长（{duration:.2f}s）"}
+    if e is None:
+        e = s + cap
+        if duration is not None:
+            e = min(e, duration)
+    truncated = False
+    if e - s > cap + 1e-6:
+        e = s + cap
+        truncated = True
+    if duration is not None and e > duration:
+        e = duration
+    if e <= s:
+        return {"error": f"视频读取区间为空（{s:.3f}s ~ {e:.3f}s）：请调整区间"}
+    if duration is not None and e < duration - 1e-6 and end_time is None:
+        truncated = True
+    count = _VIDEO_FRAMES_SHEET_COUNT
+    times = [s + (e - s) * (i + 0.5) / count for i in range(count)]
+    sheet_name = f"{source_path.name}.frames_{s:.3f}_{e:.3f}.jpg"
+    sheet_path = Path(cache_dir) / sheet_name
+    api_label = _API_TYPE_CN_LABELS.get(api_type or "", "当前接口")
+    try:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        fp_file = sheet_path.with_name(sheet_path.name + ".fp")
+        if not (
+            sheet_path.is_file() and sheet_path.stat().st_size > 0
+            and fp_file.is_file() and fp_file.read_text(encoding="ascii", errors="ignore") == fingerprint
+        ):
+            with tempfile.TemporaryDirectory(prefix="video_frames_") as tmp:
+                frames = []
+                for index, at in enumerate(times):
+                    frame_path = Path(tmp) / f"f{index:02d}.png"
+                    try:
+                        _extract_video_frame_png(ffmpeg, source_path, at, frame_path)
+                    except Exception:
+                        continue  # 单帧失败跳过（时间戳越界等），有帧即拼图
+                    frames.append((frame_path, at))
+                if not frames:
+                    return {"error": f"视频 {source_path.name} 关键帧抽取失败（{s:.1f}s~{e:.1f}s 内无可用帧）"}
+                quality_value = MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality
+                _compose_frames_sheet(frames, sheet_path, quality_value)
+            fp_file.write_text(fingerprint, encoding="ascii")
+        data = sheet_path.read_bytes()
+    except OSError as exc:
+        return {"error": f"视频关键帧拼图缓存失败: {exc}"}
+    if len(data) > MEDIA_SEND_IMAGE_LIMIT_BYTES:
+        return {"error": (
+            f"{source_path.name} 关键帧拼图（{len(data) / (1024 * 1024):.1f}MB）超过"
+            f"图片读取上限 {MEDIA_SEND_IMAGE_LIMIT_BYTES // (1024 * 1024)}MB，未注入"
+        )}
+    sheet_b64 = base64.b64encode(data).decode("ascii")
+    duration_note = f"，视频总长约{duration:.1f}s，可指定区间续读" if truncated and duration is not None else ""
+    caption = (
+        f"[视频关键帧：{source_path.name}，{len(times)}帧（{s:.1f}s~{e:.1f}s）{duration_note}。"
+        f"当前接口（{api_label}）不支持原生视频，已转为图片拼图发送；无音频内容。]"
+    )
+    return {
+        "part": {"type": "image_url", "image_url": {"url": _media_data_url("image/jpeg", sheet_b64)}},
+        "kind": "image",
+        "mime": "image/jpeg",
+        "size": len(data),
+        "downsampled": True,
+        "quality": MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality,
+        "stored_name": source_path.name,
+        "filename": source_path.name,
+        "converted": {
+            "original_format": Path(source_path.name).suffix.lower().lstrip(".") or "mp4",
+            "converted_format": "jpg",
+            "converted_kind": "image",
+            "from_video": True,
+            "frames": len(times),
+        },
+        "video": {
+            "duration": duration,
+            "fps": probed.get("fps"),
+            "width": probed.get("width"),
+            "height": probed.get("height"),
+            "estimated_duration": bool(probed.get("estimated_duration")),
+            "read": {"start": s, "end": e, "seconds": round(e - s, 3), "truncated": truncated},
+        },
+        "caption": caption,
+    }
+
+
 def _convert_image_file_to_png_file(path: Path, out_path: Path) -> None:
     """把一张图片文件转为 PNG 文件（转换内核，缓存与即时转换共用）。
 
@@ -1774,13 +2004,15 @@ MODEL_MEDIA_MAX_EDGE = 1568
 MODEL_MEDIA_DEFAULT_QUALITY = 85
 
 
-def _messages_image_model_part(path: Path, quality: int | None = None) -> dict[str, Any]:
-    """Messages accepts images, including the first GIF frame, but no audio/video."""
+def _messages_image_model_part(path: Path, quality: int | None = None, api_type: str | None = None) -> dict[str, Any]:
+    """Messages/Responses 接受图片（含 GIF 首帧），音视频走统一拒收文案（分类型、带文件名）。"""
     from chat.protocols.messages_content import prepare_image
     from chat.protocols.errors import MessagesProtocolError
 
     if media_kind(path.name) != "image":
-        return {"error": "Messages API 不支持原生音频/视频输入；read_media 仅可读取图片"}
+        bad_kind = media_kind(path.name)
+        return {"error": media_unsupported_notice(
+            bad_kind if bad_kind in {"video", "audio"} else None, path.name, api_type)}
     try:
         size = path.stat().st_size
         if size > MEDIA_SEND_IMAGE_LIMIT_BYTES:
@@ -1830,9 +2062,23 @@ def _media_model_part_from_path(
     cwd），仅影响缓存位置、不影响数据。
     """
     if api_type in {"messages", "responses"}:
+        proto_kind = media_kind(path.name)
+        if proto_kind == "video":
+            # 有视觉模型的视频回退：抽关键帧拼图以普通图片发送（调用方保证
+            # vision：附件解析层无视觉走占位，read_media 工具无视觉直接拒绝）。
+            return _build_video_frames_sheet(
+                path,
+                transcode_cache_dir if transcode_cache_dir is not None else _transcode_cache_dir("media_model_part"),
+                start_time,
+                end_time,
+                quality,
+                api_type,
+            )
+        if proto_kind == "audio":
+            return {"error": media_unsupported_notice("audio", path.name, api_type)}
         if start_time is not None or end_time is not None:
-            return {"error": "Messages 图片读取不支持视频时间区间"}
-        return _messages_image_model_part(path, quality)
+            return {"error": f"{_API_TYPE_CN_LABELS.get(api_type, '当前接口')}图片读取不支持时间区间指定"}
+        return _messages_image_model_part(path, quality, api_type=api_type)
     kind = media_kind(path.name)
     mime = media_mime_type(path.name)
     suffix_lower = Path(path.name).suffix.lower()
@@ -1853,7 +2099,7 @@ def _media_model_part_from_path(
         return {
             "error": (
                 f"{path.name}（{size / (1024 * 1024):.1f}MB）超过"
-                f"{'动图/视频' if (animated_probe or kind == 'video') else '图片/音频'}"
+                f"{'动图/视频' if (animated_probe or kind == 'video') else {'audio': '音频', 'image': '图片'}.get(kind, '媒体')}"
                 f"读取上限 {limit_bytes // (1024 * 1024)}MB，未注入；请压缩后再读取"
             ),
         }
@@ -2103,12 +2349,17 @@ def resolve_media_content_parts(
     content: Any,
     vision_enabled: bool | None = None,
     api_type: str | None = None,
+    media_limits: dict | None = None,
 ) -> tuple[Any, list[str]]:
     """把消息 content 列表里的 media:// 引用解析为上游 API 兼容格式。
 
     - ``image_url.url`` / ``video_url.url`` 等 URL 字段：解析为
       ``data:<mime>;base64,<b64>``（url 与 base64 双格式中的 base64 形态）；
     - ``input_audio.data``：解析为纯 base64（OpenAI 音频格式不要 data: 前缀）；
+
+    Messages/Responses 没有原生音视频块：音频一律替换为精确到类型的拒收
+    说明；视频在有视觉时转为关键帧拼图（单图，随附区间说明），无视觉时
+    与图片同口径只留引用占位。Completions 原样透传 video_url/input_audio。
     - 其余部件（纯文本、http(s) URL、已内联 data:）原样保留。
 
     vision_enabled=False（当前模型不支持视觉）时媒体部件不再解析为 base64，
@@ -2127,9 +2378,38 @@ def resolve_media_content_parts(
             resolved_parts.append(part)
             continue
         if api_type in {"messages", "responses"}:
-            if part.get("type") in {"input_audio", "video_url"}:
-                resolved_parts.append({"type": "text", "text": "[未发送附件：Messages API 不支持原生音频/视频输入。]"})
+            part_kind = part.get("type")
+            if part_kind == "input_audio":
+                resolved_parts.append({"type": "text", "text": media_unsupported_notice(
+                    "audio", media_part_display_name(part), api_type)})
                 continue
+            if part_kind == "video_url":
+                if vision_enabled is False:
+                    # 无视觉：不抽帧，落到下方统一占位逻辑（与图片同口径，只留引用）
+                    pass
+                elif isinstance(media_limits, dict) and media_limits.get("video") == 0:
+                    # 配额显式禁用视频：绝不转帧拼图绕过（与工具层预检同口径）
+                    resolved_parts.append({"type": "text", "text": (
+                        f"[未发送附件（视频）：{media_part_display_name(part) or '视频文件'}。"
+                        f"供应商配额禁止视频（video: 0），请更换模型或调整配置。]")})
+                    continue
+                else:
+                    video_ref = part.get("video_url") or {}
+                    video_url = video_ref.get("url") if isinstance(video_ref, dict) else None
+                    if _is_media_reference(video_url):
+                        info = load_session_media_model_part(session_id, video_url, api_type=api_type)
+                        if info and info.get("part"):
+                            if info.get("caption"):
+                                resolved_parts.append({"type": "text", "text": info["caption"]})
+                            resolved_parts.append(info["part"])
+                        else:
+                            unresolved.append(video_url)
+                            failure = (info or {}).get("error") or "文件缺失或无法读取"
+                            resolved_parts.append({"type": "text", "text": f"[{failure}]"})
+                        continue
+                    resolved_parts.append({"type": "text", "text": media_unsupported_notice(
+                        "video", media_part_display_name(part), api_type)})
+                    continue
             image = part.get("image_url")
             reference = image.get("url") if isinstance(image, dict) else None
             if vision_enabled is not False and _is_media_reference(reference):
@@ -2241,11 +2521,13 @@ def resolve_message_media_refs(
     messages: list[Any],
     vision_enabled: bool | None = None,
     api_type: str | None = None,
+    media_limits: dict | None = None,
 ) -> list[str]:
     """就地解析一组消息里的媒体引用（仅当前轮消息调用，历史轮次不解析）。
 
     vision_enabled=False 时媒体部件不解析为 base64，替换为文本占位（见
     resolve_media_content_parts）；vision_enabled=None 视为 True（兼容默认）。
+    media_limits 透传供应商配额（video: 0 时视频不转帧拼图，直接配额拒收）。
     返回未成功解析的引用列表；单个解析异常不影响其余部件。
     """
     unresolved_all: list[str] = []
@@ -2256,7 +2538,8 @@ def resolve_message_media_refs(
         if not isinstance(content, list):
             continue
         resolved, unresolved = resolve_media_content_parts(
-            session_id, content, vision_enabled=vision_enabled, api_type=api_type
+            session_id, content, vision_enabled=vision_enabled, api_type=api_type,
+            media_limits=media_limits,
         )
         message["content"] = resolved
         unresolved_all.extend(unresolved)

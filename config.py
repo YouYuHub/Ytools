@@ -56,7 +56,8 @@ MAX_USER_NAME_LENGTH = 32                    # 显示名最大字符数（前端
 
 # 原生文档（模型 supportDocTypes 声明的文件输入）与文本解析上限：
 # 上传的 PDF/DOCX 等文档在「会话生效模型声明支持该类型」时按轮随请求注入
-# （语义同图片/视频：本任务内每轮发送，出现新用户消息后转文本占位）；以下常量
+# （语义同图片/视频：本任务内每轮发送，出现新用户消息后转文本占位；续跑的
+# 内部 nudge 不算新用户消息，被续轮次的媒体保留完整数据）；以下常量
 # 约束注入规模，避免超大文档撑爆请求体/模型窗口——超预算的文档降级为文本口径
 # （解析文本 + read_document 分页读取）。运行期经 load_var 读取（配置热重载生效）。
 DEFAULT_NATIVE_DOC_MAX_BYTES = 20 * 1024 * 1024        # 单个原生文档注入上限（字节）
@@ -137,6 +138,7 @@ class ChatLLMRequest(BaseModel):
     target_round: Optional[int] = None          # 编辑重发的目标轮次号（1-based）：本轮回复原地替换历史第 N 轮，None 表示正常追加新轮
     insert_round: Optional[int] = None          # 插入位置：新轮插入历史第 N 轮之后，0 表示首轮之前；请求上下文只保留前 N 轮
     strict_insert_context: bool = False         # 兼容旧客户端；插入请求按位置截断上下文，摘要快照不会因此失效
+    resume: bool = False                      # 暂停/中断后继续：messages 仅含服务端内部 nudge；轮次照常开启但不渲染用户气泡、不计入问题/标题/索引
 
 
 class ChatModelSelection(BaseModel):

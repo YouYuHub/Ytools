@@ -864,6 +864,7 @@ from memory.chat_history_format import (
     split_context_window as _split_context_window,
     RECENT_QUESTIONS_TOKEN_BUDGET,
     round_entry_to_context_messages as _round_entry_to_context_messages,
+    find_resume_media_round_index as _find_resume_media_round_index,
     round_entry_compression_usage as _round_entry_compression_usage,
     _round_question as _extract_round_question,
 )
@@ -2898,12 +2899,22 @@ class ChatMemoryManager:
                 _write_meta_and_entries(self._file_path, meta, entries)
         return meta, entries
 
+    def get_last_round_status(self) -> str | None:
+        """返回末个已落盘 chat_round 的状态；无轮次时返回 None（只读，不物化）。"""
+        _meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
+        for entry in reversed(entries):
+            if isinstance(entry, dict) and entry.get("event") == "chat_round":
+                status = entry.get("status")
+                return str(status) if status is not None else None
+        return None
+
     async def get_context_messages(
         self,
         max_rounds: int | None = None,
         max_tool_result_length: int | None = None,
         minimal: bool = False,
         recent_questions_token_budget: int | None = None,
+        retain_stopped_round_media: bool = False,
     ) -> list[dict[str, Any]]:
         """
         获取用于模型上下文的历史视图。
@@ -2921,6 +2932,9 @@ class ChatMemoryManager:
             max_tool_result_length: 窗口内完整轮次的工具结果回传长度
             minimal: 兼容参数，不再切换已完成历史表示
             recent_questions_token_budget: 保真问题索引预算；省略时为 10k
+            retain_stopped_round_media: 续跑专用——被续轮次（末尾首个有真实用户
+                消息的 stopped/interrupted 轮）的用户消息保留原始媒体部件（发送前
+                解析为 base64），而不是转文本占位；其余轮次口径不变
         Returns:
             符合 ChatCompletion messages 结构的累计摘要/问题索引/完整轮次消息列表
         """
@@ -3005,9 +3019,13 @@ class ChatMemoryManager:
             # 此时没有已压缩轮次，无需问题索引
             question_items = []
             raw_rounds = round_entries[-max_rounds:] if max_rounds > 0 else round_entries
-        for round_entry in raw_rounds:
+        retain_index = _find_resume_media_round_index(raw_rounds) if retain_stopped_round_media else -1
+        for position, round_entry in enumerate(raw_rounds):
             messages.extend(
-                _round_entry_to_context_messages(round_entry, max_tool_result_length)
+                _round_entry_to_context_messages(
+                    round_entry, max_tool_result_length,
+                    retain_user_media=(position == retain_index),
+                )
             )
         return messages
 

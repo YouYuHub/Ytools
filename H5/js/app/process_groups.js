@@ -173,7 +173,7 @@
       const runs = [], children = Array.from(container.children);
       let run = null;
       children.forEach(function (node) {
-        if (node.matches(".process-group-summary")) return;
+        if (node.matches(".process-group-summary, .round-fold-summary")) return;
         if (!node.matches(stages)) { run = null; return; }
         const previous = run && run[run.length - 1];
         if (!run || previous.dataset.round && node.dataset.round && previous.dataset.round !== node.dataset.round) {
@@ -228,13 +228,13 @@
       new MutationObserver(function (changes) {
         const changed = changes.some(function (change) {
           const target = change.target.nodeType === 1 ? change.target : change.target.parentElement;
-          if (!target || target.closest(".process-group-summary")) return false;
+          if (!target || target.closest(".process-group-summary, .round-fold-summary")) return false;
           if (change.type === "childList" && target === container) {
             return Array.from(change.addedNodes).concat(Array.from(change.removedNodes))
-              .some(node => node.nodeType === 1 && !node.matches(".process-group-summary"));
+              .some(node => node.nodeType === 1 && !node.matches(".process-group-summary, .round-fold-summary"));
           }
           if (change.type === "attributes") {
-            const statuses = value => (value || "").split(/\s+/).filter(name => /^is-|^has-error/.test(name) && name !== "is-process-hidden").sort().join(" ");
+            const statuses = value => (value || "").split(/\s+/).filter(name => /^is-|^has-error/.test(name) && name !== "is-process-hidden" && name !== "is-roundfold-hidden").sort().join(" ");
             return change.attributeName === "class" && statuses(change.oldValue) !== statuses(target.getAttribute("class"));
           }
           return Boolean(target.closest(heads) || target.matches(".notice-bar"));
@@ -248,8 +248,13 @@
     return value;
   }
 
-  function sync(container) { if (container && container.children) controller(container).sync(); }
+  function sync(container) {
+    if (container && container.children) controller(container).sync();
+    // 小折叠先定型，大折叠随后按最终子节点同步（同容器幂等，可重入）
+    if (App.roundFold) App.roundFold.sync(container);
+  }
   function reveal(node) {
+    if (App.roundFold) App.roundFold.reveal(node);
     for (let current = node; current; current = current.parentElement) {
       if (current._processGroup) openGroup(current._processGroup, true, true);
       if (current === App.chatInner) break;
@@ -315,6 +320,8 @@
     const left = first && recordGroups.get(first), right = last && recordGroups.get(last);
     if (left && choices.get(recordKeys.get(first)) !== true) start = left.start;
     if (right && choices.get(recordKeys.get(last)) !== true) end = right.end;
+    // 轮级大折叠的窗口吸附（已折叠轮不切半轮）；无该模块时保持原边界
+    if (App.roundFold) return App.roundFold.snapBounds(records, start, end);
     return {start, end};
   }
   function tagRecord(node, record) {

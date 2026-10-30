@@ -104,14 +104,20 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
 - 前端渲染：按 `agent_id` 聚合为独立子任务块（标题条 #序号·任务摘要·状态徽标 + 可折叠的思考/正文/工具轨迹/计划区），done 后折叠为摘要态；历史回放按 JSONL 中事件块原样重建；旧前端遇未知事件走默认分支忽略、降级为普通 `tool_return` 文本。
 
 ### POST /stop_chat
-停止指定会话的聊天任务（**按会话隔离**，仅停止该 `session_id` 的后台生成任务，不影响其他会话仍在进行的任务）。
+停止指定会话的聊天任务（**按会话隔离**，仅停止该 `session_id` 的后台生成任务，不影响其他会话仍在进行的任务）。停止即暂停：轮次以 `stopped` 落盘，空闲后可经 `/resume_chat` 继续。
 - Query: `session_id`（默认 "default"）
 - 返回: `{"stop_chat": "stopped"}`；失败 400
+
+### POST /resume_chat
+暂停/中断后继续：服务端合成内部 nudge 另起一轮续跑，等价于代发一条"继续"，无需用户输入。轮次照常开启与落盘，但 nudge 事件标记 `_internal`：不渲染用户气泡、不计入轮次问题/标题/索引、不进入后轮回放；被续轮次的用户媒体保留完整数据（等价于未停止），其余历史仍按占位口径；流式消费与 `/chat_with_tool` 完全一致（同 `round_started`/任务事件）。
+- Body: `{"session_id": str, "tool_names": <可选，随本轮工具选择上送>}`
+- 返回: SSE 流；会话不存在 404；任务运行中或末轮非 `stopped/interrupted` 时 409
+- 可用性：`GET /chat_stream/status` 增返 `can_resume`（空闲 + 末轮 stopped/interrupted）与 `last_round_status`，前端据此显示 ▶ 继续按钮（运行中显示 ⏸ 暂停，空闲可继续且输入区无文本时显示 ▶）
 
 ### GET /chat_stream/status
 查询指定会话当前是否有后台生成任务（前端刷新/切换会话后据此决定是否续接 SSE 续看）。
 - Query: `session_id`（默认 "default"）
-- 返回: `{"running": bool, "session_id": "已规整的会话标识"}`
+- 返回: `{"running": bool, "can_resume": bool, "last_round_status": str | null, "session_id": "已规整的会话标识"}`
 
 ### GET /chat_stream/statuses
 

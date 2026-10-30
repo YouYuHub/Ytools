@@ -222,11 +222,15 @@ def test_missing_media_and_unsupported_audio_video_are_explicit(monkeypatch, tmp
     monkeypatch.setattr(file_memory, "HISTORY_ROOT", tmp_path)
     parts = [{"type": "image_url", "image_url": {"url": "media://missing.png"}}, {"type": "video_url", "video_url": {"url": "media://missing.mp4"}}]
     resolved, missing = file_memory.resolve_media_content_parts("missing", parts, api_type="messages")
-    assert missing == ["media://missing.png"]
+    assert missing == ["media://missing.png", "media://missing.mp4"]
     assert all(block["type"] == "text" for block in resolved)
-    for reference in ("https://media.test/a.mp4", "https://media.test/a.wav"):
-        info = builtin_tools.load_any_media_model_part("missing", reference, api_type="messages")
-        assert "不支持" in info["error"]
+    assert "文件缺失" in resolved[1]["text"]
+    video_err = builtin_tools.load_any_media_model_part("missing", "https://media.test/a.mp4", api_type="messages")["error"]
+    audio_err = builtin_tools.load_any_media_model_part("missing", "https://media.test/a.wav", api_type="messages")["error"]
+    assert "（视频）" in video_err and "（音频）" not in video_err
+    assert "不会自动下载" in video_err
+    assert "（音频）" in audio_err and "（视频）" not in audio_err
+    assert "仅支持图片与文本输入" in audio_err
     gif = builtin_tools.load_any_media_model_part("missing", "https://media.test/a.gif", api_type="messages")
     assert gif["kind"] == "image" and gif["part"]["image_url"]["url"].endswith("a.gif")
 
@@ -249,13 +253,14 @@ def test_model_capabilities_filter_office_types_and_sub_agent_keeps_images(monke
     assert sub_agent.resolve_sub_agent_vision_enabled(False)
 
 
-def test_messages_read_media_schema_only_advertises_image_arguments():
+def test_messages_read_media_schema_advertises_video_frames_without_audio():
     tool = builtin_tools.build_read_media_tool_definition()
     original = copy.deepcopy(tool)
     payload, _, _ = build_payload(request(tools=[tool]), CONFIG, True)
     native = payload["tools"][0]
-    assert "GIF 仅读取首帧" in native["description"]
-    assert not {"start_time", "end_time"} & native["input_schema"]["properties"].keys()
+    assert "关键帧" in native["description"]
+    assert "不支持音频" in native["description"]
+    assert {"start_time", "end_time"} <= native["input_schema"]["properties"].keys()
     assert tool == original
 
 

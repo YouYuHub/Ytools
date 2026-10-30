@@ -21,10 +21,10 @@
     const style = getComputedStyle(chatInner);
     return {top:number(style,"--chat-top-padding",64), bottom:number(style,"--chat-bottom-padding",56), gap:parseFloat(style.rowGap)||24};
   }
-  function roots() { return Array.from(chatInner.children).filter(node => !node.classList.contains("qnav-load-older") && !node.classList.contains("history-live-hidden") && !node.classList.contains("is-process-hidden")); }
+  function roots() { return Array.from(chatInner.children).filter(node => !node.classList.contains("qnav-load-older") && !node.classList.contains("history-live-hidden") && !node.classList.contains("is-process-hidden") && !node.classList.contains("is-roundfold-hidden")); }
   function rememberTail() {
-    // 过程标题是派生节点，由分组模块重建；缓存它会在窗口切换后恢复失效标题。
-    const nodes = Array.from(chatInner.children).filter(node => !node.hasAttribute("data-history-index") && !node.matches(".qnav-load-older, .process-group-summary"));
+    // 过程标题/轮折叠头是派生节点，由分组模块重建；缓存它会在窗口切换后恢复失效标题。
+    const nodes = Array.from(chatInner.children).filter(node => !node.hasAttribute("data-history-index") && !node.matches(".qnav-load-older, .process-group-summary, .round-fold-summary"));
     if (nodes.every(node => tailNodes.has(node))) return;
     // 后加入的提问/过程摘要可能插在已记录节点之前，按相邻节点保存顺序。
     // 已暂存到窗口外的旧轮次仍保留原来的位置。
@@ -66,7 +66,7 @@
     });
     // 当前流可能已被 restoreActiveStream 提前挂回；旧轮次若只追加缺失节点，
     // 就会跑到最新回复之后。把保存的实时尾部按时间顺序恢复为完整的后缀。
-    const mounted = Array.from(chatInner.children).filter(node => !node.classList.contains("process-group-summary")).slice(-nodes.length);
+    const mounted = Array.from(chatInner.children).filter(node => !node.classList.contains("process-group-summary") && !node.classList.contains("round-fold-summary")).slice(-nodes.length);
     if (nodes.length && nodes.some((node,index) => mounted[index] !== node)) {
       nodes.forEach(node => chatInner.appendChild(node));
       changed = true;
@@ -204,7 +204,8 @@
     refreshing = true;
     try {
       const fresh = !model || model.records !== view.records || model.heights.length !== view.records.length;
-      const revision = App.processGroups && App.processGroups.revision ? App.processGroups.revision() : 0;
+      const revision = (App.processGroups && App.processGroups.revision ? App.processGroups.revision() : 0) +
+        ":" + (App.roundFold && App.roundFold.revision ? App.roundFold.revision() : 0);
       const d = dimensions();
       if (fresh) {
         tailNodes = new Set();
@@ -217,9 +218,12 @@
       }
       if (fresh || model.groupRevision !== revision) {
         const fallback = rec => Geometry.estimate(rec,chatInner.clientWidth-48);
-        model = {records:view.records, heights:App.processGroups
+        const baseHeights = App.processGroups
           ? App.processGroups.estimateHeights(view.records, fallback, measured)
-          : Array.from(view.records, rec => measured.has(rec) ? measured.get(rec) : fallback(rec)), live:fresh ? 0 : model.live, groupRevision:revision};
+          : Array.from(view.records, rec => measured.has(rec) ? measured.get(rec) : fallback(rec));
+        // 轮级大折叠后处理：已折叠轮的未渲染成员记 0（已渲染以实测为准）
+        if (App.roundFold) App.roundFold.adjustHeights(view.records, baseHeights, measured);
+        model = {records:view.records, heights:baseHeights, live:fresh ? 0 : model.live, groupRevision:revision};
         model.offsets = Geometry.prefix(model.heights);
         if (fresh && frozen) { frozen.offsets = model.offsets.slice(); frozen.live = 0; }
       }
