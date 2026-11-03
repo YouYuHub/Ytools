@@ -58,6 +58,19 @@ def test_mixed_lines_and_explicit_encoding(job):
     assert command_output.read(meta, '', 512, finished=True)['output'] == '中文\n你好\n'
     output.write_bytes('你好'.encode('gbk'))
     assert command_output.read(meta, '', 512, finished=True, encoding='gbk')['output'] == '你好'
+    # 指定编码与内容冲突致乱码时给出明确警告
+    output.write_bytes('中文标题'.encode('utf-8'))
+    forced = command_output.read(meta, '', 512, finished=True, encoding='gbk')
+    assert forced['output'] != '中文标题'
+    assert '乱码' in (forced['encoding_warning'] or '')
+    auto = command_output.read(meta, '', 512, finished=True)
+    assert auto['output'] == '中文标题'
+    assert auto['encoding_warning'] is None
+    # 指定编码正确时无警告
+    output.write_bytes('你好'.encode('gbk'))
+    ok = command_output.read(meta, '', 512, finished=True, encoding='gbk')
+    assert ok['output'] == '你好'
+    assert ok['encoding_warning'] is None
 
 
 def test_reset_invalid_cursor_and_session_rejected(job):

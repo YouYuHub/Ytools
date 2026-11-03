@@ -133,6 +133,21 @@ class ConditionalNoteTests(unittest.TestCase):
         self.assertIn("思考过程只保留最近一次", prompt)
         self.assertIn("重要内容需要实时告诉用户", prompt)
 
+    def test_reasoning_history_stripping_always_mentioned(self):
+        # 历史思考剥离是无条件机制：默认全量(-1)与截断(正数)配置下都要说明
+        from config import DEFAULT_REASONING_RETURN_MAX_LENGTH
+        try:
+            set_env_vars({"REASONING_RETURN_MAX_LENGTH": -1})
+            prompt = sp.build_sys_prompt()
+            self.assertIn("历史轮次的思考过程不会回传给你，只有最近一次的思考会保留", prompt)
+            self.assertIn("不要只留在思考里", prompt)
+            set_env_vars({"REASONING_RETURN_MAX_LENGTH": 500})
+            prompt = sp.build_sys_prompt()
+            self.assertIn("历史轮次的思考过程不会回传给你，只有最近一次的思考会保留", prompt)
+            self.assertIn("只保留最后 500 字符", prompt)
+        finally:
+            set_env_vars({"REASONING_RETURN_MAX_LENGTH": DEFAULT_REASONING_RETURN_MAX_LENGTH})
+
     def test_file_tool_selection_priority_is_present(self):
         prompt = sp.build_sys_prompt()
         self.assertIn("search_files 只搜索文件内容，file_pattern 只筛选范围、不列出文件名", prompt)

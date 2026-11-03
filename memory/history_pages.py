@@ -129,7 +129,7 @@ def _build(path, wanted):
                     windows.append((rounds, _timestamp(row.get("started_at") or (events[0].get("timestamp") if events and isinstance(events[0], dict) else None)),
                                     _timestamp(row.get("ended_at") or (events[-1].get("timestamp") if events and isinstance(events[-1], dict) else None))))
                     for number, event in enumerate(events):
-                        if isinstance(event, dict) and event.get("role") == "user":
+                        if isinstance(event, dict) and event.get("role") == "user" and not event.get("_internal"):
                             questions.append({"round": rounds, "event_index": number, "text": _text(event.get("content"))})
                 elif row.get("event") == "context_compaction":
                     content_digest.update(raw)

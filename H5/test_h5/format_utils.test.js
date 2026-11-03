@@ -27,16 +27,22 @@ test("normalizeUsage: 归一化缺省字段", function () {
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 100,
+    cached_tokens: 0,
   });
   assert.deepEqual(formatUtils.normalizeUsage({
     prompt_tokens: 10,
     completion_tokens: 5,
-  }), { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+  }), { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cached_tokens: 0 });
   assert.deepEqual(formatUtils.normalizeUsage(undefined), {
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 0,
+    cached_tokens: 0,
   });
+  // 缓存命中保留并钳制到 [0, prompt]
+  assert.deepEqual(formatUtils.normalizeUsage({ prompt_tokens: 100, cached_tokens: 90 }).cached_tokens, 90);
+  assert.deepEqual(formatUtils.normalizeUsage({ prompt_tokens: 100, cached_tokens: 999 }).cached_tokens, 100);
+  assert.deepEqual(formatUtils.normalizeUsage({ prompt_tokens: 100, cached_tokens: -5 }).cached_tokens, 0);
 });
 
 test("usageText: 生成本轮 token 文案", function () {
@@ -45,6 +51,11 @@ test("usageText: 生成本轮 token 文案", function () {
   assert.equal(formatUtils.usageText({}), "本轮消耗 0 tokens（输入 0 · 输出 0）");
   assert.equal(formatUtils.usageText({ total_tokens: 2 }, { provider: "服务商", name: "模型 A" }),
     "本轮消耗 2 tokens（输入 0 · 输出 0） · 模型 服务商/模型 A");
+  // 有缓存命中时单列（无缓存时文案不变）
+  assert.equal(formatUtils.usageText({ prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500, cached_tokens: 900 }),
+    "本轮消耗 1,500 tokens（输入 1,000（含缓存 900） · 输出 500）");
+  assert.equal(formatUtils.usageText({ prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500, cached_tokens: 0 }),
+    "本轮消耗 1,500 tokens（输入 1,000 · 输出 500）");
 });
 
 test("roundSummaryText: 没有 usage 时只显示模型，有 usage 时显示 tokens 与模型", function () {

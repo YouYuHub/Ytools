@@ -66,7 +66,7 @@ test('模型列表项按自身 api_type 打标（data-api 与 api-* 类）', () 
 });
 
 test('编译后 CSS 包含三色体系与列表项区分样式', () => {
-  const css = fs.readFileSync(path.join(__dirname, '../style/css/main.css'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../css/main.css'), 'utf8');
   assert.match(css, /\.enhance-panel\.completions-mode/);
   assert.match(css, /\.enhance-panel\.messages-mode/);
   assert.match(css, /\.enhance-panel\.responses-mode/);

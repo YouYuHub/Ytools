@@ -144,5 +144,46 @@ class StreamReplayEndTests(unittest.IsolatedAsyncioTestCase):
             cf._SESSION_STREAMS.pop(sid, None)
 
 
+    async def test_attach_marker_carries_round_started_at(self):
+        sid = f"mock_replay_started_at_{uuid.uuid4().hex}"
+        stream = cf._set_session_stream(sid)
+        stream.live_round_no = 3
+        stream.live_round_started_at_ms = 1720000000000
+        stream.task = asyncio.create_task(asyncio.sleep(10))
+        try:
+            chunks = await self._collect(cf.tool_chat_server(
+                ChatLLMRequest(session_id=sid, messages=[])), count=1)
+            marker = frames(chunks)[0]
+            self.assertEqual(marker["round"], 3)
+            self.assertEqual(marker["round_started_at"], 1720000000000)
+        finally:
+            stream.task.cancel()
+            await asyncio.gather(stream.task, return_exceptions=True)
+            cf._SESSION_STREAMS.pop(sid, None)
+
+    def test_live_round_started_at_syncs_through_worker_events(self):
+        import queue
+        from types import SimpleNamespace
+        from factory.session_worker import _WorkerStreamAdapter, _make_worker_event_handler
+        q: queue.Queue = queue.Queue()
+        adapter = _WorkerStreamAdapter("s", q)
+        adapter.live_round_started_at_ms = 1720000000000
+        evt = q.get_nowait()
+        self.assertEqual(evt, {"type": "live_round_started_at", "at_ms": 1720000000000})
+        stream = cf._SessionStream("s")
+        try:
+            proxy = SimpleNamespace(_bound_stream=stream, loop=None)
+            _make_worker_event_handler(proxy)(evt)
+            self.assertEqual(stream.live_round_started_at_ms, 1720000000000)
+            # 非法值归一为 None，不污染主进程快照
+            adapter.live_round_started_at_ms = "bad"
+            bad_evt = q.get_nowait()
+            self.assertIsNone(bad_evt["at_ms"])
+            _make_worker_event_handler(proxy)(bad_evt)
+            self.assertIsNone(stream.live_round_started_at_ms)
+        finally:
+            stream._replay_journal.close()
+
+
 if __name__ == "__main__":
     unittest.main()

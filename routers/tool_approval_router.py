@@ -7,6 +7,7 @@ import urllib.error
 from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import Response, RedirectResponse
 from pydantic import BaseModel, Field
+from config import get_persisted_work_dir, resolve_work_dir
 from memory import permission_store as store
 from memory.chat_memory import normalize_session_id, resolve_session_work_dir
 from factory.agent_runtime.permission_policy import plan_tool, inside, protected, resolve_path
@@ -44,7 +45,16 @@ def public(approval):
 @api_permission_router.get("/chat_config/permissions")
 def get_permissions(session_id: str | None = None):
     session = normalize_session_id(session_id) if session_id else None
-    root, _ = resolve_session_work_dir(session or "default")
+    if session is None:
+        # 无会话的全局查询：只解析全局默认工作目录，不走会话元数据。
+        # 旧逻辑用 "default" 占位查元数据，会触发会话鉴权 404，导致前端
+        # 启动/打开设置时的裸请求在控制台刷 404（前端已正确处理为问题态，
+        # 但噪音扰人；且文档明确 session_id 可选，裸请求本应成功）。
+        persisted = get_persisted_work_dir()
+        resolved = resolve_work_dir(persisted) if isinstance(persisted, str) and persisted.strip() else None
+        root = str(resolved) if resolved is not None else None
+    else:
+        root, _ = resolve_session_work_dir(session)
     return {**store.policy(session), "root": root or str(Path.cwd())}
 
 

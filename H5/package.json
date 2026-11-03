@@ -4,13 +4,18 @@
   "private": true,
   "description": "类似 ChatGPT 风格对话主页（SCSS + 原生 JS）",
   "scripts": {
-    "build:css": "sass style/scss/main.scss style/css/main.css --style=expanded --no-source-map",
-    "watch:css": "sass style/scss/main.scss style/css/main.css --style=expanded --watch --no-source-map",
+    "build:css": "sass src/scss/main.scss css/main.css --style=expanded --no-source-map",
+    "watch:css": "sass src/scss/main.scss css/main.css --style=expanded --watch --no-source-map",
+    "build:js": "tsc -p tsconfig.build.json",
+    "watch:js": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"test_h5/*.test.js\""
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "jsdom": "30.1.3",
-    "sass": "^1.102.0"
+    "sass": "^1.102.0",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "dompurify": "3.4.17",

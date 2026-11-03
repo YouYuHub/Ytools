@@ -103,8 +103,9 @@ class SessionReplayTests(unittest.IsolatedAsyncioTestCase):
                 self.stream.emit(chunk)
             for chunk in rest:
                 self.assertEqual(await anext(first), chunk)
-            for chunk in [one] + rest:
-                self.assertEqual(await anext(second), chunk)
+            # 后附接者排空时已积压 13 帧：紧凑为 1 帧，内容与逐帧一致
+            merged = frame({'content': 'first' + ''.join('delta' + str(i) for i in range(12))})
+            self.assertEqual(await anext(second), merged)
             self.assertEqual(await anext(first), frame({'replay_end': True}))
             self.assertEqual(await anext(second), frame({'replay_end': True}))
             await first.aclose()  # one page leaves; other page keeps following
@@ -131,8 +132,9 @@ class SessionReplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(marker['replay_complete'])
             warning = json.loads((await anext(subscription))[6:])
             self.assertEqual(warning['warning']['code'], 'STREAM_REPLAY_GAP')
-            for chunk in self.stream.buffer:
-                self.assertEqual(await anext(subscription), chunk)
+            # 热缓存 4 帧紧凑为 1 帧后下发
+            merged = json.loads((await anext(subscription))[6:])
+            self.assertEqual(merged, {'content': '4567'})
         finally:
             await subscription.aclose()
 
@@ -158,8 +160,9 @@ class SessionReplayTests(unittest.IsolatedAsyncioTestCase):
         try:
             marker = json.loads((await anext(subscription))[6:])
             self.assertFalse(marker['replay_complete'])
-            for chunk in expected:
-                self.assertEqual(await anext(subscription), chunk)
+            # 12 帧正文紧凑为 1 帧，内容完整
+            merged = json.loads((await anext(subscription))[6:])
+            self.assertEqual(merged, {'content': ''.join(str(i) for i in range(12))})
         finally:
             await subscription.aclose()
 

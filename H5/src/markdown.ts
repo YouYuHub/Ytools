@@ -1,0 +1,1000 @@
+/**
+ * 轻量 Markdown 渲染器（先转义 HTML，再解析块级与行内语法）
+ * 支持：标题 / 代码块 / 行内代码 / 粗斜体 / 链接 / 列表 / 引用 / 表格 / 分割线
+ */
+(function (global: any) {
+  function escapeHtml(text: any): string {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // 行内占位符前缀/后缀（控制字符，正常文本不会出现）
+  const PH_OPEN = "\u0001";
+  const PH_CLOSE = "\u0001";
+  // 媒体伪标签占位符（控制字符，与行内代码占位不同前缀）
+  const MEDIA_PH_OPEN = "\u0002";
+  // 数学公式占位符（控制字符，与前两者不同前缀）
+  const MATH_PH_OPEN = "\u0003";
+  const MATH_PH_CLOSE = "\u0003";
+
+  // KaTeX 数学公式渲染（window.katex 由 index.html 提前引入；Node 单测等
+  // 无 katex 环境下降级为原文展示，不影响其余渲染）。
+  // 支持：$…$ 行内 / $$…$$ 块级 / \(…\) 行内 / \[…\] 块级（模型常见四种写法）。
+  // 提取在媒体标签/块级解析之前：公式内的 * _ | 等不能被其它语法误吃。
+  // 定界符歧义防护：美元符行内公式要求内部含 LaTeX 命令（\）或上下标/花括号，
+  // 纯数字价格（如 $5 到 $8）不会被当成公式；未闭合的定界符保持原文。
+  function mathExtract(escapedText: any): any {
+    const items: any[] = [];   // {display: bool, tex: string}，tex 为未转义原文
+    function push(display: any, tex: any): string {
+      items.push({ display: display, tex: tex });
+      return MATH_PH_OPEN + (items.length - 1) + MATH_PH_CLOSE;
+    }
+    let text = String(escapedText || "");
+
+    // 块级 $$…$$（可跨行；贪婪配对，同段两个 $$ 之间为一段公式）
+    text = text.replace(/\$\$([\s\S]+?)\$\$/g, function (_m: any, tex: any) {
+      if (tex.includes(FENCE_PH)) return _m;
+      return push(true, unescapeTagText(tex));
+    });
+    // 块级 \[…\]
+    text = text.replace(/\\\[([\s\S]+?)\\\]/g, function (_m: any, tex: any) {
+      if (tex.includes(FENCE_PH)) return _m;
+      return push(true, unescapeTagText(tex));
+    });
+    // 行内 \(…\)
+    text = text.replace(/\\\(([\s\S]+?)\\\)/g, function (_m: any, tex: any) {
+      if (tex.includes(FENCE_PH)) return _m;
+      return push(false, unescapeTagText(tex));
+    });
+    // 行内 $…$：内部需含 LaTeX 特征（\命令、^、_、花括号包内容）才认作公式，
+    // 避免「两个价格 $5 … $8」被误判；tex 内不允许换行（行内公式单行）
+    text = text.replace(/\$([^$\n]+)\$/g, function (match: any, tex: any) {
+      if (tex.includes(FENCE_PH)) return match;
+      const hasCommand = /\\[a-zA-Z]+/.test(tex);
+      const hasScript = /[\^_]\{?[^{}\s]/.test(tex);
+      if (!hasCommand && !hasScript) return match;
+      return push(false, unescapeTagText(tex));
+    });
+    return { text: text, items: items };
+  }
+
+  // 占位符 → KaTeX HTML；katex 缺失/渲染失败时降级为原文（code 样式）。
+  // 原文随 data-tex 保存（转义一层），便于后续扩展「复制源码」等交互。
+  function buildMathHtml(display: any, tex: any): string {
+    const esc = escapeHtml;
+    let html = "";
+    let failed = false;
+    if (global.katex && typeof global.katex.renderToString === "function") {
+      try {
+        html = global.katex.renderToString(tex, {
+          displayMode: display,
+          throwOnError: false,
+          strict: false,
+          output: "html",
+        });
+      } catch (_) {
+        failed = true;
+      }
+    } else {
+      failed = true;
+    }
+    const cls = display ? "md-math md-math-display" : "md-math md-math-inline";
+    if (failed || !html) {
+      // 降级：等宽原文 + 占位说明，保持版式可读
+      const body = '<code class="md-math-raw">' + esc(tex) + "</code>";
+      return '<span class="' + cls + ' is-raw" data-tex="' + esc(tex) + '">' + body + "</span>";
+    }
+    return '<span class="' + cls + '" data-tex="' + esc(tex) + '">' + html + "</span>";
+  }
+
+  function restoreMathPlaceholders(html: any, items: any): string {
+    if (!items.length) return html;
+    const RE = new RegExp(MATH_PH_OPEN + "(\\d+)" + MATH_PH_CLOSE, "g");
+    // 块级公式独占一行时替换整个 <p>，避免 display 块嵌进段落
+    let out = html.replace(new RegExp("<p>" + MATH_PH_OPEN + "(\\d+)" + MATH_PH_CLOSE + "</p>", "g"),
+      function (_: any, idx: any) {
+        const item = items[Number(idx)];
+        return item ? buildMathHtml(item.display, item.tex) : "";
+      });
+    return out.replace(RE, function (_: any, idx: any) {
+      const item = items[Number(idx)];
+      return item ? buildMathHtml(item.display, item.tex) : "";
+    });
+  }
+
+  // 媒体伪标签解析器：由 App 在启动时注入（media.js），把标签 src 解析为
+  // 可访问 URL（media:// → 会话媒体端点；http(s) 原样；其它按本地路径 →
+  // /file/get_local_file）。未注入时控件仍渲染但无法加载。
+  let mediaResolver: any = null;
+
+  function setMediaResolver(fn: any): void { mediaResolver = typeof fn === "function" ? fn : null; }
+
+  // 模型输出的伪标签（转义后形态）：&lt;image ...&gt;...&lt;/image&gt; 或自闭合。
+  // 属性值以 &quot; 包裹（escapeHtml 把 " 转义为 &quot;）。
+  const MEDIA_TAG_RE = /&lt;(image|audio|video|pdf)((?:[^&]|&(?!gt;))*?)(?:\/&gt;|&gt;([\s\S]*?)&lt;\/\1&gt;)/g;
+  const MEDIA_ATTR_RE = /([a-zA-Z_][\w:-]*)\s*=\s*&quot;((?:(?!&quot;).)*)&quot;/g;
+
+  // 解析 <svg> 开标签里的 viewBox，返回宽高比（w/h；非法/缺失返回 null）
+  function viewBoxAspectRatio(open: any): any {
+    const m = /\bviewBox\s*=\s*["']\s*([\d.eE+-]+)[\s,]+([\d.eE+-]+)[\s,]+([\d.eE+-]+)[\s,]+([\d.eE+-]+)/i.exec(open);
+    if (!m) return null;
+    const w = parseFloat(m[3]);
+    const h = parseFloat(m[4]);
+    return w > 0 && h > 0 && Number.isFinite(w) && Number.isFinite(h)
+      ? Number((w / h).toFixed(6)) : null;
+  }
+
+  // 把「填满宽度 + 超长钳制」声明合并进 <svg> 开标签的 style（不覆盖其它内联样式）：
+  // aspect-ratio + width:calc(min(100%, 170vh*比例) * var(--md-zoom, 1)) —— 默认
+  // 填满控件宽度（左右仅剩视图自身的 4px 窄边距），高度按比例联动；仅当填满宽度
+  // 后高度会超过约 1.7 屏（极竖长内容）才按高度收窄，避免页面被无限拉高。
+  // 末尾乘 --md-zoom 是「显示缩放」通道：倍率由 messages.js 写在控件块元素上，
+  // 放大后由视图容器（overflow:auto）滚动查看、缩小则居中（margin:0 auto）。
+  // 注意不能把这里钳制值压回 70vh：一旦触顶，等比内容只能居中缩小，
+  // 两侧会重新出现大片透明留白（"图片只占中间一部分宽度"）
+  function applyAdaptiveStyle(open: any, ar: any): string {
+    const styleVal = "aspect-ratio:" + ar +
+      ";width:calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1));height:auto";
+    const styleMatch = /\sstyle\s*=\s*["']([^"']*)["']/i.exec(open);
+    if (styleMatch) {
+      // 追加到原值末尾：同名声明后写的生效，净化源码自带的 width/height 干扰
+      open = open.replace(styleMatch[0],
+        ' style="' + styleMatch[1].replace(/;\s*$/, "") + ";" + styleVal + '"');
+    } else {
+      open = open.replace(/<svg/i, '<svg style="' + styleVal + '"');
+    }
+    return open;
+  }
+
+  // 内联视图专用 SVG 准备（不影响代码视图与「复制代码」的原文）：
+  // 1) 流式铺满：去掉根节点固定 width/height（缺 viewBox 时由其转出），
+  //    否则 CSS height:auto 会取属性内在高度导致视口压扁、内容居中留白；
+  // 2) 触顶收字框：按 viewBox 比例注入 aspect-ratio 自适应样式（见 applyAdaptiveStyle）；
+  // 3) 渲染净化：用 DOMPurify 的 SVG 白名单解析，而不是正则删除危险片段。
+  //    净化器未加载时关闭图片预览；源码仍可在代码视图查看/复制。
+  //    代码视图/复制始终保留完整原文（净化只作用于图片视图）。
+  function makeDisplaySvg(rawSvg: any): string {
+    if (!global.DOMPurify || typeof global.DOMPurify.sanitize !== "function") {
+      return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+    }
+    const source = String(rawSvg);
+    // SMIL 的部分动画元素、CSS 样式及 <use>/<mpath> 的本地引用会被内联
+    // SVG 白名单移除。将这类 SVG 放进浏览器的 image 文档环境：动画和样式
+    // 可以运行，而脚本、事件处理器及外部资源不会获得页面执行权限。
+    // 不能把动画标签直接加入 DOMPurify 的内联白名单（SMIL 可改写 href）。
+    if (/<(?:animate[\w:-]*|set|discard|style|use|mpath)\b|\bstyle\s*=/i.test(source)) {
+      const openMatch = source.match(/^\s*<svg\b[^>]*>/i);
+      if (!openMatch) return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+      let imageSvg = source;
+      if (!/\bxmlns\s*=/.test(openMatch[0])) {
+        imageSvg = imageSvg.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+      }
+      if (/\bxlink:/.test(source) && !/\bxmlns:xlink\s*=/.test(openMatch[0])) {
+        imageSvg = imageSvg.replace(/<svg\b/i, '<svg xmlns:xlink="http://www.w3.org/1999/xlink"');
+      }
+      const ar = viewBoxAspectRatio(openMatch[0]);
+      const sizeStyle = ar
+        ? "aspect-ratio:" + ar + ";width:calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1));height:auto"
+        : "width:calc(100% * var(--md-zoom, 1));height:auto";
+      try {
+        const src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(imageSvg);
+        return '<img class="md-animated-svg" alt="SVG 图片" src="' + escapeHtml(src) + '" style="' + sizeStyle + '">';
+      } catch (_) {
+        return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+      }
+    }
+    let svg = global.DOMPurify.sanitize(source, {
+      USE_PROFILES: { svg: true, svgFilters: true },
+      FORBID_TAGS: ["foreignObject", "script", "style"],
+      FORBID_ATTR: ["style", "href", "xlink:href"],
+    });
+    const openMatch = svg.match(/<svg\b[^>]*>/i);
+    if (openMatch && /^\s*<svg\b/i.test(svg)) {
+      let open = openMatch[0];
+      const w = /\bwidth\s*=\s*["']([\d.]+)/i.exec(open);
+      const h = /\bheight\s*=\s*["']([\d.]+)/i.exec(open);
+      if (!/\bviewBox\s*=/i.test(open) && w && h) {
+        open = open.replace(/<svg/i, '<svg viewBox="0 0 ' + w[1] + " " + h[1] + '"');
+      }
+      const ar = viewBoxAspectRatio(open);
+      if (ar) open = applyAdaptiveStyle(open, ar);
+      open = open.replace(/\s(width|height)\s*=\s*["'][^"']*["']/gi, "");
+      svg = svg.replace(openMatch[0], open);
+      return svg;
+    }
+    return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
+  }
+
+  // 缩放按钮组（三控件 svg/mermaid/canvas 共用）：[−] [百分比] [＋]。
+  // 纯静态标记——点击行为、状态与 --md-zoom 的应用由 messages.js 统一接线
+  // （事件委托 + Ctrl+滚轮；点百分比按钮复位 100%）。
+  function buildZoomGroupHtml(): string {
+    return (
+      '<div class="md-zoom-group" title="显示缩放：按钮或 Ctrl+滚轮（点百分比复位 100%）">' +
+      '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="out" title="缩小一档">-</button>' +
+      '<button type="button" class="md-svg-btn md-zoom-btn md-zoom-reset" data-zoom-action="reset" title="点击复位 100%">100%</button>' +
+      '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="in" title="放大一档">+</button>' +
+      "</div>"
+    );
+  }
+
+  // SVG 代码 → 双视图控件：头部（名称 + 代码/图片切换 + 复制代码 + 复制图片），
+  // 全屏/恢复图标对（SVG，currentColor 跟随按钮文字色）：媒体预览弹窗、
+  // SVG/Mermaid/Canvas 控件共用同一套图标语言，经 Markdown.fullscreenIcons
+  // 导出（后加载模块取用，取不到时回退 ⛶/⤡ 字符）。
+  const FULLSCREEN_ICON_EXPAND =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>';
+  const FULLSCREEN_ICON_COMPRESS =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>';
+
+  // 主体「代码视图」（语法高亮 pre/code，与普通代码块同款复制语义）与
+  // 「图片视图」（inline SVG，整行一张独占显示）二选一显示，默认看图片。
+  // 原始 SVG 源码经 escapeHtml 后存入 data-svg-code，复制/切图时还原使用；
+  // alt 属性作为控件名称，缺省用「SVG 图片」。
+  function buildSvgWidget(svgCode: any, attrs: any): string {
+    const esc = escapeHtml;
+    const name = (attrs.alt || attrs.title || "").trim() || "SVG 图片";
+    // 图片视图：净化后的 SVG 内联进文档（去除固定尺寸实现流式铺满、
+    // 移除脚本与事件属性防执行）；源码原文完整保留在代码视图与 data-svg-code
+    const svgInline = '<div class="md-svg-view" data-svg-view="image">' + makeDisplaySvg(svgCode) + "</div>";
+    return (
+      '<div class="md-svg-block" data-svg-kind="svg" data-svg-code="' + esc(svgCode) + '">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">' + esc(name) + "</span>" +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">图片</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
+      '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">' + FULLSCREEN_ICON_EXPAND + ' 全屏</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code class="language-markup">' + esc(svgCode) + "</code></pre>" +
+      "</div>" +
+      svgInline +
+      "</div>"
+    );
+  }
+
+  // Mermaid 图表 → 双视图控件：与 SVG 控件同构（代码/图片切换 + 复制代码 +
+  // 复制图片），差异在于「图片视图」由 Mermaid.js **异步**渲染——初始放
+  // 「渲染中」占位，messages.js 的懒加载链路完成 mermaid.render 后回填 SVG；
+  // 语法错误时标记 failed 并显示错误说明（代码视图始终可看）。
+  // data-mermaid-id/state 供异步渲染链路定位与去重；源码原文存 data-svg-code
+  // （复制代码复用 SVG 控件的复制逻辑，无需新增交互）。
+  let mermaidWidgetSeq = 0;
+  function buildMermaidWidget(code: any): string {
+    const esc = escapeHtml;
+    const id = "md-mermaid-" + (++mermaidWidgetSeq);
+    return (
+      '<div class="md-svg-block md-mermaid-block" data-svg-kind="mermaid"' +
+      ' data-svg-code="' + esc(code) + '"' +
+      ' data-mermaid-id="' + id + '" data-mermaid-state="pending">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">Mermaid 图</span>' +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">图片</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
+      '<button type="button" class="md-svg-btn" data-svg-action="rerender" title="重新渲染此图">↻ 重渲染</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">' + FULLSCREEN_ICON_EXPAND + ' 全屏</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code>' + esc(code) + "</code></pre>" +
+      "</div>" +
+      '<div class="md-svg-view" data-svg-view="image">' +
+      '<div class="md-mermaid-loading" data-mermaid-holder="' + id + '">Mermaid 渲染中…</div>' +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // Canvas 程序块 → 「待运行」控件：```canvas 栅栏内是一段 JS 绘图脚本，
+  // **默认不执行**——先展示预览占位与代码视图，用户点「运行」确认后才在
+  // 沙箱 iframe 中执行（运行时与消息交互在 messages.js 的沙箱链路完成）。
+  // data-canvas-code 存源码原文；图片视图初始为「未运行」占位，代码视图
+  // 与 SVG 控件同款（等宽 + 滚动 + 复制代码）；「截图」按钮在运行后可用，
+  // 复用 SVG 控件的导出链路（canvas 像素直接 toBlob）；「重置」清空画布
+  // 回到未运行占位（与「停止」的区别：不移除已执行的判断，纯视觉复位）。
+  let canvasWidgetSeq = 0;
+  function buildCanvasWidget(code: any): string {
+    const esc = escapeHtml;
+    const id = "md-canvas-" + (++canvasWidgetSeq);
+    return (
+      '<div class="md-svg-block md-canvas-block" data-svg-kind="canvas"' +
+      ' data-svg-code="' + esc(code) + '"' +
+      ' data-canvas-id="' + id + '" data-canvas-state="idle">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">Canvas 程序</span>' +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">画布</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
+      '<button type="button" class="md-svg-btn md-canvas-run" data-canvas-action="run">▶ 运行</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="shot" title="导出当前画布为 PNG">截图</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="full" title="全屏显示画布（Esc 退出）">' + FULLSCREEN_ICON_EXPAND + ' 全屏</button>' +
+      '<button type="button" class="md-svg-btn" data-canvas-action="reset" title="清空画布回到未运行状态">↺ 重置</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code class="language-javascript">' + esc(code) + "</code></pre>" +
+      "</div>" +
+      '<div class="md-svg-view md-canvas-view" data-svg-view="image">' +
+      '<div class="md-canvas-placeholder">未运行 · 点击「▶ 运行」在沙箱中执行脚本</div>' +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // 按栅栏语言分发构建双视图控件
+  function buildFenceWidget(kind: any, code: any): string {
+    if (kind === "mermaid") return buildMermaidWidget(code);
+    if (kind === "canvas") return buildCanvasWidget(code);
+    return buildSvgWidget(code, {});
+  }
+
+  // ---------- Mermaid 懒加载 + 异步渲染（与 messages.js 回填链路配合） ----------
+  // mermaid.min.js 5.5MB：不做首屏静态引入，首次出现 ```mermaid 图时才注入
+  // <script> 动态加载；加载完成后 initialize 一次（startOnLoad=false、
+  // securityLevel=strict 禁用 HTML 标签与点击回调）。
+  const MERMAID_BASE_CONFIG = {
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "default",
+    // v12 默认 false：语法错误时 mermaid 会把「bomb + Syntax error in text」
+    // 错误 SVG 渲染进它挂在 document.body 的临时容器（#d{id}），异常路径下
+    // 残留节点把页面底部撑出一大块错误图；true 时失败直接抛异常（临时元素
+    // 由库内 T() 清理），错误说明走我们自己的 holder 文本展示。
+    suppressErrorRendering: true,
+  };
+  let mermaidLoadPromise: any = null;
+  let mermaidInitPromise: any = null;
+
+  // 渲染结果缓存（code → svg 文本）：流式期间整块重建会为同一张图换新控件
+  // id 并重复调度 mermaid.render，命中缓存可直接复用上次 SVG，省去重复解析
+  // （也顺带规避高频并发下 mermaid 内部临时节点的隐患）；仅记成功结果，
+  // 失败不缓存以便重试；上限 40 篇防长会话内存膨胀（近似 LRU：命中挪队尾）。
+  const MERMAID_CACHE_MAX = 40;
+  const mermaidResultCache: any = new Map();
+
+  function mermaidCacheGet(code: any): any {
+    if (!mermaidResultCache.has(code)) return null;
+    const svg = mermaidResultCache.get(code);
+    mermaidResultCache.delete(code);
+    mermaidResultCache.set(code, svg);
+    return svg;
+  }
+
+  function mermaidCacheSet(code: any, svg: any): void {
+    if (mermaidResultCache.has(code)) mermaidResultCache.delete(code);
+    mermaidResultCache.set(code, svg);
+    if (mermaidResultCache.size > MERMAID_CACHE_MAX) {
+      const oldest = mermaidResultCache.keys().next().value;
+      mermaidResultCache.delete(oldest);
+    }
+  }
+
+  function ensureMermaidLoaded(): Promise<any> {
+    if (global.mermaid && typeof global.mermaid.render === "function") {
+      if (!mermaidInitPromise) {
+        mermaidInitPromise = Promise.resolve().then(function () {
+          if (global.mermaid.initialize) global.mermaid.initialize(MERMAID_BASE_CONFIG);
+        });
+      }
+      return mermaidInitPromise;
+    }
+    if (mermaidLoadPromise) return mermaidLoadPromise;
+    mermaidLoadPromise = new Promise(function (resolve: any, reject: any) {
+      const script = document.createElement("script");
+      script.src = "js/vendor/mermaid/mermaid.min.js";
+      script.onload = function () {
+        try {
+          if (global.mermaid && global.mermaid.initialize) {
+            global.mermaid.initialize(MERMAID_BASE_CONFIG);
+          }
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+      script.onerror = function () {
+        mermaidLoadPromise = null;
+        reject(new Error("mermaid.min.js 加载失败"));
+      };
+      (document.head || document.documentElement).appendChild(script);
+    });
+    return mermaidLoadPromise;
+  }
+
+  // 结果 SVG 写入 holder 并做自适应宽度处理（渲染失败态也在这里统一落）
+  function applyMermaidSvg(holder: any, svg: any): void {
+    holder.innerHTML = svg;
+    const svgEl = holder.querySelector("svg");
+    if (svgEl) {
+      // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
+      // min(100%, 170vh*比例)，高度随比例联动——宽图触上限时容器跟着收窄，
+      // 消除 100% 宽 + 居中缩放的两侧透明留白；宽度/上限同乘 --md-zoom
+      // （显示缩放通道，见 applyAdaptiveStyle 注释）
+      const vb = String(svgEl.getAttribute("viewBox") || "")
+        .trim().split(/[\s,]+/).map(Number);
+      if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
+        Number.isFinite(vb[2]) && Number.isFinite(vb[3])) {
+        // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
+        const ar = Number((vb[2] / vb[3]).toFixed(6));
+        svgEl.style.aspectRatio = String(ar);
+        svgEl.style.width = "calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1))";
+        svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
+        svgEl.style.height = "auto";
+      } else {
+        svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
+        svgEl.style.width = "calc(100% * var(--md-zoom, 1))";
+        svgEl.style.height = "auto";
+      }
+      svgEl.style.display = "block";
+      svgEl.style.margin = "0 auto";
+    }
+  }
+
+  // mermaid.render 的临时容器 id 规则（v12 源码）：无容器参数调用时在
+  // document.body 上创建 #d{id}（部分路径为 #i{id}）；正常完成时库内
+  // removeTempElements 会移除，异常路径可能残留（曾表现为页面底部被
+  // bomb 错误图撑高）。suppressErrorRendering 已让失败不再画错误图，
+  // 这里再兜底清掉可能残留的临时节点。
+  function removeMermaidTempNodes(renderId: any): void {
+    if (typeof document === "undefined" || !document.body) return;
+    ["d" + renderId, "i" + renderId].forEach(function (tid: any) {
+      const node = document.getElementById(tid);
+      if (node && node.parentNode === document.body) {
+        node.parentNode.removeChild(node);
+      }
+    });
+  }
+
+  // mermaid.render 包装：结果 SVG 写入 holder 并做自适应宽度处理；
+  // 渲染失败时 holder 显示错误说明并继续抛出（调用方可做状态标记）。
+  // opts.renderId：换用其它 DOM id 调 mermaid.render（流式重建后同一图已换
+  // 新控件 id，重试/重渲染要用当次控件的 id，避免与旧临时节点冲突）；
+  // opts.cachedCode：以该 key 查写结果缓存（同 code 的重建直接复用上次 SVG）。
+  function renderMermaidInto(id: any, code: any, holder: any, opts: any): Promise<any> {
+    opts = opts || {};
+    const cacheKey = opts.cachedCode || "";
+    if (cacheKey) {
+      const cached = mermaidCacheGet(cacheKey);
+      if (cached) {
+        holder.classList.remove("md-mermaid-error");
+        applyMermaidSvg(holder, cached);
+        return Promise.resolve(true);
+      }
+    }
+    const renderId = opts.renderId || id;
+    return ensureMermaidLoaded().then(function () {
+      return Promise.resolve(global.mermaid.render(renderId, code)).then(function (result: any) {
+        const svg = (result && result.svg) || "";
+        if (!svg) throw new Error("渲染结果为空");
+        if (cacheKey) mermaidCacheSet(cacheKey, svg);
+        applyMermaidSvg(holder, svg);
+        return true;
+      });
+    }).catch(function (err: any) {
+      // 失败兜底：清理可能残留在 body 上的渲染临时容器，再落错误态文案
+      removeMermaidTempNodes(renderId);
+      holder.classList.add("md-mermaid-error");
+      holder.textContent = "Mermaid 渲染失败：" + ((err && err.message) || "语法错误");
+      throw err;
+    });
+  }
+
+  // 所有代码围栏共用一套规则：允许 0–3 个空格缩进、反引号/波浪线以及
+  // >=3 字符的围栏。结束围栏必须同字符、长度不小于开头且不带其他内容。
+  // 在媒体/公式提取之前整体保护源码，避免示例被渲染为图片或公式。
+  const FENCE_PH = "\u0004";
+  const FENCE_LINE_RE = /^([ \t]*)\u0004(\d+)\u0004[ \t]*$/;
+
+  function openingFence(line: any): any {
+    const match = /^( {0,3})(`{3,}|~{3,})([^\n]*)$/.exec(line);
+    if (!match || (match[2][0] === "`" && match[3].includes("`"))) return null;
+    const info = match[3].trim();
+    return { indent: match[1].length, marker: match[2][0], length: match[2].length,
+      info: info, lang: info.split(/\s+/)[0] || "code" };
+  }
+
+  function closesFence(line: any, fence: any): boolean {
+    const match = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+    return !!match && match[1][0] === fence.marker && match[1].length >= fence.length;
+  }
+
+  function extractFencedBlocks(text: any): any {
+    const lines = text.split("\n"), blocks: any[] = [], output: any[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const fence = openingFence(lines[i]);
+      if (!fence) { output.push(lines[i]); continue; }
+      const prefix = " ".repeat(fence.indent), body: any[] = [];
+      i++;
+      while (i < lines.length && !closesFence(lines[i], fence)) {
+        // 只移除开头围栏引入的缩进；代码自身的额外缩进原样保留。
+        let remove = 0;
+        while (remove < fence.indent && lines[i][remove] === " ") remove++;
+        body.push(lines[i].slice(remove));
+        i++;
+      }
+      blocks.push({ ...fence, body: body, closed: i < lines.length });
+      output.push(prefix + FENCE_PH + (blocks.length - 1) + FENCE_PH);
+    }
+    return { text: output.join("\n"), blocks: blocks };
+  }
+
+  function unescapeTagText(text: any): string {
+    return String(text)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, "&");
+  }
+
+  // 还原被 escapeHtml 转义的文本到原始内容（用于 data-table-raw 等属性回读）
+  function unescapeHtml(text: any): string {
+    return String(text)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+
+  function parseMediaAttrs(attrText: any): any {
+    const attrs: any = {};
+    String(attrText || "").replace(MEDIA_ATTR_RE, function (_: any, name: any, value: any) {
+      attrs[name.toLowerCase()] = unescapeTagText(value);
+      return _;
+    });
+    return attrs;
+  }
+
+  function mediaKindLabel(kind: any): string {
+    if (kind === "image") return "🖼️ 图片";
+    if (kind === "audio") return "🎵 音频";
+    if (kind === "video") return "🎬 视频";
+    return "📄 PDF";
+  }
+
+  // 单个伪标签 → 媒体控件 HTML。只注入白名单属性（src/alt/title），
+  // 模型给出的 class/style/事件等一律丢弃；URL 经 escapeHtml 后入属性。
+  function buildMediaWidget(kind: any, attrs: any, rawTag: any): string {
+    const src = attrs.src || "";
+    const name = (attrs.alt || attrs.title || "").trim() ||
+      (src ? src.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "") || kind;
+    let resolved = "";
+    try { resolved = mediaResolver ? String(mediaResolver(kind, src) || "") : ""; } catch (_) { resolved = ""; }
+    const esc = escapeHtml;
+    const broken = resolved ? "" : " is-broken";
+    return (
+      '<div class="md-media md-media-' + kind + broken + '"' +
+      ' data-media-kind="' + kind + '"' +
+      ' data-media-src="' + esc(src) + '"' +
+      (resolved ? ' data-media-url="' + esc(resolved) + '"' : "") +
+      ' data-media-raw="' + esc(rawTag) + '">' +
+      (kind === "image"
+        ? '<img class="md-media-el" loading="lazy" alt="' + esc(name) + '"' +
+        (resolved ? ' src="' + esc(resolved) + '"' : "") + '>'
+        : kind === "video"
+          ? '<video class="md-media-el" controls preload="metadata"' +
+          (resolved ? ' src="' + esc(resolved) + '"' : "") + '></video>'
+          : kind === "audio"
+            ? '<div class="md-media-caption">' + mediaKindLabel(kind) + " · " + esc(name) + "</div>" +
+            '<audio class="md-media-el" controls preload="metadata"' +
+            (resolved ? ' src="' + esc(resolved) + '"' : "") + '></audio>'
+            : '<div class="md-media-caption">' + mediaKindLabel(kind) + " · " + esc(name) + "</div>") +
+      '<div class="md-media-actions">' +
+      '<button type="button" class="md-media-btn" data-media-action="preview">预览</button>' +
+      '<button type="button" class="md-media-btn" data-media-action="delete" title="不会删除实际文件">删除</button>' +
+      "</div>" +
+      '<div class="md-media-status">用户已删除/文件不存在</div>' +
+      "</div>"
+    );
+  }
+
+  // 代码围栏已整体提取，只把正文中的完整伪标签转成媒体控件。
+  // 流式中间态的未闭合标签仍按普通文本显示。
+  function extractMediaTags(escapedText: any): any {
+    const widgets: any[] = [];
+    const text = escapedText.replace(MEDIA_TAG_RE, function (match: any, kind: any, attrText: any, _body: any) {
+      if (match.includes(FENCE_PH)) return match;
+      widgets.push(buildMediaWidget(kind, parseMediaAttrs(attrText), unescapeTagText(match)));
+      return MEDIA_PH_OPEN + (widgets.length - 1) + MEDIA_PH_OPEN;
+    });
+    return { text: text, widgets: widgets };
+  }
+
+  function restoreMediaPlaceholders(html: any, widgets: any): string {
+    if (!widgets.length) return html;
+    const PH_RE = new RegExp(MEDIA_PH_OPEN + "(\\d+)" + MEDIA_PH_OPEN, "g");
+    // 独立成段的占位（常见形态）：控件替换整个 <p>，避免块级 div 嵌进段落
+    let out = html.replace(new RegExp("<p>" + MEDIA_PH_OPEN + "(\\d+)" + MEDIA_PH_OPEN + "</p>", "g"),
+      function (_: any, idx: any) {
+        const widget = widgets[Number(idx)];
+        return widget != null ? widget : "";
+      });
+    return out.replace(PH_RE, function (_: any, idx: any) {
+      const widget = widgets[Number(idx)];
+      return widget != null ? widget : "";
+    });
+  }
+
+  function renderInline(text: any): string {
+    // 先提取行内代码段做占位保护：避免代码内容中的 *、_、[、| 等
+    // 被后续粗斜体/链接/表格分列规则误处理
+    const codes: any[] = [];
+    let out = text.replace(/`([^`]+)`/g, function (match: any, code: any) {
+      codes.push(code);
+      return PH_OPEN + (codes.length - 1) + PH_CLOSE;
+    });
+    out = out
+      .replace(/\\\|/g, "|")
+      // 还原转义形态的 <br>：模型常在表格单元格内用 <br> 换行，md 源经
+      // escapeHtml 后已变成 &lt;br&gt; 字面文本。仅还原无属性的换行标签
+      // （安全标签，无法注入），其余 HTML 保持转义；行内代码已先行占位，
+      // 代码内容中的 &lt;br&gt; 不受影响、保持字面显示
+      .replace(/&lt;br\s*\/?&gt;/gi, "<br>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^\n]+)\*/g, "$1<em>$2</em>")
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return out.replace(new RegExp(PH_OPEN + "(\\d+)" + PH_CLOSE, "g"), function (_: any, idx: any) {
+      // 表格内行内代码的竖线以 \| 转义书写，渲染时还原为 |
+      return "<code>" + codes[Number(idx)].replace(/\\\|/g, "|") + "</code>";
+    });
+  }
+
+  // 表格行分列：先保护行内代码段与转义竖线（\|），再按剩余的 | 切分
+  function splitTableRow(line: any): any {
+    const placeholders: any[] = [];
+    const masked = line.replace(/`[^`]*`|\\\|/g, function (match: any) {
+      placeholders.push(match);
+      return PH_OPEN + (placeholders.length - 1) + PH_CLOSE;
+    });
+    const cells = masked.split("|").map(function (cell: any) {
+      return cell.trim();
+    });
+    // 去掉行首/行尾分隔竖线产生的空单元格（中间的空单元格是合法空列，保留）
+    if (cells.length && cells[0] === "") cells.shift();
+    if (cells.length && cells[cells.length - 1] === "") cells.pop();
+    return cells.map(function (cell: any) {
+      return cell.replace(new RegExp(PH_OPEN + "(\\d+)" + PH_CLOSE, "g"), function (_: any, idx: any) {
+        return placeholders[Number(idx)];
+      });
+    });
+  }
+
+  // 整行媒体占位行（提取伪标签后的常见形态）：一行恰好一个占位符
+  const MEDIA_LINE_RE = new RegExp("^" + MEDIA_PH_OPEN + "\\d+" + MEDIA_PH_OPEN + "$");
+
+  // 段落冲刷：连续的「整行媒体占位」各自独立成段（行间不插 <br>），渲染后
+  // 媒体控件成为相邻 inline-block 兄弟节点，容器 >680px 时可两列并排；
+  // 其余行仍合并为一个段落（行间 <br> 保持换行语义）
+  function flushParagraph(buf: any): string {
+    const out: any[] = [];
+    let textBuf: any[] = [];
+    buf.forEach(function (line: any) {
+      if (MEDIA_LINE_RE.test(line.trim())) {
+        if (textBuf.length) {
+          out.push("<p>" + textBuf.map(renderInline).join("<br>") + "</p>");
+          textBuf = [];
+        }
+        out.push("<p>" + line.trim() + "</p>");
+      } else {
+        textBuf.push(line);
+      }
+    });
+    if (textBuf.length) {
+      out.push("<p>" + textBuf.map(renderInline).join("<br>") + "</p>");
+    }
+    return out.join("");
+  }
+
+  // 表格操作按钮组：常驻「复制」+「更多」下拉（复制 Markdown / 复制图片 / 下载 Excel）。
+  // more 菜单展开/收起与点击行为在 app/messages_tables.ts 的事件委托中处理；
+  // 原始 md 表格文本经 escapeHtml 后存入 data-table-raw，复制/下载时还原使用
+  //（复制图片用不到 raw，保持菜单结构统一）。
+  function buildTableActions(rawTable: any): string {
+    const rawAttr = escapeHtml(rawTable);
+    return (
+      '<div class="md-table-actions">' +
+      '<button class="md-table-btn" type="button" data-table-action="copy">复制</button>' +
+      '<div class="md-table-more">' +
+      '<button class="md-table-btn md-table-more-btn" type="button" data-table-action="more"' +
+      ' aria-haspopup="menu" aria-expanded="false">更多 ▾</button>' +
+      '<div class="md-table-menu hidden" role="menu">' +
+      '<button type="button" role="menuitem" data-table-action="copy-md" data-table-raw="' + rawAttr + '">复制 Markdown</button>' +
+      '<button type="button" role="menuitem" data-table-action="copy-image">复制图片</button>' +
+      '<button type="button" role="menuitem" data-table-action="download-xlsx" data-table-raw="' + rawAttr + '">下载 Excel</button>' +
+      "</div>" +
+      "</div>" +
+      "</div>"
+    );
+  }
+
+  // 表格起始谓词：lines[idx] 含竖线且下一行是分隔行（|---|---| 或 ---|---）。
+  // 主循环与段落吞行共用同一判断——表格紧贴上一段落（模型偶发不输出空行）时，
+  // 段落吞行若不识别表格起始会把表头/分隔行/数据行全吞成一个 <p>（表现为
+  // 表格整段变成文本，小概率复现的"表格没有转化"即此因）
+  function isTableStart(lines: any, idx: any): boolean {
+    if (idx + 1 >= lines.length) return false;
+    if (!lines[idx].includes("|")) return false;
+    const next = lines[idx + 1];
+    return /^\|?[\s:|-]+\|?$/.test(next) && next.includes("-");
+  }
+
+  function renderTable(lines: any): any {
+    const rows = lines.map(splitTableRow);
+    const isDivider = rows.length > 1 && rows[1].every(function (c: any) { return /^:?-{2,}:?$/.test(c); });
+    if (!isDivider) return null;
+
+    let html = "<table><thead><tr>";
+    rows[0].forEach(function (c: any) { html += "<th>" + renderInline(c) + "</th>"; });
+    html += "</tr></thead><tbody>";
+    rows.slice(2).forEach(function (row: any) {
+      html += "<tr>";
+      row.forEach(function (c: any) { html += "<td>" + renderInline(c) + "</td>"; });
+      html += "</tr>";
+    });
+    html += "</tbody></table>";
+    // 独立滚动块：宽表格在自身容器内水平滚动，不撑破消息宽度
+    return (
+      '<div class="md-table-block">' +
+      '<div class="md-table-scroll">' + html + "</div>" +
+      buildTableActions(lines.join("\n")) +
+      "</div>"
+    );
+  }
+
+  // 代码块语言标签 → Prism 语言名（未收录的返回空串，按纯文本展示）
+  const LANG_MAP: any = {
+    python: "python", py: "python",
+    javascript: "javascript", js: "javascript", jsx: "javascript", mjs: "javascript",
+    typescript: "typescript", ts: "typescript", tsx: "typescript",
+    cpp: "cpp", "c++": "cpp", cc: "cpp", cxx: "cpp", c: "cpp", hpp: "cpp", h: "cpp",
+    java: "java",
+    csharp: "csharp", cs: "csharp",
+    css: "css",
+    less: "less",
+    scss: "scss", sass: "sass",
+    qss: "css",
+    qml: "qml",
+    markup: "markup", html: "markup", htm: "markup", xml: "markup", svg: "markup",
+    go: "go", golang: "go",
+    rust: "rust", rs: "rust",
+    bash: "bash", sh: "bash", shell: "bash", zsh: "bash",
+    json: "json", jsonc: "json", jsonl: "json",
+    cmake: "cmake", cmakelists: "cmake",
+    makefile: "makefile", make: "makefile",
+    docker: "docker", dockerfile: "docker",
+    yaml: "yaml", yml: "yaml",
+    ini: "ini", env: "ini", dotenv: "ini",
+    gitignore: "ignore", ignore: "ignore",
+  };
+  // diff 头部文件名扩展名 → Prism 语言名（推断 diff 内层语法）
+  const DIFF_EXTS: any = {
+    py: "python",
+    js: "javascript", mjs: "javascript", jsx: "javascript",
+    ts: "typescript", tsx: "typescript",
+    cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", h: "cpp", c: "cpp",
+    java: "java",
+    cs: "csharp",
+    css: "css",
+    less: "less",
+    scss: "scss", sass: "sass",
+    qss: "css",
+    qml: "qml",
+    html: "markup", htm: "markup",
+    go: "go",
+    rs: "rust",
+    sh: "bash", bash: "bash",
+    json: "json", jsonc: "json", jsonl: "json",
+    yaml: "yaml", yml: "yaml",
+    ini: "ini", env: "ini",
+    cmake: "cmake",
+    makefile: "makefile",
+    dockerfile: "docker",
+  };
+
+  function inferDiffLang(lines: any): string {
+    for (let k = 0; k < Math.min(lines.length, 30); k++) {
+      const m = lines[k].match(/diff --git a\/\S+ b\/(\S+)$|^\+\+\+ b\/(\S+)$|^--- a\/(\S+)$/);
+      if (!m) continue;
+      const file = m[1] || m[2] || m[3];
+      const ext = (file.split(".").pop() || "").toLowerCase();
+      if (DIFF_EXTS[ext]) return DIFF_EXTS[ext];
+      // 无扩展名的特殊文件名（Dockerfile / Makefile / CMakeLists.txt / .env）
+      const base = file.toLowerCase();
+      if (base.startsWith("dockerfile")) return "docker";
+      if (base.startsWith("makefile")) return "makefile";
+      if (base.startsWith("gnumakefile")) return "makefile";
+      if (base.startsWith("cmakelists")) return "cmake";
+      if (base.startsWith(".env")) return "ini";
+    }
+    return "";
+  }
+
+  function renderFencedBlock(block: any): string {
+    const lang = block.lang, langKey = lang.toLowerCase(), body = block.body;
+    // 流式半截媒体围栏先显示普通代码，确实闭合后才变成 SVG/Mermaid/Canvas 控件。
+    if (block.closed && block.info === lang && ["svg", "mermaid", "canvas"].includes(langKey)) {
+      let code = "";
+      if (langKey === "svg") {
+        let first = body.findIndex((line: any) => line.includes("&lt;svg")), last = -1;
+        for (let i = 0; i < body.length; i++) if (body[i].includes("&lt;/svg&gt;")) last = i;
+        if (first >= 0 && last >= first) code = body.slice(first, last + 1).join("\n");
+      } else {
+        code = body.join("\n").replace(/^\n+|\n+$/g, "");
+      }
+      if (code.trim()) return buildFenceWidget(langKey, unescapeTagText(code));
+    }
+    let prismLang = "";
+    if (langKey === "diff" || langKey === "patch") {
+      const inner = inferDiffLang(body);
+      prismLang = inner ? "diff-" + inner : "diff";
+    } else {
+      prismLang = LANG_MAP[langKey] || "";
+    }
+    const cls = prismLang ? ' class="language-' + prismLang + '"' : "";
+    return '<div class="codeblock"><div class="codeblock-head">' +
+      '<span class="codeblock-lang">' + lang + "</span></div>" +
+      '<button class="copy-btn" type="button" aria-label="复制代码">' +
+      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>' +
+      '<span class="copy-label">复制</span></button>' +
+      "<pre><code" + cls + ">" + body.join("\n") + "</code></pre></div>";
+  }
+
+  function render(src: any): string {
+    const escaped = escapeHtml(String(src || "").replace(/\r\n?/g, "\n"));
+    const fences = extractFencedBlocks(escaped);
+    const media = extractMediaTags(fences.text);
+    const math = mathExtract(media.text);
+    const text = math.text;
+    const lines = text.split("\n");
+    const html: any[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // 代码块（带语言标题栏 + 复制按钮）
+      const fenceMatch = FENCE_LINE_RE.exec(line);
+      if (fenceMatch && fences.blocks[Number(fenceMatch[2])]) {
+        html.push(renderFencedBlock(fences.blocks[Number(fenceMatch[2])]));
+        i++;
+        continue;
+      }
+
+      // 标题
+      const heading = line.match(/^(#{1,4})\s+(.*)$/);
+      if (heading) {
+        const level = heading[1].length;
+        html.push("<h" + level + ">" + renderInline(heading[2]) + "</h" + level + ">");
+        i++;
+        continue;
+      }
+
+      // 分割线
+      if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+        html.push("<hr>");
+        i++;
+        continue;
+      }
+
+      // 引用
+      if (/^&gt;\s?/.test(line)) {
+        const buf: any[] = [];
+        while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+          buf.push(lines[i].replace(/^&gt;\s?/, ""));
+          i++;
+        }
+        html.push("<blockquote>" + buf.map(renderInline).join("<br>") + "</blockquote>");
+        continue;
+      }
+
+      // 表格
+      if (isTableStart(lines, i)) {
+        const buf: any[] = [];
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+          buf.push(lines[i]);
+          i++;
+        }
+        const table = renderTable(buf);
+        if (table) {
+          html.push(table);
+          continue;
+        }
+        html.push("<p>" + buf.map(renderInline).join("<br>") + "</p>");
+        continue;
+      }
+
+      // 列表：缩进的代码围栏属于前一个列表项，保持编号和代码块的归属。
+      const listRE = /^\s*[-*+]\s+/.test(line) ? /^(\s*[-*+]\s+)(.*)$/ :
+        /^\s*\d+\.\s+/.test(line) ? /^(\s*\d+\.\s+)(.*)$/ : null;
+      if (listRE) {
+        const tag = /^\s*\d+\./.test(line) ? "ol" : "ul";
+        const buf: any[] = [];
+        while (i < lines.length && listRE.test(lines[i])) {
+          const item: any = listRE.exec(lines[i]);
+          let content = renderInline(item[2]);
+          i++;
+          // 空行后紧接同一列表项的代码块也可归入；不吞掉无关段落。
+          while (i < lines.length) {
+            let next = i;
+            while (next < lines.length && lines[next].trim() === "") next++;
+            const continued: any = next < lines.length && FENCE_LINE_RE.exec(lines[next]);
+            const block = continued && fences.blocks[Number(continued[2])];
+            if (!block || continued[1].length < item[1].length) break;
+            content += renderFencedBlock(block);
+            i = next + 1;
+          }
+          buf.push("<li>" + content + "</li>");
+        }
+        html.push("<" + tag + ">" + buf.join("") + "</" + tag + ">");
+        continue;
+      }
+
+      // 空行
+      if (line.trim() === "") {
+        i++;
+        continue;
+      }
+
+      // 普通段落（合并连续行；整行媒体占位各自独立成段，便于两列并排）。
+      // 吞行时若下一行开启一个表格（表头+分隔行紧贴无空行），立即停手把
+      // 表格留给主循环的表格分支，避免整张表被吸进 <p> 变成纯文本
+      const buf = [line];
+      i++;
+      while (
+        i < lines.length &&
+        lines[i].trim() !== "" &&
+        !/^(#{1,4}\s|&gt;|\s*[-*+]\s|\s*\d+\.\s)/.test(lines[i]) &&
+        !FENCE_LINE_RE.test(lines[i]) &&
+        !isTableStart(lines, i)
+      ) {
+        buf.push(lines[i]);
+        i++;
+      }
+      html.push(flushParagraph(buf));
+    }
+
+    return '<div class="md">' +
+      restoreMathPlaceholders(
+        restoreMediaPlaceholders(html.join(""), media.widgets),
+        math.items
+      ) + "</div>";
+  }
+
+  const api = {
+    render,
+    setMediaResolver,
+    unescapeHtml,
+    buildFenceWidget,
+    ensureMermaidLoaded,
+    renderMermaidInto,
+    fullscreenIcons: { expand: FULLSCREEN_ICON_EXPAND, compress: FULLSCREEN_ICON_COMPRESS },
+  };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = api;
+  } else {
+    global.Markdown = api;
+  }
+})(typeof self !== "undefined" ? self : globalThis);

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig.json",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // 源码与产物分离：src/**/*.ts -> js/**/*.js（镜像目录，浏览器路径不变）。
+    // rootDir 固定为 src，保证输出相对结构与输入一致（src/app/chat.ts -> js/app/chat.js）；
+    // allowJs 必须关闭，否则 tsc 会把 js/ 下的手写源（history_parse_async/worker）也当输入。
+    // 未迁移的 .js 不参与发射（浏览器继续直读源码）。
+    "allowJs": false,
+    "rootDir": "src",
+    "outDir": "js",
+    "noEmit": false,
+    "removeComments": false,
+    "sourceMap": false
+  },
+  // 已迁移清单：每转完一个文件就加一行（globals.d.ts 只提供声明，不发射）
+  // 注意：include 里是 src/ 路径（源码），产物一律发射到 js/ 同名位置
+  "include": ["src/globals.d.ts", "src/quote_utils.ts", "src/clipboard_media_utils.ts", "src/session_utils.ts", "src/session_list_utils.ts", "src/session_group_utils.ts", "src/zoom_utils.ts", "src/widget_reuse.ts", "src/history_search.ts", "src/task_state.ts", "src/read_media_strip.ts", "src/file_history_sync.ts", "src/theme.ts", "src/table_canvas.ts", "src/history_parser.ts", "src/account_panel_client.ts", "src/recovery_codes.ts", "src/username_management.ts", "src/mfa_enrollment.ts", "src/login_mfa_management.ts", "src/mfa_management.ts", "src/account.ts", "src/account_preferences.ts", "src/security_client.ts", "src/login.ts", "src/app/user_profile.ts", "src/app/account_panel.ts", "src/app/model_panel_modal.ts", "src/app/chat_settings_modal.ts", "src/app/session_activity.ts", "src/app/history_search.ts", "src/app/mcp_schema_form.ts", "src/app/context_panel.ts", "src/app/permissions.ts", "src/app/session_archives.ts", "src/app/task_templates.ts", "src/app/message_diff.ts", "src/app/history_pages.ts", "src/app/workdir.ts", "src/app/task_status.ts", "src/app/task_costs.ts", "src/app/terminals.ts", "src/app/stats.ts", "src/app/process_groups.ts", "src/app/slash_commands.ts", "src/app/history_scroll.ts", "src/app/round_fold.ts", "src/app/compaction.ts", "src/app/mcp_diagnostics.ts", "src/app/history.ts", "src/app/quotes.ts", "src/app/builtin.ts", "src/app/media.ts", "src/app/session_groups.ts", "src/app/filehistory.ts", "src/app/tools.ts", "src/app/skills.ts", "src/app/stream_pipeline.ts", "src/app/model_panel.ts", "src/app/core.ts", "src/api.ts", "src/app/chat.ts", "src/app/editor.ts", "src/app/sessions.ts", "src/app/composer.ts", "src/app/messages_history.ts", "src/app/messages_render.ts", "src/app/messages_edit.ts", "src/app/messages_tools.ts", "src/app/messages_widgets.ts", "src/app/messages_canvas.ts", "src/app/messages_tables.ts", "src/app/messages_nav.ts", "src/markdown.ts", "src/format_utils.ts", "src/slash_command_utils.ts", "src/history_scroll_model.ts", "src/stream_replay_dedup.ts", "src/speech_language.ts", "src/tool_approval_state.ts", "src/app.ts"]
+}

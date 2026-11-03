@@ -1,0 +1,250 @@
+/** One compact status row for the visible session. No background polling. */
+(function (App: any) {
+  "use strict";
+  const rows = new Map<string, any>();
+  const host = document.getElementById("taskStatus") as HTMLElement;
+  if (!host) return;
+  const label = host.querySelector(".task-status-label") as HTMLElement;
+  const detail = host.querySelector(".task-status-detail") as HTMLElement;
+  const reconnect = host.querySelector("button") as HTMLButtonElement;
+  let serial = 0, reconnecting = false;
+  const VIS_KEY = "ytools-task-status-visible";
+  let statusVisible = true;
+  try {
+    const saved = localStorage.getItem(VIS_KEY);
+    if (saved === "0" || saved === "false") statusVisible = false;
+  } catch (_) { /* 私密模式等无法访问本地存储时默认显示 */ }
+  function current(handle: any): boolean { return handle && rows.get(handle.sessionId) === handle; }
+  window.addEventListener("ytools-preferences-change", () => {
+    try { statusVisible = !["0", "false"].includes(localStorage.getItem(VIS_KEY) as string); refresh(); } catch (_) { /* restricted storage */ }
+  });
+  function publish(handle: any): void {
+    if (App.sessionActivity) App.sessionActivity.note(handle.sessionId, handle.value, handle.id);
+  }
+  // 不确定态有界自动确认：后端突然中断后不再永远停在“运行中”等待用户
+  // 手动处理。进入不确定态即退避重试（5s/15s/30s，共 3 次）：后端恢复且无
+  // 任务 → 自动收尾并重载对齐；任务仍在 → 保持不确定态停查；后端仍不可
+  // 达 → 耗尽后停查，保留手动停止/重连/发送入口。与 session_activity 的
+  // 退避同步同构，但只在不确定态存续期间生效，不做常驻轮询。
+  const UNCERTAIN_RETRY_DELAYS = [5000, 15000, 30000];
+  const uncertainWatches = new Map<string, { timer: any; attempt: number }>();
+  function cancelUncertainWatch(sid?: string): void {
+    if (sid) {
+      const watch = uncertainWatches.get(sid);
+      if (watch) clearTimeout(watch.timer);
+      uncertainWatches.delete(sid);
+      return;
+    }
+    uncertainWatches.forEach(function (watch) { clearTimeout(watch.timer); });
+    uncertainWatches.clear();
+  }
+  function watchUncertain(sid: string): void {
+    if (!sid || uncertainWatches.has(sid)) return;
+    const watch: { timer: any; attempt: number } = { timer: 0, attempt: 0 };
+    uncertainWatches.set(sid, watch);
+    const tick = async function (): Promise<void> {
+      if (uncertainWatches.get(sid) !== watch || !isUncertain(sid)) return;
+      try {
+        const resolved = await reconcileUncertain(sid);
+        cancelUncertainWatch(sid);
+        if (!resolved) { refresh(); return; }
+        if (App.state.sessionId === sid) {
+          if (App.refreshComposerButtons) App.refreshComposerButtons();
+          if (typeof App.openSession === "function") setTimeout(function () { App.openSession(sid); }, 0);
+        } else {
+          refresh();
+        }
+      } catch (_) {
+        // 后端仍不可达：有剩余次数则继续退避，否则停查（保持手动入口）
+        if (uncertainWatches.get(sid) === watch) {
+          if (watch.attempt < UNCERTAIN_RETRY_DELAYS.length && isUncertain(sid)) {
+            watch.timer = setTimeout(tick, UNCERTAIN_RETRY_DELAYS[watch.attempt++]);
+          } else {
+            cancelUncertainWatch(sid);
+          }
+        }
+        refresh();
+      }
+    };
+    watch.timer = setTimeout(tick, UNCERTAIN_RETRY_DELAYS[watch.attempt++]);
+  }
+  // 回到页面时补一次确认：后端已恢复则自动收尾，无需手动点重连。
+  // 观察器运行中则交由它处理，避免重复确认。
+  async function recheckVisibleUncertain(): Promise<void> {
+    const sid = App.state.sessionId;
+    if (!sid || !isUncertain(sid) || uncertainWatches.has(sid)) return;
+    try {
+      const resolved = await reconcileUncertain(sid);
+      if (resolved && App.state.sessionId === sid) {
+        if (App.refreshComposerButtons) App.refreshComposerButtons();
+        if (typeof App.openSession === "function") App.openSession(sid);
+      }
+    } catch (_) { /* 后端仍不可用：保持不确定态 */ }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) recheckVisibleUncertain();
+  });
+  window.addEventListener("focus", recheckVisibleUncertain);
+  function refresh(): void {
+    if (!statusVisible) {
+      if (!host.hidden) host.hidden = true;
+      return;
+    }
+    const entry = rows.get(App.state.sessionId);
+    const v = TaskState.view(entry && entry.value);
+    if (host.hidden !== !!v.hidden) host.hidden = !!v.hidden;
+    if (v.hidden) return;
+    if (host.dataset.phase !== v.phase) host.dataset.phase = v.phase;
+    if (host.dataset.tone !== v.tone) host.dataset.tone = v.tone;
+    if (label.textContent !== v.label) label.textContent = v.label;
+    let detailText = v.detail;
+    if (v.phase === "disconnected" && uncertainWatches.has(App.state.sessionId)) {
+      detailText += "，正在自动重试连接";
+    }
+    if (detail.textContent !== detailText) detail.textContent = detailText;
+    const title = [v.detail, v.error].filter(Boolean).join("；");
+    if (host.title !== title) host.title = title;
+    if (reconnect.hidden !== !v.reconnect) reconnect.hidden = !v.reconnect;
+    if (reconnect.disabled !== reconnecting) reconnect.disabled = reconnecting;
+    const text = reconnecting ? "连接中…" : "重新连接";
+    if (reconnect.textContent !== text) reconnect.textContent = text;
+  }
+  function update(handle: any, action: any): void {
+    if (!current(handle)) return;
+    handle.value = TaskState.reduce(handle.value, action);
+    publish(handle);
+    // 不确定态存续 ⟺ 自动确认生效：进入启动退避重试，收尾/新任务即停
+    if (isUncertain(handle.sessionId)) watchUncertain(handle.sessionId);
+    else cancelUncertainWatch(handle.sessionId);
+    refresh();
+  }
+  function begin(sessionId: string): any {
+    cancelUncertainWatch(sessionId);
+    const entry = { sessionId, id: ++serial, value: TaskState.initial() };
+    rows.set(sessionId, entry);
+    publish(entry);
+    if (rows.size > 64) {
+      const old = [...rows.keys()].find(sid => sid !== App.state.sessionId && sid !== sessionId);
+      if (old) rows.delete(old);
+    }
+    refresh(); return entry;
+  }
+  async function end(handle: any, completed: any, error: any, detached: any): Promise<boolean> {
+    if (!current(handle) || detached || handle.value.connection === "background") return false;
+    if (error && error.status >= 400 && error.status < 500) update(handle, { type: "frame", data: { error: error.message } });
+    update(handle, { type: "end", completed: !!completed });
+    if (error && !handle.value.error) handle.value.error = String(error.message || error).slice(0, 300);
+    refresh();
+    // A dropped browser connection cannot establish whether the task ended.
+    // Reconnect only attaches (messages=[]); it never resends the user prompt.
+    return !!completed || handle.value.stopped;
+  }
+  function isUncertain(sid: string): boolean {
+    const h = rows.get(sid);
+    return !!h && !h.value.terminal && h.value.connection === "disconnected";
+  }
+  function checked(sid: string, data: any): void {
+    const h = rows.get(sid);
+    if (h && !h.value.terminal && ["background", "disconnected"].includes(h.value.connection) && data && !data.running) update(h, { type: "ended" });
+  }
+  // 后端中断/重启后旧任务已消失：向后端确认一次；无任务则收尾为已结束。
+  // 返回 true=已无不确定态（可继续发送），false=任务仍在运行；后端不可用时抛错。
+  async function reconcileUncertain(sid: string): Promise<boolean> {
+    if (!isUncertain(sid)) return true;
+    const status = await API.streamStatus(sid);
+    checked(sid, status);
+    return !isUncertain(sid);
+  }
+  function snapshot(sessionId: string, data: any): void {
+    if (!data || sessionId !== App.state.sessionId) return;
+    const listening = App.state.streaming && App.state.streamingSession === sessionId;
+    const suspended = (data.tasks || []).find((t: any) => t.state === "suspended");
+    if (suspended) {
+      const entry = rows.get(sessionId) || begin(sessionId);
+      if (entry.value.connection !== "live" && entry.value.connection !== "connecting") update(entry, { type: "suspended" });
+      else if (!listening) update(entry, { type: "suspended" });
+    } else {
+      const entry = rows.get(sessionId);
+      if (entry && entry.value.phase === "suspended" && !listening) update(entry, { type: "ended" });
+    }
+  }
+  reconnect.addEventListener("click", async function () {
+    const sid = App.state.sessionId;
+    if (!sid || reconnecting) return;
+    reconnecting = true; refresh();
+    try {
+      const entry = rows.get(sid);
+      const compact = entry && entry.kind === "compaction";
+      const status = await (compact ? API.manualCompactionStatus(sid) : API.streamStatus(sid));
+      if (App.state.sessionId !== sid) return;
+      if (rows.get(sid) !== entry) return;
+      if (status && status.running) {
+        if (compact) await App.attachManualCompaction(sid);
+        else await App.attachStreamSession(sid);
+      }
+      else {
+        update(rows.get(sid), { type: "ended" });
+        await App.openSession(sid);
+      }
+    } catch (error) { App.toast("重新连接失败：" + (error as Error).message); }
+    finally { reconnecting = false; refresh(); }
+  });
+  function isStatusVisible(): boolean { return statusVisible; }
+  function setStatusVisible(visible: any): boolean {
+    statusVisible = !!visible;
+    try { localStorage.setItem(VIS_KEY, statusVisible ? "1" : "0"); } catch (_) { /* 存储不可用时仅本次生效 */ }
+    refresh();
+    return statusVisible;
+  }
+  function toggleStatusVisible(): boolean { return setStatusVisible(!statusVisible); }
+  // 手动压缩是独立 SSE 流（不在聊天流内），单独建一条任务行以便状态条实时显示
+  // “压缩上下文 · 跨轮历史/官方压缩窗口”，结束后收尾为已完成/失败/已停止。
+  function compactBegin(sessionId: string): any {
+    const handle = begin(sessionId);
+    handle.kind = "compaction";
+    handle.value = TaskState.reduce(handle.value, { type: "connection", value: "live" });
+    handle.value = TaskState.reduce(handle.value, {
+      type: "frame",
+      data: { event: "context_compaction", phase: "start", scope: "session" }
+    });
+    publish(handle);
+    refresh();
+    return handle;
+  }
+  function compactEvent(handle: any, data: any): void {
+    if (!current(handle) || !data) return;
+    update(handle, { type: "frame", data });
+  }
+  function compactEnd(handle: any, outcome: any): boolean {
+    if (!current(handle)) return false;
+    outcome = outcome || {};
+    if (outcome.missing) {
+      update(handle, { type: "ended" });
+    } else if (outcome.disconnected) {
+      update(handle, { type: "end", completed: false });
+    } else if (outcome.stopped) {
+      update(handle, { type: "stopped" });
+    } else if (outcome.error) {
+      update(handle, { type: "frame", data: { error: String(outcome.error).slice(0, 300) } });
+      update(handle, { type: "end", completed: true });
+      if (!handle.value.error) handle.value.error = String(outcome.error).slice(0, 300);
+    } else {
+      update(handle, { type: "end", completed: true });
+    }
+    refresh();
+    return true;
+  }
+  App.taskStatus = {
+    begin, refresh, end, snapshot,
+    isUncertain, checked, reconcileUncertain,
+    event: (h: any, evt: any) => { if (current(h) && evt && evt.type !== "done") update(h, { type: "frame", data: evt.data }); },
+    connected: (h: any) => update(h, { type: "connection", value: "live" }),
+    detach: (h: any) => update(h, { type: "connection", value: "background" }),
+    isStopping: (sid: string) => { const h = rows.get(sid); return !!h && h.value.phase === "stopping"; },
+    stopping: (sid: string) => { const h = rows.get(sid); update(h, { type: "stopping" }); return h; },
+    stopped: (sid: string, h: any) => update(h || rows.get(sid), { type: "stopped" }),
+    stopFailed: (sid: string, error: any, h: any) => update(h || rows.get(sid), { type: "stop_failed", error: error.message }),
+    compactBegin, compactEvent, compactEnd,
+    isStatusVisible, setStatusVisible, toggleStatusVisible,
+  };
+})((window as unknown as { App: any }).App);

@@ -1,3 +1,4 @@
+"use strict";
 /**
  * 媒体与文档
  * - 媒体/文档预览模态框（图片/视频/音频/PDF/文本/下载兜底，media:// 解析）
@@ -5,565 +6,647 @@
  * 依赖：app/core.js、API；App.*：composer 模块（发送按钮状态）
  */
 (function (App) {
-  "use strict";
-  const {
-    state, el, toast, $,
-    composerAttachments, composer, input, MAX_PENDING_MEDIA,
-    syncComposerAttachmentBlocks,
-    MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS, mediaPreviewModal, mediaPreviewBody,
-    mediaPreviewTitle, mediaPreviewZoom, mediaPreviewZoomIn, mediaPreviewZoomOut,
-    mediaPreviewZoomLabel
-  } = App;
-
-  // ---------- 媒体/文档预览模态框 ----------
-  const PREVIEW_IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"];
-  const PREVIEW_VIDEO_EXTS = ["mp4", "webm", "mov"];
-  const PREVIEW_AUDIO_EXTS = ["wav", "mp3", "m4a", "ogg", "flac"];
-  const PREVIEW_TEXT_EXTS = ["txt", "md", "json", "log", "csv"];
-
-  function previewKindForName(name) {
-    const ext = (String(name || "").split(".").pop() || "").toLowerCase();
-    if (PREVIEW_IMAGE_EXTS.indexOf(ext) >= 0) return "image";
-    if (PREVIEW_VIDEO_EXTS.indexOf(ext) >= 0) return "video";
-    if (PREVIEW_AUDIO_EXTS.indexOf(ext) >= 0) return "audio";
-    if (ext === "pdf") return "pdf";
-    if (PREVIEW_TEXT_EXTS.indexOf(ext) >= 0) return "text";
-    return "download";
-  }
-
-  function closeMediaPreview() {
-    // 销毁内部媒体元素：暂停并移除 src，关闭预览即停止播放/收听
-    mediaPreviewBody.querySelectorAll("video, audio").forEach(function (media) {
-      try { media.pause(); } catch (_) { /* ignore */ }
-      media.removeAttribute("src");
-      try { media.load(); } catch (_) { /* ignore */ }
-    });
-    resetPreviewZoom();
-    mediaPreviewZoom.classList.add("hidden");
-    mediaPreviewBody.classList.remove("is-zoomable");
-    mediaPreviewBody.innerHTML = "";
-    mediaPreviewTitle.textContent = "";
-    mediaPreviewModal.classList.add("hidden");
-    mediaPreviewModal.setAttribute("aria-hidden", "true");
-  }
-
-  function openMediaPreview(options) {
-    const type = options.type || "download";
-    mediaPreviewTitle.textContent = options.title || "";
-    mediaPreviewBody.innerHTML = "";
-    // 图片/视频启用缩放工具栏；每次打开新媒体都从适应窗口开始
-    const zoomable = type === "image" || type === "video";
-    mediaPreviewZoom.classList.toggle("hidden", !zoomable);
-    mediaPreviewBody.classList.toggle("is-zoomable", zoomable);
-    resetPreviewZoom();
-    if (type === "image") {
-      const img = el("img", "media-preview-image");
-      img.src = options.src;
-      img.alt = options.title || "图片预览";
-      mediaPreviewBody.appendChild(img);
-    } else if (type === "video") {
-      const video = el("video", "media-preview-video");
-      video.src = options.src;
-      video.controls = true;
-      video.autoplay = true;
-      video.playsInline = true;
-      mediaPreviewBody.appendChild(video);
-    } else if (type === "audio") {
-      const wrap = el("div", "media-preview-audio");
-      wrap.appendChild(el("div", "media-preview-audio-icon", "🎵"));
-      wrap.appendChild(el("div", "media-preview-audio-name", options.title || "音频"));
-      const audio = el("audio");
-      audio.src = options.src;
-      audio.controls = true;
-      audio.autoplay = true;
-      wrap.appendChild(audio);
-      mediaPreviewBody.appendChild(wrap);
-    } else if (type === "pdf") {
-      // 浏览器原生 PDF 查看器
-      const frame = el("iframe", "media-preview-frame");
-      frame.src = options.src;
-      mediaPreviewBody.appendChild(frame);
-    } else if (type === "text") {
-      const pre = el("pre", "media-preview-text", "加载中…");
-      mediaPreviewBody.appendChild(pre);
-      fetch(options.src).then(function (res) {
-        if (!res.ok) throw new Error(res.status + " " + res.statusText);
-        return res.text();
-      }).then(function (text) {
-        pre.textContent = text || "（空文件）";
-      }).catch(function (err) {
-        pre.textContent = "读取失败：" + err.message;
-      });
-    } else {
-      const wrap = el("div", "media-preview-download");
-      wrap.appendChild(el("div", "media-preview-download-tip", "该文件类型不支持在线预览，可下载后查看"));
-      const btn = el("a", "media-preview-download-btn", "下载文件");
-      btn.href = options.src;
-      btn.download = options.title || "file";
-      wrap.appendChild(btn);
-      mediaPreviewBody.appendChild(wrap);
+    "use strict";
+    const { state, el, toast, $, composerAttachments, composer, input, MAX_PENDING_MEDIA, syncComposerAttachmentBlocks, MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS, mediaPreviewModal, mediaPreviewBody, mediaPreviewTitle, mediaPreviewZoom, mediaPreviewZoomIn, mediaPreviewZoomOut, mediaPreviewZoomLabel } = App;
+    // ---------- 媒体/文档预览模态框 ----------
+    const PREVIEW_IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"];
+    const PREVIEW_VIDEO_EXTS = ["mp4", "webm", "mov"];
+    const PREVIEW_AUDIO_EXTS = ["wav", "mp3", "m4a", "ogg", "flac"];
+    const PREVIEW_TEXT_EXTS = ["txt", "md", "json", "log", "csv"];
+    function previewKindForName(name) {
+        const ext = (String(name || "").split(".").pop() || "").toLowerCase();
+        if (PREVIEW_IMAGE_EXTS.indexOf(ext) >= 0)
+            return "image";
+        if (PREVIEW_VIDEO_EXTS.indexOf(ext) >= 0)
+            return "video";
+        if (PREVIEW_AUDIO_EXTS.indexOf(ext) >= 0)
+            return "audio";
+        if (ext === "pdf")
+            return "pdf";
+        if (PREVIEW_TEXT_EXTS.indexOf(ext) >= 0)
+            return "text";
+        return "download";
     }
-    mediaPreviewModal.classList.remove("hidden");
-    mediaPreviewModal.setAttribute("aria-hidden", "false");
-  }
-
-  // ---------- 预览缩放（图片/视频 pan & zoom） ----------
-  // transform 写法 translate(tx,ty) scale(s)：位移取屏幕像素（不受倍率影响），
-  // 缩放中心为容器中心；档位/几何计算复用 ZoomUtils（与站内三控件一致）。
-  const ZoomUtils = window.ZoomUtils;
-  const previewZoom = { scale: 1, tx: 0, ty: 0 };
-  let previewZoomDrag = null;
-  // 视频原生控制条高度：底部该区域内不劫持 mousedown/dblclick，留给控制条
-  const PREVIEW_VIDEO_CONTROLS_ZONE = 48;
-
-  function previewZoomTarget() {
-    return mediaPreviewBody.querySelector("img.media-preview-image, video.media-preview-video");
-  }
-
-  function applyPreviewZoom() {
-    mediaPreviewZoomLabel.textContent = ZoomUtils.percentFromScale(previewZoom.scale) + "%";
-    mediaPreviewZoomIn.disabled = !ZoomUtils.canStep(previewZoom.scale, +1);
-    mediaPreviewZoomOut.disabled = !ZoomUtils.canStep(previewZoom.scale, -1);
-    const target = previewZoomTarget();
-    if (!target) return;
-    target.style.transform = "translate(" + previewZoom.tx + "px, " + previewZoom.ty + "px) scale(" + previewZoom.scale + ")";
-    target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
-  }
-
-  function clampPreviewZoomPan() {
-    const target = previewZoomTarget();
-    if (!target || !target.getBoundingClientRect) return;
-    const rect = target.getBoundingClientRect();
-    const bodyRect = mediaPreviewBody.getBoundingClientRect();
-    // 布局盒不受 transform 影响：当前盒 / scale 反推未缩放尺寸
-    const baseW = rect.width / previewZoom.scale;
-    const baseH = rect.height / previewZoom.scale;
-    const clamped = ZoomUtils.clampPan(previewZoom.tx, previewZoom.ty,
-      baseW * previewZoom.scale, baseH * previewZoom.scale,
-      bodyRect.width, bodyRect.height);
-    previewZoom.tx = clamped.tx;
-    previewZoom.ty = clamped.ty;
-  }
-
-  // 以锚点（client 坐标）为中心缩放；锚点 null 表示中心缩放
-  function previewZoomBy(factor, clientX, clientY) {
-    if (!previewZoomTarget()) return;
-    let ax = null, ay = null, cx = 0, cy = 0;
-    if (clientX != null && clientY != null) {
-      const bodyRect = mediaPreviewBody.getBoundingClientRect();
-      ax = clientX - bodyRect.left;
-      ay = clientY - bodyRect.top;
-      cx = bodyRect.width / 2;
-      cy = bodyRect.height / 2;
-    }
-    const next = ZoomUtils.zoomAtPoint(previewZoom.scale, factor, ax, ay, cx, cy,
-      previewZoom.tx, previewZoom.ty);
-    previewZoom.scale = next.scale;
-    previewZoom.tx = next.tx;
-    previewZoom.ty = next.ty;
-    clampPreviewZoomPan();
-    applyPreviewZoom();
-  }
-
-  function previewZoomStep(dir) {
-    previewZoomBy(ZoomUtils.stepScale(previewZoom.scale, dir) / previewZoom.scale, null, null);
-  }
-
-  function resetPreviewZoom() {
-    previewZoom.scale = 1;
-    previewZoom.tx = 0;
-    previewZoom.ty = 0;
-    previewZoomDrag = null;
-    mediaPreviewBody.classList.remove("is-dragging");
-    const target = previewZoomTarget();
-    if (target) {
-      target.style.transform = "";
-      target.style.cursor = "";
-    }
-    applyPreviewZoom();
-  }
-
-  function previewInVideoControlsZone(target, clientY) {
-    if (!target || target.tagName !== "VIDEO" || !target.getBoundingClientRect) return false;
-    return clientY > target.getBoundingClientRect().bottom - PREVIEW_VIDEO_CONTROLS_ZONE;
-  }
-
-  mediaPreviewZoomIn.addEventListener("click", function () { previewZoomStep(+1); });
-  mediaPreviewZoomOut.addEventListener("click", function () { previewZoomStep(-1); });
-  mediaPreviewZoomLabel.addEventListener("click", resetPreviewZoom);
-
-  // Ctrl+滚轮：以鼠标位置为中心缩放；普通滚轮不拦截（文本预览仍可滚动）
-  mediaPreviewBody.addEventListener("wheel", function (e) {
-    if (!e.ctrlKey && !e.metaKey) return;
-    if (!previewZoomTarget()) return;
-    e.preventDefault();
-    previewZoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
-  }, { passive: false });
-
-  // 双击：在 2x 与适应窗口之间切换（以点击点为中心放大）
-  mediaPreviewBody.addEventListener("dblclick", function (e) {
-    const target = previewZoomTarget();
-    if (!target || e.target !== target) return;
-    if (previewInVideoControlsZone(target, e.clientY)) return;
-    if (previewZoom.scale > 1.01) resetPreviewZoom();
-    else previewZoomBy(2 / previewZoom.scale, e.clientX, e.clientY);
-  });
-
-  // 放大后按住拖动：document 级 move/up，移出弹窗也能继续拖
-  mediaPreviewBody.addEventListener("mousedown", function (e) {
-    if (e.button !== 0 || previewZoomDrag) return;
-    const target = previewZoomTarget();
-    if (!target || e.target !== target || previewZoom.scale <= 1) return;
-    if (previewInVideoControlsZone(target, e.clientY)) return;
-    previewZoomDrag = { x: e.clientX, y: e.clientY, tx: previewZoom.tx, ty: previewZoom.ty };
-    mediaPreviewBody.classList.add("is-dragging");
-    target.style.cursor = "grabbing";
-    e.preventDefault();
-  });
-  document.addEventListener("mousemove", function (e) {
-    if (!previewZoomDrag) return;
-    previewZoom.tx = previewZoomDrag.tx + (e.clientX - previewZoomDrag.x);
-    previewZoom.ty = previewZoomDrag.ty + (e.clientY - previewZoomDrag.y);
-    clampPreviewZoomPan();
-    applyPreviewZoom();
-  });
-  document.addEventListener("mouseup", function () {
-    if (!previewZoomDrag) return;
-    previewZoomDrag = null;
-    mediaPreviewBody.classList.remove("is-dragging");
-    const target = previewZoomTarget();
-    if (target) target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
-  });
-
-  // media:// 引用 / data: / http(s) → 可访问的资源 URL
-  function resolveMediaSrc(mediaRef, sessionId) {
-    if (typeof mediaRef !== "string" || !mediaRef) return null;
-    if (mediaRef.indexOf("media://") === 0) {
-      return API.sessionMediaUrl(sessionId || state.sessionId, mediaRef.slice("media://".length));
-    }
-    if (/^(data:|https?:)/.test(mediaRef)) return mediaRef;
-    return null;
-  }
-
-  // 媒体伪标签 src → 可访问 URL（markdown.js 以 (kind, src) 调用）：
-  // media:// → 会话媒体端点；http(s)/data 原样；其它按本地路径交给
-  // /file/get_local_file（后端按会话生效工作目录解析相对路径）
-  function resolveMediaTagSrc(kind, src) {
-    void kind;
-    if (typeof src !== "string" || !src) return "";
-    if (src.indexOf("media://") === 0) {
-      return API.sessionMediaUrl(state.sessionId, src.slice("media://".length));
-    }
-    if (/^data:/i.test(src)) return src;
-    return API.permissionMediaUrl(state.sessionId, src);
-  }
-
-  function openMediaPreviewForDocument(doc) {
-    if (!doc) return;
-    if (!doc.stored_name) {
-      toast("该文件上传于旧版本（未保存原始文件），无法预览");
-      return;
-    }
-    const url = API.sessionDocumentUrl(state.sessionId, doc.stored_name);
-    const kind = previewKindForName(doc.stored_name);
-    openMediaPreview({ type: kind, src: url, title: doc.filename });
-  }
-
-  $("#mediaPreviewClose").addEventListener("click", closeMediaPreview);
-  $("#mediaPreviewBackdrop").addEventListener("click", closeMediaPreview);
-  document.addEventListener("keydown", function (e) {
-    if (mediaPreviewModal.classList.contains("hidden")) return;
-    if (e.key === "Escape") {
-      closeMediaPreview();
-      return;
-    }
-    // 预览缩放快捷键（仅弹窗打开时）：Ctrl+加/减步进，Ctrl+0 重置
-    if (!e.ctrlKey && !e.metaKey) return;
-    if (e.key === "+" || e.key === "=") {
-      e.preventDefault();
-      previewZoomStep(+1);
-    } else if (e.key === "-" || e.key === "_") {
-      e.preventDefault();
-      previewZoomStep(-1);
-    } else if (e.key === "0") {
-      e.preventDefault();
-      resetPreviewZoom();
-    }
-  });
-
-  // ---------- 待发送媒体附件（粘贴/选择） ----------
-  function mediaKindOf(filename) {
-    const ext = (filename.split(".").pop() || "").toLowerCase();
-    for (const kind in MEDIA_EXTENSIONS) {
-      if (MEDIA_EXTENSIONS[kind].indexOf(ext) >= 0) return kind;
-    }
-    return null;
-  }
-
-  // ---------- 发送前图片压缩 ----------
-  // 与后端 IMAGE_THUMBNAIL_* 一致：>2MB 的图片在发送前用 canvas 重采样为
-  // 长边 ≤1568px、JPEG 质量 0.85，通常可缩到原图的 1/5~1/10；GIF 跳过
-  // （canvas 只取第一帧），压缩结果反而更大时保留原文件。
-  const COMPRESS_THRESHOLD_BYTES = 2 * 1024 * 1024;
-  const COMPRESS_MAX_EDGE = 1568;
-  const COMPRESS_JPEG_QUALITY = 0.85;
-
-  function compressImageFile(file) {
-    if (!file || file.size <= COMPRESS_THRESHOLD_BYTES) return Promise.resolve(file);
-    const ext = (file.name.split(".").pop() || "").toLowerCase();
-    if (ext === "gif") return Promise.resolve(file);
-    if (typeof createImageBitmap === "undefined" || typeof document === "undefined") {
-      return Promise.resolve(file);
-    }
-    return createImageBitmap(file).then(function (bitmap) {
-      try {
-        const scale = Math.min(1, COMPRESS_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        bitmap.close();
-        return new Promise(function (resolve) {
-          canvas.toBlob(function (blob) {
-            if (!blob || blob.size >= file.size) {
-              resolve(file);  // 压缩无收益：保留原文件
-              return;
+    function closeMediaPreview() {
+        // 全屏中关闭：先退全屏，否则弹窗 hidden 后浏览器仍卡在全屏黑屏
+        if (document.fullscreenElement) {
+            try {
+                document.exitFullscreen().catch(function () { });
             }
-            const baseName = file.name.replace(/\.[^.]+$/, "");
-            resolve(new File([blob], baseName + "_compressed.jpg", {
-              type: "image/jpeg", lastModified: Date.now(),
-            }));
-          }, "image/jpeg", COMPRESS_JPEG_QUALITY);
-        });
-      } catch (_) {
-        try { bitmap.close(); } catch (_e) { /* ignore */ }
-        return file;
-      }
-    }).catch(function () { return file; });
-  }
-
-  async function prepareMediaFile(file) {
-    if (!file) return null;
-    const kind = mediaKindOf(file.name || "");
-    if (!kind) {
-      toast("不支持的媒体类型：" + (file.name || "未命名文件"));
-      return null;
-    }
-    let finalFile = file;
-    if (kind === "image") finalFile = await compressImageFile(file);
-    // 动图 gif 按视频档（600MB）预检：发送/读取侧同样归视频档（转码前先缩放）
-    const extLower = ((file.name || "").split(".").pop() || "").toLowerCase();
-    const limitKind = extLower === "gif" ? "video" : kind;
-    const sizeLimit = MEDIA_SIZE_LIMITS[limitKind] || MEDIA_SIZE_LIMITS.image;
-    if (finalFile.size > sizeLimit) {
-      toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
-      return null;
-    }
-    return {
-      id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
-      file: finalFile,
-      name: finalFile.name,
-      kind: kind,
-      dataUrl: "",
-    };
-  }
-
-  async function addPendingMediaFiles(files) {
-    const added = [];
-    // 模型不支持视觉（vision=false）时的能力提示：附件照常上传存档，
-    // 发送时后端只会给模型传文本占位（不发图片 base64），read_media 不可用
-    if (files && files.length && !App.getChatModelVision()) {
-      toast("当前模型不支持视觉：附件仅存档，模型看不到图片内容");
-    }
-    for (const file of files || []) {
-      if (!file) continue;
-      if (state.pendingMedia.length >= MAX_PENDING_MEDIA) {
-        toast("最多附加 " + MAX_PENDING_MEDIA + " 个媒体文件");
-        break;
-      }
-      const item = await prepareMediaFile(file);
-      if (!item) continue;
-      state.pendingMedia.push(item);
-      added.push(item);
-    }
-    if (added.length) {
-      // 图片读成 dataURL 供预览；音频/视频只显示名称徽标
-      added.forEach(function (item) {
-        if (item.kind !== "image") return;
-        const reader = new FileReader();
-        reader.onload = function () {
-          item.dataUrl = String(reader.result || "");
-          renderComposerAttachments();
-        };
-        reader.readAsDataURL(item.file);
-      });
-    }
-    renderComposerAttachments();
-    return added.length;
-  }
-
-  // 统一附件区：待发送媒体（随消息上传，media:// 进内容部件）+ 会话已解析文档
-  // （file_memory，后端注入系统提示词、跨消息生效）
-  function renderComposerAttachments() {
-    const visibleDocs = state.pendingDocs.filter(function (item) { return item.sessionId === state.sessionId; });
-    if (!state.pendingMedia.length && !state.sessionDocs.length && !visibleDocs.length) {
-      composerAttachments.innerHTML = "";
-      composerAttachments.classList.add("hidden");
-      composer.classList.remove("has-media");
-      if (syncComposerAttachmentBlocks) syncComposerAttachmentBlocks();
-      App.refreshComposerButtons();
-      return;
-    }
-    composerAttachments.classList.remove("hidden");
-    // 引用、媒体和文档共享同一块区域；该区域整体位于输入行上方
-    composer.classList.add("has-media");
-    composerAttachments.innerHTML = "";
-
-    function appendDocumentMark(chip, filename) {
-      const icon = el("span", "doc-chip-symbol");
-      icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>';
-      chip.appendChild(icon);
-      const name = String(filename || "");
-      const dot = name.lastIndexOf(".");
-      const extension = dot >= 0 && dot < name.length - 1 ? name.slice(dot + 1, dot + 5).toUpperCase() : "FILE";
-      chip.appendChild(el("span", "doc-chip-ext", extension));
-      chip.title = name || "文件";
-      chip.setAttribute("aria-label", name || "文件");
-    }
-    function addProgress(chip, item) {
-      if (!item.phase || item.phase === "done") return;
-      const percent = Math.max(0, Math.min(100, Number(item.percent) || 0));
-      const overlay = el("span", "attachment-progress" + (item.phase === "processing" ? " is-processing" : ""));
-      overlay.style.setProperty("--upload-progress", percent + "%");
-      const label = item.phase === "processing" ? "处理中" : item.phase === "error" ? "失败" : percent + "%";
-      overlay.setAttribute("role", "status");
-      overlay.setAttribute("aria-label", (item.name || item.filename || "附件") + " " + label);
-      overlay.appendChild(el("span", "attachment-progress-label", label));
-      chip.appendChild(overlay);
-      chip.title = (item.name || item.filename || chip.title || "附件") + "：" + label;
-    }
-    state.pendingMedia.forEach(function (item) {
-      const chip = el("div", "media-chip");
-      chip.title = item.name || "媒体文件";
-      chip.setAttribute("aria-label", item.name || "媒体文件");
-      if (item.kind === "image" && item.dataUrl) {
-        const thumb = el("img", "media-thumb", "");
-        thumb.src = item.dataUrl;
-        thumb.alt = item.name;
-        thumb.title = "点击预览";
-        thumb.classList.add("clickable");
-        thumb.addEventListener("click", function () {
-          openMediaPreview({ type: "image", src: item.dataUrl, title: item.name });
-        });
-        chip.appendChild(thumb);
-      } else {
-        // 音频/视频无预览帧：显示类别占位，点击在预览框中播放/收听
-        const placeholder = el("div", "media-thumb media-thumb-placeholder",
-          item.kind === "audio" ? "音频" : "视频");
-        placeholder.title = "点击预览";
-        placeholder.classList.add("clickable");
-        placeholder.addEventListener("click", function () {
-          if (!item.objUrl) item.objUrl = URL.createObjectURL(item.file);
-          openMediaPreview({
-            type: item.kind === "audio" ? "audio" : "video",
-            src: item.objUrl,
-            title: item.name,
-          });
-        });
-        chip.appendChild(placeholder);
-      }
-      addProgress(chip, item);
-      const removeBtn = el("button", "media-remove", "✕");
-      removeBtn.type = "button";
-      removeBtn.title = "移除";
-      removeBtn.addEventListener("click", function () {
-        state.pendingMedia = state.pendingMedia.filter(function (m) { return m.id !== item.id; });
-        renderComposerAttachments();
-      });
-      chip.appendChild(removeBtn);
-      composerAttachments.appendChild(chip);
-    });
-    visibleDocs.forEach(function (item) {
-      const chip = el("div", "doc-chip doc-chip-pending");
-      appendDocumentMark(chip, item.filename);
-      if (item.staged) {
-        chip.title = "待发送文档：" + (item.filename || "未命名") + "；点击发送后上传并解析";
-        const remove = el("button", "media-remove", "✕");
-        remove.type = "button";
-        remove.title = "移除待发送文档";
-        remove.addEventListener("click", function (event) {
-          event.stopPropagation();
-          state.pendingDocs = state.pendingDocs.filter(function (doc) { return doc.id !== item.id; });
-          renderComposerAttachments();
-        });
-        chip.appendChild(remove);
-      } else {
-        addProgress(chip, item);
-      }
-      composerAttachments.appendChild(chip);
-    });
-    state.sessionDocs.forEach(function (doc) {
-      const chip = el("div", "doc-chip");
-      appendDocumentMark(chip, doc.filename || "未命名");
-      chip.title = "已解析文档：" + (doc.filename || "未命名")
-        + "；内容以清单形式注入对话上下文（大文件可按需读取）；点击预览";
-      chip.classList.add("clickable");
-      chip.addEventListener("click", function () {
-        openMediaPreviewForDocument(doc);
-      });
-      const del = el("button", "media-remove", "✕");
-      del.type = "button";
-      del.title = "移除文件";
-      del.addEventListener("click", async function (e) {
-        e.stopPropagation();
-        try {
-          await API.deleteSessionFile(doc.filename, state.sessionId);
-          state.sessionDocs = state.sessionDocs.filter(function (d) { return d.filename !== doc.filename; });
-          renderComposerAttachments();
-        } catch (err) {
-          toast("移除失败：" + err.message);
+            catch (_) { /* ignore */ }
         }
-      });
-      chip.appendChild(del);
-      composerAttachments.appendChild(chip);
+        // 销毁内部媒体元素：暂停并移除 src，关闭预览即停止播放/收听
+        mediaPreviewBody.querySelectorAll("video, audio").forEach(function (media) {
+            try {
+                media.pause();
+            }
+            catch (_) { /* ignore */ }
+            media.removeAttribute("src");
+            try {
+                media.load();
+            }
+            catch (_) { /* ignore */ }
+        });
+        resetPreviewZoom();
+        mediaPreviewZoom.classList.add("hidden");
+        mediaPreviewBody.classList.remove("is-zoomable");
+        mediaPreviewBody.innerHTML = "";
+        mediaPreviewTitle.textContent = "";
+        mediaPreviewModal.classList.add("hidden");
+        mediaPreviewModal.setAttribute("aria-hidden", "true");
+    }
+    function openMediaPreview(options) {
+        const type = options.type || "download";
+        mediaPreviewTitle.textContent = options.title || "";
+        mediaPreviewBody.innerHTML = "";
+        // 图片/视频启用缩放工具栏；每次打开新媒体都从适应窗口开始
+        const zoomable = type === "image" || type === "video";
+        mediaPreviewZoom.classList.toggle("hidden", !zoomable);
+        mediaPreviewBody.classList.toggle("is-zoomable", zoomable);
+        resetPreviewZoom();
+        if (type === "image") {
+            const img = el("img", "media-preview-image");
+            img.src = options.src;
+            img.alt = options.title || "图片预览";
+            mediaPreviewBody.appendChild(img);
+        }
+        else if (type === "video") {
+            const video = el("video", "media-preview-video");
+            video.src = options.src;
+            video.controls = true;
+            video.autoplay = true;
+            video.playsInline = true;
+            mediaPreviewBody.appendChild(video);
+        }
+        else if (type === "audio") {
+            const wrap = el("div", "media-preview-audio");
+            wrap.appendChild(el("div", "media-preview-audio-icon", "🎵"));
+            wrap.appendChild(el("div", "media-preview-audio-name", options.title || "音频"));
+            const audio = el("audio");
+            audio.src = options.src;
+            audio.controls = true;
+            audio.autoplay = true;
+            wrap.appendChild(audio);
+            mediaPreviewBody.appendChild(wrap);
+        }
+        else if (type === "pdf") {
+            // 浏览器原生 PDF 查看器
+            const frame = el("iframe", "media-preview-frame");
+            frame.src = options.src;
+            mediaPreviewBody.appendChild(frame);
+        }
+        else if (type === "text") {
+            const pre = el("pre", "media-preview-text", "加载中…");
+            mediaPreviewBody.appendChild(pre);
+            fetch(options.src).then(function (res) {
+                if (!res.ok)
+                    throw new Error(res.status + " " + res.statusText);
+                return res.text();
+            }).then(function (text) {
+                pre.textContent = text || "（空文件）";
+            }).catch(function (err) {
+                pre.textContent = "读取失败：" + err.message;
+            });
+        }
+        else {
+            const wrap = el("div", "media-preview-download");
+            wrap.appendChild(el("div", "media-preview-download-tip", "该文件类型不支持在线预览，可下载后查看"));
+            const btn = el("a", "media-preview-download-btn", "下载文件");
+            btn.href = options.src;
+            btn.download = options.title || "file";
+            wrap.appendChild(btn);
+            mediaPreviewBody.appendChild(wrap);
+        }
+        mediaPreviewModal.classList.remove("hidden");
+        mediaPreviewModal.setAttribute("aria-hidden", "false");
+    }
+    // ---------- 预览缩放（图片/视频 pan & zoom） ----------
+    // transform 写法 translate(tx,ty) scale(s)：位移取屏幕像素（不受倍率影响），
+    // 缩放中心为容器中心；档位/几何计算复用 ZoomUtils（与站内三控件一致）。
+    const ZoomUtils = window.ZoomUtils;
+    const previewZoom = { scale: 1, tx: 0, ty: 0 };
+    let previewZoomDrag = null;
+    // 视频原生控制条高度：底部该区域内不劫持 mousedown/dblclick，留给控制条
+    const PREVIEW_VIDEO_CONTROLS_ZONE = 48;
+    function previewZoomTarget() {
+        return mediaPreviewBody.querySelector("img.media-preview-image, video.media-preview-video");
+    }
+    function applyPreviewZoom() {
+        mediaPreviewZoomLabel.textContent = ZoomUtils.percentFromScale(previewZoom.scale) + "%";
+        mediaPreviewZoomIn.disabled = !ZoomUtils.canStep(previewZoom.scale, +1);
+        mediaPreviewZoomOut.disabled = !ZoomUtils.canStep(previewZoom.scale, -1);
+        const target = previewZoomTarget();
+        if (!target)
+            return;
+        target.style.transform = "translate(" + previewZoom.tx + "px, " + previewZoom.ty + "px) scale(" + previewZoom.scale + ")";
+        target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
+    }
+    function clampPreviewZoomPan() {
+        const target = previewZoomTarget();
+        if (!target || !target.getBoundingClientRect)
+            return;
+        const rect = target.getBoundingClientRect();
+        const bodyRect = mediaPreviewBody.getBoundingClientRect();
+        // 布局盒不受 transform 影响：当前盒 / scale 反推未缩放尺寸
+        const baseW = rect.width / previewZoom.scale;
+        const baseH = rect.height / previewZoom.scale;
+        const clamped = ZoomUtils.clampPan(previewZoom.tx, previewZoom.ty, baseW * previewZoom.scale, baseH * previewZoom.scale, bodyRect.width, bodyRect.height);
+        previewZoom.tx = clamped.tx;
+        previewZoom.ty = clamped.ty;
+    }
+    // 以锚点（client 坐标）为中心缩放；锚点 null 表示中心缩放
+    function previewZoomBy(factor, clientX, clientY) {
+        if (!previewZoomTarget())
+            return;
+        let ax = null, ay = null, cx = 0, cy = 0;
+        if (clientX != null && clientY != null) {
+            const bodyRect = mediaPreviewBody.getBoundingClientRect();
+            ax = clientX - bodyRect.left;
+            ay = clientY - bodyRect.top;
+            cx = bodyRect.width / 2;
+            cy = bodyRect.height / 2;
+        }
+        const next = ZoomUtils.zoomAtPoint(previewZoom.scale, factor, ax, ay, cx, cy, previewZoom.tx, previewZoom.ty);
+        previewZoom.scale = next.scale;
+        previewZoom.tx = next.tx;
+        previewZoom.ty = next.ty;
+        clampPreviewZoomPan();
+        applyPreviewZoom();
+    }
+    function previewZoomStep(dir) {
+        previewZoomBy(ZoomUtils.stepScale(previewZoom.scale, dir) / previewZoom.scale, null, null);
+    }
+    function resetPreviewZoom() {
+        previewZoom.scale = 1;
+        previewZoom.tx = 0;
+        previewZoom.ty = 0;
+        previewZoomDrag = null;
+        mediaPreviewBody.classList.remove("is-dragging");
+        const target = previewZoomTarget();
+        if (target) {
+            target.style.transform = "";
+            target.style.cursor = "";
+        }
+        applyPreviewZoom();
+    }
+    function previewInVideoControlsZone(target, clientY) {
+        if (!target || target.tagName !== "VIDEO" || !target.getBoundingClientRect)
+            return false;
+        return clientY > target.getBoundingClientRect().bottom - PREVIEW_VIDEO_CONTROLS_ZONE;
+    }
+    mediaPreviewZoomIn.addEventListener("click", function () { previewZoomStep(+1); });
+    mediaPreviewZoomOut.addEventListener("click", function () { previewZoomStep(-1); });
+    mediaPreviewZoomLabel.addEventListener("click", resetPreviewZoom);
+    // ---------- 预览全屏（图片/视频/PDF/文本/音频通用） ----------
+    // 全屏的是 dialog（含标题栏工具条，全屏内仍可缩放/关闭），与 canvas
+    // 控件同款模式（见 messages_canvas.ts）；按钮文案随 fullscreenchange 同步
+    // （Esc 退出时统一刷新）。
+    const mediaPreviewDialog = mediaPreviewModal.querySelector(".media-preview-dialog");
+    const mediaPreviewFull = $("#mediaPreviewFull");
+    // 全屏/恢复图标：与 SVG/Mermaid/Canvas 控件共用 Markdown.fullscreenIcons；
+    // 取不到（旧缓存/单测环境）时回退字符，保证按钮永远有可见内容。
+    function previewFullscreenIcon(on) {
+        const md = window.Markdown;
+        const icons = md && md.fullscreenIcons;
+        if (icons && icons.expand && icons.compress)
+            return on ? icons.compress : icons.expand;
+        return on ? "⤡" : "⛶";
+    }
+    function syncMediaPreviewFullscreen() {
+        const on = document.fullscreenElement === mediaPreviewDialog;
+        mediaPreviewFull.innerHTML = previewFullscreenIcon(on);
+        mediaPreviewFull.title = on ? "退出全屏（Esc）" : "全屏显示（Esc 退出全屏）";
+    }
+    function toggleMediaPreviewFullscreen() {
+        if (document.fullscreenElement === mediaPreviewDialog) {
+            document.exitFullscreen().then(function () {
+                syncMediaPreviewFullscreen();
+            }, function (err) {
+                toast("退出全屏失败：" + (err && err.message || err));
+            });
+            return;
+        }
+        if (!document.fullscreenEnabled) {
+            toast("当前环境不支持全屏显示");
+            return;
+        }
+        mediaPreviewDialog.requestFullscreen().then(function () {
+            // promise 落定时全屏已生效，直接同步按钮，不纯依赖 fullscreenchange
+            // 事件（Esc 退出仍靠事件；某些环境事件可能延迟或丢失）。
+            syncMediaPreviewFullscreen();
+        }, function (err) {
+            toast("进入全屏失败：" + (err && err.message || err));
+        });
+    }
+    mediaPreviewFull.addEventListener("click", toggleMediaPreviewFullscreen);
+    document.addEventListener("fullscreenchange", function () {
+        if (mediaPreviewModal.classList.contains("hidden"))
+            return;
+        syncMediaPreviewFullscreen();
+        // 全屏切换改变 body 尺寸：钳制一次缩放位移，图片不飘出可视区
+        clampPreviewZoomPan();
+        applyPreviewZoom();
     });
-    if (syncComposerAttachmentBlocks) syncComposerAttachmentBlocks();
-    App.refreshComposerButtons();
-  }
-
-  function clearPendingMedia() {
-    // 释放待发媒体的对象 URL
-    state.pendingMedia.forEach(function (item) {
-      if (item.objUrl) {
-        try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
-      }
+    // Ctrl+滚轮：以鼠标位置为中心缩放；普通滚轮不拦截（文本预览仍可滚动）
+    mediaPreviewBody.addEventListener("wheel", function (e) {
+        if (!e.ctrlKey && !e.metaKey)
+            return;
+        if (!previewZoomTarget())
+            return;
+        e.preventDefault();
+        previewZoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
+    }, { passive: false });
+    // 双击：在 2x 与适应窗口之间切换（以点击点为中心放大）
+    mediaPreviewBody.addEventListener("dblclick", function (e) {
+        const target = previewZoomTarget();
+        if (!target || e.target !== target)
+            return;
+        if (previewInVideoControlsZone(target, e.clientY))
+            return;
+        if (previewZoom.scale > 1.01)
+            resetPreviewZoom();
+        else
+            previewZoomBy(2 / previewZoom.scale, e.clientX, e.clientY);
     });
-    state.pendingMedia = [];
-    renderComposerAttachments();
-  }
-
-  // 粘贴剪贴板图片：加入待发送附件并在输入框上方预览
-  input.addEventListener("paste", function (e) {
-    const mediaFiles = ClipboardMediaUtils.mediaFiles(e.clipboardData, mediaKindOf);
-    if (!mediaFiles.length) return;
-    e.preventDefault();
-    addPendingMediaFiles(mediaFiles);
-  });
-
-
-  // ---------- 导出（供其它模块经 App.* 调用） ----------
-  App.mediaKindOf = mediaKindOf;
-  App.prepareMediaFile = prepareMediaFile;
-  App.addPendingMediaFiles = addPendingMediaFiles;
-  App.renderComposerAttachments = renderComposerAttachments;
-  App.clearPendingMedia = clearPendingMedia;
-  App.openMediaPreview = openMediaPreview;
-  App.resolveMediaSrc = resolveMediaSrc;
-  App.openMediaPreviewForDocument = openMediaPreviewForDocument;
-
-  // 注册 markdown 伪标签 src 解析器（markdown.js 先于本模块加载）
-  if (globalThis.Markdown && typeof Markdown.setMediaResolver === "function") {
-    Markdown.setMediaResolver(resolveMediaTagSrc);
-  }
+    // 放大后按住拖动：document 级 move/up，移出弹窗也能继续拖
+    mediaPreviewBody.addEventListener("mousedown", function (e) {
+        if (e.button !== 0 || previewZoomDrag)
+            return;
+        const target = previewZoomTarget();
+        if (!target || e.target !== target || previewZoom.scale <= 1)
+            return;
+        if (previewInVideoControlsZone(target, e.clientY))
+            return;
+        previewZoomDrag = { x: e.clientX, y: e.clientY, tx: previewZoom.tx, ty: previewZoom.ty };
+        mediaPreviewBody.classList.add("is-dragging");
+        target.style.cursor = "grabbing";
+        e.preventDefault();
+    });
+    document.addEventListener("mousemove", function (e) {
+        if (!previewZoomDrag)
+            return;
+        previewZoom.tx = previewZoomDrag.tx + (e.clientX - previewZoomDrag.x);
+        previewZoom.ty = previewZoomDrag.ty + (e.clientY - previewZoomDrag.y);
+        clampPreviewZoomPan();
+        applyPreviewZoom();
+    });
+    document.addEventListener("mouseup", function () {
+        if (!previewZoomDrag)
+            return;
+        previewZoomDrag = null;
+        mediaPreviewBody.classList.remove("is-dragging");
+        const target = previewZoomTarget();
+        if (target)
+            target.style.cursor = previewZoom.scale > 1 ? "grab" : "";
+    });
+    // media:// 引用 / data: / http(s) → 可访问的资源 URL
+    function resolveMediaSrc(mediaRef, sessionId) {
+        if (typeof mediaRef !== "string" || !mediaRef)
+            return null;
+        if (mediaRef.indexOf("media://") === 0) {
+            return API.sessionMediaUrl(sessionId || state.sessionId, mediaRef.slice("media://".length));
+        }
+        if (/^(data:|https?:)/.test(mediaRef))
+            return mediaRef;
+        return null;
+    }
+    // 媒体伪标签 src → 可访问 URL（markdown.js 以 (kind, src) 调用）：
+    // media:// → 会话媒体端点；http(s)/data 原样；其它按本地路径交给
+    // /file/get_local_file（后端按会话生效工作目录解析相对路径）
+    function resolveMediaTagSrc(kind, src) {
+        void kind;
+        if (typeof src !== "string" || !src)
+            return "";
+        if (src.indexOf("media://") === 0) {
+            return API.sessionMediaUrl(state.sessionId, src.slice("media://".length));
+        }
+        if (/^data:/i.test(src))
+            return src;
+        return API.permissionMediaUrl(state.sessionId, src);
+    }
+    function openMediaPreviewForDocument(doc) {
+        if (!doc)
+            return;
+        if (!doc.stored_name) {
+            toast("该文件上传于旧版本（未保存原始文件），无法预览");
+            return;
+        }
+        const url = API.sessionDocumentUrl(state.sessionId, doc.stored_name);
+        const kind = previewKindForName(doc.stored_name);
+        openMediaPreview({ type: kind, src: url, title: doc.filename });
+    }
+    $("#mediaPreviewClose").addEventListener("click", closeMediaPreview);
+    $("#mediaPreviewBackdrop").addEventListener("click", closeMediaPreview);
+    document.addEventListener("keydown", function (e) {
+        if (mediaPreviewModal.classList.contains("hidden"))
+            return;
+        if (e.key === "Escape") {
+            // 全屏下 Esc 只退全屏（浏览器默认行为），不关弹窗；非全屏才关闭
+            if (document.fullscreenElement)
+                return;
+            closeMediaPreview();
+            return;
+        }
+        // 预览缩放快捷键（仅弹窗打开时）：Ctrl+加/减步进，Ctrl+0 重置
+        if (!e.ctrlKey && !e.metaKey)
+            return;
+        if (e.key === "+" || e.key === "=") {
+            e.preventDefault();
+            previewZoomStep(+1);
+        }
+        else if (e.key === "-" || e.key === "_") {
+            e.preventDefault();
+            previewZoomStep(-1);
+        }
+        else if (e.key === "0") {
+            e.preventDefault();
+            resetPreviewZoom();
+        }
+    });
+    // ---------- 待发送媒体附件（粘贴/选择） ----------
+    function mediaKindOf(filename) {
+        const ext = (filename.split(".").pop() || "").toLowerCase();
+        for (const kind in MEDIA_EXTENSIONS) {
+            if (MEDIA_EXTENSIONS[kind].indexOf(ext) >= 0)
+                return kind;
+        }
+        return null;
+    }
+    // ---------- 发送前图片压缩 ----------
+    // 与后端 IMAGE_THUMBNAIL_* 一致：>2MB 的图片在发送前用 canvas 重采样为
+    // 长边 ≤1568px、JPEG 质量 0.85，通常可缩到原图的 1/5~1/10；GIF 跳过
+    // （canvas 只取第一帧），压缩结果反而更大时保留原文件。
+    const COMPRESS_THRESHOLD_BYTES = 2 * 1024 * 1024;
+    const COMPRESS_MAX_EDGE = 1568;
+    const COMPRESS_JPEG_QUALITY = 0.85;
+    function compressImageFile(file) {
+        if (!file || file.size <= COMPRESS_THRESHOLD_BYTES)
+            return Promise.resolve(file);
+        const ext = (file.name.split(".").pop() || "").toLowerCase();
+        if (ext === "gif")
+            return Promise.resolve(file);
+        if (typeof createImageBitmap === "undefined" || typeof document === "undefined") {
+            return Promise.resolve(file);
+        }
+        return createImageBitmap(file).then(function (bitmap) {
+            try {
+                const scale = Math.min(1, COMPRESS_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+                canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+                bitmap.close();
+                return new Promise(function (resolve) {
+                    canvas.toBlob(function (blob) {
+                        if (!blob || blob.size >= file.size) {
+                            resolve(file); // 压缩无收益：保留原文件
+                            return;
+                        }
+                        const baseName = file.name.replace(/\.[^.]+$/, "");
+                        resolve(new File([blob], baseName + "_compressed.jpg", {
+                            type: "image/jpeg", lastModified: Date.now(),
+                        }));
+                    }, "image/jpeg", COMPRESS_JPEG_QUALITY);
+                });
+            }
+            catch (_) {
+                try {
+                    bitmap.close();
+                }
+                catch (_e) { /* ignore */ }
+                return file;
+            }
+        }).catch(function () { return file; });
+    }
+    async function prepareMediaFile(file) {
+        if (!file)
+            return null;
+        const kind = mediaKindOf(file.name || "");
+        if (!kind) {
+            toast("不支持的媒体类型：" + (file.name || "未命名文件"));
+            return null;
+        }
+        let finalFile = file;
+        if (kind === "image")
+            finalFile = await compressImageFile(file);
+        // 动图 gif 按视频档（600MB）预检：发送/读取侧同样归视频档（转码前先缩放）
+        const extLower = ((file.name || "").split(".").pop() || "").toLowerCase();
+        const limitKind = extLower === "gif" ? "video" : kind;
+        const sizeLimit = MEDIA_SIZE_LIMITS[limitKind] || MEDIA_SIZE_LIMITS.image;
+        if (finalFile.size > sizeLimit) {
+            toast("文件超过 " + Math.round(sizeLimit / (1024 * 1024)) + "MB 限制：" + file.name);
+            return null;
+        }
+        return {
+            id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+            file: finalFile,
+            name: finalFile.name,
+            kind: kind,
+            dataUrl: "",
+        };
+    }
+    async function addPendingMediaFiles(files) {
+        const added = [];
+        // 模型不支持视觉（vision=false）时的能力提示：附件照常上传存档，
+        // 发送时后端只会给模型传文本占位（不发图片 base64），read_media 不可用
+        if (files && files.length && !App.getChatModelVision()) {
+            toast("当前模型不支持视觉：附件仅存档，模型看不到图片内容");
+        }
+        for (const file of files || []) {
+            if (!file)
+                continue;
+            if (state.pendingMedia.length >= MAX_PENDING_MEDIA) {
+                toast("最多附加 " + MAX_PENDING_MEDIA + " 个媒体文件");
+                break;
+            }
+            const item = await prepareMediaFile(file);
+            if (!item)
+                continue;
+            state.pendingMedia.push(item);
+            added.push(item);
+        }
+        if (added.length) {
+            // 图片读成 dataURL 供预览；音频/视频只显示名称徽标
+            added.forEach(function (item) {
+                if (item.kind !== "image")
+                    return;
+                const reader = new FileReader();
+                reader.onload = function () {
+                    item.dataUrl = String(reader.result || "");
+                    renderComposerAttachments();
+                };
+                reader.readAsDataURL(item.file);
+            });
+        }
+        renderComposerAttachments();
+        return added.length;
+    }
+    // 统一附件区：待发送媒体（随消息上传，media:// 进内容部件）+ 会话已解析文档
+    // （file_memory，后端注入系统提示词、跨消息生效）
+    function renderComposerAttachments() {
+        const visibleDocs = state.pendingDocs.filter(function (item) { return item.sessionId === state.sessionId; });
+        if (!state.pendingMedia.length && !state.sessionDocs.length && !visibleDocs.length) {
+            composerAttachments.innerHTML = "";
+            composerAttachments.classList.add("hidden");
+            composer.classList.remove("has-media");
+            if (syncComposerAttachmentBlocks)
+                syncComposerAttachmentBlocks();
+            App.refreshComposerButtons();
+            return;
+        }
+        composerAttachments.classList.remove("hidden");
+        // 引用、媒体和文档共享同一块区域；该区域整体位于输入行上方
+        composer.classList.add("has-media");
+        composerAttachments.innerHTML = "";
+        function appendDocumentMark(chip, filename) {
+            const icon = el("span", "doc-chip-symbol");
+            icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>';
+            chip.appendChild(icon);
+            const name = String(filename || "");
+            const dot = name.lastIndexOf(".");
+            const extension = dot >= 0 && dot < name.length - 1 ? name.slice(dot + 1, dot + 5).toUpperCase() : "FILE";
+            chip.appendChild(el("span", "doc-chip-ext", extension));
+            chip.title = name || "文件";
+            chip.setAttribute("aria-label", name || "文件");
+        }
+        function addProgress(chip, item) {
+            if (!item.phase || item.phase === "done")
+                return;
+            const percent = Math.max(0, Math.min(100, Number(item.percent) || 0));
+            const overlay = el("span", "attachment-progress" + (item.phase === "processing" ? " is-processing" : ""));
+            overlay.style.setProperty("--upload-progress", percent + "%");
+            const label = item.phase === "processing" ? "处理中" : item.phase === "error" ? "失败" : percent + "%";
+            overlay.setAttribute("role", "status");
+            overlay.setAttribute("aria-label", (item.name || item.filename || "附件") + " " + label);
+            overlay.appendChild(el("span", "attachment-progress-label", label));
+            chip.appendChild(overlay);
+            chip.title = (item.name || item.filename || chip.title || "附件") + "：" + label;
+        }
+        state.pendingMedia.forEach(function (item) {
+            const chip = el("div", "media-chip");
+            chip.title = item.name || "媒体文件";
+            chip.setAttribute("aria-label", item.name || "媒体文件");
+            if (item.kind === "image" && item.dataUrl) {
+                const thumb = el("img", "media-thumb", "");
+                thumb.src = item.dataUrl;
+                thumb.alt = item.name;
+                thumb.title = "点击预览";
+                thumb.classList.add("clickable");
+                thumb.addEventListener("click", function () {
+                    openMediaPreview({ type: "image", src: item.dataUrl, title: item.name });
+                });
+                chip.appendChild(thumb);
+            }
+            else {
+                // 音频/视频无预览帧：显示类别占位，点击在预览框中播放/收听
+                const placeholder = el("div", "media-thumb media-thumb-placeholder", item.kind === "audio" ? "音频" : "视频");
+                placeholder.title = "点击预览";
+                placeholder.classList.add("clickable");
+                placeholder.addEventListener("click", function () {
+                    if (!item.objUrl)
+                        item.objUrl = URL.createObjectURL(item.file);
+                    openMediaPreview({
+                        type: item.kind === "audio" ? "audio" : "video",
+                        src: item.objUrl,
+                        title: item.name,
+                    });
+                });
+                chip.appendChild(placeholder);
+            }
+            addProgress(chip, item);
+            const removeBtn = el("button", "media-remove", "✕");
+            removeBtn.type = "button";
+            removeBtn.title = "移除";
+            removeBtn.addEventListener("click", function () {
+                state.pendingMedia = state.pendingMedia.filter(function (m) { return m.id !== item.id; });
+                renderComposerAttachments();
+            });
+            chip.appendChild(removeBtn);
+            composerAttachments.appendChild(chip);
+        });
+        visibleDocs.forEach(function (item) {
+            const chip = el("div", "doc-chip doc-chip-pending");
+            appendDocumentMark(chip, item.filename);
+            if (item.staged) {
+                chip.title = "待发送文档：" + (item.filename || "未命名") + "；点击发送后上传并解析";
+                const remove = el("button", "media-remove", "✕");
+                remove.type = "button";
+                remove.title = "移除待发送文档";
+                remove.addEventListener("click", function (event) {
+                    event.stopPropagation();
+                    state.pendingDocs = state.pendingDocs.filter(function (doc) { return doc.id !== item.id; });
+                    renderComposerAttachments();
+                });
+                chip.appendChild(remove);
+            }
+            else {
+                addProgress(chip, item);
+            }
+            composerAttachments.appendChild(chip);
+        });
+        state.sessionDocs.forEach(function (doc) {
+            const chip = el("div", "doc-chip");
+            appendDocumentMark(chip, doc.filename || "未命名");
+            chip.title = "已解析文档：" + (doc.filename || "未命名")
+                + "；内容以清单形式注入对话上下文（大文件可按需读取）；点击预览";
+            chip.classList.add("clickable");
+            chip.addEventListener("click", function () {
+                openMediaPreviewForDocument(doc);
+            });
+            const del = el("button", "media-remove", "✕");
+            del.type = "button";
+            del.title = "移除文件";
+            del.addEventListener("click", async function (e) {
+                e.stopPropagation();
+                try {
+                    await API.deleteSessionFile(doc.filename, state.sessionId);
+                    state.sessionDocs = state.sessionDocs.filter(function (d) { return d.filename !== doc.filename; });
+                    renderComposerAttachments();
+                }
+                catch (err) {
+                    toast("移除失败：" + err.message);
+                }
+            });
+            chip.appendChild(del);
+            composerAttachments.appendChild(chip);
+        });
+        if (syncComposerAttachmentBlocks)
+            syncComposerAttachmentBlocks();
+        App.refreshComposerButtons();
+    }
+    function clearPendingMedia() {
+        // 释放待发媒体的对象 URL
+        state.pendingMedia.forEach(function (item) {
+            if (item.objUrl) {
+                try {
+                    URL.revokeObjectURL(item.objUrl);
+                }
+                catch (_) { /* ignore */ }
+            }
+        });
+        state.pendingMedia = [];
+        renderComposerAttachments();
+    }
+    // 粘贴剪贴板图片：加入待发送附件并在输入框上方预览
+    input.addEventListener("paste", function (e) {
+        const mediaFiles = ClipboardMediaUtils.mediaFiles(e.clipboardData, mediaKindOf);
+        if (!mediaFiles.length)
+            return;
+        e.preventDefault();
+        addPendingMediaFiles(mediaFiles);
+    });
+    // ---------- 导出（供其它模块经 App.* 调用） ----------
+    App.mediaKindOf = mediaKindOf;
+    App.prepareMediaFile = prepareMediaFile;
+    App.addPendingMediaFiles = addPendingMediaFiles;
+    App.renderComposerAttachments = renderComposerAttachments;
+    App.clearPendingMedia = clearPendingMedia;
+    App.openMediaPreview = openMediaPreview;
+    App.resolveMediaSrc = resolveMediaSrc;
+    App.openMediaPreviewForDocument = openMediaPreviewForDocument;
+    // 注册 markdown 伪标签 src 解析器（markdown.js 先于本模块加载）
+    if (globalThis.Markdown && typeof Markdown.setMediaResolver === "function") {
+        Markdown.setMediaResolver(resolveMediaTagSrc);
+    }
 })(window.App);

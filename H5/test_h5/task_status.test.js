@@ -1,5 +1,6 @@
 const test=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs');const path=require('node:path');const {JSDOM}=require('jsdom');
+const {stripTypeScriptTypes}=require('node:module');
 function setup(t){
   const dom=new JSDOM('<div id="chat"></div><div id="taskStatus" hidden><span class="task-status-label"></span><span class="task-status-detail"></span><button hidden>重新连接</button></div>',{runScripts:'outside-only'});
   const w=dom.window,host=w.document.querySelector('#taskStatus');
@@ -111,11 +112,11 @@ test('真实附接流程区分 EOF 与 DONE，断线不自动派发队列',async
   w.setTimeout=fn=>{fn();return 1;};
   let completed=false;const payloads=[];
   w.API.chatStream=async (body,onEvent,signal,options)=>{payloads.push(body);options.onOpen();onEvent({data:{content:'partial'}});return {completed};};
-  const source=fs.readFileSync(path.join(__dirname,'../js/app/chat.js'),'utf8');
+  const source=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/chat.ts'),'utf8'));
   const start=source.indexOf('  async function attachStreamSession('),end=source.indexOf('  /** 打开会话后',start);
   // 附接收尾调用同文件的流中断确认与错误文案助手，一并载入。
   const helperStart=source.indexOf('  // 流错误的展示文案');
-  w.eval(source.slice(helperStart,source.indexOf('  async function send(direct)',helperStart)));
+  w.eval(source.slice(helperStart,source.indexOf('  async function send(direct',helperStart)));
   w.eval(source.slice(start,end)+'\nwindow.attachForTest=attachStreamSession;');
   await w.attachForTest('s');assert.equal(x.host.dataset.phase,'disconnected');assert.deepEqual(x.calls.flushed,[]);
   assert.equal(state.streaming,false);assert.equal(payloads[0].messages.length,0);

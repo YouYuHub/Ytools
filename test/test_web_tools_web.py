@@ -116,6 +116,30 @@ class FetchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '下载上限'):
                 s._http_request('https://test.example/')
 
+    def test_network_errors_are_classified(self):
+        import socket, ssl
+        from urllib.error import URLError
+        cases = [
+            (URLError(socket.gaierror(11001, 'getaddrinfo failed')), 'DNS 解析失败'),
+            (URLError(socket.timeout('timed out')), '连接超时'),
+            (URLError(ConnectionRefusedError(10061, 'refused')), '连接被拒绝'),
+            (URLError(ConnectionResetError(10054, 'reset')), '连接被重置'),
+        ]
+        for err, label in cases:
+            with patch.object(s, 'urlopen', side_effect=err):
+                with self.assertRaisesRegex(ValueError, label):
+                    s._http_request('https://test.example/')
+        # SSL 失败且 DNS 同样不通时归因为 DNS（劫持冒充 TLS 的情况）
+        ssl_err = URLError(ssl.SSLError('UNEXPECTED_EOF_WHILE_READING'))
+        with patch.object(s, 'urlopen', side_effect=ssl_err), \
+                patch.object(s, '_dns_resolves', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'DNS 解析失败'):
+                s._http_request('https://test.example/')
+        with patch.object(s, 'urlopen', side_effect=ssl_err), \
+                patch.object(s, '_dns_resolves', return_value=True):
+            with self.assertRaisesRegex(ValueError, 'TLS 握手失败'):
+                s._http_request('https://test.example/')
+
 
     def test_real_local_http_request_and_error_response(self):
         class Handler(BaseHTTPRequestHandler):
@@ -149,6 +173,36 @@ class FetchTests(unittest.TestCase):
 
 
 class SearchTests(unittest.TestCase):
+    def setUp(self):
+        # 熔断器是模块全局状态：每个用例前后复位，避免顺序/跨文件依赖
+        s._DDG_BREAKER_FAILS = 0
+        s._DDG_BREAKER_SKIP_UNTIL = 0.0
+
+    def tearDown(self):
+        s._DDG_BREAKER_FAILS = 0
+        s._DDG_BREAKER_SKIP_UNTIL = 0.0
+
+    def test_ddg_breaker_skips_after_consecutive_failures(self):
+        with patch.object(s, '_http_request', side_effect=OSError('boom')) as http:
+            for _ in range(3):
+                with self.assertRaisesRegex(ValueError, '均失败'):
+                    s._fetch_ddg_results('python', 20)
+            # 第 4 次直接熔断，不再发请求
+            with self.assertRaisesRegex(ValueError, '熔断跳过'):
+                s._fetch_ddg_results('python', 20)
+        # 3 次 × 2 端点 = 6 次请求，第 4 次零请求
+        self.assertEqual(http.call_count, 6)
+
+    def test_ddg_breaker_resets_on_success(self):
+        html = '<a href="https://example.org" class="result__a">Python</a>'
+        with patch.object(s, '_http_request', side_effect=OSError('boom')):
+            for _ in range(2):
+                with self.assertRaises(ValueError):
+                    s._fetch_ddg_results('python', 20)
+        with patch.object(s, '_http_request', return_value=('', 200, 'text/html', html.encode())):
+            s._fetch_ddg_results('python', 20)
+        self.assertEqual(s._DDG_BREAKER_FAILS, 0)
+
     def test_ddg_attribute_order_classes_and_redirect_decoding(self):
         html = '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F%3Fq%3Da%2526b&amp;rut=x" class="other result__a"><b>Python</b> 文档</a><a href="https://example.org" class="result__snippet extra">Python 示例</a>'
         with patch.object(s, '_http_request', return_value=('', 200, 'text/html', html.encode())):

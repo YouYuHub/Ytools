@@ -375,6 +375,7 @@ class _SessionStream:
         self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
         self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
+        self.live_round_started_at_ms: int | None = None  # 本轮开始墙钟（epoch ms，与轮次号同处确认，随 marker 下发供前端计时兜底）
         self.live_round_model: dict | None = None  # 本轮生效聊天模型（round_model 推送时记录，回放 marker 携带）
         self.live_round_usage_total: dict | None = None  # 本轮绝对累计用量（缓冲截断后附接仍可恢复）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
@@ -1343,6 +1344,10 @@ async def _run_chat_generation(
         # 只有提问检查点已保存，才对外确认轮次编号；耗时预处理被停止后仍可编辑。
         if latest_user_message is not None and live_round_no > 0:
             stream.live_round_no = int(live_round_no)
+            # 轮次开始墙钟：回放重建的 DOM 节点时间戳都是“现在”，前端计时需
+            # 要真实起点兜底（否则刷新一次就从 1s 重计）。worker 模式经 evt
+            # 队列同步到主进程（见 live_round_started_at 属性/事件）。
+            stream.live_round_started_at_ms = int(time.time() * 1000)
             await _stream_emit(stream, f"data: {json.dumps({'round_started': {'round': int(live_round_no)}}, ensure_ascii=False)}\n\n")
         # 从提问落盘后的准备阶段开始回放，首调用超窗时的压缩/错误也属于
         # 当前轮，不能等进入模型循环才记录起点，否则完整重建会丢掉这些卡片。
@@ -3313,6 +3318,40 @@ async def _prepare_chat_stream(tool_request):
     return stream, True
 
 
+_REPLAY_GAP_WARNING = 'data: {"warning":{"code":"STREAM_REPLAY_GAP","message":"回放日志不可用，部分早期流事件请在任务结束后重新加载完整历史。"}}\n\n'
+
+
+def _safe_compact_replay(pending):
+    """紧凑待回放帧；紧凑自身异常时回退原字节透传（附接绝不能因此断流）。"""
+    if not pending:
+        return []
+    try:
+        from .agent_runtime.stream_replay import compact_replay_chunks
+        return compact_replay_chunks(pending)
+    except Exception as error:
+        logger.warning(f"回放紧凑失败，原样透传 {len(pending)} 帧：{error}")
+        return list(pending)
+
+
+def _drain_compact_replay(stream, seen, replay_offset):
+    """排空当前待回放段并紧凑，返回 (下发帧列表, seen, replay_offset)。
+
+    缺口语义与原来一致：遇到 gap 先落定已收集段、补警告帧，再继续收集
+    （警告位置仍在所覆盖帧之前）。调用期间新到帧不属本段，由 live 循环接管。
+    """
+    pending = []
+    out = []
+    while seen < stream.seq:
+        chunk, seen, replay_offset, gap = stream.read_replay(seen, replay_offset)
+        if gap:
+            out.extend(_safe_compact_replay(pending))
+            pending = []
+            out.append(_REPLAY_GAP_WARNING)
+        pending.append(chunk)
+    out.extend(_safe_compact_replay(pending))
+    return out, seen, replay_offset
+
+
 async def tool_chat_server(
     tool_request: ChatLLMRequest
 ) -> AsyncGenerator[str, None]:
@@ -3351,8 +3390,8 @@ async def tool_chat_server(
                 # 消费端收不到，必须随标记下发）——前端按轮次精确去重历史提问
                 # 气泡、按 model 显示本轮消耗行模型名。
                 # worker 模式由 evt 队列的 question_text/question_parts/
-                # question_quotes/live_round_no/live_round_model 事件同步到
-                # stream 对应属性。
+                # question_quotes/live_round_no/live_round_model/
+                # live_round_started_at 事件同步到 stream 对应属性。
                 marker = {"replay": True, "question_text": stream.question_text or ""}
                 if stream.question_parts:
                     marker["question_parts"] = stream.question_parts
@@ -3365,6 +3404,11 @@ async def tool_chat_server(
                     marker["round_usage_total"] = copy.deepcopy(
                         getattr(stream, "live_round_usage_total", None) or {}
                     )
+                    # 轮次开始墙钟（epoch ms）：回放重建的节点时间戳都是“现在”，
+                    # 前端大折叠计时以此为下限，否则刷新一次就从 1s 重计。
+                    started_at = getattr(stream, "live_round_started_at_ms", None)
+                    if isinstance(started_at, int) and started_at > 0:
+                        marker["round_started_at"] = started_at
                 # getattr 防御：测试替身等最小 stream 桩可能没有该属性
                 live_round_model = getattr(stream, "live_round_model", None)
                 if live_round_model:
@@ -3375,6 +3419,17 @@ async def tool_chat_server(
                 marker["replay_end_supported"] = True
                 marker["replay_complete"] = replay_complete
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
+                # 紧凑快照：排空当前待回放段，连续分片合并后一次下发；
+                # 排空后新到帧走下方 live 循环原样直通（实时语义不变）。
+                drain_from = seen
+                drain_t0 = time.monotonic()
+                drained, seen, replay_offset = _drain_compact_replay(stream, seen, replay_offset)
+                for drained_chunk in drained:
+                    yield drained_chunk
+                logger.info(
+                    "附接回放紧凑快照：%d 帧 → %d 帧（%.0fms）",
+                    seen - drain_from, len(drained), (time.monotonic() - drain_t0) * 1000,
+                )
                 replay_end_pending = True
             else:
                 replay_end_pending = False
@@ -3382,7 +3437,7 @@ async def tool_chat_server(
             while seen < stream.seq:
                 chunk, seen, replay_offset, gap = stream.read_replay(seen, replay_offset)
                 if gap:
-                    yield 'data: {"warning":{"code":"STREAM_REPLAY_GAP","message":"回放日志不可用，部分早期流事件请在任务结束后重新加载完整历史。"}}\n\n'
+                    yield _REPLAY_GAP_WARNING
                 yield chunk
             if replay_end_pending:
                 # 附接回放耗尽：此后均为实时帧（并发产生的新帧按到达顺序排在

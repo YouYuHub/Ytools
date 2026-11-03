@@ -1,6 +1,10 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),{JSDOM}=require('jsdom');
-const messages=fs.readFileSync(path.join(__dirname,'../js/app/messages.js'),'utf8');
+const {stripTypeScriptTypes}=require('node:module');
+// messages.js 已拆分：工具块读 messages_edit.ts，工具结果/子任务读 messages_tools.ts，历史渲染读 messages_history.ts
+const editSrc=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/messages_edit.ts'),'utf8'));
+const toolsSrc=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/messages_tools.ts'),'utf8'));
+const historySrc=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/messages_history.ts'),'utf8'));
 function setup(t){
   const dom=new JSDOM('<div id="chat"></div>',{runScripts:'outside-only',url:'http://test'});t.after(()=>dom.window.close());
   const w=dom.window,root=w.document.querySelector('#chat');
@@ -13,10 +17,11 @@ function setup(t){
     Markdown:{render:()=>''},renderPreservingWidgets(){},
     buildThinkBlock(){return {wrap:el('div','think-block'),textContent:()=>'',done(){},streaming(){},setText(){},add(){}};}});
   w.eval(fs.readFileSync(path.join(__dirname,'../js/app/message_diff.js'),'utf8'));
-  const end=messages.indexOf('  // 代码块复制（事件委托）',messages.indexOf('  function buildSubAgentBlock('));
-  w.eval(messages.slice(messages.indexOf('  function buildToolBlock('),end)+'\nObject.assign(App,{buildToolBlock,applyToolResult,buildDiffView,buildSubAgentBlock});');
-  const start=messages.indexOf('  function renderOneRecordInto(');
-  w.eval(messages.slice(start,messages.indexOf('  function renderRecords(',start)));
+  const toolEnd=toolsSrc.indexOf('  // 代码块复制（事件委托）',toolsSrc.indexOf('  function buildSubAgentBlock('));
+  w.eval(editSrc.slice(editSrc.indexOf('  function buildToolBlock('),editSrc.indexOf('  // ---------- 导出',editSrc.indexOf('  function buildToolBlock('))));
+  w.eval(toolsSrc.slice(toolsSrc.indexOf('  function buildDiffView('),toolEnd)+'\nObject.assign(App,{buildToolBlock,applyToolResult,buildDiffView,buildSubAgentBlock,buildThinkBlock});');
+  const start=historySrc.indexOf('  function renderOneRecordInto(');
+  w.eval(historySrc.slice(start,historySrc.indexOf('  function renderRecords(',start)));
   w.eval(fs.readFileSync(path.join(__dirname,'../js/app/stream_pipeline.js'),'utf8'));
   const files=[{path:'/project/a.py',action:'update',status:'applied',lines_added:1,lines_removed:1,history_recorded:true},
     {path:'/project/b.js',action:'add',status:'applied',lines_added:1,lines_removed:0,history_recorded:false,history_reason:'record_failed'}];
@@ -109,4 +114,31 @@ test('全部大文件跳过比较时不显示误导性的 +0/-0，旧损坏结�
   assert.doesNotMatch(ui.wrap.querySelector('.tool-io-out').textContent,/\+0/);
   const invalid=JSON.stringify({files:[null]});h.App.applyToolResult(ui,'apply_patch',invalid,null,{});
   assert.equal(ui.wrap.querySelector('.tool-io-out').textContent,invalid);
+});
+
+test('同轮用量行只保留一行：重复渲染幂等',t=>{
+  const h=setup(t);
+  h.w.FormatUtils.roundSummaryText=(u)=>'U'+(u&&u.total_tokens);
+  const base={kind:'usage',round:5,model:null,ts:'2026-10-30 10:00:00'};
+  h.w.renderOneRecordInto(h.root,{...base,usage:{total_tokens:100}},{},{});
+  h.w.renderOneRecordInto(h.root,{...base,usage:{total_tokens:200}},{},{});
+  const lines=h.root.querySelectorAll('.round-usage');
+  assert.equal(lines.length,1);
+  assert.equal(lines[0].textContent,'U200');
+  assert.equal(lines[0].dataset.round,'5');
+});
+
+test('历史用量刷新跨容器的直播行，不另画一行',t=>{
+  const h=setup(t);
+  h.w.FormatUtils.roundSummaryText=(u)=>'U'+(u&&u.total_tokens);
+  h.root.id='chatInner';
+  const live=h.w.document.createElement('div');
+  live.className='round-usage';live.dataset.round='7';live.textContent='OLD';
+  h.root.appendChild(live);
+  const other=h.w.document.createElement('div');
+  h.w.document.body.appendChild(other);t.after(()=>other.remove());
+  h.w.renderOneRecordInto(other,{kind:'usage',round:7,usage:{total_tokens:300},model:null},{},{});
+  assert.equal(other.querySelectorAll('.round-usage').length,0);
+  assert.equal(h.root.querySelectorAll('.round-usage').length,1);
+  assert.equal(live.textContent,'U300');
 });

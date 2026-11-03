@@ -335,6 +335,39 @@ def merge_function_call_delta(
         existing_fc["function"]["arguments"] += fc_arguments
 
 
+def _index_for_unindexed_delta(accumulated: List[dict], delta: dict) -> int:
+    """为缺 index 的工具调用增量推导槽位（merge_tool_call_delta 专用）。
+
+    - 有 id 且累积区已有同 id：归并到该槽（多并行调用无 index 时互不串扰）；
+    - 新 id + 携带名称片段 + 0 号槽已有其他具名调用：新的并行调用，另开槽位；
+    - 其余：一律单槽（index 0）语义，与前端渲染缺省一致。首个增量无 id、
+      后续增量才带 id 的形状也能正确续接（新 id 无名称片段→落回 0 号槽，
+      后续合并逻辑会把 id 认领过去）。
+    """
+    delta_id = delta.get("id")
+    if delta_id:
+        for acc_tc in accumulated:
+            if acc_tc.get("id") == delta_id:
+                existing_index = acc_tc.get("index")
+                if isinstance(existing_index, int):
+                    return existing_index
+                break
+    slot_zero = None
+    for acc_tc in accumulated:
+        if acc_tc.get("index") == 0:
+            slot_zero = acc_tc
+            break
+    if delta_id and slot_zero is not None and slot_zero.get("id") != delta_id:
+        function_part = delta.get("function")
+        delta_name = function_part.get("name") if isinstance(function_part, dict) else None
+        slot_function = slot_zero.get("function") or {}
+        slot_name = slot_function.get("name") if isinstance(slot_function, dict) else None
+        if delta_name and slot_name:
+            used = [acc.get("index") for acc in accumulated if isinstance(acc.get("index"), int)]
+            return (max(used) + 1) if used else 0
+    return 0
+
+
 def merge_tool_call_delta(
     accumulated: List[dict],
     tool_calls_delta: list[dict]
@@ -345,6 +378,12 @@ def merge_tool_call_delta(
     - 如果 delta 的 index 已存在，则累加该 index 的内容（name, arguments 等）
     - 如果 delta 的 index 不存在，则新增一条记录
     - index 本身是标识符，直接替换而非累加
+    - 部分 OpenAI 兼容网关会省略 index（尤其单工具调用时）：有 id 按 id
+      归并，否则退化为单槽（index 0）语义——与前端增量渲染（缺 index
+      默认为 0）保持一致；新 id + 携带名称片段 + 0 号槽已被其他调用占用
+      时视为新的并行调用，另开槽位。缺 index 就整条丢弃会导致后端累积
+      为空而前端已建块，调用被静默吞掉（轮次直接 done，无 assistant、
+      无工具执行、前端工具块永远“无输出”）。
     """
     if not isinstance(tool_calls_delta, list):
         return
@@ -353,7 +392,7 @@ def merge_tool_call_delta(
             continue
         index = delta.get("index")
         if index is None:
-            continue
+            index = _index_for_unindexed_delta(accumulated, delta)
         # 查找是否已存在该 index 的记录
         existing_tc = None
         for acc_tc in accumulated:

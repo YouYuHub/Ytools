@@ -14,7 +14,13 @@ from memory import file_history as store
 
 @pytest.fixture()
 def workdir(tmp_path, monkeypatch):
-    """把版本链根目录指到临时目录 + 提供一个被跟踪的目标文件。"""
+    """把版本链根目录指到临时目录 + 提供一个被跟踪的目标文件。
+
+    注意：HISTORY_DIFF_ROOT 语义=session_files 根，真实落盘经
+    files_path(.parent) 派生（无登录身份时为 <tmp>/session_files/<sid>/
+    file_diffs）。断言落盘结构时用 store._root_dir(SESSION) 取根，
+    不要硬编码拼接路径。
+    """
     fake_root = tmp_path / "history_upload"
     monkeypatch.setattr(store, "HISTORY_DIFF_ROOT", fake_root)
     target = tmp_path / "proj" / "main.py"
@@ -50,7 +56,7 @@ def test_record_creates_baseline_and_tool_versions(workdir):
     assert entry["path"] == str(target)
     assert entry["added"] == 1 and entry["removed"] == 1
     # 目录结构：meta.json + g0/v000_base.txt + g0/v001.txt
-    key_dir = workdir["root"] / SESSION / "file_diffs" / entry["key"]
+    key_dir = store._root_dir(SESSION) / entry["key"]
     assert (key_dir / "meta.json").exists()
     assert (key_dir / "g0" / "v000_base.txt").read_text(encoding="utf-8") == "a = 1\nb = 2\nc = 3\n"
     assert (key_dir / "g0" / "v001.txt").read_text(encoding="utf-8") == "a = 10\nb = 2\nc = 3\n"
@@ -538,7 +544,7 @@ def test_rollback_empty_baseline_removes_file(workdir):
     assert result["disk_removed"] is True
     assert not new_path.exists()  # 空文件不留磁盘
     # 版本链留档还在（编辑器仍可回看/找回内容）
-    assert (workdir["root"] / SESSION / "file_diffs" / key / "meta.json").exists()
+    assert (store._root_dir(SESSION) / key / "meta.json").exists()
 
 
 def test_revert_all_removes_new_files_and_keeps_modified(workdir, tmp_path):
@@ -567,7 +573,7 @@ def test_keep_all_with_cleanup_removes_histories(workdir):
     target = workdir["target"]
     _record(target, "a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 3\n")
     key = store.file_key(str(target))
-    key_dir = workdir["root"] / SESSION / "file_diffs" / key
+    key_dir = store._root_dir(SESSION) / key
     assert key_dir.exists()
     result = store.keep_all(SESSION, cleanup=True)
     assert result["kept_count"] == 1
@@ -578,7 +584,7 @@ def test_keep_all_with_cleanup_removes_histories(workdir):
     result2 = store.keep_all(SESSION, cleanup=False)
     assert result2["kept_count"] == 1
     assert "cleaned_count" not in result2
-    key_dir2 = workdir["root"] / SESSION / "file_diffs" / key
+    key_dir2 = store._root_dir(SESSION) / key
     assert key_dir2.exists()
 
 
@@ -592,7 +598,7 @@ def test_keep_all_skips_broken_entry_isolates_errors(workdir, tmp_path):
     key2 = store.file_key(str(target2))
     # 模拟索引孤儿：删掉 target2 的版本链目录但 index.json 残留（磁盘异常场景）
     import shutil as _shutil
-    _shutil.rmtree(workdir["root"] / SESSION / "file_diffs" / key2, ignore_errors=True)
+    _shutil.rmtree(store._root_dir(SESSION) / key2, ignore_errors=True)
     result = store.keep_all(SESSION)
     assert result["kept_count"] == 1
     assert len(result["skipped"]) == 1

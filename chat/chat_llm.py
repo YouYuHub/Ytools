@@ -23,7 +23,7 @@ from typing import(
 import asyncio
 from contextlib import suppress
 
-from util.media_limits import limit_media_messages, learn_media_limit
+from util.media_limits import limit_media_messages, learn_media_limit, downgrade_native_doc_on_format_error
 from util.logger import get_logger
 from util.token_estimate import text_token_estimate
 from .http_pool import default_ssl_context, configure_response
@@ -803,6 +803,12 @@ class ChatLLM:
                         if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
                             yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求；未发送内容会明确告知模型。'}}, ensure_ascii=False)}\n\n"
                             continue
+                        if re.match(r"HTTP/\S+ 400(?: |$)", status_str):
+                            downgraded = downgrade_native_doc_on_format_error(error_text, payload["messages"])
+                            if downgraded is not None:
+                                retry_messages = downgraded
+                                yield f"data: {json.dumps({'warning': {'code': 'NATIVE_DOC_TEXT_DOWNGRADE', 'message': '网关不支持原生文档 file 部件格式，已自动转为文本并重新请求。'}}, ensure_ascii=False)}\n\n"
+                                continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -1125,6 +1131,12 @@ class ChatLLM:
                         if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
                             yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求；未发送内容会明确告知模型。'}}, ensure_ascii=False)}\n\n"
                             continue
+                        if re.match(r"HTTP/\S+ 400(?: |$)", status_str):
+                            downgraded = downgrade_native_doc_on_format_error(error_text, payload["messages"])
+                            if downgraded is not None:
+                                retry_messages = downgraded
+                                yield f"data: {json.dumps({'warning': {'code': 'NATIVE_DOC_TEXT_DOWNGRADE', 'message': '网关不支持原生文档 file 部件格式，已自动转为文本并重新请求。'}}, ensure_ascii=False)}\n\n"
+                                continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -1373,6 +1385,7 @@ class ChatLLM:
         last_step = "none"
         retry_count = 0
         retry_max_attempts = _resolve_network_retry_max_attempts()
+        retry_messages = None
         while True:
             # 网络重试固定间隔：第 2 次及以后尝试前等待（语义同流式版）
             if retry_count > 0:
@@ -1382,6 +1395,8 @@ class ChatLLM:
                 stream=False,
                 model_name=chat_config["selected_model_id"],
             )
+            if retry_messages is not None:
+                payload["messages"] = retry_messages
             payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
             # 每次尝试都预检（语义见流式版注释）
             hard_limit_error = ChatLLM._precheck_hard_limit(payload)
@@ -1448,6 +1463,11 @@ class ChatLLM:
                         )
                     if re.match(r"HTTP/\S+ 400(?: |$)", status_str) and learn_media_limit(error_text, payload["messages"], chat_config):
                         continue
+                    if re.match(r"HTTP/\S+ 400(?: |$)", status_str):
+                        downgraded = downgrade_native_doc_on_format_error(error_text, payload["messages"])
+                        if downgraded is not None:
+                            retry_messages = downgraded
+                            continue
                     raise RuntimeError(f"HTTP Error: {status_str}: {error_text}")
                 last_step = "read_body"
                 response_body = ChatLLM._read_full_response_body(f, is_chunked)

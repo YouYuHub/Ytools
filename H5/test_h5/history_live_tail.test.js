@@ -3,8 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM } = require('jsdom');
+const { stripTypeScriptTypes } = require('node:module');
 
 const source = name => fs.readFileSync(path.join(__dirname, '../js/app', name + '.js'), 'utf8');
+const tssource = name => stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app', name + '.ts'), 'utf8'));
 
 function setup(t) {
   const dom = new JSDOM('<main><div id="scroll"><div id="inner"></div></div></main>', {runScripts:'outside-only'});
@@ -39,7 +41,7 @@ function setup(t) {
   };
   Object.assign(w, App, {setEmpty() {}, scrollToBottom() { scroll.scrollTop = scroll.scrollHeight; },
     HistoryParser:require('../js/history_parser'), updateQnavActive() {}});
-  const messages = source('messages');
+  const messages = tssource('messages_history');
   w.eval(messages.slice(messages.indexOf('  const RENDER_TAIL_RECORDS'), messages.indexOf('  function appendTime(')) +
     '\nApp.getHistoryWindow = () => loadOlderState;\n' +
     messages.slice(messages.indexOf('  App.showHistoryTail ='), messages.indexOf('  App.appendTime =')));

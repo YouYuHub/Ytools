@@ -1,0 +1,142 @@
+/** 可查询 DOM 子树的结构化子集（真 Element 与测试替身都满足）。 */
+interface QueryRootLike {
+  querySelector?(selector: string): Element | null;
+  querySelectorAll?(selector: string): NodeListOf<Element>;
+}
+
+interface ContainerLike {
+  contains?(node: unknown): boolean;
+}
+
+interface SequentialMatcher<T> {
+  match: (candidates: Iterable<T>, equals: (node: T) => unknown) => T | null;
+  reset: () => void;
+}
+
+interface StreamReplayDedupApi {
+  findHistoryToolWrap: (
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    callId: unknown,
+  ) => Element | null;
+  collectHistoryTexts: (
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    round: unknown,
+  ) => Element[];
+  collectHistoryThinks: (
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    round: unknown,
+  ) => Element[];
+  renderedSourceEquals: (
+    markdown: { render: (source: string) => string },
+    el: (tag: string) => HTMLElement,
+    source: unknown,
+    nodeText: unknown,
+  ) => boolean;
+  createSequentialMatcher: <T>() => SequentialMatcher<T>;
+}
+
+(function (global: typeof globalThis, factory: () => StreamReplayDedupApi) {
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  else (global as unknown as { StreamReplayDedup: StreamReplayDedupApi }).StreamReplayDedup = api;
+})(typeof self !== "undefined" ? self : globalThis, function (): StreamReplayDedupApi {
+  "use strict";
+  // 附接回放去重：纯 DOM 查询 + 顺序匹配器。
+  // 后端重启/刷新后附接运行时流，buffer 会重放历史已渲染过的正文、思考
+  // 与工具调用；流管线在回放窗口内用这里的 helpers 找到历史节点：
+  // 工具按 callId 收养（复用其 ui 控制器），正文/思考按同轮文本比对命中
+  // 则丢弃重放帧。匹配不到一律按正常新建处理，不删除任何已有节点。
+  function escapeAttr(value: unknown): string {
+    if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(String(value));
+    return String(value).replace(/["\\]/g, "\\$&");
+  }
+  function inside(node: unknown, root: ContainerLike | null | undefined): boolean {
+    return Boolean(node && root && (node === root || (root.contains ? root.contains(node) : false)));
+  }
+  // 同 callId 的历史工具卡（排除管线自己的新容器，避免收养自己）。
+  function findHistoryToolWrap(
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    callId: unknown,
+  ): Element | null {
+    if (!chatInner || !callId || typeof chatInner.querySelector !== "function") return null;
+    const wrap = chatInner.querySelector('.tool-block[data-tool-call-id="' + escapeAttr(callId) + '"]');
+    if (!wrap || inside(wrap, msg)) return null;
+    return wrap;
+  }
+  function collectRoundNodes(
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    round: unknown,
+    selector: string,
+  ): Element[] {
+    if (!chatInner || round == null || typeof chatInner.querySelectorAll !== "function") return [];
+    const out: Element[] = [];
+    const nodes = chatInner.querySelectorAll(selector + '[data-round="' + (round as string | number) + '"]');
+    for (const node of nodes) {
+      if (inside(node, msg)) continue;
+      out.push(node);
+    }
+    return out;
+  }
+  // 同轮历史正文块（DOM 顺序）。
+  function collectHistoryTexts(
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    round: unknown,
+  ): Element[] {
+    return collectRoundNodes(chatInner, msg, round, ".msg-assistant-body");
+  }
+  // 同轮历史思考内容区（DOM 顺序，直接返回 .think-content 元素）。
+  function collectHistoryThinks(
+    chatInner: QueryRootLike | null | undefined,
+    msg: ContainerLike | null | undefined,
+    round: unknown,
+  ): Element[] {
+    const out: Element[] = [];
+    for (const wrap of collectRoundNodes(chatInner, msg, round, ".think-block")) {
+      const content = wrap.querySelector ? wrap.querySelector(".think-content") : null;
+      out.push(content || wrap);
+    }
+    return out;
+  }
+  // 源码渲染后的文本是否与历史节点一致（离屏渲染比对，不碰 DOM）。
+  function renderedSourceEquals(
+    markdown: { render: (source: string) => string },
+    el: (tag: string) => HTMLElement,
+    source: unknown,
+    nodeText: unknown,
+  ): boolean {
+    const probe = el("div");
+    probe.innerHTML = markdown.render(source as string);
+    return (probe.textContent || "").trim() === String(nodeText || "").trim();
+  }
+  // 顺序消费匹配器：回放与历史同源同序；命中即消费，避免原文重复的
+  // 多段文本互相误配（后到达的相同文本找不到未消费项时会正常新建）。
+  function createSequentialMatcher<T>(): SequentialMatcher<T> {
+    const consumed = new Set<T>();
+    return {
+      match: function (candidates: Iterable<T>, equals: (node: T) => unknown) {
+        for (const node of candidates) {
+          if (consumed.has(node)) continue;
+          if (equals(node)) {
+            consumed.add(node);
+            return node;
+          }
+        }
+        return null;
+      },
+      reset: function () { consumed.clear(); },
+    };
+  }
+  return {
+    findHistoryToolWrap: findHistoryToolWrap,
+    collectHistoryTexts: collectHistoryTexts,
+    collectHistoryThinks: collectHistoryThinks,
+    renderedSourceEquals: renderedSourceEquals,
+    createSequentialMatcher: createSequentialMatcher,
+  };
+});

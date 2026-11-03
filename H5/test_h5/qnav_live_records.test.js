@@ -3,15 +3,18 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
+const {stripTypeScriptTypes}=require('node:module');
 const {JSDOM}=require('jsdom');
-const source=fs.readFileSync(path.join(__dirname,'../js/app/messages.js'),'utf8');
+const source=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/messages_nav.ts'),'utf8'));
 function setup(records){
   const dom=new JSDOM('<div id="chat"></div><div id="nav"><div id="rail"></div><div id="panel"></div></div>');
   const d=dom.window.document;
+  const older={records};
   const ctx={chatInner:d.querySelector('#chat'),qnav:d.querySelector('#nav'),qnavRail:d.querySelector('#rail'),qnavPanel:d.querySelector('#panel'),
-    loadOlderState:{records},QNAV_MAX_DASHES:40,contentToPlainText:String,updateQnavActive(){},el(tag,cls,text){const n=d.createElement(tag);n.className=cls;if(text!=null)n.textContent=text;return n;}};
+    loadOlderState:older,QNAV_MAX_DASHES:40,contentToPlainText:String,updateQnavActive(){},el(tag,cls,text){const n=d.createElement(tag);n.className=cls;if(text!=null)n.textContent=text;return n;},
+    App:{loadOlderState:older,contentToPlainText:String}};
   vm.createContext(ctx);
-  vm.runInContext(source.slice(source.indexOf('  let qnavUsers ='),source.indexOf('  // ---------- 从用户引用')),ctx);
+  vm.runInContext(source.slice(source.indexOf('  let qnavUsers'),source.indexOf('  // ---------- 从用户引用')),ctx);
   return {ctx,close:()=>dom.window.close(),user(text,round,index,event){const n=d.createElement('div');n.className='msg-user';
     if(round!=null)n.dataset.round=String(round);if(index!=null)n.dataset.historyIndex=String(index);if(event!=null)n.dataset.sourceEvent=String(event);
     const b=d.createElement('div');b.className='msg-bubble';b.textContent=text;n.append(b);ctx.chatInner.append(n);return n;},
@@ -43,8 +46,8 @@ test('历史窗口恢复实时气泡时优先原对象，不按重复文本收�
   const live=h.user('继续');live.remove();
   const message=h.ctx.el('div','msg');
   const active={sessionId:'s',userText:'继续',round:null,userNode:live,messageNode:message};
-  const sessions=fs.readFileSync(path.join(__dirname,'../js/app/sessions.js'),'utf8');
-  h.ctx.state={sessionId:'s',activeStream:active};h.ctx.setEmpty=()=>{};h.ctx.App={rebuildQnav:h.ctx.rebuildQnav};
+  const sessions=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/sessions.ts'),'utf8'));
+  h.ctx.state={sessionId:'s',activeStream:active};h.ctx.setEmpty=()=>{};h.ctx.App=Object.assign(h.ctx.App,{rebuildQnav:h.ctx.rebuildQnav});
   vm.runInContext(sessions.slice(sessions.indexOf('  function restoreActiveStream('),sessions.indexOf('  function noteSessionArchive(')),h.ctx);
   h.ctx.restoreActiveStream('s');
   assert.equal(active.userNode,live);assert.equal(live.parentNode,h.ctx.chatInner);

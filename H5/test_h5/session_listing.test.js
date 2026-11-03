@@ -3,7 +3,8 @@ const assert=require('node:assert/strict');
 const vm=require('node:vm');
 const fs=require('node:fs');
 const path=require('node:path');
-const source=fs.readFileSync(path.join(__dirname,'../js/app/sessions.js'),'utf8');
+const {stripTypeScriptTypes}=require('node:module');
+const source=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/sessions.ts'),'utf8'));
 function setup(){
   const list={children:[],appendChild(n){this.children.push(n);n.parent=this;},
     querySelector(selector){return this.querySelectorAll(selector)[0]||null;},
@@ -20,7 +21,7 @@ function setup(){
     setTimeout(fn){const id=++timerId;timers.set(id,fn);return id;},clearTimeout(id){timers.delete(id);},
     openSession(id){opened.push(id);ctx.state.sessionId=id;return true;},startNewChat(){ctx.sessionOpenSeq++;ctx.state.sessionId=null;}};
   vm.createContext(ctx);
-  vm.runInContext(source.slice(source.indexOf('  let lastSortedRows ='),source.indexOf('  // 溢出淡出标记')),ctx);
+  vm.runInContext(source.slice(source.indexOf('  let lastSortedRows'),source.indexOf('  // 溢出淡出标记')),ctx);
   vm.runInContext(source.slice(source.indexOf('  function renderSessionItems()'),source.indexOf('  /** 多选分组视图')),ctx);
   vm.runInContext(source.slice(source.indexOf('  async function openInitialSession('),source.indexOf('  // 视图就绪跟踪')),ctx);
   vm.runInContext('this.rows=()=>lastSortedRows;',ctx);

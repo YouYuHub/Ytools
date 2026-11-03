@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
-const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_tools.ts'), 'utf8'));
 const start = source.indexOf('  function applyToolResult(');
 const end = source.indexOf('  // ---------- 子任务块', start);
 function render(name, result) {

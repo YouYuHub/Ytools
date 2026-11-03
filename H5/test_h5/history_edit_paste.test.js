@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM } = require('jsdom');
+const { stripTypeScriptTypes } = require('node:module');
 const { mediaFiles } = require('../js/clipboard_media_utils');
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const kindOf = name => /\.(png|jpe?g|webp|gif|bmp|tiff?|ico)$/i.test(name) ? 'image'
@@ -17,6 +18,23 @@ test('clipboard screenshots without usable names get an image filename and prese
   assert.equal(await result[0].text(), 'image bytes');
   const jpeg = new File(['jpeg'], '', { type: 'image/jpeg' });
   assert.match(mediaFiles({ files: [jpeg] }, kindOf)[0].name, /\.jpg$/);
+});
+
+test('clipboard getAsFile is invoked as a method (native DataTransferItem requires this)', () => {
+  // 回归：浏览器原生 getAsFile 依赖 this，摘出来裸调会抛 Illegal invocation。
+  // 此前 TS 迁移曾引入该写法，箭头函数替身测不出来，真机粘贴图片失效。
+  const file = new File(['image bytes'], 'image.png', { type: 'image/png' });
+  const item = {
+    kind: 'file',
+    type: 'image/png',
+    getAsFile() {
+      assert.equal(this, item, 'getAsFile must be called with the item as receiver');
+      return file;
+    },
+  };
+  const result = mediaFiles({ items: [item] }, kindOf);
+  assert.equal(result.length, 1);
+  assert.match(result[0].name, /^clipboard-.*\.png$/);
 });
 
 test('clipboard items and files are not duplicated; files-only, named media and text are handled', () => {
@@ -53,7 +71,7 @@ function setup(t, { insert = false, content = 'Original message' } = {}) {
   for (const file of ['quote_utils.js', 'clipboard_media_utils.js']) {
     w.eval(fs.readFileSync(path.join(__dirname, '../js', file), 'utf8'));
   }
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_edit.ts'), 'utf8'));
   const helpers = source.slice(source.indexOf('  function extractUserMediaItems('),
     source.indexOf('  /**', source.indexOf('  function contentToPlainText(')));
   const editor = source.slice(source.indexOf('  function beginUserMessageEdit('),

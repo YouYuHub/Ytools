@@ -1,6 +1,8 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),{JSDOM}=require('jsdom');
-const messages=fs.readFileSync(path.join(__dirname,'../js/app/messages.js'),'utf8');
+const {stripTypeScriptTypes}=require('node:module');
+// messages.js 已拆分：思考/工具块读 messages_edit.ts（剥离类型后切片）
+const messages=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/messages_edit.ts'),'utf8'));
 function setup(t){
   const dom=new JSDOM('<div id="chat"></div>',{runScripts:'outside-only',url:'http://test'});t.after(()=>dom.window.close());
   const w=dom.window,root=w.document.querySelector('#chat');
@@ -14,7 +16,7 @@ function setup(t){
   const thinkStart=messages.indexOf('  function buildThinkBlock(');
   const toolStart=messages.indexOf('  function buildToolBlock(');
   w.eval(messages.slice(thinkStart,toolStart)+'\nObject.assign(App,{buildThinkBlock});');
-  const end=messages.indexOf('  // 代码块复制（事件委托）',messages.indexOf('  function buildSubAgentBlock('));
+  const end=messages.indexOf('  // ---------- 导出',toolStart);
   w.eval(messages.slice(toolStart,end)+'\nObject.assign(App,{buildToolBlock});');
   return {w,App,root};
 }

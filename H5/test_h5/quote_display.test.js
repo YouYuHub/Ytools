@@ -3,13 +3,17 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const { JSDOM } = require('jsdom');
 
 function setup() {
   const dom = new JSDOM('<div id="chat"></div>');
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
-  const context = {state:{sessionId:'s'}, loadOlderState:{records:[]}, qnavEntries:[],
-    chatInner:dom.window.document.querySelector('#chat'), contentToPlainText:s=>s};
+  // messages.js 已拆分：引用定位读 messages_nav.ts（剥离类型后切片）
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
+  const older = {records:[]};
+  const context = {state:{sessionId:'s'}, loadOlderState:older, qnavEntries:[],
+    chatInner:dom.window.document.querySelector('#chat'), contentToPlainText:s=>s,
+    App:{contentToPlainText:s=>s, loadOlderState:older}};
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('  function quoteMatchText('),
     source.indexOf('  function normalizedTextOffsets(')), context);

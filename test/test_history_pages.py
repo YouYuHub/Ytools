@@ -41,6 +41,23 @@ def test_round_pages_are_read_only_and_complete_without_overlaps(accounts):
     assert hashlib.sha256(path.read_bytes()).hexdigest()==original
 
 
+def test_questions_index_skips_internal_resume_nudge(accounts):
+    # 暂停恢复的内部 nudge 不进导航问题索引（与气泡/标题/回放口径一致）
+    import json as _json
+    _, _, users, (first, _, _), root = accounts
+    path = root / "users" / users[0]["id"] / "sessions" / "chat-a" / "chat-a_chat.jsonl"
+    rows = [{"_meta": {"title": "paged", "usage": {}}}]
+    rows.append({"event": "chat_round", "question": "q1", "status": "stopped",
+                   "events": [{"role": "user", "content": "q1"}]})
+    rows.append({"event": "chat_round", "question": "", "status": "done",
+                   "events": [{"role": "user", "content": "上次任务被中断了，请继续。", "_internal": True},
+                              {"role": "assistant", "content": "a2"}]})
+    path.write_text("\n".join(_json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+    data = first.get("/chat_history/page", params={"session_id": "chat-a"}).json()
+    assert [(q["round"], q["text"] ) for q in data["questions"]] == [(1, "q1")]
+    assert data["total_rounds"] == 2
+
+
 def test_jump_snapshot_change_and_foreign_read(accounts):
     _,_,_,(first,second,_),root=accounts
     path=write_rounds(accounts)

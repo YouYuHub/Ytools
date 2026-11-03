@@ -150,11 +150,15 @@ class ModelMeter:
         self.events, self.output_ascii, self.output_non_ascii = {}, 0, 0
         self.completed = False
         self.network_started = False
+        # 是否收到过任何响应证据（usage 帧/正文/完成标记）：零证据的失败
+        # 按 0 结算，不再按全额输入估算累加。
+        self.saw_usage_frame = False
 
     def call(self):
         self.id = uuid.uuid4().hex
         self.network_started = False
         self.events, self.output_ascii, self.output_non_ascii, self.completed = {}, 0, 0, False
+        self.saw_usage_frame = False
         return {"id": self.id, "role": self.role, "agent": self.agent, "model": self.model,
                 "price": self.price, "currency": self.currency, "usage": store.normalize_usage({"prompt_tokens": self.input_estimate}),
                 "cost": None, "source": "unknown", "state": "running"}
@@ -203,6 +207,9 @@ class ModelMeter:
             return False
         self.completed = self.completed or bool(frame.get("finish_reason") or frame.get("response_complete"))
         usage = frame.get("usage")
+        if isinstance(usage, dict):
+            # usage 帧到达即证明服务端已处理（即使数值非法/缺失），不算零响应
+            self.saw_usage_frame = True
         reported = usage.get("messages_usage", usage) if isinstance(usage, dict) else None
         valid_usage = isinstance(reported, dict) and any(
             isinstance(reported.get(key), (int, float)) and not isinstance(reported.get(key), bool)
@@ -232,14 +239,20 @@ class ModelMeter:
         source = "reported" if self.events else "estimated"
         if state == "unknown" and self.events and not self.completed:
             source = "partial"
+        responded = bool(self.events) or self.output_ascii or self.output_non_ascii or self.completed or self.saw_usage_frame
         if not self.events:
-            total = store.normalize_usage({"prompt_tokens": self.input_estimate,
-                                          "completion_tokens": (self.output_ascii + 3) // 4 + self.output_non_ascii})
+            if responded:
+                total = store.normalize_usage({"prompt_tokens": self.input_estimate,
+                                              "completion_tokens": (self.output_ascii + 3) // 4 + self.output_non_ascii})
+            else:
+                # 零响应失败（连接失败/重试无回包）：无任何用量证据，按 0 结算。
+                # 此前每次重试都结算全额输入估算，失败重试会虚增数十亿 token。
+                source = "failed"
         from security import quotas
         from security.resource_limits import release
         try:
             store.settle(self.id, total, source=source, state=state)
-            quotas.settle(self.id, total["total_tokens"], sent=self.network_started,
+            quotas.settle(self.id, total["total_tokens"], sent=self.network_started and responded,
                           complete=bool(self.events and (self.completed or state == "completed")))
         finally:
             release(self.id)

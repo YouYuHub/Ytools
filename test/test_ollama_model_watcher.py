@@ -285,6 +285,54 @@ class OllamaModelWatcherTests(unittest.TestCase):
             "https://host.example/ollama/api/show",
         )
 
+    def test_discovery_timeout_is_clamped_to_max(self):
+        import util.ollama_model_watcher as watcher_mod
+        self.configure_ollama()
+        self.inventory = [{"name": "llama3:latest", "digest": "d"}]
+        self.capabilities = {"llama3:latest": ["completion"]}
+        with patch.object(watcher_mod, "load_var", side_effect=lambda name, default: "3600"):
+            self.watcher.poll_once()
+        tags_timeouts = [call[4] for call in self.calls if call[0].endswith("/api/tags")]
+        show_timeouts = [call[4] for call in self.calls if call[0].endswith("/api/show")]
+        self.assertTrue(tags_timeouts and show_timeouts)
+        self.assertTrue(all(t == watcher_mod.MAX_DISCOVERY_TIMEOUT_SECONDS for t in tags_timeouts + show_timeouts))
+
+    def test_hanging_show_requests_do_not_stall_poll(self):
+        import threading as _threading
+        import time as _time_mod
+        import util.ollama_model_watcher as watcher_mod
+        self.configure_ollama()
+        self.inventory = [
+            {"name": "fast:latest", "digest": "fast-digest"},
+            {"name": "hung:latest", "digest": "hung-digest"},
+        ]
+        release = _threading.Event()
+
+        def hanging_fake(url, *, method="GET", payload=None, api_key=None, timeout=3):
+            self.calls.append((url, method, payload, api_key, timeout))
+            if url.endswith("/api/tags"):
+                return {"models": list(self.inventory)}
+            if payload["model"] == "hung:latest":
+                release.wait(30)  # 模拟 DNS 卡死：远超预算仍不返回
+                return {"capabilities": ["completion", "vision"]}
+            return {"capabilities": ["completion", "vision"]}
+
+        self.watcher._request_json = hanging_fake
+        try:
+            with patch.object(watcher_mod, "_SHOW_DNS_GRACE_SECONDS", 0.2):
+                started = _time_mod.monotonic()
+                actions = self.watcher.poll_once()
+                elapsed = _time_mod.monotonic() - started
+        finally:
+            release.set()
+        # 预算 = 3s × 1 批 + 0.2s：必须远早于 30s 返回
+        self.assertLess(elapsed, 15.0)
+        self.assertEqual(actions, {"Ollama": "updated"})
+        available = {item["model_name"]: item for item in env_manager.list_available_models()}
+        self.assertTrue(available["fast:latest"]["vision"])
+        # 卡死的模型保守标记（能力未知），下轮继续补齐，不阻塞整轮
+        self.assertFalse(available["hung:latest"]["vision"])
+
 
 if __name__ == "__main__":
     unittest.main()

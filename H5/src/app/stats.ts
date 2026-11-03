@@ -1,0 +1,329 @@
+/**
+ * Token 统计
+ * - 会话累计用量（usage 归一化交给 FormatUtils）与顶栏徽标
+ * - 上下文 token 估算状态栏（防抖合并刷新、请求序号丢弃过期响应）
+ * 依赖：app/core.js、API、FormatUtils、SessionUtils
+ */
+(function (App: any) {
+  "use strict";
+  const {
+    state, tokenTotal, sessionMenuUsage, sessionMenuUsageValues,
+    contextTokenStatus, contextTokenSummary,
+    contextTokenModel
+  } = App;
+
+  // ---------- 当前会话聊天模型名（状态条中部占位） ----------
+  // 反映服务端生效的聊天模型选择：会话切换/新建会话/模型面板加载保存后调用。
+  // 无缓存或显式传入会话（切换会话）时拉取 /chat_config/models?role=chat_model，
+  // 之后复用缓存；forceRefresh 用于工具配置弹窗主动同步 models.json 的能力改动。
+  // 会话独立选择与全局默认已由后端合并进 role_info.selection。
+  // requestSeq 防竞态：快速连续切换会话时丢弃过期响应，避免旧会话的模型名
+  // 后到覆盖新会话的显示（与下方 context token 刷新的序号保护同一思路）。
+  let chatModelLabelRequestSeq = 0;
+  async function refreshChatModelLabel(sessionId: any, forceRefresh: any): Promise<any> {
+    if (!contextTokenModel) return false;
+    const target = sessionId ? SessionUtils.sanitizeSessionId(sessionId) : state.sessionId;
+    const requestSeq = ++chatModelLabelRequestSeq;
+    // forceRefresh / 无缓存 / 显式切换会话 / 新建会话（target 为空=取全局默认）时强制拉取，
+    // 避免沿用上一会话的独立选择缓存
+    let refreshed = false;
+    if (forceRefresh || !state.modelConfigs || !state.modelConfigs.chat_model || sessionId || !target) {
+      try {
+        const data = await API.getModels("chat_model", target || undefined, Boolean(forceRefresh));
+        if (requestSeq !== chatModelLabelRequestSeq) return false; // 过期响应：不写缓存不渲染
+        if (data) {
+          state.modelConfigs = state.modelConfigs || {};
+          state.modelConfigs.chat_model = data;
+          refreshed = true;
+        }
+      } catch (_) { /* 拉取失败保留现有显示 */ }
+    }
+    if (requestSeq !== chatModelLabelRequestSeq) return false; // 渲染前再校验，只用最新一次调用的结果
+    renderChatModelLabel();
+    return refreshed;
+  }
+
+  // 状态条模型名 + 视觉能力的渲染：唯一数据源为 state.modelConfigs.chat_model。
+  // 与缓存写入解耦成两个函数，任何更新缓存的调用方都能通过下面的单一入口
+  // 保证「写缓存 → 渲染」顺序，不再依赖"先更新缓存再调用刷新"的隐式约定。
+  function renderChatModelLabel(): void {
+    if (!contextTokenModel) return;
+    const cfg = state.modelConfigs && state.modelConfigs.chat_model;
+    const sel = cfg && cfg.role_info && cfg.role_info.selection;
+    const name = sel ? (sel.model || sel.model_name || "") : "";
+    contextTokenModel.textContent = name;
+    contextTokenModel.title = name ? "当前聊天模型：" + name : "";
+    contextTokenModel.classList.toggle("hidden", !name);
+    // 会话生效模型的视觉能力：read_media 工具可用性与附件发送提示的判定来源
+    //（后端 role_info.vision 为权威值；接口失败时保守置 true，不误伤可用功能）
+    state.chatModelVision = cfg && cfg.role_info
+      ? (cfg.role_info.vision !== false)
+      : true;
+  }
+
+  /**
+   * 更新聊天模型配置缓存的单一入口：写缓存 + 立即重绘状态条（原子）。
+   * 模型面板保存/清除会话覆盖、切换模型校准等任何拿到 chat_model 配置的
+   * 地方都应经此更新，避免出现"缓存已换新、状态条仍是旧模型名"的窗口。
+   * 传空值（null/undefined）视为无有效配置：不写缓存、仅按现有缓存重绘。
+   */
+  function setChatModelConfig(data: any): boolean {
+    if (data) {
+      state.modelConfigs = state.modelConfigs || {};
+      state.modelConfigs.chat_model = data;
+      // 本次写入即当前权威配置：让在途的旧请求（若有）失效，避免其响应
+      // 把这里刚写入的配置覆盖回旧值（与 refreshChatModelLabel 的序号保护配套）
+      chatModelLabelRequestSeq++;
+    }
+    renderChatModelLabel();
+    return Boolean(data);
+  }
+
+  App.refreshChatModelLabel = refreshChatModelLabel;
+  App.renderChatModelLabel = renderChatModelLabel;
+  App.setChatModelConfig = setChatModelConfig;
+
+  // 当前会话生效聊天模型是否支持视觉（models.json vision 字段，后端合并会话
+  // 覆盖后的权威值）；数据未拉到时保守按支持处理，避免误禁功能
+  App.getChatModelVision = function (): boolean {
+    return state.chatModelVision !== false;
+  };
+
+  // ---------- token 统计 ----------
+  // 用量归一化 / 文案见 FormatUtils（js/format_utils.js）
+  function setSessionUsage(usage: any): void {
+    state.sessionUsage = FormatUtils.normalizeUsage(usage);
+    const displayedUsage = (App.taskCosts && App.taskCosts.usage()) || state.sessionUsage;
+    state.sessionTotalTokens = displayedUsage.total_tokens;
+    const cached = Math.min(Math.max(Number(displayedUsage.cached_tokens || 0), 0), Number(displayedUsage.prompt_tokens) || 0);
+    const usageText =
+      "<span>" + FormatUtils.fmtNum(displayedUsage.total_tokens) + " tokens</span>" +
+      "<span>输入 " + FormatUtils.fmtNum(displayedUsage.prompt_tokens) +
+      (cached > 0 ? "（含缓存 " + FormatUtils.fmtNum(cached) + "）" : "") +
+      " · 输出 " + FormatUtils.fmtNum(displayedUsage.completion_tokens) + "</span>";
+    tokenTotal.innerHTML = usageText;
+    tokenTotal.classList.toggle("hidden", !displayedUsage.total_tokens);
+    if (sessionMenuUsage && sessionMenuUsageValues) {
+      sessionMenuUsageValues.innerHTML = usageText;
+      sessionMenuUsage.classList.toggle("hidden", !displayedUsage.total_tokens);
+    }
+  }
+
+  function setSessionTotalTokens(n: any): void {
+    setSessionUsage({ total_tokens: n || 0 });
+  }
+
+  function addSessionUsage(usage: any): void {
+    const current = state.sessionUsage;
+    const next = FormatUtils.normalizeUsage(usage);
+    setSessionUsage({
+      prompt_tokens: current.prompt_tokens + next.prompt_tokens,
+      completion_tokens: current.completion_tokens + next.completion_tokens,
+      total_tokens: current.total_tokens + next.total_tokens,
+      cached_tokens: (current.cached_tokens || 0) + next.cached_tokens,
+    });
+  }
+
+  async function refreshSessionUsage(sessionId: any): Promise<boolean> {
+    if (!sessionId && !state.sessionId) return false;
+    const targetSessionId = SessionUtils.sanitizeSessionId(sessionId || state.sessionId);
+    try {
+      const meta = await API.getSessionMeta(targetSessionId);
+      if (state.sessionId === targetSessionId && meta && meta.usage) {
+        // 会话文件是累计用量的权威来源，覆盖流式期间的临时累计值。
+        setSessionUsage(meta.usage);
+        return true;
+      }
+    } catch (_) {
+      // 流结束后的校准是辅助操作，失败时保留本地流式累计值。
+    }
+    return false;
+  }
+
+  // ---------- 上下文 token 统计 ----------
+  // token_stats 会读取历史文件并重新估算消息，因此流式期间不按固定间隔轮询，
+  // 只在 usage / 压缩完成等会实际改变上下文的事件后刷新。
+  const CONTEXT_STATS_EVENT_DEBOUNCE_MS = 120;
+  let contextStatsTimer: any = null;
+  let contextStatsInFlight = false;
+  let contextStatsRefreshQueued = false;
+  let contextStatsQueuedSession: any = null;
+  let contextStatsRequestSeq = 0;
+
+  function hideContextTokenStatus(): void {
+    state.contextTokenStats = null;
+    contextTokenSummary.textContent = "";
+    contextTokenSummary.title = "";
+    // 只隐藏 token 摘要；工作路径不受会话上下文影响，保持常显。
+    // 注意移除全局工具类 hidden（display:none !important），避免容器被藏住。
+    contextTokenStatus.classList.remove("hidden");
+    contextTokenStatus.classList.add("ctx-hidden");
+    contextTokenStatus.classList.remove("is-warning", "is-danger");
+  }
+
+  function resetContextTokenStats(): void {
+    contextStatsRequestSeq++;
+    contextStatsRefreshQueued = false;
+    contextStatsQueuedSession = null;
+    clearContextStatsTimer();
+    hideContextTokenStatus();
+  }
+
+  function clearContextStatsTimer(): void {
+    if (contextStatsTimer === null) return;
+    clearTimeout(contextStatsTimer);
+    contextStatsTimer = null;
+  }
+
+  function finiteNumber(value: any, fallback: any): any {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function formatContextPercent(ratio: any): string {
+    const percent = Math.max(0, ratio * 100);
+    const digits = percent >= 10 ? 1 : 2;
+    return percent.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "") + "%";
+  }
+
+  function formatTokensK(value: any): string {
+    // 统一保留 1 位小数再去尾零：100000 -> 100k，30105 -> 30.1k，105317 -> 105.3k
+    const text = (value / 1000).toFixed(1);
+    return text.replace(/0+$/, "").replace(/\.$/, "") + "k";
+  }
+
+  function renderContextTokenStats(stats: any): void {
+    const limit = finiteNumber(stats && stats.context_token_limit, 0);
+    const used = finiteNumber(stats && stats.request_context_tokens, 0);
+    const statsRounds = stats && stats.rounds && typeof stats.rounds === "object"
+      ? stats.rounds : {};
+    const hasConversationContext = state.hasConversation || state.streaming ||
+      finiteNumber(statsRounds.total, 0) > 0 || Boolean(stats && stats.has_context_summary);
+    if (!hasConversationContext) {
+      hideContextTokenStatus();
+      return;
+    }
+    if (limit <= 0 || used <= 0) {
+      hideContextTokenStatus();
+      return;
+    }
+
+    const ratioValue = finiteNumber(stats.estimated_budget_ratio, used / limit);
+    const ratio = ratioValue >= 0 ? ratioValue : used / limit;
+    const roundTokens = Array.isArray(stats.round_tokens) ? stats.round_tokens : [];
+    const recentTokens = roundTokens.reduce(function (total: any, round: any) {
+      return total + Math.max(0, finiteNumber(round && round.tokens, 0));
+    }, 0);
+    const latestRound = roundTokens.length ? roundTokens[roundTokens.length - 1] : null;
+    const rounds = statsRounds;
+    const recentCount = roundTokens.length;
+    const recentLimit = Math.max(0, finiteNumber(rounds.max_rounds, 0));
+    const summarizedCount = Math.max(0, finiteNumber(rounds.summarized, 0));
+
+    // 常态只显示 30.1k/100k (30.1%)；小屏（≤420px）仅显示百分比
+    contextTokenSummary.innerHTML =
+      '<span class="cts-nums">' + formatTokensK(used) + "/" + formatTokensK(limit) + "</span>" +
+      " (" + formatContextPercent(ratio) + ")";
+
+    // 轮次详情不再常态占位：hover 摘要块时通过 title 查看
+    const roundParts: any[] = [];
+    if (recentCount) {
+      const recentLabel = recentLimit > recentCount
+        ? "近 " + recentCount + "/" + recentLimit + " 轮估算"
+        : "近 " + recentCount + " 轮估算";
+      roundParts.push(recentLabel + " " + FormatUtils.fmtNum(recentTokens));
+      if (latestRound) {
+        roundParts.push("最近轮估算 " + FormatUtils.fmtNum(Math.max(0, finiteNumber(latestRound.tokens, 0))));
+      }
+    }
+    if (summarizedCount) roundParts.push("已摘要 " + FormatUtils.fmtNum(summarizedCount) + " 轮");
+    const roundsDetail = roundParts.join(" · ");
+
+    const messageTokens = Math.max(0, finiteNumber(stats.messages_tokens, 0));
+    const systemTokens = Math.max(0, finiteNumber(stats.system_prompt_tokens, 0));
+    const toolTokens = Math.max(0, finiteNumber(stats.tool_definition_tokens, 0));
+    const compressionCount = Math.max(0, finiteNumber(stats.context_compress_count, 0));
+    contextTokenSummary.title = [
+      "本地上下文 token 估算（远端 Responses 上下文单独管理）",
+      "消息 " + FormatUtils.fmtNum(messageTokens) +
+      " · 系统提示词 " + FormatUtils.fmtNum(systemTokens) +
+      " · 工具定义 " + FormatUtils.fmtNum(toolTokens),
+      "本地上下文 " + FormatUtils.fmtNum(used) + " / " + FormatUtils.fmtNum(limit) +
+      "（" + formatContextPercent(ratio) + "）",
+      recentCount ? "最近 " + recentCount + " 轮合计 " + FormatUtils.fmtNum(recentTokens) + " tokens" : "暂无可展开轮次",
+      compressionCount ? "当前会话累计压缩 " + FormatUtils.fmtNum(compressionCount) + " 次" : "当前会话未发生压缩",
+    ].join("\n");
+    contextTokenStatus.setAttribute("aria-label",
+      "本地上下文估算 " + formatContextPercent(ratio) +
+      (roundsDetail ? "，" + roundsDetail : ""));
+    contextTokenStatus.classList.toggle("is-warning", ratio >= 0.8 && ratio < 1);
+    contextTokenStatus.classList.toggle("is-danger", ratio >= 1);
+    contextTokenStatus.classList.remove("hidden");
+    contextTokenStatus.classList.remove("ctx-hidden");
+    state.contextTokenStats = stats;
+  }
+
+  function scheduleContextTokenStatsRefresh(delay: any, sessionId: any): void {
+    // 尚未开始的会话（sessionId 为 null）不产生任何按会话的请求，
+    // 否则后端会为不存在的会话创建只有 _meta 的空文件
+    if (!sessionId && !state.sessionId) return;
+    const targetSessionId = SessionUtils.sanitizeSessionId(sessionId || state.sessionId);
+    if (targetSessionId !== state.sessionId) return;
+    if (contextStatsTimer !== null) return;
+    contextStatsTimer = setTimeout(function () {
+      contextStatsTimer = null;
+      refreshContextTokenStats(targetSessionId);
+    }, Math.max(0, Number(delay) || 0));
+  }
+
+  async function refreshContextTokenStats(sessionId: any): Promise<void> {
+    // 同上：待开始会话不发请求，选工具/改参数等操作静默跳过
+    if (!sessionId && !state.sessionId) return;
+    const targetSessionId = SessionUtils.sanitizeSessionId(sessionId || state.sessionId);
+    if (targetSessionId !== state.sessionId) return;
+    // 事件触发的立即刷新优先于已经排队的防抖刷新，避免同一事件产生两个请求。
+    clearContextStatsTimer();
+    if (contextStatsInFlight) {
+      contextStatsRefreshQueued = true;
+      contextStatsQueuedSession = targetSessionId;
+      return;
+    }
+
+    const requestSeq = ++contextStatsRequestSeq;
+    contextStatsInFlight = true;
+    try {
+      const toolNames = targetSessionId === state.sessionId
+        ? Array.from(state.selectedTools)
+        : [];
+      const stats = await API.getContextTokenStats(targetSessionId, null, toolNames);
+      if (requestSeq === contextStatsRequestSeq && targetSessionId === state.sessionId) {
+        renderContextTokenStats(stats);
+      }
+    } catch (_) {
+      // 统计是辅助信息，后端暂时不可用时保留已有数据显示，不阻塞聊天。
+    } finally {
+      contextStatsInFlight = false;
+      const queued = contextStatsRefreshQueued;
+      const queuedSession = contextStatsQueuedSession;
+      contextStatsRefreshQueued = false;
+      contextStatsQueuedSession = null;
+      if (queued && queuedSession === state.sessionId && !contextStatsTimer) {
+        // 请求结束后再合并处理事件期间积累的刷新请求，避免连续事件形成请求风暴。
+        scheduleContextTokenStatsRefresh(CONTEXT_STATS_EVENT_DEBOUNCE_MS, queuedSession);
+      }
+    }
+  }
+
+
+  // ---------- 导出（供其它模块经 App.* 调用） ----------
+  App.setSessionUsage = setSessionUsage;
+  App.setSessionTotalTokens = setSessionTotalTokens;
+  App.addSessionUsage = addSessionUsage;
+  App.refreshSessionUsage = refreshSessionUsage;
+  App.resetContextTokenStats = resetContextTokenStats;
+  App.clearContextStatsTimer = clearContextStatsTimer;
+  App.scheduleContextTokenStatsRefresh = scheduleContextTokenStatsRefresh;
+  App.refreshContextTokenStats = refreshContextTokenStats;
+  App.CONTEXT_STATS_EVENT_DEBOUNCE_MS = CONTEXT_STATS_EVENT_DEBOUNCE_MS;
+  App.renderContextTokenStats = renderContextTokenStats;
+})((window as unknown as { App: any }).App);

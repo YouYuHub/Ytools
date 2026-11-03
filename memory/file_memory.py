@@ -139,7 +139,19 @@ def media_part_display_name(part: dict[str, Any]) -> str | None:
 
 DOC_DIRECTORY_NAME = "files"
 
+# 共享缓存伪命名空间：缩略图/转码缓存目录名，不是真实会话——
+# _get_session_dir 对它们跳过会话鉴权。任务上下文带登录身份时，
+# authorize_session 会因伪 ID 无归属而 404（实证：本地图片读取在任务内
+# 全灭，返回“404: 会话不存在或无权访问”，而直接调用正常）。
+_SHARED_CACHE_NAMESPACES = frozenset({"media_model_part", "network_media"})
+
+
 def _get_session_dir(session_id: str) -> Path:
+    if session_id in _SHARED_CACHE_NAMESPACES:
+        # 共享缓存直达固定位置：不走会话鉴权/登记（files_path 在有身份时
+        # 会因伪 ID 未登记而抛 ValueError；此处与无身份旧路径逐字一致）。
+        from memory.storage_layout import safe_session_id
+        return HISTORY_ROOT.parent / "session_files" / safe_session_id(session_id)
     from security.authorization import session as authorize_session
     authorize_session(session_id)
     from memory.storage_layout import files_path
@@ -2032,6 +2044,14 @@ def _messages_image_model_part(path: Path, quality: int | None = None, api_type:
         return {"error": "图片读取失败，未注入：" + str(exc)}
 
 
+def _non_media_error(filename: str) -> str:
+    """非媒体文件拒绝说明（三协议统一口径）。"""
+    return (
+        f"{filename} 不是图片/音频/视频文件，read_media 无法读取；"
+        f"请改用 read_file 读取文本内容，文档请用 read_document"
+    )
+
+
 def _media_model_part_from_path(
     path: Path,
     quality: int | None = None,
@@ -2063,6 +2083,8 @@ def _media_model_part_from_path(
     """
     if api_type in {"messages", "responses"}:
         proto_kind = media_kind(path.name)
+        if proto_kind is None:
+            return {"error": _non_media_error(path.name)}
         if proto_kind == "video":
             # 有视觉模型的视频回退：抽关键帧拼图以普通图片发送（调用方保证
             # vision：附件解析层无视觉走占位，read_media 工具无视觉直接拒绝）。
@@ -2081,7 +2103,12 @@ def _media_model_part_from_path(
         return _messages_image_model_part(path, quality, api_type=api_type)
     kind = media_kind(path.name)
     mime = media_mime_type(path.name)
+    original_mime = mime
     suffix_lower = Path(path.name).suffix.lower()
+    if kind is None:
+        # 非媒体文件（文本/表格/代码等）：拒绝注入并指引正确工具。
+        # 此前落入下方 else 音频分支，文本字节被塞进 input_audio 导致模型拿到乱码。
+        return {"error": _non_media_error(path.name)}
     try:
         stat = path.stat()
         size = stat.st_size
@@ -2124,6 +2151,7 @@ def _media_model_part_from_path(
                 "part": range_built["part"],
                 "kind": "video",
                 "mime": "video/mp4",
+                "original_mime": mime if mime != "video/mp4" else None,
                 "size": range_built.get("size") or size,
                 "downsampled": False,
                 "quality": None,
@@ -2153,10 +2181,12 @@ def _media_model_part_from_path(
     # 连带同请求的文本也无法返回）。注入前做一次完整解码校验（load()
     # 全量解码，覆盖头部合法但像素数据截断的损坏），失败返回错误占位、
     # 绝不注入；动图 gif 不经过此处（已走上方视频区间管线）。
+    image_longest = 0
     if kind == "image":
         try:
             with Image.open(io.BytesIO(data)) as decode_probe:
                 decode_probe.load()
+                image_longest = max(decode_probe.size)
         except Exception as decode_error:
             return {
                 "error": (
@@ -2186,6 +2216,7 @@ def _media_model_part_from_path(
         and converted is None
     )
     downsampled = False
+    thumb_adopted = False
     if needs_downsample:
         thumb = _load_image_thumbnail_base64(
             thumb_cache_dir if thumb_cache_dir is not None else _thumb_dir("media_model_part"),
@@ -2195,11 +2226,14 @@ def _media_model_part_from_path(
         )
         if thumb is not None:
             mime, data_b64 = thumb
-            downsampled = True
+            thumb_adopted = True
+            # downsampled 仅在尺寸真正缩小置真：小图+显式 quality 只重编码
+            # （仍按要求质量输出），尺寸未变时不误报“被压过”
+            downsampled = image_longest > MODEL_MEDIA_MAX_EDGE
     # 缩略图失败的兜底门控：静图（未转换）无法降质时，超过图片读取上限的
     # 原始字节绝不注入（≤30MB 的原图保持既有回退语义不变）
     if (
-        not downsampled
+        not thumb_adopted
         and effective_kind == "image"
         and converted is None
         and size > MEDIA_SEND_IMAGE_LIMIT_BYTES
@@ -2229,11 +2263,12 @@ def _media_model_part_from_path(
         "part": part,
         "kind": effective_kind,
         "mime": mime,
+        "original_mime": original_mime if mime != original_mime else None,
         "size": size,
         "downsampled": downsampled,
         "quality": (
             MODEL_MEDIA_DEFAULT_QUALITY if quality is None else quality
-        ) if downsampled else None,
+        ) if thumb_adopted else None,
         "stored_name": path.name,
         "filename": path.name,
         "converted": converted,

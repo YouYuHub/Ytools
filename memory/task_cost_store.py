@@ -242,12 +242,15 @@ def _summary(db, task_id):
         role = result["roles"].setdefault(call["role"], {"usage": normalize_usage({}), "cost": 0, "calls": 0})
         _add(role["usage"], usage)
         role["calls"] += 1
+        # 零用量终态（失败/未发送）不计入缺价与估算：没有可计价、可待返回的量
+        terminal_zero = call["source"] in ("failed", "not_sent")
         if call.get("cost") is None:
-            result["unknown_price_calls"] += 1
+            if not terminal_zero:
+                result["unknown_price_calls"] += 1
         else:
             role["cost"] += call["cost"]
             result["cost"] += call["cost"]
-        result["estimated_calls"] += call["source"] != "reported"
+        result["estimated_calls"] += call["source"] not in ("reported", "failed", "not_sent")
         result["pending_calls"] += call["state"] == "running"
     return result
 

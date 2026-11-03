@@ -23,6 +23,10 @@ PUBLIC = {("GET", "/"), ("GET", "/auth/status"), ("POST", "/auth/login")}
 PENDING_MFA = {"/auth/me", "/auth/csrf", "/auth/logout", "/auth/mfa/start", "/auth/mfa/confirm", "/auth/mfa/verify",
                "/auth/mfa/manage/login_start"}
 CREATE_SESSION = {"/chat_with_tool", "/file/upload_session_files", "/file/upload_session_media", "/chat_history/ensure_session"}
+# 建档瞬间读宽限：新会话首次发送时前端先发读请求（读按设计不预注册），
+# 未登记 ID 在这些只读端点上直通返回空数据，不报 404 噪音；
+# 写请求与他人/已删除会话仍严格 404（见 authorization.session）。
+UNREGISTERED_READ_OK = frozenset({"/file_diff/list", "/chat_context/token_stats"})
 EXECUTION = {"/inject_message", "/task_templates/start", "/chat_history/upload_chat_file",
              "/chat_history/import_package", "/chat_context/responses_rebuild"}
 KNOWN_AUTH = {
@@ -85,10 +89,10 @@ def _headers(scope):
 
 
 def _asset(path):
-    if path in PUBLIC_PAGES or path in {"/ui/login.css", "/ui/login.js", "/ui/favicon-squid.svg", "/ui/favicon-editor.png"}:
+    if path in PUBLIC_PAGES or path in {"/ui/favicon-squid.svg", "/ui/favicon-editor.png", "/ui/ask-squid.svg"}:
         return True
     suffix = path.rsplit(".", 1)[-1].lower()
-    return (path.startswith(("/ui/js/", "/ui/style/", "/ui/fonts/")) and suffix in {
+    return (path.startswith(("/ui/js/", "/ui/css/", "/ui/fonts/")) and suffix in {
         "js", "css", "woff", "woff2", "ttf", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico"}
         and "/node_modules/" not in path and "/test" not in path)
 
@@ -366,9 +370,11 @@ class SecurityMiddleware:
             raise HTTPException(422, "一次最多操作 100 个会话")
         # Raw JSONL imports resolve a source label to an owned destination in
         # storage, including safe copies of foreign/reserved IDs.
+        allow_unregistered = method in SAFE and path in UNREGISTERED_READ_OK
         for identifier in ([] if path == "/chat_history/upload_chat_file" else identifiers):
             authorization.session(identifier.strip(), create=path in CREATE_SESSION and method == "POST",
-                                  cleanup=path == "/chat_history/delete_file" and method == "DELETE")
+                                  cleanup=path == "/chat_history/delete_file" and method == "DELETE",
+                                  allow_unregistered=allow_unregistered)
         for group_id in [params.get("group_id"), data.get("group_id"), *query.get("group_id", [])]:
             if group_id:
                 authorization.require_group(str(group_id))

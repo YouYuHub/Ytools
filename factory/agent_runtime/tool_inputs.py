@@ -165,6 +165,7 @@ def normalize_ask_questions(raw: Any, *, max_questions=ASK_MAX_QUESTIONS, max_qu
             "question": question,
             "options": options,
             "multiple": entry.get("multiple", False),
+            **({"id": entry["id"].strip()} if isinstance(entry.get("id"), str) and entry["id"].strip() and len(entry["id"].strip()) <= 64 else {}),
         })
     return questions
 

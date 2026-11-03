@@ -24,7 +24,20 @@ def visible_session(identifier):
     return principal.store.resource_key(identifier) in owned_sessions() and (not row or row["state"] not in BLOCKED)
 
 
-def session(identifier, *, create=False, cleanup=False):
+def is_session_registered(identifier):
+    """会话是否已在 catalog 登记（只读谓词，不认领、不建档）。
+
+    有登录身份时返回 True/False；无 principal（内部/库调用，非 HTTP
+    鉴权边界）返回 None，调用方应沿旧路径继续。
+    """
+    principal = current()
+    if principal is None:
+        return None
+    from memory.chat_memory import normalize_session_id
+    return principal.store.owner(normalize_session_id(identifier)) is not None
+
+
+def session(identifier, *, create=False, cleanup=False, allow_unregistered=False):
     from memory.storage_layout import require_identity
     require_identity()
     principal = current()
@@ -53,6 +66,10 @@ def session(identifier, *, create=False, cleanup=False):
         principal.store.register(identifier, principal.user_id)
         principal.resource_cache.pop("session", None)
         return principal.store.resource_key(identifier)
+    if allow_unregistered and owner is None:
+        # 只读宽限：未登记 ID 视为无数据，直通由端点返回空/零值；
+        # 不认领、不建档（Reads never claim an ID），他人会话仍 404。
+        return identifier
     raise HTTPException(404, "会话不存在或无权访问")
 
 

@@ -1,6 +1,9 @@
 """暂停/中断后继续（resume）后端测试：内部 nudge 开轮、末轮判定与接口校验。"""
 import asyncio
 import json
+import os
+import sys
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -174,3 +177,188 @@ def test_resume_context_retains_stopped_round_media(tmp_path, monkeypatch):
     resolved_parts = [m["content"] for m in retained
                       if m["role"] == "user" and isinstance(m.get("content"), list)]
     assert resolved_parts[0][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+RESTART_PROBE = r'''
+import asyncio, json, os, sys
+sys.path.insert(0, os.getcwd())
+from pathlib import Path
+tmp = Path(sys.argv[1])
+sessions = sys.argv[2].split(",")
+from memory import chat_memory
+from memory import permission_store
+chat_memory.HISTORY_ROOT = tmp
+permission_store.ROOT = tmp / "state"
+
+async def collect_statuses():
+    result = {}
+    for session in sessions:
+        manager = await chat_memory.get_chat_memory_manager(session)
+        result[session] = manager.get_last_round_status()
+    return result
+
+statuses = asyncio.run(collect_statuses())
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from routers import chat_router
+
+async def fake_server(tool_request):
+    yield "data: [DONE]\n\n"
+
+chat_router.tool_chat_server = fake_server
+app = FastAPI()
+app.include_router(chat_router.api_chat_router)
+client = TestClient(app)
+out = {}
+for session in sessions:
+    st = client.get("/chat_stream/status", params={"session_id": session}).json()
+    rs = client.post("/resume_chat", json={"session_id": session})
+    out[session] = {
+        "status": statuses[session],
+        "can_resume": st["can_resume"],
+        "running": st["running"],
+        "resume_code": rs.status_code,
+    }
+print("PROBE-BEGIN")
+print(json.dumps(out))
+'''
+
+
+def _run_restart_probe(tmp_path, sessions):
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-c", RESTART_PROBE, str(tmp_path), ",".join(sessions)],
+        cwd=root, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, f"probe failed: {proc.stderr[-2000:]}"
+    marker = "PROBE-BEGIN\n"
+    assert marker in proc.stdout, f"probe no output: {proc.stdout[-1000:]} {proc.stderr[-1000:]}"
+    return json.loads(proc.stdout.split(marker, 1)[1].strip().splitlines()[0])
+
+
+def test_restart_after_clean_stop_keeps_resumable(tmp_path, monkeypatch):
+    """干净暂停（stopped 落盘、无检查点）→ 真重启（全新进程）→ 状态门与继续门全开。"""
+    monkeypatch.setattr(chat_memory, "HISTORY_ROOT", tmp_path)
+    monkeypatch.setattr(chat_memory, "_session_managers", {})
+    manager = asyncio.run(chat_memory.get_chat_memory_manager("resume_restart"))
+    asyncio.run(manager.add_chat_history({"role": "user", "content": "q"}))
+    asyncio.run(manager.add_chat_history({"role": "assistant", "content": "partial"}))
+    asyncio.run(manager.stop_current_round())
+    assert manager.get_last_round_status() == "stopped"
+    assert not manager._pending_checkpoint_path.exists(), "干净停止必须清除检查点"
+    out = _run_restart_probe(tmp_path, ["resume_restart"])
+    got = out["resume_restart"]
+    assert got["status"] == "stopped"
+    assert got["running"] is False
+    assert got["can_resume"] is True
+    assert got["resume_code"] == 200
+
+
+def test_restart_after_crash_marks_interrupted_and_resumable(tmp_path, monkeypatch):
+    """非干净终止（检查点残留、写者已死）→ 真重启 → 恢复为 interrupted 并可继续。"""
+    monkeypatch.setattr(chat_memory, "HISTORY_ROOT", tmp_path)
+    monkeypatch.setattr(chat_memory, "_session_managers", {})
+    manager = asyncio.run(chat_memory.get_chat_memory_manager("resume_crash"))
+    asyncio.run(manager.add_chat_history({"role": "user", "content": "q"}))
+    asyncio.run(manager.add_chat_history({"role": "assistant", "content": "partial"}))
+    checkpoint = manager._pending_checkpoint_path
+    assert checkpoint.exists(), "进行中轮次应有检查点"
+    # 模拟写者进程已死（重启后旧 worker PID 不存在）
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["writer_pid"] = 2 ** 30
+    checkpoint.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    out = _run_restart_probe(tmp_path, ["resume_crash"])
+    got = out["resume_crash"]
+    assert got["status"] == "interrupted"
+    assert got["running"] is False
+    assert got["can_resume"] is True
+    assert got["resume_code"] == 200
+    assert not checkpoint.exists(), "恢复后应清除检查点"
+
+def _isolate_roots(monkeypatch, tmp_path):
+    from memory import permission_store
+    monkeypatch.setattr(permission_store, "ROOT", tmp_path / "state")
+    monkeypatch.setattr(chat_memory, "HISTORY_ROOT", tmp_path)
+    monkeypatch.setattr(chat_memory, "LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr(chat_memory, "_session_managers", {})
+    return permission_store
+
+
+def _write_done_round(tmp_path, session):
+    path = tmp_path / f"{session}_chat.jsonl"
+    path.write_text(json.dumps({"_meta": {}}) + "\n", encoding="utf-8")
+    _write_round(path, "done", [{"role": "user", "content": "q"}], question="q")
+    return path
+
+
+def _make_main_task(store, session, *, owner, state="running"):
+    created = store.create_task(session, {"request": {}, "mode": "auto"})
+    with store.database() as db:
+        db.execute("UPDATE tasks SET owner=?, state=? WHERE id=?", (owner, state, created["id"]))
+    store.checkpoint(created["id"], "main", {
+        "pending_round": {
+            "event": "chat_round",
+            "question": "stale-q",
+            "started_at": "2026-10-29 13:00:00",
+            "events": [
+                {"role": "user", "content": "stale-q"},
+                {"role": "assistant", "content": "p", "tool_calls": [
+                    {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]},
+            ],
+        },
+        "messages": [{"role": "user", "content": "q"}],
+    })
+    return created["id"]
+
+
+def test_stale_restorable_round_is_resumable_but_live_is_not(tmp_path, monkeypatch):
+    """写者已死的可恢复任务视为可继续；owner 存活（待审批/真运行）绝不放行。"""
+    store = _isolate_roots(monkeypatch, tmp_path)
+    _write_done_round(tmp_path, "resume_stale")
+    _write_done_round(tmp_path, "resume_live")
+    _make_main_task(store, "resume_stale", owner=2 ** 30)
+    _make_main_task(store, "resume_live", owner=os.getpid())
+    assert store.has_stale_restorable_round("resume_stale") is True
+    assert store.has_stale_restorable_round("resume_live") is False
+    # has_restorable_round 本身两种都命中（门禁必须用 stale 变体区分）
+    assert store.has_restorable_round("resume_stale") is True
+    assert store.has_restorable_round("resume_live") is True
+    client, chat_router = _resume_client(monkeypatch)
+
+    async def fake_server(tool_request):
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(chat_router, "tool_chat_server", fake_server)
+    stale_status = client.get("/chat_stream/status", params={"session_id": "resume_stale"}).json()
+    assert stale_status["running"] is False
+    assert stale_status["can_resume"] is True
+    assert stale_status["last_round_status"] == "done"
+    assert client.post("/resume_chat", json={"session_id": "resume_stale"}).status_code == 200
+    live_status = client.get("/chat_stream/status", params={"session_id": "resume_live"}).json()
+    assert live_status["can_resume"] is False
+    assert client.post("/resume_chat", json={"session_id": "resume_live"}).status_code == 409
+
+
+def test_retire_stale_task_finalizes_interrupted_round(tmp_path, monkeypatch):
+    """新消息/继续到达时接续死亡任务：历史补 interrupted 轮，任务 cancelled。"""
+    store = _isolate_roots(monkeypatch, tmp_path)
+    _write_done_round(tmp_path, "resume_retire")
+    task_id = _make_main_task(store, "resume_retire", owner=2 ** 30)
+    from factory import chat_factory as cf
+    retired = asyncio.run(cf._retire_interrupted_tasks("resume_retire"))
+    assert retired == 1
+    assert store.task(task_id)["state"] == "cancelled"
+    manager = asyncio.run(chat_memory.get_chat_memory_manager("resume_retire"))
+    assert manager.get_last_round_status() == "interrupted"
+
+def test_restart_with_stale_permission_task_keeps_resumable(tmp_path, monkeypatch):
+    """非干净终止 + 工具轮（SQLite 遗留 running 任务）→ 真重启 → ▶ 可用且继续放行。"""
+    store = _isolate_roots(monkeypatch, tmp_path)
+    _write_done_round(tmp_path, "resume_staletask")
+    _make_main_task(store, "resume_staletask", owner=2 ** 30)
+    out = _run_restart_probe(tmp_path, ["resume_staletask"])
+    got = out["resume_staletask"]
+    assert got["running"] is False
+    assert got["can_resume"] is True
+    assert got["resume_code"] == 200

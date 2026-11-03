@@ -380,6 +380,11 @@ def list_files(session_id: str, hide_clean: bool = False) -> list[dict[str, Any]
     hide_clean=True 时隐藏已无未决内容/存在状态变更的文件，
     前端统计面板只展示仍有未决变更的文件；其版本链留档仍在，可经删除接口清理。
     """
+    from security.authorization import is_session_registered
+    if is_session_registered(session_id) is False:
+        # 未登记=无数据（存储路径本就拒绝未登记 ID）：读宽限返回空列表，
+        # 与中间件 UNREGISTERED_READ_OK 直通配套，不抛 404。
+        return []
     with _session_lock(session_id):
         root = _root_dir(session_id)
         index = _read_json(root / "index.json")

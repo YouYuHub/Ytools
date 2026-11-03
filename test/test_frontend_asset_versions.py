@@ -23,7 +23,7 @@ def test_frontend_asset_hashes_and_script_order():
     html = (H5_ROOT / "index.html").read_text(encoding="utf-8")
     scripts = re.findall(r'<script\b[^>]*\bsrc="(js/[^\"]+)"[^>]*></script>', html)
     assert scripts
-    styles = re.findall(r'<link\b[^>]*\bhref="((?:style/|js/)[^\"]+\.css\?v=[^\"]+)"[^>]*>', html)
+    styles = re.findall(r'<link\b[^>]*\bhref="((?:css/|js/)[^\"]+\.css\?v=[^\"]+)"[^>]*>', html)
     assert styles
     for url in scripts + styles:
         path, version = url.split("?v=", 1)
@@ -35,7 +35,7 @@ def test_frontend_asset_hashes_and_script_order():
     status_scripts = ["js/app/core.js", "js/task_state.js", "js/app/session_activity.js", "js/app/task_status.js", "js/app/stream_pipeline.js", "js/app/chat.js", "js/app.js"]
     positions = [html.index(path + "?v=") for path in status_scripts]
     assert positions == sorted(positions)
-    render_scripts = ['js/app/core.js', 'js/app/message_diff.js', 'js/app/messages.js', 'js/app/stream_pipeline.js']
+    render_scripts = ['js/app/core.js', 'js/app/message_diff.js', 'js/app/messages_history.js', 'js/app/messages_render.js', 'js/app/messages_edit.js', 'js/app/messages_tools.js', 'js/app/messages_widgets.js', 'js/app/messages_canvas.js', 'js/app/messages_tables.js', 'js/app/messages_nav.js', 'js/app/stream_pipeline.js']
     positions = [html.index(path + '?v=') for path in render_scripts]
     assert positions == sorted(positions)
 
@@ -43,7 +43,7 @@ def test_frontend_asset_hashes_and_script_order():
 @pytest.mark.parametrize('page', [page.file for page in PAGES if page.file != 'index.html'])
 def test_secondary_pages_version_all_local_scripts_and_styles(page):
     html = (H5_ROOT / page).read_text(encoding='utf-8')
-    urls = re.findall(r'(?:src|href)="((?:js/[^"?]+\.js|(?:style/|js/)[^"?]+\.css|login\.(?:js|css))(?:\?[^\"]*)?)"', html)
+    urls = re.findall(r'(?:src|href)="((?:js/[^"?]+\.js|(?:css/|js/)[^"?]+\.css)(?:\?[^\"]*)?)"', html)
     assert urls
     for url in urls:
         path, version = url.split('?v=', 1)

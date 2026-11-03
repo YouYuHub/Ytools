@@ -53,7 +53,7 @@ def update_index() -> None:
         target = ROOT / page.file
         html = target.read_text(encoding='utf-8')
         html = re.sub(r'<script\b[^>]*\bsrc="((?:js/[^\"]+|login\.js(?:\?[^\"]*)?))"[^>]*></script>', replace_script, html)
-        html = re.sub(r'<link\b[^>]*\bhref="((?:(?:style/|js/)[^\"]+\.css|login\.css)(?:\?[^\"]*)?)"[^>]*>',
+        html = re.sub(r'<link\b[^>]*\bhref="((?:css/|js/)[^\"]+\.css(?:\?[^\"]*)?)"[^>]*>',
                       lambda match: match.group(0).replace(match.group(1), versioned_url(match.group(1)), 1), html)
         target.write_text(html, encoding='utf-8')
 

@@ -166,6 +166,9 @@ def test_static_mount_does_not_publish_dev_directories(accounts):
     for path in ("/ui/package.json", "/ui/node_modules/playwright/package.json", "/ui/test_h5/api.test.js"):
         assert first.get(path).status_code == 404
     assert first.get("/ui/login.js").status_code == 200
+    # 根目录公开图片白名单：缺谁页面就 404（ask-squid 曾遗漏导致提问卡图标裂图）
+    assert first.get("/ui/favicon-squid.svg").status_code == 200
+    assert first.get("/ui/ask-squid.svg").status_code == 200
 
 
 def test_signed_preview_grants_are_bound_to_login(accounts):
@@ -268,3 +271,16 @@ def test_plain_member_worker_cannot_cross_any_tool_boundary(accounts):
             tool_boundary("run_command", {}, {"session": "plain-chat"})
     finally:
         CURRENT.reset(token)
+
+
+def test_permissions_global_query_needs_no_session(accounts):
+    # 前端启动/打开设置时会先发裸请求查全局模式：session_id 可选，必须 200
+    # （曾因内部用 "default" 占位查会话元数据而触发鉴权 404，控制台刷屏）。
+    # 未注册会话仍 404（不泄露存在性），安全语义不变。
+    _, _, _, (first, _, _), _ = accounts
+    bare = first.get("/chat_config/permissions")
+    assert bare.status_code == 200
+    body = bare.json()
+    assert body["session_mode"] is None and body["mode"] == body["global_mode"]
+    assert first.get("/chat_config/permissions", params={"session_id": "ghost-session"}).status_code == 404
+    assert first.get("/chat_config/permissions", params={"session_id": "chat-a"}).status_code == 200

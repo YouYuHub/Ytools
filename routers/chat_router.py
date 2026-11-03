@@ -287,13 +287,16 @@ async def chat_stream_status(session_id: str = "default"):
     查询指定会话当前是否仍在后台生成（前端刷新后据此决定是否重连 SSE）
     返回:
         {"running": bool, "can_resume": bool, "last_round_status": str | None}
-        can_resume：空闲且末轮 stopped/interrupted 时为 True，前端据此显示 ▶ 继续按钮
+        can_resume：空闲且（末轮 stopped/interrupted，或有写者已死的可恢复任务）时
+        为 True，前端据此显示 ▶ 继续按钮。后者覆盖“非干净终止 + 工具轮”重启场景：
+        检查点恢复会跳过可恢复任务（交由接续逻辑处理），末轮状态仍是旧值，
+        必须把 stale 任务也视为可继续，否则重启后 ▶ 永远不显示。
     """
     try:
         normalized_session_id = normalize_session_id(session_id)
         running = _session_generation_busy(normalized_session_id)
         last_status = await _last_round_status_for_resume(normalized_session_id)
-        can_resume = (not running) and last_status in RESUMABLE_ROUND_STATUSES
+        can_resume = (not running) and _resumable_state(normalized_session_id, last_status)
         return JSONResponse(content={
             "running": running,
             "can_resume": can_resume,
@@ -302,6 +305,19 @@ async def chat_stream_status(session_id: str = "default"):
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _resumable_state(session_id: str, last_status: str | None) -> bool:
+    """继续门禁（状态查询与继续接口共用）：末轮 stopped/interrupted，或有
+    写者已死的可恢复任务（崩溃遗留，新消息/继续到达时由接续逻辑收尾）。
+    owner 仍存活的挂起任务（待审批/真运行）绝不能视为可继续。"""
+    if last_status in RESUMABLE_ROUND_STATUSES:
+        return True
+    try:
+        from memory.permission_store import has_stale_restorable_round
+        return bool(has_stale_restorable_round(session_id))
+    except Exception:
+        return False
 
 
 async def _last_round_status_for_resume(session_id: str) -> str | None:
@@ -327,7 +343,7 @@ async def resume_chat(payload: ResumeChatRequest):
     """暂停/中断后继续：服务端合成内部 nudge 新轮，等价于代发一条"继续"。
 
     不渲染用户气泡、不计入问题/标题/索引；流式消费与 /chat_with_tool 完全一致。
-    仅当会话空闲且末轮 stopped/interrupted 时可继续，否则 409。
+    仅当会话空闲且末轮 stopped/interrupted（或有写者已死的可恢复任务）时可继续，否则 409。
     """
     from security.authorization import can_execute
     session_id = normalize_session_id(payload.session_id or "default")
@@ -336,7 +352,7 @@ async def resume_chat(payload: ResumeChatRequest):
     if _session_generation_busy(session_id):
         raise HTTPException(status_code=409, detail="任务正在运行，无需继续")
     last_status = await _last_round_status_for_resume(session_id)
-    if last_status not in RESUMABLE_ROUND_STATUSES:
+    if not _resumable_state(session_id, last_status):
         raise HTTPException(status_code=409, detail="末轮已完成或无可继续的任务")
     tool_names = [] if not can_execute() else payload.tool_names
     body: dict[str, Any] = {

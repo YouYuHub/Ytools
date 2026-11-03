@@ -491,6 +491,20 @@ def has_restorable_round(session):
         return bool(db.execute("SELECT 1 FROM tasks t JOIN checkpoints c ON c.task=t.id WHERE session=? AND state IN ('running','suspended') AND c.agent='main' AND COALESCE(json_extract(t.data,'$.preview'),0)=0 LIMIT 1", (session,)).fetchone())
 
 
+def has_stale_restorable_round(session):
+    """可恢复任务 whose 执行进程已死（崩溃/重启遗留），可被新消息/继续安全接续。
+
+    与 has_restorable_round 的区别：排除 owner 仍存活的行——待审批挂起或真正
+    运行中的任务绝不能被继续接管（会销毁待决策的审批），只有写者已死的遗留
+    任务才视为 stale。owner 非法值（None/-1/已不存在的 PID）一律按已死处理。
+    """
+    from security.authorization import session as authorize_session
+    session = authorize_session(session)
+    with database() as db:
+        owners = db.execute("SELECT t.owner FROM tasks t JOIN checkpoints c ON c.task=t.id WHERE session=? AND state IN ('running','suspended') AND c.agent='main' AND COALESCE(json_extract(t.data,'$.preview'),0)=0", (session,)).fetchall()
+    return any(not pid_alive(row[0]) for row in owners)
+
+
 def suspend_session(session):
     with database() as db:
         db.execute("UPDATE tasks SET state='suspended' WHERE session=? AND state='running' AND id IN (SELECT task FROM checkpoints)", (session,))

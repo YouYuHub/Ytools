@@ -1,9 +1,10 @@
 const test=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs');const path=require('node:path');const vm=require('node:vm');
+const {stripTypeScriptTypes}=require('node:module');
 function setup(fail,other){
   const calls={stops:[],aborts:0,states:[],toasts:[]};
   const state={sessionId:'visible',activeStream:{sessionId:other?'other':'visible'},abort:{abort(){calls.aborts++;}}};
-  const source=fs.readFileSync(path.join(__dirname,'../js/app/chat.js'),'utf8');
+  const source=stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/chat.ts'),'utf8'));
   const start=source.indexOf('  stopBtn.addEventListener('),end=source.indexOf('\n  });',start)+6;
   let handler;
   const context={state,stopBtn:{addEventListener(name,fn){handler=fn;}},toast:m=>calls.toasts.push(m),

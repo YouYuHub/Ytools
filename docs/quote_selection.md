@@ -5,7 +5,7 @@
 > 落盘与模型视图、`memory/chat_history_format.py` 历史轮次与压缩源注入、
 > `factory/agent_runtime/chat_runtime.py` 请求字段剥离、`factory/system_prompt.py`
 > 引用规则；前端 `H5/js/quote_utils.js`（纯逻辑）、`H5/js/app/quotes.js`（选区浮钮/
-> 草稿卡片/气泡卡片）、`H5/js/history_parser.js` 与 `H5/js/app/messages.js` 回放/编辑/
+> 草稿卡片/气泡卡片）、`H5/js/history_parser.js` 与 `H5/src/app/messages_history/edit/nav.ts` 回放/编辑/
 > 复制/原文跳转。测试：`test/test_quote_selection.py`、`H5/test_h5/quote_utils.test.js`、
 > `H5/test_h5/history_parser.test.js`。早期评估过的"标签直接拼进 content"前端简化版**未采用**。
 

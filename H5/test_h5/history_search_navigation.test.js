@@ -4,8 +4,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { stripTypeScriptTypes } = require("node:module");
 const parser = require("../js/history_parser.js");
-const source = fs.readFileSync(path.join(__dirname, "../js/app/messages.js"), "utf8");
+// messages.js 已拆分：引用定位/搜索跳转读 messages_nav.ts（剥离类型后切片）
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/messages_nav.ts"), "utf8"));
 const start = source.indexOf("  async function jumpToHistoryMatch(");
 const end = source.indexOf("  function jumpToQuestion(", start);
 
@@ -22,7 +24,7 @@ function node(cls, round, event, text) {
 }
 function harness(nodes, older) {
   const revealed = [], notices = [];
-  const context = { App: { pauseAutoScroll() {} }, state: { sessionId: "s" }, loadOlderState: older || { records: null },
+  const context = { App: { pauseAutoScroll() {}, loadOlderState: older || { records: null }, runOlderBatch: async () => {} }, state: { sessionId: "s" },
     chatInner: {
       querySelectorAll(selector) {
         const match = selector.match(/^\.([\w-]+)\[data-round="(\d+)"\]$/);
@@ -33,7 +35,6 @@ function harness(nodes, older) {
     toast: (message) => notices.push(message),
     revealQuoteSource: (target, query) => revealed.push({ target, query }),
     window: { setTimeout },
-    runOlderBatch: async () => {},
   };
   vm.createContext(context); vm.runInContext(source.slice(start, end), context);
   return { context, jump: context.jumpToHistoryMatch, revealed, notices };
@@ -65,7 +66,7 @@ test("older hits are loaded through the existing batching path before scrolling"
   const nodes = [], records = [{ round: 1 }, { round: 2 }, { round: 3 }];
   const older = { records, start: 2, loading: false };
   const h = harness(nodes, older); let batches = 0;
-  h.context.runOlderBatch = async () => {
+  h.context.App.runOlderBatch = async () => {
     batches += 1; older.start -= 1;
     nodes.push(node("msg-assistant-body", older.start + 1, 1, "answer"));
   };
@@ -77,7 +78,7 @@ test("a newer node in the same round cannot hide an older exact event", async ()
   const nodes = [tail], older = { records: [{ round: 1 }, { round: 1 }], start: 1, loading: false };
   const h = harness(nodes, older);
   const early = node("msg-assistant-body", 1, 1, "old answer");
-  h.context.runOlderBatch = async () => { older.start = 0; nodes.unshift(early); };
+  h.context.App.runOlderBatch = async () => { older.start = 0; nodes.unshift(early); };
   await h.jump({ session_id: "s", round_no: 1, event_index: 1, role: "assistant", field: "content" }, "old");
   assert.equal(h.revealed[0].target, early);
 });
@@ -92,7 +93,7 @@ test("jump pauses pending bottom correction and anchors the original matched spe
 test("switching away while older messages load prevents a stale search jump", async () => {
   const nodes = [], older = { records: [{ round: 1 }, { round: 2 }], start: 1, loading: false };
   const h = harness(nodes, older);
-  h.context.runOlderBatch = async () => { older.start = 0; h.context.state.sessionId = "other"; nodes.push(node("msg-user", 1, 0, "Q")); };
+  h.context.App.runOlderBatch = async () => { older.start = 0; h.context.state.sessionId = "other"; nodes.push(node("msg-user", 1, 0, "Q")); };
   assert.equal(await h.jump({ session_id: "s", round_no: 1, role: "user" }, "Q"), false);
   assert.equal(h.revealed.length, 0);
 });

@@ -76,7 +76,7 @@ async function loginSetup(t) {
   };
   w.eval(vendor); w.eval(helper); w.eval(fs.readFileSync(path.join(root, 'js/recovery_codes.js'), 'utf8'));
   w.eval(fs.readFileSync(path.join(root, 'js/login_mfa_management.js'), 'utf8'));
-  w.eval(fs.readFileSync(path.join(root, 'login.js'), 'utf8'));
+  w.eval(fs.readFileSync(path.join(root, 'js/login.js'), 'utf8'));
   await settle(); return { dom, w, calls };
 }
 test('login enrollment switches from password to QR/code and clears QR after confirmation', async t => {
@@ -101,7 +101,7 @@ test('regenerate asks for password again and does not silently issue a new secre
   assert.equal(calls.filter(call => call.url === '/auth/mfa/start').length, 1); dom.window.close();
 });
 test('both protected pages load encoder and enrollment helper before their controller', () => {
-  for (const [page, controller] of [['login.html', 'login.js?v='], ['account.html', 'js/account.js?v=']]) {
+  for (const [page, controller] of [['login.html', 'js/login.js?v='], ['account.html', 'js/account.js?v=']]) {
     const html = fs.readFileSync(path.join(root, page), 'utf8');
     assert.ok(html.indexOf('vendor/qrcode-generator/qrcode.js?v=') < html.indexOf('js/mfa_enrollment.js?v='));
     assert.ok(html.indexOf('js/mfa_enrollment.js?v=') < html.indexOf(controller));

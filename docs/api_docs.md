@@ -982,7 +982,7 @@ md 表格解析在 `factory/md_table_export.py`（与前端同语义：行内代
 - xlsx 特性：Sheet 名 `Sheet`；首行表头加粗样式；数字单元格原生数值类型；
   单元格内换行转义为 `_x000A_`；清洗异常单元格写入灰色底红字错误占位样式
   （显示「原值 + 导出失败说明」，不拖垮整表）。
-- 前端交互：`H5/js/app/messages.js`（表格按钮事件与下载）、`H5/js/markdown.js`
+- 前端交互：`H5/src/app/messages_tables.ts`（表格按钮事件与下载）、`H5/js/markdown.js`
   （`data-table-raw` 保存原文与「复制 / 更多」按钮组：更多菜单含
   复制 Markdown / 复制图片 / 下载 Excel）、`H5/js/table_canvas.js`
   （复制图片 canvas：列宽两轮收敛 + 行高自适应，长文本逐字换行不再截断）。

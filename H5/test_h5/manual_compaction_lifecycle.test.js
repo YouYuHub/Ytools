@@ -1,6 +1,8 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),{JSDOM}=require('jsdom');
+const {stripTypeScriptTypes}=require('node:module');
 const source=name=>fs.readFileSync(path.join(__dirname,'../js/app',name+'.js'),'utf8');
+const tssource=name=>stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app',name+'.ts'),'utf8'));
 function setup(t){
   const dom=new JSDOM('<div id="chat"></div><div id="taskStatus"><span class="task-status-label"></span><span class="task-status-detail"></span><button></button></div>',{runScripts:'outside-only',pretendToBeVisual:true,url:'http://test'});
   const w=dom.window,d=w.document,root=d.querySelector('#chat');t.after(()=>dom.window.close());
@@ -12,7 +14,7 @@ function setup(t){
     refreshSessionUsage(){},scheduleContextTokenStatsRefresh(){},flushPendingMessages(){},getHistoryWindow:()=>({records}),
     historyScroll:{discardNodes(nodes){nodes.forEach(n=>{discarded.push(n);n.remove();});}}};
   Object.assign(w,{el:App.el,state,loadOlderState:{records},readCompactionChoice:()=>null,rememberCompactionChoice(){}});
-  const messages=source('messages'),start=messages.indexOf('  function buildCompactionBlock('),end=messages.indexOf('  // ---------- 消息渲染',start);
+  const messages=tssource('messages_history'),start=messages.indexOf('  function buildCompactionBlock('),end=messages.indexOf('  // ---------- 导出',start);
   w.eval(messages.slice(start,end)+'\nApp.buildCompactionBlock=buildCompactionBlock;');
   w.eval(source('process_groups'));w.eval(source('task_status'));
   w.eval(source('compaction').replace('  // ---------- 导出','  App.consumeForTest = consumeCompactionStream;\n  // ---------- 导出'));

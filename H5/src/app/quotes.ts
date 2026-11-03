@@ -1,0 +1,498 @@
+/**
+ * 选中文本引用到提问（docs/quote_selection.md）
+ * - 选区检测：聊天正文中「用户提问正文」或「助手回答正文」内的同一条消息选择
+ * - 选区浮层：引用到提问（快照入草稿）或复制选中文字
+ * - 草稿引用入口：输入框上方显示数量按钮，悬停/聚焦展开原文与来源，可跳转/移除
+ * - 气泡引用卡片：用户消息气泡内展示（历史回放与实时发送共用）
+ *
+ * 依赖：app/core.js（state/el/toast 等）、js/quote_utils.js（QuoteUtils 纯逻辑）。
+ * 草稿引用存 state.pendingQuotes（与 pendingMedia 同构），随 sessionDrafts 持久。
+ */
+(function (App: any) {
+  "use strict";
+
+  const { state, el, toast, chatInner, chatScroll, composer, input } = App;
+  const QuoteUtils: any = (window as unknown as { QuoteUtils: any }).QuoteUtils;
+
+  // 引用入口（输入框上方）：index.html 中位于附件区之前
+  const composerQuotes = App.$("#composerQuotes");
+
+  // ---------- 选区操作浮层 ----------
+  let floatToolbar: any = null;
+  let floatVisible = false;
+  let pendingCapture: any = null; // mousedown 时保留的选区快照（浏览器点击后可能清选区）
+  let selectionRefreshFrame = 0;
+
+  function ensureFloatToolbar(): any {
+    if (floatToolbar) return floatToolbar;
+    floatToolbar = el("div", "quote-float-toolbar hidden");
+    floatToolbar.setAttribute("role", "toolbar");
+    floatToolbar.setAttribute("aria-label", "选中文本操作");
+    const quoteBtn = el("button", "quote-float-action quote-float-quote");
+    quoteBtn.type = "button";
+    quoteBtn.title = "把选中文字引用到提问";
+    quoteBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a8 8 0 0 1-8 8 8.1 8.1 0 0 1-3.8-.9L3 20l1.5-5.2a8 8 0 1 1 15.5-3.3Z"/><path d="M8 10h8M8 13.5h5"/></svg><span>引用到提问</span>';
+    const copyBtn = el("button", "quote-float-action quote-float-copy");
+    copyBtn.type = "button";
+    copyBtn.title = "复制选中文字";
+    copyBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span>复制</span>';
+    floatToolbar.appendChild(quoteBtn);
+    floatToolbar.appendChild(el("span", "quote-float-divider"));
+    floatToolbar.appendChild(copyBtn);
+    // mousedown 阶段读取并缓存选区：默认行为会先清掉浏览器选区，
+    // 在 click 里再读 selection 会拿到空文本
+    floatToolbar.addEventListener("mousedown", function (e: any) {
+      e.preventDefault();
+      e.stopPropagation();
+      captureSelection();
+    });
+    quoteBtn.addEventListener("click", function (e: any) {
+      e.preventDefault();
+      e.stopPropagation();
+      applyCapture();
+    });
+    copyBtn.addEventListener("click", function (e: any) {
+      e.preventDefault();
+      e.stopPropagation();
+      copyCapture();
+    });
+    document.body.appendChild(floatToolbar);
+    return floatToolbar;
+  }
+
+  function showFloatToolbar(snapshot: any): void {
+    const toolbar = ensureFloatToolbar();
+    pendingCapture = snapshot;
+    toolbar.classList.remove("hidden");
+    floatVisible = true;
+    // 先显示再测量宽度，保证钳制计算准确
+    const width = toolbar.offsetWidth || 220;
+    const height = toolbar.offsetHeight || 38;
+    const rect = snapshot.rect;
+    let left = rect.left + rect.width / 2;
+    let top = rect.top - 8;
+    if (top - height < 4) {
+      // 选区太靠上（视口顶）：翻转到选区下方
+      top = rect.bottom + 8 + height;
+    }
+    left = Math.max(8 + width / 2, Math.min(left, window.innerWidth - 8 - width / 2));
+    const minTop = Math.min(height + 4, Math.max(4, window.innerHeight - 4));
+    const maxTop = Math.max(minTop, window.innerHeight - 4);
+    top = Math.max(minTop, Math.min(top, maxTop));
+    toolbar.style.left = left + "px";
+    toolbar.style.top = top + "px";
+  }
+
+  function hideFloatToolbar(): void {
+    if (!floatVisible) return;
+    floatVisible = false;
+    pendingCapture = null;
+    if (floatToolbar) floatToolbar.classList.add("hidden");
+  }
+
+  /**
+   * 选区归属判定：只在同一条可引用消息（用户提问正文 / 助手回答正文）内
+   * 显示入口；输入框、思考过程、工具输出、按钮文字、弹窗等一律不显示。
+   */
+  function quotableTarget(node: any): any {
+    if (!node) return null;
+    const element = node.nodeType === 1 ? node : node.parentElement;
+    if (!element || typeof element.closest !== "function") return null;
+    if (!chatInner.contains(element)) return null;
+    // 按钮/操作行内的文字不参与引用（复制、编辑、删除等）
+    if (element.closest("button")) return null;
+    const assistant = element.closest(".msg-assistant-body");
+    if (assistant) return { element: assistant, role: "assistant" };
+    const userText = element.closest(".msg-user-text");
+    if (userText) return { element: userText, role: "user" };
+    return null;
+  }
+
+  /** 取可引用元素所属轮次号（历史节点与流式节点都可能带 data-round）。 */
+  function roundOf(element: any): any {
+    const host = element.closest("[data-round]");
+    const raw = host ? host.getAttribute("data-round") : null;
+    const number = Number(raw);
+    return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
+  }
+
+  /** 历史回放的同轮事件序号，可区分同一轮中多个助手正文块。 */
+  function sourceEventOf(element: any): any {
+    const host = element.closest("[data-source-event]");
+    const raw = host ? Number(host.getAttribute("data-source-event")) : NaN;
+    return Number.isInteger(raw) && raw >= 0 ? raw : null;
+  }
+
+  /** 读取当前选区（返回 {text, source, rect} 或 null）。 */
+  function readSelection(): any {
+    const selection = window.getSelection && window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount < 1) return null;
+    const rawText = selection.toString();
+    const text = QuoteUtils.normalizeQuoteText(rawText);
+    if (!text) return null;
+    const range = selection.getRangeAt(0);
+    const start = quotableTarget(range.startContainer);
+    const end = quotableTarget(range.endContainer);
+    // 起止必须落在同一条可引用消息内（跨消息选择不显示入口）
+    if (!start || !end || start.element !== end.element) return null;
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return null;
+    const source: any = {
+      role: start.role,
+      session_id: state.sessionId || undefined,
+      round: roundOf(start.element) || undefined,
+    };
+    const eventIndex = sourceEventOf(start.element);
+    if (eventIndex != null) source.event_index = eventIndex;
+    return {
+      text: text,
+      rawText: rawText,
+      source: source,
+      rect: rect,
+    };
+  }
+
+  function captureSelection(): void {
+    const snapshot = readSelection();
+    if (!snapshot) {
+      hideFloatToolbar();
+      return;
+    }
+    pendingCapture = snapshot;
+  }
+
+  function applyCapture(): void {
+    const snapshot = pendingCapture || readSelection();
+    hideFloatToolbar();
+    if (!snapshot) return;
+    const added = App.addDraftQuote({ text: snapshot.text, source: snapshot.source });
+    if (added) {
+      const selection = window.getSelection && window.getSelection();
+      if (selection && selection.removeAllRanges) selection.removeAllRanges();
+      if (input && typeof input.focus === "function") input.focus();
+      toast("已引用到提问（" + QuoteUtils.quotePreview(snapshot.text, 24) + "）");
+    }
+  }
+
+  async function copyCapture(): Promise<void> {
+    const snapshot = pendingCapture || readSelection();
+    hideFloatToolbar();
+    if (!snapshot) return;
+    const text = snapshot.rawText || snapshot.text;
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      // 非安全上下文或剪贴板权限不可用时沿用浏览器复制命令。
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.left = "-9999px";
+      document.body.appendChild(helper);
+      helper.select();
+      let copied = false;
+      try { copied = document.execCommand("copy"); } catch (_) { /* 统一在下面提示失败 */ }
+      helper.remove();
+      if (!copied) {
+        toast("复制失败（浏览器未授权剪贴板）");
+        return;
+      }
+    }
+    toast("已复制选中文字");
+  }
+
+  /** 选区变化入口：mouseup / keyup（键盘扩选）后统一检查。 */
+  function handleSelectionChange(): void {
+    // 浮钮自身的交互（mousedown/click）已单独处理，避免被这里隐藏
+    const snapshot = readSelection();
+    if (!snapshot) {
+      hideFloatToolbar();
+      return;
+    }
+    showFloatToolbar(snapshot);
+  }
+
+  // 滚动时选区本身可能仍存在；按新的视口坐标重定位浮钮。
+  // 用 requestAnimationFrame 合并高频 scroll 事件，避免重复测量布局。
+  function scheduleSelectionRefresh(): void {
+    if (selectionRefreshFrame) return;
+    selectionRefreshFrame = window.requestAnimationFrame(function () {
+      selectionRefreshFrame = 0;
+      handleSelectionChange();
+    });
+  }
+
+  document.addEventListener("mouseup", function (e: any) {
+    if (floatToolbar && floatToolbar.contains(e.target)) return;
+    // 延迟到浏览器完成选区更新后判定
+    window.setTimeout(handleSelectionChange, 0);
+  });
+  document.addEventListener("keyup", function (e: any) {
+    if (e.key !== "Shift" && e.key !== "ArrowUp" && e.key !== "ArrowDown"
+      && e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== "End" && e.key !== "Home") {
+      return;
+    }
+    window.setTimeout(handleSelectionChange, 0);
+  });
+  document.addEventListener("mousedown", function (e: any) {
+    if (floatToolbar && floatToolbar.contains(e.target)) return;
+    hideFloatToolbar();
+  });
+  document.addEventListener("keydown", function (e: any) {
+    if (e.key === "Escape") hideFloatToolbar();
+  });
+  chatScroll.addEventListener("scroll", scheduleSelectionRefresh, { passive: true });
+  // 兼容页面滚动和聊天区内嵌滚动容器滚动；上面的 RAF 会合并重复事件。
+  document.addEventListener("scroll", scheduleSelectionRefresh, true);
+  window.addEventListener("scroll", scheduleSelectionRefresh, { passive: true });
+
+  // ---------- 草稿引用（输入框上方紧凑入口 + 原文浮层） ----------
+  function renderComposerQuotes(): void {
+    if (!composerQuotes) return;
+    const quotes = state.pendingQuotes || [];
+    composerQuotes.innerHTML = "";
+    if (!quotes.length) {
+      composerQuotes.classList.add("hidden");
+      composer.classList.remove("has-quotes");
+      if (App.syncComposerAttachmentBlocks) App.syncComposerAttachmentBlocks();
+      return;
+    }
+
+    const tile = el("div", "composer-quotes-tile");
+    const trigger = el("button", "composer-quotes-trigger");
+    trigger.type = "button";
+    trigger.title = "悬停或聚焦查看引用原文";
+    trigger.setAttribute("aria-label", "查看 " + quotes.length + " 条引用原文");
+    trigger.setAttribute("aria-controls", "composerQuotesPopover");
+    trigger.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.4Z"/><path d="M8 10h8M8 14h5"/></svg>';
+    trigger.appendChild(el("span", "composer-quotes-count", String(quotes.length)));
+    tile.appendChild(trigger);
+
+    const popover = el("div", "composer-quotes-popover");
+    popover.id = "composerQuotesPopover";
+    popover.setAttribute("role", "region");
+    popover.setAttribute("aria-label", "已添加的引用原文");
+    quotes.forEach(function (quote: any, index: any) {
+      const card = el("div", "composer-quote");
+      const jump = el("button", "composer-quote-jump");
+      jump.type = "button";
+      jump.title = "点击跳转到引用原文";
+      jump.setAttribute("aria-label", "跳转到引用 " + (index + 1) + " 的原文");
+      jump.addEventListener("click", function () {
+        if (App.jumpToQuoteSource) App.jumpToQuoteSource(quote.source, quote.text);
+      });
+      const head = el("span", "composer-quote-head");
+      head.appendChild(el("span", "composer-quote-badge", "引用 " + (index + 1)));
+      const label = QuoteUtils.quoteSourceLabel(App.quoteSourceDisplay
+        ? App.quoteSourceDisplay(quote.source, quote.text) : quote.source);
+      if (label) head.appendChild(el("span", "composer-quote-source", label));
+      jump.appendChild(head);
+      jump.appendChild(el("span", "composer-quote-text", quote.text));
+      const remove = el("button", "composer-quote-remove", "×");
+      remove.type = "button";
+      remove.title = "移除该引用";
+      remove.setAttribute("aria-label", "移除引用 " + (index + 1));
+      remove.addEventListener("click", function (e: any) {
+        e.stopPropagation();
+        App.removeDraftQuote(quote.id);
+      });
+      card.appendChild(jump);
+      card.appendChild(remove);
+      popover.appendChild(card);
+    });
+    tile.appendChild(popover);
+    composerQuotes.appendChild(tile);
+    composerQuotes.classList.remove("hidden");
+    composer.classList.add("has-quotes");
+    if (App.syncComposerAttachmentBlocks) App.syncComposerAttachmentBlocks();
+  }
+
+  function addDraftQuote(entry: any): any {
+    if (!entry || typeof entry !== "object") return false;
+    const text = QuoteUtils.normalizeQuoteText(entry.text);
+    const check = QuoteUtils.checkQuoteAppend(state.pendingQuotes || [], text);
+    if (!check.ok) {
+      toast(check.reason);
+      return false;
+    }
+    state.pendingQuotes = state.pendingQuotes || [];
+    state.pendingQuotes.push({
+      id: "q_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      text: text,
+      source: QuoteUtils.normalizeQuoteSource(entry.source),
+    });
+    renderComposerQuotes();
+    if (App.autosize) App.autosize();
+    return true;
+  }
+
+  function removeDraftQuote(id: any): void {
+    if (!state.pendingQuotes || !state.pendingQuotes.length) return;
+    state.pendingQuotes = state.pendingQuotes.filter(function (quote: any) {
+      return quote.id !== id;
+    });
+    renderComposerQuotes();
+    if (App.autosize) App.autosize();
+  }
+
+  function clearPendingQuotes(): void {
+    state.pendingQuotes = [];
+    renderComposerQuotes();
+  }
+
+  // ---------- 气泡引用卡片（历史回放 / 实时发送共用） ----------
+  let activeQuotePopover: any = null;
+  let quotePopoverFrame = 0;
+  function scheduleQuotePopoverClamp(): void {
+    if (!activeQuotePopover || quotePopoverFrame) return;
+    quotePopoverFrame = window.requestAnimationFrame(function () {
+      quotePopoverFrame = 0;
+      const active = activeQuotePopover;
+      if (active && active.tile.isConnected) clampQuotePopover(active.tile, active.popover);
+    });
+  }
+  window.addEventListener("resize", scheduleQuotePopoverClamp);
+  window.addEventListener("sidebarresizeend", scheduleQuotePopoverClamp);
+  if (chatScroll) chatScroll.addEventListener("scroll", scheduleQuotePopoverClamp, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", scheduleQuotePopoverClamp);
+    window.visualViewport.addEventListener("scroll", scheduleQuotePopoverClamp);
+  }
+  /**
+   * 浮层视口钳制（与 CSS 默认展开方向互补）：
+   * - 垂直：默认向下展开；消息靠近聊天区底部、下方放不下（会被 .chat-scroll
+   *   裁剪 / .bottom 输入区盖住）且上方空间更大时，加 is-flipped 向上翻转；
+   *   展开侧依然放不下完整浮层时限高走内部滚动，保证整体可见。
+   * - 水平：CSS 默认 right:0 向左展开，解决短消息右溢出；反向极端情况
+   *   （气泡很宽、tile 靠左）下左边缘溢出则向右平移（不超过右边界）。
+   * 调用时机是 CSS :hover/:focus-within 已匹配后的下一帧，浮层已可测量。
+   */
+  function clampQuotePopover(tile: any, popover: any): void {
+    tile.classList.remove("is-flipped");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxHeight = "";
+    popover.style.maxWidth = "";
+    if (!popover.getBoundingClientRect) return;
+    const margin = 8;
+    const viewport = window.visualViewport;
+    const viewLeft = viewport ? viewport.offsetLeft : 0;
+    const viewTop = viewport ? viewport.offsetTop : 0;
+    const scrollRect = chatScroll && chatScroll.getBoundingClientRect
+      ? chatScroll.getBoundingClientRect() : null;
+    const contentLeft = scrollRect ? scrollRect.left + (chatScroll.clientLeft || 0) : 0;
+    const contentRight = scrollRect && chatScroll.clientWidth
+      ? contentLeft + chatScroll.clientWidth : scrollRect ? scrollRect.right : window.innerWidth;
+    const left = Math.max(viewLeft, contentLeft) + margin;
+    const right = Math.min(viewLeft + (viewport ? viewport.width : window.innerWidth),
+      contentRight) - margin;
+    const top = Math.max(viewTop, scrollRect ? scrollRect.top : 0) + margin;
+    const bottom = Math.min(viewTop + (viewport ? viewport.height : window.innerHeight),
+      scrollRect ? scrollRect.bottom : window.innerHeight) - margin;
+    popover.style.maxWidth = Math.max(0, right - left) + "px";
+    const rect = popover.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return; // 尚未显示，无需钳制
+    if (tile.getBoundingClientRect) {
+      const tileRect = tile.getBoundingClientRect();
+      const gap = 7; // 浮层与 tile 的间距（与 CSS top/bottom 的 7px 对齐）
+      const spaceBelow = bottom - tileRect.bottom - gap;
+      const spaceAbove = tileRect.top - top - gap;
+      if (rect.height > spaceBelow && spaceAbove > spaceBelow) {
+        tile.classList.add("is-flipped");
+      }
+      popover.style.maxHeight = Math.max(0, Math.floor(Math.min(300,
+        tile.classList.contains("is-flipped") ? spaceAbove : spaceBelow))) + "px";
+    }
+    // 同时处理左右越界；聊天区左侧可能有展开或收起的侧栏，不能按视口 0 计算。
+    const shift = Math.max(left - rect.left, Math.min(0, right - rect.right));
+    if (!shift) return;
+    // offsetParent 即 tile（position:relative），offsetLeft 相对 tile 计算。
+    popover.style.left = (popover.offsetLeft + shift) + "px";
+    popover.style.right = "auto";
+  }
+
+  function resetQuotePopover(tile: any, popover: any): void {
+    tile.classList.remove("is-flipped");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxHeight = "";
+    popover.style.maxWidth = "";
+  }
+
+  /** 构造用户气泡中的引用卡片列表；无有效引用返回 null。 */
+  function buildQuoteList(quotes: any): any {
+    const normalized = QuoteUtils.normalizeQuotes(quotes);
+    if (!normalized.length) return null;
+    const wrap = el("div", "msg-quote-list");
+    const tile = el("div", "msg-quote-tile");
+    const trigger = el("button", "msg-quote-card");
+    trigger.type = "button";
+    trigger.title = "悬停或聚焦查看引用原文";
+    trigger.setAttribute("aria-label", "查看 " + normalized.length + " 条引用");
+
+    const icon = el("span", "msg-quote-icon");
+    icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.4Z"/><path d="M8 10h8M8 14h5"/></svg>';
+    trigger.appendChild(icon);
+    trigger.appendChild(el("span", "msg-quote-index", String(normalized.length)));
+
+    const popover = el("div", "msg-quote-popover");
+    popover.setAttribute("role", "region");
+    popover.setAttribute("aria-label", "已发送消息中的引用原文");
+    normalized.forEach(function (quote: any, index: any) {
+      const jump = el("button", "msg-quote-jump");
+      jump.type = "button";
+      jump.title = "跳转到这条引用的原文";
+      jump.setAttribute("aria-label", "跳转到引用 " + (index + 1) + " 的原文");
+      jump.addEventListener("click", function (event: any) {
+        event.stopPropagation();
+        if (App.jumpToQuoteSource) App.jumpToQuoteSource(quote.source, quote.text);
+      });
+      const head = el("span", "msg-quote-head");
+      head.appendChild(el("span", "msg-quote-badge", "引用 " + (index + 1)));
+      const label = QuoteUtils.quoteSourceLabel(App.quoteSourceDisplay
+        ? App.quoteSourceDisplay(quote.source, quote.text) : quote.source);
+      if (label) head.appendChild(el("span", "msg-quote-source", label));
+      jump.appendChild(head);
+      jump.appendChild(el("span", "msg-quote-text", quote.text));
+      popover.appendChild(jump);
+    });
+    tile.appendChild(trigger);
+    tile.appendChild(popover);
+    // 浮层显示后做一次视口钳制（rAF 等 CSS :hover/:focus-within 生效后再测量）；
+    // 隐藏时清除内联位移，恢复 CSS 默认右对齐。
+    tile.addEventListener("mouseenter", function () {
+      activeQuotePopover = { tile: tile, popover: popover };
+      scheduleQuotePopoverClamp();
+    });
+    tile.addEventListener("focusin", function () {
+      activeQuotePopover = { tile: tile, popover: popover };
+      scheduleQuotePopoverClamp();
+    });
+    function hidePopover(): void {
+      if (activeQuotePopover && activeQuotePopover.tile === tile) activeQuotePopover = null;
+      resetQuotePopover(tile, popover);
+    }
+    tile.addEventListener("mouseleave", function () {
+      if (!tile.contains(document.activeElement)) hidePopover();
+    });
+    tile.addEventListener("focusout", function (e: any) {
+      if (e.relatedTarget && tile.contains(e.relatedTarget)) return;
+      if (!tile.matches(":hover")) hidePopover();
+    });
+    wrap.appendChild(tile);
+    return wrap;
+  }
+
+  // ---------- 导出 ----------
+  App.renderComposerQuotes = renderComposerQuotes;
+  App.addDraftQuote = addDraftQuote;
+  App.removeDraftQuote = removeDraftQuote;
+  App.clearPendingQuotes = clearPendingQuotes;
+  App.buildQuoteList = buildQuoteList;
+  App.captureQuoteSelection = function () {
+    const snapshot = readSelection();
+    return snapshot ? { text: snapshot.text, source: snapshot.source } : null;
+  };
+  App.hideQuoteFloat = hideFloatToolbar;
+})((window as unknown as { App: any }).App);

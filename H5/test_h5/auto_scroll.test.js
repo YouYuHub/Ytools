@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
+const { stripTypeScriptTypes } = require('node:module');
 function setup() {
   let top = 900;
   const listeners = {};
@@ -12,7 +13,8 @@ function setup() {
     get scrollTop() { return top; }, set scrollTop(value) { top = Math.min(900, value); },
     addEventListener(name, fn) { listeners[name] = fn; },
   };
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/core.js'), 'utf8');
+  // core 已迁移 TS：读 .ts 源码剥离类型后切片（发射产物重排版，切片锚点只在源码侧稳定）
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/core.ts'), 'utf8'));
   const start = source.indexOf('  // 自动跟随与用户滚动');
   const end = source.indexOf('  function setEmpty(', start);
   const context = { App: {}, chatScroll: scroll, updateScrollBottomOffset() {},

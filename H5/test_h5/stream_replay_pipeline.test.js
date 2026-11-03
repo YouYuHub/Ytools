@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const StreamReplayDedup = require('../js/stream_replay_dedup.js');
 
 function makeNode(tag, cls, text) {
@@ -76,7 +77,8 @@ function queryAll(root, sel) {
 }
 
 function harness() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/stream_pipeline.js'), 'utf8');
+  // stream_pipeline 已迁移 TS：读 .ts 源码剥离类型后切片（发射产物重排版，切片锚点只在源码侧稳定）
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/stream_pipeline.ts'), 'utf8'));
   const start = source.indexOf('  function createStreamPipeline(');
   const end = source.indexOf('\n  App.createStreamPipeline =', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;
@@ -354,17 +356,31 @@ test('回放窗口内命中历史的正文/思考/工具都不新建，结果归
   assert.equal(h.textsIn(h.msg).length, 0, '命中的正文不应新建');
   assert.equal(h.builtTools.length, toolsBefore, '命中的工具不应新建');
   assert.equal(historyUi.inputs.length, 1, '收养卡输入不应被重放增量复写');
-  assert.equal(historyUi.binds.length, 1, '收养卡应重新绑定权限');
+  assert.equal(historyUi.binds.length, 0, '回放快进：窗口内跳过逐帧权限绑定');
   h.send({ tool_return: { function_name: 'run_command', tool_call_id: 'call_1', arguments: {}, result: 'ok' } });
   assert.deepEqual(historyUi.outputs, ['ok'], '结果应归位到历史原卡');
   assert.equal(h.toolsIn(h.chatInner).length, 1, '全场只有一张工具卡');
   h.pipe.setReplayWindow(false);
+  assert.equal(historyUi.binds.length, 0, '窗口内已完成的收养卡无需重新绑定（审批已终结）');
   h.send({ content: '最终答案' });
   h.send({ finish_reason: 'stop' });
   const live = h.textsIn(h.msg);
   assert.equal(live.length, 1);
   assert.equal(live[0].textContent, '最终答案');
   h.pipe.finish();
+});
+
+test('回放快进：在途收养卡关闭时绑定一次，输入不复写', () => {
+  const h = harness();
+  const { historyUi } = historyRound(h, 2);
+  h.pipe.setReplayWindow(true);
+  h.send({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'run_command', arguments: '{"command":' } }] });
+  h.send({ tool_calls: [{ index: 0, id: 'call_1', function: { arguments: '"pwd"}' } }] });
+  assert.equal(historyUi.binds.length, 0, '窗口内跳过逐帧绑定');
+  assert.equal(historyUi.inputs.length, 1, '收养卡输入以历史为准');
+  h.pipe.setReplayWindow(false);
+  assert.equal(historyUi.binds.length, 1, '在途收养卡关闭时绑定一次');
+  assert.equal(historyUi.inputs.length, 1, '关闭落定不复写收养卡输入');
 });
 
 test('窗口内未命中历史的内容正常新建（刷新裁剪/中途刷新场景）', () => {
@@ -443,9 +459,9 @@ test('原文重复时按序消费：两次命中都丢弃，第三次新建', ()
 });
 
 test('工具卡落盘 callId 并挂载 ui 控制器供收养，绑定更新同步戳记', () => {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_edit.ts'), 'utf8'));
   const start = source.indexOf('  function buildToolBlock(');
-  const end = source.indexOf('  // ---------- 展示用 diff 视图', start);
+  const end = source.indexOf('  // ---------- 导出', start);
   function looseNode(tag, cls, text) {
     const node = makeNode(tag, cls, text);
     const strictQuery = node.querySelector;
@@ -468,4 +484,30 @@ test('工具卡落盘 callId 并挂载 ui 控制器供收养，绑定更新同�
   const bare = context.__build('run_command', {});
   assert.equal(bare.wrap.dataset.toolCallId, undefined);
   assert.equal(bare.wrap._toolBlockUi, bare);
+});
+
+test('收尾后迟到事件被丢弃，finish 幂等', () => {
+  const h = harness(); h.state.activeStream = h.activeStream;
+  h.send({ content: '第一段' });
+  assert.equal(h.textsIn(h.msg).length, 1);
+  const first = h.pipe.finish();
+  assert.equal(first.empty, false);
+  h.send({ content: '迟到段' });
+  h.send({ tool_start: { function_name: 'read_file', tool_call_id: 'late' } });
+  assert.equal(h.textsIn(h.msg).length, 1, '收尾后正文不再追加');
+  assert.equal(h.toolsIn(h.msg).length, 0, '收尾后工具不再新建');
+  assert.equal(h.pipe.finish(), first, '重复 finish 返回首结果');
+});
+
+test('finish 记录暂停间隙起点（供续跑闭合扣减）', () => {
+  const h = harness(); h.state.activeStream = h.activeStream;
+  const gaps = [];
+  h.context.App.roundFold = {
+    recordPauseGap(msg) { gaps.push(msg); },
+    closePauseGap() {},
+  };
+  h.send({ content: '正文' });
+  h.pipe.finish();
+  assert.equal(gaps.length, 1);
+  assert.equal(gaps[0], h.msg);
 });

@@ -126,26 +126,28 @@ agent_tool_sse/
 │   ├── README.md                # 前端使用说明
 │   ├── index.html               # 聊天单页入口；/ui/ 与本地打开共用此文件
 │   ├── editor.html              # 文件 Diff 独立编辑器页面
-│   ├── js/                      # theme.js / api.js / markdown.js（媒体伪标签、公式提取、
+│   ├── src/                     # 手写源码根：TS + SCSS（tsc 发射 TS 到 js/ 镜像位置；sass 编译 scss/ 到 css/）
+│   │                            #   theme / api（REST+SSE，挂 window.API）/ markdown（媒体伪标签、公式提取、
 │   │                            #   SVG/Mermaid/Canvas 栅栏控件构建、mermaid 懒加载）/
-│   │                            #   widget_reuse.js（流式保活渲染的控件复用配对决策，纯逻辑）/
-│   │                            #   zoom_utils.js（```mermaid/```svg/```canvas 三控件显示缩放纯逻辑：
-│   │                            #   档位表 50%~800%、步进/百分比归一；接线在 app/messages.js）/
-│   │                            #   file_history_sync.js（文件版本链跨窗口变更标记：编辑器页
+│   │                            #   widget_reuse（流式保活渲染的控件复用配对决策，纯逻辑）/
+│   │                            #   zoom_utils（```mermaid/```svg/```canvas 三控件显示缩放纯逻辑：
+│   │                            #   档位表 50%~800%、步进/百分比归一；接线在 src/app/messages_widgets.ts）/
+│   │                            #   file_history_sync（文件版本链跨窗口变更标记：编辑器页
 │   │                            #   写操作 markDirty 广播，主页面订阅即时刷新 + 标记兜底，纯逻辑）/
-│   │                            #   table_canvas.js（表格图片 canvas：列宽两轮收敛+行高自适应）/
-│   │                            #   session_utils.js / session_group_utils.js（会话分组纯逻辑：
+│   │                            #   table_canvas（表格图片 canvas：列宽两轮收敛+行高自适应）/
+│   │                            #   session_utils / session_group_utils（会话分组纯逻辑：
 │   │                            #   注册表/归属规整、分桶（含多选视图 bucketForBulk/未分组伪桶）、
-│   │                            #   名称校验）/ history_search.js（异步搜索状态）/
-│   │                            #   tool_approval_state.js（审批状态管理）/ quote_utils.js（选中文本引用纯逻辑：规整/限额/
-│   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app.js（入口）+
+│   │                            #   名称校验）/ history_search（异步搜索状态）/
+│   │                            #   tool_approval_state（审批状态管理）/ quote_utils（选中文本引用纯逻辑：规整/限额/
+│   │                            #   预览/复制文本，与后端 memory/quote_format 同口径）等工具模块 + app（入口）+
 │   │                            #   app/：core 共享状态；sessions/session_archives 管理会话；
-│   │                            #   messages 渲染历史，chat 调度发送/停止，stream_pipeline 渲染实时事件；
+│   │                            #   messages_* 渲染历史（8 文件拆分），chat 调度发送/停止，stream_pipeline 渲染实时事件；
 │   │                            #   task_state/task_status 分离任务阶段与网络连接，session_activity 同步侧边栏运行标记；history_scroll/process_groups 管理窗口与过程折叠；
 │   │                            #   其余模块负责引用、设置、任务预算/模板、媒体、diff、终端和快捷命令；完整职责见 H5/README.md
+│   ├── js/                      # tsc 构建产物（浏览器实际加载，不要手改；仅 history_parse_async/worker.js 为手写源）
 │   │   └── vendor/              # prism/（代码高亮，按语言拆分）、katex/（公式渲染+字体）、
 │   │                            #   mermaid/（图表 12.0，按需懒加载）
-│   ├── style/scss/ → style/css/main.css   # SCSS 源与编译产物
+│   ├── css/                     # served 样式：main.css（sass 产物，不要手改）、account_theme.css/login.css（手写）
 │   ├── version_assets.py        # 按 JS/CSS 内容更新 index.html 资源版本
 │   ├── test_browser/            # 浏览器交互脚本与无模型调用的长会话验证页
 │   └── test_h5/                 # node:test 单元测试；npm test 运行当前 *.test.js

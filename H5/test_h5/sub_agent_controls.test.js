@@ -3,6 +3,7 @@ const test = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { stripTypeScriptTypes } = require("node:module");
 
 class Node {
   constructor(tag, className, text) {
@@ -28,14 +29,15 @@ class Node {
 }
 
 function buildControls(requests) {
-  const source = fs.readFileSync(path.join(__dirname, "../js/app/messages.js"), "utf8");
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/messages_tools.ts"), "utf8"));
   const start = source.indexOf("  function buildSubAgentBlock(");
   const end = source.indexOf("  // 代码块复制（事件委托）", start);
   const context = {
     el: (tag, cls, text) => new Node(tag, cls, text),
     state: { sessionId: "different_session" }, toast() {},
     API: { async stopSubAgent(sid, aid) { requests.push([sid, aid]); return { ok: true }; } },
-    App: { highlightCodeBlocks() {}, updateCodeblockCopyButtons() {}, toolIconSvg() { return '<svg class="icon"><path/></svg>'; } },
+    App: { highlightCodeBlocks() {}, updateCodeblockCopyButtons() {}, toolIconSvg() { return '<svg class="icon"><path/></svg>'; },
+      buildThinkBlock() { return { wrap: new Node("div", "think-block"), done() {}, add() {}, streaming() {}, textContent() { return ""; } }; } },
     Markdown: { render: value => value },
     subAgentTaskSummary: value => value,
     SUB_AGENT_ERROR_STATUSES: ["stopped", "timeout", "error"],

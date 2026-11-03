@@ -97,7 +97,7 @@
 - 普通打开/搜索打开 × 顶部/中间/底部六组释放验证：松手前后首个可见节点相同，纵向偏差不超过 1px。连续滚轮能到达真实首尾，不暴露空白占位；搜索及第 81 条提问仍准确定位。
 - 验证离屏编辑草稿复用原节点、运行中消息离屏仍挂载、任务离屏完成后返回结果仍在；尾部按住时新增 1600px 输出立即可见，冻结的滚动范围不变，释放后恢复真实高度及贴底。
 
-相关文件：`H5/js/history_scroll_model.js`、`H5/js/app/history_scroll.js`、`H5/js/app/messages.js`、`H5/js/app/core.js`、`H5/style/scss/_layout.scss`、`H5/style/scss/_chat.scss`。CSS 已编译，静态资源内容版本已更新；刷新前端即可使用。
+相关文件：`H5/js/history_scroll_model.js`、`H5/js/app/history_scroll.js`、`H5/src/app/messages_nav.ts`、`H5/js/app/core.js`、`H5/src/scss/_layout.scss`、`H5/src/scss/_chat.scss`。CSS 已编译，静态资源内容版本已更新；刷新前端即可使用。
 
 ## 2026-10-22：新提问及时进入导航
 

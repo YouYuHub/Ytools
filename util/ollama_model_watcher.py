@@ -5,7 +5,7 @@ import hashlib
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -27,6 +27,12 @@ POLL_INTERVAL_ENV_NAME = "OLLAMA_MODEL_POLL_INTERVAL_SECONDS"
 DISCOVERY_TIMEOUT_ENV_NAME = "OLLAMA_MODEL_DISCOVERY_TIMEOUT_SECONDS"
 DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3.0
+# 单次请求超时配置上限：urlopen 的 timeout 管不住 DNS 解析（getaddrinfo
+# 无超时），且 show 阶段总预算按“单次超时 × 批次数”推导——不封顶的话，
+# 一个超大配置值会让整轮 poll 挂起数小时。30 秒对元数据接口已极宽松。
+MAX_DISCOVERY_TIMEOUT_SECONDS = 30.0
+# show 阶段总预算 = 单次超时 × 批次数 + 该宽限：覆盖 DNS 解析与调度抖动。
+_SHOW_DNS_GRACE_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_PARALLEL_SHOW_REQUESTS = 4
 
@@ -143,6 +149,7 @@ class OllamaModelWatcher:
             timeout = _positive_float_env(
                 DISCOVERY_TIMEOUT_ENV_NAME, DEFAULT_DISCOVERY_TIMEOUT_SECONDS
             )
+            timeout = min(timeout, MAX_DISCOVERY_TIMEOUT_SECONDS)
             provider_specs = providers if providers is not None else get_ollama_provider_configs()
             actions: dict[str, str] = {}
             for provider in provider_specs:
@@ -220,14 +227,31 @@ class OllamaModelWatcher:
 
         loaded_capabilities: dict[str, set[str]] = {}
         if needs_show:
-            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_SHOW_REQUESTS, len(needs_show))) as executor:
+            workers = min(MAX_PARALLEL_SHOW_REQUESTS, len(needs_show))
+            # 整体限时等一批：as_completed + 无限 result() 会被卡在 DNS 解析
+            # 上的 show 请求拖住整轮 poll（executor 关闭时 join 等待），且
+            # 超时配置再小也管不住解析阶段。超时未完成的直接放弃——能力未知
+            # 则保守标记，下轮继续补齐；绝不让单轮 poll 无限延长。
+            batches = max(1, -(-len(needs_show) // workers))
+            show_timeout = timeout * batches + _SHOW_DNS_GRACE_SECONDS
+            executor = ThreadPoolExecutor(max_workers=workers)
+            try:
                 futures = [executor.submit(load_capabilities, item) for item in needs_show]
-                for future in as_completed(futures):
+                done, pending = wait(futures, timeout=show_timeout)
+                for future in done:
+                    if future.cancelled():
+                        continue
                     try:
                         result_id, capabilities = future.result()
                         loaded_capabilities[result_id] = capabilities or set()
                     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
                         pass
+                for future in pending:
+                    future.cancel()
+            finally:
+                # 不等待 hanging worker（只取消未启动任务；运行中的随 urlopen
+                # 自然结束而退出，均为后台线程，不影响主流程）。
+                executor.shutdown(wait=False, cancel_futures=True)
 
         next_cache: dict[str, dict[str, Any]] = {}
         record_by_id = {record["id"]: record for record in model_records}

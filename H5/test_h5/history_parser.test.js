@@ -563,6 +563,73 @@ test("recordsBeforeActiveRound: 轮次号有效但未命中时不回退文本匹
   assert.equal(historyParser.recordsBeforeActiveRound(records, "重复的问题", 3), records);
 });
 
+test("recordsBeforeActiveRound: 轮次号命中但文本不一致时不裁（插入新轮）", function () {
+  // 插入轮 liveRound 与历史旧轮次号相同，但提问文本不同：records 里没有
+  // 当前轮旧快照，不能裁（否则连同后续轮一起误删）。
+  const records = [
+    { kind: "user", content: "旧第一问", round: 1 },
+    { kind: "assistant", content: "旧第一答", round: 1 },
+    { kind: "user", content: "旧第二问", round: 2 },
+    { kind: "assistant", content: "旧第二答", round: 2 },
+  ];
+  assert.equal(historyParser.recordsBeforeActiveRound(records, "插入的新问题", 1), records);
+  // 文本一致时仍裁（附接恢复旧快照）
+  assert.deepEqual(
+    historyParser.recordsBeforeActiveRound(records, "旧第二问", 2).map(function (r) { return r.content; }),
+    ["旧第一问", "旧第一答"]);
+});
+
+test("splitActiveRound: 只拆出当前轮区间，后续轮保留", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "第二问", round: 2 },
+    { kind: "assistant", content: "第二答", round: 2 },
+    { kind: "user", content: "第三问", round: 3 },
+    { kind: "assistant", content: "第三答", round: 3 },
+  ];
+  const mid = historyParser.splitActiveRound(records, "第二问", 2);
+  assert.equal(mid.cutStart, 2);
+  assert.equal(mid.cutEnd, 4);
+  assert.deepEqual(mid.records.map(function (r) { return r.content; }),
+    ["第一问", "第一答", "第三问", "第三答"]);
+  // 末尾轮：等价一刀裁
+  const tail = historyParser.splitActiveRound(records, "第三问", 3);
+  assert.equal(tail.cutStart, 4);
+  assert.equal(tail.cutEnd, 6);
+  assert.equal(tail.records.length, 4);
+  // 同轮引导属于当前轮，不触发边界
+  const steer = [
+    { kind: "user", content: "提问", round: 1 },
+    { kind: "tool", content: "调用", round: 1 },
+    { kind: "user", content: "引导", round: 1 },
+    { kind: "user", content: "下一轮", round: 2 },
+  ];
+  const sp = historyParser.splitActiveRound(steer, "提问", 1);
+  assert.equal(sp.cutStart, 0);
+  assert.equal(sp.cutEnd, 3);
+  assert.deepEqual(sp.records.map(function (r) { return r.content; }), ["下一轮"]);
+  // 未命中：null
+  assert.equal(historyParser.splitActiveRound(records, "插入的新问题", 1), null);
+});
+
+test("removeRound: 纯按轮次号去掉一轮区间", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "第二问", round: 2 },
+    { kind: "assistant", content: "第二答", round: 2 },
+    { kind: "user", content: "第三问", round: 3 },
+  ];
+  const mid = historyParser.removeRound(records, 2);
+  assert.equal(mid.cutStart, 2);
+  assert.equal(mid.cutEnd, 4);
+  assert.deepEqual(mid.records.map(function (r) { return r.content; }),
+    ["第一问", "第一答", "第三问"]);
+  assert.equal(historyParser.removeRound(records, 99), null);
+  assert.equal(historyParser.removeRound(records, null), null);
+});
+
 // ---------- sub_agent 子任务事件块聚合 ----------
 
 test("parseHistory: 子任务冲突/压缩提示和工具差异在刷新回放后保留，心跳不膨胀轨迹", () => {

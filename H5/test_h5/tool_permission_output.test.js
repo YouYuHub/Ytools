@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
 class Node {
   constructor(tag, cls, text) {
@@ -18,8 +19,8 @@ class Node {
 }
 
 function block() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
-  const start = source.indexOf('  function buildToolBlock('), end = source.indexOf('  // ---------- 展示用 diff', start);
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_edit.ts'), 'utf8'));
+  const start = source.indexOf('  function buildToolBlock('), end = source.indexOf('  // ---------- 导出', start);
   const context = { state: { sessionId: 's' }, el: (...args) => new Node(...args),
     App: { isBuiltinToolName: () => true, toolIconSvg: () => '', toolDisplayName: () => '运行命令' },
     FormatUtils: { prettyJson: JSON.stringify }, clearInterval, setInterval };

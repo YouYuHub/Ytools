@@ -1,0 +1,323 @@
+// 整体布局：主区 / 顶栏 / 空态居中 / 回到底部悬浮钮
+//
+// 嵌套约定：
+// - 组件内部结构按 DOM 层级嵌套（深度 <=3），状态/伪类用 &
+// - 跨容器状态（.app.empty .*）与全局复用类保持顶层扁平，避免选择器被过度限定
+
+.app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+
+  // ---------- 空态：输入条垂直居中（ChatGPT 首页形态） ----------
+  // 参数设置为独立模态框，不依赖空态输入条的位置。
+  &.empty {
+    .chat-scroll {
+      display: none;
+    }
+
+    .bottom {
+      inset: 0;
+      justify-content: center;
+      padding-bottom: 8vh;
+    }
+
+    .welcome {
+      display: block;
+    }
+
+    .scroll-bottom-btn {
+      display: none;
+    }
+  }
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  // 主区可能因侧栏拖宽而变窄；内部布局断点应根据剩余宽度判断，
+  // 而不是只看整个浏览器窗口宽度。
+  container-name: main-area;
+  container-type: inline-size;
+
+  // 移动端才显示的汉堡按钮（限定在主区内，避免侧边栏误用）
+  .only-mobile {
+    display: none;
+
+    @media (max-width: 768px) {
+      display: flex;
+    }
+  }
+
+  // ---------- 消息滚动区 ----------
+  .chat-scroll {
+    flex: 1;
+    overflow-y: scroll;
+    scroll-behavior: smooth;
+    min-height: 0;
+    scrollbar-gutter: stable;
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+    &.scrollbar-ready,
+    &.scrollbar-dragging {
+      scroll-behavior: auto;
+      overflow-anchor: none;
+    }
+  }
+
+  .chat-inner {
+    --chat-top-padding: 64px;
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: calc(var(--chat-top-padding) + var(--history-prefix-space, 0px)) 24px calc(var(--chat-bottom-padding, 56px) + var(--history-suffix-space, 0px));
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+
+    @container main-area (max-width: 768px) {
+      --chat-top-padding: 60px;
+      padding: calc(var(--chat-top-padding) + var(--history-prefix-space, 0px)) 16px calc(var(--chat-bottom-padding, 48px) + var(--history-suffix-space, 0px));
+    }
+  }
+
+  // qnav 显示时给聊天区右侧留出悬浮导航空间（常态指示条最宽 20px +
+  // right 14px = 最左缘距右 34px，44px 留白零遮挡；hover 涟漪最长 34px
+  // 是临时态，允许轻微覆盖）。桌面端生效；移动端导航改为顶栏按钮，不留白。
+  @container main-area (min-width: 680.01px) {
+    &:has(> .qnav:not(.hidden)) .chat-inner {
+      padding-right: 44px;
+    }
+  }
+}
+
+// ---------- 顶栏 ----------
+.topbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  // 高于底部输入区 .bottom（25）与右侧问题导航 .qnav（30）：顶栏下拉面板
+  // （文件变更统计等）不被输入区遮挡，也不被 qnav 展开的问题列表盖住
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 10px 16px;
+  pointer-events: none;
+
+  >* {
+    pointer-events: auto;
+  }
+
+  .topbar-spacer {
+    flex: 1;
+    min-width: 0;
+  }
+}
+
+// ---------- 顶栏操作（分享 / 加载 / 压缩 菜单） ----------
+// 图标按钮 + 下拉菜单；空态点击按钮直接进入加载（见 app.js）
+.top-actions {
+  position: relative;
+}
+
+.topbar-menu {
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 168px;
+  // 矮屏兜底：菜单自身限高滚动，末尾项（压缩/归档）永不被裁出视口；
+  // dvh 兼容移动端地址栏伸缩，72px = 顶栏高 + 间隙 + 底部余量。
+  max-height: calc(100dvh - 72px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.topbar .qnav-mobile-toggle,
+.mobile-session-usage {
+  display: none;
+}
+
+.main:has(> .qnav.hidden) .qnav-mobile-toggle {
+  display: none;
+}
+
+@container main-area (max-width: 680px) {
+  .topbar {
+    padding: 10px 12px;
+  }
+
+  .topbar .token-total {
+    display: none;
+  }
+
+  .topbar .qnav-mobile-toggle {
+    display: flex;
+  }
+
+  #sessionActionsMenu {
+    width: min(300px, calc(100cqw - 24px));
+  }
+
+  .mobile-session-usage:not(.hidden) {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px 11px;
+    margin-bottom: 5px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  .mobile-session-usage-label {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  .mobile-session-usage-values {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+}
+
+// ---------- 会话操作按钮：空态显示"加载 JSONL"图标 ----------
+// 初始空态用 icon-load（更直白），有会话内容时切回 icon-dots
+#sessionActionsBtn {
+  .icon-load {
+    display: none;
+  }
+
+  .app.empty & .icon-dots {
+    display: none;
+  }
+
+  .app.empty & .icon-load {
+    display: block;
+  }
+}
+
+// ---------- 底部区（欢迎语 + 输入条） ----------
+.bottom {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  padding: 0 20px 12px;
+  pointer-events: none;
+
+  >* {
+    pointer-events: auto;
+  }
+
+}
+
+@container main-area (max-width: 768px) {
+  .main .bottom {
+    padding: 0 8px 10px;
+  }
+}
+
+.welcome {
+  display: none;
+  text-align: center;
+  margin-bottom: 22px;
+
+  .welcome-title {
+    font-size: 26px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+}
+
+// ---------- 回到底部悬浮钮 ----------
+.scroll-bottom-btn {
+  position: absolute;
+  left: 50%;
+  bottom: var(--scroll-bottom-offset, 108px);
+  transform: translateX(-50%);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, bottom 0.15s ease;
+  z-index: 20;
+
+  &.show {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .scroll-bottom-dots {
+    display: none;
+    align-items: center;
+    gap: 3px;
+
+    span {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: scroll-bottom-dot-bounce 1.1s ease-in-out infinite;
+
+      &:nth-child(2) { animation-delay: 0.15s; }
+      &:nth-child(3) { animation-delay: 0.3s; }
+    }
+  }
+
+  &.is-generating {
+    .icon { display: none; }
+    .scroll-bottom-dots { display: flex; }
+
+    &:hover,
+    &:focus-visible {
+      .icon { display: block; }
+      .scroll-bottom-dots { display: none; }
+    }
+  }
+}
+
+@keyframes scroll-bottom-dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.55; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-bottom-btn .scroll-bottom-dots span {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+// ---------- 遮罩 ----------
+.scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 40;
+
+  @media (max-width: 768px) {
+    &.show {
+      display: block;
+    }
+  }
+}

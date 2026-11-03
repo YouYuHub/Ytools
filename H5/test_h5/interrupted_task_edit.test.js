@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const source = fs.readFileSync(path.join(__dirname,'../js/app/chat.js'),'utf8');
+const { stripTypeScriptTypes } = require('node:module');
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname,'../src/app/chat.ts'),'utf8'));
 const helper = source.slice(source.indexOf('  async function requestStopRunningGeneration('),source.indexOf('  async function confirmEditResend('));
 
 async function confirm(suspended,accept=true) {

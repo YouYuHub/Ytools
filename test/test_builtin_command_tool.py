@@ -238,6 +238,54 @@ class BuiltinCommandToolTests(unittest.TestCase):
             bt._rewrite_inline_code_to_script(
                 'python -c "print(1)\nprint(2)" ; echo done', "cmd")
 
+    def test_powershell_multiline_inline_code_rewrite(self):
+        # powershell 多行内联代码改写为临时脚本（引号嵌套不再报错）
+        command = 'python -c "import sys\nprint(sys.version)"'
+        cmd, notes = bt._rewrite_inline_code_to_script(command, "powershell")
+        self.assertNotEqual(cmd, command)
+        self.assertNotIn("-c", cmd)
+        self.assertTrue(notes)
+        self.assertIn("PowerShell", notes[0])
+        # pwsh 同理
+        cmd2, notes2 = bt._rewrite_inline_code_to_script(command, "pwsh")
+        self.assertNotEqual(cmd2, command)
+        self.assertTrue(notes2)
+        # powershell 单行（含 % 也无妨，% 无特殊含义）：不改写
+        plain = 'python -c "print(\'100%\')"'
+        cmd3, notes3 = bt._rewrite_inline_code_to_script(plain, "powershell")
+        self.assertEqual(cmd3, plain)
+        self.assertEqual(notes3, [])
+        # 无法定位的多行意图：拒绝执行
+        with self.assertRaisesRegex(ValueError, "命令未执行"):
+            bt._rewrite_inline_code_to_script(
+                'python -c "print(1)\nprint(2)" ; echo done', "powershell")
+
+    def test_nested_quote_greedy_rewrite(self):
+        # 引号嵌套（内外层同种引号）：贪心取到最后一个引号改写
+        cmd = 'python -c "print("hello")\nprint("world")"'
+        new_cmd, notes = bt._rewrite_inline_code_to_script(cmd, "powershell")
+        self.assertNotEqual(new_cmd, cmd)
+        self.assertNotIn("-c", new_cmd)
+        self.assertIn("引号嵌套", notes[0])
+        # cmd 下嵌套同样改写
+        new_cmd2, notes2 = bt._rewrite_inline_code_to_script(cmd, "cmd")
+        self.assertNotEqual(new_cmd2, cmd)
+        # 单行嵌套也改写
+        single = 'python -c "print("hi")"'
+        new_single, notes3 = bt._rewrite_inline_code_to_script(single, "powershell")
+        self.assertNotEqual(new_single, single)
+        self.assertIn("引号嵌套", notes3[0])
+        # 后面还有命令时不贪心（防吞并），原样返回
+        chained = 'python -c "print("hi")" && echo done'
+        same, notes4 = bt._rewrite_inline_code_to_script(chained, "powershell")
+        self.assertEqual(same, chained)
+        self.assertEqual(notes4, [])
+        # 单引号嵌套在双引号里是合法写法：不改写
+        ok = 'python -c "print(\'hi\')"'
+        same2, notes5 = bt._rewrite_inline_code_to_script(ok, "powershell")
+        self.assertEqual(same2, ok)
+        self.assertEqual(notes5, [])
+
     @unittest.skipUnless(IS_WINDOWS, "cmd 语法仅 Windows 验证")
     def test_cmd_heredoc_rejected_before_execution(self):
         with self.assertRaisesRegex(ValueError, "heredoc.*命令未执行"):
@@ -406,6 +454,23 @@ class BuiltinCommandToolTests(unittest.TestCase):
                 })
                 self.assertEqual(result["exit_code"], 0)
                 self.assertEqual(result["stdout"].strip().splitlines(), ["4996", "4997", "4998", "4999"])
+
+    @unittest.skipUnless(IS_WINDOWS, "work_dir 方括号用例仅 Windows 验证")
+    def test_powershell_work_dir_with_brackets(self):
+        # PowerShell 启动对方括号 cwd 做通配符匹配会静默回退 System32；
+        # 必须 LiteralPath，且 stdout 证明实际运行目录正确
+        import tempfile
+        from pathlib import Path as _Path
+        with tempfile.TemporaryDirectory() as folder:
+            target = _Path(folder) / "[bracket] dir"
+            target.mkdir()
+            result = bt.execute_run_command({
+                "command": "(Get-Location).Path", "shell": "powershell",
+                "work_dir": str(target), "timeout_seconds": 30,
+                "_structured_output": True,
+            })
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(result["stdout"].strip().rstrip("\\"), str(target))
 
     @unittest.skipUnless(IS_WINDOWS, "PowerShell 直连执行用例仅 Windows 验证")
     def test_powershell_direct_fallback_preserves_upstream_exit_code(self):

@@ -15,7 +15,7 @@ async function setup(t,handler,configure){
     return {ok:data.status>=200&&data.status<300,status:data.status,json:async()=>data.data};
   };
   if(configure)configure(w);
-  for(const file of ['js/vendor/qrcode-generator/qrcode.js','js/mfa_enrollment.js','js/recovery_codes.js','js/login_mfa_management.js','login.js'])w.eval(fs.readFileSync(path.join(root,file),'utf8'));
+  for(const file of ['js/vendor/qrcode-generator/qrcode.js','js/mfa_enrollment.js','js/recovery_codes.js','js/login_mfa_management.js','js/login.js'])w.eval(fs.readFileSync(path.join(root,file),'utf8'));
   await settle();return {w,calls,el:id=>w.document.getElementById(id)};
 }
 async function submit(w,form){form.dispatchEvent(new w.Event('submit',{cancelable:true}));await settle();await settle();}

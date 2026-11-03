@@ -27,9 +27,9 @@ def digest(path):
 
 def test_stamp_updates_pages_and_worker_chain_idempotently(tmp_path, monkeypatch):
     (tmp_path / "js").mkdir()
-    (tmp_path / "style").mkdir()
+    (tmp_path / "css").mkdir()
     (tmp_path / "js" / "a.js").write_text("console.log(1);\n", encoding="utf-8")
-    (tmp_path / "style" / "main.css").write_text(".a{color:red}\n", encoding="utf-8")
+    (tmp_path / "css" / "main.css").write_text(".a{color:red}\n", encoding="utf-8")
     (tmp_path / "js" / "history_parser.js").write_text("/* parser */\n", encoding="utf-8")
     (tmp_path / "js" / "history_parse_worker.js").write_text(
         "importScripts('history_parser.js?v=000000000000');\n", encoding="utf-8")
@@ -38,7 +38,7 @@ def test_stamp_updates_pages_and_worker_chain_idempotently(tmp_path, monkeypatch
     (tmp_path / "index.html").write_text(
         "<head>\n"
         '<script src="js/a.js?v=000000000000"></script>\n'
-        '<link rel="stylesheet" href="style/main.css?v=000000000000">\n'
+        '<link rel="stylesheet" href="css/main.css?v=000000000000">\n'
         "</head>\n",
         encoding="utf-8")
     stamper = load_stamper()
@@ -48,7 +48,7 @@ def test_stamp_updates_pages_and_worker_chain_idempotently(tmp_path, monkeypatch
     stamper.update_index()
     html = (tmp_path / "index.html").read_text(encoding="utf-8")
     assert f"js/a.js?v={digest(tmp_path / 'js' / 'a.js')}" in html
-    assert f"style/main.css?v={digest(tmp_path / 'style' / 'main.css')}" in html
+    assert f"css/main.css?v={digest(tmp_path / 'css' / 'main.css')}" in html
     assert "defer" in html  # defer_scripts 页面补全 defer
     worker = (tmp_path / "js" / "history_parse_worker.js").read_text(encoding="utf-8")
     assert f"history_parser.js?v={digest(tmp_path / 'js' / 'history_parser.js')}" in worker

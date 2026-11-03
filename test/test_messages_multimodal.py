@@ -231,6 +231,8 @@ def test_missing_media_and_unsupported_audio_video_are_explicit(monkeypatch, tmp
     assert "不会自动下载" in video_err
     assert "（音频）" in audio_err and "（视频）" not in audio_err
     assert "仅支持图片与文本输入" in audio_err
+    # 网络直传探活：桩 URL 不可达，mock 探活通过以验证透传形态不变
+    monkeypatch.setattr(builtin_tools, "_probe_url_media", lambda source: None)
     gif = builtin_tools.load_any_media_model_part("missing", "https://media.test/a.gif", api_type="messages")
     assert gif["kind"] == "image" and gif["part"]["image_url"]["url"].endswith("a.gif")
 

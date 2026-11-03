@@ -3,8 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const { JSDOM } = require('jsdom');
-const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+// messages.js 已拆分：历史分段渲染读 messages_history.ts，问题导航读 messages_nav.ts
+const historySrc = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_history.ts'), 'utf8'));
+const navSrc = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
 
 function setup() {
   const dom = new JSDOM('<div id="scroll"><div id="chat"></div></div><div id="nav"></div><div id="rail"></div><div id="panel"></div>');
@@ -27,11 +30,12 @@ function setup() {
       disconnect() { this.disconnected = true; }
     },
     scrollToBottom() { bottoms++; scroll.scrollTop = scroll.scrollHeight-scroll.clientHeight; }, contentToPlainText: s => s,
-    updateQnavActive() {}, App: { pauseAutoScroll() {}, refreshAskBlockStates() {}, updateCodeblockCopyButtons() {} },
+    updateQnavActive() {}, App: { pauseAutoScroll() {}, refreshAskBlockStates() {}, updateCodeblockCopyButtons() {}, contentToPlainText: s => s },
   };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('  const RENDER_TAIL_RECORDS'), source.indexOf('  function appendTime(')), context);
-  vm.runInContext(source.slice(source.indexOf('  let qnavUsers ='), source.indexOf('  // ---------- 从用户引用')), context);
+  vm.runInContext(historySrc.slice(historySrc.indexOf('  const RENDER_TAIL_RECORDS'), historySrc.indexOf('  function appendTime(')), context);
+  vm.runInContext(navSrc.slice(navSrc.indexOf('  let qnavUsers'), navSrc.indexOf('  // ---------- 从用户引用')), context);
+  context.App.loadOlderState = vm.runInContext('loadOlderState', context);
   // 用轻量内容代替 Markdown 和工具的细节，验证真实分页/导航编排。
   context.renderOneRecordInto = (container, rec) => {
     const node = context.el('div', rec.kind === 'user' ? 'msg-user' : 'msg-assistant-body');

@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
-const MESSAGES = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+const MESSAGES = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
 
 // 最小 fake 节点：rect 可配、classList 含 toggle、parentElement 链可配。
 class Node {
@@ -82,7 +83,7 @@ function setupQnavActive(userTops) {
   const qnavUsers = userTops.map(top => (top == null ? null : new Node({ top, bottom: top + 100 })));
   const items = userTops.map(() => new Node());
   const context = {
-    chatScroll, qnavUsers,
+    chatScroll, qnavUsers, App: {},
     qnavRail: { querySelectorAll: () => [] },
     qnavPanel: { querySelectorAll: () => items },
   };
@@ -110,13 +111,14 @@ test('滚动回调：任一更新器抛错也不卡死 scrollTick，下次滚动
   let scrollHandler = null;
   let toggles = 0;
   const rafCallbacks = [];
+  const older = { records: null };
   const context = {
     chatScroll: {
       scrollHeight: 2000, scrollTop: 0, clientHeight: 900,
       getBoundingClientRect: () => ({ top: 60, bottom: 960 }),
       addEventListener: (type, fn) => { scrollHandler = fn; },
     },
-    loadOlderState: { records: null },
+    loadOlderState: older, App: { loadOlderState: older },
     scrollBottomBtn: { classList: { toggle: () => { toggles++; } } },
     updateCodeblockCopyButtons: () => { throw new Error('boom'); },
     updateQnavActive: () => {},
@@ -161,9 +163,11 @@ class ElNode {
 function setupRebuildQnav(records, rendered) {
   const chatInner = new ElNode('chat-inner');
   rendered.forEach(n => chatInner.appendChild(n));
+  const older = { records };
   const context = {
     chatInner,
-    loadOlderState: { records },
+    loadOlderState: older,
+    App: { loadOlderState: older, contentToPlainText: s => s },
     qnav: new ElNode('qnav'), qnavRail: new ElNode('rail'), qnavPanel: new ElNode('panel'),
     QNAV_MAX_DASHES: 40,
     el: (tag, cls, text) => new ElNode(cls, text),
@@ -171,7 +175,7 @@ function setupRebuildQnav(records, rendered) {
     updateQnavActive() {},
   };
   vm.createContext(context);
-  vm.runInContext(slice('  let qnavUsers =', '  // ---------- 从用户引用'), context);
+  vm.runInContext(slice('  let qnavUsers', '  // ---------- 从用户引用'), context);
   context.rebuildQnav();
   // 跨 vm 域数组原型不同，序列化后回宿主再断言
   return JSON.parse(vm.runInContext(

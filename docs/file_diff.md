@@ -131,7 +131,7 @@ graph TD
 
 ### 4.1 识别逻辑（不依赖工具名白名单）
 
-`H5/js/app/messages.js::applyToolResult(block, name, resultText, fileDiff)`（模块级函数，已导出 `App.applyToolResult`）：
+`H5/src/app/messages_tools.ts::applyToolResult(block, name, resultText, fileDiff)`（模块级函数，已导出 `App.applyToolResult`）：
 
 - 入参 `fileDiff` 为对象且 `resultText` 能 `JSON.parse` 出含 `path` 字段的对象 → **diff 视图 + 摘要文本**；
 - 否则一律回退 `setOutput(原文纯文本)`。
@@ -190,7 +190,7 @@ tool-block 状态机配套：
 
 ## 5. 样式
 
-`H5/style/scss/_chat.scss`（tool-block 样式块之后）新增 `.diff-view` 系列：
+`H5/src/scss/_chat.scss`（tool-block 样式块之后）新增 `.diff-view` 系列：
 
 - 明色：add 行 `rgba(46,160,67,.16)` 绿底、del 行 `rgba(248,81,73,.16)` 红底、徽标 `#1a7f37` / `#cf222e`；
 - 暗色（`html[data-theme="dark"]`）：徽标换 `#7ee787` / `#ff9492`；
@@ -234,11 +234,11 @@ tool-block 状态机配套：
 | `factory/chat_factory.py` | `_format_tool_result` 剥离；主循环 JSONL 落盘 record.file_diff；SSE tool_return.file_diff |
 | `factory/agent_runtime/sub_agent.py` | `_format_result_text` 剥离；正常 tool_result 子事件带 file_diff |
 | `H5/js/history_parser.js` | toolResult 记录透传 `file_diff` |
-| `H5/js/app/messages.js` | `buildDiffView`（含行内高亮）/ `applyToolResult` / buildToolBlock 的 setDiff/clearDiff/finish/beginStream/挂点 |
+| `H5/src/app/messages_tools.ts` + `messages_edit.ts` | `buildDiffView`（含行内高亮）/ `applyToolResult`（tools）/ buildToolBlock 的 setDiff/clearDiff/finish/beginStream/挂点（edit） |
 | `H5/js/vendor/prism/prism-python-imports.js` | python 语法增强（内建类型/None/全大写常量/docstring/类名，VS Code 口径） |
-| `H5/style/scss/_prism.scss` | Prism 主题调色板（python=VS Code Light+/Dark Modern；constant/variable/docstring 独立变量；`.diff-code.language-x` 继承挂点） |
+| `H5/src/scss/_prism.scss` | Prism 主题调色板（python=VS Code Light+/Dark Modern；constant/variable/docstring 独立变量；`.diff-code.language-x` 继承挂点） |
 | `H5/js/app/chat.js` | 两处 tool_return 挂点改走 applyToolResult；fileChanges 徽标防抖刷新 |
-| `H5/style/scss/_chat.scss` | diff 视图样式（明/暗主题） |
+| `H5/src/scss/_chat.scss` | diff 视图样式（明/暗主题） |
 | `docs/api_docs.md` | 「文件变更 diff」一节（字段速查）+ §9 REST 接口契约 |
 
 ---
@@ -346,7 +346,7 @@ hunk 序号语义：使用 `SequenceMatcher` 得出的差异块顺序（0 起）
 | `js/app/filehistory.js` | 顶栏徽标（文件数，纯事件驱动刷新：`noteSessionChanged` 会话切换事件 + `FileHistorySync` 脏标记，`BADGE_REFRESH_MIN_INTERVAL_MS=1500` 节流；不再保留定时轮询）+ 统计面板（后缀筛选框 + 全部保留 / 全部撤回 / 清理留档按钮，批量操作均二次确认）；点击文件新窗口打开 `editor.html` |
 | `editor.html` + `js/app/editor.js` | **V2.3 独立 diff 编辑器页**：URL 参数 `?session_id&key`；全文视图 ctx/add 行均可编辑（overlay：Prism 高亮层 + 透明 textarea）；del 红块只读；保存（Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 区间撤留；顶栏固定「↑上一块 / ↓下一块」差异块跳转（V2.5，滚动位置锚定）；顶栏主题下拉（跟随系统/浅色/深色，与主应用共用 ThemeManager / ytools-theme-preference），API 指向同源 localStorage `ytools-api-base` |
 | `js/app/chat.js` | tool_return 处挂 `scheduleFileChangesBadgeRefresh` |
-| `style/scss/_filehistory.scss` | 面板/编辑器样式（add/del 色值与 V1 diff-view 同口径；dark 主题变量） |
+| `src/scss/_filehistory.scss` | 面板/编辑器样式（add/del 色值与 V1 diff-view 同口径；dark 主题变量） |
 
 编辑器交互规则（对齐 VS Code inline diff 效果）：
 - 行级 Total Diff 单栏：`ctx` 行（未变）正常渲染**不可编辑**（保持定位稳定）；`add` 行绿底 textarea **可编辑**；`del` 行红底**无行号**只读（删除线，模拟 VS Code 删除行内联展示）；
@@ -384,7 +384,7 @@ V2.0 已实现：版本链存储 / 10 个 REST 接口 / 编辑器（diff 视图 
 
 **V2.3 追加（2026-09，按用户实测反馈；阶段 3「编辑器行内 Prism 高亮」落地）**：
 - **工具块头部完整文件路径**：`_file_diff` 载荷新增 `path/display_path`（builtin_tools._build_file_diff）；工具块头部在「调用工具 edit_file +4 -2」右侧渲染完整路径（`tool-block-file`，flex:1 自动换行、垂直居中、点击复制）。旧历史数据无 path 字段时前端三级兜底：参数 JSON 的 `path`（兼容旧名 `full_file_name`）→ diff 文件头 `--- a/xxx` → path 字段；
-- **独立编辑器页**：新增 `H5/editor.html` + `js/app/editor.js` + `style/scss/_editor.scss`（注册进 main.scss）。面板点击文件改为 `window.open("editor.html?session_id=...&key=...")` 新窗口打开，替代原主页面内嵌全屏 modal（index.html 的 fileDiffModal 已移除，fhConfirmModal 保留给「清理留档」）。编辑器页具备全部操作：保存（乐观锁，Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 保留与撤回（含"此处及之后"区间语义，按钮挂在差异块头部）；主题经 theme.js 与主应用同步，API base 复用同一 localStorage（同 file:// origin）；头部完整文件路径独占顶行（过长自动换行，次行为基线→当前版本号），操作按钮调矮（12px 紧凑布局）。
+- **独立编辑器页**：新增 `H5/editor.html` + `js/app/editor.js` + `src/scss/_editor.scss`（注册进 main.scss）。面板点击文件改为 `window.open("editor.html?session_id=...&key=...")` 新窗口打开，替代原主页面内嵌全屏 modal（index.html 的 fileDiffModal 已移除，fhConfirmModal 保留给「清理留档」）。编辑器页具备全部操作：保存（乐观锁，Ctrl+S）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版 / hunk 保留与撤回（含"此处及之后"区间语义，按钮挂在差异块头部）；主题经 theme.js 与主应用同步，API base 复用同一 localStorage（同 file:// origin）；头部完整文件路径独占顶行（过长自动换行，次行为基线→当前版本号），操作按钮调矮（12px 紧凑布局）。
 - **全文可编辑**：编辑器 ctx 行（未变行）与 add 行（绿行）均改为可编辑 overlay（Prism 高亮层 pre.eh-hl + 透明 textarea 叠加，caret 可见）；del 红块保持只读无行号。全文其余部分编辑不改变 diff 语义，保存时以当前版本全文为底替换被编辑行整体入链（user_edit 版本），EOL 尾随换行按 `current_ends_with_nl` 保真；
 - **行内语法高亮**：编辑器页按文件后缀推断语言（与主应用 DIFF_FILE_EXTS 同口径的 LANG_EXTS 表），行文本经 Prism tokenize → encode → Token.stringify 输出已转义 HTML 注入高亮层；未就绪/不支持的语言自动回退纯文本。主应用 messages.js 的 diff-view 高亮此前已存在（V1.1），本轮补齐编辑器侧。
 - **结构化行编辑 + 多行选择**（行级 textarea 架构）：回车=光标处拆行（后续行号即时顺延、高亮重绘、光标落新行首）；行首退格=并入上一可编辑行（空行即删除、行号回收）；行尾 Delete=并入下一行；上下方向键在行边界跨行跳转；多行粘贴自动按行拆分；多行选择=点击定锚点 → Shift+点击扩展（可跨多行、可含红块行，整行蓝色高亮），Ctrl+C 复制 / Ctrl+X 剪切 / Ctrl+A（二次按下扩为全文件）/ 直接输入替换 / Backspace·Delete 删除选区（跨行删除连红块行一并移除=接受该删除）/ Esc 取消；full 视图保存算法改为**按行序拼接所有 ctx/add 行当前值**（结构编辑后保存天然正确）。

@@ -3,9 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
 function pipeline() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/stream_pipeline.js'), 'utf8');
+  // stream_pipeline 已迁移 TS：读 .ts 源码剥离类型后切片（发射产物重排版，切片锚点只在源码侧稳定）
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/stream_pipeline.ts'), 'utf8'));
   const start = source.indexOf('  function createStreamPipeline(');
   const end = source.indexOf('\n  App.createStreamPipeline =', start);
   const functionEnd = source.lastIndexOf('\n  }', end) + 4;

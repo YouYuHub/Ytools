@@ -19,6 +19,15 @@ def test_dns_mixed_public_private_fails_and_allowlist_is_exact_origin(monkeypatc
     assert network.resolve_target("http://127.0.0.1:80", allowed_origins=("http://127.0.0.1",))[3] == "127.0.0.1"
 
 
+def test_benchmarking_range_is_not_mistaken_for_private(monkeypatch):
+    # 透明代理出口常用 198.18.0.0/15：非危险地址，不得误杀公网域名
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args: [(2, 1, 6, "", ("198.18.1.22", 443))])
+    assert network.resolve_target("https://www.python.org/x.png")[3] == "198.18.1.22"
+    # 危险地址仍拦截：ULA、私网映射
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args: [(2, 1, 6, "", (ip, 80)) for ip in ("8.8.8.8", "192.168.1.1")])
+    with pytest.raises(ValueError): network.resolve_target("http://example.com/")
+
+
 def test_connection_uses_validated_address_and_redirect_is_not_followed(monkeypatch):
     connected, closed = [], []
     monkeypatch.setattr(network, "resolve_target", lambda *a, **kw: (__import__('urllib.parse', fromlist=['urlsplit']).urlsplit("http://example.com/path"), "example.com", 80, "8.8.8.8"))

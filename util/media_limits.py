@@ -107,3 +107,87 @@ def learn_media_limit(error, messages, config):
         while len(_cache) > 128:
             _cache.popitem(last=False)
     return True
+
+
+def native_doc_format_error(error):
+    """网关是否拒绝了 dict 形态的 file 部件（原生文档格式不兼容）。
+
+    形如 OpenCode 网关的 ``MMGPT3Item.file Input should be a valid string``
+    校验错误：网关只接受 string 形态的 file，与 OpenAI 官方
+    ``{"type": "file", "file": {"filename", "file_data"}}`` 格式不兼容。
+    必须同时命中格式特征，避免把偶发 400 误判为确定性格式错误。
+    """
+    text = str(error or '')
+    if 'MMGPT3Item' in text and 'Input should be a valid string' in text:
+        return True
+    return ('content.list' in text and 'Input should be a valid string' in text
+            and ("'file'" in text or '"file"' in text))
+
+
+def _file_part_payload(part):
+    if not isinstance(part, dict) or part.get('type') != 'file':
+        return None
+    info = part.get('file')
+    return info if isinstance(info, dict) else None
+
+
+def downgrade_native_doc_to_text(messages):
+    """把 dict 形态 file 部件替换为解析文本部件（返回新列表，原列表不动）。
+
+    无可降级部件返回 None。解析失败/超长时转为明确占位或截断文本，
+    绝不把 data URL 带入文本。调用方（chat_llm 400 分支）拿到非 None 后
+    经 retry_messages 通道重发一次。
+    """
+    import base64
+
+    from config import DEFAULT_FILE_TEXT_MAX_CHARS
+    from factory.file_factory import extract_text_from_bytes
+
+    def needs_downgrade(content):
+        return isinstance(content, list) and any(_file_part_payload(p) is not None for p in content)
+
+    if not any(isinstance(m, dict) and needs_downgrade(m.get('content')) for m in (messages or [])):
+        return None
+    result = copy.deepcopy(messages)
+    for message in result:
+        content = message.get('content') if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for index, part in enumerate(content):
+            info = _file_part_payload(part)
+            if info is None:
+                continue
+            filename = str(info.get('filename') or '文档')
+            text = ''
+            try:
+                data_url = str(info.get('file_data') or '')
+                b64 = data_url.split(',', 1)[1] if ',' in data_url else data_url
+                text = extract_text_from_bytes(filename, base64.b64decode(b64)) or ''
+            except Exception as exc:
+                text = ''
+                parse_error = str(exc)
+            else:
+                parse_error = ''
+            if text.strip():
+                truncated = len(text) > DEFAULT_FILE_TEXT_MAX_CHARS
+                body = text[:DEFAULT_FILE_TEXT_MAX_CHARS] if truncated else text
+                content[index] = {'type': 'text', 'text': (
+                    f'[文档 {filename} 原生格式不受当前网关支持，已自动转为文本'
+                    f'（共 {len(text)} 字符' + ('，已截断' if truncated else '') + '）：]\n' + body)}
+            else:
+                content[index] = {'type': 'text', 'text': (
+                    f'[文档 {filename} 原生格式不受当前网关支持，且文本解析失败'
+                    f'（{parse_error or "无文本内容"}）：请改用 read_document 文本模式分页读取。]')}
+    return result
+
+
+def downgrade_native_doc_on_format_error(error, messages):
+    """网关 file 部件格式错误时返回降级后的 messages（转解析文本），否则 None。
+
+    供 chat_llm 400 分支调用：命中时经 retry_messages 通道重发一次（不计
+    网络重试），与 MEDIA_LIMIT_DOWNGRADE 同模式。降级后请求里不再有 dict
+    形态 file 部件，不会重复触发，无循环风险。
+    """
+    if not native_doc_format_error(error):
+        return None
+    return downgrade_native_doc_to_text(messages)

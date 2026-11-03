@@ -1,3 +1,4 @@
+"use strict";
 /**
  * 内置工具交互（服务端本地执行）
  * - todo_write：任务计划徽标与面板渲染（SSE todo 事件驱动）
@@ -5,513 +6,502 @@
  * 依赖：app/core.js；App.*：messages（问题导航）、chat（发送）模块
  */
 (function (App) {
-  "use strict";
-  const {
-    state, el, toast, $,
-    input, askModal, askQuestions, askSubmit,
-    contextTokenTodoSlot, todoPanelHost,
-    chatInner
-  } = App;
-
-  // ---------- 内置工具（服务端本地执行：todo_write / ask_user / sub_agent 等） ----------
-  // 内置工具并入“配置工具”模态框：作为伪服务 __builtin__ 下的第一组参与勾选，
-  // 保存/加载与 MCP 工具走同一链路（会话独立 _meta.tool_selection / 全局默认 inputs），
-  // 后端按名称识别并注入（与 factory/agent_runtime/builtin_tools.py 对应）
-  const TODO_TOOL_NAME = "todo_write";
-  const ASK_USER_TOOL_NAME = "ask_user";
-  const WRITE_FILE_TOOL_NAME = "write_file";
-  const EDIT_FILE_TOOL_NAME = "edit_file";
-  const READ_FILE_TOOL_NAME = "read_file";
-  const SEARCH_FILES_TOOL_NAME = "search_files";
-  const RUN_COMMAND_TOOL_NAME = "run_command";
-  const READ_MEDIA_TOOL_NAME = "read_media";
-  const READ_DOCUMENT_TOOL_NAME = "read_document";
-  const SUB_AGENT_TOOL_NAME = "sub_agent";
-  const BUILTIN_SERVER_KEY = "__builtin__";
-  const BUILTIN_TOOLS = [
-    {
-      name: TODO_TOOL_NAME,
-      description: "任务计划：模型自我规划多步骤任务并实时更新计划清单，状态栏可查看进度",
-    },
-    {
-      name: ASK_USER_TOOL_NAME,
-      description: "向用户提问：模型遇到关键分歧时弹出提问卡片，你点选选项或输入回答后任务继续",
-    },
-    {
-      name: SUB_AGENT_TOOL_NAME,
-      description: "子智能体：父任务并发派发独立上下文的子任务（各自思考/工具轨迹完整展示在子任务块内，父模型只看最终回复）；受 .env 的 SUB_AGENT_* 限额控制",
-    },
-    {
-      name: WRITE_FILE_TOOL_NAME,
-      description: "写入文件（内置）：整文件覆盖或追加，自动创建目录；相对路径基于会话工作目录",
-    },
-    {
-      name: EDIT_FILE_TOOL_NAME,
-      description: "编辑文件：精确替换，支持单文件批量修改、内容指纹和版本记录",
-    },
-    { name: "apply_patch", description: "上下文补丁：一次新增、修改或删除多个文件；先校验全部修改，再逐文件提交" },
-    {
-      name: READ_FILE_TOOL_NAME,
-      description: "读取文件：带行号、编码和内容指纹；支持分段读取及大文件索引复用",
-    },
-    {
-      name: SEARCH_FILES_TOOL_NAME,
-      description: "文件检索：内容搜索与文件路径枚举，支持相对路径筛选和结果续读；同时启用 list_files",
-    },
-    {
-      name: RUN_COMMAND_TOOL_NAME,
-      description: "终端命令：短等待、增量输出、交互输入与可选 PTY；同时启用查询、输入和停止工具",
-    },
-    {
-      name: READ_MEDIA_TOOL_NAME,
-      description: "读取媒体（内置）：模型读取当前任务消息中的图片/视频（≤5 个）并以视觉形式观察",
-    },
-    {
-      name: READ_DOCUMENT_TOOL_NAME,
-      description: "读取文档（内置）：按字符区间读取解析文本，或按当前模型的 supportDocTypes 发送原生文档；需在此处启用后模型才可调用",
-    },
-  ];
-
-  // 每个内置工具用一枚易辨认的线性图标；同一映射也供工具调用卡片使用。
-  // 另含第一方 sys MCP 工具（fetch_url/web_search）；其余 MCP 工具共用扳手默认图标。
-  const TOOL_ICON_PATHS = {
-    todo_write: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3 6 1.4 1.4L7 4.8M3 12h3M3 18h3"/>',
-    ask_user: '<path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-5a7.5 7.5 0 1 1 17-4.5Z"/><path d="M10 9a2 2 0 1 1 3.4 1.4c-.9.8-1.4 1.1-1.4 2.1M12 15.5h.01"/>',
-    sub_agent: '<circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M12 7.5v4M12 11.5 5 15.5M12 11.5l7 4"/>',
-    write_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-7"/><path d="M13 3v5h5M8 12h5M8 16h3M19 3v6M16 6h6"/>',
-    edit_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h7"/><path d="M13 3v5h5M8 12h3M8 16h2"/><path d="m15 17 5.8-5.8a1.6 1.6 0 0 1 2.2 2.2L17.2 21H14v-3.2Z"/>',
-    apply_patch: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M13 3v5h5"/><path d="M9 11v4M7 13h4M7 18h4"/>',
-    read_file: '<path d="M12 7c-1.5-2.1-3.5-3-6-3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h1c2.5 0 4.5.7 6 2M12 7c1.5-2.1 3.5-3 6-3h1a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-1c-2.5 0-4.5.7-6 2M12 7v15"/><path d="M6 9h2M16 9h2"/>',
-    search_files: '<path d="M4 4h11l4 4v3M15 4v4h4M4 4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M6 11h7M6 15h4"/><circle cx="17" cy="17" r="3.5"/><path d="m19.6 19.6 2 2"/>',
-    list_files: '<path d="M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M7 13.5h10M7 16.5h7"/>',
-    run_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
-    poll_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
-    stop_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
-    write_stdin: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
-    read_media: '<rect x="7" y="3" width="14" height="15" rx="2" transform="rotate(8 14 10.5)"/><rect x="3" y="6" width="14" height="15" rx="2"/><circle cx="7.5" cy="10.5" r="1.3"/><path d="m4 18 4-4 3 3 2-2 3 3"/>',
-    read_document: '<path d="M6 3.5h8l4 4v12A1.5 1.5 0 0 1 16.5 21h-11A1.5 1.5 0 0 1 4 19.5v-14A2 2 0 0 1 6 3.5Z"/><path d="M14 3.5V8h4M8 11h8M8 14.5h8M8 18h5"/>',
-    fetch_url: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c-5.2 5-5.2 12 0 17M12 3.5c5.2 5 5.2 12 0 17"/>',
-    web_search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
-  };
-  const TOOL_DISPLAY_NAMES = {
-    todo_write: "改写计划",
-    ask_user: "询问用户",
-    sub_agent: "委派子智能体",
-    write_file: "写入文件",
-    edit_file: "编辑文件",
-    apply_patch: "应用补丁",
-    read_file: "读取文件",
-    search_files: "搜索内容",
-    list_files: "列出文件",
-    run_command: "运行命令",
-    poll_command: "查询命令",
-    stop_command: "停止命令",
-    write_stdin: "发送终端输入",
-    read_media: "读取媒体",
-    read_document: "读取文档",
-  };
-  const DEFAULT_TOOL_ICON_PATH = '<path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/>';
-
-  // 提问小鱿鱼（举手托问号）：与项目 favicon 同一配色（粉身 #ee80b1 / 蓝 #3e77c2），
-  // 用于提问弹窗标题与流内提问卡片标题；配置工具列表的 ask_user 行图标另见 TOOL_ICON_PATHS（线性版）。
-  const ASK_SQUID_SVG = '<img class="ask-title-icon" src="ask-squid.svg?v=1" alt="">';
-
-  function toolIconSvg(name, className) {
-    const paths = Object.prototype.hasOwnProperty.call(TOOL_ICON_PATHS, name)
-      ? TOOL_ICON_PATHS[name]
-      : DEFAULT_TOOL_ICON_PATH;
-    const classAttribute = className || "icon tool-icon";
-    return '<svg class="' + classAttribute + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + "</svg>";
-  }
-
-  function toolDisplayName(name) {
-    return Object.prototype.hasOwnProperty.call(TOOL_DISPLAY_NAMES, name)
-      ? TOOL_DISPLAY_NAMES[name]
-      : "";
-  }
-
-  function isBuiltinToolName(name) {
-    return name === READ_DOCUMENT_TOOL_NAME || name === "list_files" ||
-      BUILTIN_TOOLS.some(function (tool) { return tool.name === name; });
-  }
-
-  function renderTodoWidget() {
-    if (!contextTokenTodoSlot || !todoPanelHost) return;
-    const todos = Array.isArray(state.todoTodos) ? state.todoTodos : [];
-    // 按钮：放在状态栏左侧预留槽
-    contextTokenTodoSlot.innerHTML = "";
-    // 面板：独立容器参与 composer-wrap 垂直布局（占位、不遮挡输入框），
-    // 位于状态栏与输入框之间；最多完整显示 6 条，超出部分面板内滚动
-    if (!todos.length) {
-      todoPanelHost.innerHTML = "";
-      todoPanelHost.classList.add("hidden");
-      return;
+    "use strict";
+    const { state, el, toast, $, input, askModal, askQuestions, askSubmit, contextTokenTodoSlot, todoPanelHost, chatInner } = App;
+    // ---------- 内置工具（服务端本地执行：todo_write / ask_user / sub_agent 等） ----------
+    // 内置工具并入“配置工具”模态框：作为伪服务 __builtin__ 下的第一组参与勾选，
+    // 保存/加载与 MCP 工具走同一链路（会话独立 _meta.tool_selection / 全局默认 inputs），
+    // 后端按名称识别并注入（与 factory/agent_runtime/builtin_tools.py 对应）
+    const TODO_TOOL_NAME = "todo_write";
+    const ASK_USER_TOOL_NAME = "ask_user";
+    const WRITE_FILE_TOOL_NAME = "write_file";
+    const EDIT_FILE_TOOL_NAME = "edit_file";
+    const READ_FILE_TOOL_NAME = "read_file";
+    const SEARCH_FILES_TOOL_NAME = "search_files";
+    const RUN_COMMAND_TOOL_NAME = "run_command";
+    const READ_MEDIA_TOOL_NAME = "read_media";
+    const READ_DOCUMENT_TOOL_NAME = "read_document";
+    const SUB_AGENT_TOOL_NAME = "sub_agent";
+    const BUILTIN_SERVER_KEY = "__builtin__";
+    const BUILTIN_TOOLS = [
+        {
+            name: TODO_TOOL_NAME,
+            description: "任务计划：模型自我规划多步骤任务并实时更新计划清单，状态栏可查看进度",
+        },
+        {
+            name: ASK_USER_TOOL_NAME,
+            description: "向用户提问：模型遇到关键分歧时弹出提问卡片，你点选选项或输入回答后任务继续",
+        },
+        {
+            name: SUB_AGENT_TOOL_NAME,
+            description: "子智能体：父任务并发派发独立上下文的子任务（各自思考/工具轨迹完整展示在子任务块内，父模型只看最终回复）；受 .env 的 SUB_AGENT_* 限额控制",
+        },
+        {
+            name: WRITE_FILE_TOOL_NAME,
+            description: "写入文件（内置）：整文件覆盖或追加，自动创建目录；相对路径基于会话工作目录",
+        },
+        {
+            name: EDIT_FILE_TOOL_NAME,
+            description: "编辑文件：精确替换，支持单文件批量修改、内容指纹和版本记录",
+        },
+        { name: "apply_patch", description: "上下文补丁：一次新增、修改或删除多个文件；先校验全部修改，再逐文件提交" },
+        {
+            name: READ_FILE_TOOL_NAME,
+            description: "读取文件：带行号、编码和内容指纹；支持分段读取及大文件索引复用",
+        },
+        {
+            name: SEARCH_FILES_TOOL_NAME,
+            description: "文件检索：内容搜索与文件路径枚举，支持相对路径筛选和结果续读；同时启用 list_files",
+        },
+        {
+            name: RUN_COMMAND_TOOL_NAME,
+            description: "终端命令：短等待、增量输出、交互输入与可选 PTY；同时启用查询、输入和停止工具",
+        },
+        {
+            name: READ_MEDIA_TOOL_NAME,
+            description: "读取媒体（内置）：模型读取当前任务消息中的图片/视频（≤5 个）并以视觉形式观察",
+        },
+        {
+            name: READ_DOCUMENT_TOOL_NAME,
+            description: "读取文档（内置）：按字符区间读取解析文本，或按当前模型的 supportDocTypes 发送原生文档；需在此处启用后模型才可调用",
+        },
+    ];
+    // 每个内置工具用一枚易辨认的线性图标；同一映射也供工具调用卡片使用。
+    // 另含第一方 sys MCP 工具（fetch_url/web_search）；其余 MCP 工具共用扳手默认图标。
+    const TOOL_ICON_PATHS = {
+        todo_write: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3 6 1.4 1.4L7 4.8M3 12h3M3 18h3"/>',
+        ask_user: '<path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-5a7.5 7.5 0 1 1 17-4.5Z"/><path d="M10 9a2 2 0 1 1 3.4 1.4c-.9.8-1.4 1.1-1.4 2.1M12 15.5h.01"/>',
+        sub_agent: '<circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M12 7.5v4M12 11.5 5 15.5M12 11.5l7 4"/>',
+        write_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-7"/><path d="M13 3v5h5M8 12h5M8 16h3M19 3v6M16 6h6"/>',
+        edit_file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h7"/><path d="M13 3v5h5M8 12h3M8 16h2"/><path d="m15 17 5.8-5.8a1.6 1.6 0 0 1 2.2 2.2L17.2 21H14v-3.2Z"/>',
+        apply_patch: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M13 3v5h5"/><path d="M9 11v4M7 13h4M7 18h4"/>',
+        read_file: '<path d="M12 7c-1.5-2.1-3.5-3-6-3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h1c2.5 0 4.5.7 6 2M12 7c1.5-2.1 3.5-3 6-3h1a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-1c-2.5 0-4.5.7-6 2M12 7v15"/><path d="M6 9h2M16 9h2"/>',
+        search_files: '<path d="M4 4h11l4 4v3M15 4v4h4M4 4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M6 11h7M6 15h4"/><circle cx="17" cy="17" r="3.5"/><path d="m19.6 19.6 2 2"/>',
+        list_files: '<path d="M3 7h6l2 2h10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M7 13.5h10M7 16.5h7"/>',
+        run_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+        poll_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+        stop_command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+        write_stdin: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+        read_media: '<rect x="7" y="3" width="14" height="15" rx="2" transform="rotate(8 14 10.5)"/><rect x="3" y="6" width="14" height="15" rx="2"/><circle cx="7.5" cy="10.5" r="1.3"/><path d="m4 18 4-4 3 3 2-2 3 3"/>',
+        read_document: '<path d="M6 3.5h8l4 4v12A1.5 1.5 0 0 1 16.5 21h-11A1.5 1.5 0 0 1 4 19.5v-14A2 2 0 0 1 6 3.5Z"/><path d="M14 3.5V8h4M8 11h8M8 14.5h8M8 18h5"/>',
+        fetch_url: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c-5.2 5-5.2 12 0 17M12 3.5c5.2 5 5.2 12 0 17"/>',
+        web_search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
+    };
+    const TOOL_DISPLAY_NAMES = {
+        todo_write: "改写计划",
+        ask_user: "询问用户",
+        sub_agent: "委派子智能体",
+        write_file: "写入文件",
+        edit_file: "编辑文件",
+        apply_patch: "应用补丁",
+        read_file: "读取文件",
+        search_files: "搜索内容",
+        list_files: "列出文件",
+        run_command: "运行命令",
+        poll_command: "查询命令",
+        stop_command: "停止命令",
+        write_stdin: "发送终端输入",
+        read_media: "读取媒体",
+        read_document: "读取文档",
+    };
+    const DEFAULT_TOOL_ICON_PATH = '<path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/>';
+    // 提问小鱿鱼（举手托问号）：与项目 favicon 同一配色（粉身 #ee80b1 / 蓝 #3e77c2），
+    // 用于提问弹窗标题与流内提问卡片标题；配置工具列表的 ask_user 行图标另见 TOOL_ICON_PATHS（线性版）。
+    const ASK_SQUID_SVG = '<img class="ask-title-icon" src="ask-squid.svg?v=1" alt="">';
+    function toolIconSvg(name, className) {
+        const paths = Object.prototype.hasOwnProperty.call(TOOL_ICON_PATHS, name)
+            ? TOOL_ICON_PATHS[name]
+            : DEFAULT_TOOL_ICON_PATH;
+        const classAttribute = className || "icon tool-icon";
+        return '<svg class="' + classAttribute + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + "</svg>";
     }
-    const done = todos.filter(function (item) { return item.status === "done"; }).length;
-    const toggle = el("button", "todo-toggle" + (state.todoPanelOpen ? " open" : ""));
-    toggle.appendChild(el("span", "todo-icon", "📋"));
-    toggle.appendChild(el("span", "todo-label", "计划"));
-    toggle.appendChild(el("span", "todo-progress", done + "/" + todos.length));
-    toggle.setAttribute("aria-label", "任务计划 " + done + "/" + todos.length + "，点击展开或收起");
-    // el() 走 textContent（安全文本），SVG 需按 HTML 插入才会渲染
-    toggle.insertAdjacentHTML("beforeend",
-      '<svg class="icon todo-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>');
-    toggle.title = "任务计划（模型自我规划），点击展开/收起";
-    toggle.addEventListener("click", function () {
-      state.todoPanelOpen = !state.todoPanelOpen;
-      renderTodoWidget();
-    });
-    contextTokenTodoSlot.appendChild(toggle);
-    todoPanelHost.innerHTML = "";
-    if (state.todoPanelOpen) {
-      todos.forEach(function (item) {
-        const row = el("div", "todo-row todo-" + (item.status || "pending"));
-        const icon = item.status === "done" ? "✓" : (item.status === "in_progress" ? "▶" : "○");
-        row.appendChild(el("span", "todo-row-icon", icon));
-        row.appendChild(el("span", "todo-row-text", item.content || ""));
-        todoPanelHost.appendChild(row);
-      });
-      todoPanelHost.classList.remove("hidden");
-    } else {
-      todoPanelHost.classList.add("hidden");
+    function toolDisplayName(name) {
+        return Object.prototype.hasOwnProperty.call(TOOL_DISPLAY_NAMES, name)
+            ? TOOL_DISPLAY_NAMES[name]
+            : "";
     }
-  }
-
-  function applySessionTodo(todos) {
-    state.todoTodos = Array.isArray(todos) ? todos : [];
-    renderTodoWidget();
-  }
-
-  // ---------- 模型提问交互（ask_user：问题卡片 + 回答作为下一条消息） ----------
-
-  // 提问卡片一律可点击回答：即使提问之后已有回答轮次甚至后续普通对话，
-  // 也可以重新回答——提交时按卡片所处位置弹出处理方式确认（更新该回答轮 /
-  // 插入回答 / 删除之后所有 / 取消），由用户决定如何安置新回答
-  function refreshAskBlockStates() {
-    document.querySelectorAll("#chatInner .ask-block").forEach(function (block) {
-      const hint = block.querySelector(".ask-block-hint");
-      if (hint) {
-        hint.textContent = "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式";
-      }
-    });
-  }
-
-  // 聊天流内静态卡片：仅展示问题与选项，交互在弹窗中完成；
-  // 点击卡片可重新打开回答窗口（流式进行中在提交时拦截）
-  function buildAskBlock(questions) {
-    const wrap = el("div", "ask-block ask-block-clickable");
-    const title = el("div", "ask-block-title");
-    title.innerHTML = ASK_SQUID_SVG + "<span>模型向你提问（回答后任务继续）</span>";
-    wrap.appendChild(title);
-    (Array.isArray(questions) ? questions : []).forEach(function (q, index) {
-      let text = (index + 1) + ". " + (q.question || "");
-      if (Array.isArray(q.options) && q.options.length) {
-        text += "（选项：" + q.options.join(" / ") + "）";
-      }
-      wrap.appendChild(el("div", "ask-block-question", text));
-    });
-    wrap.appendChild(el("div", "ask-block-hint", "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式"));
-    if (Array.isArray(questions) && questions.length) {
-      wrap.addEventListener("click", function () {
-        openAskModal(questions, wrap);
-      });
+    function isBuiltinToolName(name) {
+        return name === READ_DOCUMENT_TOOL_NAME || name === "list_files" ||
+            BUILTIN_TOOLS.some(function (tool) { return tool.name === name; });
     }
-    return wrap;
-  }
-
-  // 从 ask_user 工具入参中解析问题列表（历史回放用）；非法返回 null
-  function parseAskQuestionsFromArgs(args) {
-    try {
-      const data = typeof args === "string" ? JSON.parse(args) : args;
-      const questions = data && Array.isArray(data.questions) ? data.questions : null;
-      if (!questions || !questions.length) return null;
-      const valid = questions.every(function (q) {
-        return q && typeof q.question === "string" && q.question.trim();
-      });
-      return valid ? questions : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function renderAskModal(questions) {
-    askQuestions.innerHTML = "";
-    (Array.isArray(questions) ? questions : []).forEach(function (q, index) {
-      const item = el("div", "ask-question");
-      const multi = !!q.multiple;
-      item.appendChild((function () {
-        const row = el("div", "ask-question-text", (index + 1) + ". " + (q.question || ""));
-        if (multi) row.appendChild(el("span", "ask-multi-tag", "可多选"));
-        return row;
-      })());
-      const optionsWrap = el("div", "ask-options");
-      const custom = document.createElement("textarea");
-      custom.rows = 3;
-      custom.className = "ask-custom";
-      custom.placeholder = "或输入自定义回答…";
-      custom.setAttribute("aria-label", "第 " + (index + 1) + " 题自定义回答");
-      const clearSelected = function () {
-        optionsWrap.querySelectorAll(".ask-option.selected").forEach(function (other) {
-          other.classList.remove("selected");
+    function renderTodoWidget() {
+        if (!contextTokenTodoSlot || !todoPanelHost)
+            return;
+        const todos = Array.isArray(state.todoTodos) ? state.todoTodos : [];
+        // 按钮：放在状态栏左侧预留槽
+        contextTokenTodoSlot.innerHTML = "";
+        // 面板：独立容器参与 composer-wrap 垂直布局（占位、不遮挡输入框），
+        // 位于状态栏与输入框之间；最多完整显示 6 条，超出部分面板内滚动
+        if (!todos.length) {
+            todoPanelHost.innerHTML = "";
+            todoPanelHost.classList.add("hidden");
+            return;
+        }
+        const done = todos.filter(function (item) { return item.status === "done"; }).length;
+        const toggle = el("button", "todo-toggle" + (state.todoPanelOpen ? " open" : ""));
+        toggle.appendChild(el("span", "todo-icon", "📋"));
+        toggle.appendChild(el("span", "todo-label", "计划"));
+        toggle.appendChild(el("span", "todo-progress", done + "/" + todos.length));
+        toggle.setAttribute("aria-label", "任务计划 " + done + "/" + todos.length + "，点击展开或收起");
+        // el() 走 textContent（安全文本），SVG 需按 HTML 插入才会渲染
+        toggle.insertAdjacentHTML("beforeend", '<svg class="icon todo-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>');
+        toggle.title = "任务计划（模型自我规划），点击展开/收起";
+        toggle.addEventListener("click", function () {
+            state.todoPanelOpen = !state.todoPanelOpen;
+            renderTodoWidget();
         });
-      };
-      (Array.isArray(q.options) ? q.options : []).forEach(function (option) {
-        const chip = el("button", "ask-option", option);
-        chip.type = "button";
-        chip.addEventListener("click", function () {
-          if (multi) {
-            chip.classList.toggle("selected");
-          } else {
-            const wasSelected = chip.classList.contains("selected");
-            clearSelected();
-            if (!wasSelected) chip.classList.add("selected");
-          }
-          // 有点选时清空自定义输入，保证每题答案来源唯一
-          if (optionsWrap.querySelector(".ask-option.selected")) custom.value = "";
-          updateAskSubmitState();
+        contextTokenTodoSlot.appendChild(toggle);
+        todoPanelHost.innerHTML = "";
+        if (state.todoPanelOpen) {
+            todos.forEach(function (item) {
+                const row = el("div", "todo-row todo-" + (item.status || "pending"));
+                const icon = item.status === "done" ? "✓" : (item.status === "in_progress" ? "▶" : "○");
+                row.appendChild(el("span", "todo-row-icon", icon));
+                row.appendChild(el("span", "todo-row-text", item.content || ""));
+                todoPanelHost.appendChild(row);
+            });
+            todoPanelHost.classList.remove("hidden");
+        }
+        else {
+            todoPanelHost.classList.add("hidden");
+        }
+    }
+    function applySessionTodo(todos) {
+        state.todoTodos = Array.isArray(todos) ? todos : [];
+        renderTodoWidget();
+    }
+    // ---------- 模型提问交互（ask_user：问题卡片 + 回答作为下一条消息） ----------
+    // 提问卡片一律可点击回答：即使提问之后已有回答轮次甚至后续普通对话，
+    // 也可以重新回答——提交时按卡片所处位置弹出处理方式确认（更新该回答轮 /
+    // 插入回答 / 删除之后所有 / 取消），由用户决定如何安置新回答
+    function refreshAskBlockStates() {
+        document.querySelectorAll("#chatInner .ask-block").forEach(function (block) {
+            const hint = block.querySelector(".ask-block-hint");
+            if (hint) {
+                hint.textContent = "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式";
+            }
         });
-        optionsWrap.appendChild(chip);
-      });
-      // 自定义输入优先：输入内容时取消点选，保证每题答案来源唯一
-      custom.addEventListener("input", function () {
-        if (custom.value.trim()) clearSelected();
+    }
+    // 聊天流内静态卡片：仅展示问题与选项，交互在弹窗中完成；
+    // 点击卡片可重新打开回答窗口（流式进行中在提交时拦截）
+    function buildAskBlock(questions) {
+        const wrap = el("div", "ask-block ask-block-clickable");
+        const title = el("div", "ask-block-title");
+        title.innerHTML = ASK_SQUID_SVG + "<span>模型向你提问（回答后任务继续）</span>";
+        wrap.appendChild(title);
+        (Array.isArray(questions) ? questions : []).forEach(function (q, index) {
+            let text = (index + 1) + ". " + (q.question || "");
+            if (Array.isArray(q.options) && q.options.length) {
+                text += "（选项：" + q.options.join(" / ") + "）";
+            }
+            wrap.appendChild(el("div", "ask-block-question", text));
+        });
+        wrap.appendChild(el("div", "ask-block-hint", "点击本卡片可（重新）回答；已有后续对话时会先确认处理方式"));
+        if (Array.isArray(questions) && questions.length) {
+            wrap.addEventListener("click", function () {
+                openAskModal(questions, wrap);
+            });
+        }
+        return wrap;
+    }
+    // 从 ask_user 工具入参中解析问题列表（历史回放用）；非法返回 null
+    function parseAskQuestionsFromArgs(args) {
+        try {
+            const data = typeof args === "string" ? JSON.parse(args) : args;
+            const questions = data && Array.isArray(data.questions) ? data.questions : null;
+            if (!questions || !questions.length)
+                return null;
+            const valid = questions.every(function (q) {
+                return q && typeof q.question === "string" && q.question.trim();
+            });
+            return valid ? questions : null;
+        }
+        catch (_) {
+            return null;
+        }
+    }
+    function renderAskModal(questions) {
+        askQuestions.innerHTML = "";
+        (Array.isArray(questions) ? questions : []).forEach(function (q, index) {
+            const item = el("div", "ask-question");
+            const multi = !!q.multiple;
+            item.appendChild((function () {
+                const row = el("div", "ask-question-text", (index + 1) + ". " + (q.question || ""));
+                if (multi)
+                    row.appendChild(el("span", "ask-multi-tag", "可多选"));
+                return row;
+            })());
+            const optionsWrap = el("div", "ask-options");
+            const custom = document.createElement("textarea");
+            custom.rows = 3;
+            custom.className = "ask-custom";
+            custom.placeholder = "或输入自定义回答…";
+            custom.setAttribute("aria-label", "第 " + (index + 1) + " 题自定义回答");
+            const clearSelected = function () {
+                optionsWrap.querySelectorAll(".ask-option.selected").forEach(function (other) {
+                    other.classList.remove("selected");
+                });
+            };
+            (Array.isArray(q.options) ? q.options : []).forEach(function (option) {
+                const chip = el("button", "ask-option", option);
+                chip.type = "button";
+                chip.addEventListener("click", function () {
+                    if (multi) {
+                        chip.classList.toggle("selected");
+                    }
+                    else {
+                        const wasSelected = chip.classList.contains("selected");
+                        clearSelected();
+                        if (!wasSelected)
+                            chip.classList.add("selected");
+                    }
+                    // 有点选时清空自定义输入，保证每题答案来源唯一
+                    if (optionsWrap.querySelector(".ask-option.selected"))
+                        custom.value = "";
+                    updateAskSubmitState();
+                });
+                optionsWrap.appendChild(chip);
+            });
+            // 自定义输入优先：输入内容时取消点选，保证每题答案来源唯一
+            custom.addEventListener("input", function () {
+                if (custom.value.trim())
+                    clearSelected();
+                updateAskSubmitState();
+            });
+            if (optionsWrap.childElementCount)
+                item.appendChild(optionsWrap);
+            item.appendChild(custom);
+            askQuestions.appendChild(item);
+        });
         updateAskSubmitState();
-      });
-      if (optionsWrap.childElementCount) item.appendChild(optionsWrap);
-      item.appendChild(custom);
-      askQuestions.appendChild(item);
-    });
-    updateAskSubmitState();
-  }
-
-  // 每题都有答案（点选或自定义输入）才允许提交
-  function updateAskSubmitState() {
-    if (!askSubmit) return;
-    const items = askQuestions.querySelectorAll(".ask-question");
-    let complete = items.length > 0;
-    items.forEach(function (item) {
-      const hasSelection = !!item.querySelector(".ask-option.selected");
-      const custom = item.querySelector(".ask-custom");
-      const hasCustom = !!(custom && custom.value.trim());
-      if (!hasSelection && !hasCustom) complete = false;
-    });
-    askSubmit.disabled = !complete;
-  }
-
-  function openAskModal(questions, sourceBlock) {
-    state.pendingAskQuestions = Array.isArray(questions) ? questions : [];
-    state.pendingAskBlock = sourceBlock || null;
-    renderAskModal(state.pendingAskQuestions);
-    askModal.classList.remove("hidden");
-    askModal.setAttribute("aria-hidden", "false");
-  }
-
-  function closeAskModal() {
-    askModal.classList.add("hidden");
-    askModal.setAttribute("aria-hidden", "true");
-    state.pendingAskQuestions = null;
-    state.pendingAskBlock = null;
-  }
-
-  // 覆盖式重答：移除提问卡片之后的所有轮次节点（旧回答气泡与模型回复），
-  // 与后端 truncate_rounds_for_reanswer 的 JSONL 截断保持一一对应
-  function clearNodesAfterAskBlock(block) {
-    if (!block || !block.isConnected) return;
-    const chat = block.closest("#chatInner");
-    if (!chat) return;
-    let anchor = block;
-    while (anchor.parentElement && anchor.parentElement !== chat) {
-      anchor = anchor.parentElement;
     }
-    if (anchor.parentElement !== chat) return;
-    let node = anchor.nextElementSibling;
-    while (node) {
-      const next = node.nextElementSibling;
-      node.remove();
-      node = next;
-    }
-    App.rebuildQnav();
-  }
-
-  function handleAskSubmit() {
-    const questions = state.pendingAskQuestions;
-    if (!Array.isArray(questions) || !questions.length) {
-      closeAskModal();
-      return;
-    }
-    // 有未作答的题目时禁止提交（按钮同时处于禁用态，此处为兜底）
-    if (askSubmit && askSubmit.disabled) return;
-    // 会话仍在输出时不允许提交：覆盖式回答需要确定的历史边界，
-    // 等当前流结束后重新点击提问卡片提交即可
-    if (state.streaming && state.streamingSession === state.sessionId) {
-      toast("当前会话仍在输出，请稍后再提交回答");
-      return;
-    }
-    const items = askQuestions.querySelectorAll(".ask-question");
-    const lines = ["【回答模型提问】"];
-    questions.forEach(function (q, index) {
-      let answer = "";
-      const item = items[index];
-      if (item) {
-        const custom = item.querySelector(".ask-custom");
-        if (custom && custom.value.trim()) {
-          answer = custom.value.trim();
-        } else {
-          // 多选题用顿号拼接所有选中项
-          answer = Array.from(item.querySelectorAll(".ask-option.selected"))
-            .map(function (chip) { return chip.textContent; })
-            .join("、");
-        }
-      }
-      lines.push((index + 1) + ". " + (q.question || ""));
-      lines.push("   答：" + (answer || "（未回答）"));
-    });
-    const text = lines.join("\n");
-    const sourceBlock = state.pendingAskBlock;
-    closeAskModal();
-    submitAskAnswer(text, sourceBlock);
-  }
-  askSubmit.addEventListener("click", handleAskSubmit);
-  $("#askModalClose").addEventListener("click", closeAskModal);
-  $("#askModalBackdrop").addEventListener("click", closeAskModal);
-
-  // 回答提交编排（ask_user 卡片）：按提问卡片所处对话位置自动分流——
-  // - 提问是最新轮次（其后无任何轮次）：回答按普通新轮追加，无需历史插入；
-  // - 提问之后已有回答轮：三选确认——「更新该回答轮」（替换旧回答轮，即
-  //   编辑重发 regen 语义）/「删除提问之后所有」/「取消（不发起任务）」；
-  // - 提问之后只有普通对话轮（用户曾跳过该提问开启新任务）：三选确认——
-  //   「插入回答（后续轮次整体后推）」/「删除提问之后所有」/「取消」。
-  //   模式信息从卡片所在轮次的 data-round 推导（历史/实时流均有标注）；
-  // 找不到轮号（旧数据/异常结构）降级为普通发送
-  function submitAskAnswer(text, sourceBlock) {
-    // 定位提问卡片所在轮次号：卡片 → 所在轮次 DOM 锚点 → data-round
-    function findAskRound() {
-      if (!sourceBlock || !sourceBlock.isConnected) return null;
-      let node = sourceBlock;
-      while (node && node !== chatInner) {
-        if (node.getAttribute && node.getAttribute("data-round")) {
-          return parseInt(node.getAttribute("data-round"), 10) || null;
-        }
-        node = node.parentElement;
-      }
-      return null;
-    }
-    const askRound = findAskRound();
-    if (!askRound) {
-      // 降级：拿不到轮号走旧行为（覆盖式清理 + 普通发送）
-      clearNodesAfterAskBlock(sourceBlock);
-      input.value = text;
-      App.send();
-      return;
-    }
-    // 提问轮之后是否已有回答轮 / 是否存在任何后续轮次
-    let hasExistingAnswer = false;
-    let hasLaterRounds = false;
-    for (const node of chatInner.children) {
-      const r = node.getAttribute ? parseInt(node.getAttribute("data-round"), 10) : NaN;
-      if (Number.isFinite(r) && r > askRound) {
-        hasLaterRounds = true;
-        const bubble = node.querySelector(".msg-user .msg-bubble");
-        if (bubble && bubble.textContent.indexOf("【回答模型提问】") === 0) {
-          hasExistingAnswer = true;
-        }
-        break;
-      }
-    }
-    // 搜索只挂载命中附近的消息；后续提问可能尚未进入 DOM。
-    const later = App.historyQuestionAfterRound && App.historyQuestionAfterRound(askRound);
-    if (later) {
-      hasLaterRounds = true;
-      hasExistingAnswer = later.text.indexOf("【回答模型提问】") === 0;
-    }
-    if (!hasLaterRounds) {
-      // 自动弹窗的正常续答走普通发送，统一接收 round_started 并跟随实时输出。
-      // 只有中间插入才需要 insert_round，末尾续答不应进入历史编辑分支。
-      App.send({ text: text });
-      return;
-    }
-    // 后面已有对话（回答轮或普通对话）：三选确认后再发送
-    showAskAnswerConfirm(text, askRound, hasExistingAnswer);
-  }
-
-  // 三选确认弹层（独立轻量模态，复用 tool-modal 遮罩风格）
-  function showAskAnswerConfirm(text, askRound, hasExistingAnswer) {
-    const backdrop = el("div", "tool-modal-backdrop ask-answer-backdrop");
-    const dialog = el("div", "ask-answer-confirm");
-    // hasExistingAnswer=true → 主操作「更新该回答轮」（regen 替换旧回答轮）；
-    // false（提问后只有普通对话）→ 主操作「插入回答」（insert_round，后续轮次后推）
-    dialog.appendChild(el("div", "ask-answer-title",
-      hasExistingAnswer ? "该提问已有一个回答，请选择处理方式" : "该提问之后已有其他对话，请选择回答方式"));
-    const desc = el("div", "ask-answer-desc",
-      hasExistingAnswer
-        ? "「更新该回答轮」会重新生成该轮回答（后续对话保留，编号顺延）；" +
-          "「删除提问之后所有」会移除该回答及之后的所有轮次（含上传附件，不可恢复）；" +
-          "「取消」放弃本次回答，不发起任务。"
-        : "「插入回答」会把回答作为新轮插到该提问之后（后续对话整体后推，保留）；" +
-          "「删除提问之后所有」会移除该提问之后的所有轮次（含上传附件，不可恢复）；" +
-          "「取消」放弃本次回答，不发起任务。");
-    dialog.appendChild(desc);
-    const actions = el("div", "ask-answer-actions");
-    const cancelBtn = el("button", "ask-answer-cancel", "取消");
-    const updateBtn = el("button", "ask-answer-update", hasExistingAnswer ? "更新该回答轮" : "插入回答");
-    const truncateBtn = el("button", "ask-answer-truncate", "删除之后所有");
-    cancelBtn.type = "button";
-    updateBtn.type = "button";
-    truncateBtn.type = "button";
-    cancelBtn.addEventListener("click", function () {
-      backdrop.remove();
-    });
-    updateBtn.addEventListener("click", function () {
-      backdrop.remove();
-      if (hasExistingAnswer) {
-        // 更新该回答轮 = 编辑重发语义：替换旧回答轮（原位重跑）
-        App.confirmEditResend({
-          msg: null,
-          round: askRound + 1,
-          text: text,
-          media: [],
-          mode: "regen",
+    // 每题都有答案（点选或自定义输入）才允许提交
+    function updateAskSubmitState() {
+        if (!askSubmit)
+            return;
+        const items = askQuestions.querySelectorAll(".ask-question");
+        let complete = items.length > 0;
+        items.forEach(function (item) {
+            const hasSelection = !!item.querySelector(".ask-option.selected");
+            const custom = item.querySelector(".ask-custom");
+            const hasCustom = !!(custom && custom.value.trim());
+            if (!hasSelection && !hasCustom)
+                complete = false;
         });
-      } else {
-        // 插入回答 = 插入语义：新回答轮插入提问轮之后，后续轮次整体后推
-        App.send({ text: text, insertAfterRound: askRound });
-      }
-    });
-    truncateBtn.addEventListener("click", function () {
-      backdrop.remove();
-      // 删除之后所有 = truncate 预演确认后发送（破坏面大，走既有 dry_run 明细）
-      App.confirmEditResend({
-        msg: null,
-        round: askRound + 1,
-        text: text,
-        media: [],
-        mode: "truncate",
-      });
-    });
-    actions.appendChild(cancelBtn);
-    actions.appendChild(updateBtn);
-    actions.appendChild(truncateBtn);
-    dialog.appendChild(actions);
-    backdrop.appendChild(dialog);
-    document.body.appendChild(backdrop);
-  }
-
-
-  // ---------- 导出（供其它模块经 App.* 调用） ----------
-  App.TODO_TOOL_NAME = TODO_TOOL_NAME;
-  App.ASK_USER_TOOL_NAME = ASK_USER_TOOL_NAME;
-  App.SUB_AGENT_TOOL_NAME = SUB_AGENT_TOOL_NAME;
-  App.RUN_COMMAND_TOOL_NAME = RUN_COMMAND_TOOL_NAME;
-  App.BUILTIN_SERVER_KEY = BUILTIN_SERVER_KEY;
-  App.BUILTIN_TOOLS = BUILTIN_TOOLS;
-  App.isBuiltinToolName = isBuiltinToolName;
-  App.toolIconSvg = toolIconSvg;
-  App.toolDisplayName = toolDisplayName;
-  App.renderTodoWidget = renderTodoWidget;
-  App.applySessionTodo = applySessionTodo;
-  App.buildAskBlock = buildAskBlock;
-  App.parseAskQuestionsFromArgs = parseAskQuestionsFromArgs;
-  App.refreshAskBlockStates = refreshAskBlockStates;
-  App.openAskModal = openAskModal;
-  App.closeAskModal = closeAskModal;
+        askSubmit.disabled = !complete;
+    }
+    function openAskModal(questions, sourceBlock) {
+        state.pendingAskQuestions = Array.isArray(questions) ? questions : [];
+        state.pendingAskBlock = sourceBlock || null;
+        renderAskModal(state.pendingAskQuestions);
+        askModal.classList.remove("hidden");
+        askModal.setAttribute("aria-hidden", "false");
+    }
+    function closeAskModal() {
+        askModal.classList.add("hidden");
+        askModal.setAttribute("aria-hidden", "true");
+        state.pendingAskQuestions = null;
+        state.pendingAskBlock = null;
+    }
+    // 覆盖式重答：移除提问卡片之后的所有轮次节点（旧回答气泡与模型回复），
+    // 与后端 truncate_rounds_for_reanswer 的 JSONL 截断保持一一对应
+    function clearNodesAfterAskBlock(block) {
+        if (!block || !block.isConnected)
+            return;
+        const chat = block.closest("#chatInner");
+        if (!chat)
+            return;
+        let anchor = block;
+        while (anchor.parentElement && anchor.parentElement !== chat) {
+            anchor = anchor.parentElement;
+        }
+        if (anchor.parentElement !== chat)
+            return;
+        let node = anchor.nextElementSibling;
+        while (node) {
+            const next = node.nextElementSibling;
+            node.remove();
+            node = next;
+        }
+        App.rebuildQnav();
+    }
+    function handleAskSubmit() {
+        const questions = state.pendingAskQuestions;
+        if (!Array.isArray(questions) || !questions.length) {
+            closeAskModal();
+            return;
+        }
+        // 有未作答的题目时禁止提交（按钮同时处于禁用态，此处为兜底）
+        if (askSubmit && askSubmit.disabled)
+            return;
+        // 会话仍在输出时不允许提交：覆盖式回答需要确定的历史边界，
+        // 等当前流结束后重新点击提问卡片提交即可
+        if (state.streaming && state.streamingSession === state.sessionId) {
+            toast("当前会话仍在输出，请稍后再提交回答");
+            return;
+        }
+        const items = askQuestions.querySelectorAll(".ask-question");
+        const lines = ["【回答模型提问】"];
+        questions.forEach(function (q, index) {
+            let answer = "";
+            const item = items[index];
+            if (item) {
+                const custom = item.querySelector(".ask-custom");
+                if (custom && custom.value.trim()) {
+                    answer = custom.value.trim();
+                }
+                else {
+                    // 多选题用顿号拼接所有选中项
+                    answer = Array.from(item.querySelectorAll(".ask-option.selected"))
+                        .map(function (chip) { return chip.textContent; })
+                        .join("、");
+                }
+            }
+            lines.push((index + 1) + ". " + (q.question || ""));
+            lines.push("   答：" + (answer || "（未回答）"));
+        });
+        const text = lines.join("\n");
+        const sourceBlock = state.pendingAskBlock;
+        closeAskModal();
+        submitAskAnswer(text, sourceBlock);
+    }
+    askSubmit.addEventListener("click", handleAskSubmit);
+    $("#askModalClose").addEventListener("click", closeAskModal);
+    $("#askModalBackdrop").addEventListener("click", closeAskModal);
+    // 回答提交编排（ask_user 卡片）：按提问卡片所处对话位置自动分流——
+    // - 提问是最新轮次（其后无任何轮次）：回答按普通新轮追加，无需历史插入；
+    // - 提问之后已有回答轮：三选确认——「更新该回答轮」（替换旧回答轮，即
+    //   编辑重发 regen 语义）/「删除提问之后所有」/「取消（不发起任务）」；
+    // - 提问之后只有普通对话轮（用户曾跳过该提问开启新任务）：三选确认——
+    //   「插入回答（后续轮次整体后推）」/「删除提问之后所有」/「取消」。
+    //   模式信息从卡片所在轮次的 data-round 推导（历史/实时流均有标注）；
+    // 找不到轮号（旧数据/异常结构）降级为普通发送
+    function submitAskAnswer(text, sourceBlock) {
+        // 定位提问卡片所在轮次号：卡片 → 所在轮次 DOM 锚点 → data-round
+        function findAskRound() {
+            if (!sourceBlock || !sourceBlock.isConnected)
+                return null;
+            let node = sourceBlock;
+            while (node && node !== chatInner) {
+                if (node.getAttribute && node.getAttribute("data-round")) {
+                    return parseInt(node.getAttribute("data-round"), 10) || null;
+                }
+                node = node.parentElement;
+            }
+            return null;
+        }
+        const askRound = findAskRound();
+        if (!askRound) {
+            // 降级：拿不到轮号走旧行为（覆盖式清理 + 普通发送）
+            clearNodesAfterAskBlock(sourceBlock);
+            input.value = text;
+            App.send();
+            return;
+        }
+        // 提问轮之后是否已有回答轮 / 是否存在任何后续轮次
+        let hasExistingAnswer = false;
+        let hasLaterRounds = false;
+        for (const node of chatInner.children) {
+            const r = node.getAttribute ? parseInt(node.getAttribute("data-round"), 10) : NaN;
+            if (Number.isFinite(r) && r > askRound) {
+                hasLaterRounds = true;
+                const bubble = node.querySelector(".msg-user .msg-bubble");
+                if (bubble && bubble.textContent.indexOf("【回答模型提问】") === 0) {
+                    hasExistingAnswer = true;
+                }
+                break;
+            }
+        }
+        // 搜索只挂载命中附近的消息；后续提问可能尚未进入 DOM。
+        const later = App.historyQuestionAfterRound && App.historyQuestionAfterRound(askRound);
+        if (later) {
+            hasLaterRounds = true;
+            hasExistingAnswer = later.text.indexOf("【回答模型提问】") === 0;
+        }
+        if (!hasLaterRounds) {
+            // 自动弹窗的正常续答走普通发送，统一接收 round_started 并跟随实时输出。
+            // 只有中间插入才需要 insert_round，末尾续答不应进入历史编辑分支。
+            App.send({ text: text });
+            return;
+        }
+        // 后面已有对话（回答轮或普通对话）：三选确认后再发送
+        showAskAnswerConfirm(text, askRound, hasExistingAnswer);
+    }
+    // 三选确认弹层（独立轻量模态，复用 tool-modal 遮罩风格）
+    function showAskAnswerConfirm(text, askRound, hasExistingAnswer) {
+        const backdrop = el("div", "tool-modal-backdrop ask-answer-backdrop");
+        const dialog = el("div", "ask-answer-confirm");
+        // hasExistingAnswer=true → 主操作「更新该回答轮」（regen 替换旧回答轮）；
+        // false（提问后只有普通对话）→ 主操作「插入回答」（insert_round，后续轮次后推）
+        dialog.appendChild(el("div", "ask-answer-title", hasExistingAnswer ? "该提问已有一个回答，请选择处理方式" : "该提问之后已有其他对话，请选择回答方式"));
+        const desc = el("div", "ask-answer-desc", hasExistingAnswer
+            ? "「更新该回答轮」会重新生成该轮回答（后续对话保留，编号顺延）；" +
+                "「删除提问之后所有」会移除该回答及之后的所有轮次（含上传附件，不可恢复）；" +
+                "「取消」放弃本次回答，不发起任务。"
+            : "「插入回答」会把回答作为新轮插到该提问之后（后续对话整体后推，保留）；" +
+                "「删除提问之后所有」会移除该提问之后的所有轮次（含上传附件，不可恢复）；" +
+                "「取消」放弃本次回答，不发起任务。");
+        dialog.appendChild(desc);
+        const actions = el("div", "ask-answer-actions");
+        const cancelBtn = el("button", "ask-answer-cancel", "取消");
+        const updateBtn = el("button", "ask-answer-update", hasExistingAnswer ? "更新该回答轮" : "插入回答");
+        const truncateBtn = el("button", "ask-answer-truncate", "删除之后所有");
+        cancelBtn.type = "button";
+        updateBtn.type = "button";
+        truncateBtn.type = "button";
+        cancelBtn.addEventListener("click", function () {
+            backdrop.remove();
+        });
+        updateBtn.addEventListener("click", function () {
+            backdrop.remove();
+            if (hasExistingAnswer) {
+                // 更新该回答轮 = 编辑重发语义：替换旧回答轮（原位重跑）
+                App.confirmEditResend({
+                    msg: null,
+                    round: askRound + 1,
+                    text: text,
+                    media: [],
+                    mode: "regen",
+                });
+            }
+            else {
+                // 插入回答 = 插入语义：新回答轮插入提问轮之后，后续轮次整体后推
+                App.send({ text: text, insertAfterRound: askRound });
+            }
+        });
+        truncateBtn.addEventListener("click", function () {
+            backdrop.remove();
+            // 删除之后所有 = truncate 预演确认后发送（破坏面大，走既有 dry_run 明细）
+            App.confirmEditResend({
+                msg: null,
+                round: askRound + 1,
+                text: text,
+                media: [],
+                mode: "truncate",
+            });
+        });
+        actions.appendChild(cancelBtn);
+        actions.appendChild(updateBtn);
+        actions.appendChild(truncateBtn);
+        dialog.appendChild(actions);
+        backdrop.appendChild(dialog);
+        document.body.appendChild(backdrop);
+    }
+    // ---------- 导出（供其它模块经 App.* 调用） ----------
+    App.TODO_TOOL_NAME = TODO_TOOL_NAME;
+    App.ASK_USER_TOOL_NAME = ASK_USER_TOOL_NAME;
+    App.SUB_AGENT_TOOL_NAME = SUB_AGENT_TOOL_NAME;
+    App.RUN_COMMAND_TOOL_NAME = RUN_COMMAND_TOOL_NAME;
+    App.BUILTIN_SERVER_KEY = BUILTIN_SERVER_KEY;
+    App.BUILTIN_TOOLS = BUILTIN_TOOLS;
+    App.isBuiltinToolName = isBuiltinToolName;
+    App.toolIconSvg = toolIconSvg;
+    App.toolDisplayName = toolDisplayName;
+    App.renderTodoWidget = renderTodoWidget;
+    App.applySessionTodo = applySessionTodo;
+    App.buildAskBlock = buildAskBlock;
+    App.parseAskQuestionsFromArgs = parseAskQuestionsFromArgs;
+    App.refreshAskBlockStates = refreshAskBlockStates;
+    App.openAskModal = openAskModal;
+    App.closeAskModal = closeAskModal;
 })(window.App);

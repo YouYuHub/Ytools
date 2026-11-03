@@ -6,7 +6,7 @@
 
 工具升级见 [进一步优化](../docs/tool_followup_plan.md)：大文件编辑页展示快照回退模式并禁用截断内容保存；终端面板识别交互工具结果，仍按文本展示 PTY 日志。
 
-> 前端样式应修改 H5/style/scss 源文件，由 CSS watch 自动生成，不直接编辑生成的 CSS。
+> 前端样式应修改 H5/src/scss 源文件，由 CSS watch 自动生成，不直接编辑生成的 CSS。
 
 ---
 
@@ -40,14 +40,18 @@ localStorage.setItem('ytools-api-base', 'http://192.168.1.10:48621')
 
 ```powershell
 npm.cmd ci             # 按 package-lock.json 安装依赖
-npm.cmd run build:css  # 编译 style/scss/main.scss -> style/css/main.css
+npm.cmd run build:css  # 编译 src/scss/main.scss -> css/main.css
 npm.cmd run watch:css  # 开发时监听 SCSS（保持运行）
+npm.cmd run build:js   # 编译 src/*.ts -> js/*.js（当前 80 个模块，见 tsconfig.build.json）
+npm.cmd run watch:js   # 开发时监听 TS（保持运行）
+npm.cmd run typecheck  # 全量类型检查（不发射）
 npm.cmd test           # 运行 test_h5/*.test.js 单元测试
 ```
 
-修改 JS 或生成 CSS 后，从项目根目录执行 `python -B H5/version_assets.py`。监听 SCSS 不会自动更新资源哈希；发布或浏览器验收前仍需执行版本脚本。浏览器交互脚本在 `test_browser/`，不包含在 `npm test` 中。
+修改 JS/TS 或生成 CSS 后，先执行构建（`build:js` / `build:css`），再从项目根目录执行 `python -B H5/version_assets.py`。监听模式不会自动更新资源哈希；发布或浏览器验收前仍需执行版本脚本。浏览器交互脚本在 `test_browser/`，不包含在 `npm test` 中。
 
-> 页面引用的是编译产物 `style/css/main.css`，修改 SCSS 后必须重新编译才能生效。
+> 页面引用的是编译产物 `css/main.css`，修改 SCSS 后必须重新编译才能生效。
+> 同理：`src/` 下的 `.ts` 文件是源码，`build:js` 产物（`js/` 下镜像位置的 `.js`）才是浏览器/测试实际加载的——只改 `src/` 下的 `.ts`，不要手改产物；每迁移一个文件就把它加进 `tsconfig.build.json` 的 include 清单（`js/` 下仅 `history_parse_async/worker.js` 两个是手写源，其余 `.js` 均为产物）。
 
 ### 对话显示
 
@@ -65,75 +69,94 @@ npm.cmd test           # 运行 test_h5/*.test.js 单元测试
 H5/
 ├── index.html                  # 单页应用入口：侧边栏 + 主区 + 各弹窗骨架
 ├── editor.html                 # 独立文件 diff 编辑器
-├── package.json                # 脚本：build:css / watch:css / test
+├── package.json                # 脚本：build:css / watch:css / build:js / watch:js / typecheck / test
 ├── package-lock.json           # npm 依赖锁文件
-├── version_assets.py           # 更新 index.html 的 JS/CSS 内容哈希
-├── build-css.bat               # 双击一键编译 SCSS（无本地 sass 时回退 npx）
-├── watch_css.cmd               # 监听模式快捷方式
+├── version_assets.py           # 更新各入口页的 JS/CSS 内容哈希
 │
-├── js/
-│   ├── theme.js                # 主题管理（最先加载，避免首屏闪烁）
-│   ├── api.js                  # 后端 API 封装（REST + SSE 流解析），挂 window.API
-│   ├── file_history_sync.js    # 文件版本链跨窗口变更标记（BroadcastChannel + storage 脏标记，纯逻辑）
-│   ├── tool_approval_state.js  # 工具审批状态同步与并发提交状态（纯逻辑）
-│   ├── stream_replay_dedup.js  # 附接回放去重：历史节点查询与顺序消费匹配器（纯逻辑）
-│   ├── task_state.js          # 主任务阶段与连接状态的纯状态机
-│   ├── read_media_strip.js      # read_media 图片条：结果解析/引用转地址/缩略图网格构建（纯逻辑+注入式 DOM）
-│   ├── markdown.js             # 轻量 Markdown 渲染器（先转义 HTML 再解析）
-│   ├── zoom_utils.js           # 三控件显示缩放纯逻辑（档位表 50%~800%/步进/百分比归一）
-│   ├── widget_reuse.js         # 流式保活渲染的控件复用配对决策（纯逻辑）
-│   ├── table_canvas.js         # 表格图片 canvas：列宽两轮收敛 + 行高自适应（复制图片用）
-│   ├── session_utils.js        # 会话 ID 规整（与后端 normalize_session_id 对齐）
-│   ├── session_list_utils.js   # 会话列表排序/标题兜底规则
-│   ├── session_group_utils.js  # 会话分组纯逻辑（注册表/归属规整、分桶、名称校验）
-│   ├── format_utils.js         # 数字/时间/JSON 格式化、token 用量文案
-│   ├── history_parser.js       # 历史 JSONL -> 渲染记录列表
-│   ├── history_parse_async.js  # 大历史 Worker 解析与同步回退
-│   ├── history_parse_worker.js # Worker 入口，共用历史解析器
-│   ├── history_scroll_model.js # 历史高度估算、偏移查找与窗口几何
-│   ├── history_search.js       # 跨会话异步搜索状态（防竞态/取消/分页）
-│   ├── quote_utils.js          # 选中文本引用纯逻辑（规整/限额/预览/复制文本，与后端 memory/quote_format 同口径）
-│   ├── speech_language.js      # 语音识别语言/地区选项、浏览器缓存与分语种文字处理
-│   ├── app.js                  # 应用入口：一次性迁移旧配置并执行 init 启动序列（约 60 行）
-│   ├── app/                    # 主逻辑模块（IIFE 挂 window.App 共享命名空间，见"四"）
-│   │   ├── core.js             # 共享核心：state/常量/DOM 引用/通用工具（须最先加载）
-│   │   ├── quotes.js           # 选中文本引用：选区浮钮/草稿引用卡片/气泡引用卡片（须在 core 之后加载）
-│   │   ├── sessions.js         # 会话列表与会话切换（重命名/删除/新对话/恢复流）
-│   │   ├── session_archives.js # 归档入口、左下设置菜单（含会话状态显隐）与归档会话列表
-│   │   ├── history_search.js   # 全历史搜索弹窗与结果导航
-│   │   ├── session_groups.js   # 侧边栏分组区（悬停/点击展开、新建/折叠/重命名/删除、会话归组选择器）
-│   │   ├── stats.js            # 会话累计用量与上下文统计条
-│   │   ├── context_panel.js    # 上下文管理面板
-│   │   ├── task_costs.js       # 任务预算与用量明细
-│   │   ├── task_status.js      # 紧凑任务状态栏：聊天/压缩进度、断线重连与显隐设置
-│   │   ├── session_activity.js # 侧边栏运行标记、本地阶段和批量后台状态同步
-│   │   ├── task_templates.js   # 任务模板选择与保存
-│   │   ├── workdir.js          # 工作路径显示与内联编辑
-│   │   ├── permissions.js      # 权限设置与工具/子任务审批交互
-│   │   ├── process_groups.js   # 过程分组折叠、悬停时间与历史窗口展开状态
-│   │   ├── messages.js         # 历史/消息渲染、问题导航与定位
-│   │   ├── history_scroll.js   # 历史窗口、完整滚动坐标与实时尾部恢复
-│   │   ├── history.js          # 分享导出/加载 JSONL/文件上传 chips
-│   │   ├── compaction.js       # 手动压缩对话（含状态条进度同步）
-│   │   ├── builtin.js          # 内置工具列表、todo 任务计划卡片、ask_user 提问弹窗与工具模态框内置分组；媒体格式转换由后端 read_media 处理
-│   │   ├── user_profile.js     # 当前账号显示名：侧栏内联编辑
-│   │   ├── media.js            # 附件与图片/音视频/文档预览
-│   │   ├── skills.js           # Skills 提示词库：可拖拽对话框（列表/预览/编辑/保存/加载到输入框）
-│   │   ├── composer.js         # 输入区/聊天设置弹窗/功能菜单
-│   │   ├── chat_settings_modal.js # 聊天设置页签、焦点与窄屏适配
-│   │   ├── model_panel.js      # 模型参数表单（四角色草稿/协议参数/保存）
-│   │   ├── model_panel_modal.js # 模态框生命周期、键盘焦点、背景隔离与手机可视窗口
-│   │   ├── tools.js            # 工具选择弹窗（"配置工具"）
-│   │   ├── filehistory.js      # 文件版本链：顶栏徽标 + 统计面板（事件驱动刷新，配 _filehistory.scss）
-│   │   ├── editor.js           # 文件 diff 编辑器页逻辑（editor.html，配 _editor.scss）
-│   │   ├── stream_pipeline.js  # 发送/附接共用的 SSE 渲染与回放管线
-│   │   ├── chat.js             # 发送/停止/附接调度与标题触发
-│   │   ├── terminals.js        # 本会话后台/短等待命令管理与轮询
-│   │   └── slash_commands.js   # 输入框斜杠快捷命令（含会话状态显隐）
-│   └── vendor/                 # Prism 高亮、KaTeX 公式、DOMPurify 净化、Mermaid 懒加载图表
-│
-├── style/
-│   ├── scss/                   # 样式源码；下列为主要分区，实际入口见 main.scss
+├── src/                      # TS 源码（唯一可编辑的前端逻辑；产物发射到 js/ 镜像位置）
+│   ├── account.ts              # 账号页逻辑
+│   ├── account_panel_client.ts # 账号面板客户端
+│   ├── account_preferences.ts  # 账号偏好（主题/语言等）存取
+│   ├── api.ts                  # 后端 API 封装（REST + SSE 流解析），挂 window.API
+│   ├── app.ts                  # 应用入口：一次性迁移旧配置并执行 init 启动序列（约 60 行）
+│   ├── clipboard_media_utils.ts # 剪贴板文件/截图提取与安全改名（纯逻辑，可注入 File 构造器）
+│   ├── file_history_sync.ts    # 文件版本链跨窗口变更标记（BroadcastChannel + storage 脏标记，纯逻辑）
+│   ├── format_utils.ts         # 数字/时间/JSON 格式化、token 用量文案
+│   ├── globals.d.ts            # 全局符号声明（只供类型检查，不发射）
+│   ├── history_parser.ts       # 历史 JSONL -> 渲染记录列表
+│   ├── history_scroll_model.ts # 历史高度估算、偏移查找与窗口几何
+│   ├── history_search.ts       # 跨会话异步搜索状态（防竞态/取消/分页）
+│   ├── login.ts                # 登录页逻辑（产物 js/login.js）
+│   ├── login_mfa_management.ts # 登录页 MFA 管理
+│   ├── markdown.ts             # 轻量 Markdown 渲染器（先转义 HTML 再解析）
+│   ├── mfa_enrollment.ts       # MFA 绑定 enrollment 流程
+│   ├── mfa_management.ts       # MFA 管理（解绑/重置）
+│   ├── quote_utils.ts          # 选中文本引用纯逻辑（规整/限额/预览/复制文本，与后端 memory/quote_format 同口径）
+│   ├── read_media_strip.ts     # read_media 图片条：结果解析/引用转地址/缩略图网格构建（纯逻辑+注入式 DOM）
+│   ├── recovery_codes.ts       # 恢复码展示/下载/清理
+│   ├── security_client.ts      # 安全客户端（鉴权 bootstrap/请求包装）
+│   ├── session_group_utils.ts  # 会话分组纯逻辑（注册表/归属规整、分桶、名称校验）
+│   ├── session_list_utils.ts   # 会话列表排序/标题兜底规则
+│   ├── session_utils.ts        # 会话 ID 规整与生成（与后端 normalize_session_id 对齐）
+│   ├── slash_command_utils.ts  # 输入框开头 / 快捷命令：触发读取、前缀移除与命令过滤
+│   ├── speech_language.ts      # 语音识别语言/地区选项、浏览器缓存与分语种文字处理
+│   ├── stream_replay_dedup.ts  # 附接回放去重：历史节点查询与顺序消费匹配器（纯逻辑）
+│   ├── table_canvas.ts         # 表格图片 canvas：列宽两轮收敛 + 行高自适应（复制图片用）
+│   ├── task_state.ts           # 主任务阶段与连接状态的纯状态机
+│   ├── theme.ts                # 主题管理（最先加载，避免首屏闪烁）
+│   ├── tool_approval_state.ts  # 工具审批状态同步与并发提交状态（纯逻辑）
+│   ├── username_management.ts  # 用户名修改
+│   ├── widget_reuse.ts         # 流式保活渲染的控件复用配对决策（纯逻辑）
+│   ├── zoom_utils.ts           # 三控件显示缩放纯逻辑（档位表 50%~800%/步进/百分比归一）
+│   ├── app/                    # 主逻辑模块（IIFE 挂 window.App 共享命名空间）
+│   │   ├── account_panel.ts    # 账号面板
+│   │   ├── builtin.ts          # 内置工具列表、todo 任务计划卡片、ask_user 提问弹窗与工具模态框内置分组；媒体格式转换由后端 read_media 处理
+│   │   ├── chat.ts             # 发送/停止/附接调度与标题触发
+│   │   ├── chat_settings_modal.ts # 聊天设置页签、焦点与窄屏适配
+│   │   ├── compaction.ts       # 手动压缩对话（含状态条进度同步）
+│   │   ├── composer.ts         # 输入区/聊天设置弹窗/功能菜单
+│   │   ├── context_panel.ts    # 上下文管理面板
+│   │   ├── core.ts             # 共享核心：state/常量/DOM 引用/通用工具（须最先加载）
+│   │   ├── editor.ts           # 文件 diff 编辑器页逻辑（editor.html，配 _editor.scss）
+│   │   ├── filehistory.ts      # 文件版本链：顶栏徽标 + 统计面板（事件驱动刷新，配 _filehistory.scss）
+│   │   ├── history.ts          # 分享导出/加载 JSONL/文件上传 chips
+│   │   ├── history_pages.ts    # 历史分页加载
+│   │   ├── history_scroll.ts   # 历史窗口、完整滚动坐标与实时尾部恢复
+│   │   ├── history_search.ts   # 全历史搜索弹窗与结果导航
+│   │   ├── mcp_diagnostics.ts  # MCP 诊断面板
+│   │   ├── mcp_schema_form.ts  # MCP 参数表单渲染
+│   │   ├── media.ts            # 附件与图片/音视频/文档预览
+│   │   ├── message_diff.ts     # 文件 diff 视图构建与行内高亮
+│   │   ├── messages_history.ts # 历史记录回放与分段渲染
+│   │   ├── messages_render.ts  # 消息基础渲染（高亮/保活/用户气泡）
+│   │   ├── messages_edit.ts    # 用户消息编辑/重发与思考·工具块构建器
+│   │   ├── messages_tools.ts   # 工具结果渲染与子任务块
+│   │   ├── messages_widgets.ts # 媒体伪标签/三控件缩放/SVG 双视图块
+│   │   ├── messages_canvas.ts  # Canvas 沙箱运行时与 Mermaid 异步渲染
+│   │   ├── messages_tables.ts  # md 表格复制/导出
+│   │   ├── messages_nav.ts     # 右侧问题导航/引用定位/滚动与代码块复制钉
+│   │   ├── model_panel.ts      # 模型参数表单（四角色草稿/协议参数/保存）
+│   │   ├── model_panel_modal.ts # 模态框生命周期、键盘焦点、背景隔离与手机可视窗口
+│   │   ├── permissions.ts      # 权限设置与工具/子任务审批交互
+│   │   ├── process_groups.ts   # 过程分组折叠、悬停时间与历史窗口展开状态
+│   │   ├── quotes.ts           # 选中文本引用：选区浮钮/草稿引用卡片/气泡引用卡片（须在 core 之后加载）
+│   │   ├── round_fold.ts       # 轮级大折叠：每轮只保留最新正文
+│   │   ├── session_activity.ts # 侧边栏运行标记、本地阶段和批量后台状态同步
+│   │   ├── session_archives.ts # 归档入口、左下设置菜单（含会话状态显隐）与归档会话列表
+│   │   ├── session_groups.ts   # 侧边栏分组区（悬停/点击展开、新建/折叠/重命名/删除、会话归组选择器）
+│   │   ├── sessions.ts         # 会话列表与会话切换（重命名/删除/新对话/恢复流）
+│   │   ├── skills.ts           # Skills 提示词库：可拖拽对话框（列表/预览/编辑/保存/加载到输入框）
+│   │   ├── slash_commands.ts   # 输入框斜杠快捷命令（含会话状态显隐）
+│   │   ├── stats.ts            # 会话累计用量与上下文统计条
+│   │   ├── stream_pipeline.ts  # 发送/附接共用的 SSE 渲染与回放管线
+│   │   ├── task_costs.ts       # 任务预算与用量明细
+│   │   ├── task_status.ts      # 紧凑任务状态栏：聊天/压缩进度、断线重连与显隐设置
+│   │   ├── task_templates.ts   # 任务模板选择与保存
+│   │   ├── terminals.ts        # 本会话后台/短等待命令管理与轮询
+│   │   ├── tools.ts            # 工具选择弹窗（"配置工具"）
+│   │   ├── user_profile.ts     # 当前账号显示名：侧栏内联编辑
+│   │   └── workdir.ts          # 工作路径显示与内联编辑
+│   ├── scss/                   # 样式源码（入口 main.scss @use 汇总；sass 编译到 css/main.css）
 │   │   ├── main.scss           # 入口 @use 汇总
 │   │   ├── _variables.scss     # CSS 自定义属性（light 默认 + [data-theme="dark"] 覆盖）
 │   │   ├── _base.scss          # 重置与基础元素
@@ -149,8 +172,20 @@ H5/
 │   │   ├── _history_search.scss # 历史搜索
 │   │   ├── _permissions.scss   # 工具授权状态
 │   │   ├── _task_status.scss   # 输入框上方单行任务状态
-│   │   └── _terminals.scss     # 后台终端面板
-│   └── css/main.css            # 编译产物（页面实际引用）
+│   │   └── _terminals.scss     # 后台终端面板（另有 _context_panel/_mcp_diagnostics/_task_templates/_session_archives/_task_costs/_account_panel，入口见 main.scss）
+│
+├── js/                       # 构建产物（tsc 发射，浏览器实际加载；不要手改）
+│   ├── app/                    # 与 src/app 镜像的 .js 产物
+│   ├── login.js                # 登录页产物（源码 src/login.ts）
+│   ├── history_parse_async.js  # 手写源（未迁移）：大历史 Worker 解析与同步回退
+│   ├── history_parse_worker.js # 手写源（未迁移）：Worker 入口（version_assets.py 直接改写内部 ?v=）
+│   └── vendor/                 # Prism 高亮、KaTeX 公式、DOMPurify 净化、Mermaid 懒加载图表
+│
+│
+├── css/                      # served 样式（浏览器实际加载）
+│   ├── main.css              # sass 产物（源码 src/scss/，不要手改）
+│   ├── account_theme.css     # 手写：账号页主题跟随
+│   └── login.css             # 手写：登录/账号页基础样式
 │
 ├── test_browser/               # 独立浏览器交互验证（不属于 npm test）
 │   ├── native_scrollbar.cjs     # 原生滚动条回归
@@ -211,17 +246,21 @@ H5/
 
 | 模块 | 导出 | 职责 |
 |---|---|---|
-| session_utils.js | `sanitizeSessionId` / `fileNameToSessionId` | 会话标识以文件名为准（`<id>_chat.jsonl`），保留 Unicode/空格/下划线/点/横线，替换危险字符并拦截 `..` 路径穿越，兜底 `"default"` |
-| session_list_utils.js | `sortRows` / `firstQuestionTitle` / `timeValue` | 列表按 `max(后端 updated_at, 本地 recency)` 倒序、created_at 兜底；标题取首条提问前 40 字符（与后端 `_meta.title` 规则一致） |
-| session_group_utils.js | `normalizeGroups` / `normalizeAssignments` / `bucketSessions` / `bucketForBulk` / `validateGroupName` / `UNGROUPED_KEY` | 分组注册表与会话归属规整（过滤非法条目、order 稳定排序）、会话按归属分桶（未知分组归未分组）、多选分组视图分桶（已定义分组按注册顺序、空组保留、末尾「未分组」伪桶仅在存在未分组会话时返回）、分组名校验（控制字符折叠 + 40 字上限，与后端 `_normalize_group_name` 一致） |
-| format_utils.js | `fmtNum` / `fmtTime` / `prettyJson` / `normalizeUsage` / `usageText` / `compactionUsageText` | 千分位数字、时间去日期前缀、JSON 美化、usage 三字段归一化、「本轮消耗 N tokens（输入 x · 输出 y） · 模型 provider/name」（旧轮无模型字段时省略模型）及压缩消耗文案 |
-| history_parser.js | `parseHistory` / `recordsBeforeActiveRound` | 解析后端 JSONL：首行 `_meta` 取累计 usage；`chat_round.events` 展开为 user/think/assistant/tool/toolResult/usage/notice 记录（用户记录携带 `quotes` 引用快照）；`context_compaction` 事件行转为 compaction 记录（`phase=aborted` 回溯置中断态；带 `display_round` 锚点的跨轮压缩行按轮次预扫描收集、解析到锚定轮次时按 `display_event_index` 归位合并，不依赖物理行序，兼容旧版后端反序文件）；打开会话时剔除正在流式的当前轮避免重复渲染（无轮次号回退文本匹配时同时比较引用签名） |
-| history_search.js | `createController` | 全历史搜索请求状态机：防抖、取消旧请求、超时处理、分页与过期结果保护 |
-| tool_approval_state.js | `create` | 审批状态与请求并发管理：跟踪待审批/已结束记录、刷新状态、同一审批并发决定共享提交 |
-| task_state.js | `initial` / `reduce` / `view` | 主任务阶段、连接状态、并行工具和等待原因；无 DOM/计时器 |
-| stream_replay_dedup.js | `findHistoryToolWrap` / `collectHistoryTexts` / `collectHistoryThinks` / `renderedSourceEquals` / `createSequentialMatcher` | 附接回放去重：按 callId 找历史工具卡、同轮历史正文/思考收集、离屏渲染比对、顺序消费匹配 |
-| read_media_strip.js | `parseReadMediaResult` / `resolveReferenceUrl` / `buildStripItems` / `buildMediaStrip` | read_media 图片条：结果 JSON 解析、引用转可访问地址（media://→会话媒体端点，本地路径→本地文件端点）、可展开缩略图网格构建（默认折叠、展开时才加载媒体） |
-| quote_utils.js | `normalizeQuotes` / `checkQuoteAppend` / `quotePreview` / `quoteSourceLabel` / `composeCopyText` / `quotesForRequest` / `QUOTE_LIMITS` | 选中文本引用纯逻辑：规整（换行统一/去首尾空白/丢弃 UI 字段）、限额校验（5 段/单段 4000 字/合计 12000 字，与后端 `memory/quote_format.py` 同口径）、卡片预览与来源文案、复制消息的人可读文本（"引用 1：…\n\n问题：…"）、请求快照剥离本地字段 |
+| clipboard_media_utils.ts | `mediaFiles` | 从剪贴板 DataTransfer 提取文件（无 items 时回退 files），按 MIME 把匿名截图安全改名为 `clipboard-<时间戳>-<序号>.<ext>`，仅保留 `kindOf` 认可的类型；File 构造器可注入，构造失败时保留原文件 |
+| session_utils.ts | `sanitizeSessionId` / `generateSessionId` | 会话标识以文件名为准（`<id>_chat.jsonl`，兼容带 `.jsonl` 后缀），保留 Unicode/空格/下划线/点/横线，替换危险字符并拦截 `..` 路径穿越，兜底 `"default"`；新 ID 形如 `yt-<YYYY-MM-DD_HH.MM.SS>_<三位随机数>` |
+| session_list_utils.ts | `TITLE_MAX` / `timeValue` / `firstQuestionTitle` / `pickSendTitle` / `shouldOpenSessionOnClick` / `sortRows` | 列表按 `max(后端 updated_at, 本地 recency)` 倒序、created_at 兜底；标题取首条提问前 40 字符（与后端 `_meta.title` 规则一致）；已有标题不被临时占位顶掉；点击已就绪/加载中的当前会话跳过重复加载 |
+| session_group_utils.ts | `normalizeGroups` / `normalizeAssignments` / `bucketSessions` / `bucketForBulk` / `validateGroupName` / `UNGROUPED_KEY` | 分组注册表与会话归属规整（过滤非法条目、order 稳定排序）、会话按归属分桶（未知分组归未分组）、多选分组视图分桶（已定义分组按注册顺序、空组保留、末尾「未分组」伪桶仅在存在未分组会话时返回）、分组名校验（控制字符折叠 + 40 字上限，与后端 `_normalize_group_name` 一致） |
+| format_utils.ts | `fmtNum` / `fmtTime` / `prettyJson` / `normalizeUsage` / `usageText` / `compactionUsageText` | 千分位数字、时间去日期前缀、JSON 美化、usage 三字段归一化、「本轮消耗 N tokens（输入 x · 输出 y） · 模型 provider/name」（旧轮无模型字段时省略模型）及压缩消耗文案 |
+| slash_command_utils.ts | `readTrigger` / `removeTrigger` / `filterCommands` | 输入框开头 `/` 命令：仅在行首、光标在命令前缀内且无空白时激活；发送前剥离命令前缀；按 id/title/description/aliases 大小写不敏感过滤（空查询返回全部副本） |
+| history_parser.ts | `parseHistory` / `recordsBeforeActiveRound` | 解析后端 JSONL：首行 `_meta` 取累计 usage；`chat_round.events` 展开为 user/think/assistant/tool/toolResult/usage/notice 记录（用户记录携带 `quotes` 引用快照）；`context_compaction` 事件行转为 compaction 记录（`phase=aborted` 回溯置中断态；带 `display_round` 锚点的跨轮压缩行按轮次预扫描收集、解析到锚定轮次时按 `display_event_index` 归位合并，不依赖物理行序，兼容旧版后端反序文件）；打开会话时剔除正在流式的当前轮避免重复渲染（无轮次号回退文本匹配时同时比较引用签名） |
+| history_search.ts | `createController` | 全历史搜索请求状态机：防抖、取消旧请求、超时处理、分页与过期结果保护 |
+| tool_approval_state.ts | `create` | 审批状态与请求并发管理：跟踪待审批/已结束记录、刷新状态、同一审批并发决定共享提交 |
+| task_state.ts | `initial` / `reduce` / `view` | 主任务阶段、连接状态、并行工具和等待原因；无 DOM/计时器 |
+| stream_replay_dedup.ts | `findHistoryToolWrap` / `collectHistoryTexts` / `collectHistoryThinks` / `renderedSourceEquals` / `createSequentialMatcher` | 附接回放去重：按 callId 找历史工具卡、同轮历史正文/思考收集、离屏渲染比对、顺序消费匹配 |
+| history_scroll_model.ts | `estimate` / `prefix` / `locate` / `fit` | 未渲染历史记录的高度估算（按 kind 与字数/媒体数）、前缀和索引、滚动位置二分定位、真实窗口在估算范围内的放置（超大消息用负位移保留所读部分） |
+| speech_language.ts | `DEFAULT_LANGUAGE` / `STORAGE_KEY` / `languages` / `get` / `read` / `save` / `normalize` / `separator` | 语音识别语言/地区选项（20 种，冻结）、localStorage 读写（异常回退默认）、分语种文字规整（中日去汉字间空格、标点贴合）与拼接分隔符判断 |
+| read_media_strip.ts | `parseReadMediaResult` / `resolveReferenceUrl` / `buildStripItems` / `buildMediaStrip` | read_media 图片条：结果 JSON 解析、引用转可访问地址（media://→会话媒体端点，本地路径→本地文件端点）、可展开缩略图网格构建（默认折叠、展开时才加载媒体） |
+| quote_utils.ts | `normalizeQuotes` / `checkQuoteAppend` / `quotePreview` / `quoteSourceLabel` / `composeCopyText` / `quotesForRequest` / `QUOTE_LIMITS` | 选中文本引用纯逻辑：规整（换行统一/去首尾空白/丢弃 UI 字段）、限额校验（5 段/单段 4000 字/合计 12000 字，与后端 `memory/quote_format.py` 同口径）、卡片预览与来源文案、复制消息的人可读文本（"引用 1：…\n\n问题：…"）、请求快照剥离本地字段 |
 
 ---
 
@@ -273,19 +312,19 @@ H5/
 | 工作路径（app/workdir.js） | 常显工作目录（会话未覆盖时显示「默认 · 」前缀），双击内联编辑，hover tooltip 显示完整路径：**新对话**（无 sessionId）保存为全局默认（`changeChatDir` → POST /change_chat_dir）；**已有会话**保存为会话独立目录（`API.setSessionWorkDir` → POST /chat_config/work_dir，写 `_meta.work_dir`），清空输入恢复跟随全局默认 |
 | 账号显示名（app/user_profile.js） | 侧栏名字可内联编辑，保存到当前账号；空白恢复用户名。“设置 → 账号与安全”提供密码、MFA、登录设备及管理员账号管理。浏览器缓存按账号分区 |
 | 会话切换（app/sessions.js） | 新建会话仅置空 sessionId（待开始态），首次发送/上传才生成 ID 并即时以提问前 40 字符置顶侧边栏；打开会话用序号防竞态，拉历史 → 渲染 → 恢复进行中流 UI → 重建问题导航 → 瞬跳底部 → 探测后台任务是否仍在生成并续接。**重复点击跳过重载**：视图就绪跟踪（`readySessionId` / `loadingSessionId`）+ `session_list_utils.shouldOpenSessionOnClick` 判定——点击已完整显示的当前会话（或加载中的会话）不再重新加载，点击其他会话照常切换；显式 `App.openSession(...)`（删除轮次后重载、流失败对齐、深链启动等）不受影响始终真实重载；加载失败不置就绪，可再次点击重试 |
-| 历史渲染（app/messages.js） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对；`read_media` 结果额外附加可展开的图片缩略图条，见下）、轮次 usage 行（含「模型 provider/name」，由轮次 `model` 字段提供）、提示/出错横幅、压缩块（含中断态）；历史轮用户气泡 hover 操作行（复制/编辑/删除/插入对话）：编辑面板支持「重新生成该轮」target_round 原地替换 /「删除该轮及之后」truncate 预演确认；编辑框可直接粘贴剪贴板图片（含截图），显示缩略图并支持移除，确认发送后才上传；新媒体附件上限 6 个，连续粘贴与文件选择共用处理队列，取消编辑释放预览且丢弃未完成的图片处理；「插入对话」同样支持粘贴图片，在所选用户消息之前打开空白编辑面板，发送时带 `insert_round=该轮号-1`，仅用此前的历史作为上下文，后续轮次保留并后移；运行中确认发送会先停止生成；「删除」以 `single` 模式删除该轮整轮；任务启动后端推 `round_started` 和 `round_model`，前端就地补挂操作行并显示本轮模型 |
-| 消息渲染（app/messages.js） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——默认复制按钮写入 TSV 与 text/html 两种剪贴板格式，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
-| 读取媒体图片条（js/read_media_strip.js + app/messages.js） | `read_media` 工具块输出区下方附加「已查看 N 张图像」可展开条：缩略图网格（图片/视频首帧/音频图标），点击进媒体预览弹窗（复用缩放）；默认折叠、展开时才加载媒体；文件已删除显示「找不到图片，可能已删除」占位，未读取项显示原因；实时/历史/子任务三路共用 `applyToolResult` 钩子 |
-| 三控件显示缩放（js/zoom_utils.js / app/messages.js） | ```mermaid / ```svg / ```canvas 三种块头部带缩放按钮组（[−] [百分比] [＋]，百分比按钮点击复位 100%），50%~800% 共 16 档；**Ctrl+滚轮**在图片视图内步进缩放（svg/mermaid）；缩放经 CSS 变量 `--md-zoom` 驱动——svg/mermaid 内联宽度表达式乘倍率（放大后控件内滚动查看、上限 85vh，缩小居中），canvas 沙箱 iframe 尺寸不变、倍率经 postMessage 下发到沙箱（stage 尺寸乘倍率 + object-fit:contain 等比放大、沙箱 body 滚动）；全屏中缩放同样生效（宽度/高度上限按倍率重算，safe center 保证超宽时可滚到全部区域）；**导出 PNG/复制图片始终按 100% 基准尺寸**（导出计算除以当前倍率），不受查看缩放影响 |
-| Canvas 沙箱内置环境（app/messages.js / factory/system_prompt.py） | 每个 `canvas` 块使用独立 `iframe sandbox="allow-scripts"`；预置 `stage` / `canvas`（同一画布）、`ctx` / `context`（2D 上下文）及 `width` / `height`、`W` / `H`、`WIDTH` / `HEIGHT` 尺寸别名。别名为全局变量，脚本仍可使用 `const ctx = stage.getContext('2d')` 等局部声明；原生 `window`、`document`、`requestAnimationFrame`、`setTimeout` / `setInterval` 等浏览器 API 可在隔离 iframe 内使用，日志通过沙箱代理 `console` 回传 |
-| 问题导航 qnav（app/messages.js） | 用户问题 ≥2 条出现：桌面端右侧虚线轨（上限 40 根）hover 展开编号面板；窄屏用顶栏按钮点开问题列表，选择后收起并跳转。滚动 rAF 节流高亮当前位置 |
+| 历史渲染（src/app/messages_history.ts + src/app/messages_edit.ts 编辑面板） | 按 records 类型装配：用户气泡、思考折叠块、回答正文、工具调用折叠块（输入 JSON+输出文本配对；`read_media` 结果额外附加可展开的图片缩略图条，见下）、轮次 usage 行（含「模型 provider/name」，由轮次 `model` 字段提供）、提示/出错横幅、压缩块（含中断态）；历史轮用户气泡 hover 操作行（复制/编辑/删除/插入对话）：编辑面板支持「重新生成该轮」target_round 原地替换 /「删除该轮及之后」truncate 预演确认；编辑框可直接粘贴剪贴板图片（含截图），显示缩略图并支持移除，确认发送后才上传；新媒体附件上限 6 个，连续粘贴与文件选择共用处理队列，取消编辑释放预览且丢弃未完成的图片处理；「插入对话」同样支持粘贴图片，在所选用户消息之前打开空白编辑面板，发送时带 `insert_round=该轮号-1`，仅用此前的历史作为上下文，后续轮次保留并后移；运行中确认发送会先停止生成；「删除」以 `single` 模式删除该轮整轮；任务启动后端推 `round_started` 和 `round_model`，前端就地补挂操作行并显示本轮模型 |
+| 消息渲染（src/app/messages_render/tables/nav.ts） | Prism 高亮、Markdown 渲染、代码复制按钮事件委托；表格 hover 出「复制 / 更多 ▾」——默认复制按钮写入 TSV 与 text/html 两种剪贴板格式，更多菜单含复制 Markdown / 复制图片（canvas 网格图）/ 下载 Excel（POST /export/table/xlsx）；复制按钮 sticky 钉住时水平位移至代码块中线避开分享按钮 |
+| 读取媒体图片条（src/read_media_strip.ts + src/app/messages_tools.ts） | `read_media` 工具块输出区下方附加「已查看 N 张图像」可展开条：缩略图网格（图片/视频首帧/音频图标），点击进媒体预览弹窗（复用缩放）；默认折叠、展开时才加载媒体；文件已删除显示「找不到图片，可能已删除」占位，未读取项显示原因；实时/历史/子任务三路共用 `applyToolResult` 钩子 |
+| 三控件显示缩放（src/zoom_utils.ts / src/app/messages_widgets.ts） | ```mermaid / ```svg / ```canvas 三种块头部带缩放按钮组（[−] [百分比] [＋]，百分比按钮点击复位 100%），50%~800% 共 16 档；**Ctrl+滚轮**在图片视图内步进缩放（svg/mermaid）；缩放经 CSS 变量 `--md-zoom` 驱动——svg/mermaid 内联宽度表达式乘倍率（放大后控件内滚动查看、上限 85vh，缩小居中），canvas 沙箱 iframe 尺寸不变、倍率经 postMessage 下发到沙箱（stage 尺寸乘倍率 + object-fit:contain 等比放大、沙箱 body 滚动）；全屏中缩放同样生效（宽度/高度上限按倍率重算，safe center 保证超宽时可滚到全部区域）；**导出 PNG/复制图片始终按 100% 基准尺寸**（导出计算除以当前倍率），不受查看缩放影响 |
+| Canvas 沙箱内置环境（src/app/messages_canvas.ts / factory/system_prompt.py） | 每个 `canvas` 块使用独立 `iframe sandbox="allow-scripts"`；预置 `stage` / `canvas`（同一画布）、`ctx` / `context`（2D 上下文）及 `width` / `height`、`W` / `H`、`WIDTH` / `HEIGHT` 尺寸别名。别名为全局变量，脚本仍可使用 `const ctx = stage.getContext('2d')` 等局部声明；原生 `window`、`document`、`requestAnimationFrame`、`setTimeout` / `setInterval` 等浏览器 API 可在隔离 iframe 内使用，日志通过沙箱代理 `console` 回传 |
+| 问题导航 qnav（src/app/messages_nav.ts） | 用户问题 ≥2 条出现：桌面端右侧虚线轨（上限 40 根）hover 展开编号面板；窄屏用顶栏按钮点开问题列表，选择后收起并跳转。滚动 rAF 节流高亮当前位置 |
 | 用户气泡附件网格（app/core.js `fitAttachmentBlockGrid`） | 提问气泡内的引用/图片/音视频/文档共用等尺寸网格横向排布：列数按可用宽度计算（不可测时延迟到下一帧重试）；超出两行折叠进「+N」展开块（点击展开全部/收起，不用 overflow 裁剪以免引用浮层被夹断）；窗口缩放/侧栏伸缩经 ResizeObserver（仅宽度变化）自动重算 |
 | 移动端适配（SCSS `@container`/`@media`） | 主区窄于 680px 时，顶栏累计用量移入右上角会话操作菜单，问题导航改为顶栏入口，文件变更面板保持在屏内；Skills 弹窗手机端全屏，列表选中文件后切到正文，可返回列表，正文与工具栏字号收紧。设置弹窗页签完整可见，≤480px 字段行上下排布；宽 md 表格在容器内横滑 |
-| 滚动联动（app/messages.js 滚动回调/`updateQnavActive`/`rebuildQnav`） | 修 `visible` 变量遮蔽 TDZ（视口有代码块即抛错，致导航高亮钉死第一条、回底按钮冻结）；滚动回调加 try/finally 永不卡死 `scrollTick`；高亮基线指向首个已渲染条目之前最后一条（分页窗口顶部不再回落第一条）；无戳提问气泡按轮次兜底收养 |
+| 滚动联动（src/app/messages_nav.ts 滚动回调/`updateQnavActive`/`rebuildQnav`） | 修 `visible` 变量遮蔽 TDZ（视口有代码块即抛错，致导航高亮钉死第一条、回底按钮冻结）；滚动回调加 try/finally 永不卡死 `scrollTick`；高亮基线指向首个已渲染条目之前最后一条（分页窗口顶部不再回落第一条）；无戳提问气泡按轮次兜底收养 |
 | 导出/加载（app/history.js） | 顶栏为图标按钮：空态点击直接进入"加载 JSONL"文件选择；有会话内容时点击展开三选项菜单——**分享对话**（统一打包 ZIP，即使没有附件也携带仅所选会话配置的 SQLite 权限快照；分组随包，manifest v3）、**加载 JSONL**（校验后上传导入，重名自动另存，导入失败本地预览兜底；**zip 包导入时按组名还原分组归属**，导入弹窗展示分组名、会话权限及还原说明；配置仅合并到最终会话 ID，本地全局和其他会话不变；完成 toast 补「N 个已归入分组」，随后刷新侧边栏分组区）、**压缩对话**（见下） |
 | 手动压缩（app/compaction.js） | 点击"压缩对话"后：① 并行读取 token_stats 与历史压缩配置，仅用于确认弹窗展示当前上下文和摘要预算；② 二次确认（仅防误点击）；③ 确认后 POST `compact_manual?stream=true` 的 SSE 流，事件结构与自动压缩一致（start/delta/done + summary_text），复用 `buildCompactionBlock` 实时渲染压缩模型思考与累计摘要正文，结尾 result 帧提示纳入累计摘要的轮数并刷新用量/上下文统计；全程经 `taskStatus.compactBegin/Event/End` 同步会话状态条（压缩上下文·跨轮历史/官方压缩窗口 → 已完成/失败/已停止），切走会话不丢失。后端任务与 SSE 消费端分离（与聊天流一致）：刷新/断线不再取消压缩，打开会话经 `GET .../status` 自动 `attach=true` 重连收看剩余进度；停止必须经 `POST .../stop` 显式取消。后端手动压缩与自动压缩共用多轮流程，覆盖全部已完成轮次，原始历史只存储不回传；模型上下文为累计摘要 + 全历史最近 10k tokens 用户问题 + 当前任务 |
 | 输入区（app/composer.js） | textarea 自增高；Enter 发送 / Shift 换行（排除中文输入法组合态）；发送/语音/停止按钮只反映当前会话状态；**有文本时语音钮保留**（与发送钮并排，录音时红色呼吸圈）；点击麦克风开始连续听写，按完整结果快照实时更新，重复 final 不重复追加；点击聚焦、方向键移动、选择/复制文字不停止听写，保留用户选区及尾部文本的相对光标位置；键盘输入、删除、粘贴或剪切也复用当前识别实例，保留修改后的草稿与光标，只接入之后的新语音，不重放编辑前的语音片段；**输入法组合期间只缓存识别结果**，不软件改写 textarea 或打断候选词，提交完成后再定位并写入新增语音；仅清理语音文本中汉字间的水平空格及中文标点周边空格，保留英文词间空格、换行与手动原稿；麦克风停止按钮允许最后结果收尾（组合输入期间停止直接保留输入法文本），发送、切会话/新对话、页面隐藏/离开立即隔离迟到结果并取消待写入缓存；自然断开后自动续听（连续两次空白续听仍无结果则停止）；网络/权限错误或启动失败停止后可再次点击麦克风，旧识别器未发送 end 时 2 秒后清理阻塞并重试。当前没有建议 chip 控件 |
-| 选中文本引用（app/quotes.js + js/quote_utils.js） | 在用户提问正文/助手回答正文中选中文字 → 浮钮「引用到提问」（仅在单条可引用消息内、且非按钮/工具输出时显示；滚动时按新的选区位置重定位，Esc/点击别处/选区消失时隐藏）→ 输入框上方出现**引用数量按钮**，悬停/聚焦展开**浮层**逐条展示引用原文与来源（多段、可单独移除、**点击来源跳转原文** `jumpToQuoteSource`、随会话草稿保存与恢复）；发送时作为用户消息同级 `quotes` 字段上送（结构化快照，不打标签进 content），历史回放/流恢复重建引用卡片，编辑可保留或移除，复制输出人可读文本（"引用 1：…\n\n问题：…"）；限额与后端同口径（5 段/单段 4000 字/合计 12000 字），超限本地提示 |
+| 选中文本引用（src/app/quotes.ts + src/quote_utils.ts） | 在用户提问正文/助手回答正文中选中文字 → 浮钮「引用到提问」（仅在单条可引用消息内、且非按钮/工具输出时显示；滚动时按新的选区位置重定位，Esc/点击别处/选区消失时隐藏）→ 输入框上方出现**引用数量按钮**，悬停/聚焦展开**浮层**逐条展示引用原文与来源（多段、可单独移除、**点击来源跳转原文** `jumpToQuoteSource`、随会话草稿保存与恢复）；发送时作为用户消息同级 `quotes` 字段上送（结构化快照，不打标签进 content），历史回放/流恢复重建引用卡片，编辑可保留或移除，复制输出人可读文本（"引用 1：…\n\n问题：…"）；限额与后端同口径（5 段/单段 4000 字/合计 12000 字），超限本地提示 |
 | 模型参数设置（app/model_panel.js + model_panel_modal.js） | 参数按钮打开统一模态框，空白页和聊天页布局一致，不再锚定输入框或上下展开。桌面宽至多 900px、高至多 820px（距可视窗口边缘至少 16px），≤600px 窄屏全屏；顶部四角色页签和关闭按钮共用一行，标题仅保留无障碍名称，底部固定栏只保留取消/确定。配置范围、恢复默认和清除会话覆盖放在可滚动表单内；表单子项禁止 Flex 收缩，模型列表按内容展开（最高 320px / 42vh），超长列表独立滚动，避免被压成一条线。手机选择器/输入框全宽，确认按钮和表单主要触控目标至少 44px，顶部角色/关闭按钮 40px；JSON/请求头输入 16px 防自动放大。请求头键值上下排列，使用 visualViewport 的 resize/scroll 事件调整键盘出现后的可用高度，无轮询。高级参数和自定义请求头折叠；Chat 蓝色、Messages 绿色、Responses 粉色。打开锁定背景滚动并 inert 隔离，Tab 循环聚焦，Esc/关闭/取消经统一出口恢复背景与原焦点，遮罩点击不丢弃编辑；保存期间禁止关闭。四角色切换保留草稿，迟到的加载不覆盖已编辑字段，参数仍按协议分桶；会话覆盖/全局默认与请求头保存语义不变，确定顺序保存有变化的角色，失败保留草稿，保存成功刷新配置后关闭 |
 | 会话标题自动生成（后端 factory/agent_runtime/title_generator.py，前端驱动触发） | 「标题模型」tab 选择的模型由**前端在 SSE 流内**消费：流式管线收集模型输出（思考/正文取较长者）累计达 100 字符（流结束不足 100 以已有全文触发）即调 `POST /chat_config/generate_title` 一次，请求携带用户问题（截 300 字）与输出预览；后端调标题模型生成 ≤30 字标题（后端硬截断 40 字兜底）、写回会话 `_meta.title` 并打 `_title_state` 标记，标题**同步返回**——前端收到即替换侧栏标题（零轮询，不再轮询 `getSessionMeta`）。**多模态标题**：首问带图片/视频/音频时，标题模型支持视觉则媒体解析 base64 一并送入（大图自动缩略），不支持则转「[图片 media://x.png]」文本占位。未配置标题模型或调用失败时保持旧机制标题（首个用户问题前 40 字）；所选模型需在其网关侧可用（部分网关按角色做区域门控，403 时更换标题模型即可） |
 | “+”功能菜单（app/composer.js） | 上传文件 / 选择工具 / 聊天设置 / Skills 提示词四个入口，分发至 history/tools/composer/skills 各自的处理逻辑；菜单以 fixed 定位锚定「+」按钮上方（打开时按按钮视口坐标计算，多行输入撑高输入框也不会漂移） |

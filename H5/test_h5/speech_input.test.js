@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const SpeechLanguage = require('../js/speech_language.js');
 
 function setup(value = '', options = {}) {
@@ -58,8 +59,8 @@ function setup(value = '', options = {}) {
     window, document, API: options.api, AbortController, App: {}, Event: class { constructor(type) { this.type = type; } },
     setTimeout(fn, delay = 0) { timers.set(++timerId, { fn, due: now + delay }); return timerId; }, clearTimeout(id) { timers.delete(id); },
   };
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/composer.js'), 'utf8');
-  const start = source.indexOf('  let speechRec = null;');
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/composer.ts'), 'utf8'));
+  const start = source.indexOf('  let speechRec');
   const end = source.indexOf('  // ---------- 运行中发送选项', start);
   vm.createContext(context); vm.runInContext(source.slice(start, end), context);
   return { context, input, instances, button, document, window, messages, timers, store, languageSelect, languageBadge, languageStatus,

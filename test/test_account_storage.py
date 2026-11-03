@@ -350,3 +350,20 @@ def test_restored_fixture_account_can_login_and_read_history_without_source(stor
         assert "old" in json.dumps(summaries)
         history = client.get("/chat_history/file", params={"session_id": "old"})
         assert history.status_code == 200 and '"title": "legacy"' in history.text
+
+
+def test_shared_media_cache_namespaces_skip_session_auth(storage):
+    from memory import file_memory
+    # 登录态下：缩略图/转码共享缓存伪命名空间不走会话鉴权
+    # （实证：带身份时本地图片读取因此 404 全灭）
+    transcode = file_memory._transcode_cache_dir("media_model_part")
+    assert transcode.is_dir()
+    network = file_memory._transcode_cache_dir("network_media")
+    assert network.is_dir()
+    thumb = file_memory._thumb_dir("media_model_part")
+    assert thumb.is_dir()
+    # 真实会话仍鉴权：未登记的会话 404
+    import pytest
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        file_memory._get_session_dir("no-such-session")

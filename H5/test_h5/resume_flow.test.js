@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { stripTypeScriptTypes } = require("node:module");
 const { JSDOM } = require("jsdom");
 const historyParser = require("../js/history_parser.js");
 
@@ -28,7 +29,7 @@ function composerContext(state) {
     stopGroup: btn(), stopMenuBtn: btn(), queueMenu: { classList: { add() {} } },
     App: {}, requestAnimationFrame() {}, updateScrollBottomOffset() {},
   };
-  const source = fs.readFileSync(path.join(__dirname, "../js/app/composer.js"), "utf8").replace(/\r\n/g, "\n");
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/composer.ts"), "utf8")).replace(/\r\n/g, "\n");
   const start = source.indexOf("  function refreshComposerButtons() {");
   const end = source.indexOf("\n  }\n", start) + 4;
   context.__box = {};
@@ -97,8 +98,9 @@ function resumeContext({ resumeImpl, uncertain = false, refreshImpl } = {}) {
     reconcileStreamInterruption: async () => {},
     setTimeout: () => 0, AbortController: dom.window.AbortController,
   };
-  const source = fs.readFileSync(path.join(__dirname, "../js/app/chat.js"), "utf8");
-  const start = source.indexOf("  async function resume() {");
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/chat.ts"), "utf8"));
+  // 切片包含 findReusableLiveContainer（resume 依赖它找暂停轮容器）
+  const start = source.indexOf("  function findReusableLiveContainer(");
   const end = source.indexOf("\n  sendBtn.addEventListener(", start);
   context.__box = {};
   vm.runInNewContext(source.slice(start, end) + "\n__box.fn = resume;", context);
@@ -136,7 +138,7 @@ test("resume: 409 被拒后提示并重同步可用性", async t => {
 test("stopBtn: 暂停成功后同步 ▶ 可用性", async () => {
   const calls = { avail: [] };
   const state = { sessionId: "s", activeStream: null, abort: null };
-  const source = fs.readFileSync(path.join(__dirname, "../js/app/chat.js"), "utf8");
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/chat.ts"), "utf8"));
   const start = source.indexOf("  stopBtn.addEventListener(");
   const end = source.indexOf("\n  });", start) + 6;
   let handler;
@@ -178,7 +180,7 @@ test("stopBtn→中断收尾：停止确认后跳过重同步，不覆盖 ▶", 
   const running = x.resume();
   while (started.length === 0) await new Promise(r => setImmediate(r));
   // 停止按钮切片：与续跑共享 state，模拟用户点击暂停
-  const source = fs.readFileSync(path.join(__dirname, "../js/app/chat.js"), "utf8");
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/chat.ts"), "utf8"));
   const start = source.indexOf("  stopBtn.addEventListener(");
   const end = source.indexOf("\n  });", start) + 6;
   let stopHandler;

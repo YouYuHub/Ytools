@@ -2,8 +2,9 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
+const { stripTypeScriptTypes } = require("node:module");
 
-const source = fs.readFileSync(path.join(__dirname, "../js/app/messages.js"), "utf8");
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, "../src/app/messages_edit.ts"), "utf8"));
 const start = source.indexOf("  function attachLiveRoundEntry(");
 const end = source.indexOf("  function beginUserMessageEdit(", start);
 const attach = new Function("attachUserEditAction", source.slice(start, end) + "\nreturn attachLiveRoundEntry;")(() => {});

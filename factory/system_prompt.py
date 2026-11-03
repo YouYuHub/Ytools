@@ -170,8 +170,10 @@ def build_sys_prompt(
 ) -> str:
     """构建系统提示词。
 
-    思考过程/历史工具结果的回传长度提示只在配置为正数（截断回传）时出现：
-    截断会改变模型看到的内容，必须明确告知边界；全量回传与不回传时不提示。
+    历史思考剥离（只保留最近一次）是无条件机制，始终提示；回传长度
+    （末尾 N 字符）只在配置为正数时追加说明。历史工具结果的回传长度提示
+    只在配置为正数（截断回传）或 0（不回传）时出现：截断/省略会改变模型
+    看到的内容，必须明确告知边界；全量回传时不提示。
     MCP 工具执行超时为实时配置（用户可在聊天设置中修改），始终告知模型，
     便于其把长耗时操作拆分/分批，避免单次调用撞上超时被中止。
 
@@ -279,8 +281,19 @@ def build_sys_prompt(
     # tool_result_limit < 0：工具结果完整回传，无需提示
     if reasoning_limit > 0:
         # 与 full_reasoning[-reasoning_limit:] 的"末尾 N 字符"语义一致
-        notes.append(f"你的思考过程（reasoning_content）只会保留最后 {reasoning_limit} 字符。")
-    # reasoning_limit <= 0：完整回传或不回传，无需提示
+        # 历史思考剥离是无条件机制：无论回传长度配置如何，历史轮次的思考一律
+        # 不回传，只保留最近一次 API 调用的思考。重要结论应写入正文回复或调用
+        # 工具落盘，不要只留在思考里。
+        notes.append(
+            f"历史轮次的思考过程不会回传给你，只有最近一次的思考会保留（只保留最后 {reasoning_limit} 字符）；"
+            "重要结论应写入正文回复或调用工具落盘，不要只留在思考里。"
+        )
+    else:
+        # reasoning_limit <= 0：完整回传最近一次或不回传，但历史剥离机制不变
+        notes.append(
+            "历史轮次的思考过程不会回传给你，只有最近一次的思考会保留；"
+            "重要结论应写入正文回复或调用工具落盘，不要只留在思考里。"
+        )
     numbered_notes = "\n".join(f"{index}、{note}" for index, note in enumerate(notes, start=1))
     media_prompt = build_media_tag_prompt() if include_media_prompt else ""
     return (

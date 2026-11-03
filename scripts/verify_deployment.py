@@ -50,7 +50,7 @@ def assets(root=ROOT):
     found={}
     for page in PAGES:
         html=(root/"H5"/page.file).read_text(encoding="utf-8")
-        for relative,digest in re.findall(r'(?:src|href)="((?:js/[^"?]+\.js|(?:style/|js/)[^"?]+\.css|login\.(?:js|css)))\?v=([a-f0-9]{12})"',html):
+        for relative,digest in re.findall(r'(?:src|href)="((?:js/[^"?]+\.js|(?:css/|js/)[^"?]+\.css))\?v=([a-f0-9]{12})"',html):
             found[relative]=digest
     for owner,relative in (("js/history_parse_worker.js","history_parser.js"),("js/history_parse_async.js","js/history_parse_worker.js")):
         source=(root/"H5"/owner).read_text(encoding="utf-8")

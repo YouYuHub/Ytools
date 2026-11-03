@@ -523,7 +523,7 @@ class LoadAnyMediaTests(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_load_any_media_network_url(self):
-        # URL 直传：不再下载/入库，原样把 URL 作为多模态部件透传给上游
+        # URL 直传：探活通过后，原样把 URL 作为多模态部件透传给上游
         png = _make_png_bytes(40, 30)
         server = ThreadingHTTPServer(("127.0.0.1", 0), _StubMediaHandler)
         server_bytes = {}
@@ -546,8 +546,12 @@ class LoadAnyMediaTests(unittest.TestCase):
             info2 = bt.load_any_media_model_part(TEST_SESSION, raw_url)
             self.assertIsNotNone(info2)
             self.assertEqual(info2["part"]["image_url"]["url"], raw_url)
-            # 全程零请求：URL 不经服务器下载（404 与否由模型供应商处理）
-            self.assertEqual(server_bytes["hits"], 0)
+            # 注入前探活：每个 URL 一次探测请求（404 与否本地判定，不再丢给供应商）
+            self.assertEqual(server_bytes["hits"], 2)
+            # 死链：404 直接拒绝，不注入（否则上游整请求 400）
+            dead = bt.load_any_media_model_part(TEST_SESSION, f"http://127.0.0.1:{port}/image/nope.png")
+            self.assertIn("HTTP 404", dead["error"])
+            self.assertNotIn("part", dead)
         finally:
             server.shutdown()
             server.server_close()
@@ -689,6 +693,131 @@ class ConcurrencyGuardAndCorruptImageTests(unittest.TestCase):
             self.assertIn("无法解码为图片", result["error"])
         finally:
             _cleanup_test_session()
+
+
+class ProbeUrlMediaTests(unittest.TestCase):
+    """网络直链注入前探活：死链/错误页面直接拒绝，不注入。"""
+
+    def _resp(self, body, content_type="image/png"):
+        from email.message import Message
+
+        class FakeResp:
+            def __init__(self, body, content_type):
+                self._body = body
+                self.headers = Message()
+                self.headers["Content-Type"] = content_type
+
+            def read(self, n=-1):
+                data, self._body = self._body[:n], self._body[n:]
+                return data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return FakeResp(body, content_type)
+
+    def test_valid_image_passes(self):
+        with patch.object(bt, "permission_urlopen", return_value=self._resp(_make_png_bytes(8, 8))):
+            self.assertIsNone(bt._probe_url_media("https://example.test/ok.png"))
+
+    def test_svg_passes_on_content_type(self):
+        # SVG 无魔数：按 Content-Type 放行，不误杀
+        with patch.object(bt, "permission_urlopen", return_value=self._resp(b"<svg></svg>", "image/svg+xml")):
+            self.assertIsNone(bt._probe_url_media("https://example.test/a.svg"))
+
+    def test_http_error_rejected(self):
+        import urllib.error
+
+        err = urllib.error.HTTPError("https://example.test/no.png", 404, "Not Found", None, None)
+        with patch.object(bt, "permission_urlopen", side_effect=err):
+            result = bt._probe_url_media("https://example.test/no.png")
+            self.assertIn("HTTP 404", result)
+
+    def test_html_error_page_rejected(self):
+        # 200 但内容是 HTML 错误页：Content-Type + 魔数双重判定拒绝
+        with patch.object(bt, "permission_urlopen", return_value=self._resp(b"<html>oops</html>", "text/html")):
+            result = bt._probe_url_media("https://example.test/err.png")
+            self.assertIn("不是图片", result)
+
+    def test_dead_url_not_injected_end_to_end(self):
+        import urllib.error
+
+        err = urllib.error.HTTPError("https://example.test/no.png", 404, "Not Found", None, None)
+        with patch.object(bt, "permission_urlopen", side_effect=err):
+            info = bt.load_any_media_model_part(TEST_SESSION, "https://example.test/no.png")
+            self.assertIn("HTTP 404", info["error"])
+            self.assertNotIn("part", info)
+            result = bt.execute_read_media({"references": ["https://example.test/no.png"]}, TEST_SESSION, None)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["loaded"], [])
+            self.assertIn("HTTP 404", result["skipped"][0]["reason"])
+
+    def test_text_file_rejected_not_audio(self):
+        # 文本文件拒绝注入并指引 read_file，不再塞进 input_audio
+        tmp_dir = fm.HISTORY_ROOT / "text_reject_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for name in ("note.txt", "data.yml"):
+                p = tmp_dir / name
+                p.write_text("hello", encoding="utf-8")
+                info = bt.load_any_media_model_part(TEST_SESSION, str(p))
+                self.assertIn("read_file", info["error"])
+                self.assertNotIn("part", info)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_downsample_reports_original_mime(self):
+        # 降采样转码后如实报告原始 MIME
+        png = _make_png_bytes(2000, 1200)
+        tmp_dir = fm.HISTORY_ROOT / "mime_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "big.png"
+        tmp_path.write_bytes(png)
+        try:
+            info = bt.load_any_media_model_part(TEST_SESSION, str(tmp_path), quality=60)
+            self.assertNotIn("error", info)
+            self.assertTrue(info["downsampled"])
+            self.assertEqual(info["mime"], "image/jpeg")
+            self.assertEqual(info["original_mime"], "image/png")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_small_image_with_quality_is_not_marked_downsampled(self):
+        # 小图+显式 quality 只重编码不缩尺寸：downsampled 置假，但仍按要求质量输出
+        png = _make_png_bytes(40, 30)
+        tmp_dir = fm.HISTORY_ROOT / "smallq_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "small.png"
+        tmp_path.write_bytes(png)
+        try:
+            info = bt.load_any_media_model_part(TEST_SESSION, str(tmp_path), quality=60)
+            self.assertNotIn("error", info)
+            self.assertFalse(info["downsampled"])
+            self.assertEqual(info["mime"], "image/jpeg")
+            self.assertEqual(info["quality"], 60)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_already_injected_message_is_explicit(self):
+        png = _make_png_bytes(20, 16)
+        tmp_dir = fm.HISTORY_ROOT / "dedup_msg_probe"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "a.png"
+        tmp_path.write_bytes(png)
+        try:
+            first = bt.execute_read_media({"references": [str(tmp_path)]}, TEST_SESSION, None)
+            self.assertTrue(first["ok"])
+            second = bt.execute_read_media(
+                {"references": [str(tmp_path)]}, TEST_SESSION, None,
+                already_injected=set(first["injected_references"]),
+            )
+            self.assertFalse(second["ok"])
+            self.assertIn("无需重复读取", second["message"])
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

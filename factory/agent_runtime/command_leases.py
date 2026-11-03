@@ -18,7 +18,7 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
     bt._BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
     spec_path = bt._BG_LOG_DIR / ('bg_lease_' + uuid.uuid4().hex + '.json')
     script = spec_path.with_suffix('.run.cmd' if shell_kind == 'cmd' else '.run.ps1' if shell_kind in {'powershell', 'pwsh'} else '.run.sh')
-    bt._write_runner_script(script, shell_kind, command)
+    bt._write_runner_script(script, shell_kind, command, cwd)
     argv = ([shell_exe, '/c', str(script)] if shell_kind == 'cmd' else
             [shell_exe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
             if shell_kind in {'powershell', 'pwsh'} else [shell_exe, str(script)])
@@ -66,6 +66,20 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
         result['yielded'] = result['status'] == 'running'
         result['message'] += ' | 使用 poll_command 继续查询' if result['yielded'] else ''
         return result
+    except TimeoutError:
+        # 工具时限先于 yield 等待结束：保留已启动进程，转为后台式 lease，
+        # 归还 job_id 与已捕获输出（此前直接杀进程并抛裸错，输出全丢）。
+        # 注意与取消区分：ToolCancelledError 仍走下方杀进程路径。
+        if not job_id:
+            spec_path.with_suffix('.cancel').touch()
+            raise
+        try:
+            partial = command_jobs.incremental(job_id, session_id, '', max_chars, 0, check_deadline=False)
+        except Exception:
+            raise
+        partial['yielded'] = True
+        partial['message'] = (partial.get('message') or '') + ' | 工具等待超时，任务已转为后台继续，使用 poll_command 查询'
+        return partial
     except BaseException:
         if job_id:
             try:

@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const {JSDOM} = require('jsdom');
-const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
 
 function setup(t, count=600, stride=200) {
   const dom = new JSDOM('<div id="scroll"><div id="chat"></div></div><div id="nav"><div id="rail"></div><div id="panel"></div></div>');
@@ -13,11 +14,12 @@ function setup(t, count=600, stride=200) {
   Object.defineProperties(scroll, {scrollHeight:{value:5000}, clientHeight:{value:500}});
   scroll.getBoundingClientRect = () => ({top:60,bottom:560});
   const records = Array.from({length:count}, (_,i) => ({kind:i%stride===0?'user':'assistant',round:Math.floor(i/stride)+1,content:'记录 '+i,source_event_index:i%stride}));
-  const context = {chatInner,chatScroll:scroll,loadOlderState:{records,start:0,end:count},
+  const older = {records,start:0,end:count};
+  const context = {chatInner,chatScroll:scroll,loadOlderState:older,
     qnav:d.querySelector('#nav'),qnavRail:d.querySelector('#rail'),qnavPanel:d.querySelector('#panel'),QNAV_MAX_DASHES:40,
-    contentToPlainText:String,el(tag,cls,text){const n=d.createElement(tag);n.className=cls;n.textContent=text||'';return n;}};
+    contentToPlainText:String,App:{loadOlderState:older,contentToPlainText:String},el(tag,cls,text){const n=d.createElement(tag);n.className=cls;n.textContent=text||'';return n;}};
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('  let qnavUsers ='),source.indexOf('  // ---------- 从用户引用')),context);
+  vm.runInContext(source.slice(source.indexOf('  let qnavUsers'),source.indexOf('  // ---------- 从用户引用')),context);
   vm.runInContext(source.slice(source.indexOf('  function updateQnavActive()'),source.indexOf('  // ---------- 滚动：回到底部')),context);
   function mount(index,top,options={}) {
     const n=d.createElement('div');n.dataset.historyIndex=String(index);

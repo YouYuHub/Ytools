@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
 class Node {
   constructor(cls = '') {
@@ -35,7 +36,8 @@ function setup(width) {
     el: (tag, cls, text) => new Node(cls),
   };
   vm.createContext(context);
-  const core = fs.readFileSync(path.join(__dirname, '../js/app/core.js'), 'utf8');
+  // core 已迁移 TS：读 .ts 源码剥离类型后切片（发射产物重排版，切片锚点只在源码侧稳定）
+  const core = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/core.ts'), 'utf8'));
   const start = core.indexOf('  function fitAttachmentBlockGrid(');
   const end = core.indexOf('  // ---------- 导出到共享命名空间', start);
   vm.runInContext(core.slice(start, end), context);

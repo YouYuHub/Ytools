@@ -3,9 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const { JSDOM } = require('jsdom');
 
-const source = fs.readFileSync(path.join(__dirname, '../js/app/core.js'), 'utf8');
+// core 已迁移 TS：读 .ts 源码剥离类型后切片（发射产物重排版，切片锚点只在源码侧稳定）
+const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/core.ts'), 'utf8'));
 function setup() {
   const dom = new JSDOM('<main id="main"><div id="scroll"><div id="inner"><pre></pre></div></div><div id="composer"></div></main>');
   const { document } = dom.window;

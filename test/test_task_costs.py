@@ -196,3 +196,33 @@ def test_missing_or_invalid_usage_is_not_treated_as_free(usage):
     assert task["estimated_calls"] == 1
     assert task["usage"]["total_tokens"] > 0
     assert not store.reserve("t", tools=["main:next"])["allowed"]
+
+
+def test_zero_response_failure_settles_zero():
+    # 零响应失败（连接失败/重试无回包）：按 0 结算，不计估算/缺价
+    m = meter(); m.start_sync()
+    m.feed({"error": "ConnectionResetError", "retrying": True})
+    m.settle("unknown")
+    task = store.status("t")
+    assert task["usage"]["total_tokens"] == 0
+    assert task["estimated_calls"] == 0
+    assert task["unknown_price_calls"] == 0
+
+
+def test_retry_counts_only_reported_usage():
+    # 重试：失败尝试零结算，成功尝试按回传 usage 计，总量不虚增
+    from factory.agent_runtime.task_costs import network_attempt_sync, MODEL_METER
+    m = meter(); m.start_sync()
+    token = MODEL_METER.set(m)
+    try:
+        network_attempt_sync()
+        m.feed({"error": "ConnectionResetError", "retrying": True})
+        m.settle("unknown")
+        network_attempt_sync()
+        m.feed({"id": "r1", "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+        m.settle()
+    finally:
+        MODEL_METER.reset(token)
+    task = store.status("t")
+    assert task["usage"]["total_tokens"] == 15
+    assert task["estimated_calls"] == 0

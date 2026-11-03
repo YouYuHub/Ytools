@@ -3,12 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const { JSDOM } = require('jsdom');
 
-const chatSource = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
+const chatSource = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/chat.ts'), 'utf8'));
 const helperSource = chatSource.slice(
   chatSource.indexOf('  // 流错误的展示文案'),
-  chatSource.indexOf('  async function send(direct)'));
+  chatSource.indexOf('  async function send(direct'));
 
 // ---------- task_status.reconcileUncertain ----------
 

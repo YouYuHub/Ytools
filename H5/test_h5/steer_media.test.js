@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const QuoteUtils = require('../js/quote_utils.js');
 
 class Node {
@@ -38,9 +39,9 @@ function setup(options = {}) {
     },
   };
   vm.createContext(context);
-  const chat = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
+  const chat = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/chat.ts'), 'utf8'));
   vm.runInContext(chat.slice(chat.indexOf('  function buildUserContent('), chat.indexOf('  // V2 文件版本链')), context);
-  const composer = fs.readFileSync(path.join(__dirname, '../js/app/composer.js'), 'utf8');
+  const composer = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/composer.ts'), 'utf8'));
   vm.runInContext(composer.slice(composer.indexOf('  async function submitSteerOrQueue('), composer.indexOf('  // ---------- 弹层锚定工具')), context);
   return { context, state, calls, revoked, submit: mode => context.submitSteerOrQueue(mode || 'steer') };
 }

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 const Strip = require('../js/read_media_strip.js');
 
 function makeNode(tag, cls, text) {
@@ -207,7 +208,7 @@ test('图片加载失败就地替换为找不到占位', () => {
 });
 
 function renderStrip() {
-  const source = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+  const source = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_tools.ts'), 'utf8'));
   const start = source.indexOf('  /** read_media 结果的图片条');
   const end = source.indexOf('  /** 工具输出统一入口', start);
   const previews = [];

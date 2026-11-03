@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 
 // 最小 fake DOM：支持 class 记录、监听器记录与手动触发、按类名查询。
 class Node {
@@ -33,7 +34,7 @@ class Node {
 }
 
 function setup(count) {
-  const messages = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+  const messages = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
   const root = new Node('root');
   for (let i = 0; i < count; i++) {
     const user = new Node('msg-user'); user.appendChild(new Node('msg-bubble', '问题' + (i + 1)));
@@ -42,9 +43,10 @@ function setup(count) {
   const context = {
     chatInner: root, qnav: new Node('qnav'), qnavRail: new Node('rail'), qnavPanel: new Node('panel'),
     QNAV_MAX_DASHES: 40, el: (tag, cls, text) => new Node(cls, text), updateQnavActive() {},
+    App: {},
   };
   vm.createContext(context);
-  const navStart = messages.indexOf('  let qnavUsers =');
+  const navStart = messages.indexOf('  let qnavUsers');
   const navEnd = messages.indexOf('  // ---------- 从用户引用', navStart);
   vm.runInContext(messages.slice(navStart, navEnd), context);
   context.rebuildQnav();

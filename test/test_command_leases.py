@@ -88,6 +88,33 @@ def test_short_command_finishes_in_initial_call_with_actual_exit(logs, exit_code
         'job_id': result['job_id'], '_session_id': 'lease-test'})['output'] == ''
 
 
+def test_tool_timeout_during_yield_returns_running_job(logs, monkeypatch):
+    # 等待中工具时限先到：不杀进程，转后台式 lease 归还 job_id 与已捕获输出
+    shell = 'powershell' if os.name == 'nt' else 'sh'
+    real_incremental = command_jobs.incremental
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("工具执行超时")
+        return real_incremental(*args, **kwargs)
+
+    monkeypatch.setattr(command_jobs, 'incremental', flaky)
+    result = bt.try_execute_builtin_command_tool('run_command', {
+        'command': python_command("import time; print('begin', flush=True); time.sleep(20)", shell),
+        'shell': shell, 'work_dir': str(logs), 'yield_time_ms': 5000, 'timeout_seconds': 60,
+        '_session_id': 'lease-test'})
+    assert result['status'] == 'running', result
+    assert result['yielded'] is True
+    assert 'job_id' in result
+    assert 'poll_command' in result['message']
+    # 进程存活：后续可 poll 到输出
+    final = command_jobs.action(result['job_id'], 'poll', 'lease-test')
+    assert final['status'] == 'running'
+    command_jobs.action(result['job_id'], 'stop', 'lease-test')
+
+
 def test_total_timeout_still_applies_after_yield(logs):
     shell = 'powershell' if os.name == 'nt' else 'sh'
     result = bt.try_execute_builtin_command_tool('run_command', {

@@ -165,6 +165,73 @@ class MediaLimitTests(unittest.TestCase):
         self.assertEqual(resumed['messages'][-2]['content'], 'partial')
         self.assertIn('中断处继续', resumed['messages'][-1]['content'])
 
+    def test_native_doc_format_error_detection(self):
+        file_error = ('Invalid request format: 3 validation errors for GPT3Message\n'
+                        'content.list[nullable[union[str,MMGPT3Item]]].1.MMGPT3Item.file\n'
+                        "  Input should be a valid string [type=string_type, input_value={'type': 'file'}, input_type=dict]")
+        self.assertTrue(m.native_doc_format_error(file_error))
+        self.assertFalse(m.native_doc_format_error('[空响应体] log-id=- endpoint-id=-'))
+        self.assertFalse(m.learn_media_limit('HTTP 400 invalid tool_call_id', [], _model_config()))
+        self.assertFalse(m.native_doc_format_error('HTTP 400 invalid tool_call_id'))
+        self.assertFalse(m.native_doc_format_error(''))
+        self.assertFalse(m.native_doc_format_error(None))
+
+    def test_downgrade_native_doc_to_text(self):
+        import base64
+        body = base64.b64encode('张三\n电话 13800000000'.encode('utf-8')).decode()
+        messages = [{'role': 'user', 'content': [
+            {'type': 'text', 'text': '请看简历'},
+            {'type': 'file', 'file': {'filename': 'resume.txt', 'file_data': 'data:text/plain;base64,' + body}},
+        ]}]
+        original = copy.deepcopy(messages)
+        result = m.downgrade_native_doc_to_text(messages)
+        self.assertIsNotNone(result)
+        self.assertEqual(messages, original)
+        self.assertEqual(result[0]['content'][0], {'type': 'text', 'text': '请看简历'})
+        downgraded = result[0]['content'][1]
+        self.assertEqual(downgraded['type'], 'text')
+        self.assertIn('resume.txt', downgraded['text'])
+        self.assertIn('张三', downgraded['text'])
+        self.assertIn('13800000000', downgraded['text'])
+        self.assertNotIn('base64', downgraded['text'])
+        # 无 file 部件 → None（不触发降级）
+        self.assertIsNone(m.downgrade_native_doc_to_text([{'role': 'user', 'content': 'hi'}]))
+        self.assertIsNone(m.downgrade_native_doc_to_text([]))
+        # string 形态 file（网关原生格式）不动
+        self.assertIsNone(m.downgrade_native_doc_to_text(
+            [{'role': 'user', 'content': [{'type': 'file', 'file': 'file-abc123'}]}]))
+        # 解析失败 → 明确占位而非抛错
+        bad = [{'role': 'user', 'content': [{'type': 'file', 'file': {'filename': 'x.bin', 'file_data': '!!!not-base64!!!'}}]}]
+        failed = m.downgrade_native_doc_to_text(bad)
+        self.assertIn('解析失败', failed[0]['content'][0]['text'])
+
+    def test_downgrade_combined_gate(self):
+        file_error = 'MMGPT3Item.file Input should be a valid string'
+        self.assertIsNone(m.downgrade_native_doc_on_format_error('偶发 400', [{'role': 'user', 'content': 'hi'}]))
+        self.assertIsNone(m.downgrade_native_doc_on_format_error(file_error, [{'role': 'user', 'content': 'hi'}]))
+
+    def test_sse_file_format_400_downgrades_to_text_and_retries(self):
+        import base64
+        body = base64.b64encode('李四简历正文'.encode('utf-8')).decode()
+        file_error = ('Invalid request format: 3 validation errors for GPT3Message\n'
+                        'content.list[nullable[union[str,MMGPT3Item]]].1.MMGPT3Item.file\n'
+                        '  Input should be a valid string')
+        req = ChatLLMRequest(messages=[{'role': 'user', 'content': [
+            {'type': 'text', 'text': '请看附件'},
+            {'type': 'file', 'file': {'filename': 'resume.txt', 'file_data': 'data:text/plain;base64,' + body}},
+        ]}], max_tokens=32)
+        sock = _FakeSocket([_chunked_http(b'400 Bad Request', json.dumps({'error': file_error}).encode()), _sse_http(OK)])
+        with patch('chat.chat_llm.socket.create_connection', return_value=sock):
+            output = ''.join(ChatLLM.std_completions_sse(req, _model_config()))
+        self.assertIn('NATIVE_DOC_TEXT_DOWNGRADE', output)
+        self.assertIn('"content": "ok"', output)
+        payloads = [json.loads(data.split(b'\r\n\r\n', 1)[1]) for data in sock.sent]
+        self.assertEqual(len(payloads), 2)
+        self.assertIn('file_data', json.dumps(payloads[0]))
+        second = json.dumps(payloads[1], ensure_ascii=False)
+        self.assertNotIn('file_data', second)
+        self.assertIn('李四简历正文', second)
+
     def test_async_sse_downgrade(self):
         async def run():
             responses = [_sse_http(('data: ' + json.dumps({'error': {'message': ERROR}}) + '\n').encode()), _sse_http(OK)]

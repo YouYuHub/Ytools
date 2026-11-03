@@ -18,6 +18,7 @@ MCP 网页工具服务（web_tools_server）。
 # 标准库
 import asyncio
 import base64
+import json
 import re
 import sys
 import zlib
@@ -25,7 +26,7 @@ from html import unescape
 from html.parser import HTMLParser
 from http.client import IncompleteRead
 from pathlib import Path
-from typing import Optional, Annotated, Literal
+from typing import Optional, Annotated, Literal, Union
 from pydantic import Field
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, parse_qs, urljoin
@@ -370,6 +371,46 @@ class _HttpResult(tuple):
         return result
 
 
+def _dns_resolves(hostname: str) -> bool:
+    """DNS 存活探针（3 秒上限，任何异常视为不可达）。
+
+    某些网络会劫持 DNS 并在 TLS 阶段失败，错误表面是 SSL，根因是域名
+    问题；SSL 失败时反查一次 DNS 以正确归类。仅失败路径调用。
+    """
+    import concurrent.futures as _futures
+    import socket as _socket
+    try:
+        with _futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_socket.getaddrinfo, hostname, 443, 0, _socket.SOCK_STREAM)
+            future.result(timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def _classify_url_error(exc: BaseException, url: str) -> str:
+    """把 urlopen 异常归类为 DNS / 连接 / TLS / 超时四类中文说明。"""
+    import socket as _socket
+    import ssl as _ssl
+    host = urlsplit(url).hostname or url
+    root = getattr(exc, "reason", exc)
+    if isinstance(root, _ssl.SSLCertVerificationError):
+        return f"TLS 证书验证失败：{host}（{root}）；请检查系统时间/证书或更换来源"
+    if isinstance(root, _ssl.SSLError):
+        if not _dns_resolves(host):
+            return f"DNS 解析失败：{host}；请检查域名拼写与网络（TLS 报错为表象）"
+        return f"TLS 握手失败：{host}（{root}）"
+    if isinstance(root, _socket.gaierror):
+        return f"DNS 解析失败：{host}（{root}）；请检查域名拼写与网络"
+    if isinstance(root, (_socket.timeout, TimeoutError)):
+        return f"连接超时：{host}；可调大 timeout_seconds 重试"
+    if isinstance(root, ConnectionRefusedError):
+        return f"连接被拒绝：{host}；目标端口可能未监听"
+    if isinstance(root, ConnectionResetError):
+        return f"连接被重置：{host}；可能被中间设备拦截，可稍后重试"
+    return f"请求失败：{url}（{root}）"
+
+
 def _http_request(url: str, method: str = "GET", body: str = "", headers: Optional[dict] = None,
                   timeout_seconds: float = 30.0, allow_partial: bool = False) -> tuple:
     """执行 HTTP 请求，返回 (最终 URL, 状态码, Content-Type, 原始字节)。
@@ -392,6 +433,8 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
             response = urlopen(request, timeout=remaining_seconds(timeout_seconds))
         except HTTPError as exc:
             response = exc  # HTTP 错误仍有可读正文，使用同样的大小与解压保护。
+        except TimeoutError:
+            raise  # 工具时限，不归类为网络错误
         with response:
             chunks = []
             transferred = 0
@@ -450,7 +493,7 @@ def _http_request(url: str, method: str = "GET", body: str = "", headers: Option
                     pass  # 解压失败则按原样返回，交由上层按文本处理
             return _HttpResult(response.geturl(), response.status, content_type, raw, dict(response.headers), partial_note)
     except URLError as exc:
-        raise ValueError(f"请求失败: {url}（{exc.reason}）") from exc
+        raise ValueError(_classify_url_error(exc, url)) from exc
     except TimeoutError as exc:
         raise ValueError(f"请求超时: {url}") from exc
 
@@ -470,9 +513,17 @@ def _pick_web_charset(content_type: str, raw: bytes, encoding: str) -> str:
 # ============================ 网页工具实现 ============================
 def _fetch_url_impl(url, mode, pattern, tag, max_chars, timeout_seconds,
                     encoding, method, body, headers, offset=0) -> str:
+    # body 接受对象/数组：内部转 JSON（自然写法不再被 schema 拒绝）
+    if isinstance(body, (dict, list)):
+        try:
+            body = json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"body 无法序列化为 JSON：{exc}；请传字符串或可序列化对象")
+    elif body is not None and not isinstance(body, str):
+        raise ValueError("body 须为字符串或可 JSON 序列化的对象/数组")
     values = {"url": url, "mode": mode, "pattern": pattern, "tag": tag, "max_chars": max_chars,
               "timeout_seconds": timeout_seconds, "encoding": encoding, "method": method,
-              "body": body, "offset": offset}
+              "body": body or "", "offset": offset}
     for key, maximum in (("url", 8192), ("mode", 20), ("pattern", 8192), ("tag", 4096),
                          ("encoding", 64), ("method", 20), ("body", 2 * 1024 * 1024)):
         string_arg(values, key, max_length=maximum)
@@ -1110,7 +1161,19 @@ class _DdgResultParser(HTMLParser):
             self.current[2] = "".join(chunks).strip()[:300]
 
 
-def _fetch_ddg_results(query: str, limit: int) -> tuple:
+# DuckDuckGo 熔断器：连续失败后一段时间内跳过尝试（每次尝试最多浪费
+# 2×15s），auto 模式直接用 Bing 结果并在诊断里说明；成功一次即复位。
+_DDG_BREAKER_FAILS = 0
+_DDG_BREAKER_SKIP_UNTIL = 0.0
+_DDG_BREAKER_THRESHOLD = 3
+_DDG_BREAKER_COOLDOWN_SECONDS = 600
+
+
+def _fetch_ddg_results(query: str, limit: int, *, ignore_breaker: bool = False) -> tuple:
+    global _DDG_BREAKER_FAILS, _DDG_BREAKER_SKIP_UNTIL
+    import time as _time
+    if not ignore_breaker and _time.monotonic() < _DDG_BREAKER_SKIP_UNTIL:
+        raise ValueError("DuckDuckGo 近期连续失败，熔断跳过中（仅 Bing 结果）")
     failures = []
     last_page = ("", "")
     # HTML 无法解析/访问失败时仅追加一次 Lite 尝试，不绕过验证码，也不无限重试。
@@ -1126,8 +1189,10 @@ def _fetch_ddg_results(query: str, limit: int) -> tuple:
             if parser.current:
                 parser.results.append(tuple(parser.current))
             if parser.results:
+                _DDG_BREAKER_FAILS = 0
                 return _relevance_rank(_dedupe_results(parser.results, limit * 3), query, limit * 3), False
             if re.search(r"no results|no-results|没有找到", html_text, re.I):
+                _DDG_BREAKER_FAILS = 0
                 return [], False
             raise ValueError("未解析到结果：可能验证码、访问受限或页面结构变化")
         except (ValueError, OSError) as exc:
@@ -1135,7 +1200,11 @@ def _fetch_ddg_results(query: str, limit: int) -> tuple:
     if last_page[1]:
         rescued = _generic_link_fallback(last_page[1], last_page[0], query, limit * 3)
         if rescued:
+            _DDG_BREAKER_FAILS = 0
             return rescued, True
+    _DDG_BREAKER_FAILS += 1
+    if _DDG_BREAKER_FAILS >= _DDG_BREAKER_THRESHOLD:
+        _DDG_BREAKER_SKIP_UNTIL = _time.monotonic() + _DDG_BREAKER_COOLDOWN_SECONDS
     raise ValueError("DuckDuckGo HTML/Lite 均失败：" + "；".join(failures))
 
 
@@ -1186,7 +1255,8 @@ def _web_search_checked(query, limit, engine):
                 diagnostics.append(f"DuckDuckGo: {exc}")
     if not results:
         try:
-            results, ddg_fallback = _fetch_ddg_results(query, candidate_limit)
+            # 显式 engine=ddg 绕过熔断（用户明确要求就试一次）；auto 回退遵守熔断
+            results, ddg_fallback = _fetch_ddg_results(query, candidate_limit, ignore_breaker=(engine_key == "ddg"))
             engine_name = "DuckDuckGo（Bing 无结果/不可达或显式指定）"
             if ddg_fallback:
                 engine_name = "DuckDuckGo非结构化兜底"
@@ -1243,7 +1313,7 @@ async def fetch_url(
     timeout_seconds: Annotated[float, Field(strict=True, ge=1, le=120, allow_inf_nan=False, description="请求总时限秒数，默认 30")] = 30.0,
     encoding: Annotated[str, Field(max_length=64, description="响应编码；省略自动判断")] = "",
     method: Annotated[str, Field(min_length=1, max_length=20, description="HTTP 方法，默认 GET")] = "GET",
-    body: Annotated[str, Field(max_length=2 * 1024 * 1024, description="请求体；默认 Content-Type 为 application/json")] = "",
+    body: Annotated[Union[str, dict, list], Field(description="请求体；可传对象/数组（自动转 JSON）或字符串；默认 Content-Type 为 application/json")] = "",
     headers: Annotated[Optional[dict[str, str]], Field(max_length=64, description="附加请求头字符串键值对象")] = None,
     offset: Annotated[int, Field(strict=True, ge=0, description="GET/HEAD 文本字符偏移；按 next_offset 续读，每次重新请求")] = 0,
 ) -> str:

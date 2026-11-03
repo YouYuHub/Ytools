@@ -1,0 +1,1303 @@
+/**
+ * 后端 API 封装（见 docs/api_docs.md）
+ * 同源部署：直接使用 location.origin；独立 fixture 回退文档约定地址。
+ */
+const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.protocol))
+  ? location.origin : "http://127.0.0.1:48621";
+
+(function(global: any) {
+  const BASE = api_url.replace(/\/$/, "");
+  async function request(path: any, options?: any) {
+    const res = await fetch(BASE + path, options);
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const body = await res.json();
+        if (Array.isArray(body.detail)) {
+          // FastAPI 422 校验错误：detail 是数组，逐条转成可读文本
+          detail = body.detail.map(function(item: any) {
+            const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
+            return (loc ? loc + ": " : "") + (item.msg || JSON.stringify(item));
+          }).join("; ");
+        } else {
+          detail = body.detail || body.message || JSON.stringify(body);
+        }
+      } catch (_) { /* 忽略非 JSON 响应 */ }
+      const error: any = new Error(detail);
+      error.status = res.status;
+      throw error;
+    }
+    return res.json();
+  }
+
+  function terminalSessionQuery(sessionId: any) {
+    if (!sessionId) throw new Error("后台终端需要指定当前会话");
+    return "?session_id=" + encodeURIComponent(sessionId);
+  }
+  function taskCostConfig(sessionId: any) {
+    return request("/task_costs/config" + (sessionId ? "?session_id=" + encodeURIComponent(sessionId) : ""));
+  }
+  function saveTaskCostConfig(limits: any, sessionId: any) {
+    return request("/task_costs/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limits: limits, session_id: sessionId || null }) });
+  }
+  function saveTaskPricing(pricing: any) {
+    return request("/task_costs/pricing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(pricing) });
+  }
+  function taskCostUsage(sessionId: any, options: any) {
+    return request("/task_costs/usage?session_id=" + encodeURIComponent(sessionId), options);
+  }
+  function continueTaskBudget(task: any, limits: any) {
+    return request("/task_costs/" + encodeURIComponent(task.id) + "/continue", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: task.session_id, version: task.version, limits: limits }) });
+  }
+  function stopTaskBudget(task: any) {
+    return request("/task_costs/" + encodeURIComponent(task.id) + "/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: task.session_id }) });
+  }
+  function listTerminalJobs(sessionId: any, options: any) { return request("/terminal/jobs" + terminalSessionQuery(sessionId), options); }
+  function getTerminalJob(id: any, sessionId: any, options: any) {
+    return request("/terminal/jobs/" + encodeURIComponent(id) + terminalSessionQuery(sessionId), options);
+  }
+  function operateTerminalJob(id: any, operation: any, sessionId: any) {
+    return request("/terminal/jobs/" + encodeURIComponent(id) + "/" + operation + terminalSessionQuery(sessionId), { method: "POST" });
+  }
+  function terminalLogUrl(id: any, sessionId: any) {
+    return BASE + "/terminal/jobs/" + encodeURIComponent(id) + "/log/download" + terminalSessionQuery(sessionId);
+  }
+
+  // XHR 的 upload 事件提供真实的已发送字节数；100% 后等待服务端解析/保存。
+  function uploadRaw(path: any, file: any, onProgress?: any, signal?: any) {
+    if (global.YtoolsAuth && global.YtoolsAuth.upload) return global.YtoolsAuth.upload(BASE + path,file,onProgress,signal);
+    return new Promise(function(resolve: any, reject: any) {
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+      function finish(error: any, result?: any) {
+        if (settled) return;
+        settled = true;
+        if (signal) signal.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolve(result);
+      }
+      function abort() { xhr.abort(); }
+      xhr.open("POST", BASE + path);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = function(event: any) {
+        if (onProgress && event.lengthComputable) {
+          onProgress({ phase: "upload", percent: Math.min(100, Math.round(event.loaded / event.total * 100)) });
+        }
+      };
+      xhr.upload.onload = function () {
+        if (onProgress) onProgress({ phase: "processing", percent: 100 });
+      };
+      xhr.onload = function () {
+        let body;
+        try { body = JSON.parse(xhr.responseText); } catch (_) { body = {}; }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          finish(new Error(body.detail || body.message || ("上传失败 " + xhr.status)));
+          return;
+        }
+        if (onProgress) onProgress({ phase: "done", percent: 100 });
+        finish(null, body);
+      };
+      xhr.onerror = function () { finish(new Error("网络连接中断")); };
+      xhr.onabort = function () { const error = new Error("上传已取消"); (error as any).name = "AbortError"; finish(error); };
+      if (signal) {
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) { abort(); return; }
+      }
+      if (onProgress) onProgress({ phase: "upload", percent: 0 });
+      xhr.send(file);
+    });
+  }
+
+  // 批量上传：全部请求同时发出，总耗时≈最慢单个（串行是累加）。
+  // Promise.all 按输入顺序结算，results 下标与 files 一一对应
+  // （chat.ts 用 results[index] 回填 items[index]，顺序不能乱）；
+  // 各文件独立 catch：单个失败只记 failed，不影响其它（与串行版一致）；
+  // AbortError 穿透整批抛 AbortError（各 XHR 共用 signal，中断时都会 abort）。
+  async function uploadRawBatch(path: any, files: any, onProgress: any, signal: any) {
+    const selected: any = Array.from(files || []);
+    if (selected.length > 10) throw new Error("最多上传 10 个文件");
+    const separator = path.includes("?") ? "&" : "?";
+    const settled = await Promise.all(selected.map(function (file: any, index: any) {
+      return uploadRaw(path + separator + "filename=" + encodeURIComponent(file.name), file,
+        function (progress: any) { if (onProgress) onProgress(index, progress, file); }, signal
+      ).then(function (data: any) {
+        return { data: data, file: file, error: null };
+      }, function (error: any) {
+        if ((error as any).name === "AbortError") throw error;
+        if (onProgress) onProgress(index, { phase: "error", percent: 0 }, file);
+        return { data: null, file: file, error: error };
+      });
+    }));
+    const combined: any = { total: selected.length, success: 0, failed: 0, results: [], upload_id: null };
+    settled.forEach(function (entry: any) {
+      if (entry.data) {
+        combined.success += entry.data.success || 0;
+        combined.failed += entry.data.failed || 0;
+        combined.results.push.apply(combined.results, entry.data.results || []);
+        if (entry.data.upload_id) combined.upload_id = entry.data.upload_id;
+      } else {
+        combined.failed++;
+        combined.results.push({ filename: entry.file.name, status: "failed", message: (entry.error as any).message });
+      }
+    });
+    return combined;
+  }
+
+  // ---------- 会话历史 ----------
+  function listSessions() {
+    return request("/chat_history/sessions");
+  }
+
+  function listSessionSummaries(sessionId: any, options: any) {
+    options = options || {};
+    const params = new URLSearchParams({ archive_scope: options.archiveScope || (sessionId == null ? "active" : "all") });
+    if (sessionId != null) params.set("session_id", sessionId);
+    if (options.withArchiveState) params.set("with_archive_state", "true");
+    return request("/chat_history/summaries?" + params.toString());
+  }
+
+  function setSessionArchived(sessionId: any, archived: any) {
+    return request("/chat_history/archive", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, archived: archived }) });
+  }
+  function listArchivedSessions(query: any, offset: any, signal: any) {
+    return request("/chat_history/archives?" + new URLSearchParams({ q: query || "", offset: String(offset || 0), limit: "50" }), { signal: signal });
+  }
+
+  function streamStatus(sessionId: any) {
+    return request("/chat_stream/status?session_id=" + encodeURIComponent(sessionId));
+  }
+  function streamStatuses(signal: any) {
+    return request("/chat_stream/statuses", { signal: signal });
+  }
+
+  function getSessionMeta(sessionId: any) {
+    return request("/chat_history/meta?session_id=" + encodeURIComponent(sessionId));
+  }
+
+  /**
+   * 前端触发的会话标题生成（SSE 流内采集到预览后调用一次，非轮询）。
+   * 后端调标题模型生成、写盘并同步返回标题（已生成过/失败/未配置时
+   * 返回 skipped + 当前盘上标题）；前端收到即替换侧栏标题。
+   * @param {{session_id, question_text?, model_preview?, question_parts?}} body
+   */
+  function generateSessionTitle(body: any) {
+    return request("/chat_config/generate_title", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  /**
+   * 获取当前会话的模型上下文 token 统计。
+   * @param {string} sessionId 会话 ID
+  * @param {number} [maxRounds] 参与统计的最近轮数；<=0 表示全部；省略时由服务端跟随聊天设置
+   * @param {string[]} [toolNames] 当前选中的工具名称
+   */
+  function getContextTokenStats(sessionId: any, maxRounds: any, toolNames: any) {
+    const params = new URLSearchParams();
+    params.set("session_id", sessionId || "default");
+    if (maxRounds != null) params.set("max_rounds", String(maxRounds));
+    // 只有当前确实选了工具时才统计工具 schema，避免无工具状态产生额外开销。
+    if (Array.isArray(toolNames) && toolNames.length) {
+      params.set("include_tools", "true");
+      toolNames.forEach(function(name: any) { params.append("tool_names", name); });
+    }
+    return request("/chat_context/token_stats?" + params.toString());
+  }
+
+  function getContextOverview(sessionId: any, toolNames: any, offset: any, signal: any) {
+    const params = new URLSearchParams({ session_id: sessionId, inspection: "true", max_rounds: "0",
+      round_offset: String(offset || 0), round_limit: "40" });
+    if (Array.isArray(toolNames) && toolNames.length) {
+      params.set("include_tools", "true");
+      toolNames.forEach((name: any) => params.append("tool_names", name));
+    }
+    return request("/chat_context/token_stats?" + params.toString(), { signal: signal });
+  }
+
+  function updateSessionTitle(sessionId: any, title: any) {
+    return request(
+      "/chat_history/title?title=" + encodeURIComponent(title) + "&session_id=" + encodeURIComponent(sessionId),
+      { method: "PUT" }
+    );
+  }
+
+  function fetchSessionFile(sessionId: any) {
+    return fetch(BASE + "/chat_history/file?session_id=" + encodeURIComponent(sessionId)).then(function(res: any) {
+      if (!res.ok) throw new Error("加载会话失败");
+      return res.text();
+    });
+  }
+
+  function fetchSessionPage(sessionId: any, options: any) {
+    options = options || {};
+    const params = new URLSearchParams({session_id:sessionId,limit:String(options.limit || 20)});
+    ["before","around","revision","include_questions"].forEach(function(key: any) {
+      if (options[key] != null) params.set(key,String(options[key]));
+    });
+    return request("/chat_history/page?"+params.toString(),{signal:options.signal});
+  }
+
+  function fetchHistoryEvent(sessionId: any, ref: any, signal: any) {
+    const params=new URLSearchParams({session_id:sessionId,round_no:String(ref.round),event_index:String(ref.event_index),revision:ref.revision});
+    return request("/chat_history/event?"+params.toString(),{signal:signal});
+  }
+
+  function searchHistory(query: any, options: any) {
+    options = options || {};
+    const params = new URLSearchParams({ q: query, limit: String(options.limit || 40), offset: String(options.offset || 0) });
+    params.set("include_internal", String(Boolean(options.includeInternal)));
+    params.set("include_filenames", String(Boolean(options.includeFilenames)));
+    params.set("archive_scope", options.archiveScope || "active");
+    if (options.revision) params.set("revision", options.revision);
+    return request("/chat_history/search?" + params.toString(), { signal: options.signal });
+  }
+
+  function getPermissions(session: any) { return request("/chat_config/permissions" + (session ? "?session_id=" + encodeURIComponent(session) : "")); }
+  function setPermissions(mode: any, session: any) { return request("/chat_config/permissions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, session_id: session || null }) }); }
+  function pendingApprovals(session: any, ids: any) {
+    return request("/tool_approvals/pending?session_id=" + encodeURIComponent(session) +
+      (ids || []).slice(-200).map((id: any) => "&approval_ids=" + encodeURIComponent(id)).join(""));
+  }
+  function decideApproval(approval: any, decision: any) { return request("/tool_approvals/" + encodeURIComponent(approval.id) + "/decision", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: approval.session_id, epoch: approval.epoch, decision }) }); }
+  function previewPermission(session: any, source: any) { return request("/tool_approvals/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session, source }) }); }
+  function cancelPermissionTask(taskId: any, session: any) { return request("/tool_approvals/tasks/" + encodeURIComponent(taskId) + "/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) }); }
+  function resumePermissionTask(taskId: any, session: any) { return request("/tool_approvals/tasks/" + encodeURIComponent(taskId) + "/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) }); }
+  function permissionMediaUrl(session: any, source: any, grant: any) { return BASE + "/permissions/media?session_id=" + encodeURIComponent(session || "default") + "&source=" + encodeURIComponent(source) + (grant ? "&grant=" + encodeURIComponent(grant) : ""); }
+
+  function deleteSession(sessionId: any) {
+    return request("/chat_history/delete_file?session_id=" + encodeURIComponent(sessionId), { method: "DELETE" });
+  }
+
+  // ---------- 会话分组 ----------
+  /** 列出全部分组 + 会话归属映射（{groups:[...], assignments:{sid:gid}}）。 */
+  function listSessionGroups() {
+    return request("/chat_history/groups");
+  }
+
+  /** 新建分组；同名已存在时后端返回既有分组（幂等）。 */
+  function createSessionGroup(name: any) {
+    return request("/chat_history/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+  }
+
+  /** 重命名分组 / 更新折叠状态（字段省略表示不修改）。 */
+  function updateSessionGroup(groupId: any, payload: any) {
+    return request("/chat_history/groups/" + encodeURIComponent(groupId), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+  }
+
+  /** 删除分组（后端连带解除其全部成员会话的归属）。 */
+  function deleteSessionGroup(groupId: any) {
+    return request("/chat_history/groups/" + encodeURIComponent(groupId), { method: "DELETE" });
+  }
+
+  /** 把会话加入分组 / 移出分组（groupId 传 null 或空串 = 移出）。 */
+  function assignSessionGroup(sessionId: any, groupId: any) {
+    return request("/chat_history/group_assign", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", group_id: groupId || null }),
+    });
+  }
+
+  /**
+   * 上传 jsonl 聊天历史文件到后端（保存为后端会话）
+   * @param {string} sessionId 目标会话ID（可传文件名，后端会自动去掉后缀并规整）
+   * @param {File} file jsonl 文件
+   * @param {boolean} [overwrite=false] 是否强制覆盖同名历史文件；False 时同名自动追加时间戳另存
+   * @returns {Promise<{state, session_id, filename, imported_rounds, collision, meta, ...}>}
+   */
+  function uploadChatHistory(sessionId: any, file: any, overwrite: any) {
+    const params = new URLSearchParams();
+    params.set("session_id", sessionId || "default");
+    params.set("filename", file.name);
+    if (overwrite) params.set("overwrite", "true");
+    return uploadRaw("/chat_history/upload_chat_file?" + params.toString(), file);
+  }
+
+  // ---------- 会话分享 / 多会话导入（zip / jsonl 两阶段） ----------
+  /**
+   * 把一个或多个会话打包为 zip 下载。
+   * 响应为二进制 zip；以 <a download> 方式触发浏览器下载。
+   * @param {string[]} sessionIds 会话 ID 列表（单会话即 zip 分享）
+   * @returns {Promise<{skipped:string[], name:string}>} skipped 为不存在的会话
+   */
+  async function exportSessionsZip(sessionIds: any) {
+    // 逗号分隔单值传参：后端 session_ids 是标量 str（重复键会被丢弃只留最后一个）
+    const params = new URLSearchParams();
+    params.set("session_ids", (sessionIds || []).join(","));
+    const res = await fetch(BASE + "/chat_history/export_zip?" + params.toString());
+    if (!res.ok) {
+      let detail = "导出失败 " + res.status;
+      try {
+        const body = await res.json();
+        if (body.detail) detail = body.detail;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const skipped: any = [];
+    try {
+      (res.headers.get("X-Skipped-Sessions") || "")
+        .split(",").forEach(function(s: any) { if (s) skipped.push(decodeURIComponent(s)); });
+    } catch (_) { /* 头缺失忽略 */ }
+    // 从 Content-Disposition 提取 UTF-8 文件名（单会话 <id>_chat.zip / 多会话带时间戳）
+    const dispo = res.headers.get("Content-Disposition") || "";
+    const m = dispo.match(/filename\*=UTF-8''([^;]+)/i);
+    const name = m ? decodeURIComponent(m[1]) : "ytools_sessions.zip";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    (document.body as HTMLElement).appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    return { skipped: skipped, name: name };
+  }
+
+  /**
+   * 导入预检（不落盘）：上传 zip/jsonl，返回会话清单与本地冲突列表
+   * @param {File} file zip 或 jsonl 文件
+   * @returns {Promise<{type, filename, total, sessions:Array, conflicts:string[]}>}
+   */
+  function previewImport(file: any) {
+    return uploadRaw("/chat_history/import_preview?filename=" + encodeURIComponent(file.name), file);
+  }
+
+  /**
+   * 导入提交（第二阶段）：按逐会话冲突决策写入
+   * @param {File} file 同预检的文件（后端无状态，需重传）
+   * @param {string} [conflictStrategy="ask"] 全局策略 ask/overwrite/rename/skip
+   * @param {Object<string,string>} [decisions] {session_id: overwrite|rename|skip}
+   * @returns {Promise<{state, imported:Array, skipped:Array, failed:Array}>}
+   */
+  function submitImport(file: any, conflictStrategy: any, decisions: any) {
+    const params = new URLSearchParams();
+    params.set("filename", file.name);
+    params.set("conflict_strategy", conflictStrategy || "ask");
+    if (decisions && Object.keys(decisions).length) {
+      params.set("decisions", JSON.stringify(decisions));
+    }
+    return uploadRaw("/chat_history/import_package?" + params.toString(), file);
+  }
+
+  // ---------- 工具 ----------
+  /**
+   * 列出工具；后端默认复用 TTL 内的探测缓存（首屏毫秒级返回），
+   * refresh 为 true 时要求绕过缓存强制重探（"配置工具"弹窗的刷新按钮）
+   */
+  function listTools(refresh: any) {
+    return request("/tools/list" + (refresh ? "?refresh=1" : ""));
+  }
+
+  function mcpDiagnosticServers(signal: any) { return request("/tools/diagnostics", { signal: signal }); }
+  function listTaskTemplates(signal: any) { return request("/task_templates", { signal }); }
+  function validateTaskTemplate(template: any) { return request("/task_templates/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(template) }); }
+  function taskTemplateOptions(session: any, signal: any) { return request("/task_templates/options" + (session ? "?source_session_id=" + encodeURIComponent(session) : ""), { signal }); }
+  function getTaskTemplate(id: any, signal: any) { return request("/task_templates/" + encodeURIComponent(id), { signal }); }
+  function saveTaskTemplate(template: any, id: any, version: any) {
+    return request("/task_templates" + (id ? "/" + encodeURIComponent(id) : ""), { method: id ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(id ? { template, version } : template) });
+  }
+  function deleteTaskTemplate(id: any, version: any) { return request("/task_templates/" + encodeURIComponent(id) + "?version=" + version, { method: "DELETE" }); }
+  function previewTaskTemplate(template: any, session: any, signal: any) { return request("/task_templates/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ template, source_session_id: session || null }), signal }); }
+  function startTaskTemplate(template: any, session: any, requestId: any, fingerprint: any) { return request("/task_templates/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ template, source_session_id: session || null, request_id: requestId, expected_fingerprint: fingerprint }) }); }
+  function testMcpServer(payload: any, signal: any) {
+    return request("/tools/diagnostics", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload), signal: signal });
+  }
+
+  // ---------- 模型配置 ----------
+  /**
+   * 获取模型列表与指定角色（chat/compaction/title）的选择配置
+   * @param {string} [role="chat_model"] 角色：chat_model / compaction_model / title_model
+   */
+  /**
+   * 列出 models.json 中所有可用的 provider / model 组合，并返回指定角色的完整配置
+   * 传 sessionId 时按「会话覆盖 → 全局默认」返回该会话的生效选择
+   * （role_info 附加 is_overridden，响应含 session_selection/effective_selection/warning）
+   * @param {string} [role] chat_model / compaction_model / title_model，默认 chat_model
+   * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [forceRefresh=false] 强制绕过浏览器缓存，重新读取模型配置
+   */
+  function getModels(role: any, sessionId: any, forceRefresh: any) {
+    const params = new URLSearchParams();
+    if (role) params.set("role", role);
+    if (sessionId) params.set("session_id", sessionId);
+    return request(
+      "/chat_config/models" + (params.toString() ? "?" + params.toString() : ""),
+      forceRefresh ? { cache: "no-store" } : undefined
+    );
+  }
+
+  /**
+   * 选择模型（可选参数）并保存配置
+   * 不传 sessionId：写全局默认（models.json 顶层 model_selection）
+   * 传 sessionId：写入该会话 _meta.model_selection（仅覆盖该角色）
+   * @param {string} provider 服务商名（models.json provider 键）
+   * @param {string} model 模型名（models.json models 键）
+   * @param {string} [role="chat_model"] 角色
+   * @param {object|null} [parameter] 生成参数（按 api_type 分桶）；null 表示仅切换模型、保留原参数桶
+   * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [clear] 仅会话级有效：清除该会话当前角色的独立模型选择，恢复跟随全局默认
+   * @param {Array|null} [headers] 该角色自定义请求头 [{name, value}]；null 保持现有配置，[] 清空
+   */
+  function selectModel(provider: any, model: any, role: any, parameter: any, sessionId: any, clear: any, headers: any) {
+    const body: any = { provider: provider, model: model };
+    if (role) body.role = role;
+    if (parameter !== undefined) body.parameter = parameter;
+    if (headers !== undefined) body.headers = headers;
+    if (sessionId) {
+      body.session_id = sessionId;
+      if (clear) body.clear = true;
+    }
+    return request("/chat_config/models/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function getHistoryCompactionConfig(sessionId: any) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/history_compaction" + query);
+  }
+
+  /**
+   * 获取已保存的工具选择
+   * 不传 sessionId：全局默认（setting/mcp_servers.json 的 inputs 键）
+   * 传 sessionId：附加会话独立选择信息
+   * （session_selection/effective_selection/is_overridden/warning，见 docs/api_docs.md）
+   * @param {string} [sessionId] 会话 ID
+   * @returns {Promise<{state, inputs: Object<string, string[]>, servers: string[]}>}
+   */
+  function getToolSelection(sessionId: any) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/tool_selection" + query);
+  }
+
+
+  /**
+   * 保存工具选择
+   * 不传 sessionId：写回全局默认 setting/mcp_servers.json 的 inputs 键（新建会话前的默认）
+   * 传 sessionId：写入该会话 _meta.tool_selection 覆盖快照（空 inputs = 显式无工具模式，
+   * 不再回退全局默认）；clear=true 时忽略 inputs，清除会话覆盖恢复跟随全局
+   * @param {Object<string, string[]>} inputs 服务名 -> 工具名数组；未提及的已配置服务保存为 []
+   * @param {string} [sessionId] 会话 ID
+   * @param {boolean} [clear] 仅会话级有效：清除该会话的工具选择覆盖，恢复跟随全局默认
+   */
+  function updateToolSelection(inputs: any, sessionId: any, clear: any) {
+    const body: any = sessionId
+      ? { inputs: inputs || {}, session_id: sessionId }
+      : { inputs: inputs || {} };
+    if (sessionId && clear) body.clear = true;
+    return request("/chat_config/tool_selection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * 读取会话「每条消息重新标题」开关（会话独立配置）
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{state, enabled, exists, title_state: {title_generated, attempted}}>}
+   */
+  function getRetitleSetting(sessionId: any) {
+    return request("/chat_config/retitle_setting?session_id=" + encodeURIComponent(sessionId));
+  }
+
+  /**
+   * 写入会话「每条消息重新标题」开关（会话独立配置，仅对本会话生效）
+   * @param {string} sessionId 会话 ID
+   * @param {boolean} enabled true=每轮收尾都重新生成标题；false=仅首轮生成一次
+   */
+  function updateRetitleSetting(sessionId: any, enabled: any) {
+    return request("/chat_config/retitle_setting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, enabled: Boolean(enabled) }),
+    });
+  }
+
+  function updateHistoryCompactionConfig(config: any, sessionId: any) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/history_compaction" + query, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  function getContextReturnConfig() {
+    return request("/chat_config/context_return");
+  }
+
+  /**
+   * 获取工作目录配置；传 sessionId 时返回该会话的独立目录信息
+   * （session_dir/is_overridden/effective_dir/warning，见 docs/api_docs.md）
+   */
+  function getWorkDirConfig(sessionId: any) {
+    const query = sessionId ? ("?session_id=" + encodeURIComponent(sessionId)) : "";
+    return request("/chat_config/work_dir" + query);
+  }
+
+  /**
+   * 切换全局默认聊天工作目录（.env DEFAULT_CHAT_WORK_DIR，作为新会话初始目录）
+   * @param {string} newDir 新的工作目录路径
+   */
+  function changeChatDir(newDir: any) {
+    return request("/change_chat_dir?new_dir=" + encodeURIComponent(newDir), {
+      method: "POST",
+    });
+  }
+
+  /**
+   * 设置/清除会话独立工作目录（写入会话 _meta.work_dir）
+   * @param {string} sessionId 会话 ID
+   * @param {string} workDir 工作目录；空串表示清除覆盖，恢复跟随全局默认
+   */
+  function setSessionWorkDir(sessionId: any, workDir: any) {
+    return request("/chat_config/work_dir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, work_dir: workDir }),
+    });
+  }
+
+  /**
+   * 更新思考过程与历史工具结果的最大回传长度
+   * @param {{reasoning_max_length: number, tool_result_max_length: number}} config 均为整数；0=不回传，负数=全部回传
+   */
+  function updateContextReturnConfig(config: any) {
+    return request("/chat_config/context_return", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取 MCP 工具执行配置（单次工具执行超时秒数）
+   */
+  function getMcpToolConfig() {
+    return request("/chat_config/mcp_tools");
+  }
+
+  /**
+   * 更新 MCP 工具执行超时秒数
+   * @param {{call_timeout_seconds: number}} config 0=不限制，正数=超时秒数
+   */
+  function updateMcpToolConfig(config: any) {
+    return request("/chat_config/mcp_tools", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取工具并发执行配置（MCP 工具线程池 + 子智能体并发上限）
+   */
+  function getToolConcurrencyConfig() {
+    return request("/chat_config/tool_concurrency");
+  }
+
+  /**
+   * 更新工具并发执行配置
+   * @param {{mcp_tool_workers: number, sub_agent_max_concurrent: number}} config 两者均 >= 1
+   */
+  function updateToolConcurrencyConfig(config: any) {
+    return request("/chat_config/tool_concurrency", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取模型网络请求失败重试次数配置
+   */
+  function getNetworkRetryConfig() {
+    return request("/chat_config/network_retry");
+  }
+
+  /**
+   * 更新模型网络请求失败重试次数
+   * @param {{max_attempts: number}} config 0 或负数=不限制（一直重试），正数=连续失败 N 次后终止任务
+   */
+  function updateNetworkRetryConfig(config: any) {
+    return request("/chat_config/network_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取上下文压缩失败重试次数配置
+   */
+  function getCompactionRetryConfig() {
+    return request("/chat_config/compaction_retry");
+  }
+
+  /**
+   * 更新上下文压缩失败重试次数
+   * @param {{max_attempts: number}} config 一次尝试=一条完整降级链；0 或负数=不限制，正数=N 条链耗尽后终止任务
+   */
+  function updateCompactionRetryConfig(config: any) {
+    return request("/chat_config/compaction_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取子智能体交付保障重试配置（空收尾重试/断流续跑/todo 未完成提醒）
+   */
+  function getSubAgentRetryConfig() {
+    return request("/chat_config/sub_agent_retry");
+  }
+
+  /**
+   * 更新子智能体交付保障重试配置
+   * @param {{final_reply_max_attempts: number, stream_error_max_attempts: number, todo_remind_max: number}} config
+   *   final_reply/stream_error：0 或负数=不限制；todo_remind：0=关闭，负数=不限制（成功执行其他工具后额度重置，单纯更新计划不重置）
+   */
+  function updateSubAgentRetryConfig(config: any) {
+    return request("/chat_config/sub_agent_retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 获取视频区间读取最大秒数配置（read_media 工具）
+   */
+  function getVideoReadLimitConfig() {
+    return request("/chat_config/video_read_limit");
+  }
+
+  /**
+   * 更新视频区间读取最大秒数（read_media 工具）
+   * @param {{max_seconds: number}} config 5–3600，越界/非法值由读取端自动钳制
+   */
+  function updateVideoReadLimitConfig(config: any) {
+    return request("/chat_config/video_read_limit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  // ---------- 停止 ----------
+  function stopChat(sessionId: any) {
+    return request("/stop_chat?session_id=" + encodeURIComponent(sessionId || "default"), { method: "POST" });
+  }
+
+  function stopSubAgent(sessionId: any, agentId: any) {
+    return request("/stop_sub_agent", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, agent_id: agentId }),
+    });
+  }
+
+  function getSubAgentLimitsConfig() {
+    return request("/chat_config/sub_agent_limits");
+  }
+
+  function updateSubAgentLimitsConfig(config: any) {
+    return request("/chat_config/sub_agent_limits", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    });
+  }
+
+  /**
+   * 运行中注入用户消息（消息引导）：任务运行中投递给后端，生成循环在
+   * 下一轮检查点（工具结果处理完毕后）取出并作为新一轮继续。
+   * 返回 {ok: boolean}；ok=false 表示任务未运行（前端回退为普通发送）。
+   */
+  async function injectMessage(sessionId: any, content: any, options: any) {
+    const res = await request("/inject_message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, content: content,
+        quotes: options && options.quotes, message_id: options && options.messageId }),
+    });
+    return res && typeof res === "object" ? res : { ok: false };
+  }
+
+  /**
+   * 撤回一条尚未消费的注入消息（消息引导提示行 ×）：
+   * 按文本匹配从后端注入队列移除；已被消费时 {ok:false}（不可撤回）。
+   */
+  async function cancelInjectMessage(sessionId: any, text: any, messageId: any) {
+    const res = await request("/cancel_inject_message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, text: text, message_id: messageId }),
+    });
+    return res && typeof res === "object" ? res : { ok: false };
+  }
+
+  // ---------- 会话文件 ----------
+  function uploadSessionFiles(sessionId: any, fileList: any, onProgress: any, signal: any) {
+    return uploadRawBatch("/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), fileList, onProgress, signal);
+  }
+
+  function getSessionFiles(sessionId: any) {
+    return request("/file/get_session_file_memory?number=10&session_id=" + encodeURIComponent(sessionId));
+  }
+
+  function deleteSessionFile(filename: any, sessionId: any) {
+    return request(
+      "/file/delete_session_file_memory?filename=" + encodeURIComponent(filename) + "&session_id=" + encodeURIComponent(sessionId),
+      { method: "DELETE" }
+    );
+  }
+
+  /**
+   * 读取 SSE 响应体：逐行解析 data: 帧，[DONE] 结束。
+   * chatStream / compactContextStream 共用。
+   */
+  async function readSseResponse(res: any, onEvent: any) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let exhausted = false;
+    function dispatch(raw: any) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) return false;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") {
+        onEvent({ type: "done", data: null });
+        return true;
+      }
+      let parsed;
+      try { parsed = JSON.parse(data); }
+      catch (_) { return false; } // 只跳过无效 JSON，不能吞掉页面事件处理异常。
+      onEvent({ type: "data", data: parsed });
+      return false;
+    }
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        exhausted = done;
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = (lines.pop() as string); // 最后一段可能不完整，留到下次
+        for (const raw of lines) {
+          if (dispatch(raw)) return { completed: true };
+        }
+        if (done) {
+          if (buffer && dispatch(buffer)) return { completed: true };
+          break;
+        }
+      }
+      onEvent({ type: "done", data: null });
+      return { completed: false };
+    } finally {
+      // [DONE] 或显示异常提前退出时释放读取器，异常交给聊天层展示。
+      try { if (!exhausted) await reader.cancel(); }
+      catch (_) { /* 保留原始网络/渲染异常，取消读取失败不覆盖它 */ }
+      finally { reader.releaseLock(); }
+    }
+  }
+
+  /**
+   * 上传多媒体附件（图片/音频/视频）：POST /file/upload_session_media
+   * 原始字节保存到 history_files/session_files/<session>/media/，返回 media:// 引用
+   * @param {string} sessionId 会话 ID
+   * @param {File[]} files 媒体文件列表
+   * @returns {Promise<{total:number, success:number, failed:number,
+   *   results:Array<{filename,status,stored_name?,media_ref?,kind?,mime?,size?,message?}>, upload_id}>}
+   */
+  async function uploadSessionMedia(sessionId: any, files: any, onProgress: any, signal: any) {
+    const params = new URLSearchParams();
+    params.set("session_id", sessionId || "default");
+    return uploadRawBatch("/file/upload_session_media?" + params.toString(), files, onProgress, signal);
+  }
+
+  /** 会话内媒体文件的访问 URL（消息气泡缩略图等用途） */
+  function sessionMediaUrl(sessionId: any, storedName: any) {
+    return BASE + "/file/get_session_media?session_id=" +
+      encodeURIComponent(sessionId || "default") +
+      "&name=" + encodeURIComponent(storedName || "");
+  }
+
+  /** 会话内文档原始文件的访问 URL（点击预览 PDF/文本/下载） */
+  function sessionDocumentUrl(sessionId: any, storedName: any) {
+    return BASE + "/file/get_session_document?session_id=" +
+      encodeURIComponent(sessionId || "default") +
+      "&name=" + encodeURIComponent(storedName || "");
+  }
+
+  /** 本地文件的访问 URL（媒体伪标签本地路径 src；相对路径由后端按会话工作目录解析） */
+  function localFileUrl(sessionId: any, path: any) {
+    return BASE + "/file/get_local_file?session_id=" +
+      encodeURIComponent(sessionId || "default") +
+      "&path=" + encodeURIComponent(path || "");
+  }
+
+  /**
+   * 删除消息中的媒体伪标签：POST /chat_history/remove_media_tag
+   * 把会话历史 JSONL 中该标签原文替换为占位说明（用户已删除/文件不存在）
+   */
+  async function removeMediaTag(sessionId: any, rawTag: any) {
+    return request("/chat_history/remove_media_tag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        tag: rawTag || "",
+        replacement: "用户已删除/文件不存在",
+      }),
+    });
+  }
+
+  /**
+   * 按轮次号删除历史轮次：POST /chat_history/delete_rounds
+   * @param {string} sessionId 会话 ID
+   * @param {number} startRound 1-based 轮次号（第 N 个 chat_round）
+   * @param {{mode?:string, deleteFiles?:boolean, dryRun?:boolean}} [opts]
+   *   mode: "truncate"=该轮及之后全删（GPT 编辑语义）；"single"=仅删该轮整轮
+   *   dryRun: true 时只返回将删除的轮次与文件明细（state="planned"），不写盘
+   * @returns {Promise<object>} 后端结果（planned 明细 / succeed+meta_after）
+   */
+  async function deleteRounds(sessionId: any, startRound: any, opts: any) {
+    opts = opts || {};
+    return request("/chat_history/delete_rounds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        start_round: startRound,
+        mode: opts.mode || "truncate",
+        delete_files: opts.deleteFiles !== false,
+        dry_run: !!opts.dryRun,
+        keep_media_refs: opts.keepMediaRefs || [],
+      }),
+    });
+  }
+
+  /**
+   * SSE 聊天：POST /chat_with_tool
+   * @param {object} payload 请求体（messages/session_id/tool_names...）
+   * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
+   * @param {AbortSignal} [signal] 中止信号
+   */
+  async function chatStream(payload: any, onEvent: any, signal: any, options: any) {
+    if ((window as any).YtoolsAuth && !(window as any).YtoolsAuth.executionAllowed) payload = Object.assign({}, payload, { tool_names: [] });
+    const res = await fetch(BASE + "/chat_with_tool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: signal,
+    });
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        detail = JSON.stringify(await res.json());
+      } catch (_) { /* ignore */ }
+      const error: any = new Error(detail); error.status = res.status; throw error;
+    }
+    if (options && options.onOpen) options.onOpen();
+    return await readSseResponse(res, onEvent);
+  }
+
+  /**
+   * SSE 继续：POST /resume_chat（暂停/中断后无用户消息续跑）
+   * @param {object} payload 请求体（session_id/tool_names...）
+   * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
+   * @param {AbortSignal} [signal] 中止信号
+   */
+  async function resumeChat(payload: any, onEvent: any, signal: any, options: any) {
+    if ((window as any).YtoolsAuth && !(window as any).YtoolsAuth.executionAllowed) payload = Object.assign({}, payload, { tool_names: [] });
+    const res = await fetch(BASE + "/resume_chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: signal,
+    });
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const body = await res.json();
+        detail = (body && (body.detail || body.message)) || JSON.stringify(body);
+      } catch (_) { /* ignore */ }
+      const error: any = new Error(detail); error.status = res.status; throw error;
+    }
+    if (options && options.onOpen) options.onOpen();
+    return await readSseResponse(res, onEvent);
+  }
+
+  /**
+   * 手动压缩（流式）：POST /chat_context/compact_manual?stream=true
+   * 事件结构与自动压缩一致：context_compaction 的 start/delta/done
+   * （done 携带 summary_text），结尾附加 compaction_manual_result 结果帧。
+   * 后台任务与消费端分离：SSE 断开不再取消压缩，刷新后可用 attach 重连。
+   * @param {string} sessionId 会话 ID
+   * @param {(event: {type:string, data:any}) => void} onEvent 每个 SSE 事件回调
+   * @param {AbortSignal} [signal] 中止信号（仅断开本地消费，不停止后台任务）
+   * @param {boolean} [attach] 为 true 时只附接到已有任务，不启动新任务
+   */
+  async function compactContextStream(sessionId: any, onEvent: any, signal: any, attach: any) {
+    const params = new URLSearchParams();
+    params.set("session_id", sessionId || "default");
+    params.set("stream", "true");
+    if (attach) params.set("attach", "true");
+    const res = await fetch(BASE + "/chat_context/compact_manual?" + params.toString(), {
+      method: "POST",
+      signal: signal,
+    });
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const body = await res.json();
+        detail = (body && (body.detail || body.message)) || JSON.stringify(body);
+      } catch (_) { /* ignore */ }
+      const error: any = new Error(detail); error.status = res.status; throw error;
+    }
+    return await readSseResponse(res, onEvent);
+  }
+
+  /**
+   * 查询手动压缩是否正在运行（刷新后重连判定）。
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{running:boolean, session_id:string}>}
+   */
+  function manualCompactionStatus(sessionId: any) {
+    return request("/chat_context/compact_manual/status?session_id=" + encodeURIComponent(sessionId || "default"));
+  }
+
+  /**
+   * 显式停止手动压缩（刷新/断线不再隐式取消，必须经此接口）。
+   * @param {string} sessionId 会话 ID
+   * @returns {Promise<{stopped:boolean, running:boolean}>}
+   */
+  function stopManualCompaction(sessionId: any) {
+    return request("/chat_context/compact_manual/stop?session_id=" + encodeURIComponent(sessionId || "default"), {
+      method: "POST",
+    });
+  }
+
+  // ---------- Skills 提示词库 ----------
+  function listPrompts() {
+    return request("/prompts/list");
+  }
+
+  function readPrompt(name: any) {
+    return request("/prompts/read?name=" + encodeURIComponent(name));
+  }
+
+  function createPrompt(name: any, content: any) {
+    return request("/prompts/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, content: content || "" }),
+    });
+  }
+
+  function savePrompt(name: any, content: any) {
+    return request("/prompts/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, content: content }),
+    });
+  }
+
+  function renamePrompt(oldName: any, newName: any) {
+    return request("/prompts/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_name: oldName, new_name: newName }),
+    });
+  }
+
+  function deletePrompt(name: any) {
+    return request("/prompts/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+  }
+
+  // ---------- 当前账号显示名（侧边栏读取；编辑位于账号设置页） ----------
+  /**
+   * 读取当前账号资料（当前仅显示名）
+   * @returns {Promise<{state, name, default_name, max_length, persisted, source}>}
+   */
+  function getUserProfile() {
+    return request("/user/profile");
+  }
+
+  function getSpeechInputConfig(options: any) {
+    return request("/chat_config/speech_input", options);
+  }
+
+  function updateSpeechInputConfig(language: any, onlyIfUnset: any, options: any) {
+    return request("/chat_config/speech_input", Object.assign({}, options, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language: language, only_if_unset: Boolean(onlyIfUnset) }),
+    }));
+  }
+
+  // ---------- V2 文件历史版本链（docs/file_diff.md §9） ----------
+  function listFileChanges(sessionId: any) {
+    return request("/file_diff/list?session_id=" + encodeURIComponent(sessionId || "default"));
+  }
+
+  function fileVersions(sessionId: any, key: any) {
+    return request("/file_diff/versions?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileContent(sessionId: any, key: any, v: any, page: any) {
+    let path = "/file_diff/content?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key);
+    if (v != null) path += "&v=" + encodeURIComponent(v);
+    if (page && page.offset != null) path += "&offset=" + encodeURIComponent(page.offset);
+    if (page && page.limit != null) path += "&limit=" + encodeURIComponent(page.limit);
+    return request(path);
+  }
+
+  function fileTotalDiff(sessionId: any, key: any) {
+    return request("/file_diff/total_diff?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileChangeDiff(sessionId: any, key: any, v: any) {
+    return request("/file_diff/change_diff?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key) + "&v=" + encodeURIComponent(v));
+  }
+
+  function fileFullView(sessionId: any, key: any) {
+    return request("/file_diff/full_view?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key));
+  }
+
+  function fileHunkUndo(sessionId: any, key: any, hunkIndex: any, untilHunk: any) {
+    return request("/file_diff/hunk_undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        hunk_index: hunkIndex,
+        until_hunk: !!untilHunk,
+      }),
+    });
+  }
+
+  function fileRollback(sessionId: any, key: any, options: any) {
+    const opts = options || {};
+    return request("/file_diff/rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        to_version: opts.to_version != null ? opts.to_version : null,
+        to_round: opts.to_round != null ? opts.to_round : null,
+        target: opts.target || "baseline",
+      }),
+    });
+  }
+
+  function fileSave(sessionId: any, key: any, content: any, expectedHash: any) {
+    return request("/file_diff/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        content: content,
+        expected_hash: expectedHash,
+      }),
+    });
+  }
+
+  function fileKeep(sessionId: any, key: any) {
+    return request("/file_diff/keep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", key: key }),
+    });
+  }
+
+  function fileHistoryDelete(sessionId: any, key: any) {
+    return request("/file_diff/delete?session_id=" + encodeURIComponent(sessionId || "default")
+      + "&key=" + encodeURIComponent(key), { method: "DELETE" });
+  }
+
+  function fileHunkKeep(sessionId: any, key: any, hunkIndex: any, untilHunk: any) {
+    return request("/file_diff/hunk_keep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId || "default",
+        key: key,
+        hunk_index: hunkIndex,
+        until_hunk: !!untilHunk,
+      }),
+    });
+  }
+
+  function fileSyncFromDisk(sessionId: any, key: any) {
+    return request("/file_diff/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", key: key }),
+    });
+  }
+
+  function fileCleanup(sessionId: any, cleanOnly: any) {
+    return request("/file_diff/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", clean_only: !!cleanOnly }),
+    });
+  }
+
+  function fileKeepAll(sessionId: any, cleanup: any) {
+    return request("/file_diff/keep_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default", cleanup: cleanup !== false }),
+    });
+  }
+
+  function fileRevertAll(sessionId: any) {
+    return request("/file_diff/revert_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId || "default" }),
+    });
+  }
+
+  global.API = {
+    taskCostConfig, saveTaskCostConfig, saveTaskPricing, taskCostUsage, continueTaskBudget, stopTaskBudget,
+    getResponsesState: function(sessionId: any) {
+      return request("/chat_context/responses_state?session_id=" + encodeURIComponent(sessionId));
+    },
+    rebuildResponsesContext: function(sessionId: any, source: any) {
+      return request("/chat_context/responses_rebuild?session_id=" + encodeURIComponent(sessionId) +
+        "&source=" + encodeURIComponent(source || "local"), { method: "POST" });
+    },
+    BASE,
+    listSessions,
+    listSessionSummaries,
+    setSessionArchived,
+    listArchivedSessions,
+    streamStatus,
+    streamStatuses,
+    getSessionMeta,
+    generateSessionTitle,
+    getContextTokenStats,
+    getContextOverview,
+    updateSessionTitle,
+    fetchSessionFile,
+    fetchSessionPage,
+    fetchHistoryEvent,
+    searchHistory,
+    getPermissions, setPermissions, pendingApprovals, decideApproval, previewPermission, permissionMediaUrl, cancelPermissionTask, resumePermissionTask,
+    deleteSession,
+    listSessionGroups,
+    createSessionGroup,
+    updateSessionGroup,
+    deleteSessionGroup,
+    assignSessionGroup,
+    uploadChatHistory,
+    exportSessionsZip,
+    previewImport,
+    listTerminalJobs, getTerminalJob, operateTerminalJob, terminalLogUrl,
+    submitImport,
+    listTools,
+    mcpDiagnosticServers, testMcpServer,
+      listTaskTemplates, validateTaskTemplate, taskTemplateOptions, getTaskTemplate, saveTaskTemplate, deleteTaskTemplate, previewTaskTemplate, startTaskTemplate,
+    getModels,
+    selectModel,
+    getHistoryCompactionConfig,
+    updateHistoryCompactionConfig,
+    getToolSelection,
+    updateToolSelection,
+    getRetitleSetting,
+    updateRetitleSetting,
+    getContextReturnConfig,
+    updateContextReturnConfig,
+    getMcpToolConfig,
+    updateMcpToolConfig,
+    getToolConcurrencyConfig,
+    updateToolConcurrencyConfig,
+    getNetworkRetryConfig,
+    updateNetworkRetryConfig,
+    getCompactionRetryConfig,
+    updateCompactionRetryConfig,
+    getSubAgentRetryConfig,
+    updateSubAgentRetryConfig,
+    getVideoReadLimitConfig,
+    updateVideoReadLimitConfig,
+    getWorkDirConfig,
+    changeChatDir,
+    setSessionWorkDir,
+    stopChat,
+    stopSubAgent,
+    getSubAgentLimitsConfig,
+    updateSubAgentLimitsConfig,
+    injectMessage,
+    cancelInjectMessage,
+    uploadSessionFiles,
+    uploadSessionMedia,
+    sessionMediaUrl,
+    sessionDocumentUrl,
+    localFileUrl,
+    removeMediaTag,
+    deleteRounds,
+    getSessionFiles,
+    deleteSessionFile,
+    chatStream,
+    resumeChat,
+    compactContextStream,
+    manualCompactionStatus,
+    stopManualCompaction,
+    listPrompts,
+    readPrompt,
+    createPrompt,
+    savePrompt,
+    renamePrompt,
+    deletePrompt,
+    getUserProfile,
+    getSpeechInputConfig,
+    updateSpeechInputConfig,
+    listFileChanges,
+    fileVersions,
+    fileContent,
+    fileTotalDiff,
+    fileFullView,
+    fileChangeDiff,
+    fileHunkUndo,
+    fileHunkKeep,
+    fileSyncFromDisk,
+    fileRollback,
+    fileSave,
+    fileKeep,
+    fileHistoryDelete,
+    fileCleanup,
+    fileKeepAll,
+    fileRevertAll,
+  };
+})(window);

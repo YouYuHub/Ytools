@@ -62,6 +62,18 @@ class AskUserToolDefinitionTests(unittest.TestCase):
         self.assertEqual(normalized[0]["options"], ["方案A", "方案B"])
         self.assertEqual(normalized[1], {"question": "补充说明？", "options": [], "multiple": False})
 
+    def test_normalize_ask_questions_keeps_valid_id(self):
+        normalized = builtin_tools.normalize_ask_questions([
+            {"id": "db", "question": "选哪个库？"},
+            {"id": "  ", "question": "无 id？"},
+            {"id": "x" * 65, "question": "超长 id？"},
+            {"id": 123, "question": "非字符串 id？"},
+        ])
+        self.assertEqual(normalized[0]["id"], "db")
+        self.assertNotIn("id", normalized[1])
+        self.assertNotIn("id", normalized[2])
+        self.assertNotIn("id", normalized[3])
+
     def test_normalize_ask_questions_multiple_flag(self):
         normalized = builtin_tools.normalize_ask_questions([
             {"question": "喜欢哪些语言？", "options": ["Python", "Go"], "multiple": True},

@@ -1,0 +1,1071 @@
+/**
+ * 应用共享核心：全局状态、常量、DOM 引用与通用工具
+ * - 所有 app/ 模块共享的 state（会话/流式/面板/附件等运行时状态）
+ * - 页面 DOM 引用一次性收集，挂到 window.App 供各模块解构
+ * - 通用工具：el/toast/滚动定位/空态切换/菜单开关/侧边栏/会话搜索/悬浮提示
+ * 依赖：theme.js（ThemeManager）；被 app/ 其余模块与 app.js 入口依赖，须最先加载
+ */
+(window as unknown as { App: any }).App = (window as unknown as { App: any }).App || {};
+(function(App: any) {
+  "use strict";
+  const state = {
+    // 当前会话 id；null 表示"尚未开始的新对话"（未产生任何内容）。
+    // 会话 ID 只在真正产生内容的动作（发送消息 / 上传文件）时才惰性生成，
+    // 选工具、调参数等操作不触发 ID 分配，避免后端凭空创建空会话文件。
+    sessionId: null,
+    streaming: false,
+    // 当前正在监听/流式的会话 id（同一时刻前端只监听一个会话的流，后端任务可多会话并行）
+    streamingSession: null,
+    abort: null,
+    tools: [],
+    servers: [],
+    failedServers: [],
+    selectedTools: new Set(),
+    draftTools: new Set(),
+    showToolChips: false,
+    boost: false,
+    sessionTotalTokens: 0,
+    sessionUsage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cached_tokens: 0 },
+    contextTokenStats: null,
+    workDir: "",
+    workDirOverridden: false,
+    // 会话级工具选择：当前会话是否设置了独立选择（false 表示跟随全局默认）
+    toolSelectionOverridden: false,
+    chatSettingsDefaults: null,
+    activeStream: null,
+    hasConversation: false,
+    importedHistoryText: null,
+    pendingDelete: null,
+    // 本地“最近触碰”记录：{ sessionId: { title, ts } }
+    // 发送消息 / 重命名时写入，用于后端落盘/元数据尚未生效时保持正确的置顶顺序
+    sessionRecency: {},
+    // 模型配置：role -> GET /chat_config/models 响应（chat_model / compaction_model / title_model）
+    modelConfigs: {},
+    // 模型配置：role -> 会话是否设置了独立模型选择（false 表示跟随全局默认）
+    modelOverridden: {},
+    // 模型配置面板最近一次加载是否失败（决定面板提示文案）
+    modelLoadFailed: false,
+    activeModelRole: "chat_model",
+    // 面板中当前选中的模型：provider::model（仅面板内草稿，未确定前不生效）
+    selectedModelKey: "",
+    // 参数面板中生成参数是否被手动修改过（决定提交时是否带 parameter）
+    modelParamDirty: false,
+    // 待发送的多媒体附件（粘贴/选择的图片音频视频）：[{id,file,name,kind,dataUrl}]
+    pendingMedia: [],
+    // 待发送的引用快照（选中文本引用到提问，docs/quote_selection_design.md）：
+    // [{id, text, source:{role,session_id,round}}]；随会话草稿保存/恢复，
+    // 发送成功后清空（id 仅本地 UI 用，请求上送前由 QuoteUtils 剥离）
+    pendingQuotes: [],
+    // 正在上传或由服务端解析的文档，仅用于输入框内显示进度
+    pendingDocs: [],
+    // 会话内已上传解析的文档（file_memory）：解析文本由后端注入系统提示词，跨消息生效
+    sessionDocs: [],
+    // 任务计划（模型自我规划）：SSE todo 事件驱动更新
+    todoTodos: [],
+    todoPanelOpen: false,
+    // 当前待回答的提问（ask_user 事件携带的问题列表；null=无待回答提问）
+    pendingAskQuestions: null,
+    // 待回答提问对应的聊天流内卡片（覆盖式重答时用于清除其后的旧轮次）
+    pendingAskBlock: null,
+    // 手动压缩进行中标记：compaction 模块置位，发送守卫与发送按钮据此拦截
+    manualCompactRunning: false,
+    // 手动压缩所属会话：守卫/按钮只作用于该会话，其他会话不受影响
+    manualCompactSession: null,
+    // 手动压缩的中止控制器：终止按钮点击时 abort 断开压缩 SSE 连接
+    manualCompactAbort: null,
+    // 流式期间的消息暂存：
+    // steerMessage = 注入不可用时的引导暂存（流结束后作为新一轮发送；
+    //   正常引导走后端检查点注入，附件先上传，按 ID 独立跟踪消费）
+    // pendingQueue = 队列消息（当前任务完成后 FIFO 逐条自动发送，可累积多条）
+    // 均为 { text, media } 结构；media 为待上传附件快照，空数组表示纯文本
+    steerMessage: null,
+    pendingQueue: [],
+    // 已提交后端、等待检查点消费的引导消息列表：{ id, sessionId, text, media, quotes }，
+    // 在消息框上方展示；SSE message_injected（消费信号）到达时清除
+    injectedPending: [],
+    // 引导/队列按钮组当前展开的菜单归属："steer" | "queue" | ""（未展开）
+    composerSendMode: "",
+    // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，
+    // 该轮 send 结束后不触发引导/队列 flush（消费后自动复位）
+    suppressFlushOnce: false,
+    // ▶继续可用性（暂停/中断后可续跑）：归属会话 + 是否可继续；
+    // 真源在后端（空闲 + 末轮 stopped/interrupted），前端经状态接口同步
+    resumeAvailable: false,
+    resumeSessionId: null,
+    // 每会话独立的输入草稿：{ text, media } —— 切换会话时保存/恢复，
+    // 文本与待发附件都不丢失；key 为会话 ID，"" 对应"新对话"未建号状态
+    sessionDrafts: {},
+  };
+
+  // 待发送附件上限：数量与单文件大小按类别区分（与后端 MEDIA_SIZE_LIMITS 一致：视频 600MB）
+  const MAX_PENDING_MEDIA = 6;
+  const MEDIA_SIZE_LIMITS = { image: 20 * 1024 * 1024, audio: 20 * 1024 * 1024, video: 600 * 1024 * 1024 };
+  // 与后端 memory.file_memory 的媒体扩展名白名单保持一致
+  // （ico/tif/tiff 上传后由后端自动转为 png，模型始终收到原生支持的格式）
+  const MEDIA_EXTENSIONS = {
+    image: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff"],
+    audio: ["wav", "mp3", "m4a", "ogg", "flac"],
+    video: ["mp4", "webm", "mov", "mkv"],
+  };
+  // 与后端 file_factory.PARSER_BY_EXT / TEXT_FILE_EXTENSIONS 一致
+  // （解析文本写入 file_memory，由后端注入系统提示词，与二进制媒体走不同通道）
+  const DOC_EXTENSIONS = [
+    "pdf", "docx", "doc", "xls", "xlsx",
+    "txt", "md", "markdown", "rst", "log", "text", "me", "csv", "tsv", "json", "jsonl", "ndjson",
+    "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "env", "gitignore", "gitattributes",
+    "editorconfig", "srt", "vtt", "ass", "tex", "bib", "html", "htm", "xhtml", "xml", "xsl", "xslt",
+    "css", "scss", "sass", "less", "styl", "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte", "map", "svg",
+    "py", "pyi", "ipynb", "java", "kt", "kts", "scala", "groovy", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
+    "cs", "go", "rs", "swift", "m", "mm", "php", "rb", "pl", "pm", "lua", "r", "jl", "dart", "ex", "exs",
+    "erl", "hrl", "hs", "clj", "cljs", "el", "vim", "asm", "s", "f", "f90", "f95", "for", "pas", "d", "nim",
+    "zig", "v", "sol", "tcl", "awk", "sed", "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", "sql",
+    "graphql", "gql", "proto", "thrift", "cmake", "make", "mk", "gradle", "dockerfile", "containerfile",
+    "tf", "tfvars", "hcl", "nix", "diff", "patch", "po", "pot", "strings", "pem", "crt", "cer", "key", "pub", "asc", "lic", "license",
+  ];
+  const MAX_DOC_FILE_SIZE = 10 * 1024 * 1024;
+
+  function docKindOf(filename: any) {
+    const ext = (filename.split(".").pop() || "").toLowerCase();
+    return DOC_EXTENSIONS.indexOf(ext) >= 0;
+  }
+
+  const QNAV_MAX_DASHES = 40;
+
+  // ---------- DOM ----------
+  const $: any = function(sel: any) { return document.querySelector(sel); };
+  const app = $("#app");
+  const sidebar = $("#sidebar");
+  const scrim = $("#scrim");
+  const sessionList = $("#sessionList");
+  const tokenTotal = $("#tokenTotal");
+  const sessionMenuUsage = $("#sessionMenuUsage");
+  const sessionMenuUsageValues = $("#sessionMenuUsageValues");
+  const sessionActionsBtn = $("#sessionActionsBtn");
+  const sessionActionsMenu = $("#sessionActionsMenu");
+  const shareSessionItem = $("#shareSessionItem");
+  const compactSessionItem = $("#compactSessionItem");
+  const main = $(".main");
+  const chatScroll = $("#chatScroll");
+  const chatInner = $("#chatInner");
+  const input = $("#input");
+  const composer = $(".composer");
+  const composerWrap = $(".composer-wrap");
+  const contextTokenStatus = $("#contextTokenStatus");
+  const contextTokenSummary = $("#contextTokenSummary");
+  const contextTokenWorkdir = $("#contextTokenWorkdir");
+  const sendBtn = $("#sendBtn");
+  const stopBtn = $("#stopBtn");
+  const resumeBtn = $("#resumeBtn");
+  const voiceBtn = $("#voiceBtn");
+  const stopGroup = $("#stopGroup");
+  const stopMenuBtn = $("#stopMenuBtn");
+  const queueMenu = $("#queueMenu");
+  const composerAttachments = $("#composerAttachments");
+  const composerQuotes = $("#composerQuotes");
+  const composerAttachmentBlocks = $("#composerAttachmentBlocks");
+  const pendingOutbox = $("#pendingOutbox");
+  const contextTokenTodoSlot = $("#contextTokenTodoSlot");
+  const contextTokenModel = $("#contextTokenModel");
+  const todoPanelHost = $("#todoPanel");
+  const askModal = $("#askModal");
+  const askQuestions = $("#askQuestions");
+  const askSubmit = $("#askSubmit");
+  const mediaPreviewModal = $("#mediaPreviewModal");
+  const mediaPreviewBody = $("#mediaPreviewBody");
+  const mediaPreviewTitle = $("#mediaPreviewTitle");
+  const mediaPreviewZoom = $("#mediaPreviewZoom");
+  const mediaPreviewZoomIn = $("#mediaPreviewZoomIn");
+  const mediaPreviewZoomOut = $("#mediaPreviewZoomOut");
+  const mediaPreviewZoomLabel = $("#mediaPreviewZoomLabel");
+  const boostBtn = $("#boostBtn");
+  const enhancePanel = $("#enhancePanel");
+  const enhanceModal = $("#enhanceModal");
+  const enhanceBody = $("#enhanceBody");
+  const enhanceScope = $("#enhanceScope");
+  const enhanceClose = $("#enhanceClose");
+  const modelTabs = $("#modelTabs");
+  const modelPicker = $("#modelPicker");
+  const modelPickerLabel = $("#modelPickerLabel");
+  const modelList = $("#modelList");
+  const chatParametersGroup = $("#chatParametersGroup");
+  const messagesParametersGroup = $("#messagesParametersGroup");
+  const responsesParametersGroup = $("#responsesParametersGroup");
+  const responsesMode = $("#responsesMode");
+  const responsesModeHint = $("#responsesModeHint");
+  const responsesStatefulControls = $("#responsesStatefulControls");
+  const responsesEffort = $("#responsesEffort");
+  const responsesSummary = $("#responsesSummary");
+  const responsesVerbosity = $("#responsesVerbosity");
+  const responsesSampling = $("#responsesSampling");
+  const responsesTemperatureRow = $("#responsesTemperatureRow");
+  const responsesTemperature = $("#responsesTemperature");
+  const responsesTemperatureValue = $("#responsesTemperatureValue");
+  const responsesTopPRow = $("#responsesTopPRow");
+  const responsesTopP = $("#responsesTopP");
+  const responsesTopPValue = $("#responsesTopPValue");
+  const responsesInstructions = $("#responsesInstructions");
+  const responsesExtraBody = $("#responsesExtraBody");
+  const responsesStateHint = $("#responsesStateHint");
+  const responsesRebuildSource = $("#responsesRebuildSource");
+  const responsesRebuild = $("#responsesRebuild");
+
+  const reasoningEffort = $("#reasoningEffort");
+  const enableThinking = $("#enableThinking");
+  const temperature = $("#temperature");
+  const temperatureValue = $("#temperatureValue");
+  const maxTokens = $("#maxTokens");
+  const maxTokensValue = $("#maxTokensValue");
+  const topP = $("#topP");
+  const topPValue = $("#topPValue");
+  const presencePenalty = $("#presencePenalty");
+  const presencePenaltyValue = $("#presencePenaltyValue");
+  const messagesTemperatureRow = $("#messagesTemperatureRow");
+  const messagesTemperature = $("#messagesTemperature");
+  const messagesTemperatureValue = $("#messagesTemperatureValue");
+  const messagesTopPRow = $("#messagesTopPRow");
+  const messagesTopP = $("#messagesTopP");
+  const messagesTopPValue = $("#messagesTopPValue");
+  const messagesThinkingMode = $("#messagesThinkingMode");
+  const messagesThinkingBudgetRow = $("#messagesThinkingBudgetRow");
+  const messagesThinkingBudget = $("#messagesThinkingBudget");
+  const messagesThinkingBudgetValue = $("#messagesThinkingBudgetValue");
+  const messagesThinkingHint = $("#messagesThinkingHint");
+  const messagesEffort = $("#messagesEffort");
+  const messagesStopSequences = $("#messagesStopSequences");
+  const messagesExtraBody = $("#messagesExtraBody");
+  const enhanceCancel = $("#enhanceCancel");
+  const enhanceConfirm = $("#enhanceConfirm");
+  const enhanceReset = $("#enhanceReset");
+  const enhanceClearOverride = $("#enhanceClearOverride");
+  const enhanceHint = $("#enhanceHint");
+  const customHeadersBox = $("#customHeadersBox");
+  const customHeadersRows = $("#customHeadersRows");
+  const addHeaderRow = $("#addHeaderRow");
+  const settingsRetitleRow = $("#settingsRetitleRow");
+  const settingsRetitleToggle = $("#settingsRetitleToggle");
+  const settingsRetitleStatus = $("#settingsRetitleStatus");
+  const plusBtn = $("#plusBtn");
+  const plusMenu = $("#plusMenu");
+  const toolModal = $("#toolModal");
+  const toolGroups = $("#toolGroups");
+  const toolSearchInput = $("#toolSearchInput");
+  const toolSelected = $("#toolSelected");
+  const toolCollapseAll = $("#toolCollapseAll");
+  const toolRefresh = $("#toolRefresh");
+  const toolFollowGlobal = $("#toolFollowGlobal");
+  const fileInput = $("#fileInput");
+  const historyFileInput = $("#historyFileInput");
+  const fileChips = $("#fileChips");
+  const toolChips = $("#toolChips");
+  const profileName = $("#profileName");
+  const profileSub = $("#profileSub");
+  const scrollBottomBtn = $("#scrollBottomBtn");
+  const qnav = $("#qnav");
+  const qnavRail = $("#qnavRail");
+  const qnavPanel = $("#qnavPanel");
+  const toastWrap = $("#toastWrap");
+  const deleteModal = $("#deleteModal");
+  const deleteModalBackdrop = $("#deleteModalBackdrop");
+  const deleteCancel = $("#deleteCancel");
+  const deleteConfirm = $("#deleteConfirm");
+  // 导入冲突决策弹窗（zip/jsonl 两阶段导入）
+  const importConflictModal = $("#importConflictModal");
+  const importConflictBackdrop = $("#importConflictBackdrop");
+  const importConflictList = $("#importConflictList");
+  const importConflictHint = $("#importConflictHint");
+  const importConflictSummary = $("#importConflictSummary");
+  const importConflictCancel = $("#importConflictCancel");
+  const importConflictSubmit = $("#importConflictSubmit");
+  const chatSettingsModal = $("#chatSettingsModal");
+  const chatSettingsBackdrop = $("#chatSettingsBackdrop");
+  const chatSettingsClose = $("#chatSettingsClose");
+  const chatSettingsCancel = $("#chatSettingsCancel");
+  const chatSettingsConfirm = $("#chatSettingsConfirm");
+  const chatSettingsReset = $("#chatSettingsReset");
+  const toolCallTimeoutSeconds = $("#toolCallTimeoutSeconds");
+  const networkRetryMaxAttempts = $("#networkRetryMaxAttempts");
+  const compactionRetryMaxAttempts = $("#compactionRetryMaxAttempts");
+  const subAgentFinalReplyRetryMax = $("#subAgentFinalReplyRetryMax");
+  const subAgentStreamErrorRetryMax = $("#subAgentStreamErrorRetryMax");
+  const subAgentTodoRemindMax = $("#subAgentTodoRemindMax");
+  const videoReadMaxSeconds = $("#videoReadMaxSeconds");
+  const mcpToolWorkers = $("#mcpToolWorkers");
+    const subAgentMaxConcurrent = $("#subAgentMaxConcurrent");
+    const subAgentMaxRounds = $("#subAgentMaxRounds");
+    const subAgentTimeoutSeconds = $("#subAgentTimeoutSeconds");
+  const triggerRatio = $("#triggerRatio");
+  const summaryBudgetRatio = $("#summaryBudgetRatio");
+  const historyTargetTokens = $("#historyTargetTokens");
+  const historyTargetHint = $("#historyTargetHint");
+  const oversizedRejectFactor = $("#oversizedRejectFactor");
+  const maxOversizedRejections = $("#maxOversizedRejections");
+  const effectiveThresholdHint = $("#effectiveThresholdHint");
+
+  const THEME_LABEL: any = { system: "跟随系统", light: "浅色", dark: "深色" };
+  const SESSION_TITLE_KEY = "ytools-session-title-overrides";
+
+  // 四个模型角色的配置选项卡（sub_agent_model 未配置时子任务继承父级聊天模型）
+  const MODEL_ROLES = [
+    { role: "chat_model", label: "聊天模型" },
+    { role: "compaction_model", label: "压缩模型" },
+    { role: "title_model", label: "标题模型" },
+    { role: "sub_agent_model", label: "子智能体模型" },
+  ];
+
+  // 各角色生成参数的内置默认值（服务端未配置/解析不到时使用）
+  const ROLE_DEFAULT_PARAMS = {
+    chat_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
+    compaction_model: { temperature: 0.2, top_p: 1, presence_penalty: 0, reasoning_effort: "low", enable_thinking: false },
+    title_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
+    sub_agent_model: { temperature: 0.7, top_p: 1, presence_penalty: 2, reasoning_effort: "medium", enable_thinking: true },
+  };
+
+  // 各协议的恢复默认预设。Messages 留空采用供应商默认值。
+  const API_TYPE_DEFAULT_PARAMS = {
+    chat_completions: { temperature: 0.7, top_p: 1.0, presence_penalty: 2.0, reasoning_effort: "medium", enable_thinking: true },
+    responses: { temperature: 1.0, top_p: 1.0, presence_penalty: 0.0, reasoning_effort: "medium", enable_thinking: true },
+    messages: {},
+  };
+
+  // 后端接口会返回同一份 defaults；这里仅作为后端暂不可用时的离线回退。
+  const CHAT_SETTINGS_DEFAULTS = {
+    call_timeout_seconds: 300,
+    network_retry_max_attempts: 3,
+    compaction_retry_max_attempts: 2,
+    sub_agent_final_reply_retry_max: 3,
+    sub_agent_stream_error_retry_max: 3,
+    sub_agent_todo_remind_max: 3,
+    video_read_max_seconds: 60,
+    mcp_tool_workers: 3,
+    sub_agent_max_concurrent: 3,
+    sub_agent_max_rounds: 40,
+    sub_agent_timeout_seconds: 900,
+    trigger_ratio: 0.8,
+    summary_budget_ratio: 0.2,
+    target_tokens: 0,
+    oversized_reject_factor: 1.5,
+    max_oversized_rejections: 3,
+  };
+
+  function readTitleOverrides() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_TITLE_KEY) || "{}");
+      return saved && typeof saved === "object" ? saved : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  // ---------- 工具函数 ----------
+  function el(tag: any, className?: any, text?: any): any {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function toast(message: any) {
+    const node = el("div", "toast", message);
+    toastWrap.appendChild(node);
+    setTimeout(function () {
+      node.classList.add("fade");
+      setTimeout(function () { node.remove(); }, 350);
+    }, 2600);
+  }
+
+  function isMobile() {
+    return window.matchMedia("(max-width: 768px)").matches;
+  }
+
+  // 自动跟随与用户滚动共用一份状态；用户意图优先于流式更新。
+  // 上滚意图按位移累计：触控板抖动、滚动锚定回跳、高亮重排等都会产生零星
+  // 小位移上滚，若直接暂停会让快速生成时无故脱离底部；800ms 内累计上滚
+  // 超过阈值才视为用户要脱离底部。鼠标滚轮一格约 100px，仍是单次即停。
+  let autoScrollPaused = false;
+  let chatScrollbarDragging = false;
+  function isChatScrollbarDragging() { return chatScrollbarDragging; }
+  let lastScrollTop = chatScroll.scrollTop;
+  let bottomScrollFrame: any = null;
+  let upScrollIntentPx = 0;
+  let upScrollIntentAt = 0;
+  const UP_SCROLL_INTENT_PX = 48;
+  const UP_SCROLL_INTENT_WINDOW_MS = 800;
+  function noteUpScrollIntent(px: any) {
+    if (!(px > 0)) return;
+    const now = Date.now();
+    if (now - upScrollIntentAt > UP_SCROLL_INTENT_WINDOW_MS) upScrollIntentPx = 0;
+    upScrollIntentAt = now;
+    upScrollIntentPx += px;
+    if (upScrollIntentPx >= UP_SCROLL_INTENT_PX) {
+      upScrollIntentPx = 0;
+      pauseAutoScroll();
+    }
+  }
+  // 累计只由明确的用户下滚输入（滚轮/触摸下滚、主动回底）清零：流式跟随的
+  // 程序化置底同样产生向下的 scroll 事件，不能用它清零，否则快速生成时
+  // 跟随置底会反复吞掉用户的上滚累计，导致用户永远无法暂停。
+  function resetUpScrollIntent() {
+    upScrollIntentPx = 0;
+    upScrollIntentAt = 0;
+  }
+
+  function cancelBottomCorrection() {
+    if (bottomScrollFrame != null) cancelAnimationFrame(bottomScrollFrame);
+    bottomScrollFrame = null;
+  }
+
+  function scrollToBottom(instant: any) {
+    if (chatScrollbarDragging) return;
+    if (App.showHistoryTail) App.showHistoryTail();
+    autoScrollPaused = false;
+    resetUpScrollIntent();
+    if (App.historyScroll && App.historyScroll.clearUserScrolledUp) App.historyScroll.clearUserScrolledUp();
+    cancelBottomCorrection();
+    const prev = instant ? chatScroll.style.scrollBehavior : null;
+    if (instant) chatScroll.style.scrollBehavior = "auto";
+    updateScrollBottomOffset();
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+    lastScrollTop = chatScroll.scrollTop;
+    if (instant) chatScroll.style.scrollBehavior = prev;
+    // content-visibility 高度回填修正；用户开始浏览后不得执行过期的置底。
+    bottomScrollFrame = requestAnimationFrame(function () {
+      bottomScrollFrame = null;
+      if (autoScrollPaused || chatScrollbarDragging) return;
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScroll.scrollTop = chatScroll.scrollHeight;
+      lastScrollTop = chatScroll.scrollTop;
+      chatScroll.style.scrollBehavior = behavior;
+    });
+  }
+
+  function nearBottom() {
+    return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 120;
+  }
+
+  function pauseAutoScroll() {
+    autoScrollPaused = true;
+    resetUpScrollIntent();
+    cancelBottomCorrection();
+    // 立即终止此前的 smooth 置底动画，避免它在上滚输入后继续推进。
+    const behavior = chatScroll.style.scrollBehavior;
+    chatScroll.style.scrollBehavior = "auto";
+    if (!chatScrollbarDragging) chatScroll.scrollTop = chatScroll.scrollTop;
+    lastScrollTop = chatScroll.scrollTop;
+    chatScroll.style.scrollBehavior = behavior;
+  }
+
+  // 捕获阶段在 scroll 事件及内部控件阻止冒泡之前响应上滚意图。
+  chatScroll.addEventListener("wheel", function(event: any) {
+    if (event.deltaY < 0) noteUpScrollIntent(-event.deltaY);
+    else if (event.deltaY > 0) resetUpScrollIntent();
+  }, { passive: true, capture: true });
+  let lastTouchY: any = null;
+  chatScroll.addEventListener("touchstart", function(event: any) {
+    lastTouchY = event.touches.length ? event.touches[0].clientY : null;
+  }, { passive: true });
+  chatScroll.addEventListener("touchmove", function(event: any) {
+    const y = event.touches.length ? event.touches[0].clientY : null;
+    if (y != null && lastTouchY != null) {
+      if (y > lastTouchY) noteUpScrollIntent(y - lastTouchY);
+      else if (y < lastTouchY) resetUpScrollIntent();
+    }
+    lastTouchY = y;
+  }, { passive: true });
+  chatScroll.addEventListener("keydown", function(event: any) {
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) {
+      pauseAutoScroll();
+    }
+  });
+
+  chatScroll.addEventListener("scroll", function () {
+    const top = chatScroll.scrollTop;
+    const movingUp = top < lastScrollTop - 1;
+    const movingDown = top > lastScrollTop + 1;
+    if (movingUp) {
+      // 程序化置底会同步更新 lastScrollTop，能走到这里的上移基本来自用户
+      // 或布局抖动；累计到阈值才暂停，零星小位移不打断快速生成时的跟随。
+      noteUpScrollIntent(lastScrollTop - top);
+    } else if (!chatScrollbarDragging && autoScrollPaused && movingDown &&
+      chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
+      autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
+    }
+    lastScrollTop = top;
+  });
+
+  function stickToBottom() {
+    if (autoScrollPaused || chatScrollbarDragging) {
+      updateScrollBottomOffset();
+      return;
+    }
+    // 流式跟随采用瞬时更新，避免连续的 smooth 动画与用户操作竞争。
+    scrollToBottom(true);
+  }
+
+  function setEmpty(empty: any) {
+    app.classList.toggle("empty", Boolean(empty));
+    sessionActionsBtn.title = empty ? "加载" : "分享 / 加载 / 压缩对话";
+    App.refreshComposerButtons();
+    // 问题导航只在真正清空会话时隐藏；转为非空态时按当前消息数重建显隐，
+    // 否则手动压缩等仅调用 setEmpty(false) 的流程会把导航藏掉且无人恢复
+    if (empty || typeof App.rebuildQnav !== "function") {
+      qnav.classList.add("hidden");
+    } else {
+      App.rebuildQnav();
+    }
+    requestAnimationFrame(updateScrollBottomOffset);
+    if (!enhancePanel.classList.contains("hidden")) App.fitEnhancePanel();
+  }
+
+  function updateScrollBottomOffset() {
+    if (!main || !composerWrap) return;
+    const keepBottom = !chatScrollbarDragging && !autoScrollPaused && !app.classList.contains("empty") &&
+      chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 24;
+    const mainRect = main.getBoundingClientRect();
+    const composerRect = composerWrap.getBoundingClientRect();
+    const offset = Math.max(16, mainRect.bottom - composerRect.top + 12);
+    main.style.setProperty("--scroll-bottom-offset", Math.ceil(offset) + "px");
+    const chatBottomPadding = Math.max(56, mainRect.bottom - composerRect.top + 16);
+    chatInner.style.setProperty("--chat-bottom-padding", Math.ceil(chatBottomPadding) + "px");
+    if (keepBottom) chatScroll.scrollTop = chatScroll.scrollHeight;
+  }
+
+  // ---------- 主题 ----------
+  function refreshThemeUI() {
+    const pref = ThemeManager.getPreference();
+    profileSub.textContent = THEME_LABEL[pref];
+  }
+
+  document.addEventListener("themechange", refreshThemeUI);
+
+  // ---------- 菜单开关 ----------
+  function closeMenus() {
+    plusMenu.classList.add("hidden");
+    sessionActionsMenu.classList.add("hidden");
+    queueMenu.classList.add("hidden");
+    state.composerSendMode = "";
+  }
+
+  function closeToolModal() {
+    if (App.toolModalSaving) return;
+    toolModal.classList.add("hidden");
+    toolModal.setAttribute("aria-hidden", "true");
+    hideToolTip();
+    if (App.onToolModalClosed) App.onToolModalClosed();
+  }
+
+  $("#profileCard").addEventListener("click", function(e: any) {
+    e.stopPropagation();
+    if (App.sidebarSettings) App.sidebarSettings.toggle(e.currentTarget);
+  });
+  document.addEventListener("click", function(e: any) {
+    // composedPath 在事件派发时定格：面板内点击即使处理过程中 DOM 被增删
+    // （如删除自定义请求头行后按钮脱离文档），仍判定为面板内点击，
+    // 不会误触发"点击面板外部"的收起逻辑
+    const clickPath = typeof e.composedPath === "function" ? e.composedPath() : null;
+    const inEnhancePanel = clickPath ? clickPath.includes(enhancePanel) : enhancePanel.contains(e.target);
+    if (!plusMenu.contains(e.target) && !inEnhancePanel &&
+      !sessionActionsMenu.contains(e.target) && !queueMenu.contains(e.target) &&
+      e.target !== plusBtn && e.target !== boostBtn &&
+      !sessionActionsBtn.contains(e.target)) {
+      closeMenus();
+    }
+    if (!e.target.closest(".session-menu") && !e.target.closest(".session-actions")) {
+      App.closeSessionMenus();
+    }
+  });
+  document.addEventListener("keydown", function(e: any) {
+    if (e.key === "Escape") {
+      if (!enhancePanel.classList.contains("hidden")) {
+        if (!e.isComposing && App.closeModelPanel) App.closeModelPanel();
+        return;
+      }
+      // 编辑中的用户消息优先消费 Esc（编辑/确认弹窗与模态框可并存）
+      if (document.querySelector(".msg.msg-user.is-editing")) {
+        App.cancelAnyUserEdit();
+        return;
+      }
+      closeMenus();
+      if (!toolModal.classList.contains("hidden")) closeToolModal();
+      if (!deleteModal.classList.contains("hidden")) App.closeDeleteModal();
+      if (!importConflictModal.classList.contains("hidden")) App.closeImportConflict();
+      if (!chatSettingsModal.classList.contains("hidden")) App.closeChatSettings();
+      if (!askModal.classList.contains("hidden")) App.closeAskModal();
+    }
+  });
+
+  $("#toolModalClose").addEventListener("click", closeToolModal);
+  $("#toolModalBackdrop").addEventListener("click", closeToolModal);
+  // 跨模块的 App.* 方法必须经包装函数在点击时再解引用：core.js 先于行为
+  // 模块（sessions.js 等）加载，此刻 App.closeDeleteModal 还是 undefined，
+  // 直接注册 addEventListener(type, undefined) 会被静默忽略（拆分单文件
+  // app.js 之前不存在此问题），表现为弹窗按钮点击无响应。
+  deleteModalBackdrop.addEventListener("click", function () { App.closeDeleteModal(); });
+  deleteCancel.addEventListener("click", function () { App.closeDeleteModal(); });
+  deleteConfirm.addEventListener("click", function () { App.confirmDeleteSession(); });
+  // 导入冲突弹窗：关闭逻辑由 history.js 模块注册（App.closeImportConflict）
+  importConflictBackdrop.addEventListener("click", function () { App.closeImportConflict(); });
+  importConflictCancel.addEventListener("click", function () { App.closeImportConflict(); });
+
+  // ---------- 侧边栏 ----------
+  const sidebarResizeHandle = $("#sidebarResizeHandle");
+  const SIDEBAR_WIDTH_KEY = "ytools-sidebar-width";
+  const SIDEBAR_DEFAULT_WIDTH = 240;
+  const SIDEBAR_MIN_WIDTH = 220;
+  const SIDEBAR_MAX_WIDTH = 840;
+  const SIDEBAR_MAIN_MIN_WIDTH = 360;
+  let sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
+  let sidebarResizePointer: any = null;
+  let sidebarResizeStartWidth = SIDEBAR_DEFAULT_WIDTH;
+  let sidebarResizeStartCollapsed = false;
+  let sidebarResizeMetrics: any = null;
+  let sidebarResizeFrame: any = null;
+  let sidebarResizeX: any = null;
+
+  try {
+    const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    if (Number.isFinite(savedWidth) && savedWidth >= SIDEBAR_MIN_WIDTH && savedWidth <= SIDEBAR_MAX_WIDTH) {
+      sidebarPreferredWidth = savedWidth;
+    }
+  } catch (_) { /* 私密模式等无法访问本地存储时使用默认宽度 */ }
+
+  function sidebarWidthLimit() {
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth - SIDEBAR_MAIN_MIN_WIDTH));
+  }
+
+  function clampSidebarWidth(width: any) {
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(sidebarWidthLimit(), Math.round(width)));
+  }
+
+  function sidebarRailWidth() {
+    return parseFloat(getComputedStyle(sidebar).getPropertyValue("--rail-width")) || 50;
+  }
+
+  function sidebarCollapseThreshold() {
+    // 常用宽度在约半宽处切换；超宽侧栏的阈值封顶，避免拖很远才能重新展开。
+    return Math.max(sidebarRailWidth() + 32, Math.min(180, sidebarPreferredWidth / 2));
+  }
+
+  function applySidebarWidth() {
+    const width = clampSidebarWidth(sidebarPreferredWidth);
+    const collapsed = sidebar.classList.contains("collapsed");
+    document.documentElement.style.setProperty("--sidebar-width", width + "px");
+    const rail = sidebarResizeMetrics ? sidebarResizeMetrics.rail : sidebarRailWidth();
+    sidebarResizeHandle.setAttribute("aria-valuemin", String(rail));
+    sidebarResizeHandle.setAttribute("aria-valuemax", String(sidebarWidthLimit()));
+    sidebarResizeHandle.setAttribute("aria-valuenow", String(collapsed ? rail : width));
+    sidebarResizeHandle.setAttribute("aria-valuetext", collapsed ? "已收起" : width + " 像素");
+  }
+
+  function saveSidebarWidth() {
+    try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarPreferredWidth)); } catch (_) { /* 存储不可用时仍允许本次拖动 */ }
+  }
+  window.addEventListener("ytools-preferences-change", () => {
+    if (sidebarResizePointer !== null) return;
+    try {
+      const width = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+      if (Number.isInteger(width) && width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH) { sidebarPreferredWidth = width; applySidebarWidth(); }
+    } catch (_) { /* restricted storage */ }
+  });
+
+  function finishSidebarResize(commit: any) {
+    if (sidebarResizePointer === null) return;
+    const pointerId = sidebarResizePointer;
+    if (sidebarResizeFrame !== null) cancelAnimationFrame(sidebarResizeFrame);
+    sidebarResizeFrame = null;
+    if (commit && sidebarResizeX !== null) applySidebarPointer();
+    sidebarResizeX = null;
+    if (!commit) {
+      sidebarPreferredWidth = sidebarResizeStartWidth;
+      setSidebarCollapsed(sidebarResizeStartCollapsed);
+    }
+    sidebarResizePointer = null;
+    (document.body as HTMLElement).classList.remove("sidebar-resizing");
+    if (sidebarResizeHandle.hasPointerCapture && sidebarResizeHandle.hasPointerCapture(pointerId)) {
+      sidebarResizeHandle.releasePointerCapture(pointerId);
+    }
+    applySidebarWidth();
+    sidebarResizeMetrics = null;
+    window.dispatchEvent(new Event("sidebarresizeend"));
+    if (commit) saveSidebarWidth();
+  }
+
+  applySidebarWidth();
+  window.addEventListener("resize", function () {
+    if (isMobile()) finishSidebarResize(true);
+    applySidebarWidth();
+  });
+  sidebarResizeHandle.addEventListener("pointerdown", function(event: any) {
+    if (sidebarResizePointer !== null || event.button !== 0 || isMobile()) return;
+    event.preventDefault();
+    sidebarResizePointer = event.pointerId;
+    sidebarResizeStartWidth = sidebarPreferredWidth;
+    sidebarResizeStartCollapsed = sidebar.classList.contains("collapsed");
+    sidebarResizeMetrics = { left: sidebar.getBoundingClientRect().left,
+      rail: sidebarRailWidth(), threshold: sidebarCollapseThreshold() };
+    if (sidebarResizeHandle.setPointerCapture) sidebarResizeHandle.setPointerCapture(event.pointerId);
+    (document.body as HTMLElement).classList.add("sidebar-resizing");
+  });
+  function applySidebarPointer() {
+    sidebarResizeFrame = null;
+    if (sidebarResizePointer === null || sidebarResizeX === null) return;
+    // 拖动起点的左边缘/阈值固定；移动过程中只写宽度，避免每次事件先强制布局。
+    const width = sidebarResizeX - sidebarResizeMetrics.left - 1;
+    const threshold = sidebarResizeMetrics.threshold;
+    // 迟滞 8px，防止指针停在阈值附近时侧栏来回闪烁。
+    if (sidebar.classList.contains("collapsed")) {
+      if (width >= threshold + 8) setSidebarCollapsed(false);
+    } else if (width <= threshold - 8) {
+      setSidebarCollapsed(true);
+    }
+    if (!sidebar.classList.contains("collapsed")) {
+      sidebarPreferredWidth = clampSidebarWidth(width);
+      applySidebarWidth();
+    }
+  }
+  window.addEventListener("pointermove", function(event: any) {
+    if (event.pointerId !== sidebarResizePointer) return;
+    sidebarResizeX = event.clientX;
+    if (sidebarResizeFrame === null) sidebarResizeFrame = requestAnimationFrame(applySidebarPointer);
+  });
+  window.addEventListener("pointerup", function(event: any) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
+  });
+  window.addEventListener("pointercancel", function(event: any) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(false);
+  });
+  window.addEventListener("blur", function () { finishSidebarResize(true); });
+  sidebarResizeHandle.addEventListener("lostpointercapture", function(event: any) {
+    if (event.pointerId === sidebarResizePointer) finishSidebarResize(true);
+  });
+  sidebarResizeHandle.addEventListener("keydown", function(event: any) {
+    let width = clampSidebarWidth(sidebarPreferredWidth);
+    const collapsed = sidebar.classList.contains("collapsed");
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (collapsed && event.key === "ArrowLeft") return;
+    if (event.key === "Home" || (event.key === "ArrowLeft" && !collapsed && width <= SIDEBAR_MIN_WIDTH)) {
+      setSidebarCollapsed(true);
+      return;
+    }
+    if (event.key === "ArrowLeft" && !collapsed) width -= event.shiftKey ? 40 : 16;
+    else if (event.key === "ArrowRight" && !collapsed) width += event.shiftKey ? 40 : 16;
+    else if (event.key === "End") width = sidebarWidthLimit();
+    setSidebarCollapsed(false);
+    sidebarPreferredWidth = clampSidebarWidth(width);
+    applySidebarWidth();
+    saveSidebarWidth();
+  });
+  sidebarResizeHandle.addEventListener("dblclick", function () {
+    sidebarPreferredWidth = SIDEBAR_DEFAULT_WIDTH;
+    setSidebarCollapsed(false);
+    applySidebarWidth();
+    saveSidebarWidth();
+  });
+
+  function setSidebarCollapsed(collapsed: any) {
+    sidebar.classList.toggle("collapsed", collapsed);
+    scrim.classList.toggle("show", isMobile() && !collapsed);
+    applySidebarWidth();
+  }
+
+  $("#sidebarToggle").addEventListener("click", function () { setSidebarCollapsed(true); });
+  $("#railExpand").addEventListener("click", function () { setSidebarCollapsed(false); });
+  $("#railChats").addEventListener("click", function () { setSidebarCollapsed(false); });
+  $("#menuToggle").addEventListener("click", function () { setSidebarCollapsed(false); });
+  scrim.addEventListener("click", function () { setSidebarCollapsed(true); });
+
+  // 收起态设置菜单不展开侧边栏。
+  $("#railAvatar").addEventListener("click", function(event: any) {
+    event.stopPropagation();
+    if (App.sidebarSettings) App.sidebarSettings.toggle(event.currentTarget);
+  });
+
+  // ---------- 会话搜索 ----------
+  function filterSessions(keyword: any) {
+    sessionList.querySelectorAll(".session-item").forEach(function(node: any) {
+      const name = node.querySelector(".session-name").textContent.toLowerCase();
+      node.style.display = !keyword || name.includes(keyword) ? "" : "none";
+    });
+    // 多选分组视图：过滤后隐藏没有任何可见成员的组块（避免空组头残留）
+    sessionList.querySelectorAll(".bulk-group").forEach(function(block: any) {
+      const visible = Array.from(block.querySelectorAll(".session-item"))
+        .some(function(node: any) { return node.style.display !== "none"; });
+      block.style.display = visible ? "" : "none";
+    });
+    // 多选分组视图：搜索期间强制展开分组（命中结果不应藏在折叠组内）
+    sessionList.classList.toggle("bulk-search-open", Boolean(keyword));
+    // 可见集变化后同步总控「全选/取消全选」按钮状态
+    if (App.updateBulkSelectAllBtn) App.updateBulkSelectAllBtn();
+    // 搜索时隐藏分组区（「最近」已含全部会话，搜索结果在扁平列表中呈现）
+    if (App.sessionGroups && App.sessionGroups.applyFilter) App.sessionGroups.applyFilter(keyword);
+  }
+
+  // ---------- 工具行描述悬浮提示 ----------
+  const toolTip = el("div", "tool-tip");
+  toolTip.style.display = "none";
+  (document.body as HTMLElement).appendChild(toolTip);
+
+  function hideToolTip() {
+    toolTip.style.display = "none";
+  }
+
+
+  // 引用与附件使用 display:contents 子槽，必须同步外层容器显隐。
+  // fit 幂等：列数按可用宽度重算；不可测时（历史回放先拼 detached
+  // fragment，clientWidth 为 0）延迟到下一帧重试，最多 5 次；超出两行的
+  // 部分折叠进 +N 展开块（display:none，不占网格单元；不用 overflow 裁剪，
+  // 避免引用浮层被夹断）。
+  function fitAttachmentBlockGrid(container: any, retries?: any) {
+    if (!container) return;
+    const tiles = container.querySelectorAll(
+      ".composer-quotes-tile, .media-chip, .doc-chip, .msg-quote-tile, .msg-user-media-thumb, .msg-user-media-audio, .msg-user-media-doc"
+    );
+    if (!tiles.length) return;
+    const style = getComputedStyle(container);
+    const available = container.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+    if (!(available > 0) && (retries || 0) < 5 && typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(function () { fitAttachmentBlockGrid(container, (retries || 0) + 1); });
+      return;
+    }
+    const gap = parseFloat(style.columnGap) || 6;
+    const columns = Math.min(tiles.length, Math.max(1, Math.floor((available + gap) / (52 + gap))));
+    container.style.setProperty("--attachment-block-columns", String(columns));
+    container.style.setProperty("--attachment-block-size", "52px");
+    fitAttachmentBlockOverflow(container, tiles, columns);
+  }
+
+  // 两行封顶：可见单元 = min(总数, 列数×2)；超出时最后一个单元换成 +N
+  // 展开块（点击展开全部，再点收起）。重复调用幂等。
+  function fitAttachmentBlockOverflow(container: any, tiles: any, columns: any) {
+    const expanded = Boolean(container.dataset && container.dataset.attachmentExpanded === "1");
+    const capacity = Math.max(1, columns) * 2;
+    let moreTile = container._attachmentMoreTile || null;
+    if (tiles.length <= capacity) {
+      if (moreTile) moreTile.hidden = true;
+      if (container.dataset) delete container.dataset.attachmentExpanded;
+      tiles.forEach(function(t: any) { t.hidden = false; });
+      return;
+    }
+    if (!moreTile) {
+      moreTile = el("button", "attachment-more-tile");
+      moreTile.type = "button";
+      moreTile.addEventListener("click", function () {
+        if (container.dataset.attachmentExpanded === "1") delete container.dataset.attachmentExpanded;
+        else container.dataset.attachmentExpanded = "1";
+        fitAttachmentBlockGrid(container);
+      });
+      container._attachmentMoreTile = moreTile;
+      container.appendChild(moreTile);
+    }
+    moreTile.hidden = false;
+    if (expanded) {
+      moreTile.textContent = "收起";
+      moreTile.setAttribute("aria-label", "收起附件，只显示两行");
+      tiles.forEach(function(t: any) { t.hidden = false; });
+    } else {
+      const visibleCount = capacity - 1;
+      moreTile.textContent = "+" + (tiles.length - visibleCount);
+      moreTile.setAttribute("aria-label", "展开全部 " + tiles.length + " 个附件");
+      tiles.forEach(function(t: any, i: any) { t.hidden = i >= visibleCount; });
+    }
+  }
+
+  function syncComposerAttachmentBlocks() {
+    if (!composerAttachmentBlocks) return;
+    const hasQuotes = Boolean(composerQuotes && composerQuotes.children.length && !composerQuotes.classList.contains("hidden"));
+    const hasMedia = Boolean(composerAttachments && composerAttachments.children.length && !composerAttachments.classList.contains("hidden"));
+    composer.classList.toggle("has-quotes", hasQuotes);
+    composer.classList.toggle("has-media", hasMedia);
+    composerAttachmentBlocks.classList.toggle("hidden", !hasQuotes && !hasMedia);
+    if (hasQuotes || hasMedia) fitAttachmentBlockGrid(composerAttachmentBlocks);
+    updateScrollBottomOffset();
+  }
+
+  // ---------- 导出到共享命名空间（各模块按需解构） ----------
+  Object.assign(App, {
+  MAX_PENDING_MEDIA, MEDIA_SIZE_LIMITS, MEDIA_EXTENSIONS,
+  DOC_EXTENSIONS, MAX_DOC_FILE_SIZE, QNAV_MAX_DASHES,
+  SESSION_TITLE_KEY, MODEL_ROLES, ROLE_DEFAULT_PARAMS,
+  API_TYPE_DEFAULT_PARAMS, CHAT_SETTINGS_DEFAULTS, app,
+  sidebar, scrim, sessionList,
+  tokenTotal, sessionMenuUsage, sessionMenuUsageValues,
+  sessionActionsBtn, sessionActionsMenu, shareSessionItem,
+  compactSessionItem, main, chatScroll,
+  chatInner, input, composer,
+  composerWrap, contextTokenStatus, contextTokenSummary,
+  contextTokenWorkdir, contextTokenModel, sendBtn, stopBtn, resumeBtn,
+  voiceBtn, stopGroup, stopMenuBtn, queueMenu,
+  composerAttachments, pendingOutbox, contextTokenTodoSlot,
+  composerQuotes, composerAttachmentBlocks, syncComposerAttachmentBlocks, fitAttachmentBlockGrid,
+  todoPanelHost, askModal, askQuestions,
+  askSubmit, mediaPreviewModal, mediaPreviewBody,
+  mediaPreviewTitle, mediaPreviewZoom, mediaPreviewZoomIn, mediaPreviewZoomOut,
+  mediaPreviewZoomLabel, boostBtn, enhancePanel, enhanceModal, enhanceBody, enhanceScope,
+  enhanceClose, modelTabs, modelPicker,
+  modelPickerLabel, modelList, reasoningEffort,
+responsesParametersGroup, responsesMode, responsesModeHint, responsesStatefulControls, responsesEffort, responsesSummary, responsesVerbosity, responsesSampling, responsesTemperatureRow, responsesTemperature, responsesTemperatureValue, responsesTopPRow, responsesTopP, responsesTopPValue, responsesInstructions, responsesExtraBody, responsesStateHint, responsesRebuildSource, responsesRebuild,
+  chatParametersGroup, messagesParametersGroup, enableThinking, temperature, temperatureValue,
+  maxTokens, maxTokensValue, topP,
+  topPValue, presencePenalty, presencePenaltyValue,
+  messagesTemperatureRow, messagesTemperature, messagesTemperatureValue,
+  messagesTopPRow, messagesTopP, messagesTopPValue, messagesThinkingMode,
+  messagesThinkingBudgetRow, messagesThinkingBudget, messagesThinkingBudgetValue, messagesThinkingHint,
+  messagesEffort, messagesStopSequences, messagesExtraBody,
+  enhanceCancel, enhanceConfirm, enhanceReset,
+  enhanceClearOverride, enhanceHint,
+  customHeadersBox, customHeadersRows, addHeaderRow,
+  settingsRetitleRow, settingsRetitleToggle, settingsRetitleStatus,
+  plusBtn, plusMenu, toolModal, toolGroups,
+  toolSearchInput, toolSelected, toolCollapseAll,
+  toolRefresh, toolFollowGlobal, fileInput, historyFileInput,
+  fileChips, toolChips,
+  profileName, profileSub, scrollBottomBtn, qnav,
+  qnavRail, qnavPanel, toastWrap,
+  deleteModal, deleteModalBackdrop, deleteCancel,
+  deleteConfirm, importConflictModal, importConflictBackdrop,
+  importConflictList, importConflictHint, importConflictSummary,
+  importConflictCancel, importConflictSubmit,
+  chatSettingsModal, chatSettingsBackdrop,
+  chatSettingsClose, chatSettingsCancel, chatSettingsConfirm,
+  chatSettingsReset,
+  toolCallTimeoutSeconds, networkRetryMaxAttempts, compactionRetryMaxAttempts, videoReadMaxSeconds, mcpToolWorkers,
+  subAgentFinalReplyRetryMax, subAgentStreamErrorRetryMax, subAgentTodoRemindMax,
+  subAgentMaxConcurrent,
+  subAgentMaxRounds, subAgentTimeoutSeconds,
+  triggerRatio, summaryBudgetRatio, historyTargetTokens, historyTargetHint, oversizedRejectFactor,
+  maxOversizedRejections, effectiveThresholdHint, state, $,
+  el, toast, isMobile,
+  scrollToBottom, nearBottom, stickToBottom, pauseAutoScroll, isChatScrollbarDragging, setEmpty,
+  updateScrollBottomOffset, refreshThemeUI, closeMenus,
+  closeToolModal, setSidebarCollapsed, filterSessions,
+  readTitleOverrides, docKindOf, hideToolTip,
+  toolTip
+  });
+
+  // 原生滚动条由浏览器处理拖动，pointermove 通常不会发回 DOM；用
+  // 滚动条区域的按下/全局释放明确标记手势，禁止滚动补偿抢夺原生拖动。
+  (function observeNativeScrollbarDrag() {
+    let pointerId: any = null;
+    let pressY = 0;
+    function scrollbarGeometry(event: any) {
+      if (event.target !== chatScroll || event.pointerType === "touch") return null;
+      const rect = chatScroll.getBoundingClientRect();
+      const scale = rect.width / (chatScroll.offsetWidth || rect.width || 1);
+      const left = rect.left + chatScroll.clientLeft * scale, right = left + chatScroll.clientWidth * scale;
+      if (event.clientX >= left && event.clientX < right) return null;
+      if (event.clientY < rect.top || event.clientY >= rect.top + (chatScroll.clientTop + chatScroll.clientHeight) * scale) return null;
+      return {rect,scale};
+    }
+    function clearPreparation() { chatScroll.classList.remove("scrollbar-ready"); }
+    // 在按下之前测准轨道，避免 pointerdown 内的高度回填改变浏览器即将
+    // 命中的滑块位置，使真正的拖动被原生控件误当作点击轨道。
+    chatScroll.addEventListener("pointermove", function(event: any) {
+      if (chatScrollbarDragging) return;
+      if (App.historyScroll && App.historyScroll.active && App.historyScroll.active()) { clearPreparation(); return; }
+      if (event.buttons || !scrollbarGeometry(event)) { clearPreparation(); return; }
+      if (chatScroll.classList.contains("scrollbar-ready")) return;
+      const range = chatScroll.scrollHeight - chatScroll.clientHeight;
+      const progress = range > 0 ? chatScroll.scrollTop / range : 0;
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScroll.classList.add("scrollbar-ready");
+      chatScroll.scrollTop = progress * Math.max(0, chatScroll.scrollHeight - chatScroll.clientHeight);
+      lastScrollTop = chatScroll.scrollTop;
+      chatScroll.style.scrollBehavior = behavior;
+    }, {passive:true});
+    chatScroll.addEventListener("pointerleave", function () { if (!chatScrollbarDragging) clearPreparation(); });
+    function finish(event: any, cancelled: any) {
+      if (cancelled) clearPreparation();
+      if (!chatScrollbarDragging || (event && event.pointerId != null && pointerId != null && event.pointerId !== pointerId)) return;
+      const atTop = chatScroll.scrollTop <= 2;
+      const atBottom = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight <= 2;
+      const historyRelease = App.historyScroll && App.historyScroll.captureRelease();
+      let edge = atTop ? "start" : atBottom ? "end" : null;
+      // 原生滑块可能因轨道命中/浏览器释放处理而保留旧像素位置；有实际
+      // 拖动位移时，也尊重鼠标最终到达轨道端点的意图。单击箭头不算拖动。
+      if (!historyRelease && !cancelled && event && Math.abs(event.clientY - pressY) > 4) {
+        const rect = chatScroll.getBoundingClientRect();
+        const endSize = Math.max(2, (chatScroll.offsetWidth - chatScroll.clientWidth) * rect.width / chatScroll.offsetWidth);
+        if (event.clientY <= rect.top + endSize) edge = "start";
+        else if (event.clientY >= rect.bottom - endSize) edge = "end";
+      }
+      // 先记录手势结束的位置，再释放布局锁。流式内容可继续更新；拖动期间
+      // 被暂存的新增高度在此恢复，只有用户确实拖到底部时才继续跟随。
+      const behavior = chatScroll.style.scrollBehavior;
+      chatScroll.style.scrollBehavior = "auto";
+      chatScrollbarDragging = false; pointerId = null;
+      chatScroll.classList.remove("scrollbar-dragging");
+      clearPreparation();
+      chatInner.style.removeProperty("--scrollbar-content-height");
+      if (historyRelease) App.historyScroll.endDrag(cancelled,historyRelease);
+      else if (!cancelled && edge === "start") chatScroll.scrollTop = 0;
+      else if (!cancelled && edge === "end") chatScroll.scrollTop = chatScroll.scrollHeight;
+      lastScrollTop = chatScroll.scrollTop;
+      autoScrollPaused = cancelled || edge !== "end";
+      chatScroll.style.scrollBehavior = behavior;
+      chatScroll.dispatchEvent(new CustomEvent("chat-scrollbar-dragend", { detail: {
+        cancelled: Boolean(cancelled), edge: cancelled ? null : edge
+      } }));
+    }
+    chatScroll.addEventListener("pointerdown", function(event: any) {
+      if (event.button !== 0) return;
+      const geometry = scrollbarGeometry(event);
+      if (!geometry) return;
+      const scale = geometry.scale;
+      if (chatScroll.scrollHeight <= chatScroll.clientHeight) return;
+      chatScrollbarDragging = true; pointerId = event.pointerId; pressY = event.clientY;
+      pauseAutoScroll();
+      const range = chatScroll.scrollHeight - chatScroll.clientHeight;
+      const progress = range > 0 ? chatScroll.scrollTop / range : 0;
+      chatScroll.classList.add("scrollbar-dragging");
+      clearPreparation();
+      // 原生拖动依赖固定 scrollHeight。历史模式包含完整会话的首尾占位，
+      // 不在按下时改比例；没有历史窗口时才测准当前懒渲染内容并补偿比例。
+      chatInner.style.setProperty("--scrollbar-content-height", chatInner.getBoundingClientRect().height / scale + "px");
+      if (!App.historyScroll || !App.historyScroll.active || !App.historyScroll.active()) {
+        chatScroll.scrollTop = progress * (chatScroll.scrollHeight - chatScroll.clientHeight);
+      }
+      if (App.historyScroll) App.historyScroll.beginDrag();
+    }, { capture: true });
+    window.addEventListener("pointerup", function(event: any) { finish(event, false); }, true);
+    window.addEventListener("mouseup", function(event: any) { finish(event, false); }, true);
+    window.addEventListener("pointercancel", function(event: any) { finish(event, true); }, true);
+    window.addEventListener("blur", function () { finish(null, true); });
+    window.addEventListener("resize", function () { finish(null, true); });
+    document.addEventListener("visibilitychange", function () { if (document.hidden) finish(null, true); });
+  })();
+
+  // 附件网格跟随缩放/窗口变化重算列数：只在 chatInner 宽度变化时重算
+  // （流式高度变化频繁，过滤掉避免抖动），rAF 节流合并。位于导出区
+  // 之后，不在单测切片范围内。
+  (function observeAttachmentGridResize() {
+    if (typeof ResizeObserver === "undefined" || !chatInner) return;
+    let lastWidth = 0;
+    let queued = false;
+    new ResizeObserver(function () {
+      const width = chatInner.clientWidth || 0;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      if (queued) return;
+      queued = true;
+      const defer = typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame : function(fn: any) { return setTimeout(fn, 16); };
+      defer(function () {
+        queued = false;
+        if ((document.body as HTMLElement).classList.contains("sidebar-resizing")) return;
+        chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(function(c: any) {
+          fitAttachmentBlockGrid(c);
+        });
+      });
+    }).observe(chatInner);
+    window.addEventListener("sidebarresizeend", function () {
+      lastWidth = chatInner.clientWidth || 0;
+      chatInner.querySelectorAll(".msg-user-attachment-blocks").forEach(function(c: any) {
+        fitAttachmentBlockGrid(c);
+      });
+    });
+  })();
+})((window as unknown as { App: any }).App);

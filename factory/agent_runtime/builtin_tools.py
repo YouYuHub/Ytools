@@ -1271,10 +1271,11 @@ def execute_search_files(tool_args: dict[str, Any]) -> dict[str, Any]:
     if not isregex and not total_matches and any(token in pattern for token in ("|", ".*", "\\d", "\\s")):
         warnings.append("[当前按普通文本匹配；若 pattern 使用正则语法，请显式传 is_regex=true。]")
     header = (f"[search_files] {search_label}: {pattern[:160]} | 目录: {_display_path(root)[:160]}"
-              f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处")
+              f" | 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / "
+              f"{'约 ' if not scan_complete else ''}{total_matches} 处")
     prefix = "\n".join(warnings + [header])
     if len(prefix) > return_max_chars - 180:
-        header = f"[search_files] 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {total_matches} 处；路径和表达式见返回字段。"
+        header = f"[search_files] 扫描 {files_scanned} 个文本文件，命中 {files_matched} 个文件 / {'约 ' if not scan_complete else ''}{total_matches} 处；路径和表达式见返回字段。"
         prefix = "\n".join(warnings + [header])
     metadata = {
         "success": True,
@@ -2277,6 +2278,43 @@ def _fetch_url_media_bytes(
     return data
 
 
+def _probe_url_media(source: str) -> str | None:
+    """网络直链注入前探活：可达性 + 内容类型校验。返回错误说明或 None（通过）。
+
+    URL 直传零校验会导致坏链注入后上游整请求 400（实证：死链注入后供应商
+    报 media URL download failed，重试 20 次任务失败）。探活只读响应头 +
+    首个分片（4KB），不下载全文；失败返回模型可见的错误说明并跳过注入。
+    """
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
+        with permission_urlopen(req, timeout=30) as resp:
+            headers = resp.headers
+            if hasattr(headers, "get_content_type"):
+                content_type = headers.get_content_type() or ""
+            else:
+                content_type = str(headers.get("Content-Type", "") or "").split(";")[0].strip()
+            head = resp.read(4097)
+    except urllib.error.HTTPError as exc:
+        return f"网络媒体下载失败（HTTP {exc.code}）：{source}；未注入，请检查链接有效性"
+    except PermissionError:
+        return f"网络媒体来源未获本次授权：{source}；未注入"
+    except Exception as exc:
+        return f"网络媒体无法访问（{exc}）：{source}；未注入"
+    if not head:
+        return f"网络媒体内容为空：{source}；未注入"
+    if content_type.startswith(("image/", "video/", "audio/")) or content_type == "application/octet-stream":
+        return None
+    if file_memory._sniff_media_filename(head) is not None:
+        return None
+    return (
+        f"网络媒体不是图片/音视频（Content-Type: {content_type or '未知'}，"
+        f"可能为错误页面）：{source}；未注入"
+    )
+
+
 def _network_media_fetch_limit_bytes(source_or_name: str) -> int:
     """网络直链转换下载上限：gif 动图按视频档 600MB，其余按静图档 30MB。
 
@@ -2336,6 +2374,10 @@ def load_any_media_model_part(
             if kind == "video":
                 return {"error": f"[未发送附件（视频）：{name}。网络视频不会自动下载，请下载到本地后读取；本地视频可转为关键帧拼图查看。]", "source_type": "network", "source": source}
             return {"error": file_memory.media_unsupported_notice(kind, name, api_type), "source_type": "network", "source": source}
+        # 注入前探活：死链/错误页面直接拒绝，不注入（否则上游整请求 400）。
+        probe_error = _probe_url_media(source)
+        if probe_error is not None:
+            return {"error": probe_error, "source_type": "network", "source": source}
         part: dict[str, Any]
         if kind == "image":
             part = {"type": "image_url", "image_url": {"url": source}}
@@ -2612,6 +2654,7 @@ def execute_read_media(
             "source_type": info.get("source_type"),
             "kind": info.get("kind"),
             "mime": info.get("mime"),
+            "original_mime": info.get("original_mime"),
             "size": info.get("size"),
             "downsampled": info.get("downsampled"),
             "quality": info.get("quality"),
@@ -2621,13 +2664,15 @@ def execute_read_media(
             "video": info.get("video"),
         })
     loaded = bool(loaded_items)
+    if loaded:
+        message = f"已准备 {len(loaded_items)} 个媒体，将提供给下一次模型请求；请检查 skipped"
+    elif skipped and all(s.get("reason") == "already_injected" for s in skipped):
+        message = "所请求的媒体本轮已注入过，无需重复读取（如需查看内容请直接使用上下文中的媒体）"
+    else:
+        message = "没有可读取的媒体（引用无效/重复或全部被跳过）"
     return {
         "ok": loaded,
-        "message": (
-            f"已准备 {len(loaded_items)} 个媒体，将提供给下一次模型请求；请检查 skipped"
-            if loaded
-            else "没有可读取的媒体（引用无效/重复或全部被跳过）"
-        ),
+        "message": message,
         "loaded": loaded_items,
         "skipped": skipped,
         # 去重键口径：未指定区间=引用原文；指定区间=引用#start-end
@@ -3385,17 +3430,26 @@ def _has_multiline_inline_intent(command: str) -> bool:
     return False
 
 
-def _inline_code_needs_script(code: str, multi_line: bool) -> bool:
+def _inline_code_needs_script(code: str, multi_line: bool, shell_kind: str = "cmd", quote: str = "") -> bool:
     """该段内联代码是否需要改写为临时脚本。
 
-    需要：多行（cmd 按行解释 .cmd，必被拆行）或含 `%`（cmd 批处理层会吞掉
+    cmd 需要：多行（按行解释 .cmd，必被拆行）或含 `%`（批处理层会吞掉
     孤立 `%`、把 `%VAR%` 展开成环境变量值，代码在到达子进程前就被破坏）。
-    不需要：单行且不含 `%`——交给 shell 原生处理（保持既有行为与低开销）。
+    powershell/pwsh 需要：多行（双引号内联代码的引号嵌套/换行在 -Command
+    内联与 .ps1 解析中都极易错乱，模型习惯性写法必炸；改写后语义等价）。
+    所有 shell 都需要：代码含与外层同种的引号（引号嵌套，如
+    `python -c "print("hi")"`——内外层引号无法区分，不改写必错乱）。
+    powershell 下 `%` 无特殊含义，单行含 `%` 不改写；其余单行交给 shell
+    原生处理（保持既有行为与低开销）。
     """
+    if quote and quote in code:
+        return True
+    if shell_kind in ("powershell", "pwsh"):
+        return multi_line
     return multi_line or ("%" in code)
 
 
-def _locate_inline_code_segment(command: str, start: int = 0):
+def _locate_inline_code_segment(command: str, start: int = 0, shell_kind: str = "cmd"):
     """定位下一段"需要脚本化"的内联代码，返回定位 dict 或 None。
 
     两级策略：
@@ -3407,13 +3461,13 @@ def _locate_inline_code_segment(command: str, start: int = 0):
     只接受"单行含 `%`"或"多行"的段；其余段跳过继续向后找。
     """
     found = _find_inline_code(command, min_lines=1, start=start)
-    if found is not None and _inline_code_needs_script(found["code"], found["multi_line"]):
+    if found is not None and _inline_code_needs_script(found["code"], found["multi_line"], shell_kind, found.get("quote") or ""):
         return found
     search_from = start
     while True:
         match = _INLINE_CODE_RE.search(command, search_from)
         if not match:
-            return None
+            break
         quote = match.group("quote")
         open_index = match.end() - 1
         close_index = command.find(quote, open_index + 1)
@@ -3434,7 +3488,7 @@ def _locate_inline_code_segment(command: str, start: int = 0):
             continue
         code = command[open_index + 1: close_index]
         if len(code) <= _INLINE_SCRIPT_MAX_CHARS and _inline_code_needs_script(
-            code, "\n" in code
+            code, "\n" in code, shell_kind, quote
         ):
             return {
                 "interp": match.group("interp").strip().lstrip("&|(").strip(),
@@ -3448,10 +3502,36 @@ def _locate_inline_code_segment(command: str, start: int = 0):
                 "multi_line": "\n" in code,
             }
         search_from = close_index + 1
+    # 第三级：引号嵌套贪心（`python -c "print("hi")"`）——前两级会把内层引号
+    # 当闭引号而提前闭合。贪心取“开引号→最后一个同种引号”；仅当最后一个
+    # 引号后无实质内容时返回（后面还有命令则不贪心，避免吞并
+    # `python -c "A" && echo "done"` 这类后续段）。
+    match = _INLINE_CODE_RE.search(command, start)
+    if match is not None:
+        quote = match.group("quote")
+        open_index = match.end() - 1
+        close_index = command.rfind(quote, open_index + 1)
+        if close_index > open_index:
+            code = command[open_index + 1: close_index]
+            if (quote in code and not command[close_index + 1:].strip()
+                    and len(code) <= _INLINE_SCRIPT_MAX_CHARS
+                    and _inline_code_needs_script(code, "\n" in code, shell_kind, quote)):
+                return {
+                    "interp": match.group("interp").strip().lstrip("&|(").strip(),
+                    "flag": match.group("flag"),
+                    "flag_start": match.start("flag"),
+                    "flag_end": match.end("flag"),
+                    "open_index": open_index,
+                    "close_index": close_index,
+                    "quote": quote,
+                    "code": code,
+                    "multi_line": "\n" in code,
+                }
+    return None
 
 
 def _rewrite_inline_code_to_script(command: str, shell_kind: str):
-    """把 cmd 无法安全直接执行的内联代码改写为临时脚本（cmd 家族）。
+    """把 shell 无法安全直接执行的内联代码改写为临时脚本。
 
     cmd 会破坏两类内联代码，因此两类都改写为 `<解释器> "<临时脚本>"`：
     - 多行：命令写入 .run.cmd 后按行解释，后续行被当独立命令执行
@@ -3460,22 +3540,26 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
       环境变量值（实测 `python -c "print('100%')"` 输出 `100`；`print('%d' % 5)`
       直接 SyntaxError）。脚本文件内容不经 cmd 批处理解析，两种链路
       （隐藏中转链 / Popen 直连）下语义都稳定，且退出码透传。
+    powershell/pwsh 只改写多行内联代码：双引号字符串里的引号嵌套/换行在
+    PowerShell 解析中极易错乱（模型习惯性写法必炸）；单行（含 `%`，在
+    PowerShell 无特殊含义）交给原生处理。其它 shell（bash/sh/zsh）原生支持
+    多行引号字符串，不改写。
     注意必须连入口 flag（`-c`/`-e`）一起替换掉：`python -c "<路径>"` 会把路径
     当代码字符串执行（实测 SyntaxError），而 `python "<路径>"` 才是执行脚本。
     无法安全定位且存在跨行代码意图时抛 ValueError（拒绝执行）。
     返回 (新命令, 提示列表)。
     """
-    if shell_kind != "cmd":
+    if shell_kind not in ("cmd", "powershell", "pwsh"):
         return command, []
-    found = _locate_inline_code_segment(command)
+    found = _locate_inline_code_segment(command, shell_kind=shell_kind)
     if found is None:
         # 不能安全改写且确有【跨行】内联代码时必须拒绝执行：否则 cmd 可能已运行
-        # 首行，随后把代码正文当成一串独立命令，模型也无法从退出码判断哪些行
-        # 真的执行了。单行内联代码（哪怕整条命令还有其它 shell 行）不受拆行
-        # 影响，不误杀"多行 shell 命令 + 单行内联代码"的普通写法。
+        # 首行，随后把代码正文当成一串独立命令（powershell 则报引号错乱），模型
+        # 也无法从退出码判断哪些行真的执行了。单行内联代码（哪怕整条命令还有
+        # 其它 shell 行）不受拆行影响，不误杀"多行 shell 命令 + 单行内联代码"的普通写法。
         if _has_multiline_inline_intent(command):
             raise ValueError(
-                "cmd 下的多行内联代码无法安全改写，命令未执行；请用 write_file 写入"
+                "多行内联代码无法安全改写，命令未执行；请用 write_file 写入"
                 "脚本后运行，或改用适合该语法的 shell")
         return command, []
     interp = found["interp"]
@@ -3501,14 +3585,40 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
         f'{command[:found["flag_start"]]}{script_arg}'
         f'{command[found["close_index"] + 1:]}'
     )
+    # 嵌套判定：代码含与外层同种的引号（只有贪心第三级能产出这种 found，
+    # 精确/退化定位的闭引号就是第一个同种引号，代码里不可能还有）。
+    nested = bool(found.get("quote") and found["quote"] in code)
     if found["multi_line"]:
-        note = (
-            f"检测到多行内联代码（{interp} {found['flag']}）：cmd 按行解释 .cmd 文件"
-            f"会把后续行当命令执行，已自动改写为临时脚本 {_display_path(script_path)} "
-            "后执行（语义等价，退出码透传）"
-        )
+        if nested:
+            note = (
+                f"检测到多行内联代码且含引号嵌套（{interp} {found['flag']}）：内外层"
+                "引号无法区分，直接执行必错乱，"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（语义等价，退出码透传）"
+            )
+        elif shell_kind in ("powershell", "pwsh"):
+            note = (
+                f"检测到多行内联代码（{interp} {found['flag']}）：PowerShell 对双引号内"
+                "代码的引号嵌套/换行解析严格，直接执行极易报引号错乱，"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（语义等价，退出码透传）"
+            )
+        else:
+            note = (
+                f"检测到多行内联代码（{interp} {found['flag']}）：cmd 按行解释 .cmd 文件"
+                f"会把后续行当命令执行，已自动改写为临时脚本 {_display_path(script_path)} "
+                "后执行（语义等价，退出码透传）"
+            )
     else:
-        note = (
+        if nested:
+            note = (
+                f"检测到单行内联代码中的引号嵌套（{interp} {found['flag']}）：内外层"
+                "引号无法区分，直接执行必错乱，"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（语义等价，退出码透传）"
+            )
+        else:
+            note = (
             f"检测到单行内联代码中的 `%`（{interp} {found['flag']}）：cmd 批处理层会"
             "吞掉孤立 `%` 或把 `%VAR%` 展开成环境变量值（实测 `print('100%')` 输出丢 `%`），"
             f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
@@ -3586,13 +3696,37 @@ def _append_command_notes(text: str, notes: list) -> str:
     return text + "\n" + "\n".join(lines)
 
 
+# 日志目录清理节流：24h 过期清理不需要每次调用都跑（万级文件时单次
+# 扫描秒级，会吃掉小超时命令的全部时限）。每进程最多 5 分钟清理一次。
+_PRUNE_BG_FILES_INTERVAL_SECONDS = 300
+_prune_bg_files_last_run = 0.0
+
+
 def _prune_old_bg_files() -> None:
-    """清理过期中转文件；未关闭的后台记录和仍运行的任务不按 24h 删除。"""
+    """清理过期中转文件；未关闭的后台记录和仍运行的任务不按 24h 删除。
+
+    后台线程执行：万级文件时目录扫描秒级，不能占用工具时限（实证：
+    小超时命令因此在启动前就被裸超时）。清理操作全 OSError 容忍，
+    多进程并发清理安全。
+    """
+    global _prune_bg_files_last_run
+    now = time.monotonic()
+    if now - _prune_bg_files_last_run < _PRUNE_BG_FILES_INTERVAL_SECONDS:
+        return
+    _prune_bg_files_last_run = now
+    from threading import Thread
+    Thread(target=_prune_old_bg_files_sync, daemon=True).start()
+
+
+def _prune_old_bg_files_sync() -> None:
     try:
         cutoff = time.time() - 24 * 3600
         protected = set()
         for metadata_path in _BG_LOG_DIR.glob("bg_*.meta.json"):
             try:
+                # 新鲜任务的元数据免解析：其文件 mtime 同样新鲜，mtime 检查自会保留
+                if not _prune_candidate_by_name(metadata_path.name, cutoff):
+                    continue
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 pid = int(metadata["pid"])
                 alive = _pid_alive_windows(pid) if os.name == "nt" else _pid_alive_posix(pid)
@@ -3611,12 +3745,30 @@ def _prune_old_bg_files() -> None:
                         continue
                     if pattern == "inline_*" and protected:
                         continue
+                    if not _prune_candidate_by_name(item.name, cutoff):
+                        continue
                     if item.stat().st_mtime < cutoff:
                         item.unlink()
                 except OSError:
                     continue
     except OSError:
         pass
+
+
+def _prune_candidate_by_name(name: str, cutoff: float) -> bool:
+    """按文件名时间戳快判是否可能过期：新鲜文件免 stat。
+
+    bg_/fg_/inline_ 文件名均含 YYYYMMDD_HHMMSS；解析成功且晚于 cutoff
+    即判定新鲜（留 1 小时余量防时钟偏差）；解析失败回退 stat。
+    """
+    match = re.match(r"^(?:bg_|fg_|inline_)(\d{8})_(\d{6})", name)
+    if not match:
+        return True
+    try:
+        stamp = time.mktime(time.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S"))
+    except (ValueError, OverflowError):
+        return True
+    return stamp < cutoff - 3600
 
 
 def _pid_alive_windows(pid: int) -> bool:
@@ -3783,7 +3935,7 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         launcher_path.write_bytes(launcher_text.encode("utf-8", errors="replace"))
         vbs_path.write_bytes(vbs_text.encode("utf-8", errors="replace"))
     if runner_path is not None:
-        _write_runner_script(runner_path, shell_kind, command)
+        _write_runner_script(runner_path, shell_kind, command, work_dir)
     # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
     pid = _wmi_create_process(f'wscript.exe //nologo "{vbs_path}"')
     return {
@@ -3799,7 +3951,18 @@ _POWERSHELL_EXIT_SUFFIX = (
 )
 
 
-def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> None:
+def _powershell_literal_cwd_line(cwd: str) -> str:
+    """PowerShell 启动会对继承的工作目录做通配符 Set-Location：目录含 [ ] 时
+    匹配失败会静默回退到 $PSHOME（实证 System32）。显式 LiteralPath 切一次，
+    失败直接 exit 1（大声失败，不静默跑错目录）。"""
+    escaped = str(cwd).replace("'", "''")
+    return (
+        "try { Set-Location -LiteralPath '" + escaped + "' -ErrorAction Stop }"
+        " catch { Write-Error $_; exit 1 }\n"
+    )
+
+
+def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_dir: str = "") -> None:
     """写执行脚本：cmd→.run.cmd（mbcs）；powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；
     bash/sh/zsh→.run.sh（UTF-8，stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，
     让中转链 done 文件记录命令本身的退出码。
@@ -3820,6 +3983,8 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str) -> No
         return
     text = normalized + "\n"
     if shell_kind in ("powershell", "pwsh"):
+        if work_dir:
+            text = _powershell_literal_cwd_line(work_dir) + text
         text = powershell_text_prelude() + text
         text += _POWERSHELL_EXIT_SUFFIX
         runner_path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
@@ -3924,7 +4089,7 @@ def _run_foreground_direct(command, shell_exe, shell_kind, shell_prefix,
         if shell_kind in ("powershell", "pwsh"):
             # 与隐藏中转脚本保持一致：管道末段是 Select-Object 等 cmdlet 时，
             # PowerShell -Command 可能只返回 0/1，丢失上游原生程序的退出码。
-            command = powershell_text_prelude() + command + "\n" + _POWERSHELL_EXIT_SUFFIX
+            command = _powershell_literal_cwd_line(cwd) + powershell_text_prelude() + command + "\n" + _POWERSHELL_EXIT_SUFFIX
         argv = [shell_exe, *shell_prefix, command]
     popen_kwargs = dict(
         stdin=subprocess.DEVNULL, cwd=cwd,

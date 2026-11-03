@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { stripTypeScriptTypes } = require('node:module');
 class Node {
   constructor(cls, text = '') { this.cls = cls; this.textContent = text; this.children = []; this.dataset = {}; this.classList = { add() {}, remove() {} }; }
   appendChild(n) { if (n.parentNode) n.parentNode.removeChild(n); this.children.push(n); n.parentNode = this; }
@@ -22,8 +23,8 @@ function user(root, text, round) {
   n.appendChild(new Node('msg-bubble', text)); root.appendChild(n); return n;
 }
 for (const reused of [false, true]) test(`附接进行中的第三轮提问立即进入问题导航（${reused ? '复用' : '新建'}气泡）`, async () => {
-  const chatSource = fs.readFileSync(path.join(__dirname, '../js/app/chat.js'), 'utf8');
-  const messages = fs.readFileSync(path.join(__dirname, '../js/app/messages.js'), 'utf8');
+  const chatSource = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/chat.ts'), 'utf8'));
+  const messages = stripTypeScriptTypes(fs.readFileSync(path.join(__dirname, '../src/app/messages_nav.ts'), 'utf8'));
   const root = new Node('root'); user(root, '第一条', 1); user(root, '第二条', 2);
   if (reused) user(root, '生成中的第三条', 3);
   const rail = new Node('rail'); const panel = new Node('panel');
@@ -50,7 +51,7 @@ for (const reused of [false, true]) test(`附接进行中的第三轮提问立�
     } },
   };
   vm.createContext(context);
-  const navStart = messages.indexOf('  let qnavUsers =');
+  const navStart = messages.indexOf('  let qnavUsers');
   const navEnd = messages.indexOf('  // ---------- 从用户引用', navStart);
   vm.runInContext(messages.slice(navStart, navEnd), context);
   context.App.rebuildQnav = context.rebuildQnav;
@@ -59,7 +60,7 @@ for (const reused of [false, true]) test(`附接进行中的第三轮提问立�
   const end = chatSource.indexOf('  /** 打开会话后', start);
   // 附接收尾调用同文件的流中断确认与错误文案助手，一并载入。
   const helperStart = chatSource.indexOf('  // 流错误的展示文案');
-  vm.runInContext(chatSource.slice(helperStart, chatSource.indexOf('  async function send(direct)', helperStart)), context);
+  vm.runInContext(chatSource.slice(helperStart, chatSource.indexOf('  async function send(direct', helperStart)), context);
   vm.runInContext(chatSource.slice(start, end), context);
   await context.attachStreamSession('session');
   assert.equal(checked, true);

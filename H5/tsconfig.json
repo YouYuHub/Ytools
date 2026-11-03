@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig.json",
+  "compilerOptions": {
+    // 经典脚本形态：保持现有 IIFE + window 全局 + <script> 顺序加载，不打包、不改模块制式。
+    // 注：TS7 已移除 module:none；但本仓源码本就没有 import/export，任何 module 取值
+    // 发射结果都一样（原样输出脚本，不包模块壳），故用 esnext（约束最少）。
+    "target": "ES2022",
+    "module": "esnext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // 渐进迁移：JS 文件默认不检查（逐个文件加 // @ts-check 或改名 .ts 后再收紧）
+    // 注意：js/ 下的发射产物必须排除在外（否则与 src/ 源码重复声明）；仅保留
+    // 两个手写 .js 源参与程序（同样不检查，只为将来加 // @ts-check 留口子）。
+    "allowJs": true,
+    "checkJs": false,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    // 本配置只做类型检查不发射；发射走 tsconfig.build.json
+    "noEmit": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "js/history_parse_async.js", "js/history_parse_worker.js", "test_h5/**/*.js"]
+}

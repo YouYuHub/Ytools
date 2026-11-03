@@ -15,11 +15,28 @@ _DNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_pre
 _DNS_SLOTS = threading.BoundedSemaphore(8)
 
 
-def _public(address):
-    address = ipaddress.ip_address(address)
-    if getattr(address, "ipv4_mapped", None):
-        address = address.ipv4_mapped
-    return address.is_global and not (address.is_multicast or address.is_reserved or address.is_unspecified)
+def _blocked(address):
+    """SSRF 危险地址判定（显式黑名单）。
+
+    只拦截真正危险的范围：回环、私网（RFC1918/ULA）、链路本地
+    （含云元数据 169.254.169.254）、未指定、组播。其它非全球单播
+    （如基准测试段 198.18.0.0/15，某些网络的透明代理出口）放行——
+    此前用 is_global 一刀切，公网域名经此类出口解析时被误杀。
+    """
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return any(ip in net for net in _BLOCKED_NETWORKS)
+
+
+_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "0.0.0.0/8", "224.0.0.0/4",
+    "::1/128", "::/128", "fe80::/10", "fc00::/7", "ff00::/8",
+))
 
 
 def _origin(parts):
@@ -49,7 +66,7 @@ def resolve_target(url, *, allowed_origins=(), timeout=5):
         except (OSError, concurrent.futures.TimeoutError) as exc:
             future.cancel()
             raise ValueError("目标地址解析失败或超时") from exc
-    if not addresses or (not private_allowed and any(not _public(address) for address in addresses)):
+    if not addresses or (not private_allowed and any(_blocked(address) for address in addresses)):
         raise ValueError("不允许访问回环、私网、链路本地或云元数据地址")
     return parts, host, port, addresses[0]
 

@@ -27,7 +27,10 @@ class FileHistoryRouterTests(unittest.TestCase):
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp())
         self._orig_root = store.HISTORY_DIFF_ROOT
-        store.HISTORY_DIFF_ROOT = self._tmp
+        # HISTORY_DIFF_ROOT 语义=session_files 根，真实落盘经 files_path(.parent)
+        # 派生：嵌一层使 .parent 落在测试独占目录内，否则会写到系统 Temp 共享
+        # 目录（session_files/<sid>/file_diffs），跨运行累积污染 cleaned_count。
+        store.HISTORY_DIFF_ROOT = self._tmp / "history_root" / "session_files"
         self.app = FastAPI()
         self.app.include_router(file_history_router.api_file_history_router)
         self.client = TestClient(self.app)

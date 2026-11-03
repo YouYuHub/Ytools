@@ -46,7 +46,7 @@ def test_deployment_check_verifies_anonymous_boundaries_and_all_assets():
     from scripts import verify_deployment as deploy
     def fetch(origin,path,method='GET'):
         if path=='/auth/status':return 200,json.dumps(dict.fromkeys(['initialized','account_panel','account_sharing','history_paging'],True)).encode(),{}
-        if path.startswith('/ui/js/') or path.startswith('/ui/style/') or path.startswith('/ui/login.'):
+        if path.startswith('/ui/js/') or path.startswith('/ui/css/') or path.startswith('/ui/login.'):
             relative=path.split('?',1)[0].removeprefix('/ui/')
             return 200,(deploy.ROOT/'H5'/relative).read_bytes(),{}
         if path.startswith('/ui/'):return 303,b'',{'Location':'/ui/login.html'}

@@ -296,6 +296,26 @@ def test_unsafe_http_paging_does_not_repeat_request():
     request.assert_not_called()
 
 
+def test_fetch_url_body_accepts_dict_and_list():
+    # body 传对象/数组：内部转 JSON，不再被 schema 拒绝
+    seen = {}
+
+    def fake_request(url, method="GET", body="", headers=None, timeout_seconds=30, allow_partial=False):
+        seen["body"] = body
+        return (url, 200, "application/json", b'{"ok":true}')
+
+    with patch.object(web, "_http_request", side_effect=fake_request):
+        web._fetch_url_impl("https://example.test/api", "text", "", "", 8000, 30,
+                            "", "POST", {"a": 1}, None)
+        assert seen["body"] == '{"a": 1}'
+        web._fetch_url_impl("https://example.test/api", "text", "", "", 8000, 30,
+                            "", "POST", [1, 2], None)
+        assert seen["body"] == '[1, 2]'
+    with pytest.raises(ValueError, match="body"):
+        web._fetch_url_impl("https://example.test/api", "text", "", "", 8000, 30,
+                            "", "POST", 12345, None)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell cmdlet exit status")
 def test_powershell_cmdlet_failure_has_nonzero_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(bt, "_BG_LOG_DIR", tmp_path)

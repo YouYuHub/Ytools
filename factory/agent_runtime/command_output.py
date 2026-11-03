@@ -22,6 +22,24 @@ def _decode(data, *, final, encoding, candidates):
     return text, len(data) - len(decoder.getstate()[0]), name
 
 
+def _auto_decode(data, final, candidates):
+    # Detect complete lines separately: Windows tools may mix UTF-8 and OEM output.
+    from .builtin_tools import _command_output_candidates
+    output, consumed, used_encodings = [], 0, set()
+    pieces = data.splitlines(keepends=True)
+    for i, piece in enumerate(pieces):
+        text, size, used = _decode(piece, final=i < len(pieces) - 1 or piece.endswith(b'\n') or final,
+                                   encoding='', candidates=candidates or _command_output_candidates())
+        output.append(text)
+        consumed += size
+        used_encodings.add(used)
+        if size < len(piece):
+            break
+    output = ''.join(output)
+    used = next(iter(used_encodings)) if len(used_encodings) == 1 else 'mixed' if used_encodings else None
+    return output, consumed, used
+
+
 def read(meta, cursor, max_chars, *, finished=False, encoding=''):
     from .builtin_tools import _command_output_candidates
     offset, identity, prefix = 0, None, None
@@ -36,6 +54,7 @@ def read(meta, cursor, max_chars, *, finished=False, encoding=''):
         except (ValueError, KeyError, TypeError, UnicodeError) as exc:
             raise ValueError('cursor 无效或不属于该任务；从头读取请传 cursor=""') from exc
     path = Path(meta['output_path'])
+    user_forced_encoding = bool(encoding)
     try:
         handle = path.open('rb')
     except FileNotFoundError:
@@ -69,27 +88,27 @@ def read(meta, cursor, max_chars, *, finished=False, encoding=''):
         data = handle.read(max_chars)
         end = offset + len(data)
         final = finished and end >= stat.st_size
+        warning = None
         if encoding:
             output, consumed, used = _decode(data, final=final, encoding=encoding, candidates=())
+            if user_forced_encoding:
+                # 指定编码与自动识别结果不一致时警告（强制单编码读混合/异种输出必乱码）
+                auto_output, _, auto_used = _auto_decode(data, final, None)
+                if auto_output != output:
+                    warning = (f"指定编码 {encoding} 与自动识别"
+                               f"（{auto_used or '未知'}）结果不一致，输出可能乱码；"
+                               f"传空 encoding 可恢复自动识别")
         else:
             # Detect complete lines separately: Windows tools may mix UTF-8 and OEM output.
-            output, consumed, used_encodings = [], 0, set()
-            pieces = data.splitlines(keepends=True)
-            for i, piece in enumerate(pieces):
-                text, size, used = _decode(piece, final=i < len(pieces) - 1 or piece.endswith(b'\n') or final,
-                                           encoding='', candidates=_command_output_candidates())
-                output.append(text)
-                consumed += size
-                used_encodings.add(used)
-                if size < len(piece):
-                    break
-            output = ''.join(output)
-            used = next(iter(used_encodings)) if len(used_encodings) == 1 else 'mixed' if used_encodings else None
+            output, consumed, used = _auto_decode(data, final, None)
         offset += consumed
         handle.seek(0)
         prefix = hashlib.sha256(handle.read(min(offset, 64))).hexdigest()
         token = base64.urlsafe_b64encode(json.dumps({'job': meta['job_id'], 'offset': offset,
                 'identity': current_identity, 'prefix': prefix}, separators=(',', ':')).encode()).decode()
+        if user_forced_encoding and warning is None and '\ufffd' in output:
+            warning = (f"指定编码 {encoding} 解码出现替换字符，可能乱码；"
+                       f"传空 encoding 可恢复自动识别")
         return {'output': output, 'next_cursor': token,
                 'has_more': offset < stat.st_size, 'encoding': used,
-                'decoding_errors': '\ufffd' in output}
+                'decoding_errors': '\ufffd' in output, 'encoding_warning': warning}

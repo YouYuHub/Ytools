@@ -124,6 +124,7 @@ class _WorkerStreamAdapter:
         self._question_parts = None
         self._question_quotes = None
         self._live_round_no = None
+        self._live_round_started_at_ms = None
         self._live_round_model = None
         self._live_round_usage_total = None
         self.user_stop_requested = False
@@ -195,6 +196,24 @@ class _WorkerStreamAdapter:
             normalized = None
         self._live_round_no = normalized
         self._evt_queue.put({"type": "live_round_no", "round": normalized})
+
+    # 本轮开始墙钟（epoch ms）：与轮次号同处由生成循环写入，经 evt 队列
+    # 同步到主进程 stream.live_round_started_at_ms（附接 marker 携带
+    # round_started_at 字段，前端大折叠计时下限用）
+    @property
+    def live_round_started_at_ms(self):
+        return self._live_round_started_at_ms
+
+    @live_round_started_at_ms.setter
+    def live_round_started_at_ms(self, value) -> None:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = None
+        if normalized is not None and normalized < 1:
+            normalized = None
+        self._live_round_started_at_ms = normalized
+        self._evt_queue.put({"type": "live_round_started_at", "at_ms": normalized})
 
     # 本轮生效聊天模型（provider/name/id）：round_model 推送时由生成循环写入，
     # 经 evt 队列同步到主进程 stream.live_round_model（附接回放 marker 携带
@@ -927,6 +946,13 @@ def _make_worker_event_handler(proxy: SessionWorkerProxy) -> Callable[[dict], No
             # 本轮最终轮次号：附接回放 marker 携带 round 字段用
             try:
                 stream.live_round_no = evt.get("round")
+            except Exception:
+                pass
+        elif evt_type == "live_round_started_at":
+            # 本轮开始墙钟：附接回放 marker 携带 round_started_at 字段用
+            try:
+                at_ms = evt.get("at_ms")
+                stream.live_round_started_at_ms = int(at_ms) if at_ms else None
             except Exception:
                 pass
         elif evt_type == "live_round_model":

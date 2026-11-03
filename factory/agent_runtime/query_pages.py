@@ -60,7 +60,7 @@ def resume(args, *, files=False):
         _prune()
         snapshot = _cache.get(key)
         if not snapshot or snapshot['files'] != files or snapshot["signature"] != _signature(args):
-            raise ValueError("CURSOR_EXPIRED：结果已过期或查询改变，请重新搜索")
+            raise ValueError("CURSOR_EXPIRED：结果已过期（5 分钟未续读/服务重启）或查询改变，请去掉 cursor 重新搜索（即重开第一页）")
         _cache.move_to_end(key)
     from .search_ignore import unchanged as version_unchanged
     from .permission_runtime import guard_path
@@ -75,7 +75,12 @@ def resume(args, *, files=False):
             except OSError:
                 unchanged = False
             if not unchanged:
-                raise ValueError("FILE_QUERY_CHANGED：搜索范围已变化，请移除 cursor 重新搜索")
+                from pathlib import Path as _Path
+                missing = not _Path(path).exists()
+                raise ValueError(
+                    "FILE_QUERY_CHANGED：搜索范围已变化（" +
+                    ("路径已删除/移动：" if missing else "目录新增/删除/修改了文件：") +
+                    f"{str(path)[:120]}），游标已失效；请移除 cursor 重新搜索")
         return _locked_page(key, snapshot, args, int(index), int(offset))
 
 
@@ -165,8 +170,16 @@ def _locked_page(key, snapshot, args, index, offset):
             break
     more = index < len(items) or bool(producer and not producer.exhausted)
     shown = sum(line.startswith(">") for chunk in chunks for line in chunk.splitlines())
+    exact = bool(data.get("total_matches_exact", True))
+    total_label = str(data.get('total_matches', 0)) if exact else "≥" + str(data.get('total_matches', 0))
+    if exact:
+        total_note = "；统计仅覆盖已扫描部分。]"
+    elif more:
+        total_note = "；扫描未完成，统计为下限（总数会随续读增长）。]"
+    else:
+        total_note = "；扫描未完成，统计为下限。]"
     summary = (f"[本页 {len(paths)} 个路径]" if snapshot["files"] else
-               f"[展示 {shown}/{data.get('total_matches', 0)} 处命中；统计仅覆盖已扫描部分。]")
+               f"[展示 {shown}/{total_label} 处命中" + total_note)
     empty = ("（无匹配结果）" if data.get("scan_complete", True) else "（已扫描部分无匹配；不能判定不存在）") if not items else ""
     data.update(message="\n".join(filter(None, [prefix, summary, empty, *(chunks if not snapshot['files'] else []),
                 '[捕获结果达到上限；请缩小范围或用 read_file 读取原文]' if data.get('capture_truncated') else '',

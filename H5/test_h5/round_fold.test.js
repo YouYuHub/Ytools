@@ -265,6 +265,34 @@ test("扁平历史按用户节点分轮，各轮独立折叠", async t => {
   assert.equal(x.chatInner.querySelector(".round-usage").classList.contains("is-roundfold-hidden"), false);
 });
 
+test("同轮追发消息不分段：整轮一个大折叠", async t => {
+  const x = setup();
+  t.after(x.close);
+  function user(round, text) {
+    const u = div(x.document, "msg msg-user");
+    u.dataset.round = String(round);
+    u.append(div(x.document, "msg-bubble msg-user-text", text));
+    return u;
+  }
+  const tool1 = div(x.document, "tool-block", "工具一");
+  const body1 = div(x.document, "msg-assistant-body", "旧段正文");
+  const user2 = user(7, "追发");
+  const tool2 = div(x.document, "tool-block", "工具二");
+  const body2 = div(x.document, "msg-assistant-body", "最新正文");
+  x.chatInner.append(user(7, "问题"), tool1, body1, user2, tool2, body2);
+  x.App.roundFold.sync(x.chatInner);
+  const headers = x.chatInner.querySelectorAll(".round-fold-summary");
+  assert.equal(headers.length, 1);
+  // 前段成员同样被收纳（旧 bug：同 key 覆盖导致前段无折叠）
+  assert.equal(tool1.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(body1.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tool2.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(body2.classList.contains("is-roundfold-hidden"), false);
+  // 追发的用户消息保持可见
+  assert.equal(user2.classList.contains("is-roundfold-hidden"), false);
+  assert.match(headers[0].querySelector(".round-fold-counts").textContent, /2 次工具调用/);
+});
+
 test("小折叠状态在展开大折叠后保持", async t => {
   const x = setup();
   t.after(x.close);
@@ -414,4 +442,538 @@ test("1s 计时器真实触发（端到端）", async t => {
     await new Promise(r => setTimeout(r, 100));
   }
   assert.match(duration.textContent, /^用时 \d+s$/);
+});
+
+test("暂停续跑：暂停容器尾后已完成残留被收纳，进行中仍可见", async t => {
+  const x = setup();
+  t.after(x.close);
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "1";
+  // 第一程：正文后冻结了已完成的思考+工具（暂停时尾后残留）
+  const paused = div(x.document, "msg");
+  const body1 = div(x.document, "msg-assistant-body", "第一段正文");
+  const think2 = div(x.document, "think-block", "残留思考");
+  const tool2 = div(x.document, "tool-block", "残留工具");
+  paused.append(body1, think2, tool2);
+  // 续跑容器：尾后运行中工具保持可见
+  const live = div(x.document, "msg");
+  const body2 = div(x.document, "msg-assistant-body", "续跑正文");
+  const running = div(x.document, "tool-block is-executing", "运行中工具");
+  live.append(body2, running);
+  x.chatInner.append(user, paused, live);
+  x.App.roundFold.sync(x.chatInner);
+  assert.equal(think2.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tool2.classList.contains("is-roundfold-hidden"), true);
+  assert.ok(paused.querySelector(".round-fold-summary"), "暂停容器应有折叠头");
+  assert.equal(body2.classList.contains("is-roundfold-hidden"), false);
+  assert.equal(running.classList.contains("is-roundfold-hidden"), false);
+  assert.equal(live.querySelector(".round-fold-summary"), null, "续跑容器无有效成员不建折叠");
+});
+
+test("单小块不建大折叠：单思考/单工具/单子任务/单提示/单用量", async t => {
+  const x = setup();
+  t.after(x.close);
+  const cases = ["think-block", "tool-block", "agent-block", "notice-bar", "round-usage"];
+  for (const cls of cases) {
+    const msg = div(x.document, "msg");
+    msg.append(div(x.document, cls, "单个"), div(x.document, "msg-assistant-body", "尾正文"));
+    x.chatInner.appendChild(msg);
+    x.App.roundFold.sync(msg);
+    assert.equal(msg.querySelector(".round-fold-summary"), null, cls + "单个不应建折叠");
+    msg.remove();
+  }
+  // 单段旧正文（流式进行态）仍折叠
+  const msg = div(x.document, "msg");
+  const first = div(x.document, "msg-assistant-body", "旧段");
+  msg.append(first, div(x.document, "msg-assistant-body msg-cursor", ""));
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"));
+  assert.equal(first.classList.contains("is-roundfold-hidden"), true);
+});
+
+test("单个小折叠组视为一块：不套大折叠；两块则折叠", async t => {
+  const x = setup();
+  t.after(x.close);
+  function groupedMsg() {
+    const msg = div(x.document, "msg");
+    const head = div(x.document, "process-group-summary", "处理过程");
+    const t1 = div(x.document, "tool-block is-process-hidden", "工具一");
+    const t2 = div(x.document, "tool-block is-process-hidden", "工具二");
+    const group = { header: head, members: [t1, t2] };
+    head._processSummary = group;
+    t1._processGroup = group; t2._processGroup = group;
+    msg.append(head, t1, t2, div(x.document, "msg-assistant-body", "尾正文"));
+    x.chatInner.appendChild(msg);
+    return msg;
+  }
+  const single = groupedMsg();
+  x.App.roundFold.sync(single);
+  assert.equal(single.querySelector(".round-fold-summary"), null, "单个闭合组不应再套大折叠");
+  // 组外再加一块：两块应折叠
+  const two = groupedMsg();
+  two.insertBefore(div(x.document, "think-block", "组外思考"), two.firstChild);
+  x.App.roundFold.sync(two);
+  assert.ok(two.querySelector(".round-fold-summary"), "组+单块应建折叠");
+});
+
+test("尾后小折叠组整体收纳：全完成连头收走；有运行则整组可见", async t => {
+  const x = setup();
+  t.after(x.close);
+  function tailGroupMsg(running) {
+    const msg = div(x.document, "msg");
+    const head = div(x.document, "process-group-summary", "处理过程");
+    const t1 = div(x.document, "tool-block", "工具一");
+    const t2 = div(x.document, running ? "tool-block is-executing" : "tool-block", "工具二");
+    const group = { header: head, members: [t1, t2] };
+    head._processSummary = group;
+    t1._processGroup = group; t2._processGroup = group;
+    msg.append(
+      div(x.document, "msg-assistant-body", "旧段"),
+      div(x.document, "msg-assistant-body", "尾正文"),
+      head, t1, t2,
+    );
+    x.chatInner.appendChild(msg);
+    return { msg, head, t1, t2 };
+  }
+  const done = tailGroupMsg(false);
+  x.App.roundFold.sync(done.msg);
+  assert.ok(done.msg.querySelector(".round-fold-summary"));
+  for (const n of [done.head, done.t1, done.t2]) {
+    assert.equal(n.classList.contains("is-roundfold-hidden"), true, "全完成组连头收走");
+  }
+  const live = tailGroupMsg(true);
+  x.App.roundFold.sync(live.msg);
+  for (const n of [live.head, live.t1, live.t2]) {
+    assert.equal(n.classList.contains("is-roundfold-hidden"), false, "有运行成员则整组可见");
+  }
+  // 运行组头无 linkage 时同样保持可见（已有单测覆盖进行中工具，此处只断言裸头）
+  assert.equal(live.msg.querySelector(".round-fold-summary button") !== null, true);
+});
+
+test("尾后待确认与最新用量行保持可见", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  const waiting = div(x.document, "tool-block is-waiting", "待确认");
+  const usageOld = div(x.document, "round-usage", "用量旧");
+  const usageNew = div(x.document, "round-usage", "用量新");
+  msg.append(
+    div(x.document, "msg-assistant-body", "旧段"),
+    div(x.document, "msg-assistant-body", "尾正文"),
+    waiting, usageOld, usageNew,
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  assert.equal(waiting.classList.contains("is-roundfold-hidden"), false);
+  assert.equal(waiting._roundFold, undefined, "待确认节点不进折叠");
+  assert.ok(usageOld._roundFold, "尾后旧用量应被收纳为成员");
+  assert.equal(usageNew.classList.contains("is-roundfold-hidden"), false, "最新用量保留");
+  assert.equal(usageNew._roundFold, undefined);
+  const header = msg.querySelector(".round-fold-summary");
+  assert.ok(header);
+  assert.equal(header.classList.contains("is-waiting"), true, "尾后待确认应点亮头状态");
+  assert.equal(header.classList.contains("is-open"), true, "待确认应强制展开");
+  // 待确认解除后恢复折叠
+  waiting.classList.remove("is-waiting");
+  x.App.roundFold.sync(msg);
+  assert.equal(usageOld.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(header.classList.contains("is-open"), false);
+});
+
+test("记录口径：尾后已完成记录收纳，单条非正文不成折叠", async t => {
+  const x = setup();
+  t.after(x.close);
+  // 尾后两条工具：收纳（首个记头高度 36，其余 0）
+  const heights = [50, 100, 120, 130, 80];
+  x.App.roundFold.adjustHeights([
+    { round: 1, kind: "user" },
+    { round: 1, kind: "assistant" },
+    { round: 1, kind: "tool" },
+    { round: 1, kind: "tool" },
+    { round: 1, kind: "usage" },
+  ], heights, new Map());
+  assert.deepEqual(heights, [50, 100, 36, 0, 80]);
+  // 尾后单条工具：不成折叠，不调整
+  const single = [50, 100, 120];
+  x.App.roundFold.adjustHeights([
+    { round: 2, kind: "user" },
+    { round: 2, kind: "assistant" },
+    { round: 2, kind: "tool" },
+  ], single, new Map());
+  assert.deepEqual(single, [50, 100, 120]);
+  // 尾后旧用量收纳、最新用量保留；单条旧用量不成折叠
+  const usage = [50, 100, 30, 30];
+  x.App.roundFold.adjustHeights([
+    { round: 3, kind: "user" },
+    { round: 3, kind: "assistant" },
+    { round: 3, kind: "usage" },
+    { round: 3, kind: "usage" },
+  ], usage, new Map());
+  assert.deepEqual(usage, [50, 100, 30, 30]);
+});
+
+test("记录口径：小折叠组整体算一块（经 processGroups.groupOf）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const group = { start: 1, end: 3 };
+  const think1 = { round: 4, kind: "think" };
+  const think2 = { round: 4, kind: "think" };
+  x.App.processGroups = { groupOf: rec => (rec === think1 || rec === think2 ? group : null) };
+  const heights = [50, 100, 110, 200];
+  x.App.roundFold.adjustHeights([
+    { round: 4, kind: "user" }, think1, think2, { round: 4, kind: "assistant" },
+  ], heights, new Map());
+  assert.deepEqual(heights, [50, 100, 110, 200], "单组不成大折叠");
+  // 两组则折叠
+  const g2 = { start: 3, end: 5 };
+  const think3 = { round: 5, kind: "think" };
+  const think4 = { round: 5, kind: "think" };
+  const tool1 = { round: 5, kind: "tool" };
+  const tool2 = { round: 5, kind: "tool" };
+  x.App.processGroups = { groupOf: rec => {
+    if (rec === think3 || rec === think4) return group;
+    if (rec === tool1 || rec === tool2) return g2;
+    return null;
+  } };
+  const heights2 = [50, 100, 110, 120, 130, 200];
+  x.App.roundFold.adjustHeights([
+    { round: 5, kind: "user" }, think3, think4, tool1, tool2, { round: 5, kind: "assistant" },
+  ], heights2, new Map());
+  assert.deepEqual(heights2, [50, 36, 0, 0, 0, 200], "两组应折叠");
+});
+
+test("直播等待模型期间计时跳动（无 DOM 进行态也亮灯）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const msg = div(x.document, "msg");
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 125000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾正文");
+  tail.dataset.stageTimestamp = new Date(now - 120000).toISOString();
+  msg.append(old, tail);
+  x.chatInner.appendChild(msg);
+  // 直播中：无任何进行态 class，但容器是当前流
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  x.App.roundFold.sync(msg);
+  const header = msg.querySelector(".round-fold-summary");
+  assert.ok(header);
+  assert.equal(header.classList.contains("is-running"), true, "直播流应亮运行灯");
+  assert.equal(header.querySelector(".round-fold-duration").textContent, "用时 5s");
+  x.App.roundFold.tick();
+  assert.equal(header.querySelector(".round-fold-duration").textContent, "用时 2m 5s");
+});
+
+test("暂停/结束停表并摘灯；继续后新容器恢复、旧段冻结", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  function livePair(oldText) {
+    const msg = div(x.document, "msg");
+    const old = div(x.document, "msg-assistant-body", oldText);
+    old.dataset.stageTimestamp = new Date(now - 125000).toISOString();
+    const tail = div(x.document, "msg-assistant-body", "尾");
+    tail.dataset.stageTimestamp = new Date(now - 120000).toISOString();
+    msg.append(old, tail);
+    x.chatInner.appendChild(msg);
+    return { msg, header: null };
+  }
+  const first = livePair("旧段一");
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: first.msg };
+  x.App.roundFold.sync(first.msg);
+  first.header = first.msg.querySelector(".round-fold-summary");
+  x.App.roundFold.tick();
+  assert.equal(first.header.querySelector(".round-fold-duration").textContent, "用时 2m 5s");
+  // 暂停：流结束，类已清理
+  x.App.state.streaming = false;
+  x.App.state.streamingSession = null;
+  x.App.state.activeStream = null;
+  x.App.roundFold.tick();
+  assert.equal(first.header.classList.contains("is-running"), false, "停表应摘灯");
+  assert.equal(first.header.querySelector(".round-fold-duration").textContent, "用时 5s", "冻结为静态跨度");
+  // 继续：新容器恢复跳动，旧段保持冻结
+  const second = livePair("旧段二");
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: second.msg };
+  x.App.roundFold.sync(second.msg);
+  second.header = second.msg.querySelector(".round-fold-summary");
+  assert.equal(second.header.classList.contains("is-running"), true);
+  x.App.roundFold.tick();
+  assert.match(second.header.querySelector(".round-fold-duration").textContent, /^用时 2m /);
+  assert.equal(first.header.querySelector(".round-fold-duration").textContent, "用时 5s", "旧暂停段不跟跳");
+  assert.equal(first.header.classList.contains("is-running"), false);
+});
+
+test("待确认一票否决：直播流也不计时", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const msg = div(x.document, "msg");
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 125000).toISOString();
+  const waiting = div(x.document, "tool-block is-waiting", "待确认");
+  waiting.dataset.stageTimestamp = new Date(now - 120000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 120000).toISOString();
+  msg.append(old, waiting, tail);
+  x.chatInner.appendChild(msg);
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  x.App.roundFold.sync(msg);
+  const header = msg.querySelector(".round-fold-summary");
+  assert.equal(header.classList.contains("is-running"), false);
+  assert.equal(header.classList.contains("is-waiting"), true);
+  assert.equal(header.classList.contains("is-open"), true);
+  const frozen = header.querySelector(".round-fold-duration").textContent;
+  x.App.roundFold.tick();
+  assert.equal(header.querySelector(".round-fold-duration").textContent, frozen, "待确认冻结");
+});
+
+test("非直播容器不跟跳（历史折叠只看 DOM 进行态）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const hist = div(x.document, "msg");
+  hist.dataset.round = "1";
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 125000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 120000).toISOString();
+  hist.append(old, tail);
+  const live = div(x.document, "msg");
+  live.append(div(x.document, "msg-assistant-body", "直播正文"));
+  x.chatInner.append(hist, live);
+  // 直播的是另一个容器
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: live };
+  x.App.roundFold.sync(hist);
+  const header = hist.querySelector(".round-fold-summary");
+  assert.equal(header.classList.contains("is-running"), false, "历史折叠不亮灯");
+  x.App.roundFold.tick();
+  assert.equal(header.querySelector(".round-fold-duration").textContent, "用时 5s");
+});
+
+test("尾上时间戳永不折叠（非紧贴的照常收纳）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  const timeA = div(x.document, "msg-time stage-time", "10:00");
+  const think1 = div(x.document, "think-block", "思考一");
+  const think2 = div(x.document, "think-block", "思考二");
+  const timeB = div(x.document, "msg-time stage-time", "10:01");
+  const tail = div(x.document, "msg-assistant-body", "尾正文");
+  msg.append(timeA, think1, think2, timeB, tail);
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"));
+  assert.equal(timeA.classList.contains("is-roundfold-hidden"), true, "非紧贴时间照常收纳");
+  assert.equal(think1.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(think2.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(timeB.classList.contains("is-roundfold-hidden"), false, "尾上时间戳可见");
+  assert.equal(tail.classList.contains("is-roundfold-hidden"), false);
+  // 只有时间戳在尾前：不成折叠，两者都可见
+  const solo = div(x.document, "msg");
+  const onlyTime = div(x.document, "msg-time stage-time", "10:02");
+  const soloTail = div(x.document, "msg-assistant-body", "尾");
+  solo.append(onlyTime, soloTail);
+  x.chatInner.appendChild(solo);
+  x.App.roundFold.sync(solo);
+  assert.equal(solo.querySelector(".round-fold-summary"), null);
+  assert.equal(onlyTime.classList.contains("is-roundfold-hidden"), false);
+});
+
+test("暂停间隙从用时中扣除（秒表语义），开口间隙忽略", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const t0 = now - 125000, t1 = now - 5000;
+  const msg = div(x.document, "msg");
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(t0).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(t1).toISOString();
+  msg.append(old, tail);
+  x.chatInner.appendChild(msg);
+  // 闭合间隙 60s 落在跨度内：120s - 60s = 60s
+  msg._foldPauseGaps = [{ pauseAt: t0 + 30000, resumeAt: t0 + 90000 }];
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelector(".round-fold-duration").textContent, "用时 1m");
+  // 开口间隙（正常结束/永不续跑）不扣
+  msg._foldPauseGaps = [{ pauseAt: t0 + 30000, resumeAt: 0 }];
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelector(".round-fold-duration").textContent, "用时 2m");
+  // 跳动计时同样扣减
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  msg._foldPauseGaps = [{ pauseAt: t0 + 30000, resumeAt: t0 + 90000 }];
+  x.App.roundFold.sync(msg);
+  x.App.roundFold.tick();
+  assert.equal(msg.querySelector(".round-fold-duration").textContent, "用时 1m 5s");
+});
+
+test("recordPauseGap/closePauseGap：后进先闭合，无间隙不抛错", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.closePauseGap(msg);
+  x.App.roundFold.closePauseGap(null);
+  assert.equal(msg._foldPauseGaps, undefined);
+  x.App.roundFold.recordPauseGap(msg);
+  x.App.roundFold.recordPauseGap(msg);
+  assert.equal(msg._foldPauseGaps.length, 2);
+  x.App.roundFold.closePauseGap(msg);
+  assert.ok(msg._foldPauseGaps[1].resumeAt > 0);
+  assert.equal(msg._foldPauseGaps[0].resumeAt, 0);
+});
+
+test("附接重建后计时从轮次开始时间起算（不从刷新时间重计）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const msg = div(x.document, "msg");
+  // 回放重建的节点时间戳都是“现在”
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 2000).toISOString();
+  const tail = div(x.document, "msg-assistant-body msg-cursor", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+  msg.append(old, tail);
+  x.chatInner.appendChild(msg);
+  // marker 下发的真实轮次开始（10 分钟前）
+  msg._foldRoundStartedAt = now - 600000;
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  x.App.roundFold.sync(msg);
+  x.App.roundFold.tick();
+  assert.match(
+    msg.querySelector(".round-fold-duration").textContent, /^用时 10m/,
+    "应用时应从轮次开始计时，而非刷新时间"
+  );
+});
+
+test("轮次开始下限：未来值/非法值被忽略", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  function livePair(floor) {
+    const msg = div(x.document, "msg");
+    const old = div(x.document, "msg-assistant-body", "旧段");
+    old.dataset.stageTimestamp = new Date(now - 5000).toISOString();
+    const tail = div(x.document, "msg-assistant-body", "尾");
+    tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+    msg.append(old, tail);
+    x.chatInner.appendChild(msg);
+    msg._foldRoundStartedAt = floor;
+    return msg;
+  }
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  const future = livePair(now + 60000);
+  x.App.state.activeStream = { messageNode: future };
+  x.App.roundFold.sync(future);
+  assert.equal(future.querySelector(".round-fold-duration").textContent, "用时 4s");
+  const bad = livePair("not-a-number");
+  x.App.state.activeStream = { messageNode: bad };
+  x.App.roundFold.sync(bad);
+  assert.equal(bad.querySelector(".round-fold-duration").textContent, "用时 4s");
+});
+
+test("非直播折叠不受轮次开始下限影响", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const hist = div(x.document, "msg");
+  hist.dataset.round = "1";
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 5000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+  hist.append(old, tail);
+  hist._foldRoundStartedAt = now - 600000;
+  const live = div(x.document, "msg");
+  live.append(div(x.document, "msg-assistant-body", "直播正文"));
+  x.chatInner.append(hist, live);
+  // 直播的是另一个容器
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: live };
+  x.App.roundFold.sync(hist);
+  x.App.roundFold.tick();
+  assert.equal(hist.querySelector(".round-fold-duration").textContent, "用时 4s");
+});
+
+test("流结束后直播下限缓存延续（完成瞬间不缩水）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const msg = div(x.document, "msg");
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 2000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+  msg.append(old, tail);
+  x.chatInner.appendChild(msg);
+  msg._foldRoundStartedAt = now - 600000;
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  x.App.roundFold.sync(msg);
+  x.App.roundFold.tick();
+  assert.match(msg.querySelector(".round-fold-duration").textContent, /^用时 10m/);
+  // 流结束：live 判定失效，但缓存下限延续，跨度不缩水到 1s
+  x.App.state.streaming = false;
+  x.App.state.activeStream = null;
+  x.App.roundFold.sync(msg);
+  assert.match(
+    msg.querySelector(".round-fold-duration").textContent, /^用时 9m/,
+    "完成瞬间应用时仍从轮次开始起算"
+  );
+});
+
+test("历史折叠用用户发送时间兜底起点", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "9";
+  user.dataset.stageTimestamp = new Date(now - 125000).toISOString();
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 5000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+  x.chatInner.append(user, old, tail);
+  x.App.roundFold.sync(x.chatInner);
+  assert.equal(
+    x.chatInner.querySelector(".round-fold-duration").textContent, "用时 2m 4s",
+    "发送→首输出的间隙应计入（此前只算成员跨度 4s）"
+  );
+});
+
+test("重发旧轮用户时间戳过早时不拉长用时", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "9";
+  user.dataset.stageTimestamp = new Date(now - 7200000).toISOString();
+  const old = div(x.document, "msg-assistant-body", "旧段");
+  old.dataset.stageTimestamp = new Date(now - 5000).toISOString();
+  const tail = div(x.document, "msg-assistant-body", "尾");
+  tail.dataset.stageTimestamp = new Date(now - 1000).toISOString();
+  x.chatInner.append(user, old, tail);
+  x.App.roundFold.sync(x.chatInner);
+  assert.equal(
+    x.chatInner.querySelector(".round-fold-duration").textContent, "用时 4s",
+    "超过 1 小时视为重发旧轮，退回纯成员口径"
+  );
 });

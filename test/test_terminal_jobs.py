@@ -183,23 +183,44 @@ class TerminalJobsTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"/terminal/jobs/{name}/run?session_id=session-1").status_code, 400)
 
     def test_prune_retains_open_jobs_and_cleans_closed_logs(self):
+        # 清理本体同步测（_prune_old_bg_files 仅做节流+线程派发）
         name, output, _ = self.record()
         old = time.time() - 48 * 3600
         for item in self.root.iterdir():
             os.utime(item, (old, old))
-        bt._prune_old_bg_files()
+        bt._prune_old_bg_files_sync()
         self.assertTrue(output.exists())
         jobs.action(name, "close")
-        bt._prune_old_bg_files()
+        bt._prune_old_bg_files_sync()
         self.assertTrue(output.exists(), "刚关闭记录仍至少保留 24h 日志")
         path, meta = jobs.read_job(name)
         meta["closed_at"] = old
         jobs.write_metadata(path, meta)
         for item in self.root.iterdir():
             os.utime(item, (old, old))
-        bt._prune_old_bg_files()
+        bt._prune_old_bg_files_sync()
         self.assertFalse(output.exists())
         self.assertTrue(list(self.root.glob("*.lock")), "跨进程锁文件不删除")
+
+    def test_prune_entry_is_throttled_and_nonblocking(self):
+        # 入口 5 分钟节流且不阻塞（后台线程执行）
+        import threading
+        started = []
+        real_thread = threading.Thread
+
+        class SpyThread:
+            def __init__(self, *a, **k):
+                self._t = real_thread(*a, **k)
+
+            def start(self):
+                started.append(True)
+                # 不真正启动线程：只验证派发行为
+        import unittest.mock as mock
+        with mock.patch.object(threading, "Thread", SpyThread):
+            bt._prune_bg_files_last_run = 0.0
+            bt._prune_old_bg_files()
+            bt._prune_old_bg_files()
+        self.assertEqual(len(started), 1)
 
     def test_posix_launcher_uses_c_and_supervisor(self):
         fake = Mock(pid=99999999)
