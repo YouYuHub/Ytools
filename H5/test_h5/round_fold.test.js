@@ -265,7 +265,7 @@ test("扁平历史按用户节点分轮，各轮独立折叠", async t => {
   assert.equal(x.chatInner.querySelector(".round-usage").classList.contains("is-roundfold-hidden"), false);
 });
 
-test("同轮追发消息不分段：整轮一个大折叠", async t => {
+test("同轮引导切分段：前段独立折叠（不再同 key 覆盖丢失）", async t => {
   const x = setup();
   t.after(x.close);
   function user(round, text) {
@@ -276,21 +276,103 @@ test("同轮追发消息不分段：整轮一个大折叠", async t => {
   }
   const tool1 = div(x.document, "tool-block", "工具一");
   const body1 = div(x.document, "msg-assistant-body", "旧段正文");
-  const user2 = user(7, "追发");
+  const user2 = user(7, "引导");
   const tool2 = div(x.document, "tool-block", "工具二");
   const body2 = div(x.document, "msg-assistant-body", "最新正文");
   x.chatInner.append(user(7, "问题"), tool1, body1, user2, tool2, body2);
   x.App.roundFold.sync(x.chatInner);
   const headers = x.chatInner.querySelectorAll(".round-fold-summary");
+  // 前段独立成折（旧 bug：同 key 覆盖导致前段无折叠）；末段单个工具按单块规则不折
   assert.equal(headers.length, 1);
-  // 前段成员同样被收纳（旧 bug：同 key 覆盖导致前段无折叠）
   assert.equal(tool1.classList.contains("is-roundfold-hidden"), true);
   assert.equal(body1.classList.contains("is-roundfold-hidden"), true);
-  assert.equal(tool2.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tool2.classList.contains("is-roundfold-hidden"), false);
   assert.equal(body2.classList.contains("is-roundfold-hidden"), false);
-  // 追发的用户消息保持可见
+  // 引导气泡保持可见
   assert.equal(user2.classList.contains("is-roundfold-hidden"), false);
-  assert.match(headers[0].querySelector(".round-fold-counts").textContent, /2 次工具调用/);
+  assert.match(headers[0].querySelector(".round-fold-counts").textContent, /1 次工具调用/);
+});
+
+test("引导前后各成折叠且计时分段", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  function user(round, text, ts) {
+    const u = div(x.document, "msg msg-user");
+    u.dataset.round = String(round);
+    u.dataset.stageTimestamp = at(ts);
+    u.append(div(x.document, "msg-bubble msg-user-text", text));
+    return u;
+  }
+  function body(text, ts) {
+    const b = div(x.document, "msg-assistant-body", text);
+    b.dataset.stageTimestamp = at(ts);
+    return b;
+  }
+  function tool(text, ts) {
+    const b = div(x.document, "tool-block", text);
+    b.dataset.stageTimestamp = at(ts);
+    return b;
+  }
+  const t0 = now - 200000;
+  x.chatInner.append(
+    user(7, "问题", t0),
+    tool("工具一", t0 + 10000), body("旧段", t0 + 20000),
+    user(7, "引导", t0 + 100000),
+    tool("工具二", t0 + 110000), body("中段", t0 + 120000), body("最新", t0 + 130000),
+  );
+  x.App.roundFold.sync(x.chatInner);
+  const headers = x.chatInner.querySelectorAll(".round-fold-summary");
+  assert.equal(headers.length, 2);
+  // 前段停表封存（发送→段末 20s，不含引导后内容）；后段从引导重计 30s
+  assert.equal(headers[0].querySelector(".round-fold-duration").textContent, "用时 20s");
+  assert.equal(headers[1].querySelector(".round-fold-duration").textContent, "用时 30s");
+});
+
+test("直播容器内引导同样分段（无轮号气泡）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  const t0 = now - 200000;
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "8";
+  user.dataset.stageTimestamp = at(t0);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "8";
+  const think = div(x.document, "think-block", "思考");
+  think.dataset.stageTimestamp = at(t0 + 10000);
+  const tool = div(x.document, "tool-block", "工具");
+  tool.dataset.stageTimestamp = at(t0 + 20000);
+  const steer = div(x.document, "msg msg-user");
+  steer.dataset.stageTimestamp = at(t0 + 100000);
+  const body = div(x.document, "msg-assistant-body", "中段");
+  body.dataset.stageTimestamp = at(t0 + 110000);
+  const tail = div(x.document, "msg-assistant-body", "最新");
+  tail.dataset.stageTimestamp = at(t0 + 120000);
+  msg.append(think, tool, steer, body, tail);
+  x.chatInner.append(user, msg);
+  x.App.roundFold.sync(msg);
+  const headers = msg.querySelectorAll(".round-fold-summary");
+  assert.equal(headers.length, 2);
+  assert.equal(headers[0].querySelector(".round-fold-duration").textContent, "用时 20s");
+  assert.equal(headers[1].querySelector(".round-fold-duration").textContent, "用时 20s");
+  assert.equal(think.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(steer.classList.contains("is-roundfold-hidden"), false);
+  assert.equal(tail.classList.contains("is-roundfold-hidden"), false);
+});
+
+test("记录口径：引导轮分段计高度", async t => {
+  const x = setup();
+  t.after(x.close);
+  const heights = [50, 100, 110, 120, 130, 140, 200];
+  x.App.roundFold.adjustHeights([
+    { round: 6, kind: "user" }, { round: 6, kind: "tool" }, { round: 6, kind: "assistant" },
+    { round: 6, kind: "user" }, { round: 6, kind: "tool" }, { round: 6, kind: "tool" },
+    { round: 6, kind: "assistant" },
+  ], heights, new Map());
+  assert.deepEqual(heights, [50, 36, 0, 120, 36, 0, 200]);
 });
 
 test("小折叠状态在展开大折叠后保持", async t => {

@@ -292,7 +292,8 @@
     //    此时退回纯成员口径（只计量本次重发工作）。
     var HISTORY_FLOOR_MAX_GAP = 3600000;
     function floorFor(fold) {
-        var live = liveStartFloor(fold);
+        // 引导段不用直播轮次起点（那是整轮开始，会把本段用时拉长回轮首）
+        var live = fold.allowLiveFloor === false ? 0 : liveStartFloor(fold);
         if (live > 0) {
             fold.startFloor = live;
             return live;
@@ -372,7 +373,7 @@
         header.appendChild(button);
         var fold = { container: container, key: key, header: header, button: button,
             duration: duration, counts: counts, members: [], tail: null, liveTail: [], open: false, waiting: null,
-            startFloor: 0, userTs: 0 };
+            startFloor: 0, userTs: 0, allowLiveFloor: true };
         header._roundFold = fold;
         button.addEventListener("click", function () {
             var top = header.getBoundingClientRect().top;
@@ -413,17 +414,87 @@
         }
         return map;
     }
-    // 一轮内容同步：tail 取最后一段正文（即使尚空——流式新段先占位，可见地流出）；
-    // 尾前节点全部收纳；尾后已完成的节点一并收纳（暂停/中断冻结的残留），只有
-    // 进行中/待确认内容与最新用量行保持可见。无正文（纯工具轮）或无有效成员时不建折叠。
-    // userNode：本轮用户气泡（历史计时兜底用，可空）。
+    // 非末段成员收集：整组收纳（任一成员进行中/搬离/跨段则整组可见，
+    // 避免头藏起来而成员裸露）；进行中/待确认与轮内最新用量行保持可见。
+    function closedMembers(nodes, container, roundLastUsage) {
+        var members = [];
+        var seenGroups = [];
+        nodes.forEach(function (node) {
+            if (!isFoldable(node) || isLiveNode(node) || node === roundLastUsage)
+                return;
+            var g = node._processGroup ||
+                (node.matches(".process-group-summary") ? node._processSummary : null);
+            if (!g) {
+                if (members.indexOf(node) < 0)
+                    members.push(node);
+                return;
+            }
+            if (seenGroups.indexOf(g) >= 0)
+                return;
+            seenGroups.push(g);
+            var ms = g.members || [];
+            for (var k = 0; k < ms.length; k++) {
+                var m = ms[k];
+                if (!m || m.parentNode !== container || nodes.indexOf(m) < 0)
+                    return;
+                if (isLiveNode(m) || m === roundLastUsage)
+                    return;
+            }
+            ms.forEach(function (m) {
+                if (m && m !== node && members.indexOf(m) < 0 && isFoldable(m))
+                    members.push(m);
+            });
+            if (members.indexOf(node) < 0)
+                members.push(node);
+        });
+        members.sort(function (a, b) { return nodes.indexOf(a) - nodes.indexOf(b); });
+        return members;
+    }
+    // 一轮内容同步：按引导气泡切分段（同轮第 2+ 个用户节点是引导），每段独立
+    // 折叠/计时：前段停表封存（相当于已结束的轮），末段按常规规则（留最新正文）。
+    // userNode：段首用户气泡（首段传轮次气泡；历史计时兜底用，可空）。
+    // 返回本轮所有段 key（供调用方 pruneStale）。
     function syncRound(nodes, container, key, userNode) {
         var map = foldsOf(container);
-        var tailIdx = -1;
-        for (var i = nodes.length - 1; i >= 0; i--) {
-            if (isTailBody(nodes[i])) {
-                tailIdx = i;
+        var segments = [];
+        var head = userNode, current = [];
+        nodes.forEach(function (node) {
+            if (node.nodeType === 1 && node.matches(".msg-user")) {
+                segments.push({ head: head, nodes: current });
+                head = node;
+                current = [];
+                return;
+            }
+            current.push(node);
+        });
+        segments.push({ head: head, nodes: current });
+        // 轮内最新用量行（跨段只保留一条可见）
+        var roundLastUsage = null;
+        for (var u = nodes.length - 1; u >= 0; u--) {
+            if (nodes[u].nodeType === 1 && nodes[u].matches(".round-usage")) {
+                roundLastUsage = nodes[u];
                 break;
+            }
+        }
+        var keys = [];
+        segments.forEach(function (seg, i) {
+            var segKey = i === 0 ? key : key + ":s" + i;
+            keys.push(segKey);
+            syncSegment(seg.nodes, container, map, segKey, seg.head, i === segments.length - 1, roundLastUsage, i === 0);
+        });
+        return keys;
+    }
+    // 单段同步：末段 tail 取最后一段正文（即使尚空——流式新段先占位）；
+    // 非末段无尾（内容已结算，引导在检查点消费，之前节点必然完成），全部收纳，
+    // 只有进行中/待确认内容与轮内最新用量行保持可见。无有效成员时不建折叠。
+    function syncSegment(nodes, container, map, key, userNode, isFinal, roundLastUsage, allowLiveFloor) {
+        var tailIdx = -1;
+        if (isFinal) {
+            for (var i = nodes.length - 1; i >= 0; i--) {
+                if (isTailBody(nodes[i])) {
+                    tailIdx = i;
+                    break;
+                }
             }
         }
         var tail = tailIdx >= 0 ? nodes[tailIdx] : null;
@@ -434,19 +505,15 @@
             if (prev.nodeType === 1 && prev.matches(".msg-time"))
                 tailTime = prev;
         }
-        // 成员只取尾之前的节点；用量行同理（尾之前的旧用量折叠，尾之后最新一条保留）
-        var members = tail ? nodes.slice(0, tailIdx).filter(function (node) { return isFoldable(node) && node !== tailTime; }) : [];
+        // 成员只取尾之前的节点；用量行同理（尾之前的旧用量折叠，尾之后最新一条保留）。
+        // 非末段无尾：整组收纳全部可折叠节点。
+        var members = tail ? nodes.slice(0, tailIdx).filter(function (node) { return isFoldable(node) && node !== tailTime; })
+            : closedMembers(nodes, container, roundLastUsage);
         // 尾后收纳：暂停/中断会把已完成的过程节点冻结在尾正文之后；续跑新开 .msg
         // 容器后它们永远到不了尾前，不收纳就会永久裸露（暂停几次就留下几块）。
         var liveTail = [];
         if (tail) {
-            var lastUsage = null;
-            for (var u = nodes.length - 1; u >= 0; u--) {
-                if (nodes[u].nodeType === 1 && nodes[u].matches(".round-usage")) {
-                    lastUsage = nodes[u];
-                    break;
-                }
-            }
+            var lastUsage = roundLastUsage;
             var postMembers = [];
             var postStart = tailIdx + 1;
             var postHeads = [];
@@ -526,7 +593,10 @@
         var singleBody = units.length === 1 && units[0].nodeType === 1 &&
             units[0].matches(".msg-assistant-body");
         var fold = map.get(key);
-        if (!tail || !members.length || !units.length || (units.length === 1 && !singleBody)) {
+        // 末段无正文（纯工具轮）不建折叠；非末段无有效成员不建（单小块规则统一下方）
+        if ((!isFinal && (!members.length || !units.length)) ||
+            (isFinal && (!tail || !members.length || !units.length)) ||
+            (units.length === 1 && !singleBody)) {
             if (fold)
                 disbandFold(map, fold);
             return;
@@ -564,6 +634,9 @@
         fold.members = members;
         fold.tail = tail;
         fold.liveTail = liveTail;
+        // 引导段不用直播轮次起点（那是整轮开始，会把本段用时拉长回轮首）；
+        // 本段起点一律用段首用户气泡时间。
+        fold.allowLiveFloor = allowLiveFloor;
         // 历史计时兜底：用户发送时间（非法/缺失记 0，不参与）
         var userStamp = userNode ? Date.parse(userNode.dataset.stageTimestamp || "") : NaN;
         fold.userTs = !isNaN(userStamp) ? userStamp : 0;
@@ -591,17 +664,22 @@
         });
     }
     function userNodeBefore(node) {
+        var want = node.dataset ? node.dataset.round : null;
         var p = node.previousElementSibling;
         while (p) {
-            if (p.nodeType === 1 && p.matches(".msg-user"))
-                return p;
+            if (p.nodeType === 1 && p.matches(".msg-user")) {
+                // 只认同轮气泡：跨轮说明本轮气泡不在 DOM（窗口裁剪），不拿别轮的
+                if (want == null || p.dataset.round == null || String(p.dataset.round) === String(want))
+                    return p;
+                return null;
+            }
             p = p.previousElementSibling;
         }
         return null;
     }
     function syncMsgContainer(msg) {
-        syncRound(Array.from(msg.children), msg, keyForMsg(msg), userNodeBefore(msg));
-        pruneStale(msg, [keyForMsg(msg)]);
+        var keys = syncRound(Array.from(msg.children), msg, keyForMsg(msg), userNodeBefore(msg));
+        pruneStale(msg, keys);
         sweepStrays(msg);
     }
     // 孤儿头清扫：移除不属于任何现存 fold 的摘要头（窗口恢复/重建残留的旧头，
@@ -632,8 +710,9 @@
         function flush() {
             if (rangeUser) {
                 var key = keyForUserNode(rangeUser);
-                syncRound(rangeNodes, container, key, rangeUser);
-                seen.push(key);
+                var keys = syncRound(rangeNodes, container, key, rangeUser);
+                for (var k = 0; k < keys.length; k++)
+                    seen.push(keys[k]);
             }
             rangeUser = null;
             rangeNodes = [];
@@ -642,12 +721,13 @@
             if (node.nodeType !== 1)
                 return;
             if (node.matches(".msg-user")) {
-                // 同轮追发消息不分段：流式中途用户追发的消息与当前轮同轮号，
-                // 与前段同属一轮（若分段则同 key 覆盖，前段折叠丢失——r143 实证）。
-                // 用户节点本身永不折叠，保持可见，故不计入 rangeNodes。
+                // 同轮追发/引导消息不分段：与前段同属一轮（若分段则同 key 覆盖，
+                // 前段折叠丢失）；气泡本身计入段内，由 syncRound 按气泡切分段。
                 if (rangeUser && node.dataset.round != null && rangeUser.dataset.round != null &&
-                    String(node.dataset.round) === String(rangeUser.dataset.round))
+                    String(node.dataset.round) === String(rangeUser.dataset.round)) {
+                    rangeNodes.push(node);
                     return;
+                }
                 flush();
                 rangeUser = node;
                 return;
@@ -677,8 +757,9 @@
             return allFolds.get(key).open;
         return choices.get(key) === true;
     }
-    // 记录级折叠判定（estimateHeights/windowBounds 用）：返回轮内成员下标与尾下标
-    function foldableRange(records, round) {
+    // 记录级折叠判定（estimateHeights/windowBounds 用）：按引导切分段，返回每段
+    // 的成员下标与尾下标（与 DOM 分段口径一致；无引导时退化为单段）。
+    function foldableRanges(records, round) {
         var wanted = String(round);
         var idxs = [];
         for (var i = 0; i < records.length; i++) {
@@ -686,19 +767,13 @@
                 idxs.push(i);
         }
         if (!idxs.length)
-            return null;
-        var tail = -1;
-        for (var k = idxs.length - 1; k >= 0; k--) {
-            if (records[idxs[k]].kind === "assistant") {
-                tail = idxs[k];
-                break;
-            }
+            return [];
+        // 段边界：同轮第 2+ 个 user 记录是引导，每段从引导（含）起至下段止
+        var segStarts = [0];
+        for (var k = 1; k < idxs.length; k++) {
+            if (records[idxs[k]] && records[idxs[k]].kind === "user")
+                segStarts.push(k);
         }
-        if (tail < 0)
-            return null;
-        // 成员：尾前可折叠记录 + 尾后已完成记录（历史记录均为 settled，与 DOM
-        // 尾后收纳对齐；最新用量行永不折叠）。单小块不折叠（与 DOM 口径一致，
-        // 记录无时间行/组头，成员即有效成员）。
         var lastUsage = -1;
         for (var u = idxs.length - 1; u >= 0; u--) {
             if (records[idxs[u]].kind === "usage") {
@@ -706,44 +781,70 @@
                 break;
             }
         }
-        var members = idxs.filter(function (i) {
-            var kind = records[i].kind;
-            if (!MEMBER_KINDS[kind] && kind !== "usage")
-                return false;
-            if (i < tail)
-                return true;
-            if (i === tail)
-                return false;
-            if (kind === "usage" && i === lastUsage)
-                return false;
-            return true;
-        });
-        if (!members.length)
-            return null;
-        // 单小块不折叠（与 DOM 口径一致）：小折叠组整体算一块（经 processGroups
-        // 记录分组判定），单个未分组正文仍折叠。无分组信息时退化为按条计数。
         var pg = App.processGroups;
-        var units = [];
-        var seen = [];
-        members.forEach(function (i) {
-            var g = pg && pg.groupOf ? pg.groupOf(records[i]) : null;
-            if (g) {
-                if (seen.indexOf(g) < 0) {
-                    seen.push(g);
-                    units.push(g);
+        var ranges = [];
+        segStarts.forEach(function (s, si) {
+            var e = si + 1 < segStarts.length ? segStarts[si + 1] : idxs.length;
+            var segIdx = idxs.slice(s, e);
+            var isFinal = si === segStarts.length - 1;
+            var tail = -1;
+            if (isFinal) {
+                for (var k2 = segIdx.length - 1; k2 >= 0; k2--) {
+                    if (records[segIdx[k2]].kind === "assistant") {
+                        tail = segIdx[k2];
+                        break;
+                    }
                 }
-                return;
+                if (tail < 0)
+                    return;
             }
-            units.push(i);
+            // 成员：末段=尾前可折叠 + 尾后已完成（最新用量行永不折叠）；
+            // 非末段=段内全部可折叠（历史记录均为 settled）。
+            var members = segIdx.filter(function (i) {
+                var kind = records[i].kind;
+                if (!MEMBER_KINDS[kind] && kind !== "usage")
+                    return false;
+                if (!isFinal)
+                    return kind !== "usage" || i !== lastUsage;
+                if (i < tail)
+                    return true;
+                if (i === tail)
+                    return false;
+                if (kind === "usage" && i === lastUsage)
+                    return false;
+                return true;
+            });
+            if (!members.length)
+                return;
+            // 单小块不折叠（与 DOM 口径一致）：小折叠组整体算一块（经 processGroups
+            // 记录分组判定），单个未分组正文仍折叠。无分组信息时退化为按条计数。
+            var units = [];
+            var seen = [];
+            members.forEach(function (i) {
+                var g = pg && pg.groupOf ? pg.groupOf(records[i]) : null;
+                if (g) {
+                    if (seen.indexOf(g) < 0) {
+                        seen.push(g);
+                        units.push(g);
+                    }
+                    return;
+                }
+                units.push(i);
+            });
+            if (!units.length)
+                return;
+            if (units.length === 1) {
+                var only = units[0];
+                if (typeof only !== "number" || records[only].kind !== "assistant")
+                    return;
+            }
+            ranges.push({
+                key: si === 0 ? roundKey(round) : roundKey(round) + ":s" + si,
+                start: idxs[s], end: (si + 1 < segStarts.length ? idxs[segStarts[si + 1]] : idxs[idxs.length - 1] + 1),
+                tail: tail, members: members,
+            });
         });
-        if (!units.length)
-            return null;
-        if (units.length === 1) {
-            var only = units[0];
-            if (typeof only !== "number" || records[only].kind !== "assistant")
-                return null;
-        }
-        return { start: idxs[0], end: idxs[idxs.length - 1] + 1, tail: tail, members: members };
+        return ranges;
     }
     // 高度估算后处理：已渲染节点以实测为准（含隐藏=0）；未渲染且被折叠的记 0，
     // 首个成员记折叠头高度（与 processGroups 的 36 口径一致）
@@ -756,35 +857,39 @@
                 rounds[String(rec.round)] = true;
         });
         Object.keys(rounds).forEach(function (round) {
-            if (isOpen(roundKey(round)))
-                return;
-            var range = foldableRange(records, round);
-            if (!range)
-                return;
-            range.members.forEach(function (i, n) {
-                if (n === 0) {
-                    heights[i] = FOLD_HEADER_HEIGHT;
+            foldableRanges(records, round).forEach(function (range) {
+                if (isOpen(range.key))
                     return;
-                }
-                if (measured && measured.has(records[i]))
-                    return;
-                heights[i] = 0;
+                range.members.forEach(function (i, n) {
+                    if (n === 0) {
+                        heights[i] = FOLD_HEADER_HEIGHT;
+                        return;
+                    }
+                    if (measured && measured.has(records[i]))
+                        return;
+                    heights[i] = 0;
+                });
             });
         });
     }
-    // 窗口边界吸附：窗口切进已折叠轮的成员区时扩到整轮，避免半轮渲染
+    // 窗口边界吸附：窗口切进已折叠段的成员区时扩到整段，避免半段渲染
     function snapBounds(records, start, end) {
         if (!Array.isArray(records) || !(end > start))
             return { start: start, end: end };
         function snapEdge(index, isStart) {
             var fallback = isStart ? index : index + 1;
             var rec = records[index];
-            if (!rec || rec.round == null || isOpen(roundKey(rec.round)))
+            if (!rec || rec.round == null)
                 return fallback;
-            var range = foldableRange(records, rec.round);
-            if (!range || range.members.indexOf(index) < 0)
-                return fallback;
-            return isStart ? range.start : range.end;
+            var ranges = foldableRanges(records, rec.round);
+            for (var r = 0; r < ranges.length; r++) {
+                if (ranges[r].members.indexOf(index) < 0)
+                    continue;
+                if (isOpen(ranges[r].key))
+                    return fallback;
+                return isStart ? ranges[r].start : ranges[r].end;
+            }
+            return fallback;
         }
         return { start: snapEdge(start, true), end: snapEdge(end - 1, false) };
     }
