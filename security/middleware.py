@@ -359,7 +359,7 @@ class SecurityMiddleware:
         for batch in [data.get("session_ids"), *query.get("session_ids", [])]:
             if batch:
                 identifiers.extend(batch if isinstance(batch, list) else str(batch).split(","))
-        needs_session = (path.startswith(("/file/", "/file_diff/", "/terminal/", "/tool_approvals/", "/permissions/", "/chat_context/"))
+        needs_session = (path.startswith(("/file/", "/file_diff/", "/terminal/", "/tool_approvals/", "/permissions/", "/chat_context/", "/outbox", "/outbox/"))
                          or path in {"/chat_with_tool", "/stop_chat", "/stop_sub_agent", "/inject_message", "/cancel_inject_message",
                                      "/chat_history/file", "/chat_history/page", "/chat_history/event", "/chat_history/meta", "/chat_history/title", "/chat_history/delete_file",
                                      "/chat_history/archive", "/chat_history/delete_rounds", "/chat_history/remove_media_tag",

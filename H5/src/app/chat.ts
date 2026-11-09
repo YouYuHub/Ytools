@@ -224,7 +224,7 @@
 
     function queueDirectRetry() {
       if (fromInput) return;
-      state.pendingQueue.unshift({
+      const entry: any = {
         text: text,
         media: pendingMedia,
         docs: pendingDocs,
@@ -233,7 +233,25 @@
         insertAfterRound: direct && direct.insertAfterRound,
         strictInsertContext: direct && direct.strictInsertContext,
         sessionId: streamSessionId,
-      });
+      };
+      // 引导重试放回引导槽（标签不变）；槽被占则按时间顺序合并（重试的旧内容在前）。
+      // 带编辑轮次/文档的不进引导槽（语义不符），走队列。
+      if (direct && direct._originKind === "steer" && !entry.targetRound && !entry.insertAfterRound &&
+        !(entry.docs && entry.docs.length)) {
+        const prev = state.steerMessage && state.steerMessage.sessionId === streamSessionId ? state.steerMessage : null;
+        state.steerMessage = {
+          id: prev && prev.id ? prev.id : "o_" + Date.now().toString(36) + Math.random().toString(36).slice(2),
+          text: prev && prev.text ? entry.text + "\n\n" + prev.text : entry.text,
+          media: (entry.media || []).concat(prev && prev.media ? prev.media : []),
+          quotes: (entry.quotes || []).concat(prev && prev.quotes ? prev.quotes : []),
+          sessionId: streamSessionId,
+        };
+        if (App.saveOutboxEntry) App.saveOutboxEntry(streamSessionId, "steer", state.steerMessage);
+      } else {
+        if (!entry.id) entry.id = "o_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+        state.pendingQueue.unshift(entry);
+        if (App.saveOutboxEntry) App.saveOutboxEntry(streamSessionId, "queue", entry);
+      }
       App.renderPendingOutbox();
     }
 
@@ -415,7 +433,11 @@
     // 普通发送直接追加末尾
     if (direct && direct.targetRound) {
       const oldRound = String(direct.targetRound);
-      const firstNext = chatInner.querySelector('[data-round="' + (direct.targetRound + 1) + '"]');
+      // 锚点：下一轮首节点；若嵌套在容器内则上浮到顶层子节点（直接用嵌套
+      // 节点会导致 parentNode 判定失败而追加末尾，轮次显示错乱）。
+      let firstNext: any = chatInner.querySelector('[data-round="' + (direct.targetRound + 1) + '"]');
+      while (firstNext && firstNext.parentNode && firstNext.parentNode !== chatInner) firstNext = firstNext.parentNode;
+      if (!firstNext || firstNext.parentNode !== chatInner) firstNext = null;
       let removed = false;
       let sweepDone = false;
       // 旧轮节点可能被中间压缩等无 data-round 的节点分隔，统一遍历删除；
@@ -437,7 +459,14 @@
         // 无标记 .msg 回复容器（暂停/停止后未重载的直播轮：userNode 在
         // round_started 后已补打标，msg 容器从未打标）也必须清掉，否则重发后
         // 旧流式正文残留在新消息前面；用户气泡绝不能误删，显式排除。
+        // 扁平折叠头/小折叠头/提示条/提问卡/子任务块/图文块同样无标记，
+        // 不清会残留在新气泡上方造成显示错乱（压缩条是轮次分隔符、分页
+        // 铆钉是窗口 chrome，有意保留）。
         if (node.classList && (node.classList.contains("msg-time") || node.classList.contains("round-usage") ||
+          node.classList.contains("round-fold-summary") || node.classList.contains("process-group-summary") ||
+          node.classList.contains("notice-bar") || node.classList.contains("ask-block") ||
+          node.classList.contains("agent-block") || node.classList.contains("md-svg-block") ||
+          node.classList.contains("md-canvas-block") ||
           (node.classList.contains("msg") && !node.classList.contains("msg-user")))) {
           node.remove();
         }
@@ -807,7 +836,7 @@
     const streamSessionId = state.sessionId;
     if (App.taskStatus && App.taskStatus.isStopping && App.taskStatus.isStopping(streamSessionId)) return;
     // 用户主动停止：本轮结束后不自动派发引导/队列消息（消费一次后复位）
-    state.suppressFlushOnce = true;
+    state.suppressFlushSession = streamSessionId;
     const active = state.activeStream && state.activeStream.sessionId === streamSessionId ? state.activeStream : null;
     const abort = active ? state.abort : null;
     if (streamSessionId) {
@@ -831,7 +860,7 @@
           App.refreshComposerButtons();
           return;
         }
-        state.suppressFlushOnce = false;
+        state.suppressFlushSession = null;
         if (App.taskStatus) App.taskStatus.stopFailed(streamSessionId, error, taskHandle);
         toast("停止失败，请重试：" + (error as any).message); return;
       }
@@ -854,8 +883,11 @@
       state.activeStream.completed = true;
       state.activeStream = null;
     }
-    // 切换会话放弃监听：该轮结束不自动派发引导/队列（消费一次后复位）
-    state.suppressFlushOnce = true;
+    // 切换会话放弃监听：被放弃的流结束时不自动派发该会话引导/队列
+    // （消费一次后复位）；无监听流时不置位，避免误吞后续正常派发。
+    if (state.activeStream) {
+      state.suppressFlushSession = state.activeStream.sessionId;
+    }
     App.refreshComposerButtons();
   }
 
@@ -1047,7 +1079,7 @@
   }
 
   /** 打开会话后：若该会话后台仍在生成，自动附接续看。 */
-  function maybeAttachRunningStream(sessionId: any) {
+  function maybeAttachRunningStream(sessionId: any, attempt?: any) {
     if (!sessionId) return;
     const sid = SessionUtils.sanitizeSessionId(sessionId);
     if (state.streaming && state.streamingSession === sid) return;
@@ -1065,7 +1097,15 @@
           setTimeout(function () { App.flushPendingMessages(sid); }, 0);
         }
       })
-      .catch(function () { /* 状态查询失败则跳过续接与补发 */ });
+      .catch(function () {
+        // 状态查询失败则补发被跳过：5 秒后重试一次（仍停留且空闲才执行），
+        // 避免暂存消息静默卡死；重试仍失败则等下次打开/事件触发。
+        if ((attempt || 0) < 1) {
+          setTimeout(function () {
+            if (state.sessionId === sid && !state.streaming) maybeAttachRunningStream(sid, (attempt || 0) + 1);
+          }, 5000);
+        }
+      });
   }
 
   // ---------- 会话标题（前端驱动，零轮询） ----------
@@ -1162,11 +1202,11 @@
     });
     if (!confirmed) return false;
     // 用户主动停止：本轮结束后不自动派发引导/队列消息（消费一次后复位）
-    state.suppressFlushOnce = true;
+    state.suppressFlushSession = sessionId;
     try {
       await API.stopChat(sessionId);
     } catch (error) {
-      state.suppressFlushOnce = false;
+      state.suppressFlushSession = null;
       App.toast("停止原任务失败：" + (error as any).message);
       return false;
     }
@@ -1228,6 +1268,10 @@
 
     const doSend = function(targetRound: any) {
       App.exitUserMessageEdit(plan.msg);
+      // 原地重发：被编辑的气泡可能尚未打标（暂停早于 round_started 补打标），
+      // 删除循环按 data-round 匹配不到会残留成重复气泡，这里显式移除。
+      // insert 模式气泡保留（新轮插在其后），truncate 经 openSession 重建，此处跳过无害。
+      if (targetRound != null && plan.msg && plan.msg.isConnected) plan.msg.remove();
       App.send({
         text: plan.text,
         media: plan.media,

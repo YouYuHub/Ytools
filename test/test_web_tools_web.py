@@ -177,21 +177,38 @@ class SearchTests(unittest.TestCase):
         # 熔断器是模块全局状态：每个用例前后复位，避免顺序/跨文件依赖
         s._DDG_BREAKER_FAILS = 0
         s._DDG_BREAKER_SKIP_UNTIL = 0.0
+        s._DDG_NET_FAILS = 0
+        s._DDG_NET_SKIP_UNTIL = 0.0
 
     def tearDown(self):
         s._DDG_BREAKER_FAILS = 0
         s._DDG_BREAKER_SKIP_UNTIL = 0.0
+        s._DDG_NET_FAILS = 0
+        s._DDG_NET_SKIP_UNTIL = 0.0
+
+    def test_ddg_net_skip_after_total_failure(self):
+        # 网络层不可达：第一次返回聚合失败并挂起 NET 跳过，第二次直接跳过零请求
+        with patch.object(s, '_http_request', side_effect=OSError('boom')) as http:
+            with self.assertRaisesRegex(ValueError, '均失败'):
+                s._fetch_ddg_results('python', 20)
+            with self.assertRaisesRegex(ValueError, '已临时跳过'):
+                s._fetch_ddg_results('python', 20)
+        # 两次调用只产生第一次的 2 端点请求，第二次零请求
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual(s._DDG_NET_FAILS, 1)
 
     def test_ddg_breaker_skips_after_consecutive_failures(self):
-        with patch.object(s, '_http_request', side_effect=OSError('boom')) as http:
-            for _ in range(3):
+        # 页面拿到但解析失败（非网络层）：不走 NET 跳过，连续两次后走熔断跳过
+        bad_page = ('', 200, 'text/html', b'<html><body>nothing useful</body></html>')
+        with patch.object(s, '_http_request', return_value=bad_page) as http:
+            for _ in range(2):
                 with self.assertRaisesRegex(ValueError, '均失败'):
                     s._fetch_ddg_results('python', 20)
-            # 第 4 次直接熔断，不再发请求
+            # 第 3 次直接熔断，不再发请求
             with self.assertRaisesRegex(ValueError, '熔断跳过'):
                 s._fetch_ddg_results('python', 20)
-        # 3 次 × 2 端点 = 6 次请求，第 4 次零请求
-        self.assertEqual(http.call_count, 6)
+        # 2 次 × 2 端点 = 4 次请求，第 3 次零请求
+        self.assertEqual(http.call_count, 4)
 
     def test_ddg_breaker_resets_on_success(self):
         html = '<a href="https://example.org" class="result__a">Python</a>'
@@ -199,9 +216,13 @@ class SearchTests(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaises(ValueError):
                     s._fetch_ddg_results('python', 20)
+        # 冷却过期后成功一次：两套计数同时复位
+        s._DDG_NET_SKIP_UNTIL = 0.0
+        s._DDG_BREAKER_SKIP_UNTIL = 0.0
         with patch.object(s, '_http_request', return_value=('', 200, 'text/html', html.encode())):
             s._fetch_ddg_results('python', 20)
         self.assertEqual(s._DDG_BREAKER_FAILS, 0)
+        self.assertEqual(s._DDG_NET_FAILS, 0)
 
     def test_ddg_attribute_order_classes_and_redirect_decoding(self):
         html = '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F%3Fq%3Da%2526b&amp;rut=x" class="other result__a"><b>Python</b> 文档</a><a href="https://example.org" class="result__snippet extra">Python 示例</a>'
@@ -232,16 +253,18 @@ class SearchTests(unittest.TestCase):
 
     def test_missing_version_warns_instead_of_claiming_precise_results(self):
         pool = [('Python', 'https://python.org/', 'Python general information')]
-        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', side_effect=ValueError('验证码')):
-            result = s._web_search_impl('Python 3.13 新特性', 5)
+        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', side_effect=ValueError('验证码')), \
+                patch.object(s, '_fetch_sogou_results', return_value=([], False)), patch.object(s, '_fetch_so360_results', return_value=([], False)):
+            result = s._web_search_impl('Python 3.13 features', 5)
         self.assertIn('结果未完整匹配', result)
         self.assertIn('DuckDuckGo', result)
 
     def test_full_bing_pool_does_not_exclude_specific_ddg_result(self):
         pool = [('Python', f'https://example.org/{i}', 'general') for i in range(s._WEB_SEARCH_MAX_RESULTS * 3)]
         precise = ('Python 3.13 新特性', 'https://docs.python.org/3.13/whatsnew/3.13.html', '介绍')
-        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', return_value=([precise], False)):
-            result = s._web_search_impl('Python 3.13 新特性 介绍', 1)
+        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', return_value=([precise], False)), \
+                patch.object(s, '_fetch_sogou_results', return_value=([], False)), patch.object(s, '_fetch_so360_results', return_value=([], False)):
+            result = s._web_search_impl('Python 3.13 whatsnew', 1)
         self.assertIn(precise[1], result)
         self.assertNotIn('https://example.org/0', result)
 
@@ -272,7 +295,8 @@ class SearchTests(unittest.TestCase):
 
     def test_unrelated_english_pool_triggers_fallback_and_is_discarded(self):
         pool = [('Falkland Islands', 'https://example.org/islands', '旅游')]
-        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', side_effect=ValueError('验证码')) as ddg:
+        with patch.object(s, '_fetch_bing_results', return_value=(pool, False)), patch.object(s, '_fetch_ddg_results', side_effect=ValueError('验证码')) as ddg, \
+                patch.object(s, '_fetch_sogou_results', return_value=([], False)), patch.object(s, '_fetch_so360_results', return_value=([], False)):
             result = s._web_search_impl('beautifulsoup4', 8)
         ddg.assert_called_once(); self.assertIn('未获得可靠结果', result); self.assertNotIn('Falkland Islands', result)
 

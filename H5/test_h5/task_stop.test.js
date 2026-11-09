@@ -13,7 +13,7 @@ function setup(fail,other){
   vm.runInNewContext(source.slice(start,end),context);return {calls,state,context,run:()=>handler()};
 }
 test('停止请求失败时保持监听，明确提示失败并可重试',async()=>{
-  const x=setup(true,false);await x.run();assert.equal(x.calls.aborts,0);assert.equal(x.state.suppressFlushOnce,false);
+  const x=setup(true,false);await x.run();assert.equal(x.calls.aborts,0);assert.equal(x.state.suppressFlushSession,null);
   assert.deepEqual(x.calls.states,[['stopping','visible'],['failed','visible']]);assert.match(x.calls.toasts[0],/停止失败/);
 });
 test('当前会话的停止按钮不停止或中断另一个会话的监听',async()=>{

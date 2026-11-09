@@ -14,6 +14,45 @@
     const archivedSessionIds = new Set();
     let archiveVersion = 0;
     let sessionListLoadSeq = 0, sessionRenderVersion = 0, sessionRenderTimer = null;
+    // ---------- 最近列表时间段筛选（纯前端过滤，后端仍返回全部） ----------
+    const SESSION_TIME_FILTER_KEY = "ytools-session-time-filter";
+    const sessionTimeFilter = { preset: "all", start: "", end: "" };
+    try {
+        const saved = JSON.parse(localStorage.getItem(SESSION_TIME_FILTER_KEY) || "null");
+        if (saved && typeof saved === "object") {
+            if (typeof saved.preset === "string")
+                sessionTimeFilter.preset = saved.preset;
+            if (typeof saved.start === "string")
+                sessionTimeFilter.start = saved.start;
+            if (typeof saved.end === "string")
+                sessionTimeFilter.end = saved.end;
+        }
+    }
+    catch (_) { /* 私有模式/损坏数据：回退全部时间 */ }
+    function saveSessionTimeFilter() {
+        try {
+            localStorage.setItem(SESSION_TIME_FILTER_KEY, JSON.stringify(sessionTimeFilter));
+        }
+        catch (_) { }
+    }
+    function sessionTimeRange() {
+        return SessionListUtils.resolveTimeRange(sessionTimeFilter);
+    }
+    function isTimeFilterActive() {
+        return sessionTimeRange() !== null;
+    }
+    function visibleSessionRows() {
+        const recencyMap = {};
+        Object.keys(state.sessionRecency).forEach(function (id) { recencyMap[id] = state.sessionRecency[id].ts; });
+        return SessionListUtils.filterRowsByTime(lastSortedRows, sessionTimeRange(), recencyMap);
+    }
+    function msToDateInput(ms) {
+        const d = new Date(ms);
+        if (!Number.isFinite(ms) || isNaN(d.getTime()))
+            return "";
+        const p = function (n) { return (n < 10 ? "0" : "") + n; };
+        return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+    }
     // 「当前标题」注册表：记录每个会话侧边栏正在显示的标题，来源依次为
     //   后端 _meta.title（loadSessions / openSession 拉取）
     //   → 标题模型生成结果（chat.js applySessionTitle 回填）
@@ -448,11 +487,17 @@
             syncBulkSelectionUi();
             return;
         }
+        const visibleRows = visibleSessionRows();
+        if (!visibleRows.length) {
+            sessionList.appendChild(el("div", "empty-tip", "该时间段内无会话"));
+            syncBulkSelectionUi();
+            return;
+        }
         if (bulkMode) {
-            renderBulkGroupedView();
+            renderBulkGroupedView(visibleRows);
         }
         else {
-            const rows = lastSortedRows.slice(), version = sessionRenderVersion;
+            const rows = visibleRows.slice(), version = sessionRenderVersion;
             let offset = 0;
             function appendBatch() {
                 sessionRenderTimer = null;
@@ -475,17 +520,18 @@
         syncBulkSelectionUi();
     }
     /** 多选分组视图：组块（组头 + 成员行）；数据来自分组模块，未接线时退化为单一「未分组」桶。 */
-    function renderBulkGroupedView() {
+    function renderBulkGroupedView(visibleRows) {
+        const rows = Array.isArray(visibleRows) ? visibleRows : lastSortedRows;
         let buckets = null;
         const hasUtils = typeof SessionGroupUtils !== "undefined" && Boolean(SessionGroupUtils.bucketForBulk);
         if (App.sessionGroups && App.sessionGroups.getGroups && hasUtils) {
-            buckets = SessionGroupUtils.bucketForBulk(lastSortedRows, App.sessionGroups.getGroups(), App.sessionGroups.getAssignments ? App.sessionGroups.getAssignments() : {});
+            buckets = SessionGroupUtils.bucketForBulk(rows, App.sessionGroups.getGroups(), App.sessionGroups.getAssignments ? App.sessionGroups.getAssignments() : {});
         }
         if (!buckets || !buckets.length) {
             buckets = [{
                     key: (hasUtils && SessionGroupUtils.UNGROUPED_KEY) || "__ungrouped__",
                     name: "未分组",
-                    sessions: lastSortedRows.slice(),
+                    sessions: rows.slice(),
                 }];
         }
         buckets.forEach(function (bucket) {
@@ -1166,6 +1212,128 @@
     const bulkSelectAllBtn = $("#bulkSelectAllBtn");
     if (bulkSelectAllBtn)
         bulkSelectAllBtn.addEventListener("click", toggleBulkSelectAll);
+    initSessionTimeFilter();
+    // ---------- 最近列表时间段筛选 UI ----------
+    // 「最近」标题行右侧筛选按钮 + 下拉面板：预设（近一周/近一月/近三月/
+    // 全部时间）+ 自定义起止日期。选择后即时过滤并持久化，下次打开沿用。
+    function initSessionTimeFilter() {
+        try {
+            initSessionTimeFilterUi();
+        }
+        catch (_) { /* 单测 mock 环境缺 DOM API：筛选 UI 不可用，后端列表不受影响 */ }
+    }
+    function initSessionTimeFilterUi() {
+        const head = $("#sessionHead");
+        if (!head || typeof head.appendChild !== "function")
+            return;
+        const btn = el("button", "session-time-filter-btn");
+        btn.type = "button";
+        btn.id = "sessionTimeFilterBtn";
+        const allBtn = $("#bulkSelectAllBtn");
+        if (allBtn && typeof head.insertBefore === "function")
+            head.insertBefore(btn, allBtn);
+        else
+            head.appendChild(btn);
+        const panel = el("div", "session-time-panel");
+        panel.id = "sessionTimePanel";
+        panel.setAttribute("hidden", "");
+        head.appendChild(panel);
+        const presets = [["week", "近一周"], ["month", "近一月"], ["quarter", "近三月"], ["all", "全部时间"]];
+        const presetRow = el("div", "session-time-presets");
+        presets.forEach(function (pair) {
+            const b = el("button", "session-time-preset");
+            b.type = "button";
+            b.textContent = pair[1];
+            b.dataset.preset = pair[0];
+            b.addEventListener("click", function () {
+                sessionTimeFilter.preset = pair[0];
+                saveSessionTimeFilter();
+                syncSessionTimeFilterUi();
+                renderSessionItems();
+                closeSessionTimePanel();
+            });
+            presetRow.appendChild(b);
+        });
+        panel.appendChild(presetRow);
+        const customRow = el("div", "session-time-custom");
+        const startInput = document.createElement("input");
+        startInput.type = "date";
+        startInput.className = "session-time-date";
+        startInput.setAttribute("aria-label", "开始日期");
+        const endInput = document.createElement("input");
+        endInput.type = "date";
+        endInput.className = "session-time-date";
+        endInput.setAttribute("aria-label", "结束日期");
+        const applyBtn = el("button", "session-time-apply");
+        applyBtn.type = "button";
+        applyBtn.textContent = "应用";
+        applyBtn.addEventListener("click", function () {
+            const start = startInput.value || "";
+            const end = endInput.value || "";
+            if (start && end && start > end) {
+                toast("开始日期不能晚于结束日期");
+                return;
+            }
+            sessionTimeFilter.preset = (start || end) ? "custom" : "all";
+            sessionTimeFilter.start = start;
+            sessionTimeFilter.end = end;
+            saveSessionTimeFilter();
+            syncSessionTimeFilterUi();
+            renderSessionItems();
+            closeSessionTimePanel();
+        });
+        customRow.appendChild(startInput);
+        customRow.appendChild(el("span", "session-time-sep", "–"));
+        customRow.appendChild(endInput);
+        customRow.appendChild(applyBtn);
+        panel.appendChild(customRow);
+        function openSessionTimePanel() {
+            // 打开时回填当前值：自定义显示起止，预设显示其对应日期（可改，改后即转自定义）
+            const range = sessionTimeRange();
+            if (sessionTimeFilter.preset === "custom") {
+                startInput.value = sessionTimeFilter.start || "";
+                endInput.value = sessionTimeFilter.end || "";
+            }
+            else if (range) {
+                startInput.value = msToDateInput(range.fromMs);
+                endInput.value = msToDateInput(range.toMs);
+            }
+            else {
+                startInput.value = "";
+                endInput.value = "";
+            }
+            panel.querySelectorAll(".session-time-preset").forEach(function (b) {
+                b.classList.toggle("is-active", b.dataset.preset === sessionTimeFilter.preset);
+            });
+            panel.removeAttribute("hidden");
+        }
+        function closeSessionTimePanel() {
+            panel.setAttribute("hidden", "");
+        }
+        function syncSessionTimeFilterUi() {
+            btn.textContent = SessionListUtils.describeTimeFilter(sessionTimeFilter) + " ▾";
+            btn.classList.toggle("is-active", isTimeFilterActive());
+            btn.title = isTimeFilterActive() ? "按时间段筛选会话（点击更改）" : "全部时间（点击按时间段筛选）";
+        }
+        btn.addEventListener("click", function (event) {
+            event.stopPropagation();
+            if (panel.hasAttribute("hidden"))
+                openSessionTimePanel();
+            else
+                closeSessionTimePanel();
+        });
+        panel.addEventListener("mousedown", function (event) { event.stopPropagation(); });
+        document.addEventListener("mousedown", function (event) {
+            if (!panel.hasAttribute("hidden") && !panel.contains(event.target) && event.target !== btn)
+                closeSessionTimePanel();
+        });
+        document.addEventListener("keydown", function (event) {
+            if (event.key === "Escape" && !panel.hasAttribute("hidden"))
+                closeSessionTimePanel();
+        });
+        App.closeSessionTimePanel = closeSessionTimePanel;
+        syncSessionTimeFilterUi();
+    }
     async function openSession(id, options) {
         const seq = ++sessionOpenSeq;
         if (App.resetHistoryView)
@@ -1279,6 +1447,9 @@
                 App.renderRecords(visibleRecords, options && options.historyMatch ? { historyMatch: options.historyMatch } : undefined);
                 restoreActiveStream(id);
                 App.rebuildQnav();
+                // 恢复持久化暂存（刷新/切回后重建引导/队列/待消费行；已消费残留按 id 核销）
+                if (App.loadSessionOutbox)
+                    App.loadSessionOutbox(id);
                 if (!(options && options.historyMatch))
                     scrollToBottom(true);
             }

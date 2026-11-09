@@ -2870,6 +2870,13 @@ html[data-theme="dark"] {
   &.is-zoomed .md-svg-view {
     max-height: 85vh;
     overflow: auto;
+    cursor: grab;
+  }
+
+  // 拖拽平移中：抓手闭合（JS 在 mousedown/mouseup 间切换）
+  .md-svg-view.is-panning {
+    cursor: grabbing;
+    user-select: none;
   }
 
   // Mermaid 异步渲染占位/错误态
@@ -2991,10 +2998,13 @@ html[data-theme="dark"] {
   }
 
   // 兜底限高（正常路径由 JS 按各图宽高比写内联尺寸接管，见
-  // messages.js syncSvgFullscreenLayout；这里仅防 JS 未生效时溢出视口）
+  // messages.js syncSvgFullscreenLayout；这里仅防 JS 未生效时溢出视口）。
+  // flex:none：视图是 flex 居中容器，默认 flex-shrink 会把放大的图压回视口内，
+  // 导致全屏放大无效；禁止收缩后按内联尺寸溢出，由容器滚动查看。
   .md-svg-view svg,
   .md-svg-view img.md-animated-svg {
     max-height: calc(100vh - 96px);
+    flex: none;
   }
 
   // 代码视图：pre 铺满剩余高度滚动查看

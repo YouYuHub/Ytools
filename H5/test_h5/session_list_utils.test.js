@@ -110,3 +110,62 @@ test("shouldOpenSessionOnClick: 空值/空白安全（trim 后比较；异常空
   assert.equal(utils.shouldOpenSessionOnClick(null, "s-1", "s-1"), true);
   assert.equal(utils.shouldOpenSessionOnClick(undefined, "", ""), true);
 });
+test("resolveTimeRange: 全部时间/非法返回 null（不过滤）", function () {
+  assert.equal(utils.resolveTimeRange({ preset: "all" }), null);
+  assert.equal(utils.resolveTimeRange(null), null);
+  assert.equal(utils.resolveTimeRange({ preset: "nope" }), null);
+  assert.equal(utils.resolveTimeRange({ preset: "custom", start: "", end: "" }), null);
+  assert.equal(utils.resolveTimeRange({ preset: "custom", start: "2026-09-30", end: "2026-09-01" }), null);
+});
+
+test("resolveTimeRange: 预设按本地天数回退（含当天整天）", function () {
+  const now = new Date(2026, 10, 7, 15, 30, 0).getTime();
+  const week = utils.resolveTimeRange({ preset: "week" }, now);
+  assert.equal(new Date(week.fromMs).getDate(), 1);
+  assert.equal(new Date(week.fromMs).getHours(), 0);
+  assert.equal(new Date(week.toMs).getDate(), 7);
+  assert.equal(new Date(week.toMs).getHours(), 23);
+  const month = utils.resolveTimeRange({ preset: "month" }, now);
+  assert.equal(new Date(month.fromMs).getMonth(), 9);
+  assert.equal(new Date(month.fromMs).getDate(), 9);
+});
+
+test("resolveTimeRange: 自定义缺一边视为开放区间", function () {
+  const r = utils.resolveTimeRange({ preset: "custom", start: "2026-09-01", end: "2026-09-30" });
+  assert.equal(new Date(r.fromMs).getDate(), 1);
+  assert.equal(new Date(r.toMs).getDate(), 30);
+  assert.equal(new Date(r.toMs).getHours(), 23);
+  const open = utils.resolveTimeRange({ preset: "custom", start: "", end: "2026-09-30" });
+  assert.equal(open.fromMs, 0);
+});
+
+test("filterRowsByTime: 区间内外 + 无时间保留", function () {
+  const rows = [
+    { id: "a", updated: "2026-09-10 12:00:00" },
+    { id: "b", updated: "2026-10-05 12:00:00" },
+    { id: "c", updated: "", created: "" },
+  ];
+  const range = utils.resolveTimeRange({ preset: "custom", start: "2026-09-01", end: "2026-09-30" });
+  const out = utils.filterRowsByTime(rows, range, {});
+  assert.deepEqual(out.map(function (r) { return r.id; }), ["a", "c"]);
+  assert.deepEqual(utils.filterRowsByTime(rows, null, {}).length, 3);
+});
+
+test("filterRowsByTime: 本地 recency 也参与判定", function () {
+  const rows = [{ id: "x", updated: "", created: "" }];
+  const range = utils.resolveTimeRange({ preset: "custom", start: "2026-09-01", end: "2026-09-30" });
+  const inside = {};
+  inside.x = new Date(2026, 8, 15).getTime();
+  assert.equal(utils.filterRowsByTime(rows, range, inside).length, 1);
+  const outside = {};
+  outside.x = new Date(2026, 0, 1).getTime();
+  assert.equal(utils.filterRowsByTime(rows, range, outside).length, 0);
+});
+
+test("describeTimeFilter: 按钮文案", function () {
+  assert.equal(utils.describeTimeFilter({ preset: "all" }), "全部时间");
+  assert.equal(utils.describeTimeFilter({ preset: "week" }), "近一周");
+  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2026-09-01", end: "2026-09-30" }), "9月1日 - 9月30日");
+  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2020-01-01", end: "2020-01-31" }), "2020年1月1日 - 2020年1月31日");
+  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "", end: "" }), "全部时间");
+});

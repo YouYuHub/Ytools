@@ -187,6 +187,7 @@
       think.setText(rec.content);
       if (think.done) think.done();
       setStageTimestamp(think.wrap, rec.ts);
+      setStageEnd(think.wrap, rec.ts);
       container.appendChild(think.wrap);
       return;
     }
@@ -198,6 +199,9 @@
       }
       body.innerHTML = Markdown.render(rec.content);
       App.highlightCodeBlocks(body);
+      // 正文块此前从未打时间戳（尾部正文不参与计时是长期偏小的元凶之一）
+      setStageTimestamp(body, rec.ts);
+      setStageEnd(body, rec.ts);
       container.appendChild(body);
       return;
     }
@@ -226,6 +230,8 @@
       }
       App.applyToolResult(ui, rec.name, rec.result, rec.file_diff, rec.args);
       if (Number.isInteger(rec.source_event_index)) ui.wrap.dataset.resultEvent = String(rec.source_event_index);
+      // 结果到达即刷新结束戳（复用调用块时覆盖调用时间；计时取 max 用）
+      setStageEnd(ui.wrap, rec.ts);
       ui.finish();
       if (rec.history_detail && App.historyPages) App.historyPages.deferResult(ui,rec);
       return;
@@ -246,6 +252,7 @@
             existing._roundModelSnapshot = rec.model;
             existing.textContent = summary;
             setStageTimestamp(existing, rec.ts);
+            setStageEnd(existing, rec.ts);
             return;
           }
         }
@@ -255,6 +262,7 @@
         line._roundModelSnapshot = rec.model;
         if (rec.round != null) line.dataset.round = String(rec.round);
         setStageTimestamp(line, rec.ts);
+        setStageEnd(line, rec.ts);
         container.appendChild(line);
       }
       return;
@@ -269,12 +277,14 @@
       if (rec.agent_id) agentUi.wrap.dataset.agentId = rec.agent_id;
       if (rec.done_emitted) agentUi.markReturned(rec);
       setStageTimestamp(agentUi.wrap, rec.started_at);
+      setStageEnd(agentUi.wrap, rec.ended_at || rec.started_at);
       container.appendChild(agentUi.wrap);
       return;
     }
     if (rec.kind === "notice") {
       const notice = el("div", "notice-bar", rec.content);
       setStageTimestamp(notice, rec.ts);
+      setStageEnd(notice, rec.ts);
       container.appendChild(notice);
       return;
     }
@@ -295,6 +305,7 @@
           interruptedBar.appendChild(body);
         }
         setStageTimestamp(interruptedBar, rec.ts);
+        setStageEnd(interruptedBar, rec.ts);
         container.appendChild(interruptedBar);
         return;
       }
@@ -614,6 +625,10 @@
 
   function setStageTimestamp(node: any, ts: any) {
     if (App.processGroups) App.processGroups.setTimestamp(node, ts);
+  }
+  // 结束戳（计时取 max 用）：只写 dataset，不碰悬停显示。
+  function setStageEnd(node: any, ts: any) {
+    if (node && node.dataset && ts) node.dataset.stageEndTimestamp = String(ts);
   }
 
   // 压缩进度块：与思考/工具块保持一致。开始态可展开查看待压缩内容预览，

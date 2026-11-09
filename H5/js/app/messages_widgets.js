@@ -147,6 +147,43 @@
         e.preventDefault();
         stepZoom(block, e.deltaY < 0 ? +1 : -1);
     }, { passive: false });
+    // 放大后按住拖动平移（与图片预览一致的手感）：滚动容器 scroll 方案，
+    // 无需 transform 数学；仅放大档（>100%）启用，缩小/100% 不拦截。
+    // document 级 move/up：移出视图也能继续拖；视图重建后自动失效。
+    let svgPanDrag = null;
+    chatInner.addEventListener("mousedown", function (e) {
+        if (e.button !== 0 || svgPanDrag)
+            return;
+        const view = e.target.closest ? e.target.closest(".md-svg-view") : null;
+        if (!view)
+            return;
+        const block = view.closest(".md-svg-block");
+        if (!block || zoomScaleOf(block) <= 1)
+            return;
+        if (view.scrollWidth <= view.clientWidth + 1 && view.scrollHeight <= view.clientHeight + 1)
+            return;
+        svgPanDrag = { view: view, x: e.clientX, y: e.clientY,
+            sl: view.scrollLeft, st: view.scrollTop };
+        view.classList.add("is-panning");
+        e.preventDefault();
+    });
+    document.addEventListener("mousemove", function (e) {
+        if (!svgPanDrag)
+            return;
+        const view = svgPanDrag.view;
+        if (!view.isConnected) {
+            svgPanDrag = null;
+            return;
+        }
+        view.scrollLeft = svgPanDrag.sl - (e.clientX - svgPanDrag.x);
+        view.scrollTop = svgPanDrag.st - (e.clientY - svgPanDrag.y);
+    });
+    document.addEventListener("mouseup", function () {
+        if (!svgPanDrag)
+            return;
+        svgPanDrag.view.classList.remove("is-panning");
+        svgPanDrag = null;
+    });
     // ---------- SVG 生成控件（```svg 双视图块）交互 ----------
     // 视图切换/复制代码/复制图片全部事件委托：markdown 流式重渲染会重建节点
     chatInner.addEventListener("click", async function (e) {

@@ -210,6 +210,19 @@ class JsHandoffTests(unittest.TestCase):
 
 
 class SearchFallbackTests(unittest.TestCase):
+    def setUp(self):
+        # DDG 跳过状态是模块全局：复位避免被其它用例的失败污染
+        s._DDG_BREAKER_FAILS = 0
+        s._DDG_BREAKER_SKIP_UNTIL = 0.0
+        s._DDG_NET_FAILS = 0
+        s._DDG_NET_SKIP_UNTIL = 0.0
+
+    def tearDown(self):
+        s._DDG_BREAKER_FAILS = 0
+        s._DDG_BREAKER_SKIP_UNTIL = 0.0
+        s._DDG_NET_FAILS = 0
+        s._DDG_NET_SKIP_UNTIL = 0.0
+
     def test_bing_redesign_falls_back_to_links(self):
         html = ('<html><body><div class="new-layout">'
                 '<a href="https://docs.python.org/3.13/">Python 3.13 文档</a>'
@@ -237,9 +250,11 @@ class SearchFallbackTests(unittest.TestCase):
     def test_search_output_marks_fallback_engine(self):
         pool = [("Python 3.13", "https://docs.python.org/3.13/", "docs")]
         with patch.object(s, "_fetch_bing_results", return_value=(pool, True)), \
-                patch.object(s, "_fetch_ddg_results", return_value=([], False)):
+                patch.object(s, "_fetch_ddg_results", return_value=([], False)), \
+                patch.object(s, "_fetch_sogou_results", return_value=([], False)), \
+                patch.object(s, "_fetch_so360_results", return_value=([], False)):
             result = s._web_search_impl("Python 3.13", 5)
-        self.assertIn("非结构化兜底", result)
+        self.assertIn("回退为链接提取", result)
         self.assertIn("docs.python.org", result)
 
 

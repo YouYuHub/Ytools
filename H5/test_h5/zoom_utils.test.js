@@ -27,7 +27,7 @@ test("percentFromScale: 倍率转整数百分比，非法归 100", function () {
 
 test("normalizePercent: 越界钳制 + 吸附最近档位", function () {
   assert.equal(ZoomUtils.normalizePercent(100), 100);
-  assert.equal(ZoomUtils.normalizePercent(10), 50, "低于下限钳到 50");
+  assert.equal(ZoomUtils.normalizePercent(10), 25, "低于下限钳到 25");
   assert.equal(ZoomUtils.normalizePercent(9999), 800, "高于上限钳到 800");
   // 60 距离 50(10) 比 67(7) 远 -> 吸附 67；65 距 67(2) 比 50(15) 近 -> 67
   assert.equal(ZoomUtils.normalizePercent(65), 67);
@@ -55,6 +55,7 @@ test("stepScale: 相邻档位步进，边界保持不动", function () {
   const minScale = ZoomUtils.MIN_PERCENT / 100;
   assert.equal(ZoomUtils.stepScale(maxScale, +1), maxScale);
   assert.equal(ZoomUtils.stepScale(minScale, -1), minScale);
+  assert.equal(ZoomUtils.stepScale(0.5, -1), 0.25, "50% 下一档是 25%");
 });
 
 test("canStep: 边界判定供按钮禁用", function () {
@@ -94,7 +95,8 @@ test("zoomAtPoint: 中心缩放位移不变，越界钳制到档位边界", func
   assert.equal(c.tx, 30);
   assert.equal(c.ty, -20);
   assert.equal(ZoomUtils.zoomAtPoint(8, 2, null, null, 0, 0, 0, 0).scale, 8);
-  assert.equal(ZoomUtils.zoomAtPoint(0.5, 0.5, null, null, 0, 0, 0, 0).scale, 0.5);
+  assert.equal(ZoomUtils.zoomAtPoint(0.5, 0.5, null, null, 0, 0, 0, 0).scale, 0.25);
+  assert.equal(ZoomUtils.zoomAtPoint(0.25, 0.5, null, null, 0, 0, 0, 0).scale, 0.25);
   assert.equal(ZoomUtils.zoomAtPoint(NaN, NaN, null, null, 0, 0, 0, 0).scale, 1);
 });
 

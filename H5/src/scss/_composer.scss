@@ -767,6 +767,16 @@ html:not([data-theme="dark"]) #voiceBtn.is-recording {
       font-size: 11px;
     }
 
+    // 附件图片缩略图（恢复行用远端 URL，内存行用本地预览；点击进预览框）
+    .pending-outbox-thumb {
+      flex-shrink: 0;
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      object-fit: cover;
+      cursor: pointer;
+    }
+
     .pending-outbox-send {
       flex-shrink: 0;
       padding: 3px 12px;

@@ -2653,6 +2653,111 @@ class ChatMemoryManager:
                 time.sleep(delay)
         raise last_error
 
+    @property
+    def _outbox_sidecar_path(self) -> Path:
+        """暂存消息侧车文件：<session>_chat.jsonl.outbox（引导/队列未发送条目，sidecars/ 子目录）。"""
+        return self._sidecar_path(".outbox")
+
+    @staticmethod
+    def _normalize_outbox_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+        """校验并规整单条暂存；非法返回 None（调用方丢弃）。
+
+        字段：id（必需，非空 ≤128）、kind（steer/queue）、text（≤50000）、
+        media/quotes（列表，一期只存元数据）、created_at（缺失补现在）。
+        """
+        if not isinstance(entry, dict):
+            return None
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip() or len(entry_id) > 128:
+            return None
+        kind = entry.get("kind")
+        if kind not in ("steer", "queue"):
+            return None
+        text = entry.get("text") or ""
+        if not isinstance(text, str) or len(text) > 50000:
+            return None
+        media = entry.get("media") or []
+        quotes = entry.get("quotes") or []
+        docs = entry.get("docs") or []
+        if not isinstance(media, list) or not isinstance(quotes, list) or not isinstance(docs, list):
+            return None
+        created_at = entry.get("created_at")
+        if not isinstance(created_at, (int, float)):
+            created_at = time.time()
+        return {
+            "id": entry_id.strip(),
+            "kind": kind,
+            "text": text,
+            "media": [m for m in media if isinstance(m, dict)],
+            "quotes": [q for q in quotes if isinstance(q, dict)],
+            "docs": [d for d in docs if isinstance(d, dict)],
+            "created_at": created_at,
+        }
+
+    def _read_outbox_sidecar(self) -> list[dict[str, Any]]:
+        """读暂存侧车；不存在/损坏返回空列表（不抛错）。"""
+        try:
+            if self._outbox_sidecar_path.exists():
+                raw = json.loads(self._outbox_sidecar_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    entries = [self._normalize_outbox_entry(item) for item in raw]
+                    return [item for item in entries if item is not None]
+        except (OSError, json.JSONDecodeError):
+            pass
+        return []
+
+    def _write_outbox_sidecar(self, entries: list[dict[str, Any]]) -> None:
+        """侧车原子写（与 todo 同口径）；空列表时删除文件（保持目录干净）。"""
+        if not entries:
+            try:
+                self._outbox_sidecar_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        tmp_path = self._outbox_sidecar_path.with_name(self._outbox_sidecar_path.name + ".tmp")
+        payload = json.dumps(entries, ensure_ascii=False)
+        last_error: OSError | None = None
+        for delay in _ATOMIC_WRITE_RETRY_DELAYS:
+            try:
+                tmp_path.write_text(payload, encoding="utf-8")
+                os.replace(tmp_path, self._outbox_sidecar_path)
+                return
+            except OSError as err:
+                last_error = err
+                time.sleep(delay)
+        raise last_error
+
+    async def get_session_outbox(self) -> list[dict[str, Any]]:
+        """读取本会话暂存消息（引导/队列未发送条目，按创建时间排序）。"""
+        with self._lock:
+            entries = self._read_outbox_sidecar()
+        entries.sort(key=lambda item: (item.get("created_at") or 0))
+        return entries
+
+    async def upsert_session_outbox(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """新增或更新一条暂存（按 id 幂等）；返回规整后条目。"""
+        normalized = self._normalize_outbox_entry(entry)
+        if normalized is None:
+            raise ValueError("暂存条目非法（需要 id/kind/text）")
+        with self._write_guard():
+            entries = [item for item in self._read_outbox_sidecar() if item["id"] != normalized["id"]]
+            entries.append(normalized)
+            self._write_outbox_sidecar(entries)
+        return normalized
+
+    async def remove_session_outbox(self, ids: list[str]) -> int:
+        """按 id 删除暂存条目；返回实际删除条数。"""
+        wanted = {str(i) for i in (ids or [])}
+        if not wanted:
+            return 0
+        with self._write_guard():
+            entries = self._read_outbox_sidecar()
+            kept = [item for item in entries if item["id"] not in wanted]
+            removed = len(entries) - len(kept)
+            if removed:
+                self._write_outbox_sidecar(kept)
+        return removed
+
     async def update_session_title(self, title: str) -> dict[str, Any]:
         """
         更新当前会话首行 _meta 的 title 字段
@@ -3604,7 +3709,7 @@ class ChatMemoryManager:
         if chat_history_file.exists():
             _delete_path_with_retry(chat_history_file)
             deleted_parts.append(f"会话文件 {chat_history_file.name}")
-        for suffix in (".pending", ".todo", ".bak", ".responses", ".responses.tmp"):
+        for suffix in (".pending", ".todo", ".outbox", ".bak", ".responses", ".responses.tmp"):
             sidecar = _sidecar_dir(chat_history_file) / (chat_history_file.name + suffix)
             if sidecar.exists():
                 _delete_path_with_retry(sidecar)

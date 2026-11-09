@@ -52,6 +52,9 @@
                 App.renderPreservingWidgets(curAnswer, Markdown.render(answerText));
                 App.highlightCodeBlocks(curAnswer);
                 App.updateCodeblockCopyButtons();
+                // 每次落定刷新时间戳（大折叠计时取 max，冻结在首 chunk 会系统性偏小）
+                if (curAnswer.dataset)
+                    curAnswer.dataset.stageEndTimestamp = stageTimestamp;
             }
         }
         function flushAnswerRender() {
@@ -112,13 +115,42 @@
             const round = activeStream && activeStream.round;
             return typeof round === "number" && round > 0 ? round : null;
         }
+        // 去重预检（每管线一次）：历史区没有本轮节点时，收养/文本匹配注定全 miss，
+        // 整轮跳过（回放 90+ 工具时省掉 90+ 次全树扫描）；历史只增不减（本轮节点只
+        // 会被裁剪不会新增），缓存单调有效，误判方向只会是多做匹配（正确性无损）。
+        let replayAdoptCheck = null;
+        function replayHasHistoryNodes() {
+            const round = replayRound();
+            // 无轮次号无法定位，只好放行匹配（工具按 callId 收养仍需工作）
+            if (round == null)
+                return true;
+            if (replayAdoptCheck === null) {
+                replayAdoptCheck = false;
+                const want = String(round);
+                const stack = chatInner.children ? Array.from(chatInner.children) : [];
+                while (stack.length) {
+                    const n = stack.pop();
+                    if (n === msg)
+                        continue;
+                    if (n.dataset && String(n.dataset.round) === want) {
+                        replayAdoptCheck = true;
+                        break;
+                    }
+                    if (n.children && n.children.length) {
+                        for (let i = 0; i < n.children.length; i++)
+                            stack.push(n.children[i]);
+                    }
+                }
+            }
+            return replayAdoptCheck;
+        }
         function stagingActive() {
-            return replayWindow && replayRound() != null && replayDedup != null;
+            return replayWindow && replayRound() != null && replayDedup != null && replayHasHistoryNodes();
         }
         // 同 callId 的历史工具卡收养：复用其 ui 控制器（结果/审批归位到原卡），
         // 不在 DOM 新建重复卡。历史没有（被裁剪过）则返回 null 走正常新建。
         function adoptHistoryToolBlock(callId) {
-            if (!callId || !replayDedup)
+            if (!callId || !replayDedup || !replayHasHistoryNodes())
                 return null;
             const wrap = replayDedup.findHistoryToolWrap(chatInner, msg, callId);
             const ui = wrap && wrap._toolBlockUi;
@@ -203,9 +235,21 @@
         }
         function setReplayWindow(open) {
             const next = Boolean(open);
-            if (replayWindow && !next) {
-                flushStagingAsLive();
-                finalizeFastForward();
+            if (replayWindow === next)
+                return;
+            if (next) {
+                if (App.processGroups && App.processGroups.holdSync)
+                    App.processGroups.holdSync();
+            }
+            else {
+                try {
+                    flushStagingAsLive();
+                    finalizeFastForward();
+                }
+                finally {
+                    if (App.processGroups && App.processGroups.releaseSync)
+                        App.processGroups.releaseSync();
+                }
             }
             replayWindow = next;
         }
@@ -297,6 +341,9 @@
                 return;
             }
             line.textContent = summary;
+            // 每次更新刷新时间戳（同轮用量行原位复用，冻结在创建时会系统性偏小）
+            if (line.dataset)
+                line.dataset.stageEndTimestamp = stageTimestamp;
             msg.appendChild(line);
             if (!replayWindow && App.processGroups)
                 App.processGroups.sync(msg);
@@ -902,6 +949,9 @@
                         App.applyToolResult(tb.ui, tr.function_name, typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2), tr.file_diff, tr.arguments);
                         tb.ui.finish();
                         tb.done = true;
+                        // 工具完成即刷新时间戳（大折叠计时取 max，冻结在调用开始会系统性偏小）
+                        if (tb.ui.wrap && tb.ui.wrap.dataset)
+                            tb.ui.wrap.dataset.stageEndTimestamp = stageTimestamp;
                         hasStage = true;
                         appendStage(tb.ui.wrap);
                     }
@@ -910,6 +960,8 @@
                             if (tb.agentBlock === block) {
                                 tb.done = true;
                                 tb.ui.finish();
+                                if (tb.ui.wrap && tb.ui.wrap.dataset)
+                                    tb.ui.wrap.dataset.stageEndTimestamp = stageTimestamp;
                             }
                         });
                         if (Array.from(activeToolBlocks.values()).every((tb) => tb.done))
@@ -938,6 +990,9 @@
                 App.applyToolResult(tb.ui, tr.function_name, typeof tr.result === "string" ? tr.result : JSON.stringify(tr.result, null, 2), tr.file_diff, tr.arguments);
                 tb.ui.finish();
                 tb.done = true;
+                // 工具完成即刷新时间戳（大折叠计时取 max，冻结在调用开始会系统性偏小）
+                if (tb.ui.wrap && tb.ui.wrap.dataset)
+                    tb.ui.wrap.dataset.stageEndTimestamp = stageTimestamp;
                 if (activeToolBlocks && Array.from(activeToolBlocks.values()).every(function (toolBlock) { return toolBlock.done; })) {
                     activeToolBlocks = null;
                 }

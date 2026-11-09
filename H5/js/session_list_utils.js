@@ -75,6 +75,86 @@
      *   2. 相同则用 created_at 兜底（旧文件被后端误刷成同值时保证次序稳定）
      *   3. 仍相同保持原有顺序（Array.prototype.sort 稳定）
      */
+    // ---------- 最近列表时间段筛选 ----------
+    // filter: { preset: 'all'|'week'|'month'|'quarter'|'custom', start: 'YYYY-MM-DD', end: 'YYYY-MM-DD' }
+    // preset != custom 时忽略 start/end；custom 缺一边视为开放区间；非法返回 null（= 不过滤）。
+    const TIME_PRESET_DAYS = { week: 7, month: 30, quarter: 90 };
+    const TIME_PRESET_LABELS = { week: "近一周", month: "近一月", quarter: "近三月", all: "全部时间" };
+    function dayStartMs(y, m, d) {
+        return new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+    }
+    function parseDateOnly(value) {
+        if (typeof value !== "string")
+            return 0;
+        const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value.trim());
+        if (!m)
+            return 0;
+        const t = dayStartMs(Number(m[1]), Number(m[2]), Number(m[3]));
+        return Number.isFinite(t) ? t : 0;
+    }
+    function resolveTimeRange(filter, nowMs) {
+        const f = (filter && typeof filter === "object" ? filter : {});
+        const preset = typeof f.preset === "string" ? f.preset : "all";
+        if (preset === "all")
+            return null;
+        if (preset === "custom") {
+            const fromDay = parseDateOnly(f.start);
+            const endDay = parseDateOnly(f.end);
+            if (!fromDay && !endDay)
+                return null;
+            const fromMs = fromDay || 0;
+            const toMs = endDay ? endDay + 86400000 - 1 : Number.MAX_SAFE_INTEGER;
+            if (fromMs > toMs)
+                return null;
+            return { fromMs: fromMs, toMs: toMs };
+        }
+        const days = TIME_PRESET_DAYS[preset];
+        if (!days)
+            return null;
+        const now = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+        const today = new Date(now);
+        const toMs = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).getTime();
+        const fromMs = toMs - (days - 1) * 86400000 - 86399999;
+        return { fromMs: fromMs, toMs: toMs };
+    }
+    function rowTimeMs(row, recency) {
+        const rec = recency[row.id];
+        return Math.max(timeValue(row.updated), timeValue(row.created), typeof rec === "number" ? rec : 0);
+    }
+    // 按时间段过滤会话行（返回新数组，不改入参；range=null 不过滤）。
+    // 行时间 = max(后端 updated_at/created_at, 本地 recency)；三者全无视为未知，保留。
+    function filterRowsByTime(rows, range, recency) {
+        const copy = Array.isArray(rows) ? rows.slice() : [];
+        if (!range)
+            return copy;
+        const rec = recency || {};
+        return copy.filter(function (row) {
+            const t = rowTimeMs(row, rec);
+            if (!t)
+                return true;
+            return t >= range.fromMs && t <= range.toMs;
+        });
+    }
+    function shortDate(ms) {
+        const d = new Date(ms);
+        const yearPrefix = d.getFullYear() === new Date().getFullYear() ? "" : d.getFullYear() + "年";
+        return yearPrefix + (d.getMonth() + 1) + "月" + d.getDate() + "日";
+    }
+    // 筛选按钮文案：预设名 / 自定义起止 / 全部时间
+    function describeTimeFilter(filter) {
+        const f = (filter && typeof filter === "object" ? filter : {});
+        const preset = typeof f.preset === "string" ? f.preset : "all";
+        if (preset === "custom") {
+            const fromDay = parseDateOnly(f.start);
+            const endDay = parseDateOnly(f.end);
+            if (!fromDay && !endDay)
+                return TIME_PRESET_LABELS.all;
+            const left = fromDay ? shortDate(fromDay) : "最早";
+            const right = endDay ? shortDate(endDay) : "至今";
+            return left + " - " + right;
+        }
+        return TIME_PRESET_LABELS[preset] || TIME_PRESET_LABELS.all;
+    }
     function sortRows(rows, recency) {
         const copy = Array.isArray(rows) ? rows.slice() : [];
         const rec = recency || {};
@@ -95,6 +175,9 @@
         pickSendTitle: pickSendTitle,
         shouldOpenSessionOnClick: shouldOpenSessionOnClick,
         sortRows: sortRows,
+        resolveTimeRange: resolveTimeRange,
+        filterRowsByTime: filterRowsByTime,
+        describeTimeFilter: describeTimeFilter,
     };
     if (typeof module !== "undefined" && module.exports) {
         module.exports = api;

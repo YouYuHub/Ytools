@@ -278,12 +278,111 @@ body.sidebar-resizing {
     align-items: center;
     justify-content: space-between;
     padding: 14px 22px 4px;
+    position: relative;
 
     .session-label {
       font-size: 12px;
       font-weight: 600;
       color: var(--text-tertiary);
       padding: 0 10px;
+    }
+
+    // 时间段筛选按钮：默认弱化，筛选生效时高亮
+    .session-time-filter-btn {
+      margin-left: auto;
+      margin-right: 6px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      padding: 2px 8px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .session-time-filter-btn:hover {
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .session-time-filter-btn.is-active {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
+    // 筛选下拉面板：预设 + 自定义日期
+    .session-time-panel {
+      position: absolute;
+      top: 100%;
+      right: 12px;
+      z-index: 60;
+      width: 248px;
+      max-width: calc(100% - 16px);
+      background: var(--bg-elevated, var(--bg));
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md, 8px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .session-time-panel[hidden] {
+      display: none;
+    }
+    .session-time-presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .session-time-preset {
+      font-size: 12px;
+      color: var(--text);
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 10px;
+      cursor: pointer;
+    }
+    .session-time-preset:hover {
+      border-color: var(--accent);
+    }
+    .session-time-preset.is-active {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .session-time-custom {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .session-time-date {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 3px 4px;
+    }
+    .session-time-sep {
+      color: var(--text-tertiary);
+      flex: none;
+    }
+    .session-time-apply {
+      flex: none;
+      font-size: 12px;
+      color: var(--accent);
+      background: transparent;
+      border: 1px solid var(--accent);
+      border-radius: var(--radius-sm);
+      padding: 3px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .session-time-apply:hover {
+      background: var(--accent);
+      color: var(--bg);
     }
   }
 

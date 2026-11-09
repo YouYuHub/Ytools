@@ -786,8 +786,10 @@ body.tool-settings-open { overflow: hidden; }
 .qnav {
   position: absolute;
   right: 14px;
-  top: 50%;
-  transform: translateY(-50%);
+  // 顶栏下方起排（顶栏 z-index 更高且最小 56px 高）：此前垂直居中，多轮时
+  // 首条顶进顶栏按钮下层，hover/点击不到。bottom 留底边距，短列表仍居中。
+  top: 72px;
+  bottom: 16px;
   display: flex;
   align-items: center;
   z-index: 30;
@@ -797,6 +799,14 @@ body.tool-settings-open { overflow: hidden; }
     display: flex;
     flex-direction: column;
     align-items: stretch;
+    justify-content: center;
+    max-height: 100%;
+    // 极端多轮（收缩到下限仍超高）兜底内部滚动；隐藏滚动条保外观
+    overflow-y: auto;
+    scrollbar-width: none;
+    &::-webkit-scrollbar {
+      display: none;
+    }
     // 条之间零间隙：热区无缝拼接，鼠标移动时始终在某条热区内，
     // 涟漪波峰跟随鼠标平滑过渡（此前 gap 空隙会触发清除→重建闪烁）
     gap: 0;
@@ -810,6 +820,10 @@ body.tool-settings-open { overflow: hidden; }
   .qnav-dash {
     width: 100%;
     height: 8px;
+    // 多轮时允许收缩（flex-basis 8px，下限 3px 恰为指示线高），
+    // 轨道定高后所有条整体压缩，无一条被顶出可视区
+    flex: 0 1 auto;
+    min-height: 3px;
     padding: 0;
     border: 0;
     background: transparent;

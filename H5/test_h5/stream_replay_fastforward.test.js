@@ -154,6 +154,16 @@ function contentFrames(n, ch) {
   return frames;
 }
 
+test('无本轮历史节点时跳过去重匹配（直接落定）', () => {
+  const h = harness();
+  h.pipe.setReplayWindow(true);
+  contentFrames(3, 'y').forEach(h.send);
+  const bodies = h.msg.children.filter(n => (n.className || '').includes('msg-assistant-body'));
+  assert.equal(bodies.length, 1);
+  h.pipe.setReplayWindow(false);
+  assert.match(bodies[0].textContent, /yyy/);
+});
+
 test('回放窗口内 N 帧正文只渲染一次（与帧数无关）', () => {
   const h = harness();
   h.pipe.setReplayWindow(true);

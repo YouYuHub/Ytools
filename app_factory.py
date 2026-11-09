@@ -18,6 +18,7 @@ def create_app(*, security_settings=None):
     from routers.speech_config_router import api_speech_config_router
     from routers.terminal_router import api_terminal_router
     from routers.tool_approval_router import api_permission_router
+    from routers.outbox_router import api_outbox_router
     from security.app import install_security
     from security.static import AccountStaticFiles
     from util.ui_cache import ui_cache_headers
@@ -31,7 +32,7 @@ def create_app(*, security_settings=None):
         (api_prompt_router, "Skills"), (api_export_router, "Export"),
         (api_file_history_router, "FileDiffHistory"), (api_user_profile_router, "UserProfile"),
         (api_speech_config_router, "ChatConfig"), (api_terminal_router, "Terminal"),
-        (api_permission_router, "Permissions"),
+        (api_permission_router, "Permissions"), (api_outbox_router, "Outbox"),
     ):
         app.include_router(router, tags=[tag])
 

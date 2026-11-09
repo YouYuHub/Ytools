@@ -39,7 +39,7 @@ interface ZoomUtilsApi {
  *   calc(... * var(--md-zoom, 1))），本模块只负责「档位/百分比/步进」的纯计算，
  *   DOM 读写与滚动容器由 messages.js 接线。
  *
- * 档位为固定数组（等比与整数兼顾，50%~800%）：缩小用于总览超宽大图，
+ * 档位为固定数组（等比与整数兼顾，25%~800%）：缩小用于总览超宽大图，
  * 放大用于复杂流程图/细密节点的局部查看。
  * UMD 双形态：浏览器挂 window.ZoomUtils，Node 侧可 require 做单测
  * （与 session_list_utils.js / widget_reuse.js 同风格）。
@@ -54,7 +54,7 @@ interface ZoomUtilsApi {
   "use strict";
 
   // 缩放档位（百分比），严格单调递增；100 为基准档（默认显示）
-  const ZOOM_STEPS = [50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500, 600, 800];
+  const ZOOM_STEPS = [25, 50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500, 600, 800];
   const MIN_PERCENT = ZOOM_STEPS[0];
   const MAX_PERCENT = ZOOM_STEPS[ZOOM_STEPS.length - 1];
   const BASE_PERCENT = 100;
@@ -80,7 +80,7 @@ interface ZoomUtilsApi {
     return best;
   }
 
-  // 任意数值 → 合法档位百分比：非法归 100、越界钳制到 [50, 800]、再吸附最近档
+  // 任意数值 → 合法档位百分比：非法归 100、越界钳制到 [25, 800]、再吸附最近档
   function normalizePercent(value: unknown): number {
     let p = Number(value);
     if (!Number.isFinite(p) || p <= 0) return BASE_PERCENT;
@@ -114,7 +114,7 @@ interface ZoomUtilsApi {
 
   // 以锚点为中心的缩放：返回 {scale, tx, ty}。
   // (ax,ay) 锚点（鼠标）在容器中的坐标，(cx,cy) 容器中心，
-  // (tx1,ty1) 当前位移；min/max 为倍率边界（缺省 0.5~8，与档位对齐）。
+  // (tx1,ty1) 当前位移；min/max 为倍率边界（缺省 0.25~8，与档位对齐）。
   // 锚点传 null 时以中心缩放（位移不变）。
   function zoomAtPoint(
     scale1: unknown, factor: unknown,

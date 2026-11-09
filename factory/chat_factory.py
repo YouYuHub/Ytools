@@ -3574,6 +3574,82 @@ async def cancel_injected_message(session_id: str, text: str, *, message_id: str
     return {"ok": removed, "reason": "" if removed else "not_found"}
 
 
+async def peek_injected_messages(session_id: str, *, timeout: float = 5) -> list[dict] | None:
+    """查看尚未消费的注入消息（只读快照，不出队），供前端刷新后恢复提示行。
+
+    返回 [{message_id, text, quotes, media}]；任务未运行时返回空列表。
+    查询失败（worker IPC 超时）返回 None——调用方不得把未知当作空，
+    否则会把仍在后端队列的消息误判丢失并转存，导致重复发送。
+    """
+    session_id = normalize_session_id(session_id)
+    raw_items: list = []
+    if _generation_use_worker():
+        proxy = peek_worker_proxy(session_id)
+        if proxy is None:
+            return []
+        loop = asyncio.get_running_loop()
+        acknowledged = loop.create_future()
+        request_id = uuid.uuid4().hex
+
+        def receive(event):
+            if event.get("type") != "injected_snapshot" or event.get("request_id") != request_id:
+                return
+
+            def resolve():
+                if not acknowledged.done():
+                    acknowledged.set_result(event.get("messages") or [])
+            loop.call_soon_threadsafe(resolve)
+
+        proxy.add_handler(receive)
+        try:
+            if not proxy.peek_injected_messages(request_id=request_id):
+                return []
+            raw_items = await asyncio.wait_for(acknowledged, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            proxy.remove_handler(receive)
+    else:
+        stream = _get_session_stream(session_id)
+        if stream is None or stream.done:
+            return []
+        raw_items = list(stream.injected_messages)
+    snapshot = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            text = content_part_to_text(item.get("content"), include_media_labels=False)
+        except Exception:
+            text = ""
+        snapshot.append({
+            "message_id": item.get("message_id") or "",
+            "text": text or "",
+            "quotes": item.get("quotes") or [],
+            "media": _injected_media_refs(item.get("content")),
+        })
+    return snapshot
+
+
+def _injected_media_refs(content: Any) -> list[dict]:
+    """从注入消息 content 部件提取 media:// 引用（供前端恢复行缩略图）。"""
+    found: list[dict] = []
+    parts = content if isinstance(content, list) else []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind, url = None, None
+        if part.get("type") == "image_url":
+            kind, url = "image", (part.get("image_url") or {}).get("url")
+        elif part.get("type") == "video_url":
+            kind, url = "video", (part.get("video_url") or {}).get("url")
+        elif part.get("type") == "input_audio":
+            kind, url = "audio", (part.get("input_audio") or {}).get("data")
+        if kind and isinstance(url, str) and url.startswith("media://"):
+            found.append({"media_ref": url, "kind": kind})
+    return found
+
+
 async def _stop_saved_permission_tasks(session_id):
     """确认写者停止后，收尾权限快照与首个工具调用前的轮次检查点。"""
     from memory import permission_store

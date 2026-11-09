@@ -87,8 +87,9 @@ window.App = window.App || {};
         // 引导/队列按钮组当前展开的菜单归属："steer" | "queue" | ""（未展开）
         composerSendMode: "",
         // 单次抑制自动派发：用户主动停止/切换会话放弃监听时置位，
-        // 该轮 send 结束后不触发引导/队列 flush（消费后自动复位）
-        suppressFlushOnce: false,
+        // 该会话 send 结束后不触发引导/队列 flush（消费后自动复位）；会话级作用域——
+        // 全局布尔量会被无关会话的派发误消费，导致本应发出的队列永久卡住。
+        suppressFlushSession: null,
         // ▶继续可用性（暂停/中断后可续跑）：归属会话 + 是否可继续；
         // 真源在后端（空闲 + 末轮 stopped/interrupted），前端经状态接口同步
         resumeAvailable: false,

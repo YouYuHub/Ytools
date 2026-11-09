@@ -12,7 +12,7 @@ function setup(t){
   const App=w.App={state:{sessionId:'s',workDir:'/project'},chatInner:root,el,toast(){},stickToBottom(){},rebuildQnav(){},
     isBuiltinToolName:()=>true,toolDisplayName:()=> '应用补丁',toolIconSvg:(name,cls)=>'<svg class="'+cls+'"></svg>',
     clearInjectedPending(){},scheduleContextTokenStatsRefresh(){},highlightCodeBlocks(){},updateCodeblockCopyButtons(){}};
-  Object.assign(w,{el,state:App.state,toast(){},setStageTimestamp(){},loadOlderState:{records:[]},
+  Object.assign(w,{el,state:App.state,toast(){},setStageTimestamp(){},setStageEnd(){},loadOlderState:{records:[]},
     FormatUtils:{prettyJson:JSON.stringify,fmtNum:String,fmtTime:String,roundSummaryText:()=>''},
     Markdown:{render:()=>''},renderPreservingWidgets(){},
     buildThinkBlock(){return {wrap:el('div','think-block'),textContent:()=>'',done(){},streaming(){},setText(){},add(){}};}});

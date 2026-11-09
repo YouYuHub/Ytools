@@ -229,7 +229,7 @@ test('无本地流且后端不可用：停止按钮本地收尾，不卡运行�
   await x.run();
   assert.deepEqual(x.calls.states, [['stopping', 'visible'], ['stopped', 'visible']]);
   assert.match(x.calls.toasts[0], /本地停止/);
-  assert.equal(x.state.suppressFlushOnce, true);
+  assert.equal(x.state.suppressFlushSession, 'visible');
 });
 
 test('有本地流时停止失败仍保持监听，可重试', async () => {
@@ -240,6 +240,6 @@ test('有本地流时停止失败仍保持监听，可重试', async () => {
   await x.run();
   assert.deepEqual(x.calls.states, [['stopping', 'visible'], ['failed', 'visible']]);
   assert.match(x.calls.toasts[0], /停止失败/);
-  assert.equal(x.state.suppressFlushOnce, false);
+  assert.equal(x.state.suppressFlushSession, null);
   assert.equal(x.calls.aborts, 0);
 });

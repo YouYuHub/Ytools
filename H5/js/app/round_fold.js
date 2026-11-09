@@ -26,7 +26,7 @@
     // user/usage/compaction 永不折叠；toolResult/approval 无独立节点（已按 0 计）
     var MEMBER_KINDS = { think: true, tool: true, agentBlock: true, notice: true, assistant: true };
     var FOLD_HEADER_HEIGHT = 36;
-    var foldsByContainer = new WeakMap(); // container -> Map(key -> fold)
+    var foldMap = new Map(); // key -> fold（全局唯一；同轮扁平+容器合并后不再分容器）
     var allFolds = new Map(); // key -> fold（estimate/snap 用 DOM 真值优先）
     var choices = new Map(); // key -> open（跨重建记忆）
     var choiceRevision = 0;
@@ -101,7 +101,11 @@
             var rest = total % 60;
             return rest ? minutes + "m " + rest + "s" : minutes + "m";
         }
-        return Math.floor(minutes / 60) + "h " + (minutes % 60) + "m";
+        var hours = Math.floor(minutes / 60);
+        var minRest = minutes % 60;
+        var secRest = total % 60;
+        var out = hours + "h " + minRest + "m";
+        return secRest ? out + " " + secRest + "s" : out;
     }
     function renderHeader(fold) {
         var tools = 0, agents = 0, bodies = 0, thinks = 0, failures = 0;
@@ -124,15 +128,11 @@
             if (node.matches(".is-streaming, .is-executing, .is-running") ||
                 node.querySelector(".tool-status-icon"))
                 active = true;
-            var stamp = Date.parse(node.dataset.stageTimestamp || "");
-            if (!isNaN(stamp))
-                times.push(stamp);
+            pushSpan(times, node);
         });
         // 尾正文时间计入用时（整轮跨度）；流式光标视为进行中
         if (fold.tail) {
-            var tailStamp = Date.parse(fold.tail.dataset.stageTimestamp || "");
-            if (!isNaN(tailStamp))
-                times.push(tailStamp);
+            pushSpan(times, fold.tail);
             if (fold.tail.matches(".msg-cursor"))
                 active = true;
         }
@@ -146,9 +146,7 @@
             if (node.matches(".is-streaming, .is-executing, .is-running, .msg-cursor") ||
                 node.querySelector(".tool-status-icon"))
                 active = true;
-            var liveStamp = Date.parse(node.dataset.stageTimestamp || "");
-            if (!isNaN(liveStamp))
-                times.push(liveStamp);
+            pushSpan(times, node);
         });
         var floor = floorFor(fold);
         if (floor)
@@ -165,8 +163,8 @@
         if (failures)
             counts.push(failures + " 项异常");
         // 直播流等待模型时同样亮运行态（转圈 + 计时），与 foldActiveNow 同口径；
-        // 待确认 veto：审批等待期间不亮灯、不计时。
-        if (!waiting && !active && isLiveFold(fold))
+        // 待确认 veto：审批等待期间不亮灯、不计时。非末段（无尾）不用该兜底。
+        if (!waiting && !active && fold.tail && isLiveFold(fold))
             active = true;
         var duration = "";
         if (times.length >= 2) {
@@ -225,12 +223,12 @@
         }
         return total;
     }
-    // 轮次起始时间（成员+尾最早的时间戳）；无时间戳返回 0
+    // 轮次起始时间（成员+尾最早的开始戳）；无时间戳返回 0
     function foldStartTime(fold) {
         var min = Infinity;
         function feed(node) {
-            var stamp = Date.parse(node.dataset.stageTimestamp || "");
-            if (!isNaN(stamp) && stamp < min)
+            var stamp = tsStart(node);
+            if (stamp > 0 && stamp < min)
                 min = stamp;
         }
         fold.members.forEach(feed);
@@ -241,6 +239,25 @@
         if (floor && floor < min)
             min = floor;
         return min === Infinity ? 0 : min;
+    }
+    // 节点起止戳：开始（创建）与结束（最后活动）分槽——长工具调用/长回复
+    // 若只用创建时间，段内时长会被系统性吞掉。结束缺失回退开始。
+    function tsStart(node) {
+        var t = Date.parse(node.dataset.stageTimestamp || "");
+        return isNaN(t) ? 0 : t;
+    }
+    function tsEnd(node) {
+        var t = Date.parse(node.dataset.stageEndTimestamp || "");
+        if (!isNaN(t))
+            return t;
+        return tsStart(node);
+    }
+    function pushSpan(times, node) {
+        var s = tsStart(node), e = tsEnd(node);
+        if (s > 0)
+            times.push(s);
+        if (e > 0 && e !== s)
+            times.push(e);
     }
     // 当前是否仍在运行（读实时 DOM，不依赖上次 render 的 class 快照）
     function foldActiveNow(fold) {
@@ -259,7 +276,9 @@
         // 当前会话的直播流 → 任务活着，视为运行中（否则每次等模型都停表）。
         // 暂停/结束时 streaming 清掉、activeStream 置空，自然停表；继续后复用容器
         // 重新接上 activeStream，自然恢复（暂停间隙从用时中扣除，见 foldGapMs）。
-        if (!active && isLiveFold(fold))
+        // 非末段（无尾）永不适用该兜底：段内容已结算，后续输出属于更晚的段，
+        // 若跟随跳秒会导致同轮多个折叠块同时计时、读数还可能相同。
+        if (!active && fold.tail && isLiveFold(fold))
             active = true;
         return active;
     }
@@ -305,18 +324,18 @@
             return 0;
         var min = Infinity;
         fold.members.forEach(function (node) {
-            var stamp = Date.parse(node.dataset.stageTimestamp || "");
-            if (!isNaN(stamp) && stamp < min)
+            var stamp = tsStart(node);
+            if (stamp > 0 && stamp < min)
                 min = stamp;
         });
         if (fold.tail) {
-            var tailStamp = Date.parse(fold.tail.dataset.stageTimestamp || "");
-            if (!isNaN(tailStamp) && tailStamp < min)
+            var tailStamp = tsStart(fold.tail);
+            if (tailStamp > 0 && tailStamp < min)
                 min = tailStamp;
         }
         (fold.liveTail || []).forEach(function (node) {
-            var liveStamp = Date.parse(node.dataset.stageTimestamp || "");
-            if (!isNaN(liveStamp) && liveStamp < min)
+            var liveStamp = tsStart(node);
+            if (liveStamp > 0 && liveStamp < min)
                 min = liveStamp;
         });
         if (!(min < Infinity) || userTs > min || min - userTs > HISTORY_FLOOR_MAX_GAP)
@@ -342,6 +361,10 @@
             return;
         }
         var start = foldStartTime(fold);
+        // 跳秒起点与静态口径对齐（含直播下限/用户兜底），否则刷新后续跑计时从 0 起跳
+        var floor = floorFor(fold);
+        if (floor > 0 && (!start || floor < start))
+            start = floor;
         if (!start)
             return;
         var now = Date.now();
@@ -391,7 +414,7 @@
         });
         return fold;
     }
-    function disbandFold(map, fold) {
+    function disbandFold(fold) {
         tickingFolds.delete(fold);
         maybeStopTimer();
         fold.header.remove();
@@ -404,19 +427,11 @@
         // choices 保留（重建后仍按用户选择恢复）；allFolds 注销
         if (allFolds.get(fold.key) === fold)
             allFolds.delete(fold.key);
-        map.delete(fold.key);
-    }
-    function foldsOf(container) {
-        var map = foldsByContainer.get(container);
-        if (!map) {
-            map = new Map();
-            foldsByContainer.set(container, map);
-        }
-        return map;
+        foldMap.delete(fold.key);
     }
     // 非末段成员收集：整组收纳（任一成员进行中/搬离/跨段则整组可见，
     // 避免头藏起来而成员裸露）；进行中/待确认与轮内最新用量行保持可见。
-    function closedMembers(nodes, container, roundLastUsage) {
+    function closedMembers(nodes, roundLastUsage) {
         var members = [];
         var seenGroups = [];
         nodes.forEach(function (node) {
@@ -435,7 +450,7 @@
             var ms = g.members || [];
             for (var k = 0; k < ms.length; k++) {
                 var m = ms[k];
-                if (!m || m.parentNode !== container || nodes.indexOf(m) < 0)
+                if (!m || nodes.indexOf(m) < 0)
                     return;
                 if (isLiveNode(m) || m === roundLastUsage)
                     return;
@@ -450,12 +465,22 @@
         members.sort(function (a, b) { return nodes.indexOf(a) - nodes.indexOf(b); });
         return members;
     }
+    // 段归属容器：段内有直播流容器成员则取它（直播判定/起点读取），否则取首成员容器
+    function liveContainerFor(nodes) {
+        var liveMsg = App.state && App.state.activeStream ? App.state.activeStream.messageNode : null;
+        if (liveMsg) {
+            for (var i = 0; i < nodes.length; i++) {
+                if (nodes[i].parentNode === liveMsg)
+                    return liveMsg;
+            }
+        }
+        return nodes.length && nodes[0].parentNode ? nodes[0].parentNode : App.chatInner;
+    }
     // 一轮内容同步：按引导气泡切分段（同轮第 2+ 个用户节点是引导），每段独立
     // 折叠/计时：前段停表封存（相当于已结束的轮），末段按常规规则（留最新正文）。
     // userNode：段首用户气泡（首段传轮次气泡；历史计时兜底用，可空）。
     // 返回本轮所有段 key（供调用方 pruneStale）。
-    function syncRound(nodes, container, key, userNode) {
-        var map = foldsOf(container);
+    function syncRound(nodes, key, userNode) {
         var segments = [];
         var head = userNode, current = [];
         nodes.forEach(function (node) {
@@ -480,14 +505,14 @@
         segments.forEach(function (seg, i) {
             var segKey = i === 0 ? key : key + ":s" + i;
             keys.push(segKey);
-            syncSegment(seg.nodes, container, map, segKey, seg.head, i === segments.length - 1, roundLastUsage, i === 0);
+            syncSegment(seg.nodes, segKey, seg.head, i === segments.length - 1, roundLastUsage, i === 0);
         });
         return keys;
     }
     // 单段同步：末段 tail 取最后一段正文（即使尚空——流式新段先占位）；
     // 非末段无尾（内容已结算，引导在检查点消费，之前节点必然完成），全部收纳，
     // 只有进行中/待确认内容与轮内最新用量行保持可见。无有效成员时不建折叠。
-    function syncSegment(nodes, container, map, key, userNode, isFinal, roundLastUsage, allowLiveFloor) {
+    function syncSegment(nodes, key, userNode, isFinal, roundLastUsage, allowLiveFloor) {
         var tailIdx = -1;
         if (isFinal) {
             for (var i = nodes.length - 1; i >= 0; i--) {
@@ -508,7 +533,7 @@
         // 成员只取尾之前的节点；用量行同理（尾之前的旧用量折叠，尾之后最新一条保留）。
         // 非末段无尾：整组收纳全部可折叠节点。
         var members = tail ? nodes.slice(0, tailIdx).filter(function (node) { return isFoldable(node) && node !== tailTime; })
-            : closedMembers(nodes, container, roundLastUsage);
+            : closedMembers(nodes, roundLastUsage);
         // 尾后收纳：暂停/中断会把已完成的过程节点冻结在尾正文之后；续跑新开 .msg
         // 容器后它们永远到不了尾前，不收纳就会永久裸露（暂停几次就留下几块）。
         var liveTail = [];
@@ -545,7 +570,7 @@
                 var joiners = [];
                 for (var g = 0; g < group.members.length; g++) {
                     var m = group.members[g];
-                    if (!m || m.parentNode !== container)
+                    if (!m || nodes.indexOf(m) < 0)
                         return;
                     if (m === head)
                         continue;
@@ -592,18 +617,22 @@
         });
         var singleBody = units.length === 1 && units[0].nodeType === 1 &&
             units[0].matches(".msg-assistant-body");
-        var fold = map.get(key);
+        var fold = foldMap.get(key);
         // 末段无正文（纯工具轮）不建折叠；非末段无有效成员不建（单小块规则统一下方）
         if ((!isFinal && (!members.length || !units.length)) ||
             (isFinal && (!tail || !members.length || !units.length)) ||
             (units.length === 1 && !singleBody)) {
             if (fold)
-                disbandFold(map, fold);
+                disbandFold(fold);
             return;
         }
         if (!fold) {
-            fold = buildFold(container, key);
-            map.set(key, fold);
+            fold = buildFold(liveContainerFor(nodes), key);
+            foldMap.set(key, fold);
+        }
+        else {
+            // 成员跨容器变化时（窗口移动/合并）更新归属容器（直播判定/起点读取用）
+            fold.container = liveContainerFor(nodes);
         }
         allFolds.set(key, fold);
         // 跨容器认领：作用域内被其它 fold 标记过的节点（用量行收养/窗口移动）先与
@@ -619,11 +648,8 @@
                 if (at >= 0)
                     other.members.splice(at, 1);
             }
-            if (other.members && !other.members.length && other.container) {
-                var otherMap = foldsByContainer.get(other.container);
-                if (otherMap && otherMap.get(other.key) === other)
-                    disbandFold(otherMap, other);
-            }
+            if (other.members && !other.members.length && foldMap.get(other.key) === other)
+                disbandFold(other);
         });
         fold.members.forEach(function (node) {
             if (node._roundFold === fold && members.indexOf(node) < 0) {
@@ -650,17 +676,14 @@
         else
             fold.open = false;
         if (fold.header.nextElementSibling !== members[0])
-            container.insertBefore(fold.header, members[0]);
+            members[0].parentNode.insertBefore(fold.header, members[0]);
         applyVisibility(fold);
         renderHeader(fold);
     }
-    function pruneStale(container, seen) {
-        var map = foldsByContainer.get(container);
-        if (!map)
-            return;
-        Array.from(map.keys()).forEach(function (key) {
+    function pruneStale(seen) {
+        Array.from(foldMap.keys()).forEach(function (key) {
             if (seen.indexOf(key) < 0)
-                disbandFold(map, map.get(key));
+                disbandFold(foldMap.get(key));
         });
     }
     function userNodeBefore(node) {
@@ -677,47 +700,31 @@
         }
         return null;
     }
-    function syncMsgContainer(msg) {
-        var keys = syncRound(Array.from(msg.children), msg, keyForMsg(msg), userNodeBefore(msg));
-        pruneStale(msg, keys);
-        sweepStrays(msg);
-    }
-    // 孤儿头清扫：移除不属于任何现存 fold 的摘要头（窗口恢复/重建残留的旧头，
-    // 无它则幽灵头越积越多且点击无响应——成员早已不在）。
-    function sweepStrays(container) {
-        var map = foldsByContainer.get(container);
-        var live = [];
-        if (map)
-            map.forEach(function (fold) { live.push(fold.header); });
-        Array.from(container.children).forEach(function (node) {
-            if (node.nodeType === 1 && node.matches(".round-fold-summary") && live.indexOf(node) < 0) {
-                node.remove();
+    // 按轮收集节点：扁平段 + 同轮 .msg 子节点合并（刷新续跑/窗口恢复后同轮
+    // 内容常分裂在两处，分开折叠会产生同 key 双头、计数与计时全乱）。
+    // 返回 Map(key -> {flat: [], msgs: [], user})。
+    function collectRounds(chatInner) {
+        var rounds = new Map();
+        function group(key) {
+            var g = rounds.get(key);
+            if (!g) {
+                g = { flat: [], msgs: [], user: null };
+                rounds.set(key, g);
             }
-        });
-    }
-    function sync(container) {
-        if (!container || !container.children)
-            return;
-        // 直播轮容器：整体一轮
-        if (container !== App.chatInner && container.matches &&
-            container.matches(".msg") && !container.matches(".msg-user")) {
-            syncMsgContainer(container);
-            return;
+            return g;
         }
-        // 扁平历史：按用户节点/.msg 分段；段头之前（顶部杂散节点）不折叠
-        var seen = [];
         var rangeUser = null, rangeNodes = [];
-        function flush() {
+        function flushFlat() {
             if (rangeUser) {
-                var key = keyForUserNode(rangeUser);
-                var keys = syncRound(rangeNodes, container, key, rangeUser);
-                for (var k = 0; k < keys.length; k++)
-                    seen.push(keys[k]);
+                var g = group(keyForUserNode(rangeUser));
+                if (!g.user)
+                    g.user = rangeUser;
+                g.flat = g.flat.concat(rangeNodes);
             }
             rangeUser = null;
             rangeNodes = [];
         }
-        Array.from(container.children).forEach(function (node) {
+        Array.from(chatInner.children).forEach(function (node) {
             if (node.nodeType !== 1)
                 return;
             if (node.matches(".msg-user")) {
@@ -728,21 +735,100 @@
                     rangeNodes.push(node);
                     return;
                 }
-                flush();
+                flushFlat();
                 rangeUser = node;
                 return;
             }
             if (node.matches(".msg")) {
-                flush();
-                syncMsgContainer(node);
+                flushFlat();
+                group(keyForMsg(node)).msgs.push(node);
                 return;
             }
             if (rangeUser)
                 rangeNodes.push(node);
         });
-        flush();
-        pruneStale(container, seen);
+        flushFlat();
+        return rounds;
+    }
+    function docOrder(a, b) {
+        if (a === b)
+            return 0;
+        return (a.compareDocumentPosition(b) & 4) ? -1 : 1;
+    }
+    // 单轮同步：扁平节点 + 各容器子节点按文档序合并，一套折叠键。
+    // user 取扁平段头气泡（计时起点准）；纯容器轮回退容器前同轮气泡。
+    function syncMergedRound(key, g) {
+        var nodes = g.flat.slice();
+        g.msgs.forEach(function (msg) {
+            Array.from(msg.children).forEach(function (node) {
+                if (node.nodeType === 1)
+                    nodes.push(node);
+            });
+        });
+        nodes.sort(docOrder);
+        var user = g.user;
+        if (!user && g.msgs.length)
+            user = userNodeBefore(g.msgs[0]);
+        return syncRound(nodes, key, user);
+    }
+    function syncMsgContainer(msg) {
+        if (!App.chatInner)
+            return;
+        var key = keyForMsg(msg);
+        var seen = [];
+        if (msg.isConnected) {
+            var rounds = collectRounds(App.chatInner);
+            var g = rounds.get(key);
+            if (g)
+                seen = syncMergedRound(key, g);
+        }
+        if (!seen.length) {
+            // 游离容器（未挂载）：退化为只同步自身子节点
+            seen = syncRound(Array.from(msg.children).filter(function (n) { return n.nodeType === 1; }), key, userNodeBefore(msg));
+        }
+        // 定向剪枝：只处理本轮键（整轮键 + :s 段键），不动别轮
+        Array.from(foldMap.keys()).forEach(function (k) {
+            if ((k === key || k.indexOf(key + ":s") === 0) && seen.indexOf(k) < 0)
+                disbandFold(foldMap.get(k));
+        });
+        sweepStrays(msg);
+        if (App.chatInner)
+            sweepStrays(App.chatInner);
+    }
+    // 孤儿头清扫：移除不属于任何现存 fold 的摘要头（窗口恢复/重建残留的旧头，
+    // 无它则幽灵头越积越多且点击无响应——成员早已不在）。
+    function sweepStrays(container) {
+        var live = [];
+        foldMap.forEach(function (fold) { live.push(fold.header); });
+        Array.from(container.children).forEach(function (node) {
+            if (node.nodeType === 1 && node.matches(".round-fold-summary") && live.indexOf(node) < 0) {
+                node.remove();
+            }
+        });
+    }
+    function sync(container) {
+        if (!container || !container.children)
+            return;
+        // 直播轮容器：整体一轮（合并其扁平同轮节点）
+        if (container !== App.chatInner && container.matches &&
+            container.matches(".msg") && !container.matches(".msg-user")) {
+            syncMsgContainer(container);
+            return;
+        }
+        // 扁平历史：按轮收集（扁平段 + 同轮容器合并），逐轮同步
+        var rounds = collectRounds(container);
+        var seen = [];
+        rounds.forEach(function (g, key) {
+            var keys = syncMergedRound(key, g);
+            for (var k = 0; k < keys.length; k++)
+                seen.push(keys[k]);
+        });
+        pruneStale(seen);
         sweepStrays(container);
+        Array.from(container.children).forEach(function (node) {
+            if (node.nodeType === 1 && node.matches(".msg"))
+                sweepStrays(node);
+        });
     }
     function reveal(node) {
         for (var current = node; current; current = current.parentElement) {

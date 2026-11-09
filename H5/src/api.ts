@@ -753,6 +753,38 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
     return res && typeof res === "object" ? res : { ok: false };
   }
 
+  /**
+   * 暂存消息持久化（一期文本+引用）：未发送的引导/队列条目落盘到会话侧车，
+   * 打开会话时拉取恢复；已提交待消费（injected）以后端实时队列为准。
+   */
+  function getOutbox(sessionId: any) {
+    return request("/outbox?session_id=" + encodeURIComponent(sessionId));
+  }
+  function saveOutbox(sessionId: any, entry: any) {
+    return request("/outbox/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId, id: entry.id, kind: entry.kind,
+        text: entry.text || "",
+        media: (entry.media || []).map(function(m: any) {
+          return { media_ref: m.media_ref || null, name: m.name || null, kind: m.kind || null };
+        }),
+        quotes: entry.quotes || [],
+        docs: (entry.docs || []).map(function(d: any) {
+          return { filename: d.filename || d.name || null, uploaded: !!d.uploaded };
+        }),
+      }),
+    });
+  }
+  function removeOutbox(sessionId: any, ids: any) {
+    return request("/outbox/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, ids: ids }),
+    });
+  }
+
   // ---------- 会话文件 ----------
   function uploadSessionFiles(sessionId: any, fileList: any, onProgress: any, signal: any) {
     return uploadRawBatch("/file/upload_session_files?session_id=" + encodeURIComponent(sessionId), fileList, onProgress, signal);
@@ -1260,6 +1292,9 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
     updateSubAgentLimitsConfig,
     injectMessage,
     cancelInjectMessage,
+    getOutbox,
+    saveOutbox,
+    removeOutbox,
     uploadSessionFiles,
     uploadSessionMedia,
     sessionMediaUrl,

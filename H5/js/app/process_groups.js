@@ -12,6 +12,7 @@
     let historyGroups = new Map(), choiceRevision = 0;
     let indexedRecords = null, indexedLength = 0, indexedSession = null;
     let sequence = 0;
+    let groupSyncHoldCount = 0; // 回放/追赶期间抑制观察者驱动的全量同步（计数器，防嵌套泄漏）
     function text(node, value) {
         if (node.textContent !== value)
             node.textContent = value;
@@ -269,6 +270,11 @@
             groups = next;
         }
         function schedule() {
+            // 回放/追赶期间抑制观察者驱动的全量同步（否则每 100ms 在增长中的树上
+            // 做一次全量分组+折叠，O(n²) 且把渐进内容一条条抖出来；窗口关闭时
+            // finalize 会显式同步一次，显式调用不受抑制影响）。
+            if (groupSyncHoldCount > 0)
+                return;
             if (timer == null)
                 timer = setTimeout(sync, 100);
         }
@@ -410,5 +416,7 @@
         return recordGroups.get(record) || null;
     }
     App.processGroups = { sync, reveal, setTimestamp, estimateHeights, indexRecords, tagRecord, windowBounds, groupOf,
-        revision: function () { return choiceRevision; } };
+        revision: function () { return choiceRevision; },
+        holdSync: function () { groupSyncHoldCount++; },
+        releaseSync: function () { groupSyncHoldCount = Math.max(0, groupSyncHoldCount - 1); } };
 })(window.App);

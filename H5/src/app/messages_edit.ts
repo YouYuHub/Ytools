@@ -833,6 +833,9 @@
       },
       add: function(delta: any) {
         fullText += delta;
+        // 直播追加即刷新时间戳（大折叠计时取 max，冻结在首 chunk 会系统性偏小；
+        // 历史回放走 setText 不经此函数，不污染落盘时间）。
+        if (wrap.dataset) wrap.dataset.stageEndTimestamp = new Date().toISOString();
         scheduleTextFlush();
         schedulePreview();
       },

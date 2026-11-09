@@ -725,6 +725,106 @@ test("记录口径：小折叠组整体算一块（经 processGroups.groupOf）"
   assert.deepEqual(heights2, [50, 36, 0, 0, 0, 200], "两组应折叠");
 });
 
+test("用时超1小时显示到秒", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "9";
+  user.dataset.stageTimestamp = at(now - 4810000);
+  const tool = div(x.document, "tool-block", "工具");
+  tool.dataset.stageTimestamp = at(now - 4805000);
+  const body = div(x.document, "msg-assistant-body", "旧段");
+  body.dataset.stageTimestamp = at(now - 30000);
+  const tail = div(x.document, "msg-assistant-body", "最新");
+  tail.dataset.stageTimestamp = at(now);
+  x.chatInner.append(user, tool, body, tail);
+  x.App.roundFold.sync(x.chatInner);
+  const h = x.chatInner.querySelector(".round-fold-summary .round-fold-duration");
+  assert.equal(h.textContent, "用时 1h 20m 10s");
+});
+
+test("长工具按结束戳计时（不吞段内时长）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "11";
+  user.dataset.stageTimestamp = at(now - 400000);
+  const tool = div(x.document, "tool-block", "长工具");
+  tool.dataset.stageTimestamp = at(now - 390000);
+  tool.dataset.stageEndTimestamp = at(now - 100000);
+  const body = div(x.document, "msg-assistant-body", "旧段");
+  body.dataset.stageTimestamp = at(now - 90000);
+  body.dataset.stageEndTimestamp = at(now - 80000);
+  const tail = div(x.document, "msg-assistant-body", "最新");
+  tail.dataset.stageTimestamp = at(now - 70000);
+  tail.dataset.stageEndTimestamp = at(now - 60000);
+  x.chatInner.append(user, tool, body, tail);
+  x.App.roundFold.sync(x.chatInner);
+  const h = x.chatInner.querySelector(".round-fold-summary .round-fold-duration");
+  assert.equal(h.textContent, "用时 5m 40s");
+});
+
+test("同轮扁平+容器分裂时合并为一套折叠（不双头）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  const user = div(x.document, "msg msg-user");
+  user.dataset.round = "10";
+  user.dataset.stageTimestamp = at(now - 60000);
+  const tool1 = div(x.document, "tool-block", "旧工具");
+  tool1.dataset.stageTimestamp = at(now - 50000);
+  const body1 = div(x.document, "msg-assistant-body", "旧段");
+  body1.dataset.stageTimestamp = at(now - 40000);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "10";
+  const tool2 = div(x.document, "tool-block", "新工具");
+  tool2.dataset.stageTimestamp = at(now - 30000);
+  const tail = div(x.document, "msg-assistant-body", "最新");
+  tail.dataset.stageTimestamp = at(now - 20000);
+  msg.append(tool2, tail);
+  x.chatInner.append(user, tool1, body1, msg);
+  x.App.roundFold.sync(x.chatInner);
+  const headers = x.chatInner.querySelectorAll(".round-fold-summary");
+  assert.equal(headers.length, 1);
+  assert.match(headers[0].querySelector(".round-fold-counts").textContent, /2 次工具调用/);
+  assert.equal(tool1.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tool2.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tail.classList.contains("is-roundfold-hidden"), false);
+});
+
+test("直播中非末段不跳秒（只有末段计时）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const now = Date.now();
+  const at = ms => new Date(ms).toISOString();
+  const msg = div(x.document, "msg");
+  const think = div(x.document, "think-block", "思考");
+  think.dataset.stageTimestamp = at(now - 200000);
+  const tool = div(x.document, "tool-block", "工具");
+  tool.dataset.stageTimestamp = at(now - 190000);
+  const steer = div(x.document, "msg msg-user");
+  steer.dataset.stageTimestamp = at(now - 100000);
+  const body = div(x.document, "msg-assistant-body", "中段");
+  body.dataset.stageTimestamp = at(now - 90000);
+  const tail = div(x.document, "msg-assistant-body", "最新");
+  tail.dataset.stageTimestamp = at(now - 80000);
+  msg.append(think, tool, steer, body, tail);
+  x.chatInner.appendChild(msg);
+  x.App.state.streaming = true;
+  x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { messageNode: msg };
+  x.App.roundFold.sync(msg);
+  const headers = msg.querySelectorAll(".round-fold-summary");
+  assert.equal(headers.length, 2);
+  assert.equal(headers[0].classList.contains("is-running"), false, "前段应停表");
+  assert.equal(headers[1].classList.contains("is-running"), true, "末段继续计时");
+});
+
 test("直播等待模型期间计时跳动（无 DOM 进行态也亮灯）", async t => {
   const x = setup();
   t.after(x.close);

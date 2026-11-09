@@ -517,6 +517,23 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                         for item in kept:
                             adapter.injected_messages.put(item)
                     evt_queue.put({"type": "injected_cancelled", "ok": removed, "request_id": raw.get("request_id")})
+                elif ctype == "peek_inject":
+                    # 查看尚未消费的注入消息（只读快照，不出队，供前端刷新后恢复提示行）
+                    snapshot = []
+                    if adapter is not None and not adapter.done:
+                        try:
+                            pending = list(adapter.injected_messages.queue)
+                        except Exception:
+                            pending = []
+                        for item in pending:
+                            if not isinstance(item, dict):
+                                continue
+                            snapshot.append({
+                                "message_id": item.get("message_id") or "",
+                                "content": item.get("content"),
+                                "quotes": item.get("quotes") or [],
+                            })
+                    evt_queue.put({"type": "injected_snapshot", "messages": snapshot, "request_id": raw.get("request_id")})
                 elif ctype == "stop_sub_agent":
                     from factory.agent_runtime.sub_agent import request_sub_agent_stop
                     ok = request_sub_agent_stop(session_id, str(raw.get("agent_id") or ""))
@@ -814,6 +831,15 @@ class SessionWorkerProxy:
         if not self.is_alive() or not self.is_generation_running():
             return False
         return self._send({"type": "cancel_inject", "text": text, "message_id": message_id, "request_id": request_id})
+
+    def peek_injected_messages(self, *, request_id: str = "") -> bool:
+        """查看尚未消费的注入消息（只读快照，不出队）。
+
+        worker 未运行或无活动任务时返回 False。
+        """
+        if not self.is_alive() or not self.is_generation_running():
+            return False
+        return self._send({"type": "peek_inject", "request_id": request_id})
 
     def shutdown(self, timeout: float = 8.0) -> None:
         """优雅关停：通知 worker 收尾后回收进程。"""

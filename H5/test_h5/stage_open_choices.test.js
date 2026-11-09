@@ -10,7 +10,7 @@ function setup(t){
   const App=w.App={state:{sessionId:'s',workDir:'/project'},chatInner:root,el,toast(){},stickToBottom(){},rebuildQnav(){},
     isBuiltinToolName:()=>true,toolDisplayName:()=>'x',toolIconSvg:(name,cls)=>'<svg class="'+cls+'"></svg>',
     clearInjectedPending(){},scheduleContextTokenStatsRefresh(){},highlightCodeBlocks(){},updateCodeblockCopyButtons(){}};
-  Object.assign(w,{el,state:App.state,toast(){},setStageTimestamp(){},loadOlderState:{records:[]},
+  Object.assign(w,{el,state:App.state,toast(){},setStageTimestamp(){},setStageEnd(){},loadOlderState:{records:[]},
     FormatUtils:{prettyJson:JSON.stringify,fmtNum:String,fmtTime:String,roundSummaryText:()=>''},
     Markdown:{render:()=>''},renderPreservingWidgets(){}});
   const thinkStart=messages.indexOf('  function buildThinkBlock(');

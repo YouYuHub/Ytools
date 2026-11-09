@@ -134,7 +134,12 @@
    */
   async function submitSteerOrQueue(mode: any) {
     const currentStreaming = state.streaming && state.streamingSession === state.sessionId;
-    if (!currentStreaming) return;
+    // 任务已结束（菜单打开期间收尾的竞态）：直接普通发送，不静默丢弃输入
+    if (!currentStreaming) {
+      toast("当前任务已结束，直接发送");
+      App.send();
+      return;
+    }
     if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
       toast("正在压缩对话上下文，请等待压缩完成后再发送");
       return;
@@ -143,28 +148,48 @@
     const text = input.value.trim();
     const mediaSnapshot = state.pendingMedia.map(function(m: any) { return Object.assign({}, m); });
     const quoteSnapshot = (state.pendingQuotes || []).map(function(q: any) { return Object.assign({}, q); });
-    if (!text && !mediaSnapshot.length) return;
-    const message: any = { text: text, media: mediaSnapshot, quotes: quoteSnapshot, sessionId: state.sessionId };
+    const docSnapshot = (state.pendingDocs || []).filter(function(d: any) {
+      return d && d.staged && d.sessionId === state.sessionId;
+    }).map(function(d: any) { return Object.assign({}, d); });
+    if (!text && !mediaSnapshot.length && !docSnapshot.length) return;
+    const message: any = { id: "o_" + Date.now().toString(36) + Math.random().toString(36).slice(2),
+      text: text, media: mediaSnapshot, quotes: quoteSnapshot, docs: docSnapshot, sessionId: state.sessionId };
     // 从待发区移除但保留快照中的 objUrl（移除放回输入框后预览仍可用）；
     // objUrl 的最终释放在消息成功上传后（send 内）
     state.pendingMedia = [];
     state.pendingQuotes = [];
+    state.pendingDocs = (state.pendingDocs || []).filter(function(d: any) {
+      return !(d && d.staged && d.sessionId === state.sessionId);
+    });
     App.renderComposerAttachments();
     App.renderComposerQuotes();
     input.value = "";
     if (App.closeSlashCommands) App.closeSlashCommands();
     App.autosize();
     if (mode === "queue") {
+      // 先上传附件/文档换引用，再登记（刷新后可恢复发送）；上传失败则仅内存暂存
+      try {
+        await App.prepareSteerContent(message);
+        await uploadStashDocs(message);
+      } catch (err) {
+        state.pendingQueue.push(message);
+        toast("附件上传失败，仅暂存本地（刷新后丢失）：" + (err as any).message);
+        renderPendingOutbox();
+        return;
+      }
       state.pendingQueue.push(message);
+      App.saveOutboxEntry(message.sessionId, "queue", message);
       toast("已加入队列，当前任务完成后自动发送");
       renderPendingOutbox();
       return;
     }
     // 文本、图片等媒体和引用都走检查点注入，逐条消费，避免合并与撤回之间的竞态。
+    // 文档先上传进入 file_memory（会话共享上下文），随注入一起生效。
     let injected = false;
     if (message.sessionId) {
-      message.id = "steer_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+      if (!message.id) message.id = "o_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
       try {
+        await uploadStashDocs(message);
         const payload = await App.prepareSteerContent(message);
         // 先登记，再提交接口：SSE 消费事件可能先于 HTTP 响应到达。
         state.injectedPending.push(message);
@@ -189,11 +214,14 @@
     const prevSteer = (state.steerMessage && state.steerMessage.sessionId === message.sessionId)
       ? state.steerMessage : null;
     state.steerMessage = {
+      id: prevSteer && prevSteer.id ? prevSteer.id : message.id,
       text: prevSteer && prevSteer.text ? prevSteer.text + "\n\n" + text : text,
       media: (prevSteer && prevSteer.media ? prevSteer.media : []).concat(mediaSnapshot),
       quotes: (prevSteer && prevSteer.quotes ? prevSteer.quotes : []).concat(quoteSnapshot),
+      docs: (prevSteer && prevSteer.docs ? prevSteer.docs : []).concat(docSnapshot),
       sessionId: message.sessionId,
     };
+    App.saveOutboxEntry(message.sessionId, "steer", state.steerMessage);
     toast(prevSteer
       ? "引导内容已合并（空行分隔），当前回复结束后一起发送"
       : "已设为消息引导，当前回复结束后立即发送");
@@ -231,6 +259,14 @@
       if (row.message.quotes && row.message.quotes.length) {
         item.appendChild(el("span", "pending-outbox-quotes", "引用 " + row.message.quotes.length));
       }
+      // 附件/文档计数 + 图片缩略图（恢复行用远端 URL，内存行用本地预览）
+      if (row.message.media && row.message.media.length) {
+        item.appendChild(el("span", "pending-outbox-quotes", "附件 " + row.message.media.length));
+      }
+      if (row.message.docs && row.message.docs.length) {
+        item.appendChild(el("span", "pending-outbox-quotes", "文档 " + row.message.docs.length));
+      }
+      appendOutboxThumbs(item, row.message);
       // 立即发送：当前会话流式中则打断该轮（后端收尾 + 本地中止），以本条消息
       // 立即开启新一轮；无进行中的流时直接派发（与自动 flush 同链路）
       const sendNow = el("button", "pending-outbox-send", "发送");
@@ -244,8 +280,10 @@
         const interrupting = state.streaming && state.streamingSession === state.sessionId;
         // 先从暂存区移除再派发，避免 flush 内部重复取
         if (row.kind === "steer") {
+          await App.removeOutboxEntry(state.sessionId, row.message.id);
           state.steerMessage = null;
         } else {
+          await App.removeOutboxEntry(state.sessionId, row.message.id);
           const idx = state.pendingQueue.indexOf(row.message);
           if (idx >= 0) state.pendingQueue.splice(idx, 1);
         }
@@ -253,7 +291,7 @@
         if (interrupting) {
           // 抑制旧流结束时的自动派发：本次点击接管发送次序，
           // 防止被打断轮次的 finally 抢先把队列头发出
-          state.suppressFlushOnce = true;
+          state.suppressFlushSession = state.sessionId;
           try {
             await API.stopChat(state.streamingSession);
           } catch (_) { /* 后端停止失败也继续本地中止 */ }
@@ -267,8 +305,10 @@
           if (state.streaming && state.streamingSession === state.sessionId) {
             if (row.kind === "steer") {
               state.steerMessage = row.message;
+              App.saveOutboxEntry(state.sessionId, "steer", row.message);
             } else {
               state.pendingQueue.unshift(row.message);
+              App.saveOutboxEntry(state.sessionId, "queue", row.message);
             }
             renderPendingOutbox();
             toast("当前任务未能及时停止，消息已放回暂存区");
@@ -283,6 +323,7 @@
           targetRound: row.message.targetRound,
           insertAfterRound: row.message.insertAfterRound,
           strictInsertContext: row.message.strictInsertContext,
+          _originKind: row.kind,
         });
       });
       item.appendChild(sendNow);
@@ -300,6 +341,7 @@
       item.appendChild(el("span", "pending-outbox-badge", "引导"));
       item.appendChild(el("span", "pending-outbox-text", (pending.text || "").trim() || "[图片/附件]"));
       if (pending.media.length) item.appendChild(el("span", "pending-outbox-quotes", "附件 " + pending.media.length));
+      appendOutboxThumbs(item, pending);
       if (pending.quotes.length) item.appendChild(el("span", "pending-outbox-quotes", "引用 " + pending.quotes.length));
       const remove = el("button", "pending-outbox-remove", "×");
       remove.type = "button";
@@ -326,6 +368,28 @@
     composer.classList.add("has-outbox");
   }
 
+  // 暂存行图片缩略图（最多 4 张）：内存条目用本地预览，恢复条目用远端 URL；
+  // 点击进媒体预览框。音频/视频只显示计数徽标。
+  function appendOutboxThumbs(item: any, message: any): void {
+    const images = (message.media || []).filter(function(m: any) {
+      return m && m.kind !== "audio" && m.kind !== "video";
+    }).slice(0, 4);
+    images.forEach(function(m: any) {
+      let src = m.dataUrl || m.objUrl || null;
+      if (!src && m.media_ref && App.resolveMediaSrc) {
+        src = App.resolveMediaSrc(m.media_ref, message.sessionId);
+      }
+      if (!src) return;
+      const thumb = el("img", "pending-outbox-thumb", "");
+      thumb.src = src;
+      thumb.alt = m.name || "附件图片";
+      thumb.title = "点击预览";
+      thumb.addEventListener("click", function () {
+        if (App.openMediaPreview) App.openMediaPreview({ type: "image", src: src, title: m.name });
+      });
+      item.appendChild(thumb);
+    });
+  }
   /** 把文本放回输入框最前面（撤回/移除暂存消息时，先看到早提交的内容）。 */
   function prependToInput(text: any) {
     if (!text) return;
@@ -333,26 +397,178 @@
     App.autosize();
   }
 
+  // 暂存消息的文档上传：进入会话 file_memory（磁盘持久化，刷新后仍在），
+  // 成功后条目带 uploaded 标记可登记；失败抛错（调用方回退内存暂存）。
+  async function uploadStashDocs(message: any) {
+    const need = (message.docs || []).filter(function(d: any) { return d && !d.uploaded && d.file; });
+    if (!need.length) return;
+    const res = await API.uploadSessionFiles(message.sessionId,
+      need.map(function(d: any) { return d.file; }), function () {});
+    (res.results || []).forEach(function(r: any, i: any) {
+      if (r && r.status === "success" && need[i]) need[i].uploaded = true;
+    });
+    const failed = need.filter(function(d: any) { return !d.uploaded; });
+    if (failed.length) {
+      throw new Error("文档上传失败：" + failed.map(function(d: any) {
+        return d.filename || d.name || "文件";
+      }).join("、"));
+    }
+    if (App.loadSessionFiles) await App.loadSessionFiles(message.sessionId);
+  }
+  // 暂存持久化：未发送条目落盘，打开会话时恢复。失败静默（内存照常工作）。
+  // 带本地文件（未上传）的条目不登记——File 无法序列化；等上传完成后再登记，
+  // 在此之前刷新会丢失（与持久化前行为一致，不制造新的静默丢失）。
+  // 纯引用条目（media_ref / uploaded 文档）可登记，发送时直接复用引用。
+  App.saveOutboxEntry = function(sessionId: any, kind: any, message: any) {
+    if (typeof API === "undefined" || !API.saveOutbox) return Promise.resolve();
+    if (!message || !message.id || !sessionId) return Promise.resolve();
+    const hasLocalFile = (message.media || []).some(function(m: any) { return m && m.file && !m.media_ref; }) ||
+      (message.docs || []).some(function(d: any) { return d && d.file && !d.uploaded; });
+    if (hasLocalFile) return Promise.resolve();
+    return API.saveOutbox(sessionId, {
+      id: message.id, kind: kind, text: message.text || "",
+      media: message.media || [], quotes: message.quotes || [], docs: message.docs || [],
+    }).catch(function () {});
+  };
+  App.removeOutboxEntry = function(sessionId: any, id: any) {
+    if (!sessionId || !id || typeof API === "undefined" || !API.removeOutbox) return Promise.resolve();
+    // 删除失败会留下幽灵条目（下次打开恢复并重复发送），失败重试一次
+    return API.removeOutbox(sessionId, [id]).catch(function () {
+      return new Promise(function(resolve: any) { setTimeout(resolve, 800); }).then(function () {
+        return API.removeOutbox(sessionId, [id]).catch(function () {});
+      });
+    });
+  };
+  // 打开会话时恢复暂存：侧车条目按 id 合并（本地已有优先，保留含 File 的新条目）；
+  // injected 以后端实时队列为准（后端重启即消失，不恢复）；恢复后用历史核销
+  // 已消费的残留（detach 中止 SSE 后消费事件丢失的行）。
+  App.loadSessionOutbox = async function(sessionId: any) {
+    if (!sessionId || typeof API === "undefined" || !API.getOutbox) return;
+    let data;
+    try {
+      data = await API.getOutbox(sessionId);
+    } catch (_) { return; }
+    if (state.sessionId !== sessionId) return;
+    (data.entries || []).forEach(function(entry: any) {
+      if (!entry || !entry.id) return;
+      if (entry.kind === "steer") {
+        if (!state.steerMessage || state.steerMessage.sessionId !== sessionId) {
+          state.steerMessage = { id: entry.id, text: entry.text || "",
+            media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
+            sessionId: sessionId };
+        }
+      } else {
+        const exists = state.pendingQueue.some(function(m: any) { return m.id === entry.id; });
+        if (!exists) {
+          state.pendingQueue.push({ id: entry.id, text: entry.text || "",
+            media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
+            sessionId: sessionId });
+        }
+      }
+    });
+    // injected 对账：后端返回 null 表示查询失败（未知），此时跳过对账——
+    // 不得把未知当作空，否则会把仍在后端队列的消息误判丢失并转存，导致重复发送。
+    // 任务运行中同样只保留/恢复，不做丢弃与转存：消费事件可能还在路上（重放 SSE
+    // 会结算），且历史记录尚未落盘本轮，此时核销必误判；等任务结束后再对账。
+    if (data.injected != null) {
+      const liveIds: any = {};
+      (data.injected || []).forEach(function(item: any) {
+        const key = item && (item.id || item.message_id);
+        if (key) liveIds[key] = item;
+      });
+      // 本地 injected 行：后端队列仍在则保留；队列无且任务已结束才按历史核销
+      // （已消费则删；后端重启丢失则转回内存引导槽，需手动发送）。
+      const running = !!data.running;
+      const kept: any[] = [];
+      state.injectedPending.forEach(function(m: any) {
+        if (m.sessionId !== sessionId) { kept.push(m); return; }
+        if (m.id && liveIds[m.id]) { kept.push(m); return; }
+        if (running) { kept.push(m); return; } // 运行中：延迟到重放/下次打开结算
+        if (m.id && !liveIds[m.id]) {
+          if (isTextConsumed(sessionId, m.text)) return; // 已消费：丢弃残留行
+          // 后端丢失（重启/任务结束时未消费）：转回内存引导槽，不落盘（避免
+          // 幽灵条目在后续打开时被自动派发造成重复发送）；标记 _converted，
+          // 自动派发跳过，需用户手动点发送。
+          if (!state.steerMessage || state.steerMessage.sessionId !== sessionId) {
+            state.steerMessage = { id: m.id, text: m.text || "",
+              media: [], quotes: m.quotes || [], sessionId: sessionId, _converted: true };
+            toast("1 条引导后端已丢失，转回暂存（请手动发送）");
+          }
+          return;
+        }
+        kept.push(m);
+      });
+      state.injectedPending = kept;
+      // 后端有、本地无的 injected 行：恢复显示
+      Object.keys(liveIds).forEach(function(id: any) {
+        const item = liveIds[id];
+        const exists = state.injectedPending.some(function(m: any) { return m.id === id; });
+        if (!exists) {
+          state.injectedPending.push({ id: id, sessionId: sessionId,
+            text: item.text || "", media: item.media || [], quotes: item.quotes || [] });
+        }
+      });
+    }
+    renderPendingOutbox();
+  };
+  function isTextConsumed(sessionId: any, text: any): boolean {
+    const key = (text || "").trim();
+    if (!key) return false;
+    const records = App.loadOlderState && App.loadOlderState.records;
+    if (!Array.isArray(records)) return false;
+    return records.some(function(rec: any) {
+      if (!rec || rec.kind !== "user") return false;
+      const t = App.contentToPlainText ? App.contentToPlainText(rec.content) : "";
+      return (t || "").trim() === key;
+    });
+  }
   // 注入消费信号（chat.js 收到 message_injected SSE 时调用）：
-  // 清除待注入提示；气泡由 chat.js 在该时机插入消息流正确位置
+  // 清除待注入提示；气泡由 chat.js 在该时机插入消息流正确位置。
+  // 后端消费是权威信号：同 id 的引导暂存行一并清除（切走期间误转存的残留），
+  // 只按 id 匹配，不按文本（文本相同可能是另一条未发送消息）。
   App.clearInjectedPending = function(sessionId: any, messageId: any) {
     const index = state.injectedPending.findIndex(function(pending: any) {
       return (!sessionId || pending.sessionId === sessionId) && (!messageId || pending.id === messageId);
     });
-    if (index < 0) return;
-    const pending = state.injectedPending.splice(index, 1)[0];
-    (pending.media || []).forEach(function(item: any) {
-      if (item.objUrl) { try { URL.revokeObjectURL(item.objUrl); } catch (_) {} item.objUrl = ""; }
-    });
+    if (index >= 0) {
+      const pending = state.injectedPending.splice(index, 1)[0];
+      (pending.media || []).forEach(function(item: any) {
+        if (item.objUrl) { try { URL.revokeObjectURL(item.objUrl); } catch (_) {} item.objUrl = ""; }
+      });
+    }
+    if (messageId) {
+      if (state.steerMessage && state.steerMessage.id === messageId &&
+        (!sessionId || state.steerMessage.sessionId === sessionId)) {
+        App.removeOutboxEntry(state.steerMessage.sessionId, messageId);
+        state.steerMessage = null;
+      }
+      const qi = state.pendingQueue.findIndex(function(m: any) {
+        return m.id === messageId && (!sessionId || m.sessionId === sessionId);
+      });
+      if (qi >= 0) {
+        const removed = state.pendingQueue.splice(qi, 1)[0];
+        App.removeOutboxEntry(removed.sessionId, messageId);
+      }
+    }
     renderPendingOutbox();
   };
 
   function cancelPendingMessage(row: any) {
     if (row.kind === "steer") {
+      App.removeOutboxEntry(row.message.sessionId || state.sessionId, row.message.id);
       state.steerMessage = null;
-    } else {
+    } else if (row.kind === "queue") {
+      App.removeOutboxEntry(row.message.sessionId || state.sessionId, row.message.id);
       const idx = state.pendingQueue.indexOf(row.message);
       if (idx >= 0) state.pendingQueue.splice(idx, 1);
+    }
+    // 无源文件的恢复条目只删除，不放回（放回也无法编辑附件，避免残缺重发）
+    const atts = (row.message.media || []).concat(row.message.docs || []);
+    if (atts.length && atts.every(function(a: any) { return !a.file; })) {
+      toast("已删除暂存（附件无本地源文件，不可恢复编辑）");
+      App.autosize();
+      renderPendingOutbox();
+      return;
     }
     // 放回输入框最前/附件区最前（先提交的内容排在前面），便于修改后重新提交
     const restored = row.message;
@@ -395,24 +611,32 @@
    * 每次只发一条，后续条目由该轮 send 结束时的 finally 链式继续派发。
    */
   async function flushPendingMessages(finishedSessionId: any) {
-    if (state.suppressFlushOnce) {
-      state.suppressFlushOnce = false;
+    const target = finishedSessionId || state.sessionId;
+    // 会话级抑制：只跳过被抑制会话的本次派发，其他会话不受影响
+    if (state.suppressFlushSession && state.suppressFlushSession === target) {
+      state.suppressFlushSession = null;
       return;
     }
     // 压缩进行中仅拦截压缩会话的派发（其余会话不受影响）
     if (state.manualCompactRunning && state.manualCompactSession === (finishedSessionId || state.sessionId)) return;
     if (state.pendingAskQuestions) return; // ask_user 等待用户回答，不抢占
-    const target = finishedSessionId || state.sessionId;
     // 用户已切走：留在暂存区，重新打开该会话时再派发
     if (state.sessionId !== target) return;
     if (state.streaming && state.streamingSession === target) return;
     let next = null;
-    if (state.steerMessage && state.steerMessage.sessionId === target) {
+    // 转存条目（后端丢失后转回）不自动派发，需手动发送，避免误判导致重复发送
+    const steerReady = state.steerMessage && state.steerMessage.sessionId === target && !state.steerMessage._converted;
+    if (steerReady) {
       next = state.steerMessage;
+      next._originKind = "steer";
       state.steerMessage = null;
+      await App.removeOutboxEntry(target, next.id);
     } else {
       const idx = state.pendingQueue.findIndex(function(m: any) { return m.sessionId === target; });
-      if (idx >= 0) next = state.pendingQueue.splice(idx, 1)[0];
+      if (idx >= 0) {
+        next = state.pendingQueue.splice(idx, 1)[0];
+        await App.removeOutboxEntry(target, next.id);
+      }
     }
     renderPendingOutbox();
     if (!next) return;
