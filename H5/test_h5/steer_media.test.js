@@ -270,3 +270,39 @@ test('派发引导时标记来源（失败重试放回引导槽）', async () =>
   assert.equal(calls[0][0], 'send');
   assert.equal(calls[0][1]._originKind, 'steer');
 });
+
+test('墓碑：已发送 id 不再从侧车恢复，并补删侧车', async () => {
+  const { state, context, calls } = setup();
+  const store = {};
+  context.sessionStorage = {
+    getItem: k => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+  };
+  context.API.getOutbox = async () => ({ entries: [{ id: 'ghost1', kind: 'queue', text: '已发送内容' }], injected: [] });
+  context.markOutboxSent('s', 'ghost1');
+  await context.App.loadSessionOutbox('s');
+  assert.equal(state.pendingQueue.length, 0, '墓碑条目不恢复');
+  assert.ok(calls.some(c => c[0] === 'removeOutbox' && c[2][0] === 'ghost1'), '补删侧车');
+});
+
+test('行发送按钮双击只派发一次', async () => {
+  const { state, context, calls } = setup();
+  state.streaming = false;
+  state.pendingQueue.push({ id: 'q1', text: '排队消息', media: [], quotes: [], docs: [], sessionId: 's' });
+  context.renderPendingOutbox();
+  const item = context.pendingOutbox.children[0];
+  const sendBtn = item.children.find(n => n.handlers && n.handlers.click && n.textContent === '发送');
+  assert.ok(sendBtn, '找到发送按钮');
+  await sendBtn.handlers.click();
+  await sendBtn.handlers.click();
+  assert.equal(calls.filter(c => c[0] === 'send').length, 1, '只发送一次');
+  assert.equal(state.pendingQueue.length, 0, '内存已取走');
+});
+
+test('恢复重入守卫：并发打开只拉取一次', async () => {
+  const { context } = setup();
+  let fetches = 0;
+  context.API.getOutbox = async () => { fetches++; return { entries: [], injected: [] }; };
+  await Promise.all([context.App.loadSessionOutbox('s'), context.App.loadSessionOutbox('s')]);
+  assert.equal(fetches, 1);
+});

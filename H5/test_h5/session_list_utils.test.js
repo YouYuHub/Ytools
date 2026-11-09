@@ -165,7 +165,7 @@ test("filterRowsByTime: 本地 recency 也参与判定", function () {
 test("describeTimeFilter: 按钮文案", function () {
   assert.equal(utils.describeTimeFilter({ preset: "all" }), "全部时间");
   assert.equal(utils.describeTimeFilter({ preset: "week" }), "近一周");
-  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2026-09-01", end: "2026-09-30" }), "9月1日 - 9月30日");
-  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2020-01-01", end: "2020-01-31" }), "2020年1月1日 - 2020年1月31日");
+  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2026-09-01", end: "2026-09-30" }), "2026/09/01 - 2026/09/30");
+  assert.equal(utils.describeTimeFilter({ preset: "custom", start: "2020-01-01", end: "2020-01-31" }), "2020/01/01 - 2020/01/31");
   assert.equal(utils.describeTimeFilter({ preset: "custom", start: "", end: "" }), "全部时间");
 });

@@ -1250,9 +1250,13 @@
       panel.setAttribute("hidden", "");
     }
     function syncSessionTimeFilterUi() {
-      btn.textContent = SessionListUtils.describeTimeFilter(sessionTimeFilter) + " ▾";
+      const label = SessionListUtils.describeTimeFilter(sessionTimeFilter);
+      btn.textContent = label + " ▾";
       btn.classList.toggle("is-active", isTimeFilterActive());
-      btn.title = isTimeFilterActive() ? "按时间段筛选会话（点击更改）" : "全部时间（点击按时间段筛选）";
+      // title 带上完整范围：按钮在窄侧边栏内会被省略号截断，悬浮可看全
+      btn.title = isTimeFilterActive()
+        ? label + "（点击更改筛选范围）"
+        : "全部时间（点击按时间段筛选）";
     }
     btn.addEventListener("click", function(event: any) {
       event.stopPropagation();

@@ -47,6 +47,10 @@
     // 最大可见行数：5 行（5×33px 行高 + 上下 2px padding = 167px，取整 168px）
     var AUTOSIZE_MAX_HEIGHT = 168;
     function autosize() {
+        // 先刷新按钮/布局类再测量：发送钮显隐会改变输入框宽度（空→有文本时
+        // 发送钮出现挤窄输入框），若按旧宽度量高度，换行数算少导致粘贴多行文
+        // 本时高度不够、第二行被裁掉一半；后续再输入才因重测恢复（“有概率”）。
+        refreshComposerButtons();
         // 先记住当前可视首行位置：textarea 在“文本恰好填满一行”的边界状态下，
         // 输入会瞬时把视口滚到第 2 行（autosize 还未把高度算出来），然后又因
         // 高度不足以展示第 2 行而回滚——浏览器内部状态会停在第 2 行的滚动值
@@ -83,7 +87,18 @@
         else if (input.scrollTop !== savedScrollTop) {
             input.scrollTop = savedScrollTop;
         }
-        refreshComposerButtons();
+    }
+    // 输入框宽度变化时重测高度：兜底任何布局后移（字体、窗口缩放、按钮组
+    // 变化等）导致的高度过期。只看宽度（autosize 自身只改高度，不会自循环）。
+    let autosizeLastWidth = 0;
+    if (window.ResizeObserver) {
+        new ResizeObserver(function () {
+            const w = input.clientWidth;
+            if (w && w !== autosizeLastWidth) {
+                autosizeLastWidth = w;
+                autosize();
+            }
+        }).observe(input);
     }
     if (window.ResizeObserver) {
         new ResizeObserver(updateScrollBottomOffset).observe(composerWrap);
@@ -269,23 +284,35 @@
             sendNow.type = "button";
             sendNow.title = "立即发送该条消息（生成中则打断当前回复并以此消息重发）";
             sendNow.addEventListener("click", async function () {
+                if (sendNow.disabled)
+                    return;
+                sendNow.disabled = true;
                 if (state.manualCompactRunning && state.manualCompactSession === state.sessionId) {
                     toast("正在压缩对话上下文，请稍后再发送");
+                    sendNow.disabled = false;
                     return;
                 }
                 const interrupting = state.streaming && state.streamingSession === state.sessionId;
-                // 先从暂存区移除再派发，避免 flush 内部重复取
+                // 先同步取走再派发：取走与渲染之间若有 await（删侧车是网络请求），
+                // 双击/并发 flush 会重复取到同一条导致重复发送；取不到说明已被取走，直接返回。
                 if (row.kind === "steer") {
-                    await App.removeOutboxEntry(state.sessionId, row.message.id);
+                    if (state.steerMessage !== row.message) {
+                        renderPendingOutbox();
+                        return;
+                    }
                     state.steerMessage = null;
                 }
                 else {
-                    await App.removeOutboxEntry(state.sessionId, row.message.id);
                     const idx = state.pendingQueue.indexOf(row.message);
-                    if (idx >= 0)
-                        state.pendingQueue.splice(idx, 1);
+                    if (idx < 0) {
+                        renderPendingOutbox();
+                        return;
+                    }
+                    state.pendingQueue.splice(idx, 1);
                 }
                 renderPendingOutbox();
+                markOutboxSent(state.sessionId, row.message.id);
+                await App.removeOutboxEntry(state.sessionId, row.message.id);
                 if (interrupting) {
                     // 抑制旧流结束时的自动派发：本次点击接管发送次序，
                     // 防止被打断轮次的 finally 抢先把队列头发出
@@ -303,6 +330,8 @@
                         await new Promise(function (r) { setTimeout(r, 50); });
                     }
                     if (state.streaming && state.streamingSession === state.sessionId) {
+                        // 放回时取消已发送标记（消息回到待发态，重载后必须能恢复）
+                        unmarkOutboxSent(state.sessionId, row.message.id);
                         if (row.kind === "steer") {
                             state.steerMessage = row.message;
                             App.saveOutboxEntry(state.sessionId, "steer", row.message);
@@ -453,92 +482,108 @@
     // 打开会话时恢复暂存：侧车条目按 id 合并（本地已有优先，保留含 File 的新条目）；
     // injected 以后端实时队列为准（后端重启即消失，不恢复）；恢复后用历史核销
     // 已消费的残留（detach 中止 SSE 后消费事件丢失的行）。
+    let loadOutboxInflight = null;
     App.loadSessionOutbox = async function (sessionId) {
         if (!sessionId || typeof API === "undefined" || !API.getOutbox)
             return;
+        // 重入守卫：连续打开同一会话时只跑一份恢复，避免并发各推一份造成重复行
+        if (loadOutboxInflight === sessionId)
+            return;
+        loadOutboxInflight = sessionId;
         let data;
         try {
             data = await API.getOutbox(sessionId);
         }
         catch (_) {
+            loadOutboxInflight = null;
             return;
         }
-        if (state.sessionId !== sessionId)
-            return;
-        (data.entries || []).forEach(function (entry) {
-            if (!entry || !entry.id)
+        try {
+            if (state.sessionId !== sessionId)
                 return;
-            if (entry.kind === "steer") {
-                if (!state.steerMessage || state.steerMessage.sessionId !== sessionId) {
-                    state.steerMessage = { id: entry.id, text: entry.text || "",
-                        media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
-                        sessionId: sessionId };
-                }
-            }
-            else {
-                const exists = state.pendingQueue.some(function (m) { return m.id === entry.id; });
-                if (!exists) {
-                    state.pendingQueue.push({ id: entry.id, text: entry.text || "",
-                        media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
-                        sessionId: sessionId });
-                }
-            }
-        });
-        // injected 对账：后端返回 null 表示查询失败（未知），此时跳过对账——
-        // 不得把未知当作空，否则会把仍在后端队列的消息误判丢失并转存，导致重复发送。
-        // 任务运行中同样只保留/恢复，不做丢弃与转存：消费事件可能还在路上（重放 SSE
-        // 会结算），且历史记录尚未落盘本轮，此时核销必误判；等任务结束后再对账。
-        if (data.injected != null) {
-            const liveIds = {};
-            (data.injected || []).forEach(function (item) {
-                const key = item && (item.id || item.message_id);
-                if (key)
-                    liveIds[key] = item;
-            });
-            // 本地 injected 行：后端队列仍在则保留；队列无且任务已结束才按历史核销
-            // （已消费则删；后端重启丢失则转回内存引导槽，需手动发送）。
-            const running = !!data.running;
-            const kept = [];
-            state.injectedPending.forEach(function (m) {
-                if (m.sessionId !== sessionId) {
-                    kept.push(m);
+            (data.entries || []).forEach(function (entry) {
+                if (!entry || !entry.id)
+                    return;
+                // 已发送墓碑：侧车删前快照/删除失败残留，已发送不再恢复，并补删侧车
+                if (isOutboxSent(sessionId, entry.id)) {
+                    App.removeOutboxEntry(sessionId, entry.id);
                     return;
                 }
-                if (m.id && liveIds[m.id]) {
-                    kept.push(m);
-                    return;
-                }
-                if (running) {
-                    kept.push(m);
-                    return;
-                } // 运行中：延迟到重放/下次打开结算
-                if (m.id && !liveIds[m.id]) {
-                    if (isTextConsumed(sessionId, m.text))
-                        return; // 已消费：丢弃残留行
-                    // 后端丢失（重启/任务结束时未消费）：转回内存引导槽，不落盘（避免
-                    // 幽灵条目在后续打开时被自动派发造成重复发送）；标记 _converted，
-                    // 自动派发跳过，需用户手动点发送。
+                if (entry.kind === "steer") {
                     if (!state.steerMessage || state.steerMessage.sessionId !== sessionId) {
-                        state.steerMessage = { id: m.id, text: m.text || "",
-                            media: [], quotes: m.quotes || [], sessionId: sessionId, _converted: true };
-                        toast("1 条引导后端已丢失，转回暂存（请手动发送）");
+                        state.steerMessage = { id: entry.id, text: entry.text || "",
+                            media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
+                            sessionId: sessionId };
                     }
-                    return;
                 }
-                kept.push(m);
-            });
-            state.injectedPending = kept;
-            // 后端有、本地无的 injected 行：恢复显示
-            Object.keys(liveIds).forEach(function (id) {
-                const item = liveIds[id];
-                const exists = state.injectedPending.some(function (m) { return m.id === id; });
-                if (!exists) {
-                    state.injectedPending.push({ id: id, sessionId: sessionId,
-                        text: item.text || "", media: item.media || [], quotes: item.quotes || [] });
+                else {
+                    const exists = state.pendingQueue.some(function (m) { return m.id === entry.id; });
+                    if (!exists) {
+                        state.pendingQueue.push({ id: entry.id, text: entry.text || "",
+                            media: entry.media || [], quotes: entry.quotes || [], docs: entry.docs || [],
+                            sessionId: sessionId });
+                    }
                 }
             });
+            // injected 对账：后端返回 null 表示查询失败（未知），此时跳过对账——
+            // 不得把未知当作空，否则会把仍在后端队列的消息误判丢失并转存，导致重复发送。
+            // 任务运行中同样只保留/恢复，不做丢弃与转存：消费事件可能还在路上（重放 SSE
+            // 会结算），且历史记录尚未落盘本轮，此时核销必误判；等任务结束后再对账。
+            if (data.injected != null) {
+                const liveIds = {};
+                (data.injected || []).forEach(function (item) {
+                    const key = item && (item.id || item.message_id);
+                    if (key)
+                        liveIds[key] = item;
+                });
+                // 本地 injected 行：后端队列仍在则保留；队列无且任务已结束才按历史核销
+                // （已消费则删；后端重启丢失则转回内存引导槽，需手动发送）。
+                const running = !!data.running;
+                const kept = [];
+                state.injectedPending.forEach(function (m) {
+                    if (m.sessionId !== sessionId) {
+                        kept.push(m);
+                        return;
+                    }
+                    if (m.id && liveIds[m.id]) {
+                        kept.push(m);
+                        return;
+                    }
+                    if (running) {
+                        kept.push(m);
+                        return;
+                    } // 运行中：延迟到重放/下次打开结算
+                    if (m.id && !liveIds[m.id]) {
+                        if (isTextConsumed(sessionId, m.text))
+                            return; // 已消费：丢弃残留行
+                        // 后端丢失（重启/任务结束时未消费）：转回内存引导槽，不落盘（避免
+                        // 幽灵条目在后续打开时被自动派发造成重复发送）；标记 _converted，
+                        // 自动派发跳过，需用户手动点发送。
+                        if (!state.steerMessage || state.steerMessage.sessionId !== sessionId) {
+                            state.steerMessage = { id: m.id, text: m.text || "",
+                                media: [], quotes: m.quotes || [], sessionId: sessionId, _converted: true };
+                            toast("1 条引导后端已丢失，转回暂存（请手动发送）");
+                        }
+                        return;
+                    }
+                    kept.push(m);
+                });
+                state.injectedPending = kept;
+                // 后端有、本地无的 injected 行：恢复显示
+                Object.keys(liveIds).forEach(function (id) {
+                    const item = liveIds[id];
+                    const exists = state.injectedPending.some(function (m) { return m.id === id; });
+                    if (!exists) {
+                        state.injectedPending.push({ id: id, sessionId: sessionId,
+                            text: item.text || "", media: item.media || [], quotes: item.quotes || [] });
+                    }
+                });
+            }
+            renderPendingOutbox();
         }
-        renderPendingOutbox();
+        finally {
+            loadOutboxInflight = null;
+        }
     };
     function isTextConsumed(sessionId, text) {
         const key = (text || "").trim();
@@ -672,12 +717,14 @@
             next = state.steerMessage;
             next._originKind = "steer";
             state.steerMessage = null;
+            markOutboxSent(target, next.id);
             await App.removeOutboxEntry(target, next.id);
         }
         else {
             const idx = state.pendingQueue.findIndex(function (m) { return m.sessionId === target; });
             if (idx >= 0) {
                 next = state.pendingQueue.splice(idx, 1)[0];
+                markOutboxSent(target, next.id);
                 await App.removeOutboxEntry(target, next.id);
             }
         }
@@ -685,6 +732,45 @@
         if (!next)
             return;
         await App.send(next);
+    }
+    // 已发送墓碑（sessionStorage，按会话记最近 50 个已取走派发的暂存 id）：
+    // 侧车删除与发送之间若有打开/刷新（读到删前快照），或删除请求失败，
+    // 恢复时会把已发送的消息当作幽灵复活并再次发送；墓碑让恢复跳过它们。
+    // 放回暂存区（停止超时）时必须同步取消标记，否则重载后消息丢失。
+    function outboxSentKey(sessionId) { return "ytools.outbox.sent." + sessionId; }
+    function readOutboxSent(sessionId) {
+        try {
+            const list = JSON.parse(sessionStorage.getItem(outboxSentKey(sessionId)) || "[]");
+            return Array.isArray(list) ? list : [];
+        }
+        catch (_) {
+            return [];
+        }
+    }
+    function markOutboxSent(sessionId, id) {
+        if (!sessionId || !id)
+            return;
+        try {
+            const list = readOutboxSent(sessionId).filter(function (x) { return x !== id; });
+            list.push(id);
+            while (list.length > 50)
+                list.shift();
+            sessionStorage.setItem(outboxSentKey(sessionId), JSON.stringify(list));
+        }
+        catch (_) { }
+    }
+    function unmarkOutboxSent(sessionId, id) {
+        if (!sessionId || !id)
+            return;
+        try {
+            sessionStorage.setItem(outboxSentKey(sessionId), JSON.stringify(readOutboxSent(sessionId).filter(function (x) { return x !== id; })));
+        }
+        catch (_) { }
+    }
+    function isOutboxSent(sessionId, id) {
+        if (!sessionId || !id)
+            return false;
+        return readOutboxSent(sessionId).indexOf(id) >= 0;
     }
     // ---------- 弹层锚定工具（"+"功能菜单等仍留在 .composer 内的下拉复用） ----------
     // 锚定触发按钮而非容器：多行输入时 composer 变高，CSS 的 bottom: calc(100%+8px)

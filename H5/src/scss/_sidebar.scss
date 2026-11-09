@@ -276,29 +276,47 @@ body.sidebar-resizing {
   .session-head {
     display: flex;
     align-items: center;
+    // 标签与筛选钮同行：标题不再竖排（之前标签被挤到多行导致整行偏高）
+    gap: 6px;
     justify-content: space-between;
-    padding: 14px 22px 4px;
+    // 竖向收紧：上 8、下 2（原 14/4），并把头部从 flex 拉伸中解脱
+    padding: 8px 8px 2px;
+    min-height: 0;
+    min-width: 0;
     position: relative;
 
     .session-label {
-      font-size: 12px;
+      font-size: 11px;
+      line-height: 14px;
       font-weight: 600;
       color: var(--text-tertiary);
-      padding: 0 10px;
+      padding: 0 2px;
+      // 永不断行：宽度不够时让筛选钮截断，保住一行高度
+      flex: none;
+      white-space: nowrap;
     }
 
-    // 时间段筛选按钮：默认弱化，筛选生效时高亮
+    // 时间段筛选按钮：默认弱化，筛选生效时高亮。
+    // 超宽时省略号截断（完整范围看 title 悬浮提示），绝不撑破侧边栏
     .session-time-filter-btn {
       margin-left: auto;
-      margin-right: 6px;
-      font-size: 12px;
+      margin-right: 0;
+      font-size: 11px;
+      line-height: 14px;
       color: var(--text-tertiary);
       background: transparent;
       border: 1px solid transparent;
       border-radius: var(--radius-sm);
-      padding: 2px 8px;
+      padding: 1px 5px;
       cursor: pointer;
       white-space: nowrap;
+      flex: 0 1 auto;
+      // 允许低于内容宽度：否则 flex 项按 min-content 撑开，窄侧边栏直接溢出
+      min-width: 0;
+      width: auto;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .session-time-filter-btn:hover {
       color: var(--text);

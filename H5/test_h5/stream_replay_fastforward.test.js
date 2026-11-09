@@ -135,6 +135,7 @@ function harness() {
       scheduleContextTokenStatsRefresh() {}, clearInjectedPending() {},
       rebuildQnav() { counts.nav++; },
       attachLiveRoundEntry() {},
+      roundFold: { fmtDuration(ms) { return Math.max(0, Math.round(ms / 1000)) + 's'; } },
       processGroups: { sync() { counts.sync++; }, setTimestamp() {} },
     },
   };
@@ -262,4 +263,13 @@ test('无轮次号回放（非 staging 路径）同样一次落定不丢字', ()
   h.pipe.setReplayWindow(false);
   assert.equal(h.counts.render, 1);
   assert.match(textOf(h.msg), /y{30}/);
+});
+
+test('直播计时行：建管线即挂载，收尾时移除', () => {
+  const h = harness();
+  const row = h.msg.children.find(n => (n.className || '').includes('live-round-timer'));
+  assert.ok(row, '计时行已挂载');
+  assert.equal(h.msg.children[0], row, '计时行在首位');
+  h.pipe.finish();
+  assert.equal(h.msg.children.filter(n => (n.className || '').includes('live-round-timer')).length, 0, '收尾移除');
 });

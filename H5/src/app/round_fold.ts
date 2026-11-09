@@ -20,7 +20,7 @@
   // 永不折叠：用户节点/压缩条（会话级）/提问卡（可交互）/加载钮/自家头/隐藏节点/轮容器
   // （用量行单独处理：每轮只保留最后一条，其余随折叠内容隐藏）
   var EXCLUDE_SELECTOR = ".msg-user, .compaction-bar, .ask-block, " +
-    ".qnav-load-older, .round-fold-summary, .history-live-hidden, .msg";
+    ".qnav-load-older, .round-fold-summary, .history-live-hidden, .msg, .live-round-timer";
   // 记录级成员口径（estimateHeights/windowBounds 用，与 DOM 口径对齐）：
   // user/usage/compaction 永不折叠；toolResult/approval 无独立节点（已按 0 计）
   var MEMBER_KINDS: any = { think: true, tool: true, agentBlock: true, notice: true, assistant: true };
@@ -563,6 +563,9 @@
     else if (choices.has(key)) fold.open = choices.get(key);
     else fold.open = false;
     if (fold.header.nextElementSibling !== members[0]) members[0].parentNode.insertBefore(fold.header, members[0]);
+    // 折叠接管计时：移除直播计时行（若有；起播到成折叠前的过渡显示）
+    var liveTimer = members[0].parentNode.querySelector(".live-round-timer");
+    if (liveTimer) liveTimer.remove();
     applyVisibility(fold);
     renderHeader(fold);
   }
@@ -813,6 +816,6 @@
   }
   function revision(): any { return choiceRevision; }
   App.roundFold = { sync: sync, reveal: reveal, adjustHeights: adjustHeights,
-    snapBounds: snapBounds, revision: revision, tick: tick,
+    snapBounds: snapBounds, revision: revision, tick: tick, fmtDuration: fmtDuration,
     recordPauseGap: recordPauseGap, closePauseGap: closePauseGap };
 })((window as unknown as { App: any }).App);

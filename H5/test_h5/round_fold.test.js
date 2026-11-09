@@ -1159,3 +1159,39 @@ test("重发旧轮用户时间戳过早时不拉长用时", async t => {
     "超过 1 小时视为重发旧轮，退回纯成员口径"
   );
 });
+
+test("直播计时行：不计入成员，折叠接管后移除", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = liveMsg(x, 7);
+  const timer = div(x.document, "live-round-timer", "用时 3s");
+  msg.insertBefore(timer, msg.firstChild);
+  x.App.roundFold.sync(msg);
+  const head = msg.querySelector(".round-fold-summary");
+  assert.ok(head, "有折叠头");
+  assert.equal(msg.querySelector(".live-round-timer"), null, "计时行被接管移除");
+  const fold = head._roundFold;
+  assert.ok(fold.members.every(n => !n.classList.contains("live-round-timer")), "成员不含计时行");
+});
+
+test("直播计时行：单小块不成折叠时保留", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "8";
+  msg.append(div(x.document, "tool-block", "唯一工具"));
+  const timer = div(x.document, "live-round-timer", "用时 2s");
+  msg.insertBefore(timer, msg.firstChild);
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelector(".round-fold-summary"), null, "单小块不成折叠");
+  assert.ok(msg.querySelector(".live-round-timer"), "计时行保留");
+});
+
+test("roundFold 导出 fmtDuration（供直播计时行复用）", async t => {
+  const x = setup();
+  t.after(x.close);
+  assert.equal(typeof x.App.roundFold.fmtDuration, "function");
+  assert.equal(x.App.roundFold.fmtDuration(5000), "5s");
+  assert.equal(x.App.roundFold.fmtDuration(65000), "1m 5s");
+});

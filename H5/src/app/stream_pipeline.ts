@@ -30,6 +30,44 @@
     let curThink: any = null;
     let curAnswer: any = null;
     let stageTimestamp = new Date().toISOString();
+    // 直播计时行：起播即显示跳秒用时（折叠出现前唯一的计时显示；折叠接管
+    // 后由 round_fold 移除，收尾无折叠时在此移除——终态与过去一致）。
+    let liveTimerRow: any = null;
+    let liveTimerClock: any = null;
+    function stopLiveTimer(): void {
+      if (liveTimerClock != null) { clearTimeout(liveTimerClock); liveTimerClock = null; }
+      // 折叠接管后节点已脱离：remove 对脱离节点是无害空操作，直接调即可
+      if (liveTimerRow) liveTimerRow.remove();
+      liveTimerRow = null;
+    }
+    function startLiveTimer(): void {
+      if (!msg || liveTimerRow || !App.roundFold || !App.roundFold.fmtDuration) return;
+      if (msg.querySelector(".round-fold-summary") || msg.querySelector(".live-round-timer")) return;
+      const startedAt = (msg as any)._foldRoundStartedAt;
+      const t0 = typeof startedAt === "number" && startedAt > 0 ? startedAt : Date.now();
+      const row = el("div", "live-round-timer");
+      const dot = el("span", "live-round-timer-dot");
+      const text = el("span", "live-round-timer-text");
+      row.appendChild(dot);
+      row.appendChild(text);
+      let shown = false;
+      const paint = function (): void {
+        if (!row.isConnected) {
+          // 折叠接管移除后停跳；尚未挂载时（管线先建后挂）下秒重试，收尾时必停
+          liveTimerClock = null;
+          if (!shown && !finished) liveTimerClock = setTimeout(paint, 1000);
+          return;
+        }
+        shown = true;
+        const s = App.roundFold.fmtDuration(Date.now() - t0);
+        text.textContent = s ? "用时 " + s : "用时 0s";
+        liveTimerClock = setTimeout(paint, 1000);
+      };
+      liveTimerRow = row;
+      if (msg.firstChild) msg.insertBefore(row, msg.firstChild);
+      else msg.appendChild(row);
+      paint();
+    }
     let answerText = "";
     let hasStage = false;
     // 收尾后不再消费事件：暂停/中断后旧 SSE 的迟到帧必须丢弃（续跑复用同一
@@ -959,6 +997,9 @@
       requestSessionTitle(sessionId, activeStream.userText, activeStream.questionParts, preview);
     }
 
+    // 直播计时行挂载（全部声明之后调用，避开 let/const TDZ）
+    startLiveTimer();
+
     return {
       handle: handle,
       // 附接回放 marker.model → 本轮展示模型（与 round_model 帧同一入口）
@@ -989,6 +1030,9 @@
         agentBlocksAll.forEach(function (block: any) {
           if (block && !block.done) block.ui.finalizeInterrupted();
         });
+        // 直播计时行收尾：无折叠接管时移除（有折叠早被接管移除）；必须在
+        // 空容器判定之前，否则残留计时行导致空 msg 删不掉。
+        stopLiveTimer();
         if (App.processGroups) App.processGroups.sync(msg);
         if (App.permissions && App.permissions.syncPending) App.permissions.syncPending(sessionId);
         // 全部命中历史（收养/丢弃）且无其它内容时，移除空回复容器，避免空白占位

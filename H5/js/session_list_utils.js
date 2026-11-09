@@ -137,8 +137,9 @@
     }
     function shortDate(ms) {
         const d = new Date(ms);
-        const yearPrefix = d.getFullYear() === new Date().getFullYear() ? "" : d.getFullYear() + "年";
-        return yearPrefix + (d.getMonth() + 1) + "月" + d.getDate() + "日";
+        const p = function (n) { return (n < 10 ? "0" : "") + n; };
+        // 统一 YYYY/MM/DD：侧边栏宽度紧张，固定分隔符与位数便于截断/悬浮查看
+        return d.getFullYear() + "/" + p(d.getMonth() + 1) + "/" + p(d.getDate());
     }
     // 筛选按钮文案：预设名 / 自定义起止 / 全部时间
     function describeTimeFilter(filter) {

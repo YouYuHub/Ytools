@@ -798,27 +798,40 @@ html[data-theme=dark] .panel .side-actions .bulk-mode-toggle.bulk-mode-active {
 .panel .session-head {
   display: flex;
   align-items: center;
+  gap: 6px;
   justify-content: space-between;
-  padding: 14px 22px 4px;
+  padding: 8px 8px 2px;
+  min-height: 0;
+  min-width: 0;
   position: relative;
 }
 .panel .session-head .session-label {
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 14px;
   font-weight: 600;
   color: var(--text-tertiary);
-  padding: 0 10px;
+  padding: 0 2px;
+  flex: none;
+  white-space: nowrap;
 }
 .panel .session-head .session-time-filter-btn {
   margin-left: auto;
-  margin-right: 6px;
-  font-size: 12px;
+  margin-right: 0;
+  font-size: 11px;
+  line-height: 14px;
   color: var(--text-tertiary);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  padding: 2px 8px;
+  padding: 1px 5px;
   cursor: pointer;
   white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  width: auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .panel .session-head .session-time-filter-btn:hover {
   color: var(--text);
@@ -1885,6 +1898,36 @@ body.bulk-mode .bulk-group-empty {
   display: none !important;
 }
 
+.live-round-timer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.live-round-timer-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: live-timer-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes live-timer-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-round-timer-dot {
+    animation: none;
+  }
+}
 .chat-inner > .round-fold-summary,
 .msg > .round-fold-summary {
   content-visibility: visible;
@@ -7050,10 +7093,9 @@ body.tool-settings-open {
   position: absolute;
   right: 14px;
   top: 72px;
-  bottom: 16px;
   display: flex;
-  align-items: center;
   z-index: 30;
+  pointer-events: none;
 }
 .qnav .qnav-rail {
   position: relative;
@@ -7061,7 +7103,8 @@ body.tool-settings-open {
   flex-direction: column;
   align-items: stretch;
   justify-content: center;
-  max-height: 100%;
+  pointer-events: auto;
+  max-height: calc(100dvh - 160px);
   overflow-y: auto;
   scrollbar-width: none;
 }
@@ -7120,6 +7163,7 @@ body.tool-settings-open {
 .qnav .qnav-panel {
   display: none;
   position: absolute;
+  pointer-events: auto;
   right: 100%;
   top: 50%;
   transform: translateY(-50%);

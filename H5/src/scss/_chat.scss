@@ -218,6 +218,30 @@
   color: var(--danger);
 }
 .is-roundfold-hidden { display: none !important; }
+// 直播计时行：起播到成折叠前的过渡计时显示（折叠出现即被接管移除）。
+// 与折叠头同字号色系，圆点呼吸表示进行中。
+.live-round-timer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.live-round-timer-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: live-timer-pulse 1.2s ease-in-out infinite;
+}
+@keyframes live-timer-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-round-timer-dot { animation: none; }
+}
 .chat-inner > .round-fold-summary,
 .msg > .round-fold-summary {
   content-visibility: visible;
