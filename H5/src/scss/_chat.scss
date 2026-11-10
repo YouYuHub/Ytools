@@ -3113,10 +3113,14 @@ html[data-theme="dark"] {
 }
 
 // ---------- 模型提问卡片（ask_user 事件在聊天流内的静态展示；点击可重新打开回答弹窗） ----------
+// 颜色跟随主题强调色：用 --tool-icon-pink（项目内统一的“强调文字/图标色”，
+// 各 data-accent 下都做过对比度修正）。不用 --accent：那是黑白单色（亮色主题
+// 黑、暗色主题白），用作强调文字不会变化。之前硬编码 #0b84d8 导致切粉/绿/
+// 紫主题后卡片仍是蓝色，与全局风格脱节。
 .ask-block {
   width: 100%;
   border: 1px solid var(--border-strong);
-  border-left: 3px solid #0b84d8;
+  border-left: 3px solid var(--tool-icon-pink);
   border-radius: var(--radius-sm);
   background: var(--bg-elevated);
   padding: 10px 14px;
@@ -3130,7 +3134,7 @@ html[data-theme="dark"] {
     gap: 6px;
     font-size: 13.5px;
     font-weight: 600;
-    color: #0b84d8;
+    color: var(--tool-icon-pink);
 
     .ask-title-icon {
       width: 18px;
@@ -3156,8 +3160,9 @@ html[data-theme="dark"] {
     cursor: pointer;
     transition: border-color 0.15s ease, background-color 0.15s ease;
 
+    // hover：四边描边用强调色（与左边条同色，整体统一）
     &:hover {
-      border-color: #0b84d8;
+      border-color: var(--tool-icon-pink);
       background: var(--bg-hover);
     }
   }

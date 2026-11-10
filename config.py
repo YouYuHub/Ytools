@@ -23,7 +23,9 @@ DEFAULT_SERVICE_PORT = int(os.environ.get("DEFAULT_SERVICE_PORT", load_var("DEFA
 DEFAULT_HISTORY_TRIGGER_RATIO = 0.8         # 历史压缩触发比例
 DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
 # 历史压缩目标（tokens）：>0 时把"历史部分"压到该值以内（与触发阈值无关），
-# 用于压低长任务的单次输入成本；0 表示不设目标（仅按触发阈值/可用空间压缩）。
+# 用于压低长任务的单次输入成本。语义是纯历史预算，不背系统提示词/工具定义/
+# 当前轮消息/摘要预留等固定开销。0 表示不设固定目标，改用动态可用空间
+# （触发阈值 − 上面那些固定开销 − 安全余量）。
 DEFAULT_HISTORY_COMPACT_TARGET_TOKENS = 0
 DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模型上下文的系数
 DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务

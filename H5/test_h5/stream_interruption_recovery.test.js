@@ -232,7 +232,7 @@ test('无本地流且后端不可用：停止按钮本地收尾，不卡运行�
   assert.equal(x.state.suppressFlushSession, 'visible');
 });
 
-test('有本地流时停止失败仍保持监听，可重试', async () => {
+test('有本地流时停止失败：本地流已中止，保留队列抑制待重连确认', async () => {
   const x = stopSetup({
     activeStream: { sessionId: 'visible' },
     stopImpl: async () => { throw new Error('Failed to fetch'); },
@@ -240,6 +240,8 @@ test('有本地流时停止失败仍保持监听，可重试', async () => {
   await x.run();
   assert.deepEqual(x.calls.states, [['stopping', 'visible'], ['failed', 'visible']]);
   assert.match(x.calls.toasts[0], /停止失败/);
-  assert.equal(x.state.suppressFlushSession, null);
-  assert.equal(x.calls.aborts, 0);
+  // 用户按了停止：即使后端未确认，也不要在收尾时自动派发队列/引导
+  assert.equal(x.state.suppressFlushSession, 'visible');
+  // 新语义：本地流立即中止（不再等后端确认），所以 abort 会发一次
+  assert.equal(x.calls.aborts, 1);
 });

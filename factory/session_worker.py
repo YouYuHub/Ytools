@@ -117,9 +117,12 @@ class _WorkerStreamAdapter:
     主进程，emit 非阻塞，事件顺序与产生顺序一致。
     """
 
-    def __init__(self, session_id: str, evt_queue: "queue.Queue"):
+    def __init__(self, session_id: str, evt_queue: "queue.Queue", generation: int = 0):
         self.session_id = session_id
         self._evt_queue = evt_queue
+        # 代次：软停止后新轮不等旧任务退出，旧任务的 task_done 会迟到。
+        # 携带代次让主进程能认出“这是旧轮的事件”，不误清新轮的运行标志。
+        self.generation = generation
         self._question_text = ""
         self._question_parts = None
         self._question_quotes = None
@@ -129,6 +132,9 @@ class _WorkerStreamAdapter:
         self._live_round_usage_total = None
         self.user_stop_requested = False
         self.stop_requested = False
+        # 写令牌：由 _run_chat_generation 在 worker 进程内创建并挂到本 adapter，
+        # 供主进程跨进程读侧车判定是否已撤销（adapter 本身就是 worker 侧 stream）。
+        self.round_lease: Any = None
         self.done = False
         self._finish_sent = False
         # 运行中注入的用户消息队列（消息引导）：生成循环在每轮检查点取出，
@@ -150,7 +156,7 @@ class _WorkerStreamAdapter:
     def question_text(self, value: str) -> None:
         value = str(value or "")
         self._question_text = value
-        self._evt_queue.put({"type": "question_text", "text": value})
+        self._put({"type": "question_text", "text": value})
 
     # 提问原始部件（多模态时含 media:// 引用）：生成循环经 question_parts 属性
     # 保存副本后，经 evt 队列同步到主进程 stream.question_parts（回放补气泡用）
@@ -161,7 +167,7 @@ class _WorkerStreamAdapter:
     @question_parts.setter
     def question_parts(self, value) -> None:
         self._question_parts = value if isinstance(value, list) or value is None else None
-        self._evt_queue.put({
+        self._put({
             "type": "question_parts",
             "parts": self._question_parts,
         })
@@ -175,7 +181,7 @@ class _WorkerStreamAdapter:
     @question_quotes.setter
     def question_quotes(self, value) -> None:
         self._question_quotes = value if isinstance(value, list) or value is None else None
-        self._evt_queue.put({
+        self._put({
             "type": "question_quotes",
             "quotes": self._question_quotes,
         })
@@ -195,7 +201,7 @@ class _WorkerStreamAdapter:
         if normalized is not None and normalized < 1:
             normalized = None
         self._live_round_no = normalized
-        self._evt_queue.put({"type": "live_round_no", "round": normalized})
+        self._put({"type": "live_round_no", "round": normalized})
 
     # 本轮开始墙钟（epoch ms）：与轮次号同处由生成循环写入，经 evt 队列
     # 同步到主进程 stream.live_round_started_at_ms（附接 marker 携带
@@ -213,7 +219,7 @@ class _WorkerStreamAdapter:
         if normalized is not None and normalized < 1:
             normalized = None
         self._live_round_started_at_ms = normalized
-        self._evt_queue.put({"type": "live_round_started_at", "at_ms": normalized})
+        self._put({"type": "live_round_started_at", "at_ms": normalized})
 
     # 本轮生效聊天模型（provider/name/id）：round_model 推送时由生成循环写入，
     # 经 evt 队列同步到主进程 stream.live_round_model（附接回放 marker 携带
@@ -232,7 +238,7 @@ class _WorkerStreamAdapter:
                 if isinstance(value.get(key), str) and value[key].strip()
             } or None
         self._live_round_model = normalized
-        self._evt_queue.put({"type": "live_round_model", "model": normalized})
+        self._put({"type": "live_round_model", "model": normalized})
 
     @property
     def live_round_usage_total(self):
@@ -242,11 +248,22 @@ class _WorkerStreamAdapter:
     def live_round_usage_total(self, value) -> None:
         normalized = dict(value) if isinstance(value, dict) and value else None
         self._live_round_usage_total = normalized
-        self._evt_queue.put({"type": "live_round_usage_total", "usage": normalized})
+        self._put({"type": "live_round_usage_total", "usage": normalized})
+
+    def _put(self, payload: dict) -> None:
+        """所有事件统一出口：自动附着代次，供主进程过滤旧轮迟到事件。
+
+        软停止后新轮不再等旧任务退出，旧轮的 sse/task_done 会迟到。
+        `task_done` 已在 finish() 里显式带 generation；其余事件的 generation
+        由这里统一补齐，主进程 `_dispatch` 据此丢弃旧代次帧。
+        """
+        if isinstance(payload, dict) and "generation" not in payload:
+            payload["generation"] = self.generation
+        self._evt_queue.put(payload)
 
     def emit(self, chunk: str) -> None:
         if isinstance(chunk, str) and chunk:
-            self._evt_queue.put({"type": "sse", "chunk": chunk})
+            self._put({"type": "sse", "chunk": chunk})
 
     def emit_event(self, payload: dict) -> None:
         self.emit(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
@@ -256,13 +273,13 @@ class _WorkerStreamAdapter:
         return None
 
     def set_round_start(self) -> None:
-        self._evt_queue.put({"type": "round_start"})
+        self._put({"type": "round_start"})
 
     async def finish(self) -> None:
         self.done = True
         if not self._finish_sent:
             self._finish_sent = True
-            self._evt_queue.put({"type": "task_done"})
+            self._put({"type": "task_done", "generation": self.generation})
 
 
 def _emit_uncaught_generate_error(task: "asyncio.Task", adapter: "_WorkerStreamAdapter") -> None:
@@ -306,7 +323,7 @@ def _security_identity():
 
 
 async def _worker_generate(session_id, request_data, adapter, runtime_ollama_models=None,
-                           permission_resume_id=None, security_identity=None):
+                           permission_resume_id=None, security_identity=None, tools_cache=None):
     """Only the parent IPC supplies identity; it never comes from model JSON."""
     token = None
     from memory.storage_layout import _REQUIRED
@@ -325,7 +342,7 @@ async def _worker_generate(session_id, request_data, adapter, runtime_ollama_mod
         if security_identity:
             from security.preferences import read as read_preferences
             read_preferences()
-        await _worker_generate_authorized(session_id, request_data, adapter, runtime_ollama_models, permission_resume_id)
+        await _worker_generate_authorized(session_id, request_data, adapter, runtime_ollama_models, permission_resume_id, tools_cache)
     finally:
         _REQUIRED.reset(required_token)
         if token is not None:
@@ -338,6 +355,7 @@ async def _worker_generate_authorized(
     adapter: _WorkerStreamAdapter,
     runtime_ollama_models: Any = None,
     permission_resume_id: str | None = None,
+    tools_cache: Any = None,
 ) -> None:
     """worker 内执行一次完整生成任务：刷新环境 → 解析会话目录 → chdir → 生成循环。"""
     from config import PROJECT_ROOT as CONFIG_PROJECT_ROOT, ChatLLMRequest
@@ -357,6 +375,19 @@ async def _worker_generate_authorized(
         _apply_runtime_ollama_model_snapshots(runtime_ollama_models)
     except Exception as exc:
         logger.warning(f"worker 恢复运行时 Ollama 模型列表失败: {exc}")
+    # 工具探测缓存同理由父进程传入（worker 模块级缓存不共享）：装好后
+    # load_all_tools() 直接命中，不再在首 token 前重新拉起 MCP 子进程。
+    # 安装失败/无快照时自然回退到现场探测（行为与以前一致）。
+    if tools_cache:
+        try:
+            from factory.agent_runtime import tool_registry as _tool_registry
+            if _tool_registry.install_tools_cache_snapshot(tools_cache):
+                logger.info(
+                    "✅ worker 继承工具探测缓存：%d 个工具，跳过本轮 MCP 重探",
+                    len(tools_cache.get("tools") or []),
+                )
+        except Exception as exc:
+            logger.warning(f"worker 安装工具缓存快照失败（将现场探测）: {exc}")
 
     # 会话工作目录解析：_meta.work_dir 覆盖 → DEFAULT_CHAT_WORK_DIR 兜底；
     # 目录失效时发 warning 并回退，不终止任务
@@ -402,6 +433,35 @@ async def _interrupt_worker_task(session_id: str, current_task: "asyncio.Task | 
         logger.warning(f"worker 旧生成任务退出异常（已忽略）: {exc}")
 
 
+def _lease_already_revoked(session_id: str) -> bool:
+    """上一轮写令牌是否已撤销（判定能否“不等旧任务就开新轮”）。"""
+    try:
+        from factory.agent_runtime.round_lease import lease_path_for, read_lease_file
+        from memory.chat_memory import _get_chat_history_file
+        data = read_lease_file(lease_path_for(_get_chat_history_file(session_id)))
+        return bool(data and data.get("revoked"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reap_task_in_background(task: "asyncio.Task", session_id: str) -> None:
+    """后台收户旧任务：不阻塞当前命令循环，只防未处理异常污染日志。
+
+    安全性：旧轮写令牌已撤销/即将被新轮 epoch 覆盖，它写不进任何历史，
+    所以不需要“等它退出”来保证不交错。
+    """
+    async def _wait() -> None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 后台收户旧生成任务异常（已忽略）: {exc}")
+        else:
+            logger.info(f"会话 [{session_id}] 旧生成任务已在后台结束")
+    asyncio.create_task(_wait())
+
+
 async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
     """worker 命令循环：处理 generate/stop/ping/shutdown，空闲自动退出。"""
     loop = asyncio.get_running_loop()
@@ -436,6 +496,9 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
     idle_timeout = _worker_idle_timeout()
     current_task: asyncio.Task | None = None
     adapter: _WorkerStreamAdapter | None = None
+    # worker 侧代次（每收到一次 generate 自增）：随 task_started/task_done 下发，
+    # 让主进程能区分“旧轮迟到的收尾”与“新轮的事件”。
+    generation_seq = 0
 
     try:
         while True:
@@ -457,14 +520,33 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                     evt_queue.put({"type": "pong"})
                 elif ctype == "generate":
                     if current_task is not None and not current_task.done():
-                        # 携带新用户消息：平滑打断旧任务并等待其完全收尾，
-                        # 避免新旧两个生成循环交错写同一会话
+                        # 携带新用户消息：打断旧任务。
+                        #
+                        # 旧逻辑无条件等旧任务“完全收尾”再开新轮，而旧任务可能
+                        # 卡在工具线程（内置工具 20s 陪等 / MCP 工具 300s 超时），
+                        # 用户感知就是“发消息要等十几秒才动”。
+                        #
+                        # 现在：若上一轮写令牌已被撤销（已软停止）或新轮即将覆盖
+                        # 侧车 epoch（旧轮写入必然被 epoch mismatch 拒绕），就不
+                        # 再阻塞等它，只 cancel 并交付后台监控。安全性由写令牌
+                        # 保证（旧轮已经写不进任何历史），不靠时间窗口。
                         if adapter is not None:
                             adapter.user_stop_requested = False
                             adapter.stop_requested = True
-                        await _interrupt_worker_task(session_id, current_task, user_stop=False)
-                    adapter = _WorkerStreamAdapter(session_id, evt_queue)
-                    evt_queue.put({"type": "task_started"})
+                        old_task = current_task
+                        old_task.cancel()
+                        if _lease_already_revoked(session_id):
+                            logger.info(
+                                "上一轮已被软停止（写令牌已撤销），新轮不等旧任务收尾"
+                            )
+                            _reap_task_in_background(old_task, session_id)
+                        else:
+                            # 未停止的普通打断：仍然等收尾（旧任务可能正在落盘
+                            # 工具结果，让它写完再开新轮更安全）
+                            await _interrupt_worker_task(session_id, old_task, user_stop=False)
+                    generation_seq += 1
+                    adapter = _WorkerStreamAdapter(session_id, evt_queue, generation=generation_seq)
+                    evt_queue.put({"type": "task_started", "generation": generation_seq})
                     current_task = asyncio.create_task(
                         _worker_generate(
                             session_id,
@@ -473,6 +555,7 @@ async def _worker_loop(session_id: str, cmd_conn, evt_conn) -> None:
                             raw.get("runtime_ollama_models"),
                             raw.get("permission_resume_id"),
                             raw.get("security_identity"),
+                            raw.get("tools_cache"),
                         )
                     )
 
@@ -608,6 +691,8 @@ class SessionWorkerProxy:
         self._send_lock = threading.Lock()
         self._alive = False
         self._generation_running = False
+        # 已见过的最大代次：过滤旧轮迟到的 task_done（软停止后新轮不等旧任务）
+        self._latest_generation = 0
         self._handlers: list[Callable[[dict], None]] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # 是否已真实 spawn 过进程：从未启动的代理不是"死亡代理"，
@@ -617,6 +702,11 @@ class SessionWorkerProxy:
         # 事件按绑定对象转发而不是按注册表查找——打断旧任务并启动新任务的
         # 过渡窗口里，迟到的旧 task_done 不能误把新 stream 置为完成
         self._bound_stream = None
+        # 生成代次：每发一次 generate 自增。停止接口靠它区分「我等的那一轮」
+        # 和「用户新起的一轮」——旧实现只看 is_generation_running（布尔量共享），
+        # 新任务置位后会被误以为旧任务尚未收尾，15s 后强杀正在跑新消息的
+        # worker（停止后 15s 内重发就会被吃消息）。
+        self._generation_seq = 0
 
     def bind_stream(self, stream) -> None:
         self._bound_stream = stream
@@ -738,12 +828,29 @@ class SessionWorkerProxy:
         if not isinstance(evt, dict):
             return
         evt_type = evt.get("type")
-        if evt_type == "task_started":
-            self._generation_running = True
-        elif evt_type in ("task_done", "worker_exit"):
-            self._generation_running = False
+        # 代次隔离：软停止后新轮不再等旧任务退出，旧轮的 task_done 可能
+        # 迟到。若不过滤，它会把新轮的运行标志误清为 False（前端看到
+        # “已结束”，实际新轮正在跑）。
+        evt_gen = evt.get("generation")
+        stale = False
         with self._state_lock:
+            if isinstance(evt_gen, int):
+                if evt_gen < self._latest_generation:
+                    stale = True
+                elif evt_gen > self._latest_generation:
+                    self._latest_generation = evt_gen
+            if not stale:
+                if evt_type == "task_started":
+                    self._generation_running = True
+                elif evt_type in ("task_done", "worker_exit"):
+                    self._generation_running = False
             handlers = list(self._handlers)
+        if stale:
+            logger.info(
+                f"会话 [{self.session_id}] 忽略旧代次事件 {evt_type}#{evt_gen}"
+                f"（当前代次 {self._latest_generation}）"
+            )
+            return
         for handler in handlers:
             try:
                 handler(evt)
@@ -756,6 +863,12 @@ class SessionWorkerProxy:
 
     def is_generation_running(self) -> bool:
         return self._generation_running
+
+    def generation_seq(self) -> int:
+        """当前生成代次（每次 start_generation 自增）。停止接口用它判定
+        "我等的轮次是否已被新 generate 接管"。"""
+        with self._state_lock:
+            return self._generation_seq
 
     def has_started(self) -> bool:
         """是否真实 spawn 过进程（供清理逻辑区分"未启动"与"已死亡"）。"""
@@ -789,14 +902,26 @@ class SessionWorkerProxy:
         except Exception as exc:
             logger.warning(f"读取运行时 Ollama 模型快照失败: {exc}")
             runtime_ollama_models = []
+        # MCP 工具探测结果同传：worker 是 spawn 的独立进程，模块级缓存不共享，
+        # 不传就得在首 token 前重新拉起全部 MCP 子进程（秒级~十秒级）。
+        try:
+            from factory.agent_runtime import tool_registry as _tool_registry
+            tools_cache = _tool_registry.get_tools_cache_snapshot()
+        except Exception as exc:
+            logger.warning(f"读取工具缓存快照失败（worker 将现场探测）: {exc}")
+            tools_cache = None
         # 排队中的 generate 也算运行中，停止接口必须等到它被消费/取消，
         # 不能在 task_started 回执尚未到达时提前宣告停止成功。
         with self._state_lock:
             self._generation_running = True
+            # 代次自增：本次 generate 成为「当前需等待的那一轮」，此前的
+            # 停止等待方看到代次变化会主动退让（不再插手，更不会强杀）
+            self._generation_seq += 1
         sent = self._send({
             "type": "generate",
             "request": request_data or {},
             "runtime_ollama_models": runtime_ollama_models,
+            "tools_cache": tools_cache,
             "permission_resume_id": permission_resume_id,
             "security_identity": _security_identity(),
         })

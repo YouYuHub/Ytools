@@ -786,10 +786,14 @@ body.tool-settings-open { overflow: hidden; }
 .qnav {
   position: absolute;
   right: 14px;
-  // 紧贴内容高度、从顶栏下方起排：此前全高 flex 居中，空旷区 hover 会误触
-  // 面板、还会盖住底部的队列/引导按钮；短列表贴近顶部，长列表向下生长。
+  // 撑满「顶栏下沿 → 输入区上方」的可用高度（bottom 取 core.ts 写入的
+  // --bottom-stack-height），轨道（map 条）与展开列表面板都在其中垂直居中。
+  // 容器仍 pointer-events: none：空旷区不命中，不会误触 hover 面板。
   top: 72px;
+  bottom: calc(var(--bottom-stack-height, 96px) + 16px);
   display: flex;
+  // 面板是 position: absolute 子元素，不再参与 flex；轨道靠此项居中
+  align-items: center;
   z-index: 30;
   // 容器本身不命中：只有轨道/面板响应 hover/click，空旷区完全透过
   pointer-events: none;
@@ -801,8 +805,9 @@ body.tool-settings-open { overflow: hidden; }
     align-items: stretch;
     justify-content: center;
     pointer-events: auto;
-    // 容器已是内容高度，上限改按视口算（顶 72 + 底 88 输入区余量）
-    max-height: calc(100dvh - 160px);
+    // 高度上限改由父容器（.qnav 的可用高度）决定：居中后不再按视口粗略估算，
+    // 轨道永远不会越过顶栏或底部输入区。
+    max-height: 100%;
     // 极端多轮（收缩到下限仍超高）兜底内部滚动；隐藏滚动条保外观
     overflow-y: auto;
     scrollbar-width: none;
@@ -880,10 +885,13 @@ body.tool-settings-open { overflow: hidden; }
     pointer-events: auto;
     // 与轨道左边缘无缝相接，避免鼠标经过间隙时父级失去 hover 状态
     right: 100%;
+    // 与轨道一致：在可用区内垂直居中（此前固定顶部对齐，列表看起来“吊”在上边）。
     top: 50%;
     transform: translateY(-50%);
     width: min(320px, calc(100vw - 56px));
-    max-height: min(60vh, 480px);
+    // 高度上限：不超过容器可用高度（顶栏下沿到输入区上方），再收 480px。
+    // 居中后上下各留一半余量，因此长列表也不会压住输入框或顶栏。
+    max-height: min(480px, 100%);
     overflow: hidden auto;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
@@ -941,6 +949,9 @@ body.tool-settings-open { overflow: hidden; }
   @container main-area (max-width: 680px) {
     display: none;
     top: 58px;
+    // 窄屏由顶栏按钮打开，高度交给面板自身（.mobile-open 时才显示）
+    bottom: auto;
+    align-items: stretch;
     right: 12px;
     transform: none;
     max-width: calc(100cqw - 24px);
@@ -956,6 +967,8 @@ body.tool-settings-open { overflow: hidden; }
     .qnav-panel {
       display: block;
       position: static;
+      // 桌面端用 top:50% + translateY(-50%) 居中；窄屏是文档流静态定位，
+      // 必须清掉 transform，否则面板会整体上移自身高度的一半
       transform: none;
       width: min(320px, calc(100cqw - 24px));
       max-height: min(60dvh, 480px);

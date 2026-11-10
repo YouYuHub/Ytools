@@ -969,6 +969,20 @@
         deleteModal.classList.add("hidden");
         deleteModal.setAttribute("aria-hidden", "true");
     }
+    // 删除成功（含幂等 404）后的本地清理：行、缓存、标题覆盖、当前会话择路。
+    function applyDeletedSession(pending) {
+        if (pending.node)
+            pending.node.remove();
+        forgetSession(pending.id);
+        if (App.sessionGroups)
+            App.sessionGroups.removeSession(pending.id);
+        delete state.sessionRecency[pending.id];
+        const overrides = readTitleOverrides();
+        delete overrides[pending.id];
+        localStorage.setItem(SESSION_TITLE_KEY, JSON.stringify(overrides));
+        if (pending.id === state.sessionId)
+            startNewChat();
+    }
     async function confirmDeleteSession() {
         // 批量删除：pendingBulkDelete 非空时走批量流程（与单会话共用同一弹窗）
         if (state.pendingBulkDelete) {
@@ -979,23 +993,23 @@
             return;
         const pending = state.pendingDelete;
         deleteConfirm.disabled = true;
+        // 先关弹窗再删：删除是幂等操作，会话可能已被删掉（上次成功但响应丢失 /
+        // 别的标签页已删 / 后端清理中），继续把弹窗留在前台会让用户以为失败、
+        // 反复点确认。关掉后无论成败都有 toast 反馈，失败时行仍在可直接重试。
+        closeDeleteModal();
         try {
             await API.deleteSession(pending.id);
-            if (pending.node)
-                pending.node.remove();
-            forgetSession(pending.id);
-            if (App.sessionGroups)
-                App.sessionGroups.removeSession(pending.id);
-            delete state.sessionRecency[pending.id];
-            const overrides = readTitleOverrides();
-            delete overrides[pending.id];
-            localStorage.setItem(SESSION_TITLE_KEY, JSON.stringify(overrides));
+            applyDeletedSession(pending);
             toast("会话已删除");
-            closeDeleteModal();
-            if (pending.id === state.sessionId)
-                startNewChat();
         }
         catch (err) {
+            // 404 = 后端已无此会话（已删除/正在清理）：目标状态已达成，按成功处理，
+            // 否则会留下“已删但界面仍报错”的不一致。
+            if (err && err.status === 404) {
+                applyDeletedSession(pending);
+                toast("会话已删除");
+                return;
+            }
             toast("删除失败：" + err.message);
         }
         finally {

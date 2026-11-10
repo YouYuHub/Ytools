@@ -523,6 +523,20 @@
             }
         }
         var tail = tailIdx >= 0 ? nodes[tailIdx] : null;
+        // 压缩条 = 活动区分界：任务进行中触发压缩时，压缩条出现在最新正文之后，
+        // 其后的工具调用/思考/压缩本身属于“压缩后的新阶段”。若按普通尾正文口径，
+        // 这些块会被尾后收纳卷进顶部折叠，用户只看得到一段正文 + 一行折叠头，
+        // 压缩过程完全不可见。处理：有压缩条晚于尾正文时，放弃尾后收纳，
+        // 让压缩条及其前后内容全部保持可见。
+        var compactCut = -1;
+        if (tail) {
+            for (var ci = nodes.length - 1; ci > tailIdx; ci--) {
+                if (nodes[ci].nodeType === 1 && nodes[ci].matches(".compaction-bar")) {
+                    compactCut = ci;
+                    break;
+                }
+            }
+        }
         // 尾上时间戳：紧贴尾正文上方的时间行是尾的注脚（可见正文何时开始），永不折叠
         var tailTime = null;
         if (tailIdx >= 1) {
@@ -537,7 +551,7 @@
         // 尾后收纳：暂停/中断会把已完成的过程节点冻结在尾正文之后；续跑新开 .msg
         // 容器后它们永远到不了尾前，不收纳就会永久裸露（暂停几次就留下几块）。
         var liveTail = [];
-        if (tail) {
+        if (tail && compactCut < 0) {
             var lastUsage = roundLastUsage;
             var postMembers = [];
             var postStart = tailIdx + 1;
@@ -591,7 +605,12 @@
             });
             postMembers.sort(function (a, b) { return nodes.indexOf(a) - nodes.indexOf(b); });
             members = members.concat(postMembers);
-            liveTail = nodes.slice(postStart).filter(function (node) {
+        }
+        // 可见尾区（无论是否有压缩条）：尾正文之后、未进折叠的节点全部保持可见。
+        // 有压缩条时 postMembers 为空，所以压缩条、正文后的工具/思考/压缩过程
+        // 天然落在 liveTail 里展示（以前它们会被尾后收纳卷进顶部折叠）。
+        if (tail) {
+            liveTail = nodes.slice(tailIdx + 1).filter(function (node) {
                 return node.nodeType === 1 && members.indexOf(node) < 0;
             });
         }

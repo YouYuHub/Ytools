@@ -125,6 +125,21 @@
       });
       // 面板浏览时轨道不抢焦点：进入面板即清除涟漪与 peek
       qnavPanel.addEventListener("mouseenter", clearQnavRipple);
+      // 展开面板（指针进入导航区）时，若当前问题被滚出面板可视区，把它带回视口；
+      // 否则保持原阅读位置（rebuildQnav 会保留 scrollTop）。面板靠 :hover 才
+      // display:block，故延后到下一帧再量位置。
+      qnav.addEventListener("mouseenter", function() {
+        requestAnimationFrame(function() {
+          const active = qnavPanel.querySelector(".qnav-item.active");
+          if (!active || !qnavPanel.clientHeight) return;
+          const panelTop = qnavPanel.scrollTop;
+          const panelBottom = panelTop + qnavPanel.clientHeight;
+          const itemTop = active.offsetTop;
+          const itemBottom = itemTop + active.offsetHeight;
+          if (itemTop >= panelTop && itemBottom <= panelBottom) return;
+          qnavPanel.scrollTop = Math.max(0, itemTop - (qnavPanel.clientHeight - active.offsetHeight) / 2);
+        });
+      });
     }
 
     qnavEntries.forEach(function(entry: any, i: any) {

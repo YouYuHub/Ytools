@@ -176,7 +176,7 @@ def get_cached_tools_payload(max_age_seconds: float) -> Dict[str, Any] | None:
             return None
         if time.monotonic() - _TOOLS_CACHE_MONO > max_age_seconds:
             return None
-        return dict(_TOOLS_CACHE)
+        return {key: value for key, value in _TOOLS_CACHE.items() if key != "registry"}
 
 
 def _store_tools_cache(payload: Dict[str, Any]) -> None:
@@ -186,6 +186,64 @@ def _store_tools_cache(payload: Dict[str, Any]) -> None:
     with _TOOLS_CACHE_LOCK:
         _TOOLS_CACHE = dict(payload)
         _TOOLS_CACHE_MONO = time.monotonic()
+
+
+def get_tools_cache_snapshot() -> Dict[str, Any] | None:
+    """导出当前工具缓存 + 注册表快照（供 worker 进程直装，传 IPC）。
+
+    worker 是 spawn 出的独立进程，模块级缓存不共享：不传过去的话每个 worker
+    首次生成都要重新拉起全部 MCP 子进程探测（秒级~十秒级，落在首 token 前）。
+    快照含 filtered_tools 与三张映射表，安装后可等价复原 ALL_TOOLS，
+    使 worker 内的 load_all_tools() 直接命中缓存而不重探。
+    """
+    with _TOOLS_CACHE_LOCK:
+        if _TOOLS_CACHE is None:
+            return None
+        payload = dict(_TOOLS_CACHE)
+        age = time.monotonic() - _TOOLS_CACHE_MONO
+    with _REGISTRY_SWAP_LOCK:
+        payload["registry"] = {
+            "tools": [dict(item) for item in ALL_TOOLS],
+            "servers": dict(TOOL_MCP_SERVERS),
+            "original_names": dict(TOOL_ORIGINAL_NAMES),
+            "name_index": {key: list(value) for key, value in TOOL_NAME_INDEX.items()},
+        }
+    payload["age_seconds"] = age
+    return payload
+
+
+def install_tools_cache_snapshot(snapshot: Any) -> bool:
+    """在 worker 进程内安装父进程传来的缓存+注册表快照。
+
+    返回 True 表示安装成功（后续 load_all_tools 会直接命中缓存）。
+    快照不完整/不可解析时返回 False，调用方自然回退到现场探测。
+    """
+    global ALL_TOOLS, TOOL_MCP_SERVERS, TOOL_ORIGINAL_NAMES, TOOL_NAME_INDEX
+    global _TOOLS_CACHE, _TOOLS_CACHE_MONO
+    if not isinstance(snapshot, dict):
+        return False
+    registry = snapshot.get("registry")
+    if not isinstance(registry, dict):
+        return False
+    tools = registry.get("tools")
+    servers = registry.get("servers")
+    original_names = registry.get("original_names")
+    name_index = registry.get("name_index")
+    if not isinstance(tools, list) or not isinstance(servers, dict) or not isinstance(original_names, dict):
+        return False
+    with _REGISTRY_SWAP_LOCK:
+        ALL_TOOLS = tools
+        TOOL_MCP_SERVERS = servers
+        TOOL_ORIGINAL_NAMES = original_names
+        TOOL_NAME_INDEX = name_index if isinstance(name_index, dict) else {}
+    payload = {key: value for key, value in snapshot.items()
+               if key not in {"registry", "age_seconds"}}
+    with _TOOLS_CACHE_LOCK:
+        # 传递耗时计入年龄，避免父进程刚探测完、worker 启动时已过期
+        age = snapshot.get("age_seconds")
+        _TOOLS_CACHE = payload
+        _TOOLS_CACHE_MONO = time.monotonic() - (age if isinstance(age, (int, float)) and age > 0 else 0.0)
+    return True
 
 
 def _load_mcp_servers(_current_dir: str = "") -> dict:

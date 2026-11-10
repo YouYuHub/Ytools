@@ -528,6 +528,10 @@
     const composerRect = composerWrap.getBoundingClientRect();
     const offset = Math.max(16, mainRect.bottom - composerRect.top + 12);
     main.style.setProperty("--scroll-bottom-offset", Math.ceil(offset) + "px");
+    // 底部输入区整块（状态栏 + todo 面板 + 输入框 + 底边距）占用的高度：
+    // 右侧问题导航用它算自身可用高度，避免悬浮轨道/展开列表压住输入区。
+    const bottomStack = Math.max(0, mainRect.bottom - composerRect.top);
+    main.style.setProperty("--bottom-stack-height", Math.ceil(bottomStack) + "px");
     const chatBottomPadding = Math.max(56, mainRect.bottom - composerRect.top + 16);
     chatInner.style.setProperty("--chat-bottom-padding", Math.ceil(chatBottomPadding) + "px");
     if (keepBottom) chatScroll.scrollTop = chatScroll.scrollHeight;

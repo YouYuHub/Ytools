@@ -120,6 +120,7 @@ from factory.agent_runtime.context_compaction import (
     resolve_oversized_result_token_threshold,
     resolve_context_compaction_threshold,
 )
+from factory.agent_runtime.round_lease import RoundAbandoned, lease_path_for, new_lease, revoke_lease_file  # noqa: E402
 from factory.agent_runtime.tool_executor import (
     execute_tool_round,
     normalize_tool_calls,
@@ -380,6 +381,10 @@ class _SessionStream:
         self.live_round_usage_total: dict | None = None  # 本轮绝对累计用量（缓冲截断后附接仍可恢复）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
         self.stop_requested = False  # 仅属于这个生成任务，不存放在历史管理器中
+        # 写令牌（round lease）：本轮历史写权限。用户停止时主进程 revoke 后，
+        # 本轮的遗留写入（迟到工具返回/子 agent 上报）会被丢弃，因此停止接口
+        # 无需阻塞等它们退出（P0 软停止）。epoch 随 round_started 下发。
+        self.round_lease: Any = None
         self.cond = asyncio.Condition()
         # 运行中注入的用户消息队列（消息引导，inline 模式）：inject 接口写入，
         # 生成循环每轮检查点经 pop_injected_message 取出；与 worker 模式的
@@ -607,6 +612,13 @@ def _request_has_new_user_message(tool_request: ChatLLMRequest) -> bool:
     return False
 
 
+# 任务内压缩使用的「完整请求目标」暂存槽：由 _compact_task_context_if_needed 写入，
+# 紧接的单轮工具轨迹压缩读取，保证两部分共享同一预算（用户目标 = 历史部分预算，
+# 需加上 system/tools/摘要预留/问题索引 才能与全量估算比较）。
+# 0 表示本轮未启用用户目标（走动态可用空间）。
+_last_task_compaction_target: int = 0
+
+
 async def _compact_task_context_if_needed(
     messages: List[dict[str, Any]],
     tool_request: ChatLLMRequest,
@@ -628,7 +640,14 @@ async def _compact_task_context_if_needed(
     3. 暂时原样保留当前任务轮，随后由单轮压缩将工具轨迹纳入同一个完整窗口目标。
 
     返回重建后的 messages；未触发返回 None。
+
+    另有一个模块级槽 `_last_task_compaction_target`：任务内压缩若使用了用户目标，
+    就把「历史目标 + 不可压缩固定开销」换算出的完整请求目标暂存于此，供紧接的
+    单轮工具轨迹压缩共用同一预算（两项变量不跨函数可见，用返回值会破坏既有
+    `messages | None` 契约）。
     """
+    global _last_task_compaction_target
+    _last_task_compaction_target = 0
     # 发送口径：历史思考不随请求回传（copy_for_request 剥离），估算需一致，
     # 否则长任务的大量思考会把全量估算推高到远低于真实规模的阈值时误触发
     context_now = estimate_send_context_tokens(messages, tool_request.tools)
@@ -659,30 +678,27 @@ async def _compact_task_context_if_needed(
         threshold - system_tokens - tools_tokens - active_tokens
         - summary_reserve - RECENT_QUESTIONS_TOKEN_BUDGET - safety_reserve,
     )
-    # 任务进行中触发压缩时，目标约束完整请求而非只约束历史：为系统/工具定义、
-    # 当前用户问题、本轮工具轨迹摘要和最近问题索引预留空间，剩余预算再分给历史。
-    # 当前轮工具结果稍后会由单轮压缩替换成摘要；用户问题始终原样保留。
+    # 任务进行中触发压缩时，用户设置的目标（target_tokens）语义为「历史部分预算」：
+    # 它只管历史轮次的原始对话规模，不再背系统提示词 / 工具定义 / 当前轮用户
+    # 消息 / 摘要预留这些不可压缩的固定开销。
+    #
+    # 旧实现把目标当「完整请求目标」去减固定开销：628k 窗口下 system+tools+当前轮
+    # 往往就能吃掉一个小目标（如 60k），减法结果为负 → max(2048) 兜底成 2048，
+    # 历史被压得几乎清零（实测会话事件里反复出现 limit=2048、after 只剩 1~2k），
+    # 而用户设的 60k 完全没起作用。现在目标直接就是历史预算，只受「动态可用
+    # 空间」上限约束，保证压缩后完整请求仍然不超窗。
     history_target = resolve_history_target_tokens(compaction_settings)
     target_history_budget = 0
     if history_target > 0:
-        preserved_user_messages = [
-            message for message in active_messages
-            if isinstance(message, dict) and message.get("role") == "user"
-        ]
-        if _has_tool_trace(active_messages):
-            active_fixed_tokens = estimate_send_context_tokens(preserved_user_messages)
-            active_summary_reserve = resolve_effective_summary_budget(compaction_settings)
-        else:
-            # 没有可摘要的工具轨迹時，本轮内容不可压缩，必须按原文为其留预算。
-            active_fixed_tokens = active_tokens
-            active_summary_reserve = 0
-        target_history_budget = max(
-            2048,
-            history_target - system_tokens - tools_tokens
-            - active_fixed_tokens - active_summary_reserve
-            - RECENT_QUESTIONS_TOKEN_BUDGET - 64,
-        )
+        target_history_budget = history_target
         history_budget = min(history_budget, target_history_budget)
+        # 换算成完整请求目标：单轮压缩要拿它与 before_tokens（全量估算）比。
+        # 直接把用户目标（历史部分）当完整目标比，60000 永远小于 system+tools，
+        # 会导致 target_reduction_needed 恒真、每轮多压一次。
+        _last_task_compaction_target = (
+            target_history_budget + system_tokens + tools_tokens
+            + summary_reserve + RECENT_QUESTIONS_TOKEN_BUDGET
+        )
     task_summary_budget = (
         resolve_effective_summary_budget(
             compaction_settings,
@@ -694,7 +710,7 @@ async def _compact_task_context_if_needed(
         f"动态历史预算 {history_budget}（系统 {system_tokens} + 工具 {tools_tokens} + "
         f"当前轮 {active_tokens} + 摘要预留 {summary_reserve} + 问题索引 "
         f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}；"
-        f"完整窗口目标 {history_target or '未启用'}，目标历史预算 {target_history_budget or '未启用'}），"
+        f"用户历史目标 {history_target or '未启用'}，取较小值后实际预算 {target_history_budget or '未启用'}），"
         f"预算内轮次保留原始对话，超出部分压缩")
     await compact_session_history_if_needed(
         session_chat_memory,
@@ -1103,6 +1119,26 @@ async def _run_chat_generation(
     incoming_messages = list(messages)
     # 聊天记录，用于记录历史聊天所有信息
     session_chat_memory = await get_chat_memory_manager(session_id)
+    # 写令牌：本轮拥有唯一的 epoch；用户停止时主进程 revoke 后，本轮遗留
+    # 写入（迟到工具返回/子 agent 上报、300s 后才回来的 MCP 工具）会被丢弃。
+    # worker 模式：主进程派发前已写 dispatch 戳，这里收养（epoch 不变）；
+    # inline 模式无派发戳，此处新建。
+    # 拿不到会话文件路径（如单测的轻量 stub）时跳过令牌：不阻断生成路径。
+    from factory.agent_runtime.round_lease import adopt_dispatch_lease, lease_path_for, stamp_round_lease
+    lease_file = getattr(session_chat_memory, "_file_path", None)
+    if lease_file is not None:
+        lease_path = lease_path_for(lease_file)
+        round_lease = adopt_dispatch_lease(lease_path, session_id)
+        if round_lease is None:
+            # inline 模式，或 worker 未拿到派发戳：本进程新建（覆盖上轮遗留标记）
+            round_lease = stamp_round_lease(lease_path, session_id)
+        if round_lease.revoked():
+            # 用户已在「派发后、生成开始前」点了停止：立即结束，不写任何历史。
+            logger.info(f"会话 [{session_id}] 轮次在派发后被停止（epoch={round_lease.epoch}），跳过生成")
+            return
+        session_chat_memory._round_lease = round_lease
+        if stream is not None:
+            stream.round_lease = round_lease
     from security.authorization import execution_active
     stop_checker = lambda: bool(getattr(stream, "stop_requested", False) or getattr(stream, "user_stop_requested", False)
                                 or not execution_active(session_id))  # noqa: E731
@@ -2006,6 +2042,7 @@ async def _run_chat_generation(
                 if full_response:
                     await session_chat_memory.add_chat_history({"role": "assistant", "content": full_response})
                 # 手动停止：不再写入"停止任务"假消息，直接以 stopped 状态收尾当前轮次
+                # （ tolerate_revoked：用户停止时主进程已撤销令牌并定稿，这里安静跳过）
                 await session_chat_memory.stop_current_round()
                 break  # 任务结束，退出循环
             if text_tool_call_name and not tool_calls:
@@ -2952,6 +2989,9 @@ async def _run_chat_generation(
                     task_history_compacted = True
                 try:
                     current_tool_result_count = await session_chat_memory.get_current_round_tool_result_count()
+                    # 用户目标语义是「历史部分预算」；单轮压缩要与完整请求估算比较，
+                    # 用 _compact_task_context_if_needed 换算好的完整请求目标（包含
+                    # system/tools/摘要预留/问题索引），两者共享同一预算。
                     round_compaction = await compact_active_round_context_if_needed(
                         messages,
                         tool_request,
@@ -2960,6 +3000,7 @@ async def _run_chat_generation(
                         responses_manager=session_chat_memory,
                         # 同一次阈值触发先压历史再压本轮工具轨迹；让两部分共享目标预算。
                         enforce_target=task_history_compacted,
+                        full_request_target=_last_task_compaction_target or None,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -3030,7 +3071,8 @@ async def _run_chat_generation(
         # 收尾，不能留下 writer 仍存活、以后却无法恢复的 running 检查点。
         pending_round = getattr(getattr(session_chat_memory, "_round_store", None), "pending_round", None)
         if pending_round is not None and not (permission_state and permission_state["state"] == "suspended"):
-            session_chat_memory._finish_current_round("stopped" if getattr(stream, "user_stop_requested", False) else "error")
+            session_chat_memory._finish_current_round("stopped" if getattr(stream, "user_stop_requested", False) else "error",
+                                                      tolerate_revoked=True)
         stream.stop_requested = True
         # target_round / insert_round 兜底复位：正常路径由收尾替换/插入逻辑
         # 复位，异常路径下管理器缓存随 cleanup 销毁自然复位；这里显式兜底防
@@ -3064,14 +3106,35 @@ def _generation_use_worker() -> bool:
 
 
 async def _wait_worker_idle(proxy, timeout: float = 15.0) -> None:
-    """等待会话 worker 完全退出当前生成任务；超时强制终止兜底。
+    """等待会话 worker 退出「本次停止所针对的那一轮」生成；超时强制终止兜底。
 
     JSONL 写入是「临时文件 + 原子替换」，强制终止不会损坏已落盘数据；
     未收尾的当前轮由 worker 重启后的检查点恢复机制标记 interrupted。
+
+    代次校验（关键）：is_generation_running 是共享布尔量，用户“停止后立即重发”
+    时新 generate 会把它重新置 True。旧实现据此误判“旧任务仍在跑”，等到超时
+    就 terminate，把正在跑新消息的 worker 强杀（新消息被吃）。现在记下进入时
+    的代次：一旦发现代次变了，说明本轮已被新生成接管，立即退让不插手——
+    新任务由它自己的生命周期负责，旧停止不再有权限定它。
     """
     deadline = time.monotonic() + timeout
+    seq_reader = getattr(proxy, "generation_seq", None)
+    start_seq = seq_reader() if callable(seq_reader) else None
     while proxy.is_generation_running():
+        if callable(seq_reader):
+            current_seq = seq_reader()
+            # 代次变了 = 新 generate 已接管；我等的旧轮已不在等待范围内
+            if start_seq is not None and current_seq != start_seq:
+                logger.info(
+                    "停止等待退让：生成代次 %s → %s（新任务已接管，不强杀 worker）",
+                    start_seq, current_seq,
+                )
+                return
         if time.monotonic() >= deadline:
+            # 终止前二次确认：期间若已换代，仍以“不插手”为准
+            if callable(seq_reader) and start_seq is not None and seq_reader() != start_seq:
+                logger.info("停止等待超时但代次已变化，跳过强杀")
+                return
             proxy.terminate("等待旧生成任务退出超时")
             return
         await asyncio.sleep(0.05)
@@ -3151,6 +3214,7 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
     挂到 stream.task；inline 模式：保持旧行为，在主进程内起 asyncio 任务。
     返回 False 表示启动失败（已向流内写入 error 事件）。
     """
+    session_id = normalize_session_id(getattr(tool_request, "session_id", "default"))
     # 权限恢复的新流只含恢复点之后的事件；检查点里更早的工具结果仍由
     # 历史快照提供，不能声明可替换整个任务。日志本身仍保存全部恢复段。
     stream._replay_has_history_prefix = bool(permission_resume_id)
@@ -3167,7 +3231,7 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
                 logger.exception("释放未被接管的恢复任务失败")
     if not permission_resume_id:
         try:
-            retired = await _retire_interrupted_tasks(tool_request.session_id) if _request_has_new_user_message(tool_request) else 0
+            retired = await _retire_interrupted_tasks(session_id) if _request_has_new_user_message(tool_request) else 0
         except Exception as error:
             await _stream_emit(stream, _sse_error_payload(f"无法接续中断任务：{error}"))
             await stream.finish()
@@ -3179,9 +3243,7 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
     # 会话配置快照：首次正式开始任务时把当前全局默认（模型/工具/工作目录）
     # 固化为会话独立配置，此后该会话不再跟随全局设置变化（幂等，快照过即跳过）。
     try:
-        session_chat_memory = await get_chat_memory_manager(
-            normalize_session_id(getattr(tool_request, "session_id", "default"))
-        )
+        session_chat_memory = await get_chat_memory_manager(session_id)
         if not permission_resume_id and hasattr(session_chat_memory, "_recover_pending_round_checkpoint"):
             # A cached manager can predate the writer's death, including death
             # before a durable tool checkpoint existed. Recheck before new input.
@@ -3191,6 +3253,16 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
         logger.warning(f"会话配置快照失败（不影响本轮对话）: {snapshot_error}")
     if proxy is not None:
         proxy.bind_stream(stream)
+        # 派发前打戳：本进程先写下本轮 epoch（revoked=0），worker 开跑时收养它。
+        # 否则「已派发、worker 尚未进生成循环」的窗口里点停止时无令牌可撤，
+        # 旧任务在这段时间写的压缩事件/首轮消息会污染新轮。
+        try:
+            from factory.agent_runtime.round_lease import lease_path_for, stamp_dispatch_lease
+            lease_file = getattr(session_chat_memory, "_file_path", None)
+            if lease_file is not None:
+                stamp_dispatch_lease(lease_path_for(lease_file), session_id)
+        except Exception as lease_error:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 派发打戳失败（worker 将自建令牌）: {lease_error}")
         # Preserve explicit parameter selection across the process boundary.
         # Serializing defaults would turn Chat-only defaults into native opts.
         try:
@@ -3220,6 +3292,10 @@ async def _start_session_generation(proxy, stream, tool_request: ChatLLMRequest,
             await _run_chat_generation(tool_request, stream, permission_resume_id=permission_resume_id)
         except asyncio.CancelledError:
             raise
+        except RoundAbandoned as abandoned:
+            # 写令牌已被撤销（用户已停止）：旧任务迟到收尾，安静退出。
+            # 绝不能当成错误推给用户（用户已经看到“已停止”了）。
+            logger.info(f"生成任务写令牌已撤销，安静结束：{abandoned}")
         except Exception as error:
             if not stream.done:
                 await _stream_emit(stream, _sse_error_payload(f"生成任务异常终止：{error}"))
@@ -3651,8 +3727,14 @@ def _injected_media_refs(content: Any) -> list[dict]:
 
 
 async def _stop_saved_permission_tasks(session_id):
-    """确认写者停止后，收尾权限快照与首个工具调用前的轮次检查点。"""
+    """确认写者停止后，收尾权限快照与首个工具调用前的轮次检查点。
+
+    写者存活时不抢写：用户“停止后立即重发”时新 generate 已接管 worker，
+    此时强行为旧轮收尾会与新任务各写一份，造成重复轮次/轮号后移；把
+    审批任务标 cancelled 也会让用户的“允许”落到已取消的任务上。
+    """
     from memory import permission_store
+    from memory.chat_memory import _pid_alive
     from factory.agent_runtime.permission_runtime import close_pending_native
     permission_store.pending(session_id)
     with permission_store.database() as db:
@@ -3661,60 +3743,207 @@ async def _stop_saved_permission_tasks(session_id):
         saved = permission_store.load_checkpoint(task_id)
         if not saved:
             continue
+        # 检查点写者仍存活 = 新任务已接管该会话，收尾交给它自己做
+        pending_round = saved.get("pending_round") or {}
+        writer_pid = pending_round.get("writer_pid") if isinstance(pending_round, dict) else None
+        if isinstance(writer_pid, int) and _pid_alive(writer_pid):
+            logger.info(f"跳过审批任务收尾：任务 [{task_id}] 写者仍存活（新任务已接管）")
+            continue
         current = permission_store.task(task_id)
         manager = await get_chat_memory_manager(session_id)
         original = current["data"].get("request", {})
-        await manager.finish_saved_permission_round(saved.get("pending_round"), original.get("target_round"), original.get("insert_round"))
+        await manager.finish_saved_permission_round(
+            saved.get("pending_round"), original.get("target_round"), original.get("insert_round"),
+            require_dead_writer=True,
+        )
         close_pending_native(task_id, session_id, "用户停止原任务")
         permission_store.set_task_state(task_id, "cancelled")
     from memory.chat_memory import chat_memory_file_exists
     if chat_memory_file_exists(session_id):
         manager = await get_chat_memory_manager(session_id)
-        await manager.stop_current_round(recover_checkpoint=True)
+        # require_dead_writer：worker 仍在写时不抢写（停止后立即重发场景：
+        # 新 generate 已接管 worker，收尾交给它自己做，主进程只做采样性兜底）
+        result = await manager.stop_current_round(
+            recover_checkpoint=True, require_dead_writer=True)
+        if result == "写者仍存活":
+            logger.info(f"停止收尾跳过：会话 [{session_id}] 写者仍存活（新任务已接管）")
 
 
-async def stop_chat_task(session_id):
+async def stop_chat_task(session_id, *, soft: bool = True):
     ''' 手动停止当前会话的聊天任务。
 
-    worker 模式（默认）：向会话 worker 发送 stop 命令，worker 内置
-    置当前任务停止信号并取消生成任务，事件经 IPC 回流收尾；随后确认 worker
-    已完全退出当前任务（超时则强制终止兜底）。
-    inline 模式保持原两步停止：
-    1. 置当前任务停止信号：生成循环在下一次检查点（流式事件/工具结果处理）主动退出；
-    2. 取消后台生成任务（asyncio.Task.cancel）：工具执行已挪到工作线程，事件循环
-       不再被阻塞，即使当前正卡在工具调用上，取消也能在 await 点生效并触发
-       CancelledError 收尾（user_stop_requested 标记使其按"手动停止"落盘）。
-    取消只作用于生成任务本身，不影响 SSE 消费端连接。
+    三阶段设计（软/硬分离，让停止感知 ≤1 秒）：
+
+    **软停止（soft=True，默认，立即返回）**
+    1. 撤销写令牌（round lease）：本轮旧任务从此写不进历史，
+       包括 300 秒后才返回的 MCP 工具、子 agent 迟到上报；
+    2. 置中断标志（user_stop_requested / stop_requested）；
+    3. 向 worker 发送 stop 命令（非阻塞 send，不等回执）；
+    4. 主进程自己定稿本轮为 stopped（不等 worker 结账）。
+
+    **硬停止（后台线程，不阻塞 HTTP）**
+    等 worker 退出（超时强杀）、收尾权限快照、清理孤儿资源。
+    它失败不影响已经完成的软停止：会话状态已经是 stopped，
+    用户可以立即继续或发新消息。
+
+    soft=False 为兼容路径：同步跑完硬停止（内部/运维调用）。
     '''
     session_id = normalize_session_id(session_id)
-    if _generation_use_worker():
-        proxy = peek_worker_proxy(session_id)
-        stream = _get_session_stream(session_id)
-        if stream is not None:
-            stream.user_stop_requested = True
-            stream.stop_requested = True
-        if proxy is not None:
+    stream = _get_session_stream(session_id)
+    proxy = peek_worker_proxy(session_id) if _generation_use_worker() else None
+
+    # ---------- 阶段 1：软停止（全部是内存/短 IO 操作） ----------
+    # 撤销写令牌：worker 模式下 lease 对象不共享，必须走侧车文件；
+    # inline 模式下本进程有 lease 对象，直接 revoke（同时写侧车）。
+    from factory.agent_runtime.round_lease import lease_path_for, read_lease_file, revoke_lease_file
+    lease = getattr(stream, "round_lease", None) if stream is not None else None
+    if lease is not None:
+        lease.revoke("user_stop")
+    stop_epoch: str | None = None
+    try:
+        from memory.chat_memory import _get_chat_history_file
+        lease_path = lease_path_for(_get_chat_history_file(session_id))
+        # 先记下停止时的 epoch：后面定稿要用它确认“还是同一轮”
+        stop_epoch = str((read_lease_file(lease_path) or {}).get("epoch") or "") or None
+        revoked = revoke_lease_file(lease_path, "user_stop")
+        if revoked:
+            logger.info(f"会话 [{session_id}] 写令牌已跨进程撤销，遗留写入将被丢弃")
+        else:
+            # 侧车无 epoch：说明本轮还没真正开始写（或本来就无任务）。
+            # 后续 worker activate 仍会建新令牌，由 worker 侧 stop 命令打断。
+            logger.info(f"会话 [{session_id}] 无可撤销的写令牌（本轮尚未开始写入）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"会话 [{session_id}] 撤销写令牌失败（继续停止）: {exc}")
+    if stream is not None:
+        stream.user_stop_requested = True
+        stream.stop_requested = True
+    if proxy is not None:
+        # 非阻塞：只发 IPC 命令，不等 worker 回执
+        try:
             proxy.request_stop(reason="user")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 发送 stop 命令失败（继续收尾）: {exc}")
+    # 主进程自己定稿：不再等 worker 把轮次写完。令牌已撤销，worker 侧
+    # 即使还在跑也写不进历史，不会双写。
+    #
+    # 但定稿本身要写整份 JSONL（大历史会到几十 MB），不能让它拖死响应：
+    # 给 2s 上限，超时交给后台硬停止重试——用户已经能立即继续/发新消息。
+    try:
+        await asyncio.wait_for(
+            _finalize_round_locally(session_id, "stopped", expected_epoch=stop_epoch),
+            timeout=2.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"会话 [{session_id}] 软停止定稿超时（2s），转交后台硬停止重试")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"会话 [{session_id}] 软停止定稿失败（后台硬停止会重试）: {exc}")
+    # 立即结束本会话的主进程 stream：SSE 生成器马上退出，前端不需等旧
+    # worker 收尾。旧轮迟到事件由 worker 代理的代次过滤丢弃，不会泄露到
+    # 新轮的 stream。
+    if stream is not None and not stream.done:
+        try:
+            await stream.finish()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 软停止结束 stream 失败: {exc}")
+
+    # ---------- 阶段 2：硬停止（后台，不阻塞调用方） ----------
+    if soft:
+        _schedule_hard_stop(session_id, proxy, stop_epoch)
+        return
+    await _hard_stop(session_id, proxy, stop_epoch)
+
+
+async def _finalize_round_locally(session_id: str, status: str = "stopped",
+                                 expected_epoch: str | None = None) -> None:
+    """主进程侧把当前轮定稿（不等 worker）。
+
+    用 `.pending` 检查点恢复出完整轮次并写成 `stopped`。写令牌已撤销，
+    worker 侧即使后续收尾也写不进（会被 `_assert_lease_writable` 丢弃），
+    所以不会出现两份轮次。
+
+    `expected_epoch`：仅当侧车 epoch 仍是停止时刻的那个才定稿。
+    硬停止是后台执行，期间用户可能已经发了新消息（新轮已重新 activate
+    lease），此时 `.pending` 属于新轮，直接以 stopped 收尾会错杀正常新轮。
+    """
+    from memory.chat_memory import chat_memory_file_exists, _get_chat_history_file
+    if not chat_memory_file_exists(session_id):
+        return
+    if expected_epoch:
+        from factory.agent_runtime.round_lease import lease_path_for, read_lease_file
+        data = read_lease_file(lease_path_for(_get_chat_history_file(session_id)))
+        current = (data or {}).get("epoch")
+        if current and current != expected_epoch:
+            logger.info(
+                f"会话 [{session_id}] 定稿跳过：新轮已接管（{current} != {expected_epoch}）"
+            )
+            return
+    manager = await get_chat_memory_manager(session_id)
+    try:
+        # check_lease=False：本方法就是软停止的执行体，令牌刚刚被撤销，
+        # 若再校验会把“合法的定稿写入”也拦掉。
+        result = manager._finish_current_round(status, recover_checkpoint=True, check_lease=False)
+        logger.info(f"会话 [{session_id}] 本地定稿完成：{result}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"会话 [{session_id}] 本地定稿异常: {exc}")
+
+
+def _schedule_hard_stop(session_id: str, proxy, stop_epoch: str | None = None) -> None:
+    """把硬停止丢到后台线程，不占 HTTP 请求。"""
+    import threading
+
+    loop = _capture_event_loop()
+
+    def _runner() -> None:
+        try:
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(_hard_stop(session_id, proxy, stop_epoch), loop)
+            else:  # 事件循环不可用：新建一个跑完就关
+                asyncio.run(_hard_stop(session_id, proxy, stop_epoch))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 硬停止失败（不影响软停止）: {exc}")
+
+    threading.Thread(
+        target=_runner, name=f"chat-hard-stop-{session_id}", daemon=True
+    ).start()
+
+
+def _capture_event_loop():
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            return asyncio.get_event_loop_policy().get_event_loop()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+async def _hard_stop(session_id: str, proxy, stop_epoch: str | None = None) -> None:
+    """资源层收尾：等 worker 退出、收尾权限快照、清理孤儿。
+
+    失败不向上抛：软停止已经完成，用户侧状态已正确；这里只是资源回收。
+    """
+    try:
+        stream = _get_session_stream(session_id)
+        # 后台重试一次定稿：软停止那边可能因 2s 超时未完成。
+        # expected_epoch 保证新轮已接管时不会错杀新轮。
+        try:
+            await _finalize_round_locally(session_id, "stopped", expected_epoch=stop_epoch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"会话 [{session_id}] 硬停止定稿重试失败: {exc}")
+        if stream is not None and not proxy:
+            # inline 模式：取消后台生成任务（工具已挪到工作线程，cancel 在
+            # 下一个 await 点生效；写令牌已撤销，收尾写入会被丢弃）
+            task = getattr(stream, "task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"会话 [{session_id}] 生成任务退出异常（已忽略）: {exc}")
+        if proxy is not None:
             await _wait_worker_idle(proxy, timeout=15.0)
         await _stop_saved_permission_tasks(session_id)
-        return
-    stream = _get_session_stream(session_id)
-    if stream is None:
-        await _stop_saved_permission_tasks(session_id)
-        return
-    stream.user_stop_requested = True
-    stream.stop_requested = True
-    task = stream.task
-    if task is not None and not task.done():
-        task.cancel()
-        # 不要在这里立即返回：调用方需要确认后台任务已经退出，避免停止后
-        # 仍有 finally/历史写入在后台运行，重载或启动下一轮时与旧任务交错。
-        # 工具执行在工作线程中时，cancel 会先让生成协程退出；工具线程本身
-        # 由其超时配置收尾，不再阻塞本请求的事件循环。
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.warning(f"停止会话任务时忽略后台异常: {exc}")
-    await _stop_saved_permission_tasks(session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"会话 [{session_id}] 硬停止收尾异常（已忽略）: {exc}")

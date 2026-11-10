@@ -68,7 +68,11 @@
     const policyBox = section("压缩策略", "普通自动压缩按较小模型窗口判断；手动、超窗保护或历史修改重建有各自触发原因。");
     line(policyBox, "聊天与压缩模型的较小窗口", number(policy.effective_window) + " tokens");
     line(policyBox, "自动触发比例 / 阈值", (100 * Number(policy.trigger_ratio || 0)).toFixed(0) + "% / " + number(policy.trigger_threshold) + " tokens");
-    line(policyBox, "触发后的历史目标", Number(policy.target_tokens) > 0 ? number(policy.target_tokens) + " tokens" : "未单独指定");
+    // 历史目标语义：>0 时为「历史部分上限」（不含固定开销）；0 时后端按动态
+    // 可用空间自动算（触发阈值 − 系统/工具/当前轮/摘要预留/问题索引/余量）。
+    line(policyBox, "触发后的历史目标", Number(policy.target_tokens) > 0
+      ? number(policy.target_tokens) + " tokens（历史部分上限）"
+      : "动态可用空间（按阈值扣除固定开销自动计算）");
     line(policyBox, "累计摘要预算", number(policy.summary_budget) + " tokens");
     const actions = node("div", "context-panel-actions");
     const compact = operation("手动压缩…", () => App.startManualCompaction());

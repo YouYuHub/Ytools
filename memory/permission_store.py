@@ -512,7 +512,10 @@ def suspend_session(session):
 
 def delete_session(session):
     from security.authorization import session as authorize_session
-    session = authorize_session(session)
+    # cleanup=True：本函数是删除流程的收尾，目标会话此时已被标 deleted /
+    # cleanup_pending。沿用默认 cleanup=False 会在此抛 404，使“文件已删成功
+    # 但接口返回 404”的假失败出现（实测反复点确认弹窗都关不掉）。
+    session = authorize_session(session, cleanup=True)
     with database() as db:
         for table in ("approvals", "executions", "checkpoints"):
             db.execute(f"DELETE FROM {table} WHERE task IN (SELECT id FROM tasks WHERE session=?)", (session,))

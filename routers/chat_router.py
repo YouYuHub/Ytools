@@ -167,11 +167,20 @@ async def chat_with_tool(request: Request):
 
 # 停止当前聊天任务接口
 @api_chat_router.post('/stop_chat')
-async def stop_chat(session_id: str = "default"):
-    """ 停止当前聊天任务 """
+async def stop_chat(session_id: str = "default", phase: str = "soft"):
+    """ 停止当前聊天任务。
+
+    phase=soft（默认）：只做必要的事并立即返回——撤销写令牌、置中断标志、
+    发 worker stop 命令、主进程定稿本轮；资源回收（等 worker 退出、权限快照
+    收尾）转到后台。这样响应时间从「最慢的资源回收」降到几十毫秒。
+
+    phase=hard：同步跑完硬停止（内部/运维用）。
+
+    安全性不依赖“等旧任务退出”：写令牌已撤销，旧任务迟到返回也写不进历史。
+    """
     try:
-        await stop_chat_task(normalize_session_id(session_id))
-        return {'stop_chat': 'stopped'}
+        await stop_chat_task(normalize_session_id(session_id), soft=(phase != "hard"))
+        return {'stop_chat': 'stopped', 'phase': phase}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -294,7 +303,12 @@ async def chat_stream_status(session_id: str = "default"):
     """
     try:
         normalized_session_id = normalize_session_id(session_id)
-        running = _session_generation_busy(normalized_session_id)
+        # 物理运行态 + 写令牌撤销态：软停止后 worker 可能还在收尾（工具线程/
+        # MCP 调用），但本轮已无写权限——不可能再产出任何历史，对用户而言
+        # 就是“已停止”。不扣这个的话，▶ 继续要等 worker 空闲（最多 15s）。
+        busy = _session_generation_busy(normalized_session_id)
+        abandoned = _round_lease_revoked(normalized_session_id)
+        running = busy and not abandoned
         last_status = await _last_round_status_for_resume(normalized_session_id)
         can_resume = (not running) and _resumable_state(normalized_session_id, last_status)
         return JSONResponse(content={
@@ -302,9 +316,22 @@ async def chat_stream_status(session_id: str = "default"):
             "can_resume": can_resume,
             "last_round_status": last_status,
             "session_id": normalized_session_id,
+            # 诊断用：已软停止但资源仍在后台回收
+            "winding_down": bool(busy and abandoned),
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _round_lease_revoked(session_id: str) -> bool:
+    """本轮写令牌是否已被撤销（用户已停止）。读失败一律当未撤销。"""
+    try:
+        from factory.agent_runtime.round_lease import lease_path_for, read_lease_file
+        from memory.chat_memory import _get_chat_history_file
+        data = read_lease_file(lease_path_for(_get_chat_history_file(session_id)))
+        return bool(data and data.get("revoked"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _resumable_state(session_id: str, last_status: str | None) -> bool:
@@ -614,17 +641,40 @@ async def delete_chat_history(session_id: str = "default"):
         操作结果
     """
     session_id = normalize_session_id(session_id)
+    # 停任务尽力而为：会话都要删了，旧任务收尾失败（例如写盘时被目录状态
+    # 检查拒绝、worker 已死、写者仍在跑）不应阻断删除本身。之前这里直连
+    # await stop_chat_task，它内部的 _stop_saved_permission_tasks 会走写路径，
+    # 在「会话已被标 deleted/cleanup_pending」时抛 HTTPException(404)，
+    # 而外层只 except OSError，导致 404 直接冒到前端：弹窗不关、用户以为失败。
     try:
         from factory.chat_factory import stop_chat_task
         await stop_chat_task(session_id)
+    except Exception as e:  # noqa: BLE001 —— 含 HTTPException，兜底不阻断删除
+        logger.warning(f"删除会话 [{session_id}] 前停止任务失败（忽略，继续删除）: {e}")
+    try:
         result = ChatMemoryManager.delete_chat_session_file(session_id)
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"删除会话文件失败: {e}")
-    # 清理缓存的管理器实例，避免下次操作时重建已删除的目录/文件
-    from memory.permission_store import delete_session
-    delete_session(session_id)
-    await cleanup_file_memory_manager(session_id)
-    await cleanup_chat_memory_manager(session_id)
+    except HTTPException as e:
+        # 会话已被删除/正在清理（或无权访问）→ 对调用方而言是幂等成功：
+        # 目标状态已达成，前端应关弹窗、移除行，而不是报错后留着弹窗。
+        if e.status_code == 404:
+            logger.info(f"删除会话 [{session_id}] 已经是已删除/清理中状态，按幂等成功返回")
+            result = {"state": "succeed", "describe": f"会话 {session_id} 已删除"}
+        else:
+            raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # 清理缓存的管理器实例，避免下次操作时重建已删除的目录/文件。
+    # 这段是删除成功后的收尾，任何失败都不应把成功改成错误响应（否则前端
+    # 看到 404/500 却已经把会话删掉了，弹窗关不掉、用户反复重试）。
+    try:
+        from memory.permission_store import delete_session
+        delete_session(session_id)
+        await cleanup_file_memory_manager(session_id)
+        await cleanup_chat_memory_manager(session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"删除会话 [{session_id}] 成功，但收尾清理失败（忽略）: {e}")
     return JSONResponse(content=result)
 
 

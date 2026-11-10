@@ -183,9 +183,16 @@
         // 有附件时允许无文本发送；引用本身不构成提问（仍要求正文或附件）
         if (!text && !pendingMedia.length)
             return;
-        // 仅当“当前会话”正在流式时禁止发送；其他会话在后台流式不影响本会话发送
-        if (state.streaming && state.streamingSession === state.sessionId)
-            return;
+        // 仅当“当前会话”正在流式时禁止发送；其他会话在后台流式不影响本会话发送。
+        // 例外：本会话处于“停止中”（已点停止、后端已撤销写令牌并定稿本轮）时
+        // 允许发送——旧任务已无写权限，不会与新轮交错；这也是“停止后立即
+        // 重发”能真正生效的前提（以前直接 return 会默默吞掉用户输入）。
+        if (state.streaming && state.streamingSession === state.sessionId) {
+            const stoppingThis = App.taskStatus && App.taskStatus.isStopping
+                && App.taskStatus.isStopping(state.sessionId);
+            if (!stoppingThis)
+                return;
+        }
         // 目标会话同步冻结：首个 await 之前确定本消息归属（新对话顺便分配 ID）。
         // 否则发送瞬间切会话会导致消息发到目标会话（发送中途切会话实证）。
         // 首次发送才分配会话 ID（"新对话"后一直处于待开始状态）
@@ -199,7 +206,9 @@
             toast("正在压缩对话上下文，请稍后再发送");
             return;
         }
-        // 其他会话的流仍在监听：先放弃本地监听（其后端任务继续在后台生成，可随时切回续看）
+        // 其他会话的流仍在监听（或本会话处于“停止中”的旧流）：先放弃本地监听。
+        // stopping 情况下旧流已 abort 过（点停止时），这里只是清理全局标志，
+        // 避免旧流的收尾把刚开的新一轮流状态误清。
         if (state.streaming)
             detachAttachedStream();
         // 先置流式态再上传附件：上传期间同样锁住发送入口
@@ -884,25 +893,56 @@
         state.suppressFlushSession = streamSessionId;
         const active = state.activeStream && state.activeStream.sessionId === streamSessionId ? state.activeStream : null;
         const abort = active ? state.abort : null;
+        // 立即中止本地流 + 立即切“正在停止”态：后端 stop 要走 worker 取消+
+        // 收尾（内置工具被 cancel 时最多还要等它 20s 退出），以前是先 await 完
+        // 才 abort，用户感知就是“点了没反应”。现在先标停止相位（taskStatus
+        // 进入 stopping，收尾的 end() 据此按“用户停止”处理）→ 打 stopConfirmed
+        // → abort 本地流 → 再并行等后端确认；失败则回退重连（见 catch）。
+        const taskHandle = streamSessionId && App.taskStatus ? App.taskStatus.stopping(streamSessionId) : null;
+        if (active)
+            active.stopConfirmed = true;
+        if (abort)
+            abort.abort();
+        App.refreshComposerButtons();
+        // 降级守门：软停止应该几十毫秒内返回。若 3s 还没回来（后端卡住/网络
+        // 滞留），说明不能再把“停止中”当作可发送的依据，降为 stop_uncertain
+        // （界面保持已停止，但不再允许直接发送，避免与未知的后端状态交错）。
+        let settled = false;
+        // 降级守门：软停止应该几十毫秒内返回。若 3s 还没回来（后端卡住/网络
+        // 滞留），说明不能再把“停止中”当作可发送的依据，降为 stop_uncertain
+        // （界面保持已停止，但不再允许直接发送，避免与未知的后端状态交错）。
+        // 用 typeof 保护：vm 单测沙箱没有 setTimeout，不能因此报错。
+        const hasTimer = typeof setTimeout === "function";
+        const degradeTimer = hasTimer ? setTimeout(function () {
+            if (settled || !App.taskStatus)
+                return;
+            App.taskStatus.stopFailed(streamSessionId, { message: "后端响应超时" }, taskHandle);
+            toast("停止请求响应超时，已在本地停止；若后台仍在收尾，可稍后刷新确认");
+            App.refreshComposerButtons();
+        }, 3000) : null;
+        const clearDegrade = function () {
+            if (degradeTimer !== null && typeof clearTimeout === "function")
+                clearTimeout(degradeTimer);
+        };
         if (streamSessionId) {
-            const taskHandle = App.taskStatus && App.taskStatus.stopping(streamSessionId);
             try {
                 await API.stopChat(streamSessionId);
+                settled = true;
+                clearDegrade();
                 if (App.taskStatus)
                     App.taskStatus.stopped(streamSessionId, taskHandle);
-                // 暂停成功：末轮即 stopped，可继续（本地确定态，直接同步免查询）；
-                // 同时给本地流打停止确认标记，其中断收尾跳过重同步，避免落盘
-                // 窗口内的查询把 true 覆盖回 false（停止按钮不显示恢复按钮的根因）。
-                if (active)
-                    active.stopConfirmed = true;
+                // 暂停成功：末轮即 stopped，可继续（本地确定态，直接同步免查询）
                 if (App.setResumeAvailable)
                     App.setResumeAvailable(streamSessionId, true);
             }
             catch (error) {
-                // 后端不可用（网络层错误）且本地已无活动流：任务大概率已随后端中断
-                // 而消失，本地收尾为已停止以便重启后端后直接继续；若后端任务实际仍在，
-                // 下一次发送会按“新消息打断旧任务”语义平滑接管，不会产生双任务。
-                if (!active && error && error.name !== "AbortError" && error.status == null) {
+                settled = true;
+                clearDegrade();
+                // 后端不可用（网络层错误）且本地没有活动流：任务大概率已随后端中断而消失，
+                // 本地收尾为已停止（重启后端后可直接继续）；若后端任务实际仍在，下一次发送
+                // 会按“新消息打断旧任务”语义平滑接管，不会产生双任务。
+                const networkDown = !active && error && error.name !== "AbortError" && error.status == null;
+                if (networkDown) {
                     if (App.taskStatus)
                         App.taskStatus.stopped(streamSessionId, taskHandle);
                     if (App.setResumeAvailable)
@@ -911,16 +951,18 @@
                     App.refreshComposerButtons();
                     return;
                 }
-                state.suppressFlushSession = null;
+                // 本地流已中止但后端没确认停止：撤掉 stopConfirmed，让收尾的
+                // 可用性重同步接管（会向后端查 can_resume，必要时恢复 ▶）
+                if (active)
+                    active.stopConfirmed = false;
                 if (App.taskStatus)
                     App.taskStatus.stopFailed(streamSessionId, error, taskHandle);
-                toast("停止失败，请重试：" + error.message);
-                return;
+                toast("停止失败，已中止本地显示；后端任务可能仍在，可刷新重连：" + (error && error.message || error));
+                if (App.refreshResumeAvailability)
+                    App.refreshResumeAvailability(streamSessionId);
+                App.refreshComposerButtons();
             }
         }
-        if (abort && state.activeStream === active)
-            abort.abort();
-        App.refreshComposerButtons();
     });
     /**
      * 放弃当前监听的流：仅中止本地连接（后端生成任务继续在后台运行，随时可切回续看），

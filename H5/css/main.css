@@ -833,13 +833,15 @@ html[data-theme=dark] .panel .side-actions .bulk-mode-toggle.bulk-mode-active {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.panel .session-head .session-time-filter-btn:hover {
-  color: var(--text);
-  border-color: var(--border);
-}
 .panel .session-head .session-time-filter-btn.is-active {
   color: var(--accent);
-  border-color: var(--accent);
+}
+.panel .session-head .session-time-filter-btn:hover {
+  color: var(--text);
+}
+.panel .session-head .session-time-filter-btn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 .panel .session-head .session-time-panel {
   position: absolute;
@@ -4371,7 +4373,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .ask-block {
   width: 100%;
   border: 1px solid var(--border-strong);
-  border-left: 3px solid #0b84d8;
+  border-left: 3px solid var(--tool-icon-pink);
   border-radius: var(--radius-sm);
   background: var(--bg-elevated);
   padding: 10px 14px;
@@ -4385,7 +4387,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   gap: 6px;
   font-size: 13.5px;
   font-weight: 600;
-  color: #0b84d8;
+  color: var(--tool-icon-pink);
 }
 .ask-block .ask-block-title .ask-title-icon {
   width: 18px;
@@ -4407,7 +4409,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 .ask-block.ask-block-clickable:hover {
-  border-color: #0b84d8;
+  border-color: var(--tool-icon-pink);
   background: var(--bg-hover);
 }
 .ask-block.ask-block-stale {
@@ -7093,7 +7095,9 @@ body.tool-settings-open {
   position: absolute;
   right: 14px;
   top: 72px;
+  bottom: calc(var(--bottom-stack-height, 96px) + 16px);
   display: flex;
+  align-items: center;
   z-index: 30;
   pointer-events: none;
 }
@@ -7104,7 +7108,7 @@ body.tool-settings-open {
   align-items: stretch;
   justify-content: center;
   pointer-events: auto;
-  max-height: calc(100dvh - 160px);
+  max-height: 100%;
   overflow-y: auto;
   scrollbar-width: none;
 }
@@ -7168,7 +7172,7 @@ body.tool-settings-open {
   top: 50%;
   transform: translateY(-50%);
   width: min(320px, 100vw - 56px);
-  max-height: min(60vh, 480px);
+  max-height: min(480px, 100%);
   overflow: hidden auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -7257,6 +7261,8 @@ body.tool-settings-open {
   .qnav {
     display: none;
     top: 58px;
+    bottom: auto;
+    align-items: stretch;
     right: 12px;
     transform: none;
     max-width: calc(100cqw - 24px);

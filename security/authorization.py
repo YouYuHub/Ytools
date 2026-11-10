@@ -50,7 +50,11 @@ def session(identifier, *, create=False, cleanup=False, allow_unregistered=False
         from memory.storage_layout import _row
         from memory.session_catalog import BLOCKED
         row = _row(identifier)
-        if row and row["state"] in BLOCKED and not (cleanup and row["state"] in {"deleted", "cleanup_pending"}):
+        # cleanup=True（删除接口）：全量放行 BLOCKED。删除对这三种状态都应该是
+        # 幂等的——deleted/cleanup_pending（已删过）与 deleting（上次删一半就
+        # 中断了，例如目录删除抛错后未回写状态）都必须能再次进入删除流程，
+        # 否则会话会永久卡在 deleting，前端删不掉也打不开。
+        if row and row["state"] in BLOCKED and not cleanup:
             raise HTTPException(404, "会话已删除或正在清理")
         return row["id"] if row else identifier
     if create and owner is None:

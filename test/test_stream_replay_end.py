@@ -169,7 +169,11 @@ class StreamReplayEndTests(unittest.IsolatedAsyncioTestCase):
         adapter = _WorkerStreamAdapter("s", q)
         adapter.live_round_started_at_ms = 1720000000000
         evt = q.get_nowait()
-        self.assertEqual(evt, {"type": "live_round_started_at", "at_ms": 1720000000000})
+        # 事件现在带 generation（代次隔离：软停止后旧轮迟到事件需被丢弃），
+        # 只校验业务字段。
+        self.assertEqual(evt.get("type"), "live_round_started_at")
+        self.assertEqual(evt.get("at_ms"), 1720000000000)
+        self.assertIn("generation", evt)
         stream = cf._SessionStream("s")
         try:
             proxy = SimpleNamespace(_bound_stream=stream, loop=None)

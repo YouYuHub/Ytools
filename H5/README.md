@@ -193,6 +193,7 @@ H5/
 │   ├── live_tail_fixture.cjs   # 模拟 API 的长会话验证页，不调用模型或写入真实会话
 │   ├── maintenance_fixture.cjs # 实际 CSS/状态模块的隔离验证页
 │   ├── qnav_scroll_fixture.cjs # 少量问题/大量回答下的滚动导航同步验证
+│   ├── qnav_panel_align.cjs    # 问题导航 map 条/列表居中与输入区避让回归
 │   └── session_activity_fixture.cjs # 会话运行/等待/完成与列表重建验证
 └── test_h5/                    # node:test；具体文件以目录为准，含历史、滚动、回放、权限、工具、媒体和 UI 状态回归
 ```
@@ -317,7 +318,7 @@ H5/
 | 读取媒体图片条（src/read_media_strip.ts + src/app/messages_tools.ts） | `read_media` 工具块输出区下方附加「已查看 N 张图像」可展开条：缩略图网格（图片/视频首帧/音频图标），点击进媒体预览弹窗（复用缩放）；默认折叠、展开时才加载媒体；文件已删除显示「找不到图片，可能已删除」占位，未读取项显示原因；实时/历史/子任务三路共用 `applyToolResult` 钩子 |
 | 三控件显示缩放（src/zoom_utils.ts / src/app/messages_widgets.ts） | ```mermaid / ```svg / ```canvas 三种块头部带缩放按钮组（[−] [百分比] [＋]，百分比按钮点击复位 100%），50%~800% 共 16 档；**Ctrl+滚轮**在图片视图内步进缩放（svg/mermaid）；缩放经 CSS 变量 `--md-zoom` 驱动——svg/mermaid 内联宽度表达式乘倍率（放大后控件内滚动查看、上限 85vh，缩小居中），canvas 沙箱 iframe 尺寸不变、倍率经 postMessage 下发到沙箱（stage 尺寸乘倍率 + object-fit:contain 等比放大、沙箱 body 滚动）；全屏中缩放同样生效（宽度/高度上限按倍率重算，safe center 保证超宽时可滚到全部区域）；**导出 PNG/复制图片始终按 100% 基准尺寸**（导出计算除以当前倍率），不受查看缩放影响 |
 | Canvas 沙箱内置环境（src/app/messages_canvas.ts / factory/system_prompt.py） | 每个 `canvas` 块使用独立 `iframe sandbox="allow-scripts"`；预置 `stage` / `canvas`（同一画布）、`ctx` / `context`（2D 上下文）及 `width` / `height`、`W` / `H`、`WIDTH` / `HEIGHT` 尺寸别名。别名为全局变量，脚本仍可使用 `const ctx = stage.getContext('2d')` 等局部声明；原生 `window`、`document`、`requestAnimationFrame`、`setTimeout` / `setInterval` 等浏览器 API 可在隔离 iframe 内使用，日志通过沙箱代理 `console` 回传 |
-| 问题导航 qnav（src/app/messages_nav.ts） | 用户问题 ≥2 条出现：桌面端右侧虚线轨（上限 40 根）hover 展开编号面板；窄屏用顶栏按钮点开问题列表，选择后收起并跳转。滚动 rAF 节流高亮当前位置 |
+| 问题导航 qnav（src/app/messages_nav.ts） | 用户问题 ≥2 条出现：桌面端右侧虚线轨（上限 40 根）hover 展开编号面板；窄屏用顶栏按钮点开问题列表，选择后收起并跳转。滚动 rAF 节流高亮当前位置。**轨道与展开列表都在「顶栏下沿 → 输入区上方」内垂直居中**（`.qnav` 撑满该区间，`bottom` 取 `--bottom-stack-height`；面板 `top:50% + translateY(-50%)`、`max-height: min(480px, 100%)`），既不会越顶栏也不会压住输入框；展开时若当前问题滚出可视区则带回视口 |
 | 用户气泡附件网格（app/core.js `fitAttachmentBlockGrid`） | 提问气泡内的引用/图片/音视频/文档共用等尺寸网格横向排布：列数按可用宽度计算（不可测时延迟到下一帧重试）；超出两行折叠进「+N」展开块（点击展开全部/收起，不用 overflow 裁剪以免引用浮层被夹断）；窗口缩放/侧栏伸缩经 ResizeObserver（仅宽度变化）自动重算 |
 | 移动端适配（SCSS `@container`/`@media`） | 主区窄于 680px 时，顶栏累计用量移入右上角会话操作菜单，问题导航改为顶栏入口，文件变更面板保持在屏内；Skills 弹窗手机端全屏，列表选中文件后切到正文，可返回列表，正文与工具栏字号收紧。设置弹窗页签完整可见，≤480px 字段行上下排布；宽 md 表格在容器内横滑 |
 | 滚动联动（src/app/messages_nav.ts 滚动回调/`updateQnavActive`/`rebuildQnav`） | 修 `visible` 变量遮蔽 TDZ（视口有代码块即抛错，致导航高亮钉死第一条、回底按钮冻结）；滚动回调加 try/finally 永不卡死 `scrollTick`；高亮基线指向首个已渲染条目之前最后一条（分页窗口顶部不再回落第一条）；无戳提问气泡按轮次兜底收养 |

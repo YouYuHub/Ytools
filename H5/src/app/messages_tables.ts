@@ -1,12 +1,13 @@
 /**
  * md 表格复制/导出（原 messages.js 4217-4383 行拆出；无对外导出）
  * 依赖：app/core.js；跨文件调用一律经 App.*（运行时解析，defer 顺序加载保证可用）。
+ *
+ * 事件委托挂在 document（而非 chatInner）：md 表格不只在主聊天区渲染，
+ * Skills 提示词预览等模态框里的 Markdown.render 也生成同一套复制/更多按钮；
+ * 挂在 chatInner 上时这些区域的按钮 hover 能看见、点击无反应。
  */
 (function (App: any) {
   "use strict";
-  const {
-    chatInner
-  } = App;
 
   // ---------- md 表格：复制（原始 Markdown）与复制为图片 / 下载 Excel ----------
   // 矩阵转换与 canvas 网格绘制抽到 js/table_canvas.js（TableCanvas 全局，纯函数可单测）
@@ -94,8 +95,15 @@
   }
 
   // 表格操作按钮（事件委托：markdown 渲染会重建节点）
-  chatInner.addEventListener("click", async function(e: any) {
-    const btn = e.target.closest(".md-table-btn");
+  // 监听挂在 document 而非 chatInner：md 表格不只在主聊天区渲染，Skills 提示词
+  // 预览、任务模板预览等模态框里的 Markdown.render 也会生成同一套按钮。挂在
+  // chatInner 上时这些区域的按钮“hover 能看见、点了没反应”（事件不会冒泡到
+  // chatInner）。挂 document 对所有渲染位置统一生效，主聊天区行为不变。
+  document.addEventListener("click", async function(e: any) {
+    // e.target 可能是 Text/document 等非 Element（closest 不存在），先归一
+    const origin = e.target && e.target.closest ? e.target : (e.target && e.target.parentElement);
+    if (!origin || !origin.closest) return;
+    const btn = origin.closest(".md-table-btn");
     if (btn && btn.dataset.tableAction === "more") {
       // 「更多」菜单展开/收起；同时互斥关闭其它表格的菜单
       const menu = btn.parentElement.querySelector(".md-table-menu");
@@ -113,7 +121,7 @@
     closeAllTableMenus();
     let target = btn;
     if (!target) {
-      const menuBtn = e.target.closest('[role="menuitem"]');
+      const menuBtn = origin.closest('[role="menuitem"]');
       if (!menuBtn) return;
       target = menuBtn;
       // 点击菜单项后收起本表格菜单
@@ -168,7 +176,8 @@
 
   // 点击表格区外时收起「更多」菜单（捕获阶段，避免先命中其它交互）
   document.addEventListener("click", function(e: any) {
-    if (e.target.closest(".md-table-more")) return;
+    const origin = e.target && e.target.closest ? e.target : (e.target && e.target.parentElement);
+    if (origin && origin.closest && origin.closest(".md-table-more")) return;
     closeAllTableMenus();
   }, true);
   document.addEventListener("keydown", function(e: any) {

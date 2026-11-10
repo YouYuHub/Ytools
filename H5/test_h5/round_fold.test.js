@@ -1195,3 +1195,47 @@ test("roundFold 导出 fmtDuration（供直播计时行复用）", async t => {
   assert.equal(x.App.roundFold.fmtDuration(5000), "5s");
   assert.equal(x.App.roundFold.fmtDuration(65000), "1m 5s");
 });
+
+test("压缩条晚于尾正文：压缩与其后的过程块保持可见，不被卷进顶部折叠", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "9";
+  msg.append(
+    div(x.document, "msg-assistant-body", "第一段正文"),
+    div(x.document, "think-block", "旧思考"),
+    div(x.document, "tool-block", "旧工具"),
+    div(x.document, "msg-assistant-body", "最新正文"),
+    div(x.document, "compaction-bar", "压缩对话上下文"),
+    div(x.document, "think-block", "压缩后思考"),
+    div(x.document, "tool-block", "压缩后工具"),
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const head = msg.querySelector(".round-fold-summary");
+  assert.ok(head, "有折叠头");
+  const hidden = Array.from(msg.children).filter(n => n.classList.contains("is-roundfold-hidden"));
+  const texts = hidden.map(n => n.textContent);
+  assert.ok(texts.some(t2 => t2.includes("旧思考")), "尾前内容进折叠");
+  assert.ok(texts.some(t2 => t2.includes("旧工具")), "尾前内容进折叠");
+  assert.ok(!texts.some(t2 => t2.includes("压缩后思考")), "压缩后思考必须可见");
+  assert.ok(!texts.some(t2 => t2.includes("压缩后工具")), "压缩后工具必须可见");
+  const bar = Array.from(msg.children).find(n => n.classList.contains("compaction-bar"));
+  assert.ok(bar && !bar.classList.contains("is-roundfold-hidden"), "压缩条始终可见");
+});
+
+test("无压缩条时尾后收纳照旧（暂停残留仍收进折叠）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "10";
+  msg.append(
+    div(x.document, "msg-assistant-body", "旧正文"),
+    div(x.document, "msg-assistant-body", "最新正文"),
+    div(x.document, "tool-block", "暂停残留工具"),
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const leftover = Array.from(msg.children).find(n => n.textContent === "暂停残留工具");
+  assert.ok(leftover.classList.contains("is-roundfold-hidden"), "无压缩条时尾后残留仍被收纳");
+});

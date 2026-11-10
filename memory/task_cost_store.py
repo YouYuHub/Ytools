@@ -414,7 +414,10 @@ def session_summary(session):
 
 def delete_session(session):
     from security.authorization import session as authorize_session
-    session = authorize_session(session)
+    # cleanup=True：本函数属于会话删除的收尾链路，此刻会话已被标 deleted /
+    # cleanup_pending。用默认 cleanup=False 会抛 404，把已经成功的删除变成
+    # “接口返回 404”的假失败（前端弹窗关不掉、用户反复重试）。
+    session = authorize_session(session, cleanup=True)
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         for row in db.execute("SELECT id FROM tasks WHERE session=?", (session,)).fetchall():

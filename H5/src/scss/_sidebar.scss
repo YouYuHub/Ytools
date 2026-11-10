@@ -296,8 +296,9 @@ body.sidebar-resizing {
       white-space: nowrap;
     }
 
-    // 时间段筛选按钮：默认弱化，筛选生效时高亮。
-    // 超宽时省略号截断（完整范围看 title 悬浮提示），绝不撑破侧边栏
+    // 时间段筛选按钮：无边框纯文字样式（三种状态下都不出现边框）。
+    // 超宽时省略号截断（完整范围看 title 悬浮提示），绝不撑破侧边栏。
+    // 边框保留 transparent 占位而不删除：换掉会导致尺寸/基线偏移 1px。
     .session-time-filter-btn {
       margin-left: auto;
       margin-right: 0;
@@ -318,13 +319,20 @@ body.sidebar-resizing {
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .session-time-filter-btn:hover {
-      color: var(--text);
-      border-color: var(--border);
-    }
+    // 筛选生效状态：只用文字色区分（不再画边框）。不指定 border-color，
+    // 保持 base 的 transparent 占位，三种状态观感统一。
     .session-time-filter-btn.is-active {
       color: var(--accent);
-      border-color: var(--accent);
+    }
+    // hover 写在 .is-active 之后：两者同优先级（0,2,0），靠源序让 hover 在
+    // 已激活状态下也能提亮（之前 hover 在前，被 .is-active 覆盖，点了筛选
+    // 之后鼠标悬浮毫无反馈）。
+    .session-time-filter-btn:hover {
+      color: var(--text);
+    }
+    .session-time-filter-btn:focus-visible {
+      outline: 1px solid var(--accent);
+      outline-offset: 1px;
     }
 
     // 筛选下拉面板：预设 + 自定义日期

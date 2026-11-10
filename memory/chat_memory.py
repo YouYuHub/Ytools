@@ -34,6 +34,7 @@ from memory.chat_round_store import (
 )
 from util.file_lock import cross_process_lock
 from util.timestamp_utils import DEFAULT_TIMESTAMP_FORMAT, now_str
+from factory.agent_runtime.round_lease import RoundAbandoned
 from config import (
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
@@ -1271,6 +1272,13 @@ class ChatMemoryManager:
         # 历史构建截断点（原地重跑时上下文只取第 N-1 轮及以前）
         self._history_cutoff_rounds: int | None = None
         self._prefix_context_summary: tuple[int, dict[str, Any] | None] | None = None
+        # 写令牌（round lease）：生成任务设置后，用户停止时由主进程撤销，
+        # 撤销后的写入被丢弃。读侧（主进程）默认为 None（不校验），
+        # 不干扰历史查看 / 删除 / 重命名等管理操作。
+        self._round_lease: Any = None
+        # 无 lease 对象时的退化路径：直接指定 epoch 让守卫去读侧车
+        # （主要留给需要跨进程校验但拿不到对象引用的场景）
+        self._lease_epoch: str | None = None
         if read_only:
             if not self._file_path.is_file():
                 raise FileNotFoundError(self._file_path)
@@ -1316,6 +1324,11 @@ class ChatMemoryManager:
         生成任务在独立 worker 进程写轮次/压缩/usage，主进程写标题/删除/导入/
         上传记录，双方都是「读全量→改→原子替换」，必须互斥，否则后写者会
         用自己的旧快照覆盖对方的更新。
+
+        注意：本守卫**不**做写令牌（round lease）校验——删除/重命名/归档等
+        用户管理操作也要用它，不应被停止流程误伤。生成写入的两条路径
+        （`add_chat_history` / `_finish_current_round`）单独调
+        `_assert_lease_writable()`。
         """
         with cross_process_lock(self._meta_lock_path):
             with self._lock:
@@ -1326,6 +1339,27 @@ class ChatMemoryManager:
                 if row and row["state"] in BLOCKED:
                     raise HTTPException(404, "会话已删除或正在清理，拒绝重新写入")
                 yield
+
+    def _assert_lease_writable(self) -> None:
+        """生成写路径的写令牌校验（本进程内存标记 + 跨进程侧车）。
+
+        用户停止后令牌被撤销，旧任务（含迟到返回的工具线程、子 agent、
+        300s 后才回来的 MCP 工具）即使还活着也写不进去——这就是停止
+        接口可以不等它们退出的依据。非生成写入（删除/重命名/归档）
+        不应调本方法。
+        """
+        from factory.agent_runtime.round_lease import RoundAbandoned, check_lease_file, lease_path_for
+        lease = getattr(self, "_round_lease", None)
+        if lease is not None and lease.revoked():
+            raise RoundAbandoned(
+                f"会话 {self.session_id} 写令牌已撤销"
+                f"（{lease.revoked_reason or 'unknown'}），本次写入丢弃"
+            )
+        epoch = lease.epoch if lease is not None else getattr(self, "_lease_epoch", None)
+        if epoch and check_lease_file(lease_path_for(self._file_path), epoch):
+            raise RoundAbandoned(
+                f"会话 {self.session_id} 写令牌已失效（跨进程），本次写入丢弃"
+            )
 
     def _recover_pending_round_checkpoint(self) -> None:
         """进程重启后恢复上次未收尾的轮次（工具调用/思考/工具结果不丢）。
@@ -1508,13 +1542,20 @@ class ChatMemoryManager:
         return pending if pending.get("event") == "chat_round" else None
 
     async def finish_saved_permission_round(self, pending: dict, target_round=None, insert_round=None,
-                                            *, status="stopped", task_id=None, reason=None) -> None:
+                                            *, status="stopped", task_id=None, reason=None,
+                                            require_dead_writer: bool = False) -> None:
         """停止或新消息接替重启后遗留的任务，保存轨迹与原替换/插入位置。
 
         由停止接口在确认活跃写者退出后调用；不能在只读历史/预演中收尾。
+        require_dead_writer=True 时：写者进程仍存活则不收尾（新任务已接管，
+        抢写会与新任务各写一份轮次）。
         """
         if not isinstance(pending, dict) or pending.get("event") != "chat_round":
             return
+        if require_dead_writer:
+            writer_pid = pending.get("writer_pid")
+            if isinstance(writer_pid, int) and _pid_alive(writer_pid):
+                return
         with self._lock:
             try:
                 latest = json.loads(self._pending_checkpoint_path.read_text(encoding="utf-8"))
@@ -1536,7 +1577,7 @@ class ChatMemoryManager:
                 self.set_target_round(target)
             elif insert is not None:
                 self.set_insert_round(insert)
-        self._finish_current_round(status)
+        self._finish_current_round(status, require_dead_writer=require_dead_writer)
 
     @staticmethod
     def _user_event_signature(event: dict[str, Any]) -> Any:
@@ -1575,6 +1616,7 @@ class ChatMemoryManager:
             record.update(input_text)
         else:
             record["content"] = str(input_text)
+        self._assert_lease_writable()
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             had_pending_round = self._round_store.pending_round is not None
@@ -1762,11 +1804,40 @@ class ChatMemoryManager:
         except OSError:
             pass
 
-    async def stop_current_round(self, *, recover_checkpoint: bool = False) -> str:
-        """以 stopped 收尾；recover_checkpoint 仅供已确认写者退出生成任务的停止接口。"""
-        return self._finish_current_round("stopped", recover_checkpoint=recover_checkpoint)
+    async def stop_current_round(self, *, recover_checkpoint: bool = False,
+                                 require_dead_writer: bool = False) -> str:
+        """以 stopped 收尾。
 
-    def _finish_current_round(self, status: str, *, recover_checkpoint=False, require_dead_writer=False) -> str:
+        recover_checkpoint：从 .pending 侧车恢复未落盘的当前轮（仅供停止接口）。
+        require_dead_writer：恢复前要求写者进程已死。停止接口必须传 True——
+        用户“停止后立即重发”时新 generate 已接管 worker（代次变化，停止等待
+        已主动退让），此时若仍按检查点强行收尾，会与 worker 的收尾各写一份
+        轮次，造成重复轮次/轮号后移。写者存活时直接返回不写盘。
+
+        本方法多用于生成侧收尾：令牌已撤销时安静返回（主进程已定稿）。
+        """
+        return self._finish_current_round(
+            "stopped", recover_checkpoint=recover_checkpoint,
+            require_dead_writer=require_dead_writer, tolerate_revoked=True,
+        )
+
+    def _finish_current_round(self, status: str, *, recover_checkpoint=False, require_dead_writer=False,
+                              check_lease: bool = True, tolerate_revoked: bool = False) -> str:
+        """收尾当前轮。
+
+        check_lease：写前校验写令牌。
+        tolerate_revoked：令牌已撤销时**不抛异常**，而是返回 "写令牌已撤销"。
+          worker 侧收尾必须传 True：用户停止时主进程已撤销令牌并自己定稿，
+          worker 迟到收尾不能再写盘（会重复轮次），也不应以异常形式冒出。
+        """
+        if check_lease:
+            try:
+                self._assert_lease_writable()
+            except RoundAbandoned as abandoned:
+                if tolerate_revoked:
+                    logger.info(f"收尾跳过（已由停止流程定稿）：{abandoned}")
+                    return "写令牌已撤销"
+                raise
         with self._write_guard():
             meta, entries = _load_meta_and_entries(self._file_path, self.session_id)
             if recover_checkpoint:

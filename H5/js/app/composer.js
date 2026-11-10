@@ -1686,6 +1686,8 @@
     }
     // 压缩目标提示：显示该模型窗口下的可设区间（后端会把越界值夹取到区间内），
     // 并区分"用户设定值"与"实际生效值"（被夹取时明确提示）。
+    // 目标语义 = 历史部分上限（不含系统提示/工具定义/当前消息等固定开销）；
+    // 0 = 不设固定目标，后端按「动态可用空间」自动算（阈值 − 固定开销）。
     function renderHistoryTargetHint(comp) {
         if (!historyTargetHint) {
             return;
@@ -1703,7 +1705,14 @@
         const raw = readSettingNumber(historyTargetTokens);
         let text = "可设区间 " + fmt(limits.min) + " – " + fmt(limits.max) + " tokens"
             + "（窗口 " + fmt(limits.window) + " × 8%/40% 下限、40% 上限）";
-        if (raw != null && raw > 0 && (raw < limits.min || raw > limits.max)) {
+        if (raw === 0) {
+            // 0 是「动态可用空间」，不是「不设目标」：后端会自己算一个预算
+            const threshold = comp && comp.effective_threshold && comp.effective_threshold.threshold;
+            text += "；当前 0 = 动态可用空间：按";
+            text += threshold ? fmt(threshold) + "（触发阈值）" : "触发阈值";
+            text += " 扣除系统提示、工具定义、当前轮上下文、摘要预留、问题索引与安全余量后自动算历史预算";
+        }
+        else if (raw != null && raw > 0 && (raw < limits.min || raw > limits.max)) {
             const clamped = Math.max(limits.min, Math.min(raw, limits.max));
             text += "；当前 " + fmt(raw) + " 越界，将按 " + fmt(clamped) + " 生效";
         }

@@ -557,16 +557,22 @@ def resolve_summary_total_budget(
 def resolve_history_target_tokens(
     settings: ContextCompactionSettings | None = None,
 ) -> int:
-    """压缩目标（tokens）：>0 时限制历史预算；任务内压缩会扩展为完整请求窗口目标。
+    """压缩目标（tokens）：>0 时限制**历史部分**预算（不含固定开销）。
 
-    与触发阈值解耦：阈值决定“何时压”，目标决定“压到多小”。设了目标后，
-    长任务的单次输入成本可控，代价是更激进的摘要（细节减少）。独立的跨轮历史
-    压缩将其作为历史部分目标；任务内触发压缩时，历史与本轮工具轨迹共享该目标。
+    与触发阈值解耦：阈值决定“何时压”，目标决定“压到多小”。语义是纯粹的
+    “历史对话可保留上限”——不背系统提示词、工具定义、当前轮用户消息、
+    摘要预留这些不可压缩的固定开销（旧实现把它们从目标里扣，小目标会被
+    扣成负→兑底 2048，历史被压得几乎清零）。
+
+    与动态可用空间的关系：任务内压缩取 min(历史目标, 动态可用空间)，所以
+    设得比可用空间大不会超窗；设得小则压得更彻底。
 
     **用户值会被夹取到有效区间**（`_clamp_history_target_tokens`）：
     - 下限：窗口 < 500k 时取 窗口 × 8%；窗口 ≥ 500k 时取 40k。
       低于下限时摘要压不到位、压缩收益被保留轮次吃掉（用户设置更小也按下限算）。
     - 上限：窗口 × 40%。超过上限会与触发阈值/窗口余量冲突（压无可压）。
+
+    0 表示不设固定目标，完全由动态可用空间决定。
     """
     settings = settings or load_context_compaction_settings()
     raw = max(0, int(getattr(settings, "target_tokens", 0) or 0))
@@ -1990,6 +1996,7 @@ async def _compact_active_round_local(
     compression_index: int | None = None,
     event_emitter: Any | None = None,
     enforce_target: bool = False,
+    full_request_target: int | None = None,
 ) -> RoundContextCompactionResult:
     """在下一次模型调用前压缩当前任务已执行的工具轨迹。
 
@@ -2000,6 +2007,11 @@ async def _compact_active_round_local(
 
     `enforce_target` 表示同一轮已触发任务内压缩：此时按完整请求余量压缩本轮摘要，
     与刚压缩过的历史部分共用用户设置的目标。
+
+    `full_request_target`：调用方已把「用户历史目标 + 不可压缩的固定开销」换算成
+    完整请求目标时传入。用户目标的语义是「历史部分预算」，不能直接拿去与
+    完整请求估算（before_tokens）比较——那样 target=60000 永远小于 system+tools，
+    导致 target_reduction_needed 恒真、每轮都多压一次。
 
     `event_emitter` 为可选的异步回调（payload: dict -> None）：
     压缩开始时推送 {"role": "assistant", "compress_context": ...}，
@@ -2012,7 +2024,12 @@ async def _compact_active_round_local(
     # 避免长任务思考全文虚高估算导致提前触发（记录值即含虚高）
     before_tokens = estimate_send_context_tokens(original_messages, tool_request.tools)
     token_limit = resolve_context_compaction_threshold(settings)
-    target_tokens = resolve_history_target_tokens(settings) if enforce_target else 0
+    if enforce_target and full_request_target is not None and full_request_target > 0:
+        # 用调用方换算好的完整请求目标（历史预算 + 固定开销），避免把
+        # 「历史部分预算」误当完整请求目标而与 before_tokens 直接比较。
+        target_tokens = int(full_request_target)
+    else:
+        target_tokens = resolve_history_target_tokens(settings) if enforce_target else 0
     target_reduction_needed = target_tokens > 0 and before_tokens > target_tokens
     if (token_limit <= 0 or before_tokens <= token_limit) and not target_reduction_needed:
         return RoundContextCompactionResult(
