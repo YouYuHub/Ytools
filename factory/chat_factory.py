@@ -43,7 +43,7 @@ from memory.file_memory import (
     retire_native_document_parts,
 )
 from memory.chat_history_format import content_part_to_text
-from memory.chat_history_format import RECENT_QUESTIONS_TOKEN_BUDGET
+from memory.chat_history_format import resolve_recent_questions_token_budget
 from memory.quote_format import (
     content_with_quotes,
     normalize_quotes,
@@ -673,10 +673,12 @@ async def _compact_task_context_if_needed(
     active_tokens = estimate_send_context_tokens(active_messages)
     summary_reserve = resolve_effective_summary_budget(compaction_settings)
     safety_reserve = max(1024, threshold // 32)
+    # 问题索引预留随 RECENT_QUESTIONS_TOKEN_BUDGET 现读，与实际回传口径一致
+    questions_reserve = resolve_recent_questions_token_budget()
     history_budget = max(
         2048,
         threshold - system_tokens - tools_tokens - active_tokens
-        - summary_reserve - RECENT_QUESTIONS_TOKEN_BUDGET - safety_reserve,
+        - summary_reserve - questions_reserve - safety_reserve,
     )
     # 任务进行中触发压缩时，用户设置的目标（target_tokens）语义为「历史部分预算」：
     # 它只管历史轮次的原始对话规模，不再背系统提示词 / 工具定义 / 当前轮用户
@@ -697,7 +699,7 @@ async def _compact_task_context_if_needed(
         # 会导致 target_reduction_needed 恒真、每轮多压一次。
         _last_task_compaction_target = (
             target_history_budget + system_tokens + tools_tokens
-            + summary_reserve + RECENT_QUESTIONS_TOKEN_BUDGET
+            + summary_reserve + questions_reserve
         )
     task_summary_budget = (
         resolve_effective_summary_budget(
@@ -709,7 +711,7 @@ async def _compact_task_context_if_needed(
     logger.info(f"任务内上下文 {context_now} tokens 超过阈值 {threshold}，"
         f"动态历史预算 {history_budget}（系统 {system_tokens} + 工具 {tools_tokens} + "
         f"当前轮 {active_tokens} + 摘要预留 {summary_reserve} + 问题索引 "
-        f"{RECENT_QUESTIONS_TOKEN_BUDGET} + 余量 {safety_reserve}；"
+        f"{questions_reserve} + 余量 {safety_reserve}；"
         f"用户历史目标 {history_target or '未启用'}，取较小值后实际预算 {target_history_budget or '未启用'}），"
         f"预算内轮次保留原始对话，超出部分压缩")
     await compact_session_history_if_needed(

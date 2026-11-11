@@ -604,7 +604,7 @@
                         <input id="subAgentStreamErrorRetryMax" type="number" step="1">
                     </label>
                     <label class="chat-setting-field">
-                        <span>子任务计划未完成提醒次数<small>收尾时 todo 仍有未完成项则提醒继续（成功执行其他工具后额度重置，单纯更新计划不重置）；0=关闭提醒，负数=不限制</small></span>
+                        <span>子任务计划未完成提醒次数<small>收尾时 todo 仍有未完成项则提醒继续（成功执行其他工具后额度重置，单纯更新计划不重置）；耗尽仍直出交付则自动标 done 收官；0=关闭提醒直接放行，负数=无限提醒</small></span>
                         <input id="subAgentTodoRemindMax" type="number" step="1">
                     </label>
                 </section>
@@ -1145,7 +1145,7 @@
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=d12cf9a00c3f"></script>
+    <script defer src="js/app/core.js?v=e1f2dedb35af"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=3e378d638300"></script>
     <script defer src="js/app/sessions.js?v=4bc362efe0f8"></script>

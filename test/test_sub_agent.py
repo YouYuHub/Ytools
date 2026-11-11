@@ -902,6 +902,196 @@ class SubAgentDeliveryRetryTests(unittest.TestCase):
         self.assertEqual(runner.messages[0].get("role"), "system")
         self.assertEqual(runner.messages[1].get("content"), "交付保障测试任务")
 
+    @staticmethod
+    def _todo_chunks(call_id, status):
+        return [
+            _sse({"tool_calls": [{
+                "index": 0, "id": call_id, "type": "function",
+                "function": {
+                    "name": "todo_write",
+                    "arguments": json.dumps(
+                        {"todos": [{"id": "1", "content": "写文件", "status": status}]},
+                        ensure_ascii=False,
+                    ),
+                },
+            }]}),
+            _sse({"finish_reason": "tool_calls"}),
+            "data: [DONE]\n\n",
+        ]
+
+    def test_todo_auto_complete_after_reminder_exhausted(self):
+        """C：提醒额度耗尽仍直出交付 → 自动标 done 收官，不再打回。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        fake, _state = _fake_llm_script([
+            self._todo_chunks("call_t0", "pending"),
+            FINAL_CHUNKS,
+            FINAL_CHUNKS,
+        ])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(initial_todo=None)
+        with _retry_limits_patch(todo_remind_max=1):
+            runner = SubAgentRunner(ctx)
+            result = asyncio.run(runner.run())
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.rounds, 3)
+        self.assertEqual(runner._todo_remind_used, 1)
+        # 计划被自动收官：剩余项全 done
+        self.assertTrue(runner.todo)
+        self.assertTrue(all(item.get("status") == "done" for item in runner.todo))
+        # 轨迹留痕：todo 事件带 auto_completed + 自动收官 notice
+        auto_todos = [p for ph, p in emitted if ph == "todo" and p.get("auto_completed")]
+        self.assertEqual(len(auto_todos), 1)
+        auto_notices = [
+            p for ph, p in emitted
+            if ph == "notice" and p.get("retry_kind") == "todo_auto_done"
+        ]
+        self.assertEqual(len(auto_notices), 1)
+        self.assertIn("自动标 done", auto_notices[0].get("message"))
+        # 只提醒过一次（第二次收口直接自动收官，不再提醒）
+        remind_notices = [
+            p for ph, p in emitted
+            if ph == "notice" and p.get("retry_kind") == "todo_remind"
+        ]
+        self.assertEqual(len(remind_notices), 1)
+
+    def test_remind_stash_reused_on_blank_close(self):
+        """D：提醒后仅做 todo 台账、收口输出为空 → 复用提醒前交付，不空转重试。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        fake, _state = _fake_llm_script([
+            self._todo_chunks("call_t0", "pending"),
+            FINAL_CHUNKS,
+            self._todo_chunks("call_t1", "done"),
+            EMPTY_FINAL_CHUNKS,
+        ])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(initial_todo=None)
+        with _retry_limits_patch(todo_remind_max=1):
+            result = asyncio.run(SubAgentRunner(ctx).run())
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.rounds, 4)
+        # 复用提醒前交付（FINAL_CHUNKS 正文），而非空收尾重试/报错
+        self.assertIn("子任务结论", result.final_reply)
+        notices = [p for ph, p in emitted if ph == "notice"]
+        self.assertEqual(
+            [p.get("retry_kind") for p in notices], ["todo_remind"]
+        )
+
+    def test_remind_stash_invalidated_by_real_work(self):
+        """D：提醒后执行过实质工具 → 暂存失效，空收口走正常空收尾重试。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        final_b_chunks = [
+            _sse({"content": "结论乙：新工作后的交付。"}),
+            _sse({"finish_reason": "stop"}),
+            "data: [DONE]\n\n",
+        ]
+        todo_and_file_chunks = [
+            _sse({"tool_calls": [
+                {
+                    "index": 0, "id": "call_t1", "type": "function",
+                    "function": {
+                        "name": "todo_write",
+                        "arguments": json.dumps(
+                            {"todos": [{"id": "1", "content": "写文件", "status": "done"}]},
+                            ensure_ascii=False,
+                        ),
+                    },
+                },
+                {
+                    "index": 1, "id": "call_f1", "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps(
+                            {"path": "tmp/sub_ut.txt", "content": "hi", "mode": "overwrite"},
+                            ensure_ascii=False,
+                        ),
+                    },
+                },
+            ]}),
+            _sse({"finish_reason": "tool_calls"}),
+            "data: [DONE]\n\n",
+        ]
+        fake, _state = _fake_llm_script([
+            self._todo_chunks("call_t0", "pending"),
+            FINAL_CHUNKS,
+            todo_and_file_chunks,
+            EMPTY_FINAL_CHUNKS,
+            final_b_chunks,
+        ])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(initial_todo=None)
+        ctx.tools.append({"type": "function", "function": {"name": "write_file"}})
+        ctx.tool_servers["write_file"] = "__builtin__"
+        try:
+            with _retry_limits_patch(todo_remind_max=1):
+                result = asyncio.run(SubAgentRunner(ctx).run())
+        finally:
+            from pathlib import Path
+            try:
+                (Path(__file__).resolve().parents[1] / "tmp" / "sub_ut.txt").unlink()
+            except OSError:
+                pass
+        self.assertEqual(result.status, "done")
+        # 暂存已失效：空收口触发正常空收尾重试，最终用新交付收尾
+        kinds = [p.get("retry_kind") for ph, p in emitted if ph == "notice"]
+        self.assertIn("final_reply", kinds)
+        self.assertIn("结论乙", result.final_reply)
+        self.assertNotIn("子任务结论", result.final_reply)
+
+    def test_zero_limit_no_auto_complete(self):
+        """C 边界：额度 0=关闭提醒，直接放行且不自动收官（计划保持原状）。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        fake, _state = _fake_llm_script([
+            self._todo_chunks("call_t0", "pending"),
+            FINAL_CHUNKS,
+        ])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(initial_todo=None)
+        with _retry_limits_patch(todo_remind_max=0):
+            runner = SubAgentRunner(ctx)
+            result = asyncio.run(runner.run())
+        self.assertEqual(result.status, "done")
+        self.assertTrue(runner._todo_touched)
+        self.assertEqual(runner.todo[0].get("status"), "pending")
+        self.assertEqual([p for ph, p in emitted if ph == "notice"], [])
+        self.assertEqual(
+            [p for ph, p in emitted if ph == "todo" and p.get("auto_completed")], []
+        )
+
+    def test_system_prompt_states_todo_closeout_rule(self):
+        """B：子智能体系统提示前置 todo 收官规则（交付前先全标 done）。"""
+        from factory.system_prompt import build_sub_agent_system_text
+
+        text = build_sub_agent_system_text()
+        self.assertIn("第 10 条", text)
+        self.assertIn("置为 done", text)
+        self.assertIn("打回", text)
+
+    def test_todo_result_hints_closeout_first(self):
+        """B：todo 创建/更新结果文案带交付前置 done 提示。"""
+        from chat.chat_llm import ChatLLM
+        from factory.agent_runtime.sub_agent import SubAgentRunner
+
+        fake, _state = _fake_llm_script([
+            self._todo_chunks("call_t0", "pending"),
+            FINAL_CHUNKS,
+        ])
+        ChatLLM.chat_completions = fake
+        ctx, emitted = _make_retry_context(initial_todo=None)
+        with _retry_limits_patch(todo_remind_max=0):
+            result = asyncio.run(SubAgentRunner(ctx).run())
+        self.assertEqual(result.status, "done")
+        tool_results = [p for ph, p in emitted if ph == "tool_result"]
+        self.assertEqual(len(tool_results), 1)
+        self.assertIn("标 done", json.dumps(tool_results[0].get("result"), ensure_ascii=False))
+
     def test_stream_error_resumes_and_completes(self):
         """流错误断点续跑：出错轮注入内部消息继续，下一轮正常完成。"""
         from chat.chat_llm import ChatLLM

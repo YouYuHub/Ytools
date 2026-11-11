@@ -216,9 +216,10 @@ def load_sub_agent_retry_limits() -> dict[str, int]:
       子任务收尾轮最终回复为空时注入内部消息让子模型再次交付；
     - stream_error_max_attempts：流式错误断点续跑上限（0/负=不限制）——
       模型调用出错后注入内部消息从已有进度继续（工具轨迹/todo 不丢失）；
-    - todo_remind_max：todo 未完成提醒上限（0=关闭，负=不限制）——
-      只对「模型创建/更新过的计划」生效（父级预置但从未被触碰的计划
-      不拦截有效交付）；成功执行其他工具后额度重置，单纯更新计划不重置。
+    - todo_remind_max：todo 未完成提醒上限——只对「模型创建/更新过的计划」
+      生效（父级预置但从未被触碰的计划不拦截有效交付）；成功执行其他工具后
+      额度重置，单纯更新计划不重置；额度耗尽仍直出交付则自动标 done 收官
+      （0=关闭提醒直接放行，负=无限提醒直到模型亲口收官）。
 
     三项重试受已启用的轮次/超时限制约束；两项限制均为 0 时由用户手动停止。
     """
@@ -451,6 +452,10 @@ class SubAgentRunner:
         self._final_reply_retries_used = 0
         self._stream_error_retries_used = 0
         self._todo_remind_used = 0
+        # D：todo 提醒前那次交付正文暂存（仅非空才存）。提醒后模型若只做
+        # todo 台账、无实质新工作（执行其他工具即失效），且收口输出为空，
+        # 则复用它收尾，免掉空收尾重试循环。
+        self._remind_stash: str | None = None
         self._todo_loop_guard = TodoLoopGuard()
         self._todo_context = TodoContext()
         self._text_tool_call_retries = 0
@@ -1085,12 +1090,14 @@ class SubAgentRunner:
                     elif not prev_snapshot:
                         sub_message = (
                             f"子任务计划已创建（共 {len(items)} 项，进行中 {in_progress_count} 项，"
-                            f"待办 {pending_count} 项）：开始执行某步骤前将其设为 in_progress"
+                            f"待办 {pending_count} 项）：开始执行某步骤前将其设为 in_progress；"
+                            "交付最终回复前须先将全部步骤标 done"
                         )
                     else:
                         sub_message = (
                             f"子任务计划已更新（共 {len(items)} 项，已完成 {done_count} 项，"
-                            f"进行中 {in_progress_count} 项，待办 {pending_count} 项）"
+                            f"进行中 {in_progress_count} 项，待办 {pending_count} 项）；"
+                            "交付最终回复前须先将剩余步骤全部标 done"
                         )
                     todo_result = {
                         "success": True,
@@ -1547,52 +1554,82 @@ class SubAgentRunner:
                     })
                     continue
                 # ---- 交付保障（子任务限定；父级循环无此机制）----
-                # 优先级：todo 未完成提醒 > 空收尾重试 > 接受收尾。
+                # 优先级：todo 未完成提醒 > 自动收官 > 空收尾重试 > 接受收尾。
                 # todo 提醒只对「模型创建/更新过的计划」生效（它知情、做出过
                 # 承诺）；父级预置但从未被触碰的计划是隐藏状态，不拦截有效
                 # 交付——否则模型完成工作后仍会被迫补计划再重复交付一遍。
-                # 提醒额度仅在执行其他工具后重置；空收尾/提醒都以内部
-                # 消息推进，消耗 rounds，受已启用的轮次/超时限制约束。
+                # 提醒额度仅在执行其他工具后重置；额度耗尽仍直出交付则自动
+                # 收官（剩余项标 done，轨迹留痕），不再无限打回；0=关闭提醒
+                # 直接放行（计划保持原状），负数=无限提醒直到模型亲口收官。
+                # 空收尾/提醒都以内部消息推进，消耗 rounds，受已启用的
+                # 轮次/超时限制约束。
                 pending_todo = [
                     item for item in self.todo
                     if isinstance(item, dict) and item.get("status") in ("pending", "in_progress")
                 ]
                 tr_limit = self._retry_limits["todo_remind_max"]
-                if pending_todo and self._todo_touched and not self._todo_loop_guard.suspended and (
-                    tr_limit < 0 or self._todo_remind_used < tr_limit
-                ):
-                    self._todo_remind_used += 1
-                    tr_label = str(tr_limit) if tr_limit > 0 else "∞"
-                    logger.warning(f"子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
-                        f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）")
-                    partial_message = {"role": "assistant"}
-                    if full_response:
-                        partial_message["content"] = full_response
-                    if full_reasoning:
-                        partial_message["reasoning_content"] = full_reasoning
-                    if len(partial_message) > 1:
-                        self.messages.append(partial_message)
-                    self.messages.append({
-                        "role": "user",
-                        "content": (
-                            f"你准备结束子任务，但计划中仍有 {len(pending_todo)} 项未完成"
-                            "（pending/in_progress）。请继续调用工具完成它们；"
-                            "如相关步骤实际已完成或无需执行，请先用 todo 工具更新计划"
-                            "（标记 done 或说明原因），然后再给出最终回复。"
-                        ),
-                        "_internal": True,
-                    })
-                    await self._emit(
-                        "notice",
-                        message=(
-                            f"todo 计划仍有 {len(pending_todo)} 项未完成，"
-                            f"已提醒子模型继续（第 {self._todo_remind_used} 次，上限 {tr_label}）"
-                        ),
-                        retry_kind="todo_remind",
-                        seq=self._seq,
-                    )
-                    continue
+                if pending_todo and self._todo_touched and not self._todo_loop_guard.suspended:
+                    if tr_limit < 0 or self._todo_remind_used < tr_limit:
+                        self._todo_remind_used += 1
+                        tr_label = str(tr_limit) if tr_limit > 0 else "∞"
+                        logger.warning(f"子任务收尾但 todo 仍有 {len(pending_todo)} 项未完成，"
+                            f"提醒继续 #{self._todo_remind_used}（上限 {tr_label}）")
+                        partial_message = {"role": "assistant"}
+                        if full_response:
+                            partial_message["content"] = full_response
+                        if full_reasoning:
+                            partial_message["reasoning_content"] = full_reasoning
+                        if len(partial_message) > 1:
+                            self.messages.append(partial_message)
+                        self.messages.append({
+                            "role": "user",
+                            "content": (
+                                f"你准备结束子任务，但计划中仍有 {len(pending_todo)} 项未完成"
+                                "（pending/in_progress）。请继续调用工具完成它们；"
+                                "如相关步骤实际已完成或无需执行，请先用 todo 工具更新计划"
+                                "（标记 done 或说明原因），然后再给出最终回复。"
+                            ),
+                            "_internal": True,
+                        })
+                        await self._emit(
+                            "notice",
+                            message=(
+                                f"todo 计划仍有 {len(pending_todo)} 项未完成，"
+                                f"已提醒子模型继续（第 {self._todo_remind_used} 次，上限 {tr_label}）"
+                            ),
+                            retry_kind="todo_remind",
+                            seq=self._seq,
+                        )
+                        # D：暂存本次交付正文（非空才存），供提醒后空收口复用
+                        if full_response and full_response.strip():
+                            self._remind_stash = full_response
+                        continue
+                    if tr_limit > 0:
+                        # C：提醒额度耗尽仍直出交付 → 自动收官：剩余项标 done，
+                        # 落一条 todo 事件 + notice（auto_completed 留痕，前端轨迹可见）。
+                        auto_ids = []
+                        for item in pending_todo:
+                            item["status"] = "done"
+                            auto_ids.append(item.get("id"))
+                        logger.warning(f"子任务 todo 提醒额度耗尽（{tr_limit} 次）仍未收官，"
+                            f"自动标 done {len(auto_ids)} 项收尾")
+                        await self._emit("todo", todos=self.todo, auto_completed=True)
+                        await self._emit(
+                            "notice",
+                            message=(
+                                f"todo 提醒额度耗尽（{tr_limit} 次），剩余"
+                                f" {len(auto_ids)} 项已自动标 done 收官"
+                            ),
+                            retry_kind="todo_auto_done",
+                            seq=self._seq,
+                        )
+                    # tr_limit == 0：提醒关闭，沿旧语义直接放行（计划保持原状）
                 final_reply = full_response.strip()
+                # D：收口输出为空、但提醒前有过有效交付且其后无实质新工作
+                # （暂存仍有效）→ 复用暂存收尾，免掉空收尾重试循环。
+                if not final_reply and self._remind_stash:
+                    final_reply = self._remind_stash.strip()
+                    self._remind_stash = None
                 if not final_reply:
                     # 空收尾重试：正文为空（含"仅思考输出"场景）不算有效交付——
                     # 注入内部消息让子模型再次交付；额度耗尽后按 error 收尾，
@@ -1763,6 +1800,8 @@ class SubAgentRunner:
                    and not (isinstance(r.get("result"), dict) and r["result"].get("error"))
                    for r in tool_results):
                 self._todo_remind_used = 0
+                # D：有实质新工作，提醒前暂存的交付已过时，失效
+                self._remind_stash = None
             # read_media 数据注入（子任务版）：按坐标现场加载媒体 base64 部件，
             # 作为 user 消息追加进 messages（仅内存，不落盘——任务文本里的
             # media:// 引用即子任务媒体台账）。加载失败的坐标以占位文本告知

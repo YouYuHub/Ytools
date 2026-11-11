@@ -326,7 +326,7 @@ window.App = window.App || {};
         compaction_retry_max_attempts: 2,
         sub_agent_final_reply_retry_max: 3,
         sub_agent_stream_error_retry_max: 3,
-        sub_agent_todo_remind_max: 3,
+        sub_agent_todo_remind_max: 1,
         video_read_max_seconds: 60,
         mcp_tool_workers: 3,
         sub_agent_max_concurrent: 3,

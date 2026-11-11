@@ -1,5 +1,6 @@
 import unittest
 
+import memory.chat_history_format as chat_history_format
 from memory.chat_history_format import (
     adjust_context_summary_for_deleted_rounds,
     find_resume_media_round_index,
@@ -13,6 +14,8 @@ from memory.chat_history_format import (
     round_entry_to_compaction_text,
     round_entry_to_context_messages,
     round_entry_to_minimal_messages,
+    resolve_recent_questions_token_budget,
+    trim_recent_question_items,
 )
 
 
@@ -611,6 +614,48 @@ class ResumeMediaRetentionTests(unittest.TestCase):
         self.assertEqual(find_resume_media_round_index([done_media]), -1)
         self.assertEqual(find_resume_media_round_index([]), -1)
         self.assertEqual(find_resume_media_round_index(None), -1)
+
+
+class RecentQuestionsBudgetEnvTests(unittest.TestCase):
+    def setUp(self):
+        self._original_load_var = chat_history_format.load_var
+
+    def tearDown(self):
+        chat_history_format.load_var = self._original_load_var
+
+    def _with_env(self, values):
+        def fake_load_var(name, default=None):
+            return values.get(name, default)
+        chat_history_format.load_var = fake_load_var
+
+    def test_resolve_prefers_explicit_value(self):
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "123"})
+        self.assertEqual(resolve_recent_questions_token_budget(456), 456)
+
+    def test_resolve_reads_env_and_falls_back_on_invalid(self):
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "5000"})
+        self.assertEqual(resolve_recent_questions_token_budget(), 5000)
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "not-a-number"})
+        self.assertEqual(resolve_recent_questions_token_budget(), 10000)
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "-5"})
+        self.assertEqual(resolve_recent_questions_token_budget(), 10000)
+        self._with_env({})
+        self.assertEqual(resolve_recent_questions_token_budget(), 10000)
+
+    def test_resolve_zero_means_newest_only(self):
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "0"})
+        self.assertEqual(resolve_recent_questions_token_budget(), 0)
+        items = [(1, "旧问题"), (2, "新问题")]
+        self.assertEqual(trim_recent_question_items(items), [(2, "新问题")])
+
+    def test_trim_default_follows_env(self):
+        items = [(1, "旧问题"), (2, "中间问题"), (3, "最新问题")]
+        self._with_env({"RECENT_QUESTIONS_TOKEN_BUDGET": "6"})
+        self.assertEqual(
+            trim_recent_question_items(items), [(3, "最新问题")]
+        )
+        self._with_env({})
+        self.assertEqual(trim_recent_question_items(items), items)
 
 
 if __name__ == "__main__":

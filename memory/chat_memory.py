@@ -863,7 +863,7 @@ from memory.chat_history_format import (
     render_context_summary as _render_context_summary,
     render_recent_questions_message as _render_recent_questions_message,
     split_context_window as _split_context_window,
-    RECENT_QUESTIONS_TOKEN_BUDGET,
+    resolve_recent_questions_token_budget as _resolve_recent_questions_token_budget,
     round_entry_to_context_messages as _round_entry_to_context_messages,
     find_resume_media_round_index as _find_resume_media_round_index,
     round_entry_compression_usage as _round_entry_compression_usage,
@@ -3100,14 +3100,15 @@ class ChatMemoryManager:
 
         - 未压缩轮次以完整对话回传（含助手回答、工具调用等），其问题不重复
           进入保真索引；
-        - 已压缩轮次的原始用户问题进入保真索引（受 10k token 预算限制，
-          超出从最旧丢弃）。
+        - 已压缩轮次的原始用户问题进入保真索引（受 RECENT_QUESTIONS_TOKEN_BUDGET
+          限制，默认 10k，超出从最旧丢弃）。
 
         Args:
             max_rounds: 兼容参数；<=0（默认）表示不限制轮次
             max_tool_result_length: 窗口内完整轮次的工具结果回传长度
             minimal: 兼容参数，不再切换已完成历史表示
-            recent_questions_token_budget: 保真问题索引预算；省略时为 10k
+            recent_questions_token_budget: 保真问题索引预算；省略时读
+                RECENT_QUESTIONS_TOKEN_BUDGET（默认 10k）
             retain_stopped_round_media: 续跑专用——被续轮次（末尾首个有真实用户
                 消息的 stopped/interrupted 轮）的用户消息保留原始媒体部件（发送前
                 解析为 base64），而不是转文本占位；其余轮次口径不变
@@ -3154,7 +3155,7 @@ class ChatMemoryManager:
                 summary_message = None
                 summarized_count = 0
         if recent_questions_token_budget is None:
-            question_budget = RECENT_QUESTIONS_TOKEN_BUDGET
+            question_budget = _resolve_recent_questions_token_budget()
         else:
             try:
                 question_budget = max(256, int(recent_questions_token_budget))

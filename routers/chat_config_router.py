@@ -743,9 +743,9 @@ def _sub_agent_retry_config_payload() -> dict:
                 "0_or_negative": "不限制（仍受已启用的轮次/超时限制约束）",
             },
             "todo_remind_max": {
-                "positive": "收尾时 todo 未完成最多提醒 N 次（成功执行其他工具后额度重置，单纯更新计划不重置）",
-                "0": "关闭提醒（收尾即结束）",
-                "negative": "不限制提醒（仍受已启用的轮次/超时限制约束）",
+                "positive": "收尾时 todo 未完成最多提醒 N 次（成功执行其他工具后额度重置，单纯更新计划不重置）；耗尽仍直出交付则自动标 done 收官",
+                "0": "关闭提醒（收尾即结束，计划保持原状）",
+                "negative": "不限制提醒直到模型亲口收官（仍受已启用的轮次/超时限制约束）",
             },
         },
         "env_names": dict(_SUB_AGENT_RETRY_ENV_NAMES),
@@ -768,7 +768,7 @@ async def update_sub_agent_retry_config(payload: SubAgentRetryConfig):
 
     - 登录请求保存到账号；维护调用写回实例 .env，下一次子任务立即生效
     - final_reply / stream_error：0 或负数=不限制（仍受已启用的轮次/超时限制约束）
-    - todo_remind_max：0=关闭提醒，负数=不限制，正数=成功执行其他工具后额度重置的提醒次数（单纯更新计划不重置）
+    - todo_remind_max：0=关闭提醒直接放行，负数=无限提醒直到模型亲口收官，正数=提醒 N 次后自动标 done 收官（成功执行其他工具后额度重置，单纯更新计划不重置）
     """
     update_env = {
         env_name: _parse_sub_agent_retry_value(

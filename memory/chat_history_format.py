@@ -14,6 +14,8 @@ import json
 import re
 from typing import Any
 # 自定义模块
+from config import DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET
+from env_manager import load_var
 from factory.agent_runtime.chat_runtime import estimate_text_tokens, sanitize_tool_call_pairing
 from memory.chat_round_store import merge_usage_dict
 from memory.file_memory import content_part_to_text
@@ -40,8 +42,26 @@ SUMMARY_SECTION_FIELDS: list[tuple[str, str]] = [
     ("tool_state", "【工具状态】"),
 ]
 
-# 压缩轮次原始问题保留区的 token 预算：保留最近的问题，超出从最旧截断
-RECENT_QUESTIONS_TOKEN_BUDGET = 10_000
+# 压缩轮次原始问题保留区的 token 预算：保留最近的问题，超出从最旧截断。
+# 运行期默认值（RECENT_QUESTIONS_TOKEN_BUDGET 未设置/非法时回退到此值）。
+RECENT_QUESTIONS_TOKEN_BUDGET = DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET
+
+
+def resolve_recent_questions_token_budget(value: Any = None) -> int:
+    """保真问题索引预算：显式值优先，否则读 RECENT_QUESTIONS_TOKEN_BUDGET。
+
+    非法/负数回退默认 10k；0 表示只保留最新一条问题（trim 至少保留一条）。
+    每次调用现读 env，配置热重载即时生效。
+    """
+    if value is None:
+        value = load_var("RECENT_QUESTIONS_TOKEN_BUDGET", DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET)
+    try:
+        budget = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET
+    if budget < 0:
+        return DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET
+    return budget
 
 # 解析时兼容的标题别名（模型可能写出相近标题），映射到标准字段。
 _SECTION_ALIASES: dict[str, tuple[str, ...]] = {
@@ -694,12 +714,14 @@ def parse_summary_sections(text: Any) -> dict[str, Any]:
 
 def trim_recent_questions(
     questions: list[str],
-    token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
+    token_budget: int | None = None,
 ) -> list[str]:
     """保留最近（末尾）的原始问题，累计估算不超过 token 预算；超出时从最旧开始丢弃。
 
     至少保留最新一条问题（即使单条超过预算），保证模型总能读到最近一次任务意图。
+    token_budget 省略时读 RECENT_QUESTIONS_TOKEN_BUDGET（默认 10k）。
     """
+    token_budget = resolve_recent_questions_token_budget(token_budget)
     normalized = [str(question).strip() for question in questions if str(question).strip()]
     result: list[str] = []
     total = 0
@@ -715,13 +737,15 @@ def trim_recent_questions(
 
 def trim_recent_question_items(
     items: list[tuple[int | None, str]],
-    token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
+    token_budget: int | None = None,
 ) -> list[tuple[int | None, str]]:
     """按 token 预算保留最近的（轮次, 问题）条目；超出时从最旧开始丢弃。
 
     与 `trim_recent_questions` 同规则：至少保留最新一条（即使单条超过预算），
-    保证模型总能读到最近一次任务意图。
+    保证模型总能读到最近一次任务意图。token_budget 省略时读
+    RECENT_QUESTIONS_TOKEN_BUDGET（默认 10k）。
     """
+    token_budget = resolve_recent_questions_token_budget(token_budget)
     result: list[tuple[int | None, str]] = []
     total = 0
     for item in reversed(items):
@@ -736,9 +760,12 @@ def trim_recent_question_items(
 
 def extract_recent_questions(
     round_entries: list[dict[str, Any]],
-    token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
+    token_budget: int | None = None,
 ) -> list[str]:
-    """从全部历史轮次提取原始用户问题，并保留最近 token 预算内的部分。"""
+    """从全部历史轮次提取原始用户问题，并保留最近 token 预算内的部分。
+
+    token_budget 省略时读 RECENT_QUESTIONS_TOKEN_BUDGET（默认 10k）。
+    """
     questions = []
     for round_entry in round_entries:
         question = _round_question(round_entry)
@@ -749,7 +776,7 @@ def extract_recent_questions(
 
 def extract_recent_question_items(
     round_entries: list[dict[str, Any]],
-    token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
+    token_budget: int | None = None,
 ) -> list[tuple[int | None, str]]:
     """从全部历史轮次提取（轮次编号, 原始用户问题），保留最近 token 预算内的部分。
 
@@ -769,7 +796,7 @@ def split_context_window(
     round_entries: list[dict[str, Any]],
     summarized_count: int,
     keep_rounds: int | None = None,
-    token_budget: int = RECENT_QUESTIONS_TOKEN_BUDGET,
+    token_budget: int | None = None,
 ) -> tuple[list[tuple[int | None, str]], list[dict[str, Any]]]:
     """切分历史，决定"保真问题索引"与"完整对话轮次"的组成。
 
@@ -778,8 +805,8 @@ def split_context_window(
     - 未压缩轮次（summarized_count 之后的轮次）**全部**以完整对话回传
       （含助手回答、工具调用等），其问题不重复进入保真索引；
     - 已压缩轮次的原始用户问题全部进入保真索引（仍受 token_budget 限制，
-      超出从最旧丢弃）——历史规模改由压缩阈值与历史压缩目标控制，
-      不再由"保留最近 N 轮"限制。
+      省略时读 RECENT_QUESTIONS_TOKEN_BUDGET，默认 10k，超出从最旧丢弃）——
+      历史规模改由压缩阈值与历史压缩目标控制，不再由"保留最近 N 轮"限制。
 
     返回 (question_items, raw_rounds_in_window)：
     - question_items: (全局轮次编号, 问题) 列表，编号与累计摘要

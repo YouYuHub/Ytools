@@ -27,6 +27,7 @@ DEFAULT_SUMMARY_BUDGET_RATIO = 0.2          # 历史摘要总预算比例
 # 当前轮消息/摘要预留等固定开销。0 表示不设固定目标，改用动态可用空间
 # （触发阈值 − 上面那些固定开销 − 安全余量）。
 DEFAULT_HISTORY_COMPACT_TARGET_TOKENS = 0
+DEFAULT_RECENT_QUESTIONS_TOKEN_BUDGET = 10_000  # 保真问题索引预算（tokens）：已压缩轮次原始问题保留最近预算内的部分，超出从最旧丢弃；0 表示只保留最新一条
 DEFAULT_OVERSIZED_REJECT_FACTOR = 1.5       # 超长工具结果拒绝写入模型上下文的系数
 DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数时终止当前任务
 DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程最大回传长度；0 不回传真实内容（最新工具调用可能发送 "..." 占位），负数全量，正数保留末尾 N 字符
@@ -45,7 +46,7 @@ DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 900      # 单个子任务整体超时秒数
 DEFAULT_SUB_AGENT_REPLY_MAX_CHARS = 30000    # 子任务最终回复返回父级前的截断保护（完整轨迹在 JSONL 块内）
 DEFAULT_SUB_AGENT_FINAL_REPLY_RETRY_MAX = 3  # 子任务空收尾重试上限：最终回复为空时注入内部消息让子模型再次交付；0 或负数=不限制（一直重试，仍受已启用的轮次/超时限制约束）
 DEFAULT_SUB_AGENT_STREAM_ERROR_RETRY_MAX = 3  # 子任务模型调用流式错误续跑上限：出错后注入内部消息从断点继续；0 或负数=不限制（仍受已启用的轮次/超时限制约束）
-DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 3        # 子任务 todo 未完成提醒上限（成功执行其他工具后额度重置，单纯更新计划不重置）；0=关闭提醒，负数=不限制
+DEFAULT_SUB_AGENT_TODO_REMIND_MAX = 1        # 子任务 todo 未完成提醒上限（成功执行其他工具后额度重置，单纯更新计划不重置）；额度耗尽仍直出交付则自动标 done 收官；0=关闭提醒直接放行，负数=无限提醒直到模型亲口收官
 
 # 工具并发执行（前端聊天设置可调，GET/POST /chat_config/tool_concurrency）
 DEFAULT_ONE_TASK_MAX_WORKERS = 3             # 同一轮多个 MCP 工具调用并发执行的线程池大小（实际取值与工具数取较小者）

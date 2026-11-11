@@ -343,7 +343,7 @@ manifest.json                     # {version: 3, exported_at, groups: [{id, name
 | /chat_config/compaction_retry | GET | - | `{max_attempts, defaults, semantics{attempt, 0_or_negative, positive, retry_interval_seconds}, env_names, memory_state}`；上下文压缩调用失败重试上限（.env `COMPACTION_RETRY_MAX_ATTEMPTS`，默认 2）。一次"尝试"=一条完整"压缩模型→聊天模型"降级链（同源时本条链只有一次调用），链间隔固定 1 秒；达到次数抛 `ContextCompactionError` 终止当前任务 |
 | /chat_config/compaction_retry | POST | Body `{max_attempts}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次压缩调用立即生效；0 或负数=不限制（整条降级链一直重试直到手动停止） |
 | /chat_config/sub_agent_retry | GET | - | `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max, defaults, semantics, env_names, memory_state}`；子智能体交付保障重试配置（详见"子智能体（sub_agent）配置"节 §10.1） |
-| /chat_config/sub_agent_retry | POST | Body `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次子任务立即生效。`final_reply`/`stream_error`：0 或负数=不限制（仍受已启用的轮次/超时限制约束）；`todo_remind`：0=关闭提醒，负数=不限制（成功执行其他工具后额度重置，单纯更新计划不重置） |
+| /chat_config/sub_agent_retry | POST | Body `{final_reply_max_attempts, stream_error_max_attempts, todo_remind_max}`（整数，缺省用默认值） | `{state, updated, config, memory_state}`；写回 .env 并同步内存，下一次子任务立即生效。`final_reply`/`stream_error`：0 或负数=不限制（仍受已启用的轮次/超时限制约束）；`todo_remind`：0=关闭提醒直接放行，负数=无限提醒直到模型亲口收官，正数=提醒 N 次（默认 1）后自动标 done 收官（成功执行其他工具后额度重置，单纯更新计划不重置） |
 | /chat_config/retitle_setting | GET | `session_id`（必填） | `{state, session_id, enabled, exists, title_state: {title_generated, attempted}}`；读取会话「每条消息重新标题」开关（`_meta.retitle_each_message`，会话独立配置，未设置视为关闭）与标题生成状态概览 |
 | /chat_config/retitle_setting | POST | Body `{session_id, enabled}` | `{state, session_id, enabled, message}`；写入会话「每条消息重新标题」开关：开启时每轮任务收尾都重新生成标题（开启瞬间清除 `_title_state.attempted`），关闭时仅首轮生成一次；会话不存在返回 404 |
 | /chat_config/generate_title | POST | Body `{session_id(必填), question_text, model_preview, question_parts?}` | 前端触发的会话标题生成（详见下方"标题模型"节）：调标题模型生成并写回 `_meta.title`，结果同步返回（前端零轮询）；已生成过/失败标记/未配置标题模型时跳过并回显当前标题；会话不存在 404，生成失败 500 |
@@ -486,7 +486,7 @@ SUB_AGENT_TIMEOUT_SECONDS=900   # 子任务整体超时（0=不限制），超�
 SUB_AGENT_REPLY_MAX_CHARS=30000 # 返回父级的最终回复最大字符数（完整轨迹始终在 JSONL 事件块）
 SUB_AGENT_FINAL_REPLY_RETRY_MAX=3  # 空收尾重试上限（0/负=不限制）；耗尽按 error 收尾，不再伪装 done
 SUB_AGENT_STREAM_ERROR_RETRY_MAX=3 # 流式调用错误断点续跑上限（0/负=不限制）
-SUB_AGENT_TODO_REMIND_MAX=3     # 收尾时 todo 未完成提醒上限（0=关闭，负=不限制；成功执行其他工具后额度重置，单纯更新计划不重置）
+SUB_AGENT_TODO_REMIND_MAX=1     # 收尾时 todo 未完成提醒上限（额度耗尽仍直出交付则自动标 done 收官；0=关闭提醒直接放行，负=无限提醒；成功执行其他工具后额度重置，单纯更新计划不重置）
 ```
 
 前端配置：「聊天设置」模态框新增三个输入项（子任务空收尾重试次数 / 子任务断流续跑次数 / 子任务计划未完成提醒次数），经 `GET/POST /chat_config/sub_agent_retry` 读写上述 env。

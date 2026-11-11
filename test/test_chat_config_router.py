@@ -817,7 +817,7 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before.status_code, 200)
         self.assertEqual(before_body["final_reply_max_attempts"], 3)
         self.assertEqual(before_body["stream_error_max_attempts"], 3)
-        self.assertEqual(before_body["todo_remind_max"], 3)
+        self.assertEqual(before_body["todo_remind_max"], 1)
         self.assertEqual(
             before_body["env_names"],
             {
