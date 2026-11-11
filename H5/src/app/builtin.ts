@@ -219,14 +219,46 @@
     return wrap;
   }
 
-  // 从 ask_user 工具入参中解析问题列表（历史回放用）；非法返回 null
+  // 按 Unicode 码点计数（与后端 Python len 一致，emoji 按 1 计）
+  function askCodePoints(value: any): number {
+    return typeof value === "string" ? Array.from(value).length : 0;
+  }
+
+  // 从 ask_user 工具入参中解析问题列表（历史回放用）；非法返回 null。
+  // 镜像后端两层校验，被拒绝的调用不建卡——否则刷新后会被拦截的非法提问
+  // 也会冒出可点击的卡片（无对应回答、无等待任务），用户点了回答也无处可去，
+  // 还会误以为“回答了但消息块丢失”：
+  // - JSON Schema（factory/agent_runtime/tool_validation.py + builtin_tool_catalog.py
+  //   ASK_USER_TOOL_DEFINITION）：questions 数组 1-5 项；question 字符串 1-200 字符；
+  //   options 缺省或数组（空数组=纯自由输入），0-6 项，每项字符串 1-100 字符；
+  //   multiple 缺省或布尔；id 缺省或字符串且 ≤64 字符；
+  // - normalize（factory/agent_runtime/tool_inputs.py normalize_ask_questions）：
+  //   question 去空白后仍非空（纯空格题干 schema 能过、normalize 会拒）。
+  // 说明：后端 additionalProperties=False（未知键也拒绝），前端为向前兼容不校验
+  // 未知键——宁可多显示一张卡，不可藏起有效提问的重新回答入口。
   function parseAskQuestionsFromArgs(args: any): any {
     try {
       const data = typeof args === "string" ? JSON.parse(args) : args;
       const questions = data && Array.isArray(data.questions) ? data.questions : null;
-      if (!questions || !questions.length) return null;
+      if (!questions || questions.length < 1 || questions.length > 5) return null;
       const valid = questions.every(function (q: any) {
-        return q && typeof q.question === "string" && q.question.trim();
+        if (!q || typeof q !== "object" || Array.isArray(q)) return false;
+        if (typeof q.question !== "string") return false;
+        if (askCodePoints(q.question) < 1 || askCodePoints(q.question) > 200) return false;
+        if (!q.question.trim()) return false;
+        if (q.options !== undefined) {
+          if (!Array.isArray(q.options) || q.options.length > 6) return false;
+          for (let i = 0; i < q.options.length; i++) {
+            const option = q.options[i];
+            if (typeof option !== "string") return false;
+            if (askCodePoints(option) < 1 || askCodePoints(option) > 100) return false;
+          }
+        }
+        if (q.multiple !== undefined && typeof q.multiple !== "boolean") return false;
+        if (q.id !== undefined) {
+          if (typeof q.id !== "string" || askCodePoints(q.id) > 64) return false;
+        }
+        return true;
       });
       return valid ? questions : null;
     } catch (_) {
@@ -284,18 +316,13 @@
     updateAskSubmitState();
   }
 
-  // 每题都有答案（点选或自定义输入）才允许提交
+  // 提交门禁：允许跳过——单题可留空（回传“（未回答）”）、多选可 0 选择提交。
+  // 此前要求每题必答，用户对某题无意见时被迫填无意义答案，反而污染模型判断
+  // （ask_user 实测反馈）；关闭弹窗则不提交，任务保持暂停，可另发普通消息继续。
   function updateAskSubmitState(): void {
     if (!askSubmit) return;
     const items = askQuestions.querySelectorAll(".ask-question");
-    let complete = items.length > 0;
-    items.forEach(function (item: any) {
-      const hasSelection = !!item.querySelector(".ask-option.selected");
-      const custom = item.querySelector(".ask-custom");
-      const hasCustom = !!(custom && custom.value.trim());
-      if (!hasSelection && !hasCustom) complete = false;
-    });
-    askSubmit.disabled = !complete;
+    askSubmit.disabled = items.length === 0;
   }
 
   function openAskModal(questions: any, sourceBlock: any): void {
@@ -339,7 +366,8 @@
       closeAskModal();
       return;
     }
-    // 有未作答的题目时禁止提交（按钮同时处于禁用态，此处为兜底）
+    // 提交按钮仅在无题目时禁用（上已拦截）；此处为兜底。注意未作答题目
+    // 允许提交，回传“（未回答）”而不是拦住用户（跳过/0 选择是合法语义）。
     if (askSubmit && askSubmit.disabled) return;
     // 会话仍在输出时不允许提交：覆盖式回答需要确定的历史边界，
     // 等当前流结束后重新点击提问卡片提交即可
@@ -411,7 +439,12 @@
       const r = node.getAttribute ? parseInt(node.getAttribute("data-round"), 10) : NaN;
       if (Number.isFinite(r) && r > askRound) {
         hasLaterRounds = true;
-        const bubble = node.querySelector(".msg-user .msg-bubble");
+        // node 本身就可能是用户气泡（.msg-user）：querySelector 不含自身，
+        // 直接查后代 ".msg-user .msg-bubble" 在气泡节点上永远命中不了，
+        // 会把“已有回答轮”误判成“只有普通对话”，弹错确认分支。
+        const userNode = node.matches && node.matches(".msg-user")
+          ? node : node.querySelector(".msg-user");
+        const bubble = userNode && userNode.querySelector(".msg-bubble");
         if (bubble && bubble.textContent.indexOf("【回答模型提问】") === 0) {
           hasExistingAnswer = true;
         }

@@ -43,23 +43,34 @@
     function startLiveTimer(): void {
       if (!msg || liveTimerRow || !App.roundFold || !App.roundFold.fmtDuration) return;
       if (msg.querySelector(".round-fold-summary") || msg.querySelector(".live-round-timer")) return;
-      const startedAt = (msg as any)._foldRoundStartedAt;
-      const t0 = typeof startedAt === "number" && startedAt > 0 ? startedAt : Date.now();
+      // 落盘本轮起点（续跑/新管线复用容器时沿用旧值，不覆盖）：附接 marker
+      // 到达后会用后端权威墙钟覆盖（chat.ts attachStreamSession），paint 每次现读。
+      const existingStart = (msg as any)._foldRoundStartedAt;
+      if (!(typeof existingStart === "number" && existingStart > 0)) {
+        (msg as any)._foldRoundStartedAt = Date.now();
+      }
+      const t0 = Date.now();
       const row = el("div", "live-round-timer");
       const dot = el("span", "live-round-timer-dot");
       const text = el("span", "live-round-timer-text");
       row.appendChild(dot);
       row.appendChild(text);
-      let shown = false;
       const paint = function (): void {
         if (!row.isConnected) {
-          // 折叠接管移除后停跳；尚未挂载时（管线先建后挂）下秒重试，收尾时必停
+          // 行被摘掉（折叠接管/收尾移除，parentNode 置空）才停跳；行仍在 msg
+          // 内只是 msg 游离（切会话/窗口重建/管线先建后挂）时继续跳——挂回
+          // 即是正确读数，既不冻结也不从切回时刻重计；收尾/废弃时必停。
           liveTimerClock = null;
-          if (!shown && !finished) liveTimerClock = setTimeout(paint, 1000);
+          if (!finished && row.parentNode === msg && !activeStream.completed && !activeStream.detached) {
+            liveTimerClock = setTimeout(paint, 1000);
+          }
           return;
         }
-        shown = true;
-        const s = App.roundFold.fmtDuration(Date.now() - t0);
+        // 起点每次现读：附接 marker 晚于管线创建到达（刷新/切回场景），此时
+        // _foldRoundStartedAt 才被回填为真实起点；未来值（时钟偏斜）回退本地。
+        const liveStart = (msg as any)._foldRoundStartedAt;
+        const start = (typeof liveStart === "number" && liveStart > 0 && liveStart <= Date.now()) ? liveStart : t0;
+        const s = App.roundFold.fmtDuration(Date.now() - start);
         text.textContent = s ? "用时 " + s : "用时 0s";
         liveTimerClock = setTimeout(paint, 1000);
       };

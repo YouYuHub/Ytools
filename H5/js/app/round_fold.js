@@ -291,6 +291,25 @@
             return false;
         return fold.container === st.activeStream.messageNode;
     }
+    // 进行中的直播容器（跨会话豁免，不校验当前会话/ streaming 标志）：
+    // 切走看别的会话时历史同步不得解散/劫持它；完成/废弃的流不豁免。
+    function activeLiveContainer() {
+        var st = App.state;
+        if (!st || !st.activeStream || !st.activeStream.messageNode)
+            return null;
+        if (st.activeStream.completed || st.activeStream.detached)
+            return null;
+        return st.activeStream.messageNode;
+    }
+    function isSparedLiveFold(fold) {
+        var live = activeLiveContainer();
+        if (!live || !fold || fold.container !== live)
+            return false;
+        // 仅游离期豁免（切会话/窗口重建，容器暂时脱离 chatInner）：挂回后
+        // 参与正常合并；轮次号迁移（live-X → rN）等挂载态键变更不豁免，
+        // 否则旧键折叠永远不清，会留下双头。
+        return live.parentNode !== App.chatInner;
+    }
     // 直播轮计时下限：附接回放重建的节点时间戳都是“现在”，用 marker 下发的
     // 轮次开始墙钟兜底（存容器上，随续跑复用延续）。非直播折叠、缺失、非法、
     // 未来值（时钟偏斜）一律返回 0，即退回纯节点时间戳口径。
@@ -637,6 +656,22 @@
         var singleBody = units.length === 1 && units[0].nodeType === 1 &&
             units[0].matches(".msg-assistant-body");
         var fold = foldMap.get(key);
+        // 直播豁免（防劫持）：游离直播容器的折叠不得被纯扁平同步接管。
+        // 切回瞬间历史里若有同轮残留（裁剪失败），扁平同步会把直播折叠对象
+        // 改接到扁平区（头被搬到用户消息上方、直播侧裸露）；跳过等挂回合并。
+        var liveContainer = activeLiveContainer();
+        if (fold && liveContainer && fold.container === liveContainer &&
+            liveContainer.parentNode !== App.chatInner) {
+            var touchesLive = false;
+            for (var li = 0; li < nodes.length; li++) {
+                if (nodes[li] && nodes[li].parentNode === liveContainer) {
+                    touchesLive = true;
+                    break;
+                }
+            }
+            if (!touchesLive)
+                return;
+        }
         // 末段无正文（纯工具轮）不建折叠；非末段无有效成员不建（单小块规则统一下方）
         if ((!isFinal && (!members.length || !units.length)) ||
             (isFinal && (!tail || !members.length || !units.length)) ||
@@ -705,8 +740,15 @@
     }
     function pruneStale(seen) {
         Array.from(foldMap.keys()).forEach(function (key) {
-            if (seen.indexOf(key) < 0)
-                disbandFold(foldMap.get(key));
+            if (seen.indexOf(key) < 0) {
+                var fold = foldMap.get(key);
+                // 直播游离时（切会话/窗口重建，chatInner 已清空）保留其折叠对象：
+                // 头和成员都还在游离的直播容器里，挂回后合并；此时解散会把头从
+                // 游离容器里摘掉、成员全部展开，切回后顶部折叠/用时凭空消失。
+                if (isSparedLiveFold(fold))
+                    return;
+                disbandFold(fold);
+            }
         });
     }
     function userNodeBefore(node) {

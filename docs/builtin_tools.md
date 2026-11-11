@@ -5,7 +5,7 @@
 | 任务 | 工具与用法 |
 |---|---|
 | 维护计划 | `todo_write(todos)` 提交完整列表，最多 20 项；步骤含 `content/status`，`id` 可省略，返回后保持稳定。`[]` 清空 |
-| 缺少信息或需要确认 | `ask_user(questions)` 提出 1–5 题；可给 `options`、`multiple`。调用后等待用户回答，同轮其他工具不执行 |
+| 缺少信息或需要确认 | `ask_user(questions)` 提出 1–5 题；可给 `options`（0–6 项，空数组=纯自由输入）、`multiple`。调用后等待用户回答，同轮其他工具不执行。用户可留空提交（回传“（未回答）”）、多选可 0 选；非法参数展示前拦截且不在历史里留卡片 |
 | 独立子任务 | `sub_agent(task, todo?)` 写全目标、绝对路径、事实、约束和所需证据；同轮子任务并发，父模型收到最终报告 |
 | 新建文本 | `write_file(path, content, mode="create")`；目标已存在时报错，自动创建父目录 |
 | 覆盖或追加 | `write_file(..., mode="overwrite"/"append")`，必须明确模式；已有文件可带 `expected_hash` |

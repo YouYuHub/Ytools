@@ -319,14 +319,8 @@ body.sidebar-resizing {
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    // 筛选生效状态：只用文字色区分（不再画边框）。不指定 border-color，
-    // 保持 base 的 transparent 占位，三种状态观感统一。
-    .session-time-filter-btn.is-active {
-      color: var(--accent);
-    }
-    // hover 写在 .is-active 之后：两者同优先级（0,2,0），靠源序让 hover 在
-    // 已激活状态下也能提亮（之前 hover 在前，被 .is-active 覆盖，点了筛选
-    // 之后鼠标悬浮毫无反馈）。
+    // 筛选生效状态（.is-active）不做视觉区分：按钮文案本身就是当前范围
+    // （“近一月/全部时间…”），无 hover 时与未筛选观感一致；只有 hover 才提亮。
     .session-time-filter-btn:hover {
       color: var(--text);
     }

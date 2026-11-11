@@ -161,6 +161,12 @@ Node.js 需要 20 或更新版本，MCP 当前锁定为 `0.0.83`。Chromium 用�
 
 Chat Completions、Messages、Responses 三种模型接口共用同一份工具注册和运行路由。工具选择以当前服务 ID 与工具清单为准；服务已移除或工具名失效时，需在配置工具面板或任务模板中重新选择，不做旧浏览器服务名、旧调用别名迁移。用户自行配置的其他 MCP 服务保留各自身份。
 
+## 已知行为（实测）
+
+- `browser_drag` 对 HTML5 `draggable` 原生拖拽可能无效（目标无反应）；此时改用 `browser_drop`（向目标传 `data` 文本或 `paths` 文件）完成放置，实测可用。
+- `browser_file_upload` 必须先点击 input 触发文件选择器，否则报「需要 modal state」——这是正确保护，不是 bug：先 `browser_click` 点选择器，再调上传。
+- 截图 `filename` 用相对路径时落在会话工作目录，同名会覆盖；需要保留多次截图时每次传不同的文件名。
+
 ## MCP 测试与验证
 
 「配置工具 → MCP 测试」只列一个 Browser，额外选择 **连接配置（profile）** 即可测试两个运行实例。路由目标放在HTTP 请求顶层 mcp_profile；JSON/表单工具参数仍使用微软返回的原始 Schema。

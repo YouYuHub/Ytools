@@ -1239,3 +1239,96 @@ test("无压缩条时尾后收纳照旧（暂停残留仍收进折叠）", async
   const leftover = Array.from(msg.children).find(n => n.textContent === "暂停残留工具");
   assert.ok(leftover.classList.contains("is-roundfold-hidden"), "无压缩条时尾后残留仍被收纳");
 });
+
+test("切会话：游离直播折叠不被历史同步解散，挂回后头仍在容器顶部", async t => {
+  const x = setup();
+  t.after(x.close);
+  const prevUser = div(x.document, "msg-user"); prevUser.dataset.round = "1";
+  prevUser.appendChild(div(x.document, "msg-bubble", "上一轮问题"));
+  const prevUsage = div(x.document, "round-usage", "上一轮用量"); prevUsage.dataset.round = "1";
+  const user = div(x.document, "msg-user"); user.dataset.round = "2";
+  user.appendChild(div(x.document, "msg-bubble", "本轮问题"));
+  const msg = liveMsg(x, 2);
+  x.chatInner.prepend(prevUser, prevUsage, user);
+  x.App.state.streaming = true; x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { sessionId: "s", userNode: user, messageNode: msg };
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"), "直播应建折叠头");
+  // 切走：chatInner 清空后只渲染历史（上一轮），直播游离
+  x.chatInner.innerHTML = "";
+  const hUser = div(x.document, "msg-user"); hUser.dataset.round = "1";
+  hUser.appendChild(div(x.document, "msg-bubble", "上一轮问题"));
+  const hUsage = div(x.document, "round-usage", "上一轮用量"); hUsage.dataset.round = "1";
+  x.chatInner.append(hUser, hUsage);
+  x.App.roundFold.sync(x.chatInner);
+  assert.ok(msg.querySelector(".round-fold-summary"), "游离直播头不得被历史同步摘掉");
+  assert.equal(msg.querySelector(".msg-assistant-body").classList.contains("is-roundfold-hidden"), true, "成员保持折叠");
+  // 切回：挂回后头仍在容器顶部（首个成员之前），总数唯一
+  x.chatInner.append(user, msg);
+  x.App.roundFold.sync(x.chatInner);
+  const head = msg.querySelector(".round-fold-summary");
+  assert.ok(head, "挂回后直播头仍在");
+  assert.equal(head.nextElementSibling, msg.querySelector(".msg-time"), "头紧贴容器首个成员");
+  assert.equal(x.chatInner.querySelectorAll(".round-fold-summary").length, 1);
+});
+
+test("切会话：同轮历史残留不得把游离直播头劫持到扁平区", async t => {
+  const x = setup();
+  t.after(x.close);
+  const user = div(x.document, "msg-user"); user.dataset.round = "2";
+  user.appendChild(div(x.document, "msg-bubble", "本轮问题"));
+  const msg = liveMsg(x, 2);
+  x.chatInner.prepend(user);
+  x.App.state.streaming = true; x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { sessionId: "s", userNode: user, messageNode: msg };
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"));
+  // 历史含同轮残留（裁剪失败）：扁平同步不得接管游离直播折叠对象
+  x.chatInner.innerHTML = "";
+  const hUser = div(x.document, "msg-user"); hUser.dataset.round = "2";
+  hUser.appendChild(div(x.document, "msg-bubble", "本轮问题"));
+  function flat(cls, txt) { const n = div(x.document, cls, txt); n.dataset.round = "2"; return n; }
+  x.chatInner.append(hUser, flat("msg-time stage-time", "10:00"), flat("msg-assistant-body", "残留正文1"),
+    flat("think-block", "残留思考"), flat("msg-assistant-body", "残留正文2"));
+  x.App.roundFold.sync(x.chatInner);
+  assert.ok(msg.querySelector(".round-fold-summary"), "游离直播头不得被扁平同步搬走");
+  assert.equal(x.chatInner.querySelectorAll(":scope > .round-fold-summary").length, 0, "扁平区不得出现劫持来的头");
+});
+
+test("轮次号迁移：live-X 旧键在挂载态正常回收，不留双头", async t => {
+  const x = setup();
+  t.after(x.close);
+  const user = div(x.document, "msg-user");
+  user.appendChild(div(x.document, "msg-bubble", "问题"));
+  const msg = div(x.document, "msg");
+  msg.append(div(x.document, "msg-time stage-time", "10:00"), div(x.document, "msg-assistant-body", "正文1"),
+    div(x.document, "think-block", "思考"), div(x.document, "msg-assistant-body", "正文2"));
+  x.chatInner.append(user, msg);
+  x.App.state.streaming = true; x.App.state.streamingSession = "s";
+  x.App.state.activeStream = { sessionId: "s", userNode: user, messageNode: msg };
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelectorAll(".round-fold-summary").length, 1);
+  user.dataset.round = "5"; msg.dataset.round = "5";
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelectorAll(".round-fold-summary").length, 1, "迁移后唯一头");
+});
+
+test("完成/废弃的直播不再豁免：游离头随历史同步正常回收", async t => {
+  for (const flag of ["completed", "detached"]) {
+    const x = setup();
+    const user = div(x.document, "msg-user"); user.dataset.round = "2";
+    user.appendChild(div(x.document, "msg-bubble", "本轮问题"));
+    const msg = liveMsg(x, 2);
+    x.chatInner.prepend(user);
+    x.App.state.activeStream = Object.assign({ sessionId: "s", userNode: user, messageNode: msg }, { [flag]: true });
+    x.App.roundFold.sync(msg);
+    assert.ok(msg.querySelector(".round-fold-summary"));
+    x.chatInner.innerHTML = "";
+    const hUser = div(x.document, "msg-user"); hUser.dataset.round = "1";
+    hUser.appendChild(div(x.document, "msg-bubble", "旧问题"));
+    x.chatInner.append(hUser);
+    x.App.roundFold.sync(x.chatInner);
+    assert.equal(msg.querySelector(".round-fold-summary"), null, flag + "后游离头应被回收");
+    x.close();
+  }
+});

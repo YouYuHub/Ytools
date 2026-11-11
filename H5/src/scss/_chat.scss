@@ -1155,10 +1155,13 @@ html[data-theme="dark"] {
   padding: 2px 4px 0;
 }
 
-// 历史回放把用量行直接放在 chat-inner 下；抵消一部分 12px 的消息间距，
-// 让它贴近所属轮次的最后一条内容。流式消息内已有 6px 的子项间距。
+// 历史回放把用量行直接放在 chat-inner 下：上沿多抵消、贴近所属轮次的
+// 最后一条内容；下沿加间距、远离下一轮提问。流式消息内已有 6px 子项间距。
 .chat-inner > :not(.qnav-load-older) + .round-usage {
-  margin-top: -4px;
+  margin-top: -8px;
+}
+.chat-inner > .round-usage {
+  margin-bottom: 10px;
 }
 
 // ---------- 上下文压缩进度块 ----------

@@ -1583,6 +1583,11 @@
         });
         setEmpty(false);
         App.rebuildQnav();
+        // 挂回后立即重建折叠：历史渲染时的同步发生在直播游离期（即使有豁免，
+        // 合并位置仍是旧的），不等下一个流事件就把头放回直播容器顶部；
+        // 正在看旧历史时跳过（直播隐藏中，返回尾部时由 restoreTail 同步）。
+        if (!hidden && App.processGroups)
+            App.processGroups.sync(chatInner);
         // 模型名刷新已提升到 openSession 主流程（此处不再调用，避免同一次打开重复请求）
         return true;
     }

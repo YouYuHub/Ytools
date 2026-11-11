@@ -833,9 +833,6 @@ html[data-theme=dark] .panel .side-actions .bulk-mode-toggle.bulk-mode-active {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.panel .session-head .session-time-filter-btn.is-active {
-  color: var(--accent);
-}
 .panel .session-head .session-time-filter-btn:hover {
   color: var(--text);
 }
@@ -2751,7 +2748,11 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 }
 
 .chat-inner > :not(.qnav-load-older) + .round-usage {
-  margin-top: -4px;
+  margin-top: -8px;
+}
+
+.chat-inner > .round-usage {
+  margin-bottom: 10px;
 }
 
 .compaction-bar {
