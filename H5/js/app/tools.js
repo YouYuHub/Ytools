@@ -164,6 +164,7 @@
     }
     async function loadTools(forceRefresh) {
         let success = true;
+        let failureDetail = "";
         const previousTools = state.tools.slice();
         // 和工具探测并行刷新当前会话的模型能力；无论工具接口成功与否，
         // 都等能力结果返回后再渲染弹窗，避免使用旧 vision 状态。
@@ -186,8 +187,10 @@
                 state.draftTools = remapToolSet(state.draftTools, previousTools, state.tools);
             }
         }
-        catch (_) {
+        catch (err) {
             success = false;
+            // 透出后端 detail（如鉴权失败原因），避免“更新失败”黑盒难定位
+            failureDetail = (err && err.message) ? String(err.message) : "";
             state.tools = [];
             state.servers = [];
             state.failedServers = [];
@@ -205,7 +208,7 @@
         }
         if (!toolModal.classList.contains("hidden"))
             renderToolGroups();
-        return { success: success, modelConfigRefreshed: modelConfigRefreshed };
+        return { success: success, modelConfigRefreshed: modelConfigRefreshed, failureDetail: failureDetail };
     }
     function groupTools() {
         const groups = new Map();
@@ -684,7 +687,7 @@
         if (toolFollowGlobal)
             toolFollowGlobal.disabled = false;
         toast(!result.success
-            ? "工具列表更新失败"
+            ? ("工具列表更新失败" + (result.failureDetail ? "：" + result.failureDetail : ""))
             : result.modelConfigRefreshed
                 ? "工具列表和模型能力已更新"
                 : "工具列表已更新，但模型能力刷新失败");

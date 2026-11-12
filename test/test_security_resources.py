@@ -165,7 +165,8 @@ def test_static_mount_does_not_publish_dev_directories(accounts):
     _, _, _, (first, _, _), _ = accounts
     for path in ("/ui/package.json", "/ui/node_modules/playwright/package.json", "/ui/test_h5/api.test.js"):
         assert first.get(path).status_code == 404
-    assert first.get("/ui/login.js").status_code == 200
+    # 登录页脚本已随 TS 迁移搬到 /ui/js/ 下（旧 /ui/login.js 路径不再存在）
+    assert first.get("/ui/js/login.js").status_code == 200
     # 根目录公开图片白名单：缺谁页面就 404（ask-squid 曾遗漏导致提问卡图标裂图）
     assert first.get("/ui/favicon-squid.svg").status_code == 200
     assert first.get("/ui/ask-squid.svg").status_code == 200

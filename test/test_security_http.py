@@ -40,8 +40,11 @@ def secured(tmp_path, monkeypatch):
         return Response("<p>example</p>", media_type="application/pdf" if kind == "pdf" else "text/html")
     @app.get("/tools/list")
     def tools(refresh: bool = False):
-        assert not refresh, "ordinary users must never trigger forced tool discovery"
+        assert not refresh or current().admin, "ordinary users must never trigger forced tool discovery"
         return {"tools": []}
+    @app.get("/tools/diagnostics")
+    def diagnostics():
+        return {"servers": []}
     @app.post("/chat_config/models/select")
     def write_global():
         pytest.fail("query session ID must not turn a global body into a session update")
@@ -262,6 +265,41 @@ def test_force_tool_refresh_uses_framework_boolean_semantics(secured, query):
     client, *_ = secured
     login(client, "member")
     assert client.get("/tools/list?" + query).status_code == 403
+
+
+def _age_recent_auth(store, seconds=601):
+    import time
+    with store.database(True) as db:
+        db.execute("UPDATE login_sessions SET recent_auth=?", (time.time() - seconds,))
+
+
+def test_admin_tool_refresh_survives_stale_recent_auth(secured):
+    # 管理员登录超过 300 秒后点刷新：手动发现等价于热重载自动发现，
+    # 不应再被近期验证挡住（工具弹窗内无重新验证入口）。
+    client, store, _, _ = secured
+    login(client)
+    _age_recent_auth(store)
+    response = client.get("/tools/list?refresh=1")
+    assert response.status_code == 200, response.text
+
+
+def test_member_tool_refresh_denied_even_when_fresh(secured):
+    client, *_ = secured
+    login(client, "member")
+    response = client.get("/tools/list?refresh=1")
+    assert response.status_code == 403
+    assert "管理员" in response.json()["detail"]
+
+
+def test_tool_diagnostics_still_requires_recent_admin(secured):
+    # 诊断接口可实际执行工具：近期验证门槛保持不动。
+    client, store, _, _ = secured
+    login(client)
+    assert client.get("/tools/diagnostics").status_code == 200
+    _age_recent_auth(store)
+    response = client.get("/tools/diagnostics")
+    assert response.status_code == 403
+    assert "近期验证" in response.json()["detail"]
 
 
 def test_active_content_is_downloaded_and_pdf_keeps_same_origin_preview(secured):

@@ -76,8 +76,27 @@
     }
   },
   "inputs": {
+    "__builtin__": [
+      "apply_patch",
+      "ask_user",
+      "edit_file",
+      "read_document",
+      "read_file",
+      "read_media",
+      "run_command",
+      "search_files",
+      "sub_agent",
+      "todo_write",
+      "write_file"
+    ],
     "PipeIpcMcp": [],
-    "WebServer": [],
+    "WebServer": [
+      "fetch_url",
+      "web_click",
+      "web_find",
+      "web_open",
+      "web_search"
+    ],
     "Browser": []
   }
 }
