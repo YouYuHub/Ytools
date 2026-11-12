@@ -11,6 +11,8 @@ from datetime import datetime
 
 # 整个仓库历史文件统一的时间戳格式串（jsonl / 上传记录 / MCP 状态都用这个）
 DEFAULT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+# 工具错误上报用的系统时间格式（年/月/日 时:分:秒），随错误文本返回给模型
+TOOL_ERROR_TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
 
 
 def now_str() -> str:
@@ -22,3 +24,8 @@ def format_timestamp(value: datetime | None = None) -> str:
     """格式化任意时间（默认当前时间）为标准字符串。"""
     target = value or datetime.now()
     return target.strftime(DEFAULT_TIMESTAMP_FORMAT)
+
+
+def now_slash_str() -> str:
+    """获取当前本地时间的斜线格式字符串（年/月/日 时:分:秒），供工具错误上报。"""
+    return datetime.now().strftime(TOOL_ERROR_TIMESTAMP_FORMAT)

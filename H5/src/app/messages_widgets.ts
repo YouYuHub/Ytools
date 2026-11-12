@@ -1,5 +1,5 @@
 /**
- * 媒体伪标签/三控件缩放/SVG 双视图块（原 messages.js 3191-3582 行拆出）
+ * 媒体伪标签/四控件缩放/SVG 双视图块（原 messages.js 3191-3582 行拆出）
  * 依赖：app/core.js；跨文件调用一律经 App.*（运行时解析，defer 顺序加载保证可用）。
  */
 (function (App: any) {
@@ -55,7 +55,7 @@
     }
   });
 
-  // ---------- 三控件（svg/mermaid/canvas）显示缩放 ----------
+  // ---------- 四控件（svg/mermaid/canvas/chart）显示缩放 ----------
   // 缩放状态 = 块的 data-zoom（倍率）+ CSS 变量 --md-zoom：
   // - svg/mermaid 图片视图：内联宽度表达式乘 var(--md-zoom)，放大后由视图
   //   容器（overflow:auto）滚动查看、缩小则居中（margin:0 auto）；
@@ -128,16 +128,30 @@
     else if (action === "reset") applyZoomScale(block, 1);
   });
 
-  // Ctrl+滚轮缩放（仅 svg/mermaid 图片视图；canvas 在跨源 iframe 内，
-  // 滚轮事件到不了父文档，其缩放走按钮/沙箱消息）
+  // 滚轮缩放（svg/mermaid/chart 图片视图）：非全屏只响应 Ctrl+滚轮，
+  // 普通滚轮留给页面滚动；全屏内普通滚轮直接按档位步进（Ctrl 同样有效），
+  // 到边界（25%/800%）或纯水平滚动时不拦截，放行给容器滚动，
+  // 避免滚轮被“吸住”。canvas 在跨源 iframe 内，滚轮事件到不了父文档，
+  // 其缩放走按钮/沙箱消息（此处防御性跳过）。
   chatInner.addEventListener("wheel", function(e: any) {
-    if (!e.ctrlKey) return;
+    if (!e.deltaY) return;
     const view = e.target.closest ? e.target.closest(".md-svg-view") : null;
     if (!view) return;
     const block = view.closest(".md-svg-block");
-    if (!block) return;
+    if (!block || block.classList.contains("md-canvas-block")) return;
+    const dir = e.deltaY < 0 ? +1 : -1;
+    if (document.fullscreenElement !== block) {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      stepZoom(block, dir);
+      return;
+    }
+    var cur = zoomScaleOf(block);
+    if (!ZoomUtils.canStep(cur, dir)) return;
+    var next = ZoomUtils.stepScale(cur, dir);
+    if (!(next > 0) || next === cur) return;
     e.preventDefault();
-    stepZoom(block, e.deltaY < 0 ? +1 : -1);
+    applyZoomScale(block, next);
   }, { passive: false });
 
   // 放大后按住拖动平移（与图片预览一致的手感）：滚动容器 scroll 方案，

@@ -91,6 +91,12 @@
     &:has(> .qnav:not(.hidden)) .chat-inner {
       padding-right: 44px;
     }
+    // 输入区同样避让导航条：导航占右缘 14px + 轨道 40px（左缘距右 54px）。
+    // 左右各留 60px：右侧与导航零重叠（6px 间隙），左侧对称，输入框居中
+    // 不偏；输入框撑再高也不挤导航。
+    &:has(> .qnav:not(.hidden)) .bottom {
+      padding: 0 60px 12px;
+    }
   }
 }
 

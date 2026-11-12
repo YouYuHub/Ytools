@@ -31,25 +31,29 @@
     let curAnswer: any = null;
     let stageTimestamp = new Date().toISOString();
     // 直播计时行：起播即显示跳秒用时（折叠出现前唯一的计时显示；折叠接管
-    // 后由 round_fold 移除，收尾无折叠时在此移除——终态与过去一致）。
+    // 后由 round_fold 隐藏（解散时恢复），收尾时在此彻底移除。
     let liveTimerRow: any = null;
     let liveTimerClock: any = null;
     function stopLiveTimer(): void {
       if (liveTimerClock != null) { clearTimeout(liveTimerClock); liveTimerClock = null; }
-      // 折叠接管后节点已脱离：remove 对脱离节点是无害空操作，直接调即可
+      // 接管隐藏中的行一并移除（解散恢复逻辑 query 不到已删节点，自然跳过）
       if (liveTimerRow) liveTimerRow.remove();
       liveTimerRow = null;
     }
     function startLiveTimer(): void {
       if (!msg || liveTimerRow || !App.roundFold || !App.roundFold.fmtDuration) return;
       if (msg.querySelector(".round-fold-summary") || msg.querySelector(".live-round-timer")) return;
-      // 落盘本轮起点（续跑/新管线复用容器时沿用旧值，不覆盖）：附接 marker
-      // 到达后会用后端权威墙钟覆盖（chat.ts attachStreamSession），paint 每次现读。
-      const existingStart = (msg as any)._foldRoundStartedAt;
-      if (!(typeof existingStart === "number" && existingStart > 0)) {
-        (msg as any)._foldRoundStartedAt = Date.now();
-      }
+      // 本轮起点落盘：发送/续跑管线（replayComplete!==false）在容器尚无起点
+      // 时记本地创建时间（=轮次起点，折叠计时下限与续跑复用都靠它）；附接
+      // 管线绝不落盘——“未知”不能伪装成“附接时刻”，等 marker/用户时间回填
+      // 权威值（paint 现读；都缺时才回退本地 t0）。
       const t0 = Date.now();
+      const existingStart = (msg as any)._foldRoundStartedAt;
+      if (!(typeof existingStart === "number" && existingStart > 0) &&
+          activeStream.replayComplete !== false) {
+        (msg as any)._foldRoundStartedAt = t0;
+      }
+      let startSourceLogged = false;
       const row = el("div", "live-round-timer");
       const dot = el("span", "live-round-timer-dot");
       const text = el("span", "live-round-timer-text");
@@ -69,7 +73,14 @@
         // 起点每次现读：附接 marker 晚于管线创建到达（刷新/切回场景），此时
         // _foldRoundStartedAt 才被回填为真实起点；未来值（时钟偏斜）回退本地。
         const liveStart = (msg as any)._foldRoundStartedAt;
-        const start = (typeof liveStart === "number" && liveStart > 0 && liveStart <= Date.now()) ? liveStart : t0;
+        const useLive = typeof liveStart === "number" && liveStart > 0 && liveStart <= Date.now();
+        const start = useLive ? liveStart : t0;
+        if (!startSourceLogged) {
+          startSourceLogged = true;
+          if (!useLive && typeof console !== "undefined" && console.debug) {
+            console.debug("[live-timer] 无后端轮次起点，回退本地计时（刷新/附接重计请先看这条）");
+          }
+        }
         const s = App.roundFold.fmtDuration(Date.now() - start);
         text.textContent = s ? "用时 " + s : "用时 0s";
         liveTimerClock = setTimeout(paint, 1000);
@@ -1058,5 +1069,21 @@
     };
   }
 
+  // 附接回填本轮起点（marker 缺 round_started_at 时的兜底）：仅当容器尚无
+  // 有效起点、且按轮次号精确复用了历史用户气泡时，用该气泡原始发送时间
+  // 回填（与 round_fold 历史兜底同口径：Date.parse + 非法/未来值拒绝）。
+  // 文本匹配/新建气泡不回填（时间可能是“现在”或错轮，宁缺毋滥）。
+  function backfillRoundStartFromUserNode(msg: any, round: any, userNode: any, roundMatched: any): boolean {
+    if (!msg || round == null || !roundMatched) return false;
+    const cur = (msg as any)._foldRoundStartedAt;
+    if (typeof cur === "number" && cur > 0) return false;
+    const stamp = userNode && userNode.dataset
+      ? Date.parse(userNode.dataset.stageTimestamp || "") : NaN;
+    if (!(stamp > 0) || stamp > Date.now()) return false;
+    (msg as any)._foldRoundStartedAt = stamp;
+    return true;
+  }
+
   App.createStreamPipeline = createStreamPipeline;
+  App.backfillRoundStartFromUserNode = backfillRoundStartFromUserNode;
 })((window as unknown as { App: any }).App);

@@ -82,6 +82,29 @@ class SubAgentSystemTextTests(unittest.TestCase):
         self.assertNotIn("当前模型不支持视觉", prompt)
         self.assertNotIn("read_media", prompt)
         self.assertNotIn("重要内容需要实时告诉用户", prompt)
+        # 子智能体禁发富媒体（含 chart）：受众是父模型不是界面
+        self.assertIn("Chart", prompt)
+        self.assertNotIn("```chart", prompt)
+
+
+class ChartBlockPromptTests(unittest.TestCase):
+    """数据图表提示词：触发条件 + schema + 规则 + 极小示例。"""
+
+    def test_media_prompt_contains_chart_section(self):
+        prompt = sp.build_media_tag_prompt()
+        self.assertIn("## 数据图表（```chart 代码块）", prompt)
+        self.assertIn("bar（柱状/直方图", prompt)
+        self.assertIn("hbar（横条", prompt)
+        self.assertIn("line（折线", prompt)
+        self.assertIn("pie（饼图", prompt)
+        self.assertIn('"type": "bar"', prompt)
+        self.assertIn("合法 JSON", prompt)
+
+    def test_chart_prompt_included_in_main_but_not_sub_agent(self):
+        self.assertIn("```chart", sp.build_sys_prompt())
+        self.assertNotIn(
+            "## 数据图表", sp.build_sys_prompt(include_media_prompt=False)
+        )
 
 
 class ToolCallTimeoutNoteTests(unittest.TestCase):

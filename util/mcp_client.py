@@ -739,19 +739,35 @@ async def call_mcp_tool(
         call = client.call(function_name, arguments or {})
     else:
         call = _call_mcp_tool_impl(function_name, arguments, mcp_service, mcp_profile) if mcp_profile else _call_mcp_tool_impl(function_name, arguments, mcp_service)
+    def _drop_client() -> None:
+        if client is None:
+            return
+        if mcp_profile:
+            _drop_persistent_client(mcp_service, session_scope, client, mcp_profile)
+        else:
+            _drop_persistent_client(mcp_service, session_scope, client)
+
     try:
         if timeout_seconds > 0:
             result = await asyncio.wait_for(call, timeout=timeout_seconds)
         else:
             result = await call
         return f"[MCP 服务: {mcp_service}; profile: {mcp_profile}]\n{result}" if mcp_profile else result
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        if client is not None:
-            if mcp_profile:
-                _drop_persistent_client(mcp_service, session_scope, client, mcp_profile)
-            else:
-                _drop_persistent_client(mcp_service, session_scope, client)
+    except asyncio.CancelledError:
+        # 取消（用户停止/上层超时）原样上抛：不是工具超时，不包装
+        _drop_client()
         raise
+    except asyncio.TimeoutError as exc:
+        # 超时必须带可读信息：裸 TimeoutError 文本为空，上层会归一成
+        # “工具执行失败【】”，模型无法区分超时与普通错误
+        _drop_client()
+        target = f"{function_name}@{mcp_service}"
+        if mcp_profile:
+            target += f"[{mcp_profile}]"
+        raise TimeoutError(
+            f"工具调用超时：{target} 超过 {timeout_seconds:g} 秒无响应"
+            "（含连接/初始化/调用全过程）"
+        ) from exc
 
 
 if __name__ == '__main__':

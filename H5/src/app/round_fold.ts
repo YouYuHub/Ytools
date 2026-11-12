@@ -363,6 +363,14 @@
     tickingFolds.delete(fold);
     maybeStopTimer();
     fold.header.remove();
+    // 解散时恢复被接管隐藏的计时行（若有）：行仍在原容器内（仅隐藏），
+    // 且容器内已无其它折叠头（跨容器合并/键迁移时旧头先散新头后建，
+    // 同 sync 内新头会重新接管隐藏，无闪烁）；收尾已删除时 query 为空。
+    var taken = fold.container && fold.container.querySelector
+      ? fold.container.querySelector(".live-round-timer.is-taken-over") : null;
+    if (taken && taken.parentNode && !taken.parentNode.querySelector(".round-fold-summary")) {
+      taken.classList.remove("is-taken-over");
+    }
     fold.members.forEach(function (node: any) {
       if (node._roundFold !== fold) return;
       delete node._roundFold;
@@ -607,9 +615,12 @@
     else if (choices.has(key)) fold.open = choices.get(key);
     else fold.open = false;
     if (fold.header.nextElementSibling !== members[0]) members[0].parentNode.insertBefore(fold.header, members[0]);
-    // 折叠接管计时：移除直播计时行（若有；起播到成折叠前的过渡显示）
-    var liveTimer = members[0].parentNode.querySelector(".live-round-timer");
-    if (liveTimer) liveTimer.remove();
+    // 折叠接管计时：隐藏直播计时行（若有；起播到成折叠前的过渡显示）。
+    // 注意是隐藏而非删除：折叠随后可能因成员收缩被解散（单段规则/键迁移
+    // 边沿），删除会导致计时两头落空（头没了、行也没了）；隐藏的行在解散
+    // 时恢复显示，收尾时仍由管线 stopLiveTimer 彻底移除。
+    var liveTimer = members[0].parentNode.querySelector(".live-round-timer:not(.is-taken-over)");
+    if (liveTimer) liveTimer.classList.add("is-taken-over");
     applyVisibility(fold);
     renderHeader(fold);
   }

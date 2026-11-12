@@ -55,6 +55,11 @@ function harness() {
   };
   vm.createContext(context);
   vm.runInContext(source.slice(start, functionEnd), context);
+  // 附接起点回填 helper（模块级函数 + App 导出，供 chat.ts marker 缺失时调用）
+  const backfillStart = source.indexOf('  function backfillRoundStartFromUserNode(');
+  const backfillExport = 'App.backfillRoundStartFromUserNode = backfillRoundStartFromUserNode;';
+  const backfillEnd = source.indexOf(backfillExport, backfillStart) + backfillExport.length;
+  vm.runInContext(source.slice(backfillStart, backfillEnd), context);
   const activeStream = {};
   const pipe = context.createStreamPipeline(msg, 's', activeStream);
   const row = () => msg.querySelector('.live-round-timer');
@@ -62,6 +67,13 @@ function harness() {
   return {
     dom, document, chatInner, msg, activeStream, pipe,
     recreate: (stream) => context.createStreamPipeline(msg, 's', stream || {}),
+    backfill: context.App.backfillRoundStartFromUserNode,
+    spawn: (stream) => {
+      const m2 = document.createElement('div');
+      m2.className = 'msg';
+      chatInner.appendChild(m2);
+      return { msg: m2, pipe: context.createStreamPipeline(m2, 's', stream || {}) };
+    },
     row, text,
     setNow: v => { now = v; },
     getNow: () => now,
@@ -71,6 +83,42 @@ function harness() {
     drainTicks: n => { for (let i = 0; i < n && timers.length; i++) timers.shift().fn(); },
   };
 }
+
+test('附接管线不落盘未知起点（等 marker/回填），发送管线落盘', t => {
+  const h = harness();
+  t.after(() => h.dom.window.close());
+  // 附接：replayComplete=false → 不写 _foldRoundStartedAt（未知不能伪装成附接时刻）
+  const a = h.spawn({ replayComplete: false });
+  assert.equal(a.msg._foldRoundStartedAt, undefined);
+  assert.ok(a.msg.querySelector('.live-round-timer'), '计时行仍建（回退本地 t0）');
+  // 发送：replayComplete=true → 落盘创建时间
+  const s = h.spawn({ replayComplete: true });
+  assert.equal(s.msg._foldRoundStartedAt, h.getNow());
+});
+
+test('回填：按轮复用的历史用户气泡时间可作起点', t => {
+  const h = harness();
+  t.after(() => h.dom.window.close());
+  const user = h.document.createElement('div');
+  user.className = 'msg-user';
+  const sentAt = h.getNow() - 180000;
+  user.dataset.stageTimestamp = new Date(sentAt).toISOString();
+  const m2 = h.document.createElement('div');
+  // 命中：轮次匹配 + 尚无起点 → 回填
+  assert.equal(h.backfill(m2, 5, user, true), true);
+  assert.equal(m2._foldRoundStartedAt, sentAt);
+  // 已有权威值不再覆盖
+  assert.equal(h.backfill(m2, 5, user, true), false);
+  // 轮次未知 / 非轮次匹配 / 非法时间 → 拒绝
+  const m3 = h.document.createElement('div');
+  assert.equal(h.backfill(m3, null, user, true), false);
+  assert.equal(h.backfill(m3, 5, user, false), false);
+  user.dataset.stageTimestamp = 'not-a-time';
+  assert.equal(h.backfill(m3, 5, user, true), false);
+  user.dataset.stageTimestamp = new Date(h.getNow() + 60000).toISOString();
+  assert.equal(h.backfill(m3, 5, user, true), false);
+  assert.equal(m3._foldRoundStartedAt, undefined);
+});
 
 test('管线创建即落盘本轮起点，复用容器时不覆盖', t => {
   const h = harness();

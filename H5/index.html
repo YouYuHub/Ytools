@@ -10,7 +10,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js?v=56818aca26c4"></script>
-    <link rel="stylesheet" href="css/main.css?v=10c4e76e9e6f">
+    <link rel="stylesheet" href="css/main.css?v=8673d337d99e">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -620,7 +620,7 @@
                         <input id="summaryBudgetRatio" type="number" min="0.01" max="0.5" step="0.05">
                     </label>
                     <label class="chat-setting-field chat-setting-field-with-hint chat-setting-field-with-hint-long">
-                        <span>压缩目标 tokens<small>压缩后希望保留的「历史对话」上限（只算历史部分，不含系统提示、工具定义、当前消息等固定开销）。任务开始或手动压缩时控制历史预算；任务进行中触发时也用此值作为历史预算，并受「动态可用空间」上限约束（不超窗）。固定内容多时实际保留会少于此值。0=不设固定目标，改用动态可用空间：自动取「触发阈值 − 系统提示 − 工具定义 − 当前轮上下文 − 摘要预留 − 最近 10k 问题索引 − 安全余量」作为历史预算，阈值通常是较小模型窗口的 80%</small><small id="historyTargetHint" class="chat-setting-inline-hint" hidden></small></span>
+                        <span>压缩目标 tokens<small>压缩后希望保留的「历史对话」上限（只算历史部分，不含系统提示、工具定义、当前消息等固定开销）。任务开始或手动压缩时控制历史预算；任务进行中触发时也用此值作为历史预算，并受「动态可用空间」上限约束（不超窗）。固定内容多时实际保留会少于此值。0=不设固定目标，改用动态可用空间：自动取「触发阈值 − 系统提示 − 工具定义 − 当前轮上下文 − 摘要预留 − 最近 10k 问题索引 − 安全余量」作为历史预算，触发阈值由上方“触发比例”设置决定</small><small id="historyTargetHint" class="chat-setting-inline-hint" hidden></small></span>
                         <input id="historyTargetTokens" type="number" min="0" max="1000000" step="1000">
                     </label>
                     <label class="chat-setting-field">
@@ -1126,8 +1126,10 @@
     <!-- KaTeX 数学公式渲染引擎：须在 markdown.js 之前加载（全局 window.katex） -->
     <script defer src="js/vendor/katex/katex.min.js?v=10a91b479cd9"></script>
     <script defer src="js/vendor/dompurify/purify.min.js?v=cd37898f9782"></script>
-    <script defer src="js/markdown.js?v=c601b79a2d8d"></script>
-    <script defer src="js/zoom_utils.js?v=4c9319902f10"></script>
+    <!-- 数据图表渲染器：须在 markdown.js 之前加载（全局 window.ChartRender） -->
+    <script defer src="js/chart.js?v=e8bde5435006"></script>
+    <script defer src="js/markdown.js?v=5f498ee71435"></script>
+    <script defer src="js/zoom_utils.js?v=b9311622f368"></script>
     <script defer src="js/widget_reuse.js?v=7c29d826fb50"></script>
     <script defer src="js/table_canvas.js?v=db17ac772554"></script>
     <script defer src="js/session_list_utils.js?v=659277ac1123"></script>
@@ -1145,7 +1147,7 @@
     <!-- 应用主逻辑：按共享命名空间 window.App 拆分（js/app/ 目录）。
          core 持有共享 state/DOM/工具必须最先加载；app.js 为入口（初始化）必须最后加载，
          中间模块顺序无依赖（跨模块调用均经 App.* 运行期解析） -->
-    <script defer src="js/app/core.js?v=e1f2dedb35af"></script>
+    <script defer src="js/app/core.js?v=45b12bed8c71"></script>
     <!-- 引用交互（选区操作浮层/草稿入口/气泡卡片）：解构 App.$ 需在 core 之后加载 -->
     <script defer src="js/app/quotes.js?v=3e378d638300"></script>
     <script defer src="js/app/sessions.js?v=4bc362efe0f8"></script>
@@ -1162,13 +1164,13 @@
     <script defer src="js/app/permissions.js?v=e8f1b4431995"></script>
     <script defer src="js/history_scroll_model.js?v=ac6b516e5fa9"></script>
     <script defer src="js/app/process_groups.js?v=856e9b1fcd29"></script>
-    <script defer src="js/app/round_fold.js?v=54efa899d4d1"></script>
+    <script defer src="js/app/round_fold.js?v=b9571173cd94"></script>
     <script defer src="js/app/message_diff.js?v=4713a0f99548"></script>
     <script defer src="js/app/messages_history.js?v=1e1f082a743f"></script>
     <script defer src="js/app/messages_render.js?v=31edfeb43017"></script>
     <script defer src="js/app/messages_edit.js?v=fc1c17334bf3"></script>
     <script defer src="js/app/messages_tools.js?v=a0b830ea84ec"></script>
-    <script defer src="js/app/messages_widgets.js?v=0959a071e67e"></script>
+    <script defer src="js/app/messages_widgets.js?v=6d3aaeba7600"></script>
     <script defer src="js/app/messages_canvas.js?v=429fa8038e24"></script>
     <script defer src="js/app/messages_tables.js?v=f6aaf00ad4f5"></script>
     <script defer src="js/app/messages_nav.js?v=21d8569e8bd5"></script>
@@ -1191,8 +1193,8 @@
     <script defer src="js/task_state.js?v=e1fc1594e65a"></script>
     <script defer src="js/app/session_activity.js?v=6c612b5720c0"></script>
     <script defer src="js/app/task_status.js?v=2051756f3359"></script>
-    <script defer src="js/app/stream_pipeline.js?v=bcbadeb82307"></script>
-    <script defer src="js/app/chat.js?v=4cfacd14bf8e"></script>
+    <script defer src="js/app/stream_pipeline.js?v=c74dc79d363a"></script>
+    <script defer src="js/app/chat.js?v=e7ba20148e32"></script>
     <script defer src="js/app/filehistory.js?v=3ec771da0491"></script>
     <script defer src="js/app/terminals.js?v=193e10002f6d"></script>
     <script defer src="js/app/task_costs.js?v=99bdecf5a8bb"></script>

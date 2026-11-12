@@ -1160,7 +1160,7 @@ test("重发旧轮用户时间戳过早时不拉长用时", async t => {
   );
 });
 
-test("直播计时行：不计入成员，折叠接管后移除", async t => {
+test("直播计时行：不计入成员，折叠接管后隐藏（非删除）", async t => {
   const x = setup();
   t.after(x.close);
   const msg = liveMsg(x, 7);
@@ -1169,9 +1169,60 @@ test("直播计时行：不计入成员，折叠接管后移除", async t => {
   x.App.roundFold.sync(msg);
   const head = msg.querySelector(".round-fold-summary");
   assert.ok(head, "有折叠头");
-  assert.equal(msg.querySelector(".live-round-timer"), null, "计时行被接管移除");
+  assert.equal(timer.classList.contains("is-taken-over"), true, "计时行被接管隐藏");
+  assert.equal(timer.parentNode, msg, "计时行仍在容器内（可恢复）");
   const fold = head._roundFold;
   assert.ok(fold.members.every(n => !n.classList.contains("live-round-timer")), "成员不含计时行");
+});
+
+test("折叠解散：被接管的计时行恢复显示（计时不两头落空）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = liveMsg(x, 7);
+  const timer = div(x.document, "live-round-timer", "用时 3s");
+  msg.insertBefore(timer, msg.firstChild);
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"), "先建成折叠");
+  assert.equal(timer.classList.contains("is-taken-over"), true, "接管隐藏");
+  // 成员收缩到只剩时间行+尾正文：触发解散
+  msg.querySelector(".think-block").remove();
+  msg.querySelector(".tool-block").remove();
+  msg.querySelectorAll(".msg-assistant-body")[0].remove();
+  msg.querySelector(".round-usage").remove();
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelector(".round-fold-summary"), null, "折叠已解散");
+  assert.equal(timer.classList.contains("is-taken-over"), false, "计时行恢复显示");
+  assert.equal(timer.parentNode, msg, "计时行仍在原位");
+});
+
+test("压缩条插入尾后致解散：计时行恢复显示（实证回归）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  x.chatInner.appendChild(msg);
+  const timer = div(x.document, "live-round-timer", "用时 2m");
+  msg.insertBefore(timer, msg.firstChild);
+  const think = div(x.document, "think-block", "思考");
+  const tool1 = div(x.document, "tool-block", "工具1");
+  const tool2 = div(x.document, "tool-block", "工具2");
+  const body = div(x.document, "msg-assistant-body", "正文");
+  const think2 = div(x.document, "think-block", "思考2");
+  msg.append(think, tool1, tool2, body, think2);
+  // 手工模拟过程分组（本桩未加载 processGroups 模块）：三节点同组计 1 单元
+  const ghead = div(x.document, "process-group-summary", "处理过程");
+  const group = { members: [think, tool1, tool2] };
+  ghead._processSummary = group;
+  think._processGroup = group; tool1._processGroup = group; tool2._processGroup = group;
+  msg.insertBefore(ghead, think);
+  x.App.roundFold.sync(msg);
+  assert.ok(msg.querySelector(".round-fold-summary"), "尾后成员使折叠建成");
+  assert.equal(timer.classList.contains("is-taken-over"), true, "计时被接管隐藏");
+  // 任务内压缩条插到尾正文之后：尾后收纳放弃，单元掉到只剩过程组 → 解散
+  const comp = div(x.document, "compaction-bar", "压缩");
+  body.after(comp);
+  x.App.roundFold.sync(msg);
+  assert.equal(msg.querySelector(".round-fold-summary"), null, "折叠已解散");
+  assert.equal(timer.classList.contains("is-taken-over"), false, "计时行恢复显示，不两头落空");
 });
 
 test("直播计时行：单小块不成折叠时保留", async t => {

@@ -1115,6 +1115,11 @@
                         }
                         if (existing) {
                             activeStream.userNode = existing;
+                            // marker 缺 round_started_at 时的兜底：按轮次精确复用的历史
+                            // 气泡带原始发送时间，回填为本轮起点（否则计时从附接时刻重计）
+                            if (activeStream.round != null && App.backfillRoundStartFromUserNode) {
+                                App.backfillRoundStartFromUserNode(msg, activeStream.round, existing, true);
+                            }
                         }
                         else {
                             // 提问气泡必须排在回答上方：回答容器 msg 已先入列，把气泡插入到它之前

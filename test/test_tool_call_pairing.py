@@ -5,7 +5,7 @@
 每个声明都必须有配对的 tool 结果消息，违反时返回 HTTP 400 且响应体为空
 （实测 body 恰为 "0\\r\\n\\r\\n"），客户端重试同一 payload 必然全败。
 本组用例覆盖各层防护：
-- _replace_todo_context：todo 归并同步清除悬空声明（源头修复）；
+- TodoContext.sync：todo 归并同步清除悬空声明（源头修复，原 _replace_todo_context 已迁移至此）；
 - sanitize_tool_call_pairing：发请求前的统一防线；
 - copy_for_request：请求副本集成（运行时 messages 不受影响）；
 - _round_entry_to_tool_result_context_messages：历史构建侧清理与错挂修复；
@@ -20,9 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from factory import chat_factory
 from factory.agent_runtime import chat_runtime
 from factory.agent_runtime.chat_runtime import sanitize_tool_call_pairing
+from factory.agent_runtime.todo_runtime import TodoContext
 from memory.chat_history_format import _round_entry_to_tool_result_context_messages
 
 
@@ -40,8 +40,8 @@ def _dangling(messages):
     return pending
 
 
-class ReplaceTodoContextDanglingTests(unittest.TestCase):
-    """_replace_todo_context 悬空回归：只删结果、保留声明是 400 的根因。"""
+class TodoContextDanglingTests(unittest.TestCase):
+    """TodoContext.sync 悬空回归：只删结果、保留声明是 400 的根因。"""
 
     def test_latest_todo_with_content_keeps_paired_tool_calls(self):
         # 真实现场：assistant（正文 + 单独一个 todo_write 调用）——归并后
@@ -55,9 +55,7 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_todo_1",
              "_tool_name": "todo_write", "content": "ok"},
         ]
-        chat_factory._replace_todo_context(messages, [
-            {"content": "步骤一", "status": "done"},
-        ])
+        TodoContext().sync(messages)
         self.assertEqual(_dangling(messages), [])
         # 正文、声明和配对结果均保留
         kept = [m for m in messages if m.get("role") == "assistant"]
@@ -77,7 +75,7 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_todo_1",
              "_tool_name": "todo_write", "content": "ok"},
         ]
-        chat_factory._replace_todo_context(messages, [{"content": "x", "status": "done"}])
+        TodoContext().sync(messages)
         self.assertEqual(_dangling(messages), [])
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
 
@@ -98,7 +96,7 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"role": "assistant", "tool_calls": [{"id": "new_todo", "function": {"name": "todo_write", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "new_todo", "_tool_name": "todo_write", "content": "ok"},
         ])
-        chat_factory._replace_todo_context(messages, [{"content": "x", "status": "done"}])
+        TodoContext().sync(messages)
         self.assertEqual(_dangling(messages), [])
         assistant = messages[1]
         self.assertEqual(
@@ -118,10 +116,10 @@ class ReplaceTodoContextDanglingTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_todo_1",
              "_tool_name": "todo_write", "content": "ok"},
         ]
-        todos = [{"content": "x", "status": "done"}]
-        chat_factory._replace_todo_context(messages, todos)
+        todo_context = TodoContext()
+        todo_context.sync(messages)
         first_pass = [dict(m) for m in messages]
-        chat_factory._replace_todo_context(messages, todos)
+        todo_context.sync(messages)
         self.assertEqual(_dangling(messages), [])
         # 第二次执行不会重复添加计划记录
         self.assertEqual(len(messages), len(first_pass))

@@ -218,7 +218,8 @@
   color: var(--danger);
 }
 .is-roundfold-hidden { display: none !important; }
-// 直播计时行：起播到成折叠前的过渡计时显示（折叠出现即被接管移除）。
+// 直播计时行：起播到成折叠前的过渡计时显示（折叠出现即被接管隐藏，
+// 解散时恢复——只隐藏不删除，否则计时两头落空）。
 // 与折叠头同字号色系，圆点呼吸表示进行中。
 .live-round-timer {
   display: flex;
@@ -227,6 +228,10 @@
   min-height: 20px;
   font-size: 12px;
   color: var(--text-secondary);
+}
+// 折叠接管态：隐藏但保留节点（解散恢复/收尾移除都依赖它还在）
+.live-round-timer.is-taken-over {
+  display: none;
 }
 .live-round-timer-dot {
   width: 7px;
@@ -2923,9 +2928,30 @@ html[data-theme="dark"] {
     word-break: break-word;
   }
 
+  // 数据图表（```chart）配置非法时的错误态：与 mermaid 错误态同样式
+  .md-chart-error {
+    padding: 12px 10px;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--danger, #dc2626);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   // Mermaid 代码视图：等宽 + 滚动（复用 SVG 代码视图容器）
   .md-svg-code .md-svg-pre code {
     white-space: pre;
+  }
+}
+
+// ---------- 数据图表控件（```chart） ----------
+// 显示缩放：SVG 宽度乘 --md-zoom（与 svg/mermaid 同机制，按钮/Ctrl+滚轮/拖拽
+// 平移/缩放态滚动容器全部复用 .md-svg-block 通用链路）；高优先级覆盖上面的
+// width:100%，默认 100% 时等价无变化。
+.md-svg-block.md-chart-block {
+  .md-svg-view svg {
+    width: calc(100% * var(--md-zoom, 1));
+    max-width: none;
   }
 }
 

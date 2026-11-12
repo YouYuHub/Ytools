@@ -208,12 +208,12 @@
     return '<span class="md-svg-unavailable">SVG 预览不可用，请查看代码</span>';
   }
 
-  // 缩放按钮组（三控件 svg/mermaid/canvas 共用）：[−] [百分比] [＋]。
+  // 缩放按钮组（四控件 svg/mermaid/canvas/chart 共用）：[−] [百分比] [＋]。
   // 纯静态标记——点击行为、状态与 --md-zoom 的应用由 messages.js 统一接线
-  // （事件委托 + Ctrl+滚轮；点百分比按钮复位 100%）。
+  // （事件委托 + Ctrl+滚轮，全屏内直接滚轮；点百分比按钮复位 100%）。
   function buildZoomGroupHtml(): string {
     return (
-      '<div class="md-zoom-group" title="显示缩放：按钮或 Ctrl+滚轮（点百分比复位 100%）">' +
+      '<div class="md-zoom-group" title="显示缩放：按钮或 Ctrl+滚轮，全屏下直接滚轮（点百分比复位 100%）">' +
       '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="out" title="缩小一档">-</button>' +
       '<button type="button" class="md-svg-btn md-zoom-btn md-zoom-reset" data-zoom-action="reset" title="点击复位 100%">100%</button>' +
       '<button type="button" class="md-svg-btn md-zoom-btn" data-zoom-action="in" title="放大一档">+</button>' +
@@ -343,10 +343,52 @@
     );
   }
 
+  // 数据图表 → 双视图控件：与 SVG 控件同构（代码/图片切换 + 复制代码 +
+  // 复制图片）。ChartRender.renderChart 同步出图（JSON 合法即渲染，无异步
+  // 态）；非法时图片视图显示错误说明，代码视图始终可看可复制修正。
+  function buildChartWidget(code: any): string {
+    const esc = escapeHtml;
+    let imageHtml = "";
+    try {
+      const renderer = (global as any).ChartRender;
+      const out = renderer && typeof renderer.renderChart === "function"
+        ? renderer.renderChart(code)
+        : { error: "图表渲染器未加载" };
+      imageHtml = out && out.svg
+        ? out.svg
+        : '<div class="md-chart-error">' + esc((out && out.error) || "图表渲染失败") + "</div>";
+    } catch (e) {
+      imageHtml = '<div class="md-chart-error">图表渲染失败：' + esc((e as any) && (e as any).message || e) + "</div>";
+    }
+    return (
+      '<div class="md-svg-block md-chart-block" data-svg-kind="chart"' +
+      ' data-svg-code="' + esc(code) + '">' +
+      '<div class="md-svg-head">' +
+      '<span class="md-svg-name">数据图表</span>' +
+      '<div class="md-svg-viewswitch">' +
+      '<button type="button" class="md-svg-tab is-active" data-svg-action="view-image">图片</button>' +
+      '<button type="button" class="md-svg-tab" data-svg-action="view-code">代码</button>' +
+      "</div>" +
+      '<div class="md-svg-actions">' +
+      buildZoomGroupHtml() +
+      '<button type="button" class="md-svg-btn" data-svg-action="full" title="全屏显示（Esc 退出）">' + FULLSCREEN_ICON_EXPAND + ' 全屏</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-code">复制代码</button>' +
+      '<button type="button" class="md-svg-btn" data-svg-action="copy-image">复制图片</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="md-svg-code" data-svg-view="code" hidden="">' +
+      '<pre class="md-svg-pre"><code class="language-json">' + esc(code) + "</code></pre>" +
+      "</div>" +
+      '<div class="md-svg-view" data-svg-view="image">' + imageHtml + "</div>" +
+      "</div>"
+    );
+  }
+
   // 按栅栏语言分发构建双视图控件
   function buildFenceWidget(kind: any, code: any): string {
     if (kind === "mermaid") return buildMermaidWidget(code);
     if (kind === "canvas") return buildCanvasWidget(code);
+    if (kind === "chart") return buildChartWidget(code);
     return buildSvgWidget(code, {});
   }
 
@@ -834,8 +876,8 @@
 
   function renderFencedBlock(block: any): string {
     const lang = block.lang, langKey = lang.toLowerCase(), body = block.body;
-    // 流式半截媒体围栏先显示普通代码，确实闭合后才变成 SVG/Mermaid/Canvas 控件。
-    if (block.closed && block.info === lang && ["svg", "mermaid", "canvas"].includes(langKey)) {
+    // 流式半截媒体围栏先显示普通代码，确实闭合后才变成 SVG/Mermaid/Canvas/Chart 控件。
+    if (block.closed && block.info === lang && ["svg", "mermaid", "canvas", "chart"].includes(langKey)) {
       let code = "";
       if (langKey === "svg") {
         let first = body.findIndex((line: any) => line.includes("&lt;svg")), last = -1;

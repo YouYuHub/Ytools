@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from util.mcp_client import call_mcp_tool
+from util.timestamp_utils import now_slash_str
 
 
 ARGUMENT_PARSE_ERROR = "__ytools_invalid_arguments__"
@@ -182,14 +183,26 @@ def execute_tool_round(
             )
             ret = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             return index, tool_call, tool_name, tool_args, ret, None
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            # 超时单独上报：裸 TimeoutError 文本为空，不能归一成“工具执行失败【】”；
+            # 原始错误（含工具名/服务/秒数）尽量保留，并附系统时间供模型定位。
+            detail = str(exc).strip() or f"{tool_name} 执行超时"
+            ret = (
+                f"MCP 工具调用超时【{tool_name}】（{now_slash_str()}）：{detail}；"
+                "该工具本次未返回结果，请稍后重试该工具、改用其他可用工具，或直接向用户说明情况"
+            )
+            return index, tool_call, tool_name, tool_args, ret, exc
         except Exception as exc:
-            ret = f"工具执行失败【{exc}】"
+            detail = str(exc).strip() or exc.__class__.__name__
+            ret = f"工具执行失败【{detail}】（{now_slash_str()}）"
             return index, tool_call, tool_name, tool_args, ret, exc
         except BaseException as exc:
             # SystemExit 等 BaseException 派生异常（MCP 客户端内部逃逸）不能穿透
             # 包装：一旦逃出 execute_tool_round 会经 to_thread 一路上抛终止整个
             # 生成任务。统一转为工具错误反馈，让模型改用其他工具继续任务。
-            ret = f"工具执行失败【{exc.__class__.__name__}: {exc}】，该工具当前不可用；请改用其他可用工具完成任务，或直接向用户说明情况"
+            detail = str(exc).strip()
+            label = f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
+            ret = f"工具执行失败【{label}】（{now_slash_str()}），该工具当前不可用；请改用其他可用工具完成任务，或直接向用户说明情况"
             return index, tool_call, tool_name, tool_args, ret, exc
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -208,7 +221,7 @@ def execute_tool_round(
                     "tool_call": tc,
                     "tool_name": tn,
                     "tool_args": ta,
-                    "result": f"工具执行异常：{exc}",
+                    "result": f"工具执行异常：{exc}（{now_slash_str()}）",
                     "error": exc,
                 })
                 continue

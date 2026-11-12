@@ -376,7 +376,10 @@ class _SessionStream:
         self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
         self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
-        self.live_round_started_at_ms: int | None = None  # 本轮开始墙钟（epoch ms，与轮次号同处确认，随 marker 下发供前端计时兜底）
+        # 本轮开始墙钟（epoch ms）：注册时先记任务接受时刻（近似），检查点确认/
+        # worker 事件到达后覆盖为精确值。附接 marker 独立携带它（不随轮次号门控），
+        # 否则确认前的附接拿不到起点，前端计时从附接时刻重计。
+        self.live_round_started_at_ms: int | None = int(time.time() * 1000)
         self.live_round_model: dict | None = None  # 本轮生效聊天模型（round_model 推送时记录，回放 marker 携带）
         self.live_round_usage_total: dict | None = None  # 本轮绝对累计用量（缓冲截断后附接仍可恢复）
         self.user_stop_requested = False  # 手动停止触发的取消（区别于新消息打断/服务关停）
@@ -3430,6 +3433,55 @@ def _drain_compact_replay(stream, seen, replay_offset):
     return out, seen, replay_offset
 
 
+def _build_attach_marker(stream, replay_complete: bool) -> dict:
+    """构造附接回放 marker（前端补建本轮提问气泡/回填轮次与计时起点用）。
+
+    轮次开始墙钟独立于轮次号门控下发：注册时已有近似值（任务接受时刻），
+    检查点确认/worker 事件到达后为精确值；确认前的附接也能拿到可用起点，
+    否则前端计时从附接时刻重计。
+    """
+    # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
+    # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
+    # 纯文本提问归一为单个 text 部件），前端重建气泡/补挂编辑入口用；
+    # question_quotes 为本轮引用快照（选中文本引用到提问），前端
+    # 重建引用卡片用；round 为本轮最终轮次号、model 为本轮生效
+    # 聊天模型（round_started / round_model 帧均在回放起点之前，
+    # 消费端收不到，必须随标记下发）——前端按轮次精确去重历史提问
+    # 气泡、按 model 显示本轮消耗行模型名。
+    # worker 模式由 evt 队列的 question_text/question_parts/
+    # question_quotes/live_round_no/live_round_model/
+    # live_round_started_at 事件同步到 stream 对应属性。
+    marker = {"replay": True, "question_text": stream.question_text or ""}
+    if stream.question_parts:
+        marker["question_parts"] = stream.question_parts
+    if stream.question_quotes:
+        marker["question_quotes"] = stream.question_quotes
+    if stream.live_round_no:
+        marker["round"] = int(stream.live_round_no)
+        # 编辑重发旧第 N 轮时历史可能尚有旧用量；即使新轮还没有
+        # usage，也明确下发空绝对值，前端据此清除旧轮基线。
+        marker["round_usage_total"] = copy.deepcopy(
+            getattr(stream, "live_round_usage_total", None) or {}
+        )
+    # 轮次开始墙钟（epoch ms）：回放重建的节点时间戳都是“现在”，
+    # 前端计时以此为下限，否则刷新一次就从 1s 重计。独立于轮次号
+    # 门控下发（注册时已有近似值，确认后为精确值），确认前的附接
+    # 也能拿到可用起点。
+    started_at = getattr(stream, "live_round_started_at_ms", None)
+    if isinstance(started_at, int) and started_at > 0:
+        marker["round_started_at"] = started_at
+    # getattr 防御：测试替身等最小 stream 桩可能没有该属性
+    live_round_model = getattr(stream, "live_round_model", None)
+    if live_round_model:
+        marker["model"] = live_round_model
+    # 回放结束标记配对：新前端据此关闭“回放去重窗口”，之后不再把
+    # 流内容与历史已渲染节点做匹配（避免误删正常重复文本）；老前端
+    # 忽略未知字段，行为不变。
+    marker["replay_end_supported"] = True
+    marker["replay_complete"] = replay_complete
+    return marker
+
+
 async def tool_chat_server(
     tool_request: ChatLLMRequest
 ) -> AsyncGenerator[str, None]:
@@ -3459,43 +3511,7 @@ async def tool_chat_server(
             if creating:
                 replay_offset = 0
             if not creating:
-                # 附接：先发回放标记，前端据此补建“当前轮提问”气泡后再接事件；
-                # question_parts 为提问原始 content 部件（多模态时含 media:// 引用，
-                # 纯文本提问归一为单个 text 部件），前端重建气泡/补挂编辑入口用；
-                # question_quotes 为本轮引用快照（选中文本引用到提问），前端
-                # 重建引用卡片用；round 为本轮最终轮次号、model 为本轮生效
-                # 聊天模型（round_started / round_model 帧均在回放起点之前，
-                # 消费端收不到，必须随标记下发）——前端按轮次精确去重历史提问
-                # 气泡、按 model 显示本轮消耗行模型名。
-                # worker 模式由 evt 队列的 question_text/question_parts/
-                # question_quotes/live_round_no/live_round_model/
-                # live_round_started_at 事件同步到 stream 对应属性。
-                marker = {"replay": True, "question_text": stream.question_text or ""}
-                if stream.question_parts:
-                    marker["question_parts"] = stream.question_parts
-                if stream.question_quotes:
-                    marker["question_quotes"] = stream.question_quotes
-                if stream.live_round_no:
-                    marker["round"] = int(stream.live_round_no)
-                    # 编辑重发旧第 N 轮时历史可能尚有旧用量；即使新轮还没有
-                    # usage，也明确下发空绝对值，前端据此清除旧轮基线。
-                    marker["round_usage_total"] = copy.deepcopy(
-                        getattr(stream, "live_round_usage_total", None) or {}
-                    )
-                    # 轮次开始墙钟（epoch ms）：回放重建的节点时间戳都是“现在”，
-                    # 前端大折叠计时以此为下限，否则刷新一次就从 1s 重计。
-                    started_at = getattr(stream, "live_round_started_at_ms", None)
-                    if isinstance(started_at, int) and started_at > 0:
-                        marker["round_started_at"] = started_at
-                # getattr 防御：测试替身等最小 stream 桩可能没有该属性
-                live_round_model = getattr(stream, "live_round_model", None)
-                if live_round_model:
-                    marker["model"] = live_round_model
-                # 回放结束标记配对：新前端据此关闭“回放去重窗口”，之后不再把
-                # 流内容与历史已渲染节点做匹配（避免误删正常重复文本）；老前端
-                # 忽略未知字段，行为不变。
-                marker["replay_end_supported"] = True
-                marker["replay_complete"] = replay_complete
+                marker = _build_attach_marker(stream, replay_complete)
                 yield f"data: {json.dumps(marker, ensure_ascii=False)}\n\n"
                 # 紧凑快照：排空当前待回放段，连续分片合并后一次下发；
                 # 排空后新到帧走下方 live 循环原样直通（实时语义不变）。

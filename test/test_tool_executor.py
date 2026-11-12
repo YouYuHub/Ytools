@@ -1,14 +1,17 @@
 import asyncio
+import re
 import unittest
 from unittest.mock import patch
 
 from factory.agent_runtime.tool_executor import (
     _invoke_tool_function,
+    execute_tool_round,
     normalize_tool_calls,
     parse_tool_call,
     prepare_tool_execution,
 )
 import util.mcp_client as mcp_client
+from util.timestamp_utils import now_slash_str
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -121,6 +124,63 @@ class ToolExecutorTests(unittest.TestCase):
                     await mcp_client.call_mcp_tool("slow_tool", {})
 
         asyncio.run(run())
+
+    def test_mcp_client_timeout_carries_tool_and_seconds(self):
+        """超时异常必须带可读信息（工具名/服务/秒数），不能是裸 TimeoutError。"""
+        async def slow_call(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+
+        async def run():
+            with patch.object(mcp_client, "load_var", return_value="0.01"), \
+                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call):
+                with self.assertRaisesRegex(TimeoutError, "超时") as ctx:
+                    await mcp_client.call_mcp_tool(
+                        "slow_tool", {}, mcp_service="demo_server"
+                    )
+            message = str(ctx.exception)
+            self.assertIn("slow_tool", message)
+            self.assertIn("demo_server", message)
+            self.assertIn("0.01", message)
+
+        asyncio.run(run())
+
+    def test_execute_tool_round_reports_timeout_accurately(self):
+        """裸超时异常也要报成超时（含工具名与系统时间），不能归一成执行失败。"""
+        async def timed_out_call(**_kwargs):
+            raise asyncio.TimeoutError()
+
+        with patch("factory.agent_runtime.tool_executor.call_mcp_tool", timed_out_call):
+            results = execute_tool_round(
+                [(1, {"id": "call_1"}, "slow_tool", {})],
+                {"slow_tool": "server"},
+                1,
+            )
+        self.assertEqual(len(results), 1)
+        ret = results[0]["result"]
+        self.assertIn("MCP 工具调用超时", ret)
+        self.assertIn("slow_tool", ret)
+        self.assertNotIn("工具执行失败", ret)
+        self.assertRegex(ret, r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}")
+        self.assertIsInstance(results[0]["error"], TimeoutError)
+
+    def test_execute_tool_round_error_keeps_original_and_timestamp(self):
+        """普通错误保留原始信息，并附加系统时间。"""
+        async def failed_call(**_kwargs):
+            raise RuntimeError("MCP 调用失败: boom")
+
+        with patch("factory.agent_runtime.tool_executor.call_mcp_tool", failed_call):
+            results = execute_tool_round(
+                [(1, {"id": "call_1"}, "demo_tool", {})],
+                {"demo_tool": "server"},
+                1,
+            )
+        ret = results[0]["result"]
+        self.assertIn("工具执行失败", ret)
+        self.assertIn("MCP 调用失败: boom", ret)
+        self.assertRegex(ret, r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}")
+
+    def test_now_slash_str_format(self):
+        self.assertRegex(now_slash_str(), r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
 
 
 if __name__ == "__main__":

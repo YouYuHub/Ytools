@@ -786,11 +786,13 @@ body.tool-settings-open { overflow: hidden; }
 .qnav {
   position: absolute;
   right: 14px;
-  // 撑满「顶栏下沿 → 输入区上方」的可用高度（bottom 取 core.ts 写入的
-  // --bottom-stack-height），轨道（map 条）与展开列表面板都在其中垂直居中。
+  // 撑满视口高度（顶栏下沿 → 视口底边上方留白），不再跟随输入区高度：
+  // 输入框撑高时轨道不会被挤矮。轨道（map 条）与展开列表面板都在其中
+  // 垂直居中；底部多留 24px 呼吸感，与顶栏避让节奏呼应。
+  // 与输入区的避让改由输入区右侧预留实现（见 _layout.scss 的 qnav 避让规则）。
   // 容器仍 pointer-events: none：空旷区不命中，不会误触 hover 面板。
   top: 72px;
-  bottom: calc(var(--bottom-stack-height, 96px) + 16px);
+  bottom: 24px;
   display: flex;
   // 面板是 position: absolute 子元素，不再参与 flex；轨道靠此项居中
   align-items: center;
@@ -806,7 +808,7 @@ body.tool-settings-open { overflow: hidden; }
     justify-content: center;
     pointer-events: auto;
     // 高度上限改由父容器（.qnav 的可用高度）决定：居中后不再按视口粗略估算，
-    // 轨道永远不会越过顶栏或底部输入区。
+    // 轨道永远不会越过顶栏或视口底边。
     max-height: 100%;
     // 极端多轮（收缩到下限仍超高）兜底内部滚动；隐藏滚动条保外观
     overflow-y: auto;
@@ -889,8 +891,8 @@ body.tool-settings-open { overflow: hidden; }
     top: 50%;
     transform: translateY(-50%);
     width: min(320px, calc(100vw - 56px));
-    // 高度上限：不超过容器可用高度（顶栏下沿到输入区上方），再收 480px。
-    // 居中后上下各留一半余量，因此长列表也不会压住输入框或顶栏。
+    // 高度上限：不超过容器可用高度（顶栏下沿到视口底边），再收 480px。
+    // 居中后上下各留一半余量，因此长列表也不会压住顶栏或越出视口。
     max-height: min(480px, 100%);
     overflow: hidden auto;
     background: var(--bg-elevated);
