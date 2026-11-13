@@ -379,35 +379,38 @@
   }
 
   // 自动跟随与用户滚动共用一份状态；用户意图优先于流式更新。
-  // 上滚意图按位移累计：触控板抖动、滚动锚定回跳、高亮重排等都会产生零星
-  // 小位移上滚，若直接暂停会让快速生成时无故脱离底部；800ms 内累计上滚
-  // 超过阈值才视为用户要脱离底部。鼠标滚轮一格约 100px，仍是单次即停。
+  // 上滚意图按位移净额累计（无时间窗口）：触控板抖动、滚动锚定回跳、
+  // 高亮重排等零星小位移是零均值的，下滚按量抵扣后自然归零，不会误暂停；
+  // 而用户真实的上滚（哪怕每次只有 20px、间隔数秒的慢速阅读）净额终会
+  // 超过阈值并暂停。曾用 800ms 累计窗口：慢速阅读永远攒不满，暂停永不
+  // 触发，每帧跟随把用户拽回底部（思考流式时展开上滚阅读被“吸住”即此因）。
+  // 鼠标滚轮一格约 100px，仍是单次即停。
   let autoScrollPaused = false;
   let chatScrollbarDragging = false;
   function isChatScrollbarDragging() { return chatScrollbarDragging; }
   let lastScrollTop = chatScroll.scrollTop;
   let bottomScrollFrame: any = null;
   let upScrollIntentPx = 0;
-  let upScrollIntentAt = 0;
   const UP_SCROLL_INTENT_PX = 48;
-  const UP_SCROLL_INTENT_WINDOW_MS = 800;
   function noteUpScrollIntent(px: any) {
     if (!(px > 0)) return;
-    const now = Date.now();
-    if (now - upScrollIntentAt > UP_SCROLL_INTENT_WINDOW_MS) upScrollIntentPx = 0;
-    upScrollIntentAt = now;
     upScrollIntentPx += px;
     if (upScrollIntentPx >= UP_SCROLL_INTENT_PX) {
       upScrollIntentPx = 0;
       pauseAutoScroll();
     }
   }
-  // 累计只由明确的用户下滚输入（滚轮/触摸下滚、主动回底）清零：流式跟随的
-  // 程序化置底同样产生向下的 scroll 事件，不能用它清零，否则快速生成时
-  // 跟随置底会反复吞掉用户的上滚累计，导致用户永远无法暂停。
+  // 下滚按量抵扣不清零：高分辨率滚轮/触控板的下向抖动只扣掉几像素，
+  // 不会吞掉之前攒的真实上滚意图；整段下滚（回到跟随）仍能清掉累计。
+  // 流式跟随的程序化置底同样产生向下的 scroll 事件，靠 lastScrollTop
+  // 同步识别（见各置底点的同步赋值），不进入抵扣，否则跟随置底会反复
+  // 吞掉用户的上滚累计，导致用户永远无法暂停。
+  function noteDownScrollIntent(px: any) {
+    if (!(px > 0)) return;
+    upScrollIntentPx = Math.max(0, upScrollIntentPx - px);
+  }
   function resetUpScrollIntent() {
     upScrollIntentPx = 0;
-    upScrollIntentAt = 0;
   }
 
   function cancelBottomCorrection() {
@@ -415,11 +418,14 @@
     bottomScrollFrame = null;
   }
 
-  function scrollToBottom(instant: any) {
+  function scrollToBottom(instant: any, keepIntent?: any) {
     if (chatScrollbarDragging) return;
     if (App.showHistoryTail) App.showHistoryTail();
     autoScrollPaused = false;
-    resetUpScrollIntent();
+    // 流式跟随（stickToBottom）每帧都经过这里：不能清累计，否则每次置底
+    // 都把慢速阅读攒的意图吞掉，用户永远停不下来。只有显式跟随意图
+    // （发送/续跑/附接/导入/打开会话/回底按钮）才清零重计。
+    if (!keepIntent) resetUpScrollIntent();
     if (App.historyScroll && App.historyScroll.clearUserScrolledUp) App.historyScroll.clearUserScrolledUp();
     cancelBottomCorrection();
     const prev = instant ? chatScroll.style.scrollBehavior : null;
@@ -459,7 +465,7 @@
   // 捕获阶段在 scroll 事件及内部控件阻止冒泡之前响应上滚意图。
   chatScroll.addEventListener("wheel", function(event: any) {
     if (event.deltaY < 0) noteUpScrollIntent(-event.deltaY);
-    else if (event.deltaY > 0) resetUpScrollIntent();
+    else if (event.deltaY > 0) noteDownScrollIntent(event.deltaY);
   }, { passive: true, capture: true });
   let lastTouchY: any = null;
   chatScroll.addEventListener("touchstart", function(event: any) {
@@ -469,7 +475,7 @@
     const y = event.touches.length ? event.touches[0].clientY : null;
     if (y != null && lastTouchY != null) {
       if (y > lastTouchY) noteUpScrollIntent(y - lastTouchY);
-      else if (y < lastTouchY) resetUpScrollIntent();
+      else if (y < lastTouchY) noteDownScrollIntent(lastTouchY - y);
     }
     lastTouchY = y;
   }, { passive: true });
@@ -487,11 +493,16 @@
     const movingDown = top > lastScrollTop + 1;
     if (movingUp) {
       // 程序化置底会同步更新 lastScrollTop，能走到这里的上移基本来自用户
-      // 或布局抖动；累计到阈值才暂停，零星小位移不打断快速生成时的跟随。
+      // 或布局抖动；净额累计到阈值才暂停，零星抖动不打断快速生成时的跟随。
       noteUpScrollIntent(lastScrollTop - top);
-    } else if (!chatScrollbarDragging && autoScrollPaused && movingDown &&
-      chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
-      autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
+    } else if (movingDown) {
+      if (!chatScrollbarDragging && autoScrollPaused &&
+        chatScroll.scrollHeight - top - chatScroll.clientHeight <= 2) {
+        autoScrollPaused = false; // 用户向下滚回真正底部才恢复，不在近底部阈值内抢回。
+        resetUpScrollIntent();
+      } else {
+        noteDownScrollIntent(top - lastScrollTop);
+      }
     }
     lastScrollTop = top;
   });
@@ -502,7 +513,8 @@
       return;
     }
     // 流式跟随采用瞬时更新，避免连续的 smooth 动画与用户操作竞争。
-    scrollToBottom(true);
+    // keepIntent：跟随置底不清除上滚累计（见 scrollToBottom 注释）。
+    scrollToBottom(true, true);
   }
 
   function setEmpty(empty: any) {
@@ -530,7 +542,12 @@
     main.style.setProperty("--scroll-bottom-offset", Math.ceil(offset) + "px");
     const chatBottomPadding = Math.max(56, mainRect.bottom - composerRect.top + 16);
     chatInner.style.setProperty("--chat-bottom-padding", Math.ceil(chatBottomPadding) + "px");
-    if (keepBottom) chatScroll.scrollTop = chatScroll.scrollHeight;
+    if (keepBottom) {
+      chatScroll.scrollTop = chatScroll.scrollHeight;
+      // 与 scrollToBottom 同步 lastScrollTop：否则这次程序化置底的 scroll
+      // 事件会被当成用户下滚抵扣上滚累计，慢速阅读攒的意图又被吞掉。
+      lastScrollTop = chatScroll.scrollTop;
+    }
   }
 
   // ---------- 主题 ----------

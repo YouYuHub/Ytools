@@ -90,7 +90,7 @@ test('零星小位移不打断跟随，抖动后仍能贴底', () => {
   context.stickToBottom(); flush();
   assert.equal(scroll.scrollTop, 900);
 });
-test('800ms内累计上滚达到阈值暂停跟随', () => {
+test('累计上滚达到阈值暂停跟随（无时间窗口）', () => {
   const { scroll, context, fire } = setup();
   fire('wheel', { deltaY: -20 });
   scroll.scrollTop = 880; fire('scroll');
@@ -98,7 +98,16 @@ test('800ms内累计上滚达到阈值暂停跟随', () => {
   context.stickToBottom();
   assert.equal(scroll.scrollTop, 880);
 });
-test('下滚输入清零累计，换向后需重新累计才暂停', () => {
+test('下滚按量抵扣：小幅换向不吞意图，大幅下滚才清零', () => {
+  const { scroll, context, fire } = setup();
+  fire('wheel', { deltaY: -40 });
+  fire('wheel', { deltaY: 10 });
+  fire('wheel', { deltaY: -20 });
+  scroll.scrollTop = 880;
+  context.stickToBottom();
+  assert.equal(scroll.scrollTop, 880);
+});
+test('大幅下滚清掉累计，换向后需重新累计才暂停', () => {
   const { scroll, context, fire } = setup();
   fire('wheel', { deltaY: -20 });
   fire('wheel', { deltaY: 60 });
@@ -107,12 +116,23 @@ test('下滚输入清零累计，换向后需重新累计才暂停', () => {
   context.stickToBottom();
   assert.equal(scroll.scrollTop, 900);
 });
-test('累计窗口过期后重新计数，旧位移不参与暂停', () => {
+test('慢速阅读：小步上滚无过期，净额达标即暂停', () => {
   const { scroll, context, fire } = setup();
-  fire('wheel', { deltaY: -40 });
-  vm.runInContext('upScrollIntentAt = Date.now() - 1000', context);
+  // 旧 800ms 窗口下：两次小步上滚间隔一久就清零、永远不暂停，
+  // 流式跟随每帧把用户拽回底部（思考流式时上滚阅读被“吸住”）。
   fire('wheel', { deltaY: -20 });
-  scroll.scrollTop = 880;
+  scroll.scrollTop = 880; fire('scroll');
+  fire('wheel', { deltaY: -20 });
   context.stickToBottom();
+  assert.equal(scroll.scrollTop, 880);
+});
+test('流式跟随置底不吞上滚累计：慢滚两次即暂停', () => {
+  const { scroll, context, fire, flush } = setup();
+  fire('wheel', { deltaY: -20 });
+  context.stickToBottom(); flush();
   assert.equal(scroll.scrollTop, 900);
+  fire('wheel', { deltaY: -20 });
+  scroll.scrollTop = 880; fire('scroll');
+  context.stickToBottom(); flush();
+  assert.equal(scroll.scrollTop, 880);
 });
