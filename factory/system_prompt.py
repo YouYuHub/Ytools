@@ -19,6 +19,7 @@ from config import (
     DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS,
     DEFAULT_REASONING_RETURN_MAX_LENGTH,
     DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH,
+    MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS,
     get_current_dir,
 )
 from env_manager import load_var
@@ -224,6 +225,8 @@ def build_sys_prompt(
     if tool_call_timeout > 0:
         timeout_note = (
             f"MCP 工具单次执行超时为 {tool_call_timeout:g} 秒（含连接/初始化/调用全过程），"
+            f"另有 {MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS:g} 秒宽限（实际等待两者之和）："
+            "工具自身的内部超时可设为与配置值相同，其输出仍能正常返回；"
             "超时会被中止并返回错误。耗时可能较长的操作（构建、批量处理、"
             "等待外部服务）请拆分为多次调用或缩小单次范围。"
         )
@@ -267,9 +270,11 @@ def build_sys_prompt(
         "使用 list_files（若本轮可用）。搜索按 next_cursor 续读时保留原查询。"
         "用 read_file 核对原文，edit_file 修改局部；多文件修改可用 apply_patch。write_file 明确指定新建、覆盖或追加模式。"
         "命令语法须与 shell 一致；run_command 默认短等，poll_command 只传 job_id 自动续取输出；"
-        "status=running 或 has_more=true 时继续查询。"
-        "独立服务显式 background=true，stop_command 停止。"
-        "需要连续输入时设 interactive=true，需终端的程序加 tty=true；write_stdin 的 chars 原样发送，提交一行需包含换行。"
+        "status=running 或 has_more=true 时继续查询（completion=awaiting_input 表示在等输入）。"
+        "需跨调用保住 cwd/环境变量/REPL 状态时传 session_id 复用同一常驻 shell（不传=每次新建）；list_jobs 看全部在跑任务。"
+        "独立服务显式 background=true，stop_command 停止（graceful=true 先软中断再杀树）。"
+        "需要连续输入时设 interactive=true，需终端的程序加 tty=true；write_stdin 的 chars 原样发送、提交一行需包含换行，"
+        "控制键用 key（如 ctrl+c/enter/方向键）；tty 输出默认剥离 ANSI，raw=true 保留。"
         "需要用户回答时单独调用 ask_user，收到回答后继续。"
         "含替换字符的文本需先核对 encoding。"
     )

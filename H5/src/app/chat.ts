@@ -12,6 +12,10 @@
     setEmpty, sendBtn, stopBtn, resumeBtn
   } = App;
 
+  // 后台会话发送登记（sessionId → {controller, started}）：用户切走后队列消息
+  // 仍要自动发起，但不渲染当前 DOM；切回接管时 abort 对应连接，避免双份回放。
+  const bgSends = new Map<string, any>();
+
   // ---------- 发送 / 停止 ----------
 
   /**
@@ -194,6 +198,9 @@
     // 否则发送瞬间切会话会导致消息发到目标会话（发送中途切会话实证）。
     // 首次发送才分配会话 ID（"新对话"后一直处于待开始状态）
     const streamSessionId = App.ensureSessionId();
+    // 可见发送接管：仅中止仍在上传阶段的后台发送（消息由 flush 放回）；
+    // 已发出请求的后台发送不中止，避免重复投递
+    if (App.abortBackgroundSend) App.abortBackgroundSend(streamSessionId);
     // “连接已中断”不确定态：发送前先向后端确认，后端无任务则自动收尾并
     // 重载对齐后直接继续发送，不必手动停止；仍在运行则自动重连（输入保留）。
     if (!(await ensureSendable())) return;
@@ -938,6 +945,9 @@
     if (!sessionId) return;
     if (state.sessionId !== sessionId) return;
     if (state.streaming && state.streamingSession === sessionId) return;
+    // 切回接管：仅中止仍在上传阶段的后台发送（消息由 flush 放回）；
+    // 已发出请求的后台发送不中止，附接流作为第二消费端正常回放
+    if (App.abortBackgroundSend) App.abortBackgroundSend(sessionId);
     if (state.streaming) detachAttachedStream();
     state.streaming = true;
     state.streamingSession = sessionId;
@@ -1418,8 +1428,84 @@
     plansArea.appendChild(box);
   }
 
+  // ---------- 后台会话发送（用户切走后队列仍自动发起，不渲染当前 DOM） ----------
+  /**
+   * 向非当前会话发起一轮生成：只走 HTTP/SSE 与任务状态，不触碰 chatInner。
+   * 返回 {started, completed?, aborted?, error?}：
+   * - started=true 表示聊天请求已发出（onOpen 收到响应头，后端已接受任务）。
+   *   此后即使本地 SSE 断开/被接管，消息也视为已投递——后端任务继续跑，
+   *   调用方绝不能把它放回队列（否则重复发送）。
+   * - started=false 表示尚未发出聊天请求（上传阶段被中止/失败、并发守卫、
+   *   空消息），调用方应把消息放回暂存区等待下次派发。
+   * 后台监听器不渲染 DOM，切回后的附接流是独立的第二个消费端（后端支持多
+   * 回放读者），两者互不冲突，故已发出的后台发送无需中止。
+   */
+  async function sendBackground(sessionId: any, message: any) {
+    const sid = SessionUtils.sanitizeSessionId(sessionId);
+    if (!sid || !message || bgSends.has(sid)) return { started: false };
+    const text = message.text || "";
+    const media = (message.media || []).slice();
+    if (!text && !media.length) return { started: false };
+    const controller = new AbortController();
+    // phase: upload=还在传附件（可安全中止）；request=聊天请求已发出（不可中止放回）
+    const entry: any = { controller, started: false, phase: "upload" };
+    bgSends.set(sid, entry);
+    let taskHandle: any = null;
+    try {
+      const needUpload = media.filter(function(m: any) { return m && !m.media_ref && m.file; });
+      if (needUpload.length) await uploadMediaFiles(sid, needUpload, controller.signal);
+      if (media.some(function(m: any) { return m && !m.media_ref; })) throw new Error("部分附件未上传成功");
+      const needDocs = (message.docs || []).filter(function(d: any) { return d && !d.uploaded && d.file; });
+      if (needDocs.length) {
+        const res = await API.uploadSessionFiles(sid, needDocs.map(function(d: any) { return d.file; }), function() {}, controller.signal);
+        (res.results || []).forEach(function(r: any, i: any) { if (r && r.status === "success" && needDocs[i]) needDocs[i].uploaded = true; });
+        if (needDocs.some(function(d: any) { return !d.uploaded; })) throw new Error("部分文档未上传成功");
+      }
+      if (controller.signal.aborted) return { started: false, aborted: true };
+      const userContent = buildUserContent(text, media);
+      const requestQuotes = QuoteUtils.quotesForRequest(message.quotes || []);
+      const payload: any = { messages: [{ role: "user", content: userContent }], session_id: sid };
+      if (requestQuotes.length) payload.messages[0].quotes = requestQuotes;
+      if (state.selectedTools.size > 0) {
+        let toolNames: any = Array.from(state.selectedTools);
+        if (!App.getChatModelVision()) toolNames = toolNames.filter(function(n: any) { return n !== "read_media"; });
+        if (toolNames.length) payload.tool_names = toolNames;
+      }
+      if (App.taskStatus) taskHandle = App.taskStatus.begin(sid);
+      App.upsertLocalSession(sid, { userText: text || (media.length ? "[图片/附件]" : text) });
+      entry.phase = "request";
+      await API.chatStream(payload, function(evt: any) {
+        if (App.taskStatus && taskHandle && evt && evt.type !== "done") App.taskStatus.event(taskHandle, evt);
+      }, controller.signal, { onOpen: function() {
+        entry.started = true;
+        if (App.taskStatus && taskHandle) App.taskStatus.connected(taskHandle);
+      } });
+      if (App.taskStatus && taskHandle) await App.taskStatus.end(taskHandle, true, null, false);
+      return { started: true, completed: true };
+    } catch (err: any) {
+      const aborted = controller.signal.aborted || (err && err.name === "AbortError");
+      if (App.taskStatus && taskHandle) await App.taskStatus.end(taskHandle, false, aborted ? null : err, false);
+      if (aborted) return { started: entry.started, aborted: true };
+      return { started: entry.started, error: err };
+    } finally {
+      if (bgSends.get(sid) === entry) bgSends.delete(sid);
+    }
+  }
+
+  /**
+   * 切回接管/可见发送前调用：仅中止仍处于上传阶段的后台发送（聊天请求尚未
+   * 发出，可安全放回队列）。已发出请求的后台发送不中止——其消息已投递后端，
+   * 监听器静默排空即可，附接流作为第二消费端正常回放，避免重复发送。
+   */
+  function abortBackgroundSend(sessionId: any) {
+    const entry = bgSends.get(SessionUtils.sanitizeSessionId(sessionId));
+    if (entry && entry.phase === "upload") entry.controller.abort();
+  }
+
   // ---------- 导出（供其它模块经 App.* 调用） ----------
   App.send = send;
+  App.sendBackground = sendBackground;
+  App.abortBackgroundSend = abortBackgroundSend;
   App.resume = resume;
   App.setResumeAvailable = setResumeAvailable;
   App.refreshResumeAvailability = refreshResumeAvailability;

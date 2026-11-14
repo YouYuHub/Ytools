@@ -75,7 +75,15 @@
           // task, or replace a live local phase with a coarse server label.
           if (old && (old.version > before || old.local && listening(sid))) return;
           const row = remote.get(sid);
-          if (!row) entries.delete(sid);
+          if (!row) {
+            // 运行→空闲转换：用户已切走时，原任务的流被 detach 不会触发派发，
+            // 这里是后台队列自动发起的唯一触发点（切回当前会话则由可见派发负责）。
+            const wasActive = old && old.kind !== "idle";
+            entries.delete(sid);
+            if (wasActive && App.state.sessionId !== sid && typeof App.flushBackgroundMessages === "function") {
+              setTimeout(function () { App.flushBackgroundMessages(sid); }, 0);
+            }
+          }
           else entries.set(sid,
             { kind: "running", label: row.compacting ? "正在压缩上下文" : "任务进行中", version: before });
         });

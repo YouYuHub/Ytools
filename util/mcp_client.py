@@ -69,7 +69,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # 自定义模块
-from config import DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS, FunctionDefinition
+from config import DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS, FunctionDefinition, MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS
 from env_manager import load_var
 
 
@@ -448,6 +448,21 @@ def _mcp_call_timeout_seconds() -> float:
         return float(DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS)
 
 
+def _mcp_effective_timeout_seconds(configured: float) -> float:
+    """实际强制等待时长 = 配置值 + 宽限；0 或负数表示不限制（无宽限）。
+
+    宽限覆盖服务冷启动开销，并让“工具内部超时 == 配置值”的边界场景下
+    工具先超时返回、输出正常落袋，而不是被客户端抢先掐断丢输出。
+    """
+    try:
+        grace = float(MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS)
+    except (TypeError, ValueError):
+        grace = 0.0
+    if grace < 0:
+        grace = 0.0
+    return configured + grace if configured > 0 else 0.0
+
+
 def _save_mcp_image(content_item: Any) -> str:
     """MCP 图片结果落盘为 read_media 可读取的本地文件。"""
     mime = str(_sdk_attr(content_item, "mime_type", "mimeType", "") or "").lower()
@@ -710,6 +725,7 @@ async def call_mcp_tool(
 ) -> Any:
     """通过 MCP 客户端调用工具，并对完整生命周期施加配置的总超时。"""
     timeout_seconds = _mcp_call_timeout_seconds()
+    effective_seconds = _mcp_effective_timeout_seconds(timeout_seconds)
     servers = _load_mcp_servers_config()
     config = servers.get(mcp_service)
     entries = profiles(config)
@@ -748,8 +764,8 @@ async def call_mcp_tool(
             _drop_persistent_client(mcp_service, session_scope, client)
 
     try:
-        if timeout_seconds > 0:
-            result = await asyncio.wait_for(call, timeout=timeout_seconds)
+        if effective_seconds > 0:
+            result = await asyncio.wait_for(call, timeout=effective_seconds)
         else:
             result = await call
         return f"[MCP 服务: {mcp_service}; profile: {mcp_profile}]\n{result}" if mcp_profile else result
@@ -766,7 +782,7 @@ async def call_mcp_tool(
             target += f"[{mcp_profile}]"
         raise TimeoutError(
             f"工具调用超时：{target} 超过 {timeout_seconds:g} 秒无响应"
-            "（含连接/初始化/调用全过程）"
+            f"（含连接/初始化/调用全过程；含宽限实际等待 {effective_seconds:g} 秒）"
         ) from exc
 
 

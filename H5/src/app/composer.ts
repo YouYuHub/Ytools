@@ -657,8 +657,8 @@
     // 压缩进行中仅拦截压缩会话的派发（其余会话不受影响）
     if (state.manualCompactRunning && state.manualCompactSession === (finishedSessionId || state.sessionId)) return;
     if (state.pendingAskQuestions) return; // ask_user 等待用户回答，不抢占
-    // 用户已切走：留在暂存区，重新打开该会话时再派发
-    if (state.sessionId !== target) return;
+    // 用户已切走：改为后台派发（任务完成后仍自动发起，不渲染当前 DOM）
+    if (state.sessionId !== target) { await flushBackground(target); return; }
     if (state.streaming && state.streamingSession === target) return;
     let next = null;
     // 转存条目（后端丢失后转回）不自动派发，需手动发送，避免误判导致重复发送
@@ -681,6 +681,74 @@
     if (!next) return;
     await App.send(next);
   }
+
+  // 后台派发进行中登记（sessionId→true）：防止多个触发源并发取走同一条。
+  const bgFlushing = new Set<string>();
+
+  /** 把一条消息放回暂存区（后台未发起/被接管中止时），保留侧车与墓碑一致性。 */
+  function restoreBackgroundEntry(target: any, next: any, kind: any) {
+    unmarkOutboxSent(target, next.id);
+    if (kind === "steer") {
+      if (!state.steerMessage || state.steerMessage.sessionId !== target) {
+        next._originKind = "steer";
+        state.steerMessage = next;
+        App.saveOutboxEntry(target, "steer", next);
+      } else {
+        state.pendingQueue.unshift(next);
+        App.saveOutboxEntry(target, "queue", next);
+      }
+    } else {
+      state.pendingQueue.unshift(next);
+      App.saveOutboxEntry(target, "queue", next);
+    }
+    renderPendingOutbox();
+  }
+
+  /**
+   * 用户切走后的队列/引导派发：不渲染当前 DOM，经 App.sendBackground 向目标
+   * 会话发起生成。未发起/被接管中止则放回暂存区（切回后可见发送）；成功完成
+   * 则链式派发下一条。ask_user 等待回答的会话不抢占（等切回处理）。
+   */
+  async function flushBackground(target: any) {
+    if (!target || bgFlushing.has(target)) return;
+    if (state.sessionId === target) return; // 已切回，交给可见派发
+    if (state.pendingAskQuestions) return; // 有未答提问（任务暂停），不抢占
+    if (state.manualCompactRunning && state.manualCompactSession === target) return;
+    bgFlushing.add(target);
+    try {
+      let next: any = null, kind = "queue";
+      const steerReady = state.steerMessage && state.steerMessage.sessionId === target && !state.steerMessage._converted;
+      if (steerReady) {
+        next = state.steerMessage; kind = "steer";
+        next._originKind = "steer";
+        state.steerMessage = null;
+      } else {
+        const idx = state.pendingQueue.findIndex(function(m: any) { return m.sessionId === target; });
+        if (idx >= 0) next = state.pendingQueue.splice(idx, 1)[0];
+      }
+      if (!next) return;
+      markOutboxSent(target, next.id);
+      await App.removeOutboxEntry(target, next.id);
+      renderPendingOutbox();
+      const res = await App.sendBackground(target, next);
+      // 未发出聊天请求（上传中止/失败、并发守卫、空消息）：放回暂存区等下次派发
+      if (!res || !res.started) {
+        restoreBackgroundEntry(target, next, kind);
+        return;
+      }
+      // 已投递但本地连接中断：后端任务继续跑，消息绝不能放回（否则重复发送）。
+      // 不链式派发（会打断仍在跑的任务）；等 session_activity 检测到空闲再派发。
+      if (res.error) {
+        toast("后台队列消息已提交，连接中断；任务仍在后台运行，可切回会话查看");
+        return;
+      }
+      // 完成：链式派发下一条（仍切走才继续）
+      if (state.sessionId !== target) setTimeout(function() { flushBackground(target); }, 0);
+    } finally {
+      bgFlushing.delete(target);
+    }
+  }
+  App.flushBackgroundMessages = flushBackground;
 
   // 已发送墓碑（sessionStorage，按会话记最近 50 个已取走派发的暂存 id）：
   // 侧车删除与发送之间若有打开/刷新（读到删前快照），或删除请求失败，

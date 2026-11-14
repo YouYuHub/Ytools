@@ -119,7 +119,8 @@ class ToolExecutorTests(unittest.TestCase):
 
         async def run():
             with patch.object(mcp_client, "load_var", return_value="0.01"), \
-                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call):
+                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call), \
+                    patch.object(mcp_client, "MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS", 0):
                 with self.assertRaises(asyncio.TimeoutError):
                     await mcp_client.call_mcp_tool("slow_tool", {})
 
@@ -132,7 +133,8 @@ class ToolExecutorTests(unittest.TestCase):
 
         async def run():
             with patch.object(mcp_client, "load_var", return_value="0.01"), \
-                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call):
+                    patch.object(mcp_client, "_call_mcp_tool_impl", slow_call), \
+                    patch.object(mcp_client, "MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS", 0):
                 with self.assertRaisesRegex(TimeoutError, "超时") as ctx:
                     await mcp_client.call_mcp_tool(
                         "slow_tool", {}, mcp_service="demo_server"

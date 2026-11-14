@@ -16,10 +16,11 @@
 | 跨文件搜内容 | `search_files(pattern, dir_path?)`；默认普通文本，正则设 `is_regex=true`。`file_pattern` 筛选文件名或相对路径 glob |
 | 读取文档 | `read_document(filename)` 默认自动选择。`text` 用 `offset/limit`；`table` 用 `next_row/next_sheet`；PDF 选页同时给 `page_start/page_count` |
 | 查看媒体 | `read_media(references)`，每条回复一次、最多 5 个来源；可用 `media://`、本地路径、HTTP(S) 直链，检查 `loaded/skipped` |
-| 执行命令 | `run_command(command, work_dir?)` 每次新 shell，默认短等 1000ms；未结束返回 `job_id`。语法须匹配 shell，cd 不影响下次调用 |
-| 继续查看 | `poll_command(job_id)` 自动续取新增输出。`status=running` 或 `has_more=true` 时继续查询；前台总超时仍生效 |
-| 连续输入 | `run_command(..., interactive=true)`；需 TTY 的 REPL 加 `tty=true`。用 `write_stdin(job_id, chars="内容\n")` 输入并续取输出；管道读取至 EOF 的程序再传 `eof=true` |
-| 独立服务 | `run_command(..., background=true)`，不受前台总超时/任务结束回收；`poll_command(job_id)` 查看，`stop_command(job_id)` 停止 |
+| 执行命令 | `run_command(command, work_dir?)` 默认每次新 shell、短等 1000ms；未结束返回 `job_id`。语法须匹配 shell。传 `session_id="名"` 复用同一常驻 shell（保住 cwd/环境变量/REPL 状态），不传=每次新建 |
+| 继续查看 | `poll_command(job_id)` 自动续取新增输出。`status=running` 或 `has_more=true` 时继续查询；`completion=awaiting_input` 表示在等输入；footer 带 `elapsed_ms`/`cwd` |
+| 连续输入 | `run_command(..., interactive=true)`；需 TTY 的 REPL 加 `tty=true`。用 `write_stdin(job_id, chars="内容\n")` 输入并续取输出；控制键用 `key`（ctrl+c/enter/方向键等）；管道读取至 EOF 的程序再传 `eof=true` |
+| 独立服务 | `run_command(..., background=true)`，不受前台总超时/任务结束回收；`poll_command(job_id)` 查看，`stop_command(job_id)` 停止（`graceful=true` 先软中断再杀树） |
+| 任务总览 | `list_jobs(active_only?)` 列出当前会话后台/交互任务（job_id、状态、耗时、目录） |
 
 ## 常见续读与限制
 
@@ -36,7 +37,8 @@
 - 本地文档文本/表格解析最多 10 MiB；原生读取使用配置中的原生文档配额，硬上限 64 MiB，需当前模型支持该格式。
 - 原生文档只发送到下一次模型请求。视频旧画面会回收，回看需重读。本地/会话视频按返回的 `video.read.end` 续读；网络 URL 不接受时间区间。
 - 命令前台默认 120 秒、允许 1–1800 秒，预算包括预处理和启动；进程回收可能额外耗时。后台不使用此超时，停止聊天后仍保留后台任务。
-- 终端默认自动续读，无新增输出时最多等 1 秒；`wait_seconds=0–30` 可调。`cursor=""` 重读，传 `next_cursor` 可指定位置，之后继续自动续读；`tail_lines=1–200` 只预览尾部，不推进位置，不能与 cursor/wait_seconds/encoding 混用。乱码可设 `encoding`，后续沿用，空字符串恢复自动识别。完整日志见 `output_path`。
+- 终端默认自动续读，无新增输出时最多等 1 秒；`wait_seconds=0–30` 可调。`cursor=""` 重读，传 `next_cursor` 可指定位置，之后继续自动续读；`tail_lines=1–200` 只预览尾部、不推进位置，与 cursor 互斥但可配 `wait_seconds`（边等边看尾部）与 `encoding`。乱码可设 `encoding`，后续沿用，空字符串恢复自动识别。完整日志见 `output_path`。tty 输出默认剥离 ANSI，`raw=true` 保留原始控制码。
+- 常驻会话（`session_id`）跨调用保持 cwd/环境变量/REPL import 状态；cmd/PS 自动用结束标记取退出码（for 循环/多行命令不加标记、无单一退出码）。`env={名:值}` 仅本次调用生效、不污染宿主。会话空闲 30 分钟自动回收，`stop_command(job_id)` 可手动关闭。
 - 交互模式默认短等 1000ms，与后台互斥。输入仅限当前任务/代理，ask 权限模式下发送输入须审批；空输入只读取。`write_stdin` 原样发送 UTF-8，最多 16384 字符/64KiB，换行需显式包含；只传 job_id/request_id 查回执，重试沿用 request_id 和原文，勿换 ID 自动重发。PTY 不支持 `eof=true`，程序退出或 `stop_command` 结束终端。
 
 ## 最小示例

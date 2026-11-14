@@ -452,7 +452,7 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
      * @param {object|null} [parameter] 生成参数（按 api_type 分桶）；null 表示仅切换模型、保留原参数桶
      * @param {string} [sessionId] 会话 ID
      * @param {boolean} [clear] 仅会话级有效：清除该会话当前角色的独立模型选择，恢复跟随全局默认
-     * @param {Array|null} [headers] 该角色自定义请求头 [{name, value}]；null 保持现有配置，[] 清空
+     * @param {Array|null} [headers] 该角色自定义请求头 [{name, value, enabled}]；null 保持现有配置，[] 清空；enabled=false 的行保留但不发送
      */
     function selectModel(provider, model, role, parameter, sessionId, clear, headers) {
         const body = { provider: provider, model: model };

@@ -238,6 +238,8 @@ def _build_custom_header_lines(chat_config: dict[str, Any]) -> str:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        if not item.get("enabled", True):
+            continue
         name = str(item.get("name") or "").strip()
         value = "" if item.get("value") is None else str(item.get("value"))
         if not name or re.search(r"[\r\n]", name + value):

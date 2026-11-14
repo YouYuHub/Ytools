@@ -10,7 +10,7 @@ import uuid
 
 
 def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout, wait_ms, max_chars, agent,
-          interactive=False, tty=False):
+          interactive=False, tty=False, persistent=False):
     from . import builtin_tools as bt, command_jobs
     from .permission_runtime import CURRENT
     from .tool_control import check_tool_control
@@ -26,7 +26,8 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
         argv.remove('-NonInteractive')
     spec = {'argv': argv, 'script': str(script), 'cwd': cwd,
             'deadline': time.time() + timeout, 'monotonic_deadline': time.monotonic() + timeout, 'owner_pid': os.getpid(),
-            'owner_identity': process_identity(os.getpid()), 'interactive': interactive, 'tty': tty}
+            'owner_identity': process_identity(os.getpid()), 'interactive': interactive, 'tty': tty,
+            'persistent': persistent}
     spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding='utf-8')
     runner = [sys.executable, str(Path(__file__).with_name('command_lease_runner.py')), str(spec_path)]
     outer_exe, outer_kind, outer_prefix = bt._resolve_shell('cmd' if os.name == 'nt' else 'sh', os.name == 'nt')
@@ -40,7 +41,8 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
         path, meta = command_jobs.read_job(job_id, session_id)
         meta.update(background=False, command=command, shell=shell_kind,
                     owner_task=current.id if current else None, owner_agent=agent,
-                    lease_path=str(spec_path), deadline=spec['deadline'], interactive=interactive, tty=tty)
+                    lease_path=str(spec_path), deadline=spec['deadline'], interactive=interactive, tty=tty,
+                    persistent=persistent)
         command_jobs.write_metadata(path, meta)
         # Ordinary short commands should finish in one call, even if they emit output
         # before exiting. Interactive prompts must return promptly for input.
@@ -89,6 +91,33 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
         else:
             spec_path.with_suffix('.cancel').touch()
         raise
+
+
+def start_resident(argv, cwd, session_id, agent, shell_kind):
+    """以 argv 直接启动常驻交互式 shell（不写脚本、不随任务/超时被杀）。"""
+    from . import builtin_tools as bt, command_jobs
+    from .permission_runtime import CURRENT
+    from util.process_identity import process_identity
+    bt._BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    spec_path = bt._BG_LOG_DIR / ('bg_lease_' + uuid.uuid4().hex + '.json')
+    spec = {'argv': argv, 'script': '', 'cwd': cwd,
+            'deadline': time.time() + 1800, 'monotonic_deadline': time.monotonic() + 1800,
+            'owner_pid': os.getpid(), 'owner_identity': process_identity(os.getpid()),
+            'interactive': True, 'tty': False, 'persistent': True}
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding='utf-8')
+    runner = [sys.executable, str(Path(__file__).with_name('command_lease_runner.py')), str(spec_path)]
+    outer_exe, outer_kind, outer_prefix = bt._resolve_shell('cmd' if os.name == 'nt' else 'sh', os.name == 'nt')
+    invocation = subprocess.list2cmdline(runner) if os.name == 'nt' else shlex.join(runner)
+    current = CURRENT.get()
+    launched = bt._run_command_background(invocation, outer_exe, outer_kind, outer_prefix,
+                                            cwd, os.name == 'nt', session_id, structured=True)
+    job_id = launched['job_id']
+    path, meta = command_jobs.read_job(job_id, session_id)
+    meta.update(background=False, command='(resident shell)', shell=shell_kind,
+                owner_task=current.id if current else None, owner_agent=agent,
+                lease_path=str(spec_path), interactive=True, tty=False, persistent=True)
+    command_jobs.write_metadata(path, meta)
+    return job_id
 
 
 def cancel_owned(task_id, agent=None):

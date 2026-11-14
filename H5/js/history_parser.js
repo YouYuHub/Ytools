@@ -328,6 +328,11 @@
         let metaUsageTotal = 0;
         let metaUsage = {};
         let roundCounter = offset;
+        // 轮次权威时间窗（started_at/ended_at）：暂停→续跑的空闲间隙扣除用。
+        // 续跑轮是内部 nudge、无用户气泡，其节点在折叠层被并入上一轮 → 折叠跨度
+        // 会横跨整段暂停空闲。把每轮真实运行区间随记录带到 DOM，折叠层据此扣除
+        // 相邻轮之间的空档（刷新/切会话后依然成立，不依赖内存态）。
+        const roundWindows = [];
         // 预读轮次时间窗：修复旧 JSONL 中尚无 display_round 锚点的任务内历史压缩事件。
         const parsedLines = [];
         const roundTimeWindows = [];
@@ -600,10 +605,24 @@
             if (hasTokenUsage || hasRoundModel) {
                 records.push({ kind: "usage", usage: roundUsage, model: roundModel, round: roundNo });
             }
+            // 本轮真实运行区间：优先后端轮级起止；缺失时退回轮内事件首尾时间戳。
+            // 只取本轮自身事件（不含并入的压缩锚点行），避免压缩时间污染区间。
+            const roundEvents = Array.isArray(obj.events) ? obj.events : [];
+            const firstTs = roundEvents.length ? timestampValue(roundEvents[0] && roundEvents[0].timestamp) : null;
+            const lastTs = roundEvents.length
+                ? timestampValue(roundEvents[roundEvents.length - 1] && roundEvents[roundEvents.length - 1].timestamp) : null;
+            const winStart = timestampValue(obj.started_at) ?? firstTs;
+            const winEnd = timestampValue(obj.ended_at) ?? lastTs ?? winStart;
+            const window = winStart !== null && winEnd !== null && winEnd >= winStart
+                ? { start: winStart, end: winEnd } : null;
+            if (window)
+                roundWindows.push({ round: roundNo, start: window.start, end: window.end });
             // 轮内子块（sub_agent 聚合块等由辅助函数 push 的记录）统一补轮次号
             for (let r = roundStart; r < records.length; r += 1) {
                 if (records[r].round == null)
                     records[r].round = roundNo;
+                if (window)
+                    records[r].roundWindow = window;
             }
         });
         // 正在进行/中断的轮次可能尚未写成 chat_round。保留其独立压缩事件，

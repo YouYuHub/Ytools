@@ -10,7 +10,7 @@
     <link rel="icon" href="favicon-squid.svg" type="image/png">
     <!-- 先设置 data-theme，避免首屏闪烁 -->
     <script src="js/theme.js?v=56818aca26c4"></script>
-    <link rel="stylesheet" href="css/main.css?v=8673d337d99e">
+    <link rel="stylesheet" href="css/main.css?v=3c504ef598e6">
     <!-- KaTeX 数学公式渲染：CSS 需在 main.css 之后加载（字体相对路径 fonts/…） -->
     <link rel="stylesheet" href="js/vendor/katex/katex.min.css?v=50d9c78e03da">
 </head>
@@ -976,7 +976,7 @@
                     <button id="addHeaderRow" type="button" title="添加一行请求头">+ 添加</button>
                 </div>
                 <div class="enhance-headers-rows" id="customHeadersRows"></div>
-                <div class="enhance-headers-tip">随该角色的模型选择保存；请求上游时随原始 HTTP 头注入（如供应商要求的会话/签名头）。同名键后者覆盖前者。</div>
+                <div class="enhance-headers-tip">随该角色的模型选择保存；请求上游时随原始 HTTP 头注入（如供应商要求的会话/签名头）。同名键后者覆盖前者；取消勾选则保留但不发送。</div>
             </div>
             </details>
             <div class="enhance-secondary-actions">
@@ -1093,7 +1093,7 @@
 
     <div class="toast-wrap" id="toastWrap"></div>
 
-    <script defer src="js/api.js?v=77881ebb4fd5"></script>
+    <script defer src="js/api.js?v=30a14a644ea3"></script>
     <script defer src="js/file_history_sync.js?v=a17f0a7c3cd4"></script>
     <script defer src="js/vendor/prism/prism-core.min.js?v=e2624d4f66cc"></script>
     <script defer src="js/vendor/prism/prism-clike.min.js?v=c76ba4e24093"></script>
@@ -1136,8 +1136,8 @@
     <script defer src="js/session_group_utils.js?v=b8e3888a0195"></script>
     <script defer src="js/session_utils.js?v=16b80099e922"></script>
     <script defer src="js/format_utils.js?v=f92030f63ed6"></script>
-    <script defer src="js/history_parser.js?v=d2d32bb3a46c"></script>
-    <script defer src="js/history_parse_async.js?v=3625aa998728"></script>
+    <script defer src="js/history_parser.js?v=1781ddc59dd2"></script>
+    <script defer src="js/history_parse_async.js?v=83d614182435"></script>
     <script defer src="js/history_search.js?v=db245939ae22"></script>
     <!-- 引用纯逻辑（限额/预览/复制文本）：无 DOM 依赖，供 app/quotes.js 使用 -->
     <script defer src="js/quote_utils.js?v=d359c3af4975"></script>
@@ -1164,37 +1164,37 @@
     <script defer src="js/app/permissions.js?v=e8f1b4431995"></script>
     <script defer src="js/history_scroll_model.js?v=ac6b516e5fa9"></script>
     <script defer src="js/app/process_groups.js?v=856e9b1fcd29"></script>
-    <script defer src="js/app/round_fold.js?v=b9571173cd94"></script>
+    <script defer src="js/app/round_fold.js?v=fb79cf305413"></script>
     <script defer src="js/app/message_diff.js?v=4713a0f99548"></script>
-    <script defer src="js/app/messages_history.js?v=1e1f082a743f"></script>
+    <script defer src="js/app/messages_history.js?v=650e293ec178"></script>
     <script defer src="js/app/messages_render.js?v=31edfeb43017"></script>
     <script defer src="js/app/messages_edit.js?v=fc1c17334bf3"></script>
     <script defer src="js/app/messages_tools.js?v=a0b830ea84ec"></script>
-    <script defer src="js/app/messages_widgets.js?v=6d3aaeba7600"></script>
-    <script defer src="js/app/messages_canvas.js?v=429fa8038e24"></script>
+    <script defer src="js/app/messages_widgets.js?v=98630490e27c"></script>
+    <script defer src="js/app/messages_canvas.js?v=47461250187e"></script>
     <script defer src="js/app/messages_tables.js?v=f6aaf00ad4f5"></script>
     <script defer src="js/app/messages_nav.js?v=21d8569e8bd5"></script>
     <script defer src="js/app/history_scroll.js?v=a52d1ec4ec74"></script>
-    <script defer src="js/app/history_pages.js?v=050f31b1c708"></script>
+    <script defer src="js/app/history_pages.js?v=8a16ed7b499d"></script>
     <script defer src="js/app/history.js?v=fdd6843394ed"></script>
     <script defer src="js/app/compaction.js?v=6b90118de83a"></script>
     <script defer src="js/app/builtin.js?v=0176a613d3c3"></script>
     <script defer src="js/app/user_profile.js?v=d628fb7a9d80"></script>
     <script defer src="js/app/media.js?v=837473836d3c"></script>
     <script defer src="js/app/skills.js?v=ed4ec4fad6b2"></script>
-    <script defer src="js/app/composer.js?v=ceb87a599583"></script>
+    <script defer src="js/app/composer.js?v=9302ceb458da"></script>
     <script defer src="js/app/chat_settings_modal.js?v=d5e2633e03a2"></script>
     <script defer src="js/app/model_panel_modal.js?v=41c63cc0756f"></script>
-    <script defer src="js/app/model_panel.js?v=a9a8a53447e3"></script>
+    <script defer src="js/app/model_panel.js?v=0731c77136af"></script>
     <script defer src="js/app/tools.js?v=b18ef980419e"></script>
     <script defer src="js/app/mcp_schema_form.js?v=842a61820504"></script>
     <script defer src="js/app/mcp_diagnostics.js?v=c03240d570c2"></script>
     <script defer src="js/app/task_templates.js?v=a5e94044af57"></script>
     <script defer src="js/task_state.js?v=e1fc1594e65a"></script>
-    <script defer src="js/app/session_activity.js?v=6c612b5720c0"></script>
+    <script defer src="js/app/session_activity.js?v=9f11724ef86d"></script>
     <script defer src="js/app/task_status.js?v=2051756f3359"></script>
-    <script defer src="js/app/stream_pipeline.js?v=c74dc79d363a"></script>
-    <script defer src="js/app/chat.js?v=e7ba20148e32"></script>
+    <script defer src="js/app/stream_pipeline.js?v=85b2a4185430"></script>
+    <script defer src="js/app/chat.js?v=db1f2e932fad"></script>
     <script defer src="js/app/filehistory.js?v=3ec771da0491"></script>
     <script defer src="js/app/terminals.js?v=193e10002f6d"></script>
     <script defer src="js/app/task_costs.js?v=99bdecf5a8bb"></script>

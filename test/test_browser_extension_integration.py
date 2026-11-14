@@ -137,6 +137,7 @@ def test_one_service_reuses_both_target_processes_and_separates_child_scopes(mon
         assert not any(key[1] == 'sub_agent:child' for key in mcp_client._PERSISTENT_CLIENTS)
         assert len(launched) == 3
         monkeypatch.setattr(mcp_client, '_mcp_call_timeout_seconds', lambda: .05)
+        monkeypatch.setattr(mcp_client, 'MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS', 0)
         with pytest.raises(asyncio.TimeoutError):
             asyncio.run(mcp_client.call_mcp_tool('browser_snapshot', {'mcp_profile': 'extension', 'arguments': {'stall': True}}, 'Browser'))
         assert ('Browser', 'main', 'extension') not in mcp_client._PERSISTENT_CLIENTS

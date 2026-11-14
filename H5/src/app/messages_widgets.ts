@@ -183,6 +183,91 @@
     svgPanDrag = null;
   });
 
+  // ---------- 全屏头栏自动隐藏（svg/mermaid/chart/canvas 共用壳） ----------
+  // 全屏下头栏悬浮覆盖（CSS :fullscreen 接管定位，不占布局）；默认隐藏，
+  // 鼠标到顶部热区/头栏悬停/头栏聚焦/触摸顶部时加 .is-bar-visible 显示，
+  // 无操作 FULLBAR_IDLE_MS 后自动隐藏。canvas 跨源 iframe 吞 mousemove，
+  // 显示触发另有 CSS 热区条（块 ::after mouseenter，事件目标即块本身）兜底。
+  const FULLBAR_TOP_PX = 72;
+  const FULLBAR_IDLE_MS = 2200;
+  const FULLBAR_ENTER_HINT_MS = 1500;
+  let fullbarBlock: any = null;
+  let fullbarTimer: any = null;
+  function fullbarClearTimer() {
+    if (fullbarTimer) { clearTimeout(fullbarTimer); fullbarTimer = null; }
+  }
+  function fullbarLive(block: any) {
+    return block && document.fullscreenElement === block;
+  }
+  function fullbarShow(block: any) {
+    if (!fullbarLive(block)) return;
+    block.classList.add("is-bar-visible");
+  }
+  function fullbarHide(block: any) {
+    const target = block || fullbarBlock;
+    if (!target) return;
+    // YouTube 模式：只认鼠标活动，不认悬停位置——静止超时就藏，哪怕光标
+    // 停在头栏上（点完“全屏/缩放”手不动是最常见的姿势，悬停豁免会让头栏
+    // 看起来“始终显示”）；头栏上任何一点移动都会重新点亮，不影响点按钮。
+    target.classList.remove("is-bar-visible");
+  }
+  function fullbarArm(block: any, ms?: any) {
+    fullbarClearTimer();
+    if (!fullbarLive(block)) return;
+    fullbarTimer = setTimeout(function () {
+      fullbarTimer = null;
+      fullbarHide(block);
+    }, ms == null ? FULLBAR_IDLE_MS : ms);
+  }
+  function fullbarTeardown() {
+    fullbarClearTimer();
+    if (fullbarBlock) fullbarBlock.classList.remove("is-bar-visible");
+    fullbarBlock = null;
+  }
+  document.addEventListener("fullscreenchange", function () {
+    const fsEl = document.fullscreenElement;
+    fullbarTeardown();
+    if (fsEl && fsEl.classList && fsEl.classList.contains("md-svg-block")) {
+      fullbarBlock = fsEl;
+      // 进全屏先亮一下（发现“退出全屏”按钮），再自动隐藏
+      fullbarShow(fsEl);
+      fullbarArm(fsEl, FULLBAR_ENTER_HINT_MS);
+    }
+  });
+  document.addEventListener("mousemove", function (e: any) {
+    if (!fullbarLive(fullbarBlock)) return;
+    if (e.clientY <= FULLBAR_TOP_PX) fullbarShow(fullbarBlock);
+    fullbarArm(fullbarBlock);
+  }, { passive: true });
+  // 热区条（::after 伪元素，事件目标即块本身）：iframe 上方同样有效
+  document.addEventListener("mouseover", function (e: any) {
+    if (!fullbarLive(fullbarBlock) || e.target !== fullbarBlock) return;
+    fullbarShow(fullbarBlock);
+    fullbarArm(fullbarBlock);
+  }, { passive: true });
+  document.addEventListener("touchstart", function (e: any) {
+    if (!fullbarLive(fullbarBlock)) return;
+    const touches = e.touches || [];
+    if (touches.length && touches[0].clientY <= FULLBAR_TOP_PX) fullbarShow(fullbarBlock);
+    fullbarArm(fullbarBlock);
+  }, { passive: true });
+  // 键盘：Tab 进头栏点亮，之后每次按键续亮；focusout 后靠 idle 隐藏
+  document.addEventListener("focusin", function (e: any) {
+    if (!fullbarLive(fullbarBlock)) return;
+    const head = fullbarBlock.querySelector(".md-svg-head");
+    if (head && head.contains(e.target)) {
+      fullbarShow(fullbarBlock);
+      fullbarArm(fullbarBlock);
+    }
+  });
+  document.addEventListener("keydown", function (e: any) {
+    if (!fullbarLive(fullbarBlock)) return;
+    if (e.key === "Tab") {
+      fullbarShow(fullbarBlock);
+      fullbarArm(fullbarBlock);
+    }
+  });
+
   // ---------- SVG 生成控件（```svg 双视图块）交互 ----------
   // 视图切换/复制代码/复制图片全部事件委托：markdown 流式重渲染会重建节点
   chatInner.addEventListener("click", async function(e: any) {

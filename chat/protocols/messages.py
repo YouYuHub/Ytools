@@ -35,6 +35,8 @@ def headers(config):
     for item in config.get("_custom_headers") or []:
         if not isinstance(item, dict):
             continue
+        if not item.get("enabled", True):
+            continue
         name, value = str(item.get("name") or "").strip(), str(item.get("value") or "")
         key = name.casefold()
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or any(c in name + value for c in "\r\n") or key in {"host", "content-length", "connection", "transfer-encoding"}:

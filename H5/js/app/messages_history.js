@@ -451,6 +451,13 @@
                             node.setAttribute("data-history-index", String(recordOffset + rendered + i));
                         if (rec.round != null)
                             node.setAttribute("data-round", String(rec.round));
+                        // 轮次权威运行区间（后端 started_at/ended_at）：折叠层据此扣除
+                        // 「暂停→续跑」的空闲（续跑轮无用户气泡、被并入上一轮折叠）。
+                        // 内联写入：本文件的渲染段被多个单测按切片加载，不引入新函数依赖。
+                        if (rec.roundWindow && node.dataset) {
+                            node.dataset.roundWindowStart = String(rec.roundWindow.start);
+                            node.dataset.roundWindowEnd = String(rec.roundWindow.end);
+                        }
                         if (Number.isInteger(rec.source_event_index))
                             node.setAttribute("data-source-event", String(rec.source_event_index));
                         if (App.processGroups)
@@ -610,6 +617,10 @@
                     node.setAttribute("data-history-index", String(targetStart + index));
                     if (rec.round != null)
                         node.setAttribute("data-round", String(rec.round));
+                    if (rec.roundWindow && node.dataset) {
+                        node.dataset.roundWindowStart = String(rec.roundWindow.start);
+                        node.dataset.roundWindowEnd = String(rec.roundWindow.end);
+                    }
                     if (Number.isInteger(rec.source_event_index))
                         node.setAttribute("data-source-event", String(rec.source_event_index));
                     if (App.processGroups)

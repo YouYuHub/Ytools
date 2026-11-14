@@ -213,5 +213,94 @@ class BuildCustomHeaderLinesTests(unittest.TestCase):
         self.assertEqual(lines, "x-e: \r\n")
 
 
+class EnabledFlagTests(unittest.TestCase):
+    def test_normalize_keeps_explicit_disabled_sparse(self):
+        result = env_manager._normalize_custom_headers([
+            {"name": "x-on", "value": "a", "enabled": True},
+            {"name": "x-off", "value": "b", "enabled": False},
+            {"name": "x-legacy", "value": "c"},
+        ])
+        # 仅显式禁用保留 enabled 键（稀疏存储，老数据零迁移）
+        self.assertEqual(result, [
+            {"name": "x-on", "value": "a"},
+            {"name": "x-off", "value": "b", "enabled": False},
+            {"name": "x-legacy", "value": "c"},
+        ])
+
+    def test_normalize_dedup_keeps_last_wholesale(self):
+        result = env_manager._normalize_custom_headers([
+            {"name": "x-k", "value": "v1", "enabled": False},
+            {"name": "x-k", "value": "v2"},
+        ])
+        self.assertEqual(result, [{"name": "x-k", "value": "v2"}])
+
+    def test_inject_preserves_disabled_flag(self):
+        merged = env_manager.inject_custom_headers_into_config(
+            {}, [{"name": "x-off", "value": "b", "enabled": False}]
+        )
+        self.assertEqual(merged["_custom_headers"], [
+            {"name": "x-off", "value": "b", "enabled": False}
+        ])
+
+    def test_chat_completions_lines_skip_disabled(self):
+        config = {"_custom_headers": [
+            {"name": "x-on", "value": "a"},
+            {"name": "x-off", "value": "b", "enabled": False},
+        ]}
+        lines = chat_llm._build_custom_header_lines(config)
+        self.assertIn("x-on: a\r\n", lines)
+        self.assertNotIn("x-off", lines)
+
+    def test_messages_headers_skip_disabled(self):
+        from chat.protocols import messages
+        config = {"apiKey": "k", "_custom_headers": [
+            {"name": "x-on", "value": "a"},
+            {"name": "x-off", "value": "b", "enabled": False},
+        ]}
+        built = messages.headers(config)
+        self.assertEqual(built.get("x-on"), "a")
+        self.assertNotIn("x-off", built)
+
+    def test_get_role_headers_preserves_disabled(self):
+        # 回归：get_role_headers 曾手写重建 {name, value} 丢掉 enabled，
+        # 导致回填恒勾选、禁用照发（回填与发送都走它）。
+        from unittest import mock
+        with mock.patch.object(env_manager, "get_model_selection", return_value={
+            "chat_model": {
+                "ownership_name": "P", "model_name": "M", "parameter": {},
+                "api_type": "chat_completions",
+                "headers": [
+                    {"name": "x-on", "value": "a"},
+                    {"name": "x-off", "value": "b", "enabled": False},
+                ],
+            },
+        }):
+            headers = env_manager.get_role_headers("chat_model")
+        self.assertEqual(headers, [
+            {"name": "x-on", "value": "a"},
+            {"name": "x-off", "value": "b", "enabled": False},
+        ])
+        # 全链路：注入配置后发送时跳过禁用项
+        merged = env_manager.inject_custom_headers_into_config({"url": "https://x"}, headers)
+        lines = chat_llm._build_custom_header_lines(merged)
+        self.assertIn("x-on: a\r\n", lines)
+        self.assertNotIn("x-off", lines)
+
+    def test_responses_client_skips_disabled(self):
+        from types import SimpleNamespace
+        from chat import responses_client
+        config = {
+            "url": "https://example.test/v1", "apiKey": "k",
+            "_custom_headers": [
+                {"name": "x-on", "value": "a"},
+                {"name": "x-off", "value": "b", "enabled": False},
+            ],
+        }
+        client, _ = responses_client._client(config, SimpleNamespace(session_id="s"))
+        lowered = {str(k).casefold(): v for k, v in dict(client.headers).items()}
+        self.assertEqual(lowered.get("x-on"), "a")
+        self.assertNotIn("x-off", lowered)
+
+
 if __name__ == "__main__":
     unittest.main()

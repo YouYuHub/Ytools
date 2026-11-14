@@ -133,6 +133,29 @@ test('补载失败后停止接力不再空转',async()=>{
     assert.equal(f.pages.hasRound(1),false);
   }finally{f.dom.window.close();}
 });
+test('regen 重发：问题表旧轮与本地新气泡同轮一对一时合并，不多出一条',async()=>{
+  const reply=Object.assign(pageRange(1,3,3),{questions:[{round:1,event_index:0,text:'q1'},{round:2,event_index:0,text:'q2'},{round:3,event_index:0,text:'q3old'}]});
+  const f=setup(()=>reply);try{
+    await f.pages.open('a');
+    const liveNode={};
+    const nav=f.pages.navigation([{round:1,eventIndex:0,index:0,text:'q1',node:null},{round:2,eventIndex:0,index:2,text:'q2',node:null},{round:3,index:-1,text:'q3new',node:liveNode}]);
+    assert.equal(nav.length,3);
+    assert.equal(nav[2].text,'q3new');
+    assert.equal(nav[2].node,liveNode);
+  }finally{f.dom.window.close();}
+});
+test('同轮一精确一回退时合并，歧义（两侧多条）时不误并',async()=>{
+  const reply=Object.assign(pageRange(5,5,5),{questions:[{round:5,event_index:0,text:'g0'},{round:5,event_index:1,text:'g1'}]});
+  const f=setup(()=>reply);try{
+    await f.pages.open('a');
+    const liveNode={};
+    const merged=f.pages.navigation([{round:5,eventIndex:0,index:0,text:'g0',node:null},{round:5,index:-1,text:'live',node:liveNode}]);
+    assert.equal(merged.length,2);
+    assert.equal(merged[1].node,liveNode);
+    const ambiguous=f.pages.navigation([{round:5,index:-1,text:'a',node:{}},{round:5,index:-1,text:'b',node:{}}]);
+    assert.equal(ambiguous.length,4);
+  }finally{f.dom.window.close();}
+});
 test('到货零进展时停止接力不再空转',async()=>{
   const f=setupCatchUp(()=>page());try{ // before 查询也只返回已加载的 61-62
     const scroll=await openWithGap(f);

@@ -108,6 +108,11 @@ def test_poll_validation_and_legacy_tail(job):
     assert result['output'] == 'tail\n'
     assert command_jobs.action(identifier, 'poll', 's')['output_tail'] == 'tail\n'
     assert bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', 'wait_seconds': 0})['output'] == ''
-    for extra in ({'cursor': '', 'tail_lines': 5}, {'tail_lines': 5, 'wait_seconds': 1}, {'cursor': '', 'wait_seconds': 31}):
+    # cursor 与 tail_lines 仍互斥；wait_seconds 超上限仍拒绝
+    for extra in ({'cursor': '', 'tail_lines': 5}, {'cursor': '', 'wait_seconds': 31}):
         result = bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', **extra})
         assert result['success'] is False
+    # P0-3 放宽：tail_lines + wait_seconds 共存合法（边等边看尾部，不推进读取位置）
+    relaxed = bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', 'tail_lines': 5, 'wait_seconds': 1})
+    assert relaxed.get('success') is not False
+    assert relaxed['output_tail'] == 'tail\n'

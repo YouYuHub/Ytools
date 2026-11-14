@@ -26,10 +26,11 @@ def run(spec_path):
         signal.signal(signal.SIGTERM, lambda *_: cancelled.set())
     outcome = {'timed_out': False, 'cancelled': False, 'exit_code': None}
     try:
-        if cancel_path.exists() or process_identity(spec['owner_pid']) != spec['owner_identity']:
+        persistent = bool(spec.get('persistent'))
+        if cancel_path.exists() or (not persistent and process_identity(spec['owner_pid']) != spec['owner_identity']):
             outcome.update(cancelled=True, exit_code=-1)
             return -1
-        if time.monotonic() >= spec['monotonic_deadline']:
+        if not persistent and time.monotonic() >= spec['monotonic_deadline']:
             outcome.update(timed_out=True, exit_code=-1)
             return -1
         process = Terminal(spec['argv'], spec['cwd']) if spec.get('tty') else Pipe(
@@ -40,8 +41,8 @@ def run(spec_path):
                 args=(spec_path, process.write, process.close_input, lambda: process.poll() is None), daemon=True)
             writer.start()
         while process.poll() is None:
-            timed_out = time.monotonic() >= spec['monotonic_deadline']
-            owner_gone = process_identity(spec['owner_pid']) != spec['owner_identity']
+            timed_out = not persistent and time.monotonic() >= spec['monotonic_deadline']
+            owner_gone = not persistent and process_identity(spec['owner_pid']) != spec['owner_identity']
             if timed_out or owner_gone or cancel_path.exists() or cancelled.is_set():
                 outcome.update(timed_out=timed_out, cancelled=not timed_out, exit_code=-1, terminating=True,
                                command_pid=process.pid)
@@ -77,6 +78,7 @@ def run(spec_path):
             from util.atomic_json import RETRY_DELAYS
             writer.join(sum(RETRY_DELAYS) + 1.0)
         from util.file_lock import cross_process_lock
+        outcome.setdefault('finished_at', time.time())
         with cross_process_lock(spec_path.with_suffix('.input.lock'), timeout=3):
             command_jobs.write_metadata(outcome_path, outcome)
         command_input.finish_pending(spec_path)

@@ -17,7 +17,8 @@ RUN_COMMAND_NAME = "run_command"
 POLL_COMMAND_NAME = "poll_command"
 STOP_COMMAND_NAME = "stop_command"
 WRITE_STDIN_NAME = "write_stdin"
-COMMAND_TOOL_NAMES = frozenset({RUN_COMMAND_NAME, POLL_COMMAND_NAME, STOP_COMMAND_NAME, WRITE_STDIN_NAME})
+LIST_JOBS_NAME = "list_jobs"
+COMMAND_TOOL_NAMES = frozenset({RUN_COMMAND_NAME, POLL_COMMAND_NAME, STOP_COMMAND_NAME, WRITE_STDIN_NAME, LIST_JOBS_NAME})
 BUILTIN_TOOL_SERVER_KEY = "__builtin__"
 
 
@@ -426,7 +427,14 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                             'interactive': {'type': 'boolean', 'default': False,
                                                             'description': '保持 UTF-8 stdin 可写；用 write_stdin 继续输入。与 background 互斥，任务结束时停止。'},
                                             'tty': {'type': 'boolean', 'default': False,
-                                                    'description': '启用伪终端（120×30），自动启用 interactive。用于 REPL/需 TTY 的程序；输出可能含 ANSI 控制码。'}},
+                                                    'description': '启用伪终端（120×30），自动启用 interactive。用于 REPL/需 TTY 的程序；输出可能含 ANSI 控制码。'},
+                                             'session_id': {'type': 'string', 'default': '', 'maxLength': 64,
+                                                            'description': '可选常驻 shell 会话名：同名复用同一 shell，保住 cwd/环境变量/REPL 状态；'
+                                                                           '不传=每次新建（现有行为）。用 stop_command(job_id) 关闭。'},
+                                             'env': {'type': 'object', 'additionalProperties': {'type': 'string'},
+                                                     'description': '临时环境变量 {名: 值}，仅本次调用生效，不污染宿主。'},
+                                             'raw': {'type': 'boolean', 'default': False,
+                                                     'description': 'true 保留 tty 原始 ANSI 控制码；默认剥离。'}},
                              'required': ['command'],
                              'additionalProperties': False}}}
 
@@ -443,13 +451,16 @@ POLL_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                             'tail_lines': {'type': 'integer',
                                                            'minimum': 1,
                                                            'maximum': 200,
-                                                           'description': '可选尾部预览：最近 1-200 行，不推进读取位置；与 cursor/wait_seconds/encoding 互斥。'},
+                                                           'description': '可选尾部预览：最近 1-200 行，不推进读取位置；与 cursor 互斥，'
+                                                                           '可配 wait_seconds（边等边看尾部）与 encoding。'},
                                             'cursor': {'type': 'string', 'maxLength': 512,
                                                        'description': '通常省略。空字符串从头重读；传 next_cursor 从指定位置读，之后自动续读。'},
                                             'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 30, 'default': 1,
                                                              'description': '无新增输出时最多等待秒数，默认 1；0 立即查询。'},
                                             'encoding': {'type': 'string', 'maxLength': 64,
-                                                         'description': '默认自动识别；乱码时指定如 gbk，后续沿用；空字符串恢复自动识别。'}},
+                                                         'description': '默认自动识别；乱码时指定如 gbk，后续沿用；空字符串恢复自动识别。'},
+                                            'raw': {'type': 'boolean', 'default': False,
+                                                    'description': 'true 保留 tty 原始 ANSI 控制码；默认剥离。'}},
                              'required': ['job_id'],
                              'additionalProperties': False}}}
 
@@ -461,8 +472,20 @@ STOP_COMMAND_TOOL_DEFINITION = {'type': 'function',
                              'properties': {'job_id': {'type': 'string',
                                                        'description': 'run_command 返回的 job_id',
                                                        'maxLength': 256,
-                                                       'pattern': '^bg_[A-Za-z0-9_]+$'}},
+                                                       'pattern': '^bg_[A-Za-z0-9_]+$'},
+                                             'graceful': {'type': 'boolean', 'default': False,
+                                                          'description': 'true 先软中断（Ctrl+C/SIGINT），2s 内未退出再杀树；默认直接杀树。'}},
                              'required': ['job_id'],
+                             'additionalProperties': False}}}
+
+
+LIST_JOBS_TOOL_DEFINITION = {'type': 'function',
+ 'function': {'name': LIST_JOBS_NAME,
+              'description': '列出当前会话的后台/交互命令任务（job_id、状态、耗时、目录），一眼看全部在跑的任务。',
+              'parameters': {'type': 'object',
+                             'properties': {'active_only': {'type': 'boolean', 'default': False,
+                                                            'description': 'true 仅列出仍在运行的任务。'}},
+                             'required': [],
                              'additionalProperties': False}}}
 
 
@@ -474,6 +497,10 @@ WRITE_STDIN_TOOL_DEFINITION = {'type': 'function', 'function': {
                    'description': 'run_command 返回的 job_id；发送输入须已启用 interactive'},
         'chars': {'type': 'string', 'default': '', 'maxLength': 16384,
                   'description': '原样发送；提交一行加换行。最多 16384 字符/64KiB。'},
+        'key': {'type': 'string', 'default': '', 'maxLength': 32,
+                'description': '控制键（与 chars 可叠加）：enter/tab/esc/backspace/ctrl+c/ctrl+d/ctrl+z/'
+                               'up/down/left/right/home/end/pageup/pagedown/delete。tty 下方向键有效；'
+                               '管道下 ctrl+c 对读 stdin 的程序有效，原生控制台程序需 tty=true。'},
         'eof': {'type': 'boolean', 'default': False,
                 'description': '发送完 chars 后关闭管道 stdin；PTY 不支持此选项。'},
         'cursor': {'type': 'string', 'maxLength': 512,

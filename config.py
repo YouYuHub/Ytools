@@ -33,6 +33,7 @@ DEFAULT_MAX_OVERSIZED_REJECTIONS = 3        # 连续超长拒绝达到该次数�
 DEFAULT_REASONING_RETURN_MAX_LENGTH = -1    # 思考过程最大回传长度；0 不回传真实内容（最新工具调用可能发送 "..." 占位），负数全量，正数保留末尾 N 字符
 DEFAULT_TOOL_RESULT_RETURN_MAX_LENGTH = -1  # 历史轮次单个工具结果的最大回传长度；0 表示不回传，负数表示全部回传，正数表示截断到前 N 字符
 DEFAULT_MCP_TOOL_CALL_TIMEOUT_SECONDS = 300  # MCP 工具单次执行超时秒数（含连接/初始化/调用全过程）；0 或负数表示不限制
+MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS = 5.0  # MCP 超时宽限：实际强制等待 = 配置值 + 该宽限。服务冷启动会吃掉部分预算，且工具自身的内部超时常与配置值相同——没有宽限，工具刚好在边界完成时会被客户端抢先掐断、输出丢失；有宽限则工具先超时返回、输出正常落袋
 DEFAULT_TOOL_CALL_STREAM_TIMEOUT_SECONDS = 300  # 工具调用流式阶段（模型 SSE 输出 tool_calls 期间）无输出超时秒数；超时按工具调用失败反馈模型并继续任务；0 或负数表示不限制
 DEFAULT_NETWORK_RETRY_MAX_ATTEMPTS = 3       # 模型请求连续失败重试达到该次数时终止任务；0 或负数表示不限制（一直重试）
 DEFAULT_COMPACTION_RETRY_MAX_ATTEMPTS = 2    # 压缩调用重试：一次尝试=一条完整"压缩模型->聊天模型"降级链；达到该次数终止任务；0 或负数表示不限制
@@ -163,8 +164,9 @@ class ChatModelSelection(BaseModel):
     )
     headers: Optional[list[dict[str, Any]]] = Field(
         None,
-        description="该角色的自定义请求头列表 [{name, value}]；None 表示保持现有配置，"
-                    "[] 表示清空。随模型选择持久化（全局 models.json / 会话 _meta），"
+        description="该角色的自定义请求头列表 [{name, value, enabled}]；None 表示保持现有配置，"
+                    "[] 表示清空。enabled=false 的行保留但不发送（缺省视为启用）。"
+                    "随模型选择持久化（全局 models.json / 会话 _meta），"
                     "请求上游时由 ChatLLM 注入原始 HTTP 头",
     )
     session_id: Optional[str] = Field(

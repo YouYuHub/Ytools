@@ -28,6 +28,8 @@ def _client(config, request, *, asynchronous=False):
     parts = urlsplit(endpoint(config["url"]))
     headers = {"Authorization": "Bearer " + str(config.get("apiKey") or "not-needed")}
     for item in config.get("_custom_headers") or []:
+        if isinstance(item, dict) and not item.get("enabled", True):
+            continue
         name, value = str(item.get("name") or "").strip(), str(item.get("value") or "")
         if re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) and not any(c in name + value for c in "\r\n"):
             if name.casefold() not in {"host", "content-length", "connection", "transfer-encoding"}:

@@ -53,6 +53,7 @@ from .builtin_tool_catalog import (
     POLL_COMMAND_NAME,
     STOP_COMMAND_NAME,
     WRITE_STDIN_NAME,
+    LIST_JOBS_NAME,
     COMMAND_TOOL_NAMES,
     BUILTIN_TOOL_SERVER_KEY,
     SELECTABLE_BUILTIN_TOOL_NAMES,
@@ -70,6 +71,7 @@ from .builtin_tool_catalog import (
     POLL_COMMAND_TOOL_DEFINITION,
     STOP_COMMAND_TOOL_DEFINITION,
     WRITE_STDIN_TOOL_DEFINITION,
+    LIST_JOBS_TOOL_DEFINITION,
 )
 
 
@@ -131,7 +133,8 @@ def inject_builtin_tools(
         servers[RUN_COMMAND_NAME] = BUILTIN_TOOL_SERVER_KEY
         for definition, name in ((POLL_COMMAND_TOOL_DEFINITION, POLL_COMMAND_NAME),
                                  (STOP_COMMAND_TOOL_DEFINITION, STOP_COMMAND_NAME),
-                                 (WRITE_STDIN_TOOL_DEFINITION, WRITE_STDIN_NAME)):
+                                 (WRITE_STDIN_TOOL_DEFINITION, WRITE_STDIN_NAME),
+                                 (LIST_JOBS_TOOL_DEFINITION, LIST_JOBS_NAME)):
             if name not in servers:
                 tools.append(definition)
                 servers[name] = BUILTIN_TOOL_SERVER_KEY
@@ -2844,6 +2847,20 @@ def _builtin_windows_env() -> dict:
     return builtin
 
 
+import contextvars as _contextvars
+_ENV_OVERRIDE = _contextvars.ContextVar("ytools_cmd_env_override", default=None)
+
+
+def _apply_env_override(env):
+    """把本次调用的临时 env 叠加到子进程环境副本（不污染缓存/宿主）。"""
+    override = _ENV_OVERRIDE.get()
+    if not override:
+        return env
+    base = dict(env if env is not None else os.environ)
+    base.update(override)
+    return base
+
+
 def _merged_child_env():
     """构建子进程环境变量（Windows 返回 dict，POSIX 返回 None 表示默认继承）。
 
@@ -2857,9 +2874,9 @@ def _merged_child_env():
     """
     global _child_env_cache
     if os.name != "nt":
-        return None
+        return _apply_env_override(None)
     if _child_env_cache is not None:
-        return _child_env_cache
+        return _apply_env_override(_child_env_cache)
 
     def _expand(text, mapping):
         # 展开 %VAR% 引用（REG_EXPAND_SZ 类型），支持有限次嵌套
@@ -2969,7 +2986,7 @@ def _merged_child_env():
             deduped.append(part)
     merged["PATH"] = ";".join(deduped)
     _child_env_cache = merged
-    return merged
+    return _apply_env_override(merged)
 
 
 def _truncate_text(text: str, limit: int, note: str = "内容过长已截断") -> str:
@@ -4335,10 +4352,10 @@ def _command_output_tail(output_path: Path, tail_lines: int, max_chars: int) -> 
 
 def _command_job_action(action: str, job_id: str, session_id: str = "", *,
                         tail_lines: int = 30, max_chars: int = 12000,
-                        cursor=None, wait_seconds=0, encoding='') -> dict[str, Any]:
+                        cursor=None, wait_seconds=0, encoding='', graceful=False) -> dict[str, Any]:
     from factory.agent_runtime.command_jobs import action as job_action
     result = job_action(job_id, action, session_id, tail_lines=tail_lines, max_chars=max_chars,
-                        cursor=cursor, wait_seconds=wait_seconds, encoding=encoding)
+                        cursor=cursor, wait_seconds=wait_seconds, encoding=encoding, graceful=graceful)
     # UI needs command/session metadata; repeated model polls only need status and output.
     for key in ("command", "shell", "cwd", "session_id", "created_at", "can_stop"):
         result.pop(key, None)
@@ -4537,11 +4554,16 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
 
 
 def execute_write_stdin(args):
-    from .command_input import send, MAX_INPUT_BYTES
-    allowed = {'job_id', 'chars', 'eof', 'cursor', 'wait_seconds', 'request_id'}
+    from .command_input import send, MAX_INPUT_BYTES, key_to_chars
+    allowed = {'job_id', 'chars', 'key', 'eof', 'cursor', 'wait_seconds', 'request_id'}
     if any(key not in allowed and not key.startswith('_') for key in args):
-        raise ValueError('write_stdin 只接受 job_id、chars、eof、cursor、wait_seconds、request_id')
+        raise ValueError('write_stdin 只接受 job_id、chars、key、eof、cursor、wait_seconds、request_id')
     chars = string_arg(args, 'chars', max_length=16384)
+    key = string_arg(args, 'key', max_length=32)
+    if key:
+        from . import command_jobs
+        _, meta = command_jobs.read_job(str(args.get('job_id') or '').strip(), str(args.get('_session_id') or ''))
+        chars = chars + key_to_chars(key, bool(meta.get('tty')))
     if len(chars.encode('utf-8')) > MAX_INPUT_BYTES:
         raise ValueError('chars 超出 64KiB')
     request_id = string_arg(args, 'request_id', max_length=128)
@@ -4584,11 +4606,18 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         if cursor is not None and 'tail_lines' in args:
             raise ValueError('cursor 与 tail_lines 不能同时指定')
         automatic = bool(args.get('_command_auto_defaults')) and 'tail_lines' not in args
-        if cursor is None and not automatic and any(key in args for key in ('wait_seconds', 'encoding')):
-            raise ValueError('wait_seconds/encoding 仅用于 cursor 模式')
+        # tail 模式也允许 wait_seconds/encoding（边等边看尾部，不推进读取位置）。
+        if cursor is None and not automatic and 'tail_lines' not in args and any(key in args for key in ('wait_seconds', 'encoding')):
+            raise ValueError('wait_seconds/encoding 需配合 cursor 或 tail_lines 使用')
         wait_seconds = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=30)
         if action == "stop" and "tail_lines" in args:
             raise ValueError("stop 不接受 tail_lines；请在 poll_command 中使用")
+        if action == 'poll' and 'graceful' in args:
+            raise ValueError('graceful 仅用于 stop_command')
+        graceful = _optional_bool(args, 'graceful')
+        if _optional_bool(args, 'raw'):
+            from .command_jobs import RAW_OUTPUT
+            RAW_OUTPUT.set(True)
         if not isinstance(tail_lines, int) or isinstance(tail_lines, bool) or not 1 <= tail_lines <= 200:
             raise ValueError("tail_lines 必须是 1-200 之间的整数")
         if automatic and action == 'poll':
@@ -4600,7 +4629,8 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         return _command_job_action(action, str(args.get("job_id") or "").strip(),
                                    str(args.get("_session_id") or ""), tail_lines=tail_lines,
                                    max_chars=max(512, min(12000, int(args.get("_max_chars") or 12000))),
-                                   cursor=cursor, wait_seconds=wait_seconds, encoding=string_arg(args, 'encoding'))
+                                   cursor=cursor, wait_seconds=wait_seconds, encoding=string_arg(args, 'encoding'),
+                                   graceful=graceful)
     if action != "run":
         raise ValueError("action 仅支持 run、poll、stop")
     if "job_id" in args:
@@ -4609,8 +4639,36 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         raise ValueError("run 不接受 tail_lines；请在 poll_command 中使用")
     if any(key in args for key in ('cursor', 'wait_seconds', 'encoding')):
         raise ValueError('输出读取参数请在 poll_command 中使用')
-    if any(key in args for key in ('chars', 'eof', 'request_id')):
+    if any(key in args for key in ('chars', 'eof', 'request_id', 'key')):
         raise ValueError('输入参数请在 write_stdin 中使用')
+    env_override = args.get('env')
+    if env_override is not None:
+        if not isinstance(env_override, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env_override.items()):
+            raise ValueError('env 必须是 {字符串: 字符串} 映射')
+        _ENV_OVERRIDE.set(env_override)
+    if _optional_bool(args, 'raw'):
+        from .command_jobs import RAW_OUTPUT
+        RAW_OUTPUT.set(True)
+    shell_session = string_arg(args, 'session_id', max_length=64).strip()
+    if shell_session:
+        if _optional_bool(args, 'background'):
+            raise ValueError('session_id 与 background=true 不能同时指定')
+        from . import command_sessions
+        wait_ms = int_arg(args, 'yield_time_ms', 1000, maximum=30000) if 'yield_time_ms' in args else 1000
+        sess = command_sessions.run(
+            str(args.get('_session_id') or ''), shell_session, args.get('command'),
+            args.get('shell') or args.get('_default_shell') or 'auto', args.get('work_dir', ''),
+            str(args.get('_command_owner_agent') or 'main'), wait_ms,
+            max(512, min(_RUN_COMMAND_MAX_CHARS, int(args.get('_max_chars') or _RUN_COMMAND_MAX_CHARS))))
+        header = (f"[run_command] shell_session={shell_session} | shell={sess['shell']} | cwd={sess['cwd']}"
+                  f" | exit={sess['exit_code']} | status={sess['status']}")
+        if not bool(args.get('_structured_output')):
+            return header + "\n" + (sess['output'] or '（无输出）')
+        return {"message": header, "status": sess['status'], "exit_code": sess['exit_code'],
+                "shell": sess['shell'], "cwd": sess['cwd'], "job_id": sess['job_id'],
+                "stdout": sess['output'], "stderr": "", "background": False, "pid": None,
+                "timed_out": False, "truncated": False, "output_path": None, "completion_path": None,
+                "shell_session": shell_session}
     yield_time = int_arg(args, 'yield_time_ms', 1000, maximum=30000) if 'yield_time_ms' in args else None
     tty = _optional_bool(args, 'tty')
     interactive = _optional_bool(args, 'interactive') or tty
@@ -4687,6 +4745,12 @@ def try_execute_builtin_command_tool(
         return None
     try:
         args = {**(tool_args if isinstance(tool_args, dict) else {}), '_command_auto_defaults': True}
+        if tool_name == LIST_JOBS_NAME:
+            from . import command_jobs
+            jobs = command_jobs.list_jobs(str(args.get('_session_id') or ''),
+                                          active_only=_optional_bool(args, 'active_only'))
+            return {"jobs": jobs, "count": len(jobs),
+                    "message": f"[list_jobs] 共 {len(jobs)} 个任务"}
         if tool_name == WRITE_STDIN_NAME:
             result = execute_write_stdin(args)
         else:

@@ -595,18 +595,23 @@
     updateProtocolControls();
   }
 
-  // ---------- 自定义请求头编辑器（键值两列，可增减行） ----------
-  // 渲染 effective_headers 回填键值行；收集/删除行都会置 dirty，
-  // 确定时随 parameter 一并提交（headers 全量替换语义）
+  // ---------- 自定义请求头编辑器（启用勾选 + 键值两列，可增减行） ----------
+  // 渲染 effective_headers 回填键值行；收集/删除行/切换启用都会置 dirty，
+  // 确定时随 parameter 一并提交（headers 全量替换语义）。取消勾选的行保留
+  // 但不发送（enabled:false），缺省（老数据无该键）视为启用。
   function renderHeaderRows(headers: any) {
     customHeadersRows.innerHTML = "";
     (Array.isArray(headers) ? headers : []).forEach(function(item: any) {
-      addHeaderRowInputs(item.name || "", item.value || "");
+      addHeaderRowInputs(item.name || "", item.value || "", item.enabled !== false);
     });
   }
 
-  function addHeaderRowInputs(name: any, value: any) {
+  function addHeaderRowInputs(name: any, value: any, enabled?: any) {
     const row = el("div", "enhance-header-row");
+    const enabledInput = el("input", "enhance-header-enabled");
+    enabledInput.type = "checkbox";
+    enabledInput.title = "是否发送该请求头（取消勾选则保留但不发送）";
+    enabledInput.checked = enabled !== false;
     const nameInput = el("input", "enhance-header-name");
     nameInput.type = "text";
     nameInput.placeholder = "头名称（如 x-opencode-session）";
@@ -623,11 +628,20 @@
       row.remove();
       markParamDirty();
     });
+    function syncRowEnabled() {
+      row.classList.toggle("is-disabled", !enabledInput.checked);
+    }
+    enabledInput.addEventListener("change", function () {
+      syncRowEnabled();
+      markParamDirty();
+    });
     nameInput.addEventListener("input", markParamDirty);
     valueInput.addEventListener("input", markParamDirty);
+    row.appendChild(enabledInput);
     row.appendChild(nameInput);
     row.appendChild(valueInput);
     row.appendChild(removeBtn);
+    syncRowEnabled();
     customHeadersRows.appendChild(row);
   }
 
@@ -636,7 +650,12 @@
     customHeadersRows.querySelectorAll(".enhance-header-row").forEach(function(row: any) {
       const name = (row.querySelector(".enhance-header-name") || {}).value || "";
       const value = (row.querySelector(".enhance-header-value") || {}).value || "";
-      if (name.trim()) headers.push({ name: name.trim(), value: value });
+      const enabledBox = row.querySelector(".enhance-header-enabled");
+      if (name.trim()) headers.push({
+        name: name.trim(),
+        value: value,
+        enabled: !enabledBox || Boolean(enabledBox.checked),
+      });
     });
     return headers;
   }

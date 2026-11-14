@@ -3027,8 +3027,52 @@ html[data-theme="dark"] {
   padding: 10px;
   overflow: hidden;
 
+  // 全屏头栏自动隐藏（svg/mermaid/chart/canvas 共用壳，一处生效）：
+  // 头栏悬浮覆盖不占布局，内容独占全高；默认隐藏，JS 按鼠标/触摸/焦点
+  // 切 .is-bar-visible 显示（见 messages_widgets 全屏头栏控制器）。
+  // 隐藏态不用 display:none（无法 hover），用 opacity+visibility+位移；
+  // visibility 延迟翻转以保留淡出动画，显示时立即翻转。
   .md-svg-head {
-    flex: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 5;
+    transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s linear 0.18s;
+  }
+
+  &:not(.is-bar-visible) .md-svg-head {
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-100%);
+    pointer-events: none;
+  }
+
+  &.is-bar-visible .md-svg-head {
+    transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s;
+  }
+
+  // 顶部热区条：透明但可命中，mouseenter 显示头栏。canvas 内容在跨源
+  // iframe 内、鼠标在其上时父文档收不到 mousemove，热区条（父文档元素，
+  // z-index 高于内容）保证任何控件都能稳定触发显示。平时头栏盖住它，
+  // 互不干扰；14px 薄条对内容点击的影响可忽略。
+  &::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 14px;
+    z-index: 4;
+  }
+
+  // 全屏内取消嵌入态的高度上限（.is-zoomed 的 85vh、代码视图的 420px）：
+  // 全屏视图自己就是滚动容器，留着上限会导致滚动条悬在半空、底部留白。
+  // is-zoomed 这条特异性与原规则打平（0,3,0），必须带上 :fullscreen
+  // 提到 0,4,0 才稳赢，不能只靠源序。
+  &.is-zoomed .md-svg-view,
+  .md-svg-code {
+    max-height: none;
   }
 
   .md-svg-view,
@@ -3056,7 +3100,8 @@ html[data-theme="dark"] {
   // 导致全屏放大无效；禁止收缩后按内联尺寸溢出，由容器滚动查看。
   .md-svg-view svg,
   .md-svg-view img.md-animated-svg {
-    max-height: calc(100vh - 96px);
+    // 头栏已悬浮覆盖不占布局：只扣上下 padding（各 10px），不再预留头栏高度
+    max-height: calc(100vh - 20px);
     flex: none;
   }
 

@@ -484,7 +484,8 @@
   // SVG/Mermaid 全屏尺寸同步：图片视图的 svg 带流式渲染注入的内联样式
   // （width:min(100%,170vh*宽高比)，内联优先级高于 CSS 且每图比例不同），
   // 全屏"整图限高完整可见"的宽度必须按各图比例在 JS 里算：
-  // 进入全屏 → 改写内联 width = min(块宽, (视口高-96px)*比例)；退出 → 还原。
+  // 进入全屏 → 改写内联 width = min(块宽, (视口高-20px)*比例)；退出 → 还原。
+  // 20px 只扣块上下 padding：头栏已悬浮覆盖不占布局，不再预留其高度。
   // 显示缩放（--md-zoom）生效时基准宽/高上限同乘倍率（放大后容器滚动查看）。
   function syncSvgFullscreenLayout() {
     const fsEl = document.fullscreenElement;
@@ -497,7 +498,7 @@
         }
         const m = /aspect-ratio:\s*([\d.]+)/.exec(svg.getAttribute("style") || "");
         const ar = m ? parseFloat(m[1]) : 0;
-        const maxH = Math.max(240, window.innerHeight - 96);
+        const maxH = Math.max(240, window.innerHeight - 20);
         const zoom = App.zoomScaleOf(block);
         const w = (ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth) * zoom;
         svg.style.width = Math.floor(w) + "px";

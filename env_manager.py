@@ -482,32 +482,41 @@ def _normalize_parameter_buckets(parameter: Any) -> dict[str, dict[str, Any]]:
     return buckets
 
 
-def _normalize_custom_headers(raw: Any) -> list[dict[str, str]]:
+def _normalize_custom_headers(raw: Any) -> list[dict[str, Any]]:
     """把自定义请求头归一化为 [{"name": ..., "value": ...}] 列表。
 
     - 接受 [{"name": "x-foo", "value": "bar"}]（前端编辑器形态）或
       {"x-foo": "bar"}（手工编辑 models.json 的便捷形态）；
     - name 非法（空/含冒号/含空白/为标准 HTTP 传输头）的条目丢弃；
     - value 转 str（None 视为空串）；同名条目保留最后一次出现的值；
+    - enabled 缺省视为启用，仅显式禁用（enabled 键存在且为 falsy）时保留
+      "enabled": False（稀疏存储：老数据/旧前端无该键，零迁移）；
     - 返回新列表，调用方修改不影响全局状态。
     """
     if not isinstance(raw, (list, dict)):
         return []
-    pairs: list[tuple[str, Any]] = []
+    pairs: list[tuple[str, Any, bool]] = []
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
-            pairs.append((name, item.get("value")))
+            disabled = ("enabled" in item) and (not item["enabled"])
+            pairs.append((name, item.get("value"), disabled))
     else:
-        pairs = [(str(key), value) for key, value in raw.items()]
-    merged: dict[str, str] = {}
-    for name, value in pairs:
+        pairs = [(str(key), value, False) for key, value in raw.items()]
+    merged: dict[str, tuple[str, bool]] = {}
+    for name, value, disabled in pairs:
         if not name or re.search(r"[\s:]", name):
             continue
-        merged[name] = "" if value is None else str(value)
-    return [{"name": name, "value": value} for name, value in merged.items()]
+        merged[name] = ("" if value is None else str(value), disabled)
+    result = []
+    for name, (value, disabled) in merged.items():
+        item: dict[str, Any] = {"name": name, "value": value}
+        if disabled:
+            item["enabled"] = False
+        result.append(item)
+    return result
 
 
 def _normalize_model_selection(raw: Any) -> dict[str, dict[str, Any]]:
@@ -619,21 +628,16 @@ def get_role_selection(role: str) -> dict[str, Any]:
     })
 
 
-def get_role_headers(role: str) -> list[dict[str, str]]:
+def get_role_headers(role: str) -> list[dict[str, Any]]:
     """返回该角色模型选择的自定义请求头（归一化列表，副本）。
 
     会话级 ambient 覆盖已由 get_model_selection 合并（会话覆盖 → 全局默认）；
-    未配置角色/未选择模型时返回空列表。
+    未配置角色/未选择模型时返回空列表。直接委托 _normalize_custom_headers：
+    曾在此处手写重建 {name, value}，把 enabled 开关弄丢了（回填恒勾选、
+    禁用照发），归一函数是唯一口径。
     """
     selection = get_role_selection(role)
-    headers = selection.get("headers")
-    if not isinstance(headers, list):
-        return []
-    return [
-        {"name": str(item.get("name") or ""), "value": str(item.get("value") or "")}
-        for item in headers
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    ]
+    return _normalize_custom_headers(selection.get("headers"))
 
 
 def inject_custom_headers_into_config(
@@ -654,13 +658,11 @@ def inject_custom_headers_into_config(
     merged = dict(chat_config) if isinstance(chat_config, dict) else {}
     existing = merged.get("_custom_headers")
     combined = _normalize_custom_headers(existing) + normalized
-    # 同名去重：保留后注入的（调用方值优先）
-    dedup: dict[str, str] = {}
+    # 同名去重：保留后注入的整条（含 enabled 开关，调用方值优先）
+    dedup: dict[str, dict[str, Any]] = {}
     for item in combined:
-        dedup[item["name"]] = item["value"]
-    merged["_custom_headers"] = [
-        {"name": name, "value": value} for name, value in dedup.items()
-    ]
+        dedup[item["name"]] = item
+    merged["_custom_headers"] = list(dedup.values())
     return merged
 
 

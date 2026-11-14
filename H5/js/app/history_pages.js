@@ -278,11 +278,28 @@
             return entries;
         const original = entries.slice(), used = new Set();
         const byEvent = new Map(original.map(item => [item.round + ":" + item.eventIndex, item]));
+        // 后端问题表在轮次收尾前仍是旧快照：regen 重发时旧第 N 轮仍在表里
+        // （event_index 为数字），而本地条目是新气泡（无 eventIndex），精确键
+        // 对不上会多出一条（3 轮显示 4 条即此因）。回退：同轮次下“表里剩一条、
+        // 本地剩一条”才合并，多引导同轮（任一侧多条）保持原样不误并。
+        const roundLeft = new Map();
+        model.questions.forEach((question) => {
+            if (!byEvent.has(question.round + ":" + question.event_index)) {
+                roundLeft.set(question.round, (roundLeft.get(question.round) || 0) + 1);
+            }
+        });
         const all = model.questions.map((question) => {
             const entry = byEvent.get(question.round + ":" + question.event_index);
             if (entry) {
                 used.add(entry);
                 return entry;
+            }
+            if (roundLeft.get(question.round) === 1) {
+                const sameRound = original.filter(item => !used.has(item) && item.round === question.round);
+                if (sameRound.length === 1) {
+                    used.add(sameRound[0]);
+                    return sameRound[0];
+                }
             }
             return { index: -1, round: question.round, eventIndex: question.event_index, text: question.text, node: null };
         });

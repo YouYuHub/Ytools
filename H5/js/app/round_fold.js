@@ -210,18 +210,116 @@
             }
         }
     }
-    function foldGapMs(fold, start, end) {
-        var gaps = (fold.container && fold.container._foldPauseGaps) || [];
-        var total = 0;
-        for (var i = 0; i < gaps.length; i++) {
-            var p = gaps[i].pauseAt, r = gaps[i].resumeAt;
-            if (!(r > p))
+    // 轮次权威运行区间（历史落盘的 started_at/ended_at，随节点 dataset 带来）：
+    // 续跑轮是内部 nudge、没有用户气泡，其历史节点会被并入上一轮折叠，折叠跨度
+    // 于是横跨整段「暂停→继续」的空闲。用相邻运行区间之间的空档把这段扣掉，
+    // 刷新/切会话后依然成立（内存态 _foldPauseGaps 只在同一页面生命周期内有效）。
+    function roundWindowSpans(fold) {
+        var seen = Object.create(null);
+        var spans = [];
+        function feed(node) {
+            if (!node || !node.dataset)
+                return;
+            var s = Number(node.dataset.roundWindowStart), e = Number(node.dataset.roundWindowEnd);
+            if (!(s > 0) || !(e >= s))
+                return;
+            var key = s + ":" + e;
+            if (seen[key])
+                return;
+            seen[key] = true;
+            spans.push({ start: s, end: e });
+        }
+        fold.members.forEach(feed);
+        feed(fold.tail);
+        (fold.liveTail || []).forEach(feed);
+        // 直播段自身也是一个运行区间（起点=本轮/续跑起点，终点=现在）：
+        // 刷新后续跑时，历史暂停段与当前直播段之间的空档同样要扣除。
+        if (isLiveFold(fold)) {
+            var at = fold.container && fold.container._foldRoundStartedAt;
+            if (typeof at === "number" && at > 0 && at <= Date.now()) {
+                spans.push({ start: at, end: Date.now() });
+            }
+        }
+        return spans;
+    }
+    // 运行区间之外的空档（区间先合并，避免重叠/包含关系被重复计入）
+    function roundWindowGaps(fold) {
+        var spans = roundWindowSpans(fold);
+        if (spans.length < 2)
+            return [];
+        spans.sort(function (a, b) { return a.start - b.start; });
+        var gaps = [];
+        var curEnd = spans[0].end;
+        for (var i = 1; i < spans.length; i++) {
+            if (spans[i].start > curEnd)
+                gaps.push({ pauseAt: curEnd, resumeAt: spans[i].start });
+            if (spans[i].end > curEnd)
+                curEnd = spans[i].end;
+        }
+        return gaps;
+    }
+    // 间隙并集求和：内存态暂停间隙 + 历史轮次空档可能描述同一段空闲，
+    // 先合并重叠区间再算与 [start, end] 的交集，杜绝重复扣除。
+    function sumGaps(gaps, start, end) {
+        var closed = gaps.filter(function (g) { return g.resumeAt > g.pauseAt; });
+        if (!closed.length)
+            return 0;
+        closed.sort(function (a, b) { return a.pauseAt - b.pauseAt; });
+        var total = 0, curStart = closed[0].pauseAt, curEnd = closed[0].resumeAt;
+        for (var i = 1; i < closed.length; i++) {
+            var g = closed[i];
+            if (g.pauseAt <= curEnd) {
+                if (g.resumeAt > curEnd)
+                    curEnd = g.resumeAt;
                 continue;
-            var overlap = Math.min(r, end) - Math.max(p, start);
+            }
+            var overlap = Math.min(curEnd, end) - Math.max(curStart, start);
             if (overlap > 0)
                 total += overlap;
+            curStart = g.pauseAt;
+            curEnd = g.resumeAt;
         }
-        return total;
+        var last = Math.min(curEnd, end) - Math.max(curStart, start);
+        return total + (last > 0 ? last : 0);
+    }
+    function foldGapMs(fold, start, end) {
+        var memory = (fold.container && fold.container._foldPauseGaps) || [];
+        return sumGaps(memory.concat(roundWindowGaps(fold)), start, end);
+    }
+    // 直播计时行用：容器口径的间隙扣除（内存暂停间隙 + 容器内历史轮次空档）。
+    // 续跑复用容器时起点仍是轮首，不扣间隙会把整段暂停空闲算进跳秒。
+    function containerGapMs(container, start, end) {
+        if (!container)
+            return 0;
+        var memory = container._foldPauseGaps || [];
+        var spans = [], seen = Object.create(null);
+        var stamped = container.querySelectorAll("[data-round-window-start]");
+        for (var i = 0; i < stamped.length; i++) {
+            var d = stamped[i].dataset;
+            var s = Number(d.roundWindowStart), e = Number(d.roundWindowEnd);
+            if (!(s > 0) || !(e >= s))
+                continue;
+            var key = s + ":" + e;
+            if (seen[key])
+                continue;
+            seen[key] = true;
+            spans.push({ start: s, end: e });
+        }
+        var at = container._foldRoundStartedAt;
+        if (typeof at === "number" && at > 0 && at <= Date.now())
+            spans.push({ start: at, end: Date.now() });
+        var gaps = [];
+        if (spans.length >= 2) {
+            spans.sort(function (a, b) { return a.start - b.start; });
+            var curEnd = spans[0].end;
+            for (var k = 1; k < spans.length; k++) {
+                if (spans[k].start > curEnd)
+                    gaps.push({ pauseAt: curEnd, resumeAt: spans[k].start });
+                if (spans[k].end > curEnd)
+                    curEnd = spans[k].end;
+            }
+        }
+        return sumGaps(memory.concat(gaps), start, end);
     }
     // 轮次起始时间（成员+尾最早的开始戳）；无时间戳返回 0
     function foldStartTime(fold) {
@@ -739,13 +837,19 @@
             fold.open = false;
         if (fold.header.nextElementSibling !== members[0])
             members[0].parentNode.insertBefore(fold.header, members[0]);
-        // 折叠接管计时：隐藏直播计时行（若有；起播到成折叠前的过渡显示）。
+        // 折叠接管计时：仅直播折叠隐藏自己容器内的计时行（起播到成折叠前的过渡显示）。
+        // 扁平/历史折叠绝不能碰计时行：其 members[0].parentNode 是整个 chatInner，
+        // 按它查找会把正在直播轮的计时行“偷走”（切回/窗口重建的全量同步即触发），
+        // 而单单元直播轮自己永远不成折叠 → 计时永久消失。容器口径与解散恢复一致。
         // 注意是隐藏而非删除：折叠随后可能因成员收缩被解散（单段规则/键迁移
         // 边沿），删除会导致计时两头落空（头没了、行也没了）；隐藏的行在解散
         // 时恢复显示，收尾时仍由管线 stopLiveTimer 彻底移除。
-        var liveTimer = members[0].parentNode.querySelector(".live-round-timer:not(.is-taken-over)");
-        if (liveTimer)
-            liveTimer.classList.add("is-taken-over");
+        var liveMsg = activeLiveContainer();
+        if (liveMsg && fold.container === liveMsg) {
+            var liveTimer = liveMsg.querySelector(".live-round-timer:not(.is-taken-over)");
+            if (liveTimer)
+                liveTimer.classList.add("is-taken-over");
+        }
         applyVisibility(fold);
         renderHeader(fold);
     }
@@ -1058,5 +1162,6 @@
     function revision() { return choiceRevision; }
     App.roundFold = { sync: sync, reveal: reveal, adjustHeights: adjustHeights,
         snapBounds: snapBounds, revision: revision, tick: tick, fmtDuration: fmtDuration,
-        recordPauseGap: recordPauseGap, closePauseGap: closePauseGap };
+        recordPauseGap: recordPauseGap, closePauseGap: closePauseGap,
+        containerGapMs: containerGapMs };
 })(window.App);

@@ -77,7 +77,8 @@ class PersistentBrowserClientTests(unittest.TestCase):
         with patch.object(mcp_client, "_persistent_server_signature", return_value="sig"), \
                 patch.object(mcp_client, "_get_persistent_client", return_value=stalled), \
                 patch.object(mcp_client, "_drop_persistent_client") as drop, \
-                patch.object(mcp_client, "_mcp_call_timeout_seconds", return_value=0.01):
+                patch.object(mcp_client, "_mcp_call_timeout_seconds", return_value=0.01), \
+                patch.object(mcp_client, "MCP_TOOL_CALL_TIMEOUT_GRACE_SECONDS", 0):
             with self.assertRaises(asyncio.TimeoutError):
                 asyncio.run(mcp_client.call_mcp_tool("browser_snapshot", {}, "Browser"))
         drop.assert_called_once_with("Browser", "main", stalled, "isolated")

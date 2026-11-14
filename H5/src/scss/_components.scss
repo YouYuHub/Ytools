@@ -786,16 +786,17 @@ body.tool-settings-open { overflow: hidden; }
 .qnav {
   position: absolute;
   right: 14px;
-  // 撑满视口高度（顶栏下沿 → 视口底边上方留白），不再跟随输入区高度：
-  // 输入框撑高时轨道不会被挤矮。轨道（map 条）与展开列表面板都在其中
-  // 垂直居中；底部多留 24px 呼吸感，与顶栏避让节奏呼应。
+  // 撑满视口高度（顶栏下沿 → 视口底边），不再跟随输入区高度：输入框撑高时
+  // 轨道不会被挤矮。可用区上下对称于视口中线，轨道垂直居中即视口居中；
+  // 底边不留白（此前 24px 会把居中点下推、轨道离顶栏按钮偏远）。
   // 与输入区的避让改由输入区右侧预留实现（见 _layout.scss 的 qnav 避让规则）。
   // 容器仍 pointer-events: none：空旷区不命中，不会误触 hover 面板。
-  top: 72px;
-  bottom: 24px;
+  top: 64px;
+  bottom: 0;
   display: flex;
-  // 面板是 position: absolute 子元素，不再参与 flex；轨道靠此项居中
-  align-items: center;
+  // 轨道顶对齐：紧贴顶栏按钮下方展开（此前垂直居中会把短轨道推到屏幕
+  // 中部、离顶栏按钮一大段空）。面板是 absolute 子元素，同样 top:0 顶对齐。
+  align-items: flex-start;
   z-index: 30;
   // 容器本身不命中：只有轨道/面板响应 hover/click，空旷区完全透过
   pointer-events: none;
@@ -887,12 +888,12 @@ body.tool-settings-open { overflow: hidden; }
     pointer-events: auto;
     // 与轨道左边缘无缝相接，避免鼠标经过间隙时父级失去 hover 状态
     right: 100%;
-    // 与轨道一致：在可用区内垂直居中（此前固定顶部对齐，列表看起来“吊”在上边）。
-    top: 50%;
-    transform: translateY(-50%);
+    // 顶对齐：列表从顶栏按钮正下方展开，靠近触发按钮、便于就近扫读；
+    // 不再垂直居中（居中会把长列表推离按钮、顶部留一大段空）。
+    top: 0;
     width: min(320px, calc(100vw - 56px));
-    // 高度上限：不超过容器可用高度（顶栏下沿到视口底边），再收 480px。
-    // 居中后上下各留一半余量，因此长列表也不会压住顶栏或越出视口。
+    // 高度上限：不超过容器可用高度（顶栏下沿到视口底边），再收 480px，
+    // 顶对齐后向下延伸，长列表内部滚动、不越出视口。
     max-height: min(480px, 100%);
     overflow: hidden auto;
     background: var(--bg-elevated);
@@ -969,8 +970,8 @@ body.tool-settings-open { overflow: hidden; }
     .qnav-panel {
       display: block;
       position: static;
-      // 桌面端用 top:50% + translateY(-50%) 居中；窄屏是文档流静态定位，
-      // 必须清掉 transform，否则面板会整体上移自身高度的一半
+      // 窄屏是文档流静态定位，清掉桌面端的绝对定位偏移（top/transform）
+      top: auto;
       transform: none;
       width: min(320px, calc(100cqw - 24px));
       max-height: min(60dvh, 480px);
@@ -1276,9 +1277,25 @@ body.model-settings-open { overflow: hidden; }
 
     .enhance-header-row {
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 20px;
+      grid-template-columns: 18px minmax(0, 1.2fr) minmax(0, 1fr) 20px;
       gap: 6px;
       align-items: center;
+
+      // 取消勾选的行置灰（保留但不发送）
+      &.is-disabled {
+        opacity: 0.55;
+      }
+
+      .enhance-header-enabled {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        padding: 0;
+        border: none;
+        background: transparent;
+        accent-color: var(--accent, #4caf7d);
+        cursor: pointer;
+      }
 
       input {
         min-width: 0;

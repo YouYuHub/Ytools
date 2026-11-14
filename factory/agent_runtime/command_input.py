@@ -11,6 +11,26 @@ from . import command_jobs
 MAX_INPUT_BYTES = 65536
 MAX_REQUESTS = 1024
 
+# 控制键 → 字节序列。tty(PTY) 下方向键/控制字符由终端解释；管道下控制字节
+# 对读 stdin 的程序（REPL/python input）有效，Windows 原生控制台程序的
+# CTRL_C_EVENT 需 ConPTY（tty=true）才能触发，管道 \x03 不保证。
+_KEY_SEQUENCES = {
+    'tab': '\t', 'esc': '\x1b', 'backspace': '\x7f',
+    'ctrl+c': '\x03', 'ctrl+d': '\x04', 'ctrl+z': '\x1a',
+    'up': '\x1b[A', 'down': '\x1b[B', 'right': '\x1b[C', 'left': '\x1b[D',
+    'home': '\x1b[H', 'end': '\x1b[F', 'pageup': '\x1b[5~', 'pagedown': '\x1b[6~',
+    'delete': '\x1b[3~',
+}
+
+
+def key_to_chars(key, tty=False):
+    name = str(key or '').strip().lower()
+    if name == 'enter':
+        return '\r' if tty else '\n'
+    if name not in _KEY_SEQUENCES:
+        raise ValueError('key 仅支持: ' + ', '.join(['enter', *sorted(_KEY_SEQUENCES)]))
+    return _KEY_SEQUENCES[name]
+
 
 def identity(meta):
     return {key: meta.get(key) for key in
@@ -27,12 +47,13 @@ def _owned(meta, agent):
         raise PermissionError('交互终端身份已变化，请重新调用并确认')
 
 
-def send(job_id, session_id, chars, eof, request_id, cursor, wait_seconds, agent, max_chars=12000, encoding=''):
+def send(job_id, session_id, chars, eof, request_id, cursor, wait_seconds, agent, max_chars=12000, encoding='', require_owned=True):
     from .tool_control import check_tool_control
     _, meta = command_jobs.read_job(job_id, session_id)
     if not meta.get('interactive') or not meta.get('lease_path'):
         raise ValueError('该命令未启用 interactive；请用 run_command(interactive=true) 启动')
-    _owned(meta, agent)
+    if require_owned:
+        _owned(meta, agent)
     # Validate a supplied cursor before sending input: a decoding/contract error
     # must not hide the fact that a command already received a side effect.
     from .command_output import read
@@ -51,7 +72,8 @@ def send(job_id, session_id, chars, eof, request_id, cursor, wait_seconds, agent
         with cross_process_lock(spec.with_suffix('.input.lock'), timeout=3):
             check_tool_control()
             _, latest = command_jobs.read_job(job_id, session_id)
-            _owned(latest, agent)
+            if require_owned:
+                _owned(latest, agent)
             if identity(meta) != identity(latest):
                 raise PermissionError('交互终端身份已变化')
             if ack.exists():
@@ -138,6 +160,26 @@ def serve(spec_path, write, close, alive):
                 command_jobs.write_metadata(ack, value)
                 request.unlink(missing_ok=True)
         time.sleep(0.02)
+
+
+def enqueue_control(spec_path, chars):
+    """graceful stop 专用：向存活监督进程注入控制字节（调用方已验证进程身份）。
+
+    不走 send() 的所有权校验（stop 已校验 can_stop/identity）；监督进程的
+    writer 线程会按序消费。返回是否成功入队。
+    """
+    spec = Path(spec_path)
+    if not spec.exists():
+        return False
+    request_id = uuid.uuid4().hex
+    prefix = spec.with_suffix('.input.' + hashlib.sha256(request_id.encode()).hexdigest())
+    request = Path(str(prefix) + '.json')
+    fingerprint = hashlib.sha256(json.dumps([chars, False], ensure_ascii=False).encode('utf-8')).hexdigest()
+    try:
+        command_jobs.write_metadata(request, {'fingerprint': fingerprint, 'chars': chars, 'eof': False, 'status': 'queued'})
+        return True
+    except OSError:
+        return False
 
 
 def finish_pending(spec_path):

@@ -1164,6 +1164,7 @@ test("直播计时行：不计入成员，折叠接管后隐藏（非删除）",
   const x = setup();
   t.after(x.close);
   const msg = liveMsg(x, 7);
+  x.App.state.activeStream = { messageNode: msg };
   const timer = div(x.document, "live-round-timer", "用时 3s");
   msg.insertBefore(timer, msg.firstChild);
   x.App.roundFold.sync(msg);
@@ -1179,6 +1180,7 @@ test("折叠解散：被接管的计时行恢复显示（计时不两头落空�
   const x = setup();
   t.after(x.close);
   const msg = liveMsg(x, 7);
+  x.App.state.activeStream = { messageNode: msg };
   const timer = div(x.document, "live-round-timer", "用时 3s");
   msg.insertBefore(timer, msg.firstChild);
   x.App.roundFold.sync(msg);
@@ -1214,6 +1216,7 @@ test("压缩条插入尾后致解散：计时行恢复显示（实证回归）",
   ghead._processSummary = group;
   think._processGroup = group; tool1._processGroup = group; tool2._processGroup = group;
   msg.insertBefore(ghead, think);
+  x.App.state.activeStream = { messageNode: msg };
   x.App.roundFold.sync(msg);
   assert.ok(msg.querySelector(".round-fold-summary"), "尾后成员使折叠建成");
   assert.equal(timer.classList.contains("is-taken-over"), true, "计时被接管隐藏");
@@ -1223,6 +1226,54 @@ test("压缩条插入尾后致解散：计时行恢复显示（实证回归）",
   x.App.roundFold.sync(msg);
   assert.equal(msg.querySelector(".round-fold-summary"), null, "折叠已解散");
   assert.equal(timer.classList.contains("is-taken-over"), false, "计时行恢复显示，不两头落空");
+});
+
+test("扁平折叠同步不得偷走直播轮计时行（跨轮接管）", async t => {
+  const x = setup();
+  t.after(x.close);
+  // 历史扁平轮（可成折叠）+ 单单元直播轮（自己不成折叠，计时行应常显）
+  const user1 = div(x.document, "msg-user", "旧问题");
+  const think1 = div(x.document, "think-block", "旧思考");
+  const tool1 = div(x.document, "tool-block", "旧工具");
+  const body1 = div(x.document, "msg-assistant-body", "旧正文");
+  x.chatInner.append(user1, think1, tool1, body1);
+  const live = div(x.document, "msg");
+  const timer = div(x.document, "live-round-timer", "用时 5s");
+  const think2 = div(x.document, "think-block", "思考");
+  const body2 = div(x.document, "msg-assistant-body", "正文");
+  live.append(timer, think2, body2);
+  x.chatInner.appendChild(live);
+  x.App.state.activeStream = { messageNode: live };
+  // 全量同步（切回/窗口重建即此路径）：扁平折叠建成，但直播计时不得被藏
+  x.App.roundFold.sync(x.chatInner);
+  assert.ok(x.chatInner.querySelector(".round-fold-summary"), "扁平折叠建成");
+  assert.equal(timer.classList.contains("is-taken-over"), false, "直播计时行不被扁平折叠偷走");
+  assert.equal(live.querySelector(".round-fold-summary"), null, "单单元直播轮自己不成折叠");
+  // 再来一轮全量同步（流式事件间隙的同步）：仍不得偷
+  x.App.roundFold.sync(x.chatInner);
+  assert.equal(timer.classList.contains("is-taken-over"), false, "重复同步也不偷");
+});
+
+test("切回挂回：单单元直播轮计时行保持可见", async t => {
+  const x = setup();
+  t.after(x.close);
+  const user1 = div(x.document, "msg-user", "旧问题");
+  const think1 = div(x.document, "think-block", "旧思考");
+  const tool1 = div(x.document, "tool-block", "旧工具");
+  const body1 = div(x.document, "msg-assistant-body", "旧正文");
+  const live = div(x.document, "msg");
+  const timer = div(x.document, "live-round-timer", "用时 5s");
+  live.append(timer, div(x.document, "think-block", "思考"), div(x.document, "msg-assistant-body", "正文"));
+  x.chatInner.append(user1, think1, tool1, body1, live);
+  x.App.state.activeStream = { messageNode: live };
+  x.App.roundFold.sync(x.chatInner);
+  // 切走：容器游离；切回：历史重建 + 挂回 + 全量同步
+  x.chatInner.innerHTML = "";
+  x.App.roundFold.sync(x.chatInner);
+  x.chatInner.append(user1, think1, tool1, body1, live);
+  x.App.roundFold.sync(x.chatInner);
+  assert.equal(timer.classList.contains("is-taken-over"), false, "切回后计时行仍可见");
+  assert.equal(timer.parentNode, live, "计时行仍在直播容器内");
 });
 
 test("直播计时行：单小块不成折叠时保留", async t => {

@@ -81,7 +81,11 @@
             console.debug("[live-timer] 无后端轮次起点，回退本地计时（刷新/附接重计请先看这条）");
           }
         }
-        const s = App.roundFold.fmtDuration(Date.now() - start);
+        // 暂停间隙扣除（秒表语义）：续跑复用容器时起点仍是轮首，不扣会把
+        // 整段「暂停→继续」的空闲算进跳秒；历史轮次空档同样计入（刷新后仍准）。
+        const now = Date.now();
+        const gap = App.roundFold.containerGapMs ? App.roundFold.containerGapMs(msg, start, now) : 0;
+        const s = App.roundFold.fmtDuration(now - start - gap);
         text.textContent = s ? "用时 " + s : "用时 0s";
         liveTimerClock = setTimeout(paint, 1000);
       };
