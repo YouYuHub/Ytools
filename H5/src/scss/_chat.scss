@@ -2841,9 +2841,16 @@ html[data-theme="dark"] {
     gap: 2px;
     margin-right: 2px;
 
+    // 缩放钮是 inline-flex（继承 .md-svg-btn）：text-align 对 flex 子项无效，
+    // 必须用 justify-content 水平居中 + align-items 垂直居中；min-width 撑出
+    // 的富余宽度此前被 flex-start 顶到左侧（"-/+/100%" 偏左）。line-height:1
+    // 收紧行盒，消除字体基线导致的上下 1px 偏移，垂直真正居中。
     .md-zoom-btn {
       min-width: 26px;
       padding: 3px 6px;
+      justify-content: center;
+      align-items: center;
+      line-height: 1;
       text-align: center;
     }
 

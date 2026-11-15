@@ -25,3 +25,5 @@
 @use "session_archives";
 @use "task_status";
 @use "account_panel";
+// 主题化下拉：放在最后，保证 .yt-select 伴生尺寸规则覆盖各面板旧规则
+@use "select_menu";

@@ -1,0 +1,38 @@
+// 登录/账号页独立入口：这两页不加载 main.css，缺少工作区变量；
+// 此处把 auth 色板（login.css / account_theme.css）映射到下拉组件变量，
+// 使弹层跟随账号页保存的主题与强调色（--accent 由 data-accent 覆盖）。
+@use "select_menu";
+
+:root {
+  --bg-elevated: var(--panel);
+  --bg-code: var(--field, #101013);
+  --border-strong: var(--line);
+  --focus-ring: var(--accent);
+  --focus-halo: color-mix(in srgb, var(--accent) 18%, transparent);
+  --accent-contrast: #281c25;
+  --bg-hover: color-mix(in srgb, var(--accent) 14%, transparent);
+  --text-secondary: var(--muted);
+  --text-tertiary: var(--muted);
+  --scroll-thumb: var(--line);
+  --scroll-track: transparent;
+  --shadow-menu: 0 10px 32px rgba(0, 0, 0, 0.5);
+  --radius-sm: 10px;
+  --radius-md: 12px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg-code: var(--field, #faf8fb);
+    --shadow-menu: 0 10px 32px rgba(0, 0, 0, 0.16);
+  }
+}
+
+// 与 auth 输入框同规格：整行宽、12px 内边距、10px 圆角
+.auth-card .yt-select,
+.account-shell .yt-select {
+  width: 100%;
+  margin-top: 6px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--bg-code);
+}

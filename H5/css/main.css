@@ -4181,6 +4181,9 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .md-svg-block .md-zoom-group .md-zoom-btn {
   min-width: 26px;
   padding: 3px 6px;
+  justify-content: center;
+  align-items: center;
+  line-height: 1;
   text-align: center;
 }
 .md-svg-block .md-zoom-group .md-zoom-reset {
@@ -12865,5 +12868,286 @@ body.task-template-open {
     height: 100dvh;
     border: 0;
     border-radius: 0;
+  }
+}
+select.yt-select-native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  white-space: nowrap !important;
+}
+
+select option:checked {
+  background: var(--focus-ring, Highlight) linear-gradient(0deg, var(--focus-ring, Highlight), var(--focus-ring, Highlight));
+  color: var(--accent-contrast, HighlightText);
+}
+
+.yt-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--bg-code);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+.yt-select:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--focus-ring) 55%, var(--border-strong));
+}
+.yt-select:focus-visible, .yt-select.is-open {
+  outline: none;
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 2px var(--focus-halo);
+}
+.yt-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.yt-select .yt-select-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.yt-select .yt-select-chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s ease, stroke 0.15s ease;
+}
+.yt-select.is-open .yt-select-chevron {
+  transform: rotate(180deg);
+  stroke: var(--focus-ring);
+}
+
+.yt-select-menu {
+  position: fixed;
+  z-index: 10000;
+  overflow: hidden auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md, 12px);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-menu);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: yt-select-in 0.12s ease;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+}
+.yt-select-menu::-webkit-scrollbar {
+  width: 8px;
+}
+.yt-select-menu::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+  border-radius: 8px;
+}
+.yt-select-menu::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 2px solid var(--scroll-track);
+  border-radius: 6px;
+}
+.yt-select-menu::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--focus-ring) 45%, var(--scroll-thumb));
+}
+
+@keyframes yt-select-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.yt-select-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm, 8px);
+  cursor: pointer;
+  user-select: none;
+}
+.yt-select-option .yt-select-option-check {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  opacity: 0;
+}
+.yt-select-option .yt-select-option-check svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--focus-ring);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.yt-select-option .yt-select-option-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.yt-select-option.is-active {
+  background: var(--bg-hover);
+}
+.yt-select-option.is-selected {
+  background: var(--focus-ring);
+  color: var(--accent-contrast);
+  font-weight: 500;
+}
+.yt-select-option.is-selected .yt-select-option-check {
+  opacity: 1;
+}
+.yt-select-option.is-selected .yt-select-option-check svg {
+  stroke: var(--accent-contrast);
+}
+.yt-select-option[aria-disabled=true] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.yt-select-group {
+  padding: 2px 0;
+}
+
+.yt-select-group-label {
+  padding: 6px 10px 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+}
+
+.enhance-field > .yt-select {
+  min-width: 0;
+  max-width: 200px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.chat-setting-field > .yt-select {
+  flex-shrink: 0;
+  width: 124px;
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+#permissionSettings .yt-select {
+  width: 140px;
+  max-width: 100%;
+  padding: 7px 10px;
+  background: var(--bg-code);
+}
+
+.speech-language-field .yt-select {
+  width: min(100%, 280px);
+  max-width: 100%;
+  flex: 1 1 220px;
+}
+
+.history-search-scope .yt-select {
+  max-width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+
+.task-cost-dialog .yt-select {
+  padding: 8px;
+  font-size: 14px;
+  background: var(--bg);
+}
+
+.task-cost-section > .yt-select {
+  display: flex;
+  margin: 10px 0;
+  width: 100%;
+}
+
+.task-template-dialog .yt-select {
+  width: 100%;
+  padding: 9px 10px;
+  font: inherit;
+}
+
+.template-toolbar > .yt-select {
+  flex: 1 1 100%;
+}
+
+.template-section > .yt-select {
+  margin-bottom: 10px;
+}
+
+.mcp-test-dialog .yt-select {
+  width: 100%;
+  padding: 7px 8px;
+  background: var(--bg);
+}
+
+.fh-round-select.yt-select {
+  max-width: 180px;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--bg-elevated);
+}
+
+@media (max-width: 600px) {
+  .enhance-field > .yt-select {
+    width: 100%;
+    max-width: none;
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .chat-setting-field > .yt-select {
+    width: 104px;
+    min-height: 44px;
+    font-size: 16px;
+  }
+  #permissionSettings .yt-select {
+    width: 120px;
+    font-size: 16px;
+  }
+  .speech-language-field .yt-select {
+    width: 100%;
+    flex-basis: 100%;
+  }
+  .mcp-test-dialog .yt-select, .task-template-dialog .yt-select {
+    font-size: 16px;
+  }
+}
+@media (max-width: 480px) {
+  .chat-setting-field > .yt-select, #permissionSettings .yt-select {
+    width: 100%;
   }
 }

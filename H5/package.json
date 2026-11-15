@@ -4,7 +4,7 @@
   "private": true,
   "description": "类似 ChatGPT 风格对话主页（SCSS + 原生 JS）",
   "scripts": {
-    "build:css": "sass src/scss/main.scss css/main.css --style=expanded --no-source-map",
+    "build:css": "sass src/scss/main.scss css/main.css --style=expanded --no-source-map && sass src/scss/select_menu_auth.scss css/select_menu_auth.css --style=expanded --no-source-map",
     "watch:css": "sass src/scss/main.scss css/main.css --style=expanded --watch --no-source-map",
     "build:js": "tsc -p tsconfig.build.json",
     "watch:js": "tsc -p tsconfig.build.json --watch",
