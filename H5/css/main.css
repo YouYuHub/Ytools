@@ -7146,9 +7146,9 @@ body.tool-settings-open {
   position: absolute;
   right: 14px;
   top: 64px;
-  bottom: 0;
+  bottom: 64px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   z-index: 30;
   pointer-events: none;
 }
@@ -7220,7 +7220,8 @@ body.tool-settings-open {
   position: absolute;
   pointer-events: auto;
   right: 100%;
-  top: 0;
+  top: 50%;
+  transform: translateY(-50%);
   width: min(320px, 100vw - 56px);
   max-height: min(480px, 100%);
   overflow: hidden auto;
