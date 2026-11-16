@@ -18,7 +18,9 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
     bt._BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
     spec_path = bt._BG_LOG_DIR / ('bg_lease_' + uuid.uuid4().hex + '.json')
     script = spec_path.with_suffix('.run.cmd' if shell_kind == 'cmd' else '.run.ps1' if shell_kind in {'powershell', 'pwsh'} else '.run.sh')
-    bt._write_runner_script(script, shell_kind, command, cwd)
+    # 交互式 cmd：write_stdin 按 UTF-8 送字节，runner 首行 chcp 65001 对齐控制台代码页
+    bt._write_runner_script(script, shell_kind, command, cwd,
+                            utf8_console=bool(interactive and shell_kind == 'cmd'))
     argv = ([shell_exe, '/c', str(script)] if shell_kind == 'cmd' else
             [shell_exe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
             if shell_kind in {'powershell', 'pwsh'} else [shell_exe, str(script)])

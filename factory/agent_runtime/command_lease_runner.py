@@ -15,6 +15,14 @@ from factory.agent_runtime import command_input, command_jobs
 
 
 def run(spec_path):
+    # 监督进程自身的 stdout/stderr 默认按系统 ANSI 编码：英文代码页服务器上
+    # 打印中文错误信息会抛 UnicodeEncodeError（吞掉退出码与 outcome 上报）。
+    # 输出仅作日志展示，统一 replace 兜底，绝不因日志编码中断监督流程。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
     spec_path = Path(spec_path)
     spec = json.loads(spec_path.read_text(encoding='utf-8'))
     outcome_path = spec_path.with_suffix('.outcome.json')
@@ -33,6 +41,19 @@ def run(spec_path):
         if not persistent and time.monotonic() >= spec['monotonic_deadline']:
             outcome.update(timed_out=True, exit_code=-1)
             return -1
+        if os.name == 'nt' and spec.get('interactive') and not spec.get('tty'):
+            # Pipe 子进程共享本监督进程的控制台，按控制台代码页解码 stdin 字节，
+            # 而 write_stdin 恒按 UTF-8 送：不对齐会把中文输入读成乱码（常驻
+            # PowerShell 会话无脚本 prelude 可设 InputEncoding，靠这里对齐）。
+            # 仅限交互式：非交互式脚本在中文机器上是 mbcs(GBK) 字节，若提前把
+            # 共享控制台切成 65001 反而会被按 UTF-8 误读（回归）。交互式 cmd 的
+            # runner 已强制 UTF-8+chcp，与此处一致。无控制台时静默失败不影响启动。
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleCP(65001)
+                ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            except Exception:
+                pass
         process = Terminal(spec['argv'], spec['cwd']) if spec.get('tty') else Pipe(
             spec['argv'], spec['cwd'], spec.get('interactive', False))
         child_identity = process_identity(process.pid)

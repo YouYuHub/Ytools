@@ -28,7 +28,8 @@ from threading import Lock
 from typing import Any, Optional
 
 
-from util.text_encoding import decode_text, unicode_bom, powershell_text_prelude
+from util.text_encoding import (decode_text, unicode_bom, powershell_text_prelude,
+                                cmd_script_bytes, wscript_text_bytes)
 from util.tool_arguments import string_arg, int_arg, number_arg
 from util.file_lock import cross_process_lock
 from factory.agent_runtime.tool_control import (
@@ -3227,9 +3228,8 @@ def _pipe_filter_works(tool: str, args: str, exe_path: str = "") -> bool:
         probe_path = None
         try:
             handle, probe_path = tempfile.mkstemp(prefix="rc_probe_", suffix=".cmd")
-            with os.fdopen(handle, "w", encoding="mbcs", errors="replace") as file:
-                file.write("@echo off\r\n")
-                file.write(probe)
+            with os.fdopen(handle, "wb") as file:
+                file.write(cmd_script_bytes("@echo off\r\n" + probe))
             proc = subprocess.run(
                 [os.environ.get("COMSPEC") or "cmd.exe", "/c", "call", probe_path],
                 capture_output=True, timeout=remaining_seconds(2), stdin=subprocess.DEVNULL,
@@ -3945,12 +3945,11 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         'f.Write code\r\n'
         'f.Close\r\n'
     )
-    try:
-        launcher_path.write_bytes(launcher_text.encode("mbcs"))
-        vbs_path.write_bytes(vbs_text.encode("mbcs"))
-    except (OSError, LookupError):
-        launcher_path.write_bytes(launcher_text.encode("utf-8", errors="replace"))
-        vbs_path.write_bytes(vbs_text.encode("utf-8", errors="replace"))
+    # 启动器要注入整份环境块（set "PATH=…"）：非中文代码页服务器上环境值含
+    # 中文时 strict mbcs 必抛 UnicodeEncodeError（旧 except 只捕 OSError/LookupError，
+    # 漏了它 → 所有模式全失败）。cmd_script_bytes 回退 UTF-8+chcp 65001 保中文。
+    launcher_path.write_bytes(cmd_script_bytes(launcher_text))
+    vbs_path.write_bytes(wscript_text_bytes(vbs_text))
     if runner_path is not None:
         _write_runner_script(runner_path, shell_kind, command, work_dir)
     # wscript 为 GUI 子系统：WMI 默认启动它不产生可见窗口；//nologo 抑制横幅
@@ -3979,10 +3978,13 @@ def _powershell_literal_cwd_line(cwd: str) -> str:
     )
 
 
-def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_dir: str = "") -> None:
-    """写执行脚本：cmd→.run.cmd（mbcs）；powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；
-    bash/sh/zsh→.run.sh（UTF-8，stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，
-    让中转链 done 文件记录命令本身的退出码。
+def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_dir: str = "",
+                         utf8_console: bool = False) -> None:
+    """写执行脚本：cmd→.run.cmd（mbcs 优先，非中文代码页回退 UTF-8+chcp 65001）；
+    powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；bash/sh/zsh→.run.sh（UTF-8，
+    stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，让中转链 done 文件记录命令
+    本身的退出码。utf8_console=True（交互式 cmd）强制 UTF-8+chcp：write_stdin
+    按 UTF-8 送字节，控制台代码页必须同口径，否则中文输入被按 ANSI 误读。
 
     换行统一为 LF 再按目标 shell 组装：命令原文若已含 CRLF（如从文件复制而来），
     直接拼接会产生 CR CR LF，cmd 解析层会出现空行/多余回车（实测 runner 文件里
@@ -3993,10 +3995,10 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_
         # cmd 按行解释 .cmd：行尾必须是 CRLF；行内 LF 会被当命令结束（多行内联代码
         # 已在上游改写为临时脚本，此处只做兜底归一化）
         text = "@echo off\r\n" + normalized.replace("\n", "\r\n") + "\r\n"
-        try:
-            runner_path.write_bytes(text.encode("mbcs"))
-        except (OSError, LookupError):
-            runner_path.write_bytes(text.encode("utf-8", errors="replace"))
+        if utf8_console:
+            runner_path.write_bytes(b"@chcp 65001 >nul\r\n" + text.encode("utf-8"))
+        else:
+            runner_path.write_bytes(cmd_script_bytes(text))
         return
     text = normalized + "\n"
     if shell_kind in ("powershell", "pwsh"):

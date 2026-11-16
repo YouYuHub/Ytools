@@ -7,7 +7,7 @@
  * - 行内语法高亮：Prism 高亮层（pre.eh-hl）+ 透明 textarea 叠加（overlay）
  * - 差异块导航：顶栏固定「↑上一块 / ↓下一块」（jumpHunk 按滚动位置锚定相邻块头）
  * - 操作：保存（乐观锁）/ 回退基线 / 回退某轮 / 从磁盘刷新 / 保留封版；
- *   主题下拉与主应用共用 ThemeManager 偏好（跟随系统/浅色/深色）
+ *   主题/强调色下拉与主应用共用 ThemeManager 偏好（跟随系统/浅色/深色；蓝/绿/紫/粉/黄/无）
  * 依赖：api.js / theme.js / Prism；由 filehistory.js 面板点击新窗口打开。
  */
 (function(global: any) {
@@ -43,6 +43,7 @@
     sync: document.getElementById("ehSync"),
     keep: document.getElementById("ehKeep"),
     themeSelect: document.getElementById("ehThemeSelect"),
+    accentSelect: document.getElementById("ehAccentSelect"),
     prevHunk: document.getElementById("ehPrevHunk"),
     nextHunk: document.getElementById("ehNextHunk"),
     close: document.getElementById("ehClose"),
@@ -1307,6 +1308,18 @@
       dom.themeSelect.value = (window as any).ThemeManager.getPreference();
       dom.themeSelect.addEventListener("change", function () {
         (window as any).ThemeManager.setPreference(dom.themeSelect.value);
+      });
+    }
+    // 强调色切换：与主应用共用同一份偏好（ThemeManager / ytools-accent-preference）；
+    // 其它页面同步偏好时 ThemeManager 会派发 accentchange，下拉随之回填
+    const tmAccent = (window as any).ThemeManager;
+    if (dom.accentSelect && tmAccent && typeof tmAccent.getAccentPreference === "function") {
+      dom.accentSelect.value = tmAccent.getAccentPreference();
+      dom.accentSelect.addEventListener("change", function () {
+        tmAccent.setAccentPreference(dom.accentSelect.value);
+      });
+      document.addEventListener("accentchange", function () {
+        dom.accentSelect.value = tmAccent.getAccentPreference();
       });
     }
     dom.confirmOk.addEventListener("click", function () {

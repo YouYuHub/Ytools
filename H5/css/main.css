@@ -10763,6 +10763,7 @@ body.eh-page {
 }
 .eh-title-wrap strong {
   display: block;
+  min-width: 0;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.45;
@@ -10786,12 +10787,42 @@ body.eh-page {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex: none;
+  flex: 1 1 100%;
+  min-width: 0;
   flex-wrap: wrap;
   justify-content: flex-end;
 }
 
+@media (min-width: 769px) {
+  .eh-head {
+    flex-wrap: nowrap;
+  }
+  .eh-title-wrap {
+    flex: 1 1 0;
+    min-width: 240px;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .eh-title-wrap strong {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: normal;
+  }
+  .eh-sub {
+    flex: none;
+    max-width: 46%;
+  }
+  .eh-bar {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+}
 body.eh-page .eh-bar #ehThemeSelect,
+body.eh-page .eh-bar #ehAccentSelect,
 body.eh-page .eh-bar #ehPrevHunk,
 body.eh-page .eh-bar #ehClose {
   margin-left: 10px;
@@ -10814,9 +10845,16 @@ body.eh-page .fh-round-select {
   max-width: 200px;
 }
 
-body.eh-page .eh-theme-select {
+body.eh-page .eh-theme-select,
+body.eh-page .eh-accent-select {
   padding: 3px 8px;
   font-size: 12px;
+}
+
+body.eh-page .fh-btn:focus-visible,
+body.eh-page .fh-round-select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 body.eh-page .eh-hunk-nav {
@@ -10965,21 +11003,21 @@ body.eh-page .eh-hunk-nav {
 }
 
 .eh-input::selection {
-  background: rgba(49, 93, 140, 0.92);
+  background: color-mix(in srgb, var(--accent-swatch, #4a90e2) 55%, #141414);
   color: #fff;
 }
 
 .eh-input::-moz-selection {
-  background: rgba(49, 93, 140, 0.92);
+  background: color-mix(in srgb, var(--accent-swatch, #4a90e2) 55%, #141414);
   color: #fff;
 }
 
 .eh-line.is-selected {
-  background: rgba(49, 93, 140, 0.92);
+  background: color-mix(in srgb, var(--accent-swatch, #4a90e2) 55%, #141414);
 }
 
 .eh-hl .eh-sel {
-  background: rgba(49, 93, 140, 0.92);
+  background: color-mix(in srgb, var(--accent-swatch, #4a90e2) 55%, #141414);
   color: #fff;
   border-radius: 1px;
 }

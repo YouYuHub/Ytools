@@ -7,7 +7,10 @@ from pathlib import Path
 
 
 def _decode(data, *, final, encoding, candidates):
-    names = (encoding,) if encoding else tuple(dict.fromkeys(('utf-8', *candidates)))
+    # 与 decode_text 同口径：单字节西文代码页（cp1252/cp437 等）降权到 CJK 之后，
+    # 否则英文代码页服务器上 GBK 中文输出会被西文页"成功"解码成乱码。
+    from util.text_encoding import order_decode_candidates
+    names = (encoding,) if encoding else tuple(order_decode_candidates(('utf-8', *candidates)))
     for name in names:
         try:
             decoder = codecs.getincrementaldecoder(name)(errors='strict')

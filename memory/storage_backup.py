@@ -134,7 +134,10 @@ def _secure_directory(target):
     import subprocess
     import csv
     import re
-    options = dict(capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    # errors=replace：whoami/icacls 输出可能含非 ASCII 用户名/路径，英文代码页
+    # 服务器上默认 strict 解码会抛 UnicodeDecodeError；SID/ACL 关键部分恒 ASCII。
+    options = dict(capture_output=True, text=True, errors="replace", check=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
     sid = next(csv.reader(subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], **options).stdout.strip().splitlines()))[-1]
     if not re.fullmatch(r"S-1-(?:\d+-)*\d+", sid):
         raise RuntimeError("Cannot determine private directory owner")

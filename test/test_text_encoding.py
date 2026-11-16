@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from util.text_encoding import decode_text, powershell_text_prelude
+from util.text_encoding import (decode_text, powershell_text_prelude,
+                                cmd_script_bytes, wscript_text_bytes, order_decode_candidates)
 from factory import file_factory as ff
 from factory.agent_runtime import builtin_tools as bt
 from mcp_server import web_tools_server as web
@@ -105,3 +106,87 @@ class TextEncodingTests(unittest.TestCase):
             script = runner.read_text(encoding='utf-8-sig')
             self.assertIn(powershell_text_prelude(), script)
             self.assertIn('Write-Output "中文"', script)
+
+
+class NonChineseCodepageTests(unittest.TestCase):
+    """英文代码页服务器（cp1252）视角回归。
+
+    根因两类：① 写启动器/runner 时 Unicode→ANSI 严格编码，环境块/命令含中文
+    即抛 UnicodeEncodeError（所有模式全失败）；② 自动解码时单字节西文页排在
+    CJK 之前，GBK 字节被"成功"解成西文乱码（文档/终端输出静默损坏）。
+    """
+
+    def test_cmd_script_bytes_ansi_first_then_utf8_chcp(self):
+        ascii_text = '@echo off\r\necho hi\r\n'
+        self.assertEqual(cmd_script_bytes(ascii_text, ansi='cp1252'), ascii_text.encode('cp1252'))
+        zh = '@echo off\r\nset "PATH=D:\\软件;C:\\x"\r\necho 中文\r\n'
+        out = cmd_script_bytes(zh, ansi='cp1252')
+        self.assertTrue(out.startswith(b'@chcp 65001 >nul\r\n'))
+        self.assertIn('D:\\软件'.encode('utf-8'), out)
+        self.assertIn('echo 中文'.encode('utf-8'), out)
+        # 中文代码页（gbk）零变化：仍按 ANSI 原样落盘，不加 chcp
+        self.assertEqual(cmd_script_bytes(zh, ansi='gbk'), zh.encode('gbk'))
+
+    def test_wscript_bytes_utf16_bom_fallback(self):
+        vbs = wscript_text_bytes('f.Write "中文"', ansi='cp1252')
+        self.assertTrue(vbs.startswith(codecs.BOM_UTF16_LE))
+        self.assertEqual(vbs[len(codecs.BOM_UTF16_LE):].decode('utf-16-le'), 'f.Write "中文"')
+        self.assertEqual(wscript_text_bytes('f.Write 1', ansi='cp1252'), b'f.Write 1')
+
+    def test_relay_launcher_survives_non_ansi_env(self):
+        # 模拟英文代码页：环境块含中文（PATH=D:\软件\bin），strict mbcs 必失败；
+        # 启动器/runner 应回退 UTF-8+chcp，VBS 回退 UTF-16 BOM，全程不抛错。
+        with tempfile.TemporaryDirectory(prefix='工具目录_') as folder:
+            with patch.object(bt, '_BG_LOG_DIR', Path(folder)), \
+                 patch.object(bt, '_merged_child_env', return_value={'PATH': 'D:\\软件\\bin'}), \
+                 patch.object(bt, 'cmd_script_bytes', lambda text, ansi='mbcs': cmd_script_bytes(text, 'cp1252')), \
+                 patch.object(bt, 'wscript_text_bytes', lambda text, ansi='mbcs': wscript_text_bytes(text, 'cp1252')), \
+                 patch.object(bt, '_wmi_create_process', return_value=4321):
+                info = bt._write_relay_script('echo 你好', folder, 'cmd.exe', 'cmd', None, 'fg')
+            launcher = Path(info['launcher']).read_bytes()
+            self.assertTrue(launcher.startswith(b'@chcp 65001 >nul\r\n'))
+            self.assertIn('D:\\软件\\bin'.encode('utf-8'), launcher)
+            runner = Path(info['runner']).read_bytes()
+            self.assertTrue(runner.startswith(b'@chcp 65001 >nul\r\n'))
+            self.assertIn('echo 你好'.encode('utf-8'), runner)
+            self.assertTrue(Path(info['vbs']).read_bytes().startswith(codecs.BOM_UTF16_LE))
+
+    def test_runner_interactive_cmd_forces_utf8_console(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Path(folder, 'run.cmd')
+            bt._write_runner_script(runner, 'cmd', 'echo 中文', utf8_console=True)
+            data = runner.read_bytes()
+            self.assertTrue(data.startswith(b'@chcp 65001 >nul\r\n'))
+            self.assertIn('echo 中文'.encode('utf-8'), data)
+
+    def test_gbk_not_mojibake_under_western_locale(self):
+        text = '名称,内容\n工具,中文说明\n'
+        raw = text.encode('gbk')
+        with patch('util.text_encoding.locale.getpreferredencoding', return_value='cp1252'):
+            self.assertEqual(decode_text(raw)[0], text)
+            self.assertEqual(ff.decode_text_bytes(raw)[0], text)
+            self.assertEqual(ff._parse_txt(raw), text)
+            self.assertEqual(ff._parse_csv(raw), text)
+            self.assertEqual(bt._decode_command_bytes(raw), text)
+
+    def test_western_text_still_ansi_under_western_locale(self):
+        raw = 'café naïve'.encode('cp1252')
+        with patch('util.text_encoding.locale.getpreferredencoding', return_value='cp1252'):
+            out, used = decode_text(raw)
+        self.assertEqual(out, 'café naïve')
+        self.assertEqual(used, 'cp1252')
+
+    def test_candidate_order_demotes_single_byte_western(self):
+        ordered = order_decode_candidates(('utf-8', 'cp1252', 'gbk', 'cp437', 'gb18030'), ansi='cp1252')
+        self.assertEqual(ordered, ['utf-8', 'gbk', 'gb18030', 'cp1252', 'cp437'])
+        # 中文代码页不降权（双字节 CJK 保持原位）
+        self.assertEqual(order_decode_candidates(('utf-8', 'gbk', 'gb18030'), ansi='gbk'),
+                         ['utf-8', 'gbk', 'gb18030'])
+
+    def test_poll_output_gbk_before_western(self):
+        from factory.agent_runtime import command_output as co
+        raw = '中文输出\n'.encode('gbk')
+        with patch.object(bt, '_command_output_candidates', return_value=('cp1252', 'cp437', 'utf-8', 'gbk')):
+            out, _consumed, used = co._auto_decode(raw, True, None)
+        self.assertEqual(out, '中文输出\n')
+        self.assertEqual(used, 'gbk')

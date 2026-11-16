@@ -11,7 +11,7 @@
   <!-- 主题初始化（读 localStorage ytools-theme-preference，避免闪白） -->
   <script src="js/theme.js?v=56818aca26c4"></script>
   <script defer src="js/select_menu.js?v=6a5daba7f4f7"></script>
-  <link rel="stylesheet" href="css/main.css?v=277a8cd9a369" />
+  <link rel="stylesheet" href="css/main.css?v=d9d414fd41a3" />
 </head>
 
 <body class="eh-page">
@@ -29,6 +29,15 @@
         <option value="system">主题：跟随系统</option>
         <option value="light">主题：浅色</option>
         <option value="dark">主题：深色</option>
+      </select>
+      <!-- 强调色切换：与主应用共用同一 localStorage 偏好（ytools-accent-preference） -->
+      <select class="fh-round-select eh-accent-select" id="ehAccentSelect" title="强调色">
+        <option value="blue">强调：蓝</option>
+        <option value="green">强调：绿</option>
+        <option value="purple">强调：紫</option>
+        <option value="pink">强调：粉</option>
+        <option value="yellow">强调：黄</option>
+        <option value="none">强调：无</option>
       </select>
       <!-- 差异块导航：按当前滚动位置锚定相邻块头跳转（jumpHunk） -->
       <button type="button" class="fh-btn eh-hunk-nav" id="ehPrevHunk" title="跳转到上一个差异块">↑ 上一块</button>
@@ -85,7 +94,7 @@
   <script src="js/vendor/prism/prism-ini.min.js?v=139dcc920987"></script>
   <script src="js/vendor/prism/prism-ignore.min.js?v=b7b21eb5b7fa"></script>
   <script src="js/vendor/prism/prism-diff.min.js?v=f16816fb2242"></script>
-  <script src="js/app/editor.js?v=f976b6474ac5"></script>
+  <script src="js/app/editor.js?v=74474c95c594"></script>
 </body>
 
 </html>

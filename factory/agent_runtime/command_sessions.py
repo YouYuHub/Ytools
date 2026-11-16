@@ -48,7 +48,9 @@ def _key(session_id, name):
 
 def _shell_argv(shell_kind, shell_exe):
     if shell_kind == "cmd":
-        return [shell_exe, "/q"]
+        # /k 先切 UTF-8 代码页再驻留：write_stdin 按 UTF-8 送字节，控制台代码页
+        # 必须同口径（英文代码页服务器上中文输入否则被按 cp1252 误读成乱码）
+        return [shell_exe, "/q", "/k", "chcp 65001 >nul"]
     if shell_kind in {"powershell", "pwsh"}:
         return [shell_exe, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "-"]
     return [shell_exe, "-i"]
