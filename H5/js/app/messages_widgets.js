@@ -201,24 +201,35 @@
         svgPanDrag.view.classList.remove("is-panning");
         svgPanDrag = null;
     });
-    // ---------- 全屏头栏自动隐藏（svg/mermaid/chart/canvas 共用壳） ----------
+    // ---------- 全屏头栏自动隐藏（svg/mermaid/chart/canvas + 图片预览弹窗共用） ----------
+    // 图片预览弹窗（.media-preview-dialog）头栏为 .media-preview-head，同口径接管。
     // 全屏下头栏悬浮覆盖（CSS :fullscreen 接管定位，不占布局）；默认隐藏，
     // 鼠标到顶部热区/头栏悬停/头栏聚焦/触摸顶部时加 .is-bar-visible 显示，
     // 无操作 FULLBAR_IDLE_MS 后自动隐藏。canvas 跨源 iframe 吞 mousemove，
     // 显示触发另有 CSS 热区条（块 ::after mouseenter，事件目标即块本身）兜底。
     const FULLBAR_TOP_PX = 72;
     const FULLBAR_IDLE_MS = 2200;
-    const FULLBAR_ENTER_HINT_MS = 1500;
+    // 内容区活动时的快速隐藏延迟：头栏可见但鼠标在内容区移动时尽快收起。
+    // 此前任何位置的移动都重置 idle 计时器，真实使用里鼠标持续活动 →
+    // 计时器永远不到期 → 头栏“全屏后一直显示”（静止测试却正常）。
+    const FULLBAR_CONTENT_HIDE_MS = 400;
     let fullbarBlock = null;
     let fullbarTimer = null;
+    // 当前计时器种类：idle=顶部静止超时；content=离开顶部后的一次性收起倒计时。
+    // content 倒计时不得被后续内容区移动重置（否则又变成“持续活动永远续命”）。
+    let fullbarTimerKind = "";
     function fullbarClearTimer() {
         if (fullbarTimer) {
             clearTimeout(fullbarTimer);
             fullbarTimer = null;
         }
+        fullbarTimerKind = "";
     }
     function fullbarLive(block) {
         return block && document.fullscreenElement === block;
+    }
+    function fullbarHead(block) {
+        return block && block.querySelector(".md-svg-head, .media-preview-head");
     }
     function fullbarShow(block) {
         if (!fullbarLive(block))
@@ -234,12 +245,14 @@
         // 看起来“始终显示”）；头栏上任何一点移动都会重新点亮，不影响点按钮。
         target.classList.remove("is-bar-visible");
     }
-    function fullbarArm(block, ms) {
+    function fullbarArm(block, ms, kind) {
         fullbarClearTimer();
         if (!fullbarLive(block))
             return;
+        fullbarTimerKind = kind || "idle";
         fullbarTimer = setTimeout(function () {
             fullbarTimer = null;
+            fullbarTimerKind = "";
             fullbarHide(block);
         }, ms == null ? FULLBAR_IDLE_MS : ms);
     }
@@ -252,24 +265,39 @@
     document.addEventListener("fullscreenchange", function () {
         const fsEl = document.fullscreenElement;
         fullbarTeardown();
-        if (fsEl && fsEl.classList && fsEl.classList.contains("md-svg-block")) {
+        if (fsEl && fsEl.classList &&
+            (fsEl.classList.contains("md-svg-block") || fsEl.classList.contains("media-preview-dialog"))) {
             fullbarBlock = fsEl;
-            // 进全屏先亮一下（发现“退出全屏”按钮），再自动隐藏
-            fullbarShow(fsEl);
-            fullbarArm(fsEl, FULLBAR_ENTER_HINT_MS);
+            // 默认隐藏：进全屏不点亮、不挂计时器（浏览器自带 Esc 提示已告知退出
+            // 方式）；鼠标到顶部热区/头栏聚焦/触摸顶部时才显示。
+            fsEl.classList.remove("is-bar-visible");
         }
     });
     document.addEventListener("mousemove", function (e) {
         if (!fullbarLive(fullbarBlock))
             return;
-        if (e.clientY <= FULLBAR_TOP_PX)
+        if (e.clientY <= FULLBAR_TOP_PX) {
+            // 顶部：点亮 + 静止 idle 超时藏
             fullbarShow(fullbarBlock);
-        fullbarArm(fullbarBlock);
+            fullbarArm(fullbarBlock);
+        }
+        else if (fullbarBlock.classList.contains("is-bar-visible")) {
+            // 离开顶部：启动一次性收起倒计时；已在倒计时中则不重置，
+            // 后续内容区移动不“续命”，离开顶部 400ms 后必藏。
+            if (fullbarTimerKind !== "content")
+                fullbarArm(fullbarBlock, FULLBAR_CONTENT_HIDE_MS, "content");
+        }
+        else {
+            // 已隐藏且不在顶部：无需计时器
+            fullbarClearTimer();
+        }
     }, { passive: true });
     // 热区条（::after 伪元素，事件目标即块本身）：iframe 上方同样有效
     document.addEventListener("mouseover", function (e) {
         if (!fullbarLive(fullbarBlock) || e.target !== fullbarBlock)
             return;
+        if (e.clientY > FULLBAR_TOP_PX)
+            return; // 仅顶部热区；左右/底部 padding 不触发
         fullbarShow(fullbarBlock);
         fullbarArm(fullbarBlock);
     }, { passive: true });
@@ -277,15 +305,23 @@
         if (!fullbarLive(fullbarBlock))
             return;
         const touches = e.touches || [];
-        if (touches.length && touches[0].clientY <= FULLBAR_TOP_PX)
+        if (touches.length && touches[0].clientY <= FULLBAR_TOP_PX) {
             fullbarShow(fullbarBlock);
-        fullbarArm(fullbarBlock);
+            fullbarArm(fullbarBlock);
+        }
+        else if (fullbarBlock.classList.contains("is-bar-visible")) {
+            if (fullbarTimerKind !== "content")
+                fullbarArm(fullbarBlock, FULLBAR_CONTENT_HIDE_MS, "content");
+        }
+        else {
+            fullbarClearTimer();
+        }
     }, { passive: true });
     // 键盘：Tab 进头栏点亮，之后每次按键续亮；focusout 后靠 idle 隐藏
     document.addEventListener("focusin", function (e) {
         if (!fullbarLive(fullbarBlock))
             return;
-        const head = fullbarBlock.querySelector(".md-svg-head");
+        const head = fullbarHead(fullbarBlock);
         if (head && head.contains(e.target)) {
             fullbarShow(fullbarBlock);
             fullbarArm(fullbarBlock);

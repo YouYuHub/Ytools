@@ -2251,6 +2251,8 @@ body.chat-settings-open { overflow: hidden; }
 
 // 全屏态：铺满视口（无圆角/边框）；body 内媒体上限同步放大，
 // 否则图片仍被 78vh 压住，全屏等于只放大了黑边。
+// 头栏自动隐藏与 svg/mermaid/chart/canvas 同口径（messages_widgets 控制器）：
+// 悬浮覆盖不占布局、默认隐藏、顶部热区/聚焦/触摸点亮、离开顶部短延迟收起。
 .media-preview-dialog:fullscreen {
   width: 100vw;
   height: 100dvh;
@@ -2259,25 +2261,58 @@ body.chat-settings-open { overflow: hidden; }
   border: 0;
   border-radius: 0;
 
+  .media-preview-head {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 5;
+    background: var(--bg-composer);
+    transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s linear 0.18s;
+  }
+
+  &:not(.is-bar-visible) .media-preview-head {
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-100%);
+    pointer-events: none;
+  }
+
+  &.is-bar-visible .media-preview-head {
+    transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s;
+  }
+
+  // 顶部热区条：透明可命中，PDF iframe 等吞 mousemove 的内容上方也能触发显示
+  &::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 14px;
+    z-index: 4;
+  }
+
   .media-preview-body {
     flex: 1;
     min-height: 0;
   }
 
+  // 头栏悬浮不占布局：媒体上限只留少量呼吸边距（原 120px 是给占布局头栏预留的）
   img.media-preview-image,
   video.media-preview-video {
     max-width: 96vw;
-    max-height: calc(100dvh - 120px);
+    max-height: calc(100dvh - 20px);
   }
 
   iframe.media-preview-frame {
     width: 96vw;
-    height: calc(100dvh - 120px);
+    height: calc(100dvh - 20px);
   }
 
   pre.media-preview-text {
     max-width: 96vw;
-    max-height: calc(100dvh - 120px);
+    max-height: calc(100dvh - 20px);
   }
 }
 

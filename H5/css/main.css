@@ -8778,6 +8778,33 @@ body.chat-settings-open {
   border: 0;
   border-radius: 0;
 }
+.media-preview-dialog:fullscreen .media-preview-head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  background: var(--bg-composer);
+  transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s linear 0.18s;
+}
+.media-preview-dialog:fullscreen:not(.is-bar-visible) .media-preview-head {
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-100%);
+  pointer-events: none;
+}
+.media-preview-dialog:fullscreen.is-bar-visible .media-preview-head {
+  transition: opacity 0.18s ease, transform 0.18s ease, visibility 0s;
+}
+.media-preview-dialog:fullscreen::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 14px;
+  z-index: 4;
+}
 .media-preview-dialog:fullscreen .media-preview-body {
   flex: 1;
   min-height: 0;
@@ -8785,15 +8812,15 @@ body.chat-settings-open {
 .media-preview-dialog:fullscreen img.media-preview-image,
 .media-preview-dialog:fullscreen video.media-preview-video {
   max-width: 96vw;
-  max-height: calc(100dvh - 120px);
+  max-height: calc(100dvh - 20px);
 }
 .media-preview-dialog:fullscreen iframe.media-preview-frame {
   width: 96vw;
-  height: calc(100dvh - 120px);
+  height: calc(100dvh - 20px);
 }
 .media-preview-dialog:fullscreen pre.media-preview-text {
   max-width: 96vw;
-  max-height: calc(100dvh - 120px);
+  max-height: calc(100dvh - 20px);
 }
 
 .media-preview-head {
