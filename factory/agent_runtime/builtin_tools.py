@@ -1612,10 +1612,13 @@ def execute_read_document(
     if wants_native:
         if not native_supported:
             if mode == "native":
+                suffix = Path(display_filename).suffix.lower()
+                hint = ("表格文件请使用 mode=table（按行分页、保留表头）或 mode=text（Markdown 文本）"
+                        if suffix in TABLE_EXTENSIONS else "请使用 mode=text")
                 return {
                     "error": (
                         f"当前模型未声明支持 {Path(display_filename).suffix or '该'} "
-                        "原生文档输入，请使用 mode=text"
+                        f"原生文档输入；{hint}"
                     )
                 }
             if has_page_range:
@@ -1719,6 +1722,10 @@ def execute_read_document(
                 message += "；当前读取结束"
             if header_row:
                 message += f"；当前以第 {header_row} 行为表头，若无表头请设 header_row=0"
+            if result.get("style_note"):
+                message += "；" + str(result["style_note"])
+            if result.get("raw_note"):
+                message += "；" + str(result["raw_note"])
             if table_note:
                 message += "；" + table_note
             if native_fallback_note:
