@@ -8,7 +8,7 @@
 | 缺少信息或需要确认 | `ask_user(questions)` 提出 1–5 题；可给 `options`（0–6 项，空数组=纯自由输入）、`multiple`。调用后等待用户回答，同轮其他工具不执行。用户可留空提交（回传“（未回答）”）、多选可 0 选；非法参数展示前拦截且不在历史里留卡片 |
 | 独立子任务 | `sub_agent(task, todo?)` 写全目标、绝对路径、事实、约束和所需证据；同轮子任务并发，父模型收到最终报告 |
 | 新建文本 | `write_file(path, content, mode="create")`；目标已存在时报错，自动创建父目录 |
-| 覆盖或追加 | `write_file(..., mode="overwrite"/"append")`，必须明确模式；已有文件可带 `expected_hash` |
+| 覆盖或追加 | `write_file(..., mode="overwrite"/"append")`；**mode 必传**（不传报 `INVALID_ARGUMENTS` 且文件不修改），已有文件可带 `expected_hash` |
 | 修改局部 | `edit_file(path, old_string, new_string)`；多处用 `edits`，不要混用。出现多处匹配时加长原文，或明确 `replace_all=true` |
 | 多文件修改 | `apply_patch(patch)`，需在工具配置中启用；支持 Add/Update/Delete File，最多 20 个文件。先读原文，提供唯一上下文；结果含逐文件统计，失败检查 `files/rollback_complete`，`needs_attention` 文件须先重读核对 |
 | 读取文本 | `read_file(path, start_line=1, limit=200)`；按 `next_start_line` 续读。长行续读保留原 `start_line`，传 `char_offset=next_char_offset` |

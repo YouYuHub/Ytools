@@ -138,6 +138,10 @@
     // 直播流等待模型时同样亮运行态（转圈 + 计时），与 foldActiveNow 同口径；
     // 待确认 veto：审批等待期间不亮灯、不计时。非末段（无尾）不用该兜底。
     if (!waiting && !active && fold.tail && isLiveFold(fold)) active = true;
+    // 非末段（引导气泡之前的内容）按检查点语义已结算：即使个别节点残留
+    // 进行态标记（工具 done 未及打标等），也绝不亮灯/计时——否则折叠头会在
+    // 引导气泡上方持续跳秒，刷新后历史回放全 settled 才"恢复"。
+    if (!fold.tail) active = false;
     var duration = "";
     if (times.length >= 2) {
       var spanStart = Math.min.apply(null, times), spanEnd = Math.max.apply(null, times);
@@ -299,6 +303,9 @@
   }
   // 当前是否仍在运行（读实时 DOM，不依赖上次 render 的 class 快照）
   function foldActiveNow(fold: any): any {
+    // 非末段（引导前内容）已结算：永不计时（与 renderHeader 同口径，
+    // 残留进行态标记不得让封存段在引导气泡上方持续跳秒）。
+    if (!fold.tail) return false;
     var active = false;
     var nodes = fold.tail ? fold.members.concat([fold.tail], fold.liveTail || []) : fold.members;
     for (var i = 0; i < nodes.length; i++) {
@@ -794,6 +801,17 @@
     nodes.sort(docOrder);
     var user = g.user;
     if (!user && g.msgs.length) user = userNodeBefore(g.msgs[0]);
+    // 位置归属：早于本轮用户气泡的节点不属于本轮（编辑重发手术后残留、
+    // 容器与气泡顺序错位等）。若把它们纳入成员，折叠头会被 insertBefore 摆到
+    // user 消息上方（上一轮用量行之后），且非末段还会持续跳秒；刷新后历史
+    // 回放顺序正确才"恢复"。这里按文档序剔除，残留节点保持原样可见。
+    // 仅对已挂载节点判定：游离直播容器（切会话/窗口重建）compareDocumentPosition
+    // 返回 DISCONNECTED，不能据此丢弃其成员。
+    if (user && user.isConnected) {
+      nodes = nodes.filter(function (node: any) {
+        return !node.isConnected || docOrder(user, node) <= 0;
+      });
+    }
     return syncRound(nodes, key, user);
   }
   function syncMsgContainer(msg: any): void {

@@ -470,6 +470,7 @@
     const input = document.createElement("textarea");
     input.className = "eh-input";
     input.spellcheck = false;
+    input.rows = 1;   // 单行行：测量时盒塌缩到 1 行而非默认 rows=2 的两行
     input.value = row.text;
     const paint = function () {
       const html = highlight(input.value, st.lang);
@@ -518,8 +519,14 @@
 
     /** 让高亮层跟随输入行数撑高（textarea 自动行高）。 */
   function syncHeight(input: any, hl: any, cell: any) {
+    // .eh-input 为 absolute+inset:0：height:auto 会拉伸到单元格旧高度
+    // （top/bottom 均 0），scrollHeight 只增不减——窄屏量出的多行高度在
+    // 宽屏无法回收，留下大片空白。测量时临时解除 bottom 约束（配合 rows=1）
+    // 让盒塌缩到真实内容行数，测完恢复 inset:0 与显式高度。
+    input.style.bottom = "auto";
     input.style.height = "auto";
     const h = Math.max(input.scrollHeight, 21);
+    input.style.bottom = "";
     input.style.height = h + "px";
     hl.style.minHeight = h + "px";
     // 高亮层与输入层都是 absolute（inset:0），不参与行布局：

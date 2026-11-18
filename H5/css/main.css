@@ -10795,12 +10795,9 @@ body.eh-page {
 }
 
 @media (min-width: 769px) {
-  .eh-head {
-    flex-wrap: nowrap;
-  }
   .eh-title-wrap {
-    flex: 1 1 0;
-    min-width: 240px;
+    flex: 1 1 100%;
+    min-width: 0;
     flex-direction: row;
     align-items: baseline;
     gap: 10px;
@@ -10818,7 +10815,7 @@ body.eh-page {
     max-width: 46%;
   }
   .eh-bar {
-    flex: 0 1 auto;
+    flex: 1 1 100%;
     min-width: 0;
   }
 }

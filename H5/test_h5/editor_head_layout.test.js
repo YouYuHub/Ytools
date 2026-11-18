@@ -1,7 +1,8 @@
 "use strict";
 // 回归：diff 编辑器页（editor.html）顶栏三件事——
-// 1) 宽屏（>=769px）文件名与基线/版本状态同行，长路径单行溢出省略；窄屏保持竖排独占行；
-// 2) 窄屏操作按钮行可收缩换行（历史缺陷：.eh-bar flex:none 时子项宽=整行
+// 1) 宽窄屏一致：标题行独占第一行、操作栏独占第二行（各 flex-basis:100%）；
+//    宽屏标题行内文件名与基线/版本状态同行、长路径单行溢出省略；窄屏标题竖排；
+// 2) 操作按钮行可收缩换行（历史缺陷：.eh-bar flex:none 时子项宽=整行
 //    max-content，超出视口被裁切、内部 flex-wrap 永不触发，右侧按钮显示不全）；
 // 3) 强调色下拉与主应用共用 ThemeManager 偏好，选区/焦点环跟随 --accent-swatch/--focus-ring。
 // jsdom 不做布局，布局部分守护编译后 CSS 的关键声明不被回退（与 widget_zoom_centering 同口径）。
@@ -48,12 +49,11 @@ test("HTML：强调色下拉六选项与 ThemeManager.ACCENTS 同序", () => {
   dom.window.close();
 });
 
-test("宽屏：标题横排、文件名溢出省略、状态不压缩、操作栏按内容取宽", () => {
+test("宽屏：标题行独占第一行（文件名横排+溢出省略、状态不压缩）、操作栏独占第二行", () => {
   const block = wideMediaBlock();
   const wrap = ruleBody(block, ".eh-title-wrap");
   assert.match(wrap, /flex-direction:\s*row/);
-  assert.match(wrap, /flex:\s*1 1 0/);
-  assert.match(wrap, /min-width:\s*240px/);
+  assert.match(wrap, /flex:\s*1 1 100%/, "标题行应独占整行（basis:100%）");
   const strong = ruleBody(block, ".eh-title-wrap strong");
   assert.match(strong, /white-space:\s*nowrap/);
   assert.match(strong, /overflow:\s*hidden/);
@@ -61,8 +61,10 @@ test("宽屏：标题横排、文件名溢出省略、状态不压缩、操作�
   const sub = ruleBody(block, ".eh-sub");
   assert.match(sub, /flex:\s*none/);
   const bar = ruleBody(block, ".eh-bar");
-  assert.match(bar, /flex:\s*0 1 auto/);
+  assert.match(bar, /flex:\s*1 1 100%/, "操作栏应独占整行（basis:100%），拿满整行宽度");
   assert.match(bar, /min-width:\s*0/);
+  // 不得再用 nowrap 把标题与操作栏挤同一行（否则按钮二次换行）
+  assert.doesNotMatch(block, /flex-wrap:\s*nowrap/, "宽屏不应强制标题与操作栏同排");
 });
 
 test("窄屏：标题竖排独占行；操作栏占满可用宽且可换行（不再 flex:none 裁切）", () => {

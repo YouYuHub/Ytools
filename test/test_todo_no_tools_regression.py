@@ -379,6 +379,62 @@ class TodoLoopRegressionTests(unittest.TestCase):
         self.assertIn("实际进展报告", "".join(stream.chunks))
 
 
+class InjectedFrameMetadataTests(unittest.TestCase):
+    """message_injected 帧须携带轮次号与落盘时间戳：前端消费时就地挂
+    「删除/插入对话/复制/编辑」操作行与时间戳，不必等刷新回放（历史缺陷：
+    实时引导气泡 round=null 不挂入口，刷新后才出现）。"""
+
+    def setUp(self):
+        _cleanup()
+
+    def tearDown(self):
+        _cleanup()
+
+    def _run_inject(self, live_round_no):
+        stream = _FakeStream()
+        stream.live_round_no = live_round_no
+        requests = []
+
+        class LLM:
+            @staticmethod
+            def chat_completions(*, request, **kwargs):
+                requests.append(copy.deepcopy(request))
+                async def gen():
+                    if len(requests) == 1:
+                        stream.injected_messages.append({
+                            "role": "user", "content": "中途引导：请顺带检查行高",
+                            "message_id": "steer-meta",
+                        })
+                        yield 'data: {"tool_calls":[{"index":0,"id":"r1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"factory/agent_runtime/todo_runtime.py\\",\\"limit\\":1}"}}]}\n\n'
+                        yield 'data: {"finish_reason":"tool_calls"}\n\n'
+                    else:
+                        yield 'data: {"content":"收到引导", "finish_reason":"stop"}\n\n'
+                    yield "data: [DONE]\n\n"
+                return gen()
+
+        asyncio.run(_run_case(["read_file"], LLM, stream))
+        frames = [json.loads(c[6:]) for c in stream.chunks if c.startswith("data: {")]
+        event = next(f for f in frames if f.get("event") == "message_injected")
+        return event
+
+    def test_frame_carries_round_and_timestamp_matching_history(self):
+        event = self._run_inject(3)
+        self.assertEqual(event["round"], 3)
+        self.assertTrue(event.get("timestamp"))
+        stored = [r for r in _last_memory.records
+                  if isinstance(r, dict) and r.get("content") == "中途引导：请顺带检查行高"]
+        self.assertEqual(len(stored), 1)
+        # 落盘与帧共用同一时间戳：实时气泡与刷新后的历史回放显示一致
+        self.assertEqual(stored[0]["timestamp"], event["timestamp"])
+
+    def test_frame_without_confirmed_round_keeps_timestamp_only(self):
+        # 轮次未确认（live_round_no=None）：不带 round（前端等收尾重载补挂），
+        # timestamp 仍下发——旧前端忽略新字段，向后兼容
+        event = self._run_inject(None)
+        self.assertNotIn("round", event)
+        self.assertTrue(event.get("timestamp"))
+
+
 def _cleanup():
     repo_root = Path(__file__).resolve().parents[1]
     root = repo_root / "history_files"

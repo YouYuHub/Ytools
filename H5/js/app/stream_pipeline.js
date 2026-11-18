@@ -679,7 +679,11 @@
                 // 不向当前会话的消息流插入他人引导。
                 if (state.sessionId !== sessionId)
                     return;
-                App.appendUserMessage(data.content || (typeof data.text === "string" ? data.text : ""), null, sessionId, null, msg, null, data.quotes || []);
+                // 帧携带 round/timestamp（新后端）：就地打轮次标并挂「删除/插入对话/
+                // 复制/编辑」操作行与时间戳，与刷新后的历史回放一致；旧后端缺字段时
+                // 保持旧行为（round=null 不挂入口，收尾重载随历史回放补挂）。
+                const injectedRound = typeof data.round === "number" && data.round > 0 ? data.round : null;
+                App.appendUserMessage(data.content || (typeof data.text === "string" ? data.text : ""), typeof data.timestamp === "string" && data.timestamp ? data.timestamp : null, sessionId, null, msg, injectedRound, data.quotes || []);
                 App.rebuildQnav();
                 if (!replayWindow)
                     stickToBottom();

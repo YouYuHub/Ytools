@@ -41,7 +41,7 @@ body.eh-page {
   display: flex;
   align-items: center;
   gap: 8px 12px;
-  flex-wrap: wrap;         // 标题过长时操作栏换到第二行
+  flex-wrap: wrap;         // 标题行与操作栏各占一行（两者 flex-basis:100%）
   padding: 8px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-sidebar);
@@ -90,16 +90,15 @@ body.eh-page {
   justify-content: flex-end;
 }
 
-// ---------- 宽屏顶栏：文件名与基线/版本状态同行，长路径溢出省略 ----------
+// ---------- 宽屏顶栏：标题行与操作栏各独占一行（文件名+状态同行，长路径省略） ----------
+// 标题独占第一行、按钮独占第二行：按钮拿到整行宽度后单行排布，不再与标题挤
+// 同一行导致 ↑上一块/↓下一块/关闭 在操作栏内二次换行。.eh-head 基础 flex-wrap:wrap
+// 配合两者 flex-basis:100% 自然上下分两行（宽窄屏一致）。
 @media (min-width: 769px) {
-  .eh-head {
-    flex-wrap: nowrap;     // 超宽屏标题与操作栏可同排；不够宽时操作栏整体换行
-  }
-
   .eh-title-wrap {
-    flex: 1 1 0;           // 只取操作栏用剩的宽度：宽屏操作栏保持单行
-    min-width: 240px;      // 下限：文件名+状态至少可见，极窄宽屏时操作栏再换行
-    flex-direction: row;
+    flex: 1 1 100%;        // 独占第一行
+    min-width: 0;
+    flex-direction: row;   // 文件名与基线/版本状态同行
     align-items: baseline;
     gap: 10px;
 
@@ -119,7 +118,7 @@ body.eh-page {
   }
 
   .eh-bar {
-    flex: 0 1 auto;        // 按内容取宽、可收缩换行，不再强制独占一行
+    flex: 1 1 100%;        // 独占第二行，拿满整行宽度（按钮单行右对齐排布）
     min-width: 0;
   }
 }

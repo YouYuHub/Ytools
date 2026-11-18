@@ -1695,7 +1695,10 @@ async def _run_chat_generation(
             raw_content = copy.deepcopy(injected_message.get("content"))
             inject_text = content_part_to_text(raw_content, include_media_labels=False).strip()
             quotes = normalize_quotes(injected_message.get("quotes"))
-            history_message = {"role": "user", "content": raw_content}
+            # 落盘与 SSE 帧共用同一时间戳：实时气泡与刷新后的历史回放显示一致
+            from util.timestamp_utils import now_str
+            injected_ts = now_str()
+            history_message = {"role": "user", "content": raw_content, "timestamp": injected_ts}
             if quotes:
                 history_message["quotes"] = quotes
             # 先按 media:// 引用保存原始消息，图片数据只进入模型运行时副本。
@@ -1713,9 +1716,21 @@ async def _run_chat_generation(
             if unresolved:
                 logger.warning(f"引导消息有 {len(unresolved)} 个媒体引用解析失败")
             messages.append(model_message)
+            # 帧携带轮次号与落盘时间戳：前端消费时就地打 data-round/_editData
+            # 并挂「删除/插入对话/复制/编辑」操作行与时间戳，不必等刷新回放。
+            # 轮次号取 stream.live_round_no（round_started 确认时写入；worker
+            # 模式经事件同步），未确认时缺省，前端等收尾重载随历史回放补挂。
+            injected_payload = {
+                "event": "message_injected", "text": inject_text, "content": raw_content,
+                "quotes": quotes, "message_id": injected_message.get("message_id"),
+                "timestamp": injected_ts,
+            }
+            injected_round = getattr(stream, "live_round_no", None)
+            if isinstance(injected_round, int) and injected_round > 0:
+                injected_payload["round"] = injected_round
             await _stream_emit(
                 stream,
-                f"data: {json.dumps({'event': 'message_injected', 'text': inject_text, 'content': raw_content, 'quotes': quotes, 'message_id': injected_message.get('message_id')}, ensure_ascii=False)}\n\n",
+                f"data: {json.dumps(injected_payload, ensure_ascii=False)}\n\n",
             )
             logger.info(f"已注入运行中用户消息（消息引导）: {inject_text[:80]}")
             return True
