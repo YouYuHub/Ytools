@@ -394,7 +394,7 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
               'parameters': {'type': 'object',
                              'properties': {'command': {'type': 'string',
                                                         'description': '目标 shell 的命令原文；语法须与 shell 一致。cmd 用 '
-                                                                       '&& 或 & 串联。',
+                                                                       '&& 或 & 串联。PowerShell 引号转义用双写（单引号串内 \'\' / 双引号串内 ""）或反引号，勿用 C 风格 \\\' / \\"（会提前闭合字符串导致解析错乱）。',
                                                         'maxLength': 200000},
                                             'shell': {'type': 'string',
                                                       'enum': ['auto',

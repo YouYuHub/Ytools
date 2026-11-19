@@ -3651,6 +3651,275 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
     return new_command, [note]
 
 
+# C 风格反斜杠引号转义（\' / \"）：PowerShell 不认这种转义。单引号串里 `\'`
+# 的 `'` 会提前闭合字符串、双引号串里 `\"` 的 `"`  likewise，导致后续正则/参数
+# 被当裸 token 解析（实测 `-----BEGIN` 报 "Missing expression after unary
+# operator '--'"）。模型从 bash/python 习惯带过来的写法必炸。
+_PS_C_STYLE_QUOTE_RE = re.compile(r"\\['\"]")
+
+
+def _ps_parse_errors(shell_exe: str, command: str):
+    """用真实 PowerShell 解析器预检命令，返回错误消息列表；检查器不可用返回 None。
+
+    把命令写入临时 .ps1（UTF-8 BOM），调
+    `[Language.Parser]::ParseFile` 只解析不执行，收集 ParseError.Message。
+    任何异常/超时/非零退出都返回 None（视为"无法预检"，交还原生执行，不阻断）。
+    """
+    try:
+        _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        seq = next(_BG_NAME_SEQ) % 10000
+        probe = _BG_LOG_DIR / f"psparse_{stamp}_{seq:04d}_{os.getpid()}.ps1"
+        probe.write_text(command if command.endswith("\n") else command + "\n",
+                         encoding="utf-8-sig")
+    except OSError:
+        return None
+    path_lit = str(probe).replace("'", "''")
+    checker = (
+        "$e=$null;$t=$null;"
+        "[System.Management.Automation.Language.Parser]::ParseFile('" + path_lit + "',[ref]$t,[ref]$e)|Out-Null;"
+        "ConvertTo-Json -Compress -InputObject @($e|ForEach-Object{$_.Message})"
+    )
+    try:
+        proc = subprocess.run(
+            [shell_exe, "-NoProfile", "-NonInteractive", "-Command", checker],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if out in ("", "null"):
+        return []
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, str):
+        return [data]
+    if isinstance(data, list):
+        return [str(x) for x in data]
+    return None
+
+
+def _ps_fix_c_style_quotes(command: str) -> str:
+    """上下文感知地把 C 风格反斜杠引号转成 PowerShell 的双写转义。
+
+    逐字符跟踪 PS 字符串状态：单引号串内 `\\'`→`''`、双引号串内 `\\"`→`""`
+    （双写即 PS 的转义引号），其余反斜杠原样保留。只改"会造成提前闭合"的两种
+    组合，不碰字符串外的反斜杠（路径/正则）与双引号串内的 `\\'`（本就无害）。
+    含 here-string（@'/@\"）时不改动，避免误伤。
+    """
+    if re.search(r"(?m)^\s*@['\"]", command):
+        return command
+    out = []
+    state = None  # None / "'" / '"'
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+        if state is None:
+            if ch in ("'", '"'):
+                state = ch
+            out.append(ch)
+            i += 1
+            continue
+        if state == "'":
+            if ch == "\\" and nxt == "'":
+                out.append("''")
+                i += 2
+                continue
+            if ch == "'":
+                if nxt == "'":
+                    out.append("''")
+                    i += 2
+                    continue
+                state = None
+            out.append(ch)
+            i += 1
+            continue
+        # double-quoted
+        if ch == "`" and nxt:
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        if ch == "\\" and nxt == '"':
+            out.append('""')
+            i += 2
+            continue
+        if ch == '"':
+            if nxt == '"':
+                out.append('""')
+                i += 2
+                continue
+            state = None
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _guard_powershell_quotes(shell_exe: str, command: str):
+    """PowerShell 引号健壮性守卫：预检 + 安全修复 C 风格转义，修不好则拒绝。
+
+    仅当命令含 C 风格反斜杠引号（\\' / \\\"）时触发（干净命令零开销）。
+    原命令解析干净→原样返回；解析报错且上下文修复后干净→用修复版并提示；
+    仍报错→抛 ValueError（带解析器首条错误与 PS 转义规则），在执行前拒绝，
+    避免"前半段已执行、后半段解析炸"的半执行副作用。
+    返回 (命令, 提示列表)。
+    """
+    if not _PS_C_STYLE_QUOTE_RE.search(command):
+        return command, []
+    errs = _ps_parse_errors(shell_exe, command)
+    if errs is None or not errs:
+        return command, []
+    fixed = _ps_fix_c_style_quotes(command)
+    if fixed != command:
+        errs2 = _ps_parse_errors(shell_exe, fixed)
+        if errs2 is not None and not errs2:
+            return fixed, [
+                "检测到 C 风格反斜杠引号转义（\\' / \\\"）：PowerShell 不认这种转义，"
+                "单引号串内 \\' 会提前闭合字符串导致后续内容被当裸 token 解析。"
+                "已自动改为 PowerShell 双写转义（单引号串 '' / 双引号串 \"\"）后执行"
+                "（语义等价）。今后在 PowerShell 中请直接用双写转义或反引号 `\" / `'。"
+            ]
+    raise ValueError(
+        "PowerShell 解析预检失败，命令未执行：" + (errs[0] if errs else "引号/语法错乱") +
+        "。常见原因：C 风格 \\' / \\\" 转义（PowerShell 单引号串用 '' 转义、双引号串用 \"\" 或反引号 `\"）、"
+        "引号未配对。请修正引号后重试，或用 write_file 写入 .ps1 脚本再执行。"
+    )
+
+
+_PS_NATIVE_EXTS = (".exe", ".com", ".bat", ".cmd")
+
+
+def _ps_native_token_exists(token: str) -> bool:
+    """首 token 是否对应原生可执行文件（PATH 检索，仅认原生后缀）。
+
+    与 _command_exists_in_child_path 的区别：后者把无后缀命中也算存在
+    （如 ./script.ps1），而原生边界坑只发生在 .exe/.com/.bat/.cmd 这类
+    走 Win32 命令行序列化的目标上；.ps1 走 PS 参数绑定，不在此列。
+    """
+    if not token or "$" in token:
+        return False
+    lowered = token.lower()
+    if any(sep in token for sep in ("\\", "/", ":")):
+        return os.path.isfile(token) and lowered.endswith(_PS_NATIVE_EXTS)
+    for directory in _cmd_env_path_dirs():
+        for ext in _PS_NATIVE_EXTS:
+            if os.path.isfile(os.path.join(directory, token + ext)):
+                return True
+    return False
+
+
+def _ps_quoted_value_has_dquote(command: str) -> bool:
+    """是否有引号串的值含双引号（单引号串内 `"` 即字面量；双引号串内
+    `"` 只能以 `""` 或 `` `" `` 形式出现，两种都代表值里有引号）。
+
+    跳过 `#` 行注释与 `<# #>` 块注释；含 here-string 时不分析（避误判）。
+    """
+    if re.search(r"(?m)^\s*@['\"]", command):
+        return False
+    state = None  # None / "'" / '"' / "linecomment" / "blockcomment"
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+        if state is None:
+            if ch == "<" and nxt == "#":
+                state = "blockcomment"
+                i += 2
+                continue
+            if ch == "#":
+                state = "linecomment"
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                state = ch
+            i += 1
+            continue
+        if state == "linecomment":
+            if ch == "\n":
+                state = None
+            i += 1
+            continue
+        if state == "blockcomment":
+            if ch == "#" and nxt == ">":
+                state = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if state == "'":
+            if ch == '"':
+                return True
+            if ch == "'":
+                if nxt == "'":
+                    i += 2
+                    continue
+                state = None
+            i += 1
+            continue
+        # double-quoted
+        if ch == "`" and nxt:
+            if nxt == '"':
+                return True
+            i += 2
+            continue
+        if ch == '"':
+            if nxt == '"':
+                return True  # "" 转义即值里有一个 "
+            state = None
+            i += 1
+            continue
+        i += 1
+    return False
+
+
+def _ps_native_quote_warning(command: str) -> list:
+    """原生边界引号告警（只提示不阻断）：引号参数的值含 `"` 且命令段首
+    token 是原生程序时，Windows PowerShell 5.1 向原生程序传参不转义内嵌
+    双引号，参数会在 Win32 命令行层分裂/篡改（实测：git -m 含引号报
+    `unknown switch`；git --format 的值被吞引号）。脚本解析预检对此无能
+    为力（脚本层完全合法），只能靠这条启发式提醒。
+    """
+    if '"' not in command or not _ps_quoted_value_has_dquote(command):
+        return []
+    masked = []
+    state = None
+    for ch in command:
+        if state is None:
+            if ch in ("'", '"'):
+                state = ch
+                masked.append(" ")
+            else:
+                masked.append(ch)
+        elif ch == state:
+            state = None
+            masked.append(" ")
+        else:
+            masked.append(" ")
+    for segment in re.split(r"[;\r\n|&]+", "".join(masked)):
+        token = _first_token(segment)
+        if token and _ps_native_token_exists(token):
+            return [
+                f"注意：命令向原生程序 `{token}` 传递了含双引号的参数值："
+                "Windows PowerShell 向原生程序传参时不转义内嵌双引号，参数可能在 "
+                "Win32 层分裂或被篡改（实测 git -m 含引号报 unknown switch、--format "
+                "值被吞引号），而脚本解析预检对此无能为力。如执行结果异常，请去掉"
+                "参数中的内嵌双引号，或改用文件传参（如 git commit -F 消息文件）。"
+            ]
+    return []
+
+
 def _first_token(segment: str) -> str:
     text = segment.strip().lstrip("&|").strip()
     match = re.match(r"^([^\s&|<>()]+)", text)
@@ -4433,6 +4702,12 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
                 "请直接运行上游命令，再用 poll_command 的 tail_lines 读取末尾输出，"
                 "或安装可用的过滤器")
     elif shell_kind in ("powershell", "pwsh"):
+        # ⓪ 引号预检+安全修复：C 风格 \' / \" 转义在 PS 里会提前闭合字符串，
+        #    能安全修复则修复后执行，修不好在执行前拒绝（防半执行副作用）。
+        command, quote_notes = _guard_powershell_quotes(shell_exe, command)
+        guard_notes = guard_notes + quote_notes
+        # ⓪b 原生边界告警：只提示不阻断（脚本合法但 PS→exe 传参可能分裂/篡改）
+        guard_notes = guard_notes + _ps_native_quote_warning(command)
         command, pipe_notes = _guard_powershell_pipeline(command)
         guard_notes = guard_notes + pipe_notes
     work_text = string_arg({"work_dir": work_dir}, "work_dir").strip()

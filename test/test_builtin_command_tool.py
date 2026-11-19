@@ -514,5 +514,102 @@ class BuiltinCommandToolTests(unittest.TestCase):
             self.assertEqual(command, "echo a")
             self.assertEqual(local_filter, ("tail", 4))
 
+class PowerShellQuoteGuardTests(unittest.TestCase):
+    """PowerShell 引号守卫：C 风格 \\' / \\" 转义的预检+安全修复（实测坑）。"""
+
+    def test_fix_single_quote_c_style_to_doubled(self):
+        src = "Select-String -Pattern 'a\\'b'"
+        self.assertEqual(bt._ps_fix_c_style_quotes(src), "Select-String -Pattern 'a''b'")
+
+    def test_fix_double_quote_c_style_to_doubled(self):
+        src = 'Write-Output "a\\"b"'
+        self.assertEqual(bt._ps_fix_c_style_quotes(src), 'Write-Output "a""b"')
+
+    def test_fix_leaves_paths_and_harmless_backslashes(self):
+        for src in ("Get-ChildItem 'C:\\tmp'", 'Write-Output "C:\\path"',
+                    'Write-Output "a\\\'b"'):  # 双引号串内 \' 本就无害，不改
+            self.assertEqual(bt._ps_fix_c_style_quotes(src), src)
+
+    def test_fix_skips_here_string(self):
+        src = "@'\na\\'b\n'@"
+        self.assertEqual(bt._ps_fix_c_style_quotes(src), src)
+
+    def test_clean_command_zero_overhead_no_parse(self):
+        with patch.object(bt, "_ps_parse_errors") as parse:
+            cmd, notes = bt._guard_powershell_quotes("powershell", "Write-Output 'hello'")
+        self.assertEqual(cmd, "Write-Output 'hello'")
+        self.assertEqual(notes, [])
+        parse.assert_not_called()
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 解析预检仅 Windows 验证")
+    def test_parse_detects_real_failure_and_repair_cleans(self):
+        import shutil
+        exe = shutil.which("powershell")
+        bad = ("Select-String -Pattern 'sk-[A-Za-z0-9]{16,}|api[_-]?key\\s*[:=]\\s*[\"\\'][A-Za-z0-9]"
+               "|-----BEGIN|password\\s*[:=]\\s*[\"\\'][^\"\\']{8,}'")
+        errs = bt._ps_parse_errors(exe, bad)
+        self.assertTrue(errs)  # 原命令确有解析错误
+        fixed = bt._ps_fix_c_style_quotes(bad)
+        self.assertNotEqual(fixed, bad)
+        self.assertEqual(bt._ps_parse_errors(exe, fixed), [])
+        cmd, notes = bt._guard_powershell_quotes(exe, bad)
+        self.assertEqual(cmd, fixed)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("双写", notes[0])
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 解析预检仅 Windows 验证")
+    def test_unrepairable_rejected_before_execute(self):
+        import shutil
+        exe = shutil.which("powershell")
+        bad = "Write-Output 'a\\'b'; foreach ("  # 修复引号后仍有语法错误
+        with self.assertRaisesRegex(ValueError, "命令未执行"):
+            bt._guard_powershell_quotes(exe, bad)
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 执行用例仅 Windows 验证")
+    def test_end_to_end_repair_executes(self):
+        result = bt.execute_run_command({
+            "command": "Write-Output 'it\\'s'", "shell": "powershell",
+            "timeout_seconds": 30, "_structured_output": True,
+        })
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("it's", result["stdout"])
+        self.assertIn("双写", result["message"])
+
+    def test_native_warning_value_scan(self):
+        has = bt._ps_quoted_value_has_dquote
+        self.assertTrue(has('git commit -m "a""b"'))
+        self.assertTrue(has("git commit -m 'say \"hi\"'"))
+        self.assertTrue(has('Write-Output "a`"b"'))  # 反引号转义的引号也在值里
+        self.assertFalse(has("Write-Output 'it''s'"))
+        self.assertFalse(has('Write-Output "plain"'))
+        self.assertFalse(has('git status # "commented"'))
+        self.assertFalse(has("git status <# \"blocked\" #>"))
+        self.assertFalse(has("@\"\na\"\"b\n\"@"))  # here-string 跳过不分析
+
+    def test_native_warning_token_resolution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "tool.exe").write_bytes(b"")
+            Path(folder, "script.ps1").write_bytes(b"")
+            with patch.object(bt, "_cmd_env_path_dirs", return_value=[folder]):
+                self.assertTrue(bt._ps_native_token_exists("tool"))
+                self.assertFalse(bt._ps_native_token_exists("script.ps1"))
+                self.assertFalse(bt._ps_native_token_exists("$tool"))
+                self.assertFalse(bt._ps_native_token_exists("Write-Output"))
+                warned = bt._ps_native_quote_warning('tool --msg "a""b"')
+                self.assertEqual(len(warned), 1)
+                self.assertIn("tool", warned[0])
+                self.assertEqual(bt._ps_native_quote_warning('tool --msg "plain"'), [])
+                self.assertEqual(bt._ps_native_quote_warning('Write-Output "a""b"'), [])
+
+    @unittest.skipUnless(IS_WINDOWS, "PowerShell 执行用例仅 Windows 验证")
+    def test_native_warning_end_to_end(self):
+        result = bt.execute_run_command({
+            "command": 'cmd /c echo "a""b"', "shell": "powershell",
+            "timeout_seconds": 30, "_structured_output": True,
+        })
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("原生程序 `cmd`", result["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
