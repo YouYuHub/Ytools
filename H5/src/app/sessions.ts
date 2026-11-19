@@ -1292,6 +1292,9 @@
   async function openSession(id: any, options?: any) {
     const seq = ++sessionOpenSeq;
     if (App.resetHistoryView) App.resetHistoryView();
+    // 防御性复位：旧会话回放窗口若尚未关闭（切走时其收尾还在路上），
+    // 不能让追赶期抑制标志影响新会话的历史渲染（复制按钮定位）。
+    if (App.setReplayFastForward) App.setReplayFastForward(false);
     // 保存当前会话的输入草稿（文本+附件），再切换到目标会话
     App.saveSessionDraft();
     // 切换会话时结束进行中的语音输入（识别文本不能串写到另一个会话的输入框）

@@ -165,7 +165,8 @@
         applyZoomScale(block, next);
     }, { passive: false });
     // 放大后按住拖动平移（与图片预览一致的手感）：滚动容器 scroll 方案，
-    // 无需 transform 数学；仅放大档（>100%）启用，缩小/100% 不拦截。
+    // 无需 transform 数学；放大档（>100%）或按宽度适配的极端比例图
+    // （is-fit-width，100% 时也有溢出可滚）启用，其余缩小/100% 不拦截。
     // document 级 move/up：移出视图也能继续拖；视图重建后自动失效。
     let svgPanDrag = null;
     chatInner.addEventListener("mousedown", function (e) {
@@ -175,7 +176,9 @@
         if (!view)
             return;
         const block = view.closest(".md-svg-block");
-        if (!block || zoomScaleOf(block) <= 1)
+        if (!block)
+            return;
+        if (zoomScaleOf(block) <= 1 && !block.classList.contains("is-fit-width"))
             return;
         if (view.scrollWidth <= view.clientWidth + 1 && view.scrollHeight <= view.clientHeight + 1)
             return;

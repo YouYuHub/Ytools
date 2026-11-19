@@ -504,10 +504,19 @@
                 const ar = m ? parseFloat(m[1]) : 0;
                 const maxH = Math.max(240, window.innerHeight - 20);
                 const zoom = App.zoomScaleOf(block);
-                const w = (ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth) * zoom;
-                svg.style.width = Math.floor(w) + "px";
-                svg.style.height = "auto";
-                svg.style.maxHeight = Math.floor(maxH * zoom) + "px";
+                if (block.classList.contains("is-fit-width")) {
+                    // 极端宽高比图（嵌入态已按宽度适配）：全屏同样填满宽度保证可读，
+                    // 溢出高度由全屏滚动容器查看，不再按高度压成细条
+                    svg.style.width = Math.floor(block.clientWidth * zoom) + "px";
+                    svg.style.height = "auto";
+                    svg.style.maxHeight = "none";
+                }
+                else {
+                    const w = (ar > 0 ? Math.min(block.clientWidth, maxH * ar) : block.clientWidth) * zoom;
+                    svg.style.width = Math.floor(w) + "px";
+                    svg.style.height = "auto";
+                    svg.style.maxHeight = Math.floor(maxH * zoom) + "px";
+                }
             }
             else if (block.__svgStyleBackup != null) {
                 svg.setAttribute("style", block.__svgStyleBackup);
@@ -669,8 +678,26 @@
         block.dataset.mermaidState = "pending";
         scheduleMermaidRender(block);
     }
+    // ---------- 主题/强调色切换：重渲染已完成的 mermaid 块 ----------
+    // mermaid 配置是全局单例且 SVG 配色在渲染时固化——主题变化后仅对
+    // 「done」态块清缓存重渲染（renderMermaidInto 的缓存 key 带主题签名，
+    // 旧配色结果自然失效）；pending/rendering 态由渲染链路现读新配置，
+    // failed 态不自动重试（保留手动 ↻ 入口）。
+    function applyMermaidTheme() {
+        chatInner.querySelectorAll('.md-mermaid-block[data-mermaid-state="done"]').forEach(function (widget) {
+            const id = widget.dataset.mermaidId;
+            const holder = id ? widget.querySelector('[data-mermaid-holder="' + id + '"]') : null;
+            if (!holder || !holder.querySelector("svg"))
+                return;
+            widget.dataset.mermaidState = "rerender";
+            scheduleMermaidRender(widget);
+        });
+    }
+    document.addEventListener("themechange", applyMermaidTheme);
+    document.addEventListener("accentchange", applyMermaidTheme);
     // ---------- 导出（供其它模块经 App.* 调用） ----------
     App.finalizeMermaidBlocks = finalizeMermaidBlocks;
+    App.applyMermaidTheme = applyMermaidTheme;
     // syncSvgFullscreenLayout 为 messages.js 拆分新增导出（原模块内直接调用，现跨文件经 App.* 调用）
     App.syncSvgFullscreenLayout = syncSvgFullscreenLayout;
     // rerenderMermaid 同上（SVG/图片视图的 ↻ 重渲染按钮经 widgets 文件调用）

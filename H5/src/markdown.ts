@@ -399,15 +399,104 @@
   const MERMAID_BASE_CONFIG = {
     startOnLoad: false,
     securityLevel: "strict",
-    theme: "default",
     // v12 默认 false：语法错误时 mermaid 会把「bomb + Syntax error in text」
     // 错误 SVG 渲染进它挂在 document.body 的临时容器（#d{id}），异常路径下
     // 残留节点把页面底部撑出一大块错误图；true 时失败直接抛异常（临时元素
     // 由库内 T() 清理），错误说明走我们自己的 holder 文本展示。
     suppressErrorRendering: true,
+    // 大图上限放宽：默认 maxTextSize 50000 / maxEdges 500 会把多节点、
+    // 长标签的压力测试图截断报错；节点内边距略收紧让排版更紧凑。
+    maxTextSize: 200000,
+    maxEdges: 1500,
+    flowchart: { padding: 12 },
   };
+
+  // 主题跟随应用深浅色/强调色（themechange/accentchange 触发重渲染，见
+  // messages_canvas.ts）：深色页用深色调色板 + 透明子图底，消除默认浅色
+  // 主题在深色页上的「米黄补丁」割裂感；连线色取应用强调色 --accent-swatch。
+  // securityLevel 保持 strict（不为 htmlLabels 放松，防注入）。
+  function mermaidThemeVars(): any {
+    let theme = "light";
+    let accent = "blue";
+    let swatch = "";
+    try {
+      const root = typeof document !== "undefined" && document.documentElement;
+      if (root && root.dataset) {
+        theme = root.dataset.theme === "dark" ? "dark" : "light";
+        accent = root.dataset.accent || "blue";
+      }
+      if (root && typeof getComputedStyle === "function") {
+        swatch = String(getComputedStyle(root).getPropertyValue("--accent-swatch") || "").trim();
+      }
+    } catch (_) { /* 非浏览器环境（Node 单测）回退默认色板 */ }
+    if (!/^#[0-9a-fA-F]{3,8}$/.test(swatch)) swatch = theme === "dark" ? "#4a90e2" : "#3b6fe0";
+    return { theme: theme, accent: accent, swatch: swatch };
+  }
+
+  function mermaidThemeSignature(): string {
+    const v = mermaidThemeVars();
+    return v.theme + "|" + v.accent + "|" + v.swatch;
+  }
+
+  function buildMermaidConfig(): any {
+    const v = mermaidThemeVars();
+    const dark = v.theme === "dark";
+    const font = '"PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif';
+    const vars = dark ? {
+      darkMode: true,
+      background: "#141414",
+      fontFamily: font,
+      fontSize: "14px",
+      primaryColor: "#23272e",
+      primaryTextColor: "#e6e6e6",
+      primaryBorderColor: "#5a6068",
+      secondaryColor: "#2a2f36",
+      tertiaryColor: "#1c1f24",
+      lineColor: v.swatch,
+      textColor: "#e6e6e6",
+      mainBkg: "#23272e",
+      nodeBorder: "#5a6068",
+      clusterBkg: "transparent",
+      clusterBorder: "#4a4f57",
+      edgeLabelBackground: "#1e2126",
+      titleColor: "#e6e6e6",
+      nodeTextColor: "#e6e6e6",
+    } : {
+      darkMode: false,
+      background: "#ffffff",
+      fontFamily: font,
+      fontSize: "14px",
+      primaryColor: "#eef3ff",
+      primaryTextColor: "#1f2328",
+      primaryBorderColor: "#7d8590",
+      secondaryColor: "#f6f8fa",
+      tertiaryColor: "#ffffff",
+      lineColor: v.swatch,
+      textColor: "#1f2328",
+      mainBkg: "#eef3ff",
+      nodeBorder: "#7d8590",
+      clusterBkg: "transparent",
+      clusterBorder: "#c6ccd2",
+      edgeLabelBackground: "#ffffff",
+      titleColor: "#1f2328",
+      nodeTextColor: "#1f2328",
+    };
+    return Object.assign({}, MERMAID_BASE_CONFIG, { theme: "base", themeVariables: vars });
+  }
+
   let mermaidLoadPromise: any = null;
-  let mermaidInitPromise: any = null;
+  let mermaidAppliedSig = "";
+
+  // 主题签名变化时重新 initialize（mermaid 配置是全局单例）；签名含
+  // 深浅色/强调色/实际色值，系统主题跟随切换也能命中。
+  function applyMermaidConfigIfNeeded(): void {
+    const sig = mermaidThemeSignature();
+    if (sig === mermaidAppliedSig) return;
+    mermaidAppliedSig = sig;
+    if (global.mermaid && global.mermaid.initialize) {
+      global.mermaid.initialize(buildMermaidConfig());
+    }
+  }
 
   // 渲染结果缓存（code → svg 文本）：流式期间整块重建会为同一张图换新控件
   // id 并重复调度 mermaid.render，命中缓存可直接复用上次 SVG，省去重复解析
@@ -435,62 +524,83 @@
 
   function ensureMermaidLoaded(): Promise<any> {
     if (global.mermaid && typeof global.mermaid.render === "function") {
-      if (!mermaidInitPromise) {
-        mermaidInitPromise = Promise.resolve().then(function () {
-          if (global.mermaid.initialize) global.mermaid.initialize(MERMAID_BASE_CONFIG);
-        });
-      }
-      return mermaidInitPromise;
+      applyMermaidConfigIfNeeded();
+      return Promise.resolve();
     }
-    if (mermaidLoadPromise) return mermaidLoadPromise;
-    mermaidLoadPromise = new Promise(function (resolve: any, reject: any) {
-      const script = document.createElement("script");
-      script.src = "js/vendor/mermaid/mermaid.min.js";
-      script.onload = function () {
-        try {
-          if (global.mermaid && global.mermaid.initialize) {
-            global.mermaid.initialize(MERMAID_BASE_CONFIG);
-          }
-          resolve();
-        } catch (err) {
-          reject(err);
-        }
-      };
-      script.onerror = function () {
-        mermaidLoadPromise = null;
-        reject(new Error("mermaid.min.js 加载失败"));
-      };
-      (document.head || document.documentElement).appendChild(script);
-    });
-    return mermaidLoadPromise;
+    if (!mermaidLoadPromise) {
+      mermaidLoadPromise = new Promise(function (resolve: any, reject: any) {
+        const script = document.createElement("script");
+        script.src = "js/vendor/mermaid/mermaid.min.js";
+        script.onload = function () { resolve(); };
+        script.onerror = function () {
+          mermaidLoadPromise = null;
+          reject(new Error("mermaid.min.js 加载失败"));
+        };
+        (document.head || document.documentElement).appendChild(script);
+      });
+    }
+    return mermaidLoadPromise.then(function () { applyMermaidConfigIfNeeded(); });
+  }
+
+  // 极端宽高比阈值：超出后「contain 适配」会把图压成不可读细条（实测
+  // 1:6.4 竖图占宽 <7%、字号 4-5px）。改按宽度填满保证可读，溢出高度走
+  // 容器内滚动（.is-fit-width，见 _chat.scss），拖拽平移/滚轮/全屏复用既有链路。
+  const MERMAID_FIT_WIDTH_AR_MIN = 0.5;
+  const MERMAID_FIT_WIDTH_AR_MAX = 2.5;
+  function mermaidFitWidth(ar: any): boolean {
+    return Number.isFinite(ar) && ar > 0 &&
+      (ar < MERMAID_FIT_WIDTH_AR_MIN || ar > MERMAID_FIT_WIDTH_AR_MAX);
   }
 
   // 结果 SVG 写入 holder 并做自适应宽度处理（渲染失败态也在这里统一落）
   function applyMermaidSvg(holder: any, svg: any): void {
     holder.innerHTML = svg;
     const svgEl = holder.querySelector("svg");
+    const block = holder.closest ? holder.closest(".md-svg-block") : null;
     if (svgEl) {
       // 与 SVG 控件同款自适应（触顶收字框）：按 viewBox 比例把宽度钳到
       // min(100%, 170vh*比例)，高度随比例联动——宽图触上限时容器跟着收窄，
       // 消除 100% 宽 + 居中缩放的两侧透明留白；宽度/上限同乘 --md-zoom
       // （显示缩放通道，见 applyAdaptiveStyle 注释）
-      const vb = String(svgEl.getAttribute("viewBox") || "")
+      let vb = String(svgEl.getAttribute("viewBox") || "")
         .trim().split(/[\s,]+/).map(Number);
+      // viewBox 兜底：个别图型只给 width/height 属性而无可用 viewBox，
+      // 比例计算会失真；按数值宽高补 viewBox（百分比宽度跳过）。
+      if (!(vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
+        Number.isFinite(vb[2]) && Number.isFinite(vb[3]))) {
+        const aw = parseFloat(String(svgEl.getAttribute("width") || ""));
+        const ah = parseFloat(String(svgEl.getAttribute("height") || ""));
+        if (Number.isFinite(aw) && Number.isFinite(ah) && aw > 0 && ah > 0) {
+          vb = [0, 0, aw, ah];
+          svgEl.setAttribute("viewBox", "0 0 " + aw + " " + ah);
+        }
+      }
       if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 &&
         Number.isFinite(vb[2]) && Number.isFinite(vb[3])) {
-        // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
         const ar = Number((vb[2] / vb[3]).toFixed(6));
         svgEl.style.aspectRatio = String(ar);
-        svgEl.style.width = "calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1))";
-        svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
+        if (mermaidFitWidth(ar)) {
+          // 极端竖长/横长：填满宽度保证可读，溢出由容器滚动查看
+          svgEl.style.width = "calc(100% * var(--md-zoom, 1))";
+          svgEl.style.maxWidth = "none";
+          if (block) block.classList.add("is-fit-width");
+        } else {
+          // 与 SVG 控件同款：默认填满宽度，仅极竖长（>1.7 屏）才按高度收窄
+          svgEl.style.width = "calc(min(100%, 170vh * " + ar + ") * var(--md-zoom, 1))";
+          svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
+          if (block) block.classList.remove("is-fit-width");
+        }
         svgEl.style.height = "auto";
       } else {
         svgEl.style.maxWidth = "calc(100% * var(--md-zoom, 1))";
         svgEl.style.width = "calc(100% * var(--md-zoom, 1))";
         svgEl.style.height = "auto";
+        if (block) block.classList.remove("is-fit-width");
       }
       svgEl.style.display = "block";
       svgEl.style.margin = "0 auto";
+    } else if (block) {
+      block.classList.remove("is-fit-width");
     }
   }
 
@@ -516,7 +626,8 @@
   // opts.cachedCode：以该 key 查写结果缓存（同 code 的重建直接复用上次 SVG）。
   function renderMermaidInto(id: any, code: any, holder: any, opts: any): Promise<any> {
     opts = opts || {};
-    const cacheKey = opts.cachedCode || "";
+    // 缓存 key 带主题签名：深浅色/强调色切换后同 code 不复用旧配色 SVG
+    const cacheKey = opts.cachedCode ? mermaidThemeSignature() + "\u0001" + opts.cachedCode : "";
     if (cacheKey) {
       const cached = mermaidCacheGet(cacheKey);
       if (cached) {
@@ -1032,6 +1143,9 @@
     buildFenceWidget,
     ensureMermaidLoaded,
     renderMermaidInto,
+    mermaidFitWidth,
+    mermaidThemeSignature,
+    buildMermaidConfig,
     fullscreenIcons: { expand: FULLSCREEN_ICON_EXPAND, compress: FULLSCREEN_ICON_COMPRESS },
   };
   if (typeof module !== "undefined" && module.exports) {

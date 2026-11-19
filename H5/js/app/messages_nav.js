@@ -854,7 +854,27 @@
     // 垂直钉住由原生 position: sticky 完成；正常态按钮在右侧，钉住态移到代码块中线，
     // 以避开 topbar 右上角固定分享按钮。流式渲染后由调用方同步更新，避免异步回调闪切。
     const COPY_PIN_OFFSET = 8;
+    // 回放追赶期抑制：附接长任务时子任务/正文每渲染一段就调一次本函数，而它要
+    // 全文档查代码块并逐个读 rect（强制同步布局）。DOM 在追赶期不断长大，
+    // N 次调用 ≈ O(N²) 布局，实测 14k 帧回放里这一项独占 1.4s+。追赶期只记脏标，
+    // 关窗后统一补一次（滚动/缩放等实时路径不受影响，仍同步更新）。
+    let replayFastForward = false;
+    let copyButtonsDirty = false;
+    function setReplayFastForward(on) {
+        const next = Boolean(on);
+        if (replayFastForward === next)
+            return;
+        replayFastForward = next;
+        if (!next && copyButtonsDirty) {
+            copyButtonsDirty = false;
+            updateCodeblockCopyButtons();
+        }
+    }
     function updateCodeblockCopyButtons() {
+        if (replayFastForward) {
+            copyButtonsDirty = true;
+            return;
+        }
         if (document.body.classList.contains("sidebar-resizing"))
             return;
         const scrollRect = chatScroll.getBoundingClientRect();
@@ -926,4 +946,5 @@
     App.quoteSourceDisplay = quoteSourceDisplay;
     App.jumpToHistoryMatch = jumpToHistoryMatch;
     App.updateCodeblockCopyButtons = updateCodeblockCopyButtons;
+    App.setReplayFastForward = setReplayFastForward;
 })(window.App);

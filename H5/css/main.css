@@ -4219,7 +4219,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   height: auto;
   margin: 0 auto;
 }
-.md-svg-block.is-zoomed .md-svg-view {
+.md-svg-block.is-zoomed .md-svg-view, .md-svg-block.is-fit-width .md-svg-view {
   max-height: 85vh;
   overflow: auto;
   cursor: grab;
@@ -4331,7 +4331,7 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   height: 14px;
   z-index: 4;
 }
-.md-svg-block:fullscreen.is-zoomed .md-svg-view,
+.md-svg-block:fullscreen.is-zoomed .md-svg-view, .md-svg-block:fullscreen.is-fit-width .md-svg-view,
 .md-svg-block:fullscreen .md-svg-code {
   max-height: none;
 }
@@ -4354,6 +4354,9 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .md-svg-block:fullscreen .md-svg-view img.md-animated-svg {
   max-height: calc(100vh - 20px);
   flex: none;
+}
+.md-svg-block:fullscreen.is-fit-width .md-svg-view svg {
+  max-height: none;
 }
 .md-svg-block:fullscreen .md-svg-code .md-svg-pre {
   width: 100%;

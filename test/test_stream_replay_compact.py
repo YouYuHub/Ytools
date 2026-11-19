@@ -151,13 +151,20 @@ class CompactAttachTests(unittest.IsolatedAsyncioTestCase):
                 if chunk == frame({'replay_end': True}):
                     break
                 got.append(chunk)
-            # 30 正文 + 10 参数分片 + 1 结果 → 3 帧
-            self.assertEqual(len(got), 3)
-            self.assertEqual(payload(got[0])['content'], ''.join('正' + str(i) for i in range(30)))
-            merged_calls = payload(got[1])['tool_calls']
+            # 30 正文 + 10 参数分片 + 1 结果 → 3 帧（追赶期按预算批量下发，
+            # 一个 chunk 可含多帧，故按帧数而非 chunk 数断言）
+            merged_frames = []
+            for chunk in got:
+                for line in chunk.split('\n'):
+                    line = line.strip()
+                    if line.startswith('data:'):
+                        merged_frames.append(json.loads(line[5:].strip()))
+            self.assertEqual(len(merged_frames), 3)
+            self.assertEqual(merged_frames[0]['content'], ''.join('正' + str(i) for i in range(30)))
+            merged_calls = merged_frames[1]['tool_calls']
             self.assertEqual(len(merged_calls), 1)
             self.assertEqual(merged_calls[0]['function']['arguments'], ''.join('a' + str(i) for i in range(10)))
-            self.assertEqual(got[2], ret)
+            self.assertIn(ret, ''.join(got))  # 结构帧原字节透传
             # 排空后新帧走 live 原样直通
             live = frame({'content': 'live'})
             self.stream.emit(live)

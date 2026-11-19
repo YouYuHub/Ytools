@@ -3416,6 +3416,30 @@ async def _prepare_chat_stream(tool_request):
 
 _REPLAY_GAP_WARNING = 'data: {"warning":{"code":"STREAM_REPLAY_GAP","message":"回放日志不可用，部分早期流事件请在任务结束后重新加载完整历史。"}}\n\n'
 
+# 追赶期单次下发的预算（字符数，CJK 下字节数更大，仅作量级控制）：SSE 允许
+# 一个 chunk 含多帧（前端按行解析），把 N 次 ASGI send / 浏览器 reader.read()
+# 唤醒降为少数几次。长任务回放此前每帧一次 yield，浏览器每帧一次渲染
+# 机会 → 表现为"一点点加载十几秒"。按预算分批而非一次全发：保留批间渲染
+# 机会，极长任务不会把主线程堵在一个超长任务里。
+_SSE_REPLAY_BATCH_CHARS = 128 * 1024
+
+
+def _batch_sse_frames(frames):
+    """按预算把回放帧拼成少数 chunk（帧内容与顺序零变化）。"""
+    out = []
+    buf = []
+    size = 0
+    for frame in frames:
+        buf.append(frame)
+        size += len(frame)
+        if size >= _SSE_REPLAY_BATCH_CHARS:
+            out.append("".join(buf))
+            buf = []
+            size = 0
+    if buf:
+        out.append("".join(buf))
+    return out
+
 
 def _safe_compact_replay(pending):
     """紧凑待回放帧；紧凑自身异常时回退原字节透传（附接绝不能因此断流）。"""
@@ -3533,27 +3557,40 @@ async def tool_chat_server(
                 drain_from = seen
                 drain_t0 = time.monotonic()
                 drained, seen, replay_offset = _drain_compact_replay(stream, seen, replay_offset)
-                for drained_chunk in drained:
-                    yield drained_chunk
+                batches = _batch_sse_frames(drained)
+                for batch in batches:
+                    yield batch
                 logger.info(
-                    "附接回放紧凑快照：%d 帧 → %d 帧（%.0fms）",
-                    seen - drain_from, len(drained), (time.monotonic() - drain_t0) * 1000,
+                    "附接回放紧凑快照：%d 帧 → %d 帧 / %d 批（%.0fms）",
+                    seen - drain_from, len(drained), len(batches), (time.monotonic() - drain_t0) * 1000,
                 )
                 replay_end_pending = True
             else:
                 replay_end_pending = False
         while True:
+            # 追赶期批量下发：把当前积压帧按预算拼成一个 chunk。实时只有
+            # 一帧待发时等价于原逐帧直通（首字延迟不变）；积压越多收益越大。
+            pending = []
+            pending_chars = 0
             while seen < stream.seq:
                 chunk, seen, replay_offset, gap = stream.read_replay(seen, replay_offset)
                 if gap:
-                    yield _REPLAY_GAP_WARNING
-                yield chunk
-            if replay_end_pending:
+                    pending.append(_REPLAY_GAP_WARNING)
+                    pending_chars += len(_REPLAY_GAP_WARNING)
+                pending.append(chunk)
+                pending_chars += len(chunk)
+                if pending_chars >= _SSE_REPLAY_BATCH_CHARS:
+                    break
+            if pending:
+                yield "".join(pending)
+            # 回放结束标记必须排在全部回放帧之后：批量下发可能一次没排空，
+            # 此时不能提前发 replay_end（否则剩余回放帧被当成实时帧，去重窗口提前关闭）。
+            if replay_end_pending and seen >= stream.seq:
                 # 附接回放耗尽：此后均为实时帧（并发产生的新帧按到达顺序排在
                 # 回放之后，前端按序消费匹配，不会误删）。
                 replay_end_pending = False
                 yield f"data: {json.dumps({'replay_end': True}, ensure_ascii=False)}\n\n"
-            if stream.done:
+            if stream.done and seen >= stream.seq:
                 break
             # 心跳：模型长时间无增量输出时（长思考/慢工具/网关缓冲等），
             # SSE 连接会静默——nginx 等代理默认 60s 无数据即断连、浏览器

@@ -284,12 +284,16 @@
       if (replayWindow === next) return;
       if (next) {
         if (App.processGroups && App.processGroups.holdSync) App.processGroups.holdSync();
+        // 追赶期抑制复制按钮的全文档布局扫描（每段渲染一次 → O(N²) 强制布局）
+        if (App.setReplayFastForward) App.setReplayFastForward(true);
       } else {
         try {
           flushStagingAsLive();
           finalizeFastForward();
         } finally {
-          if (App.processGroups && App.processGroups.releaseSync) App.processGroups.releaseSync();
+          if (App.processGroups && App.releaseSync) App.processGroups.releaseSync();
+          // 关窗后统一补一次（追赶期只记脏标）
+          if (App.setReplayFastForward) App.setReplayFastForward(false);
         }
       }
       replayWindow = next;
