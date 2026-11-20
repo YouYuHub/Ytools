@@ -313,6 +313,17 @@
             item.appendChild(custom);
             askQuestions.appendChild(item);
         });
+        // 固定补充输入框（与题目数量无关，始终追加在末尾）：用户可输入问答之外
+        // 的说明；非空时随回答消息以「【补充说明】」段落发送，模型无需知道该机制。
+        const supplement = el("div", "ask-supplement");
+        supplement.appendChild(el("div", "ask-question-text", "补充说明（可选）"));
+        const supplementInput = document.createElement("textarea");
+        supplementInput.rows = 2;
+        supplementInput.className = "ask-custom ask-supplement-input";
+        supplementInput.placeholder = "问答之外想补充的内容…（填写后随回答一起发送；留空忽略）";
+        supplementInput.setAttribute("aria-label", "补充说明");
+        supplement.appendChild(supplementInput);
+        askQuestions.appendChild(supplement);
         updateAskSubmitState();
     }
     // 提交门禁：允许跳过——单题可留空（回传“（未回答）”）、多选可 0 选择提交。
@@ -395,6 +406,15 @@
             lines.push((index + 1) + ". " + (q.question || ""));
             lines.push("   答：" + (answer || "（未回答）"));
         });
+        // 补充说明：去除首尾空白与零宽字符后仍非空才附加（纯空白/零宽串视为无效）
+        const supplementField = askQuestions.querySelector(".ask-supplement-input");
+        const supplementRaw = supplementField && typeof supplementField.value === "string" ? supplementField.value : "";
+        const supplementText = supplementRaw.replace(/[\u200b\u200c\u200d\ufeff]/g, "").trim();
+        if (supplementText) {
+            lines.push("");
+            lines.push("【补充说明】");
+            lines.push(supplementText);
+        }
         const text = lines.join("\n");
         const sourceBlock = state.pendingAskBlock;
         closeAskModal();

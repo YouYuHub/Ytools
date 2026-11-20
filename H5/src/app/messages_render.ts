@@ -320,6 +320,11 @@
       msg.dataset.round = String(round);
       if (Number.isInteger(sourceEventIndex) && sourceEventIndex >= 0) {
         msg.dataset.sourceEvent = String(sourceEventIndex);
+        // 中途注入的引导消息（同轮非首条提问）：删除入口只删消息本身。
+        // 判定口径与 history_parser 一致——source_event_index > 0 即非本轮
+        // 首个事件；首条提问恒为 events[0]（含旧数据），流内 message_injected
+        // 插入的气泡也带该标记（见 stream_pipeline）。
+        if (sourceEventIndex > 0) msg.dataset.midRound = "1";
       }
       msg._editData = { content: content, round: round, quotes: quotes || [] };
       App.attachUserEditAction(msg);

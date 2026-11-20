@@ -477,6 +477,17 @@ interface HistoryParserApi {
       }
       const orderedEvents: Array<{ event: any; eventIndex: number }> = [];
       let compactionIndex = 0;
+      // 轮内首条真实用户提问的事件下标：其后的用户消息是运行中注入的
+      // 引导消息（midRound），删除入口只删消息本身，不整轮删除。
+      let firstUserEventIndex = -1;
+      for (let i = 0; i < obj.events.length; i += 1) {
+        const evt = obj.events[i];
+        if (evt && typeof evt === "object" && evt.role === "user" && evt.content
+            && evt.content !== "停止任务" && !evt._internal) {
+          firstUserEventIndex = i;
+          break;
+        }
+      }
       for (let eventIndex = 0; eventIndex <= obj.events.length; eventIndex += 1) {
         // 把任务中独立落盘的历史压缩事件合并回 pending chat_round.events。
         // 锚点表示压缩发生时已经写入的轮内事件数量；相同锚点保持 JSONL 写入顺序。
@@ -529,6 +540,10 @@ interface HistoryParserApi {
             kind: "user", content: evt.content, ts: ts, round: roundNo,
             source_event_index: eventIndex,
           };
+          // 中途注入的引导消息：非本轮首条提问（含旧数据无标记的场景）
+          if (firstUserEventIndex >= 0 && eventIndex > firstUserEventIndex) {
+            (userRec as any).midRound = true;
+          }
           // 引用快照（选中文本引用到提问）：透传给渲染层绘制引用卡片；
           // 旧记录无该字段时正常回放（不显示卡片）
           if (Array.isArray(evt.quotes) && evt.quotes.length) userRec.quotes = evt.quotes;

@@ -666,6 +666,32 @@ def video_max_read_seconds() -> int:
     return max(5, min(3600, value))
 
 
+# 单次注入的视频时长下限（秒）：部分供应商（实测 qwen/dashscope）对过短
+# 视频直接报 invalid_parameter_error "The video file is too short."。
+# 请求区间不足下限时自动向后扩展（优先保持 start 不动；贴近片尾时向前
+# 平移），保证切片满足供应商要求。可由 .env 的 VIDEO_MIN_READ_SECONDS
+# 配置（热重载同上限口径）；0 = 关闭下限（保留旧行为）。
+DEFAULT_VIDEO_MIN_READ_SECONDS = 3
+VIDEO_MIN_READ_SECONDS_ENV = "VIDEO_MIN_READ_SECONDS"
+
+
+def video_min_read_seconds() -> float:
+    """视频单次读取下限（秒）：动态读取 .env，钳制在 0 ~ 单次上限之间。
+
+    非法值回退默认 3；负数按 0（关闭）；大于单次上限时钳到上限
+    （否则任何区间都无法满足下限）。允许小数（如 2.5）。
+    """
+    from env_manager import load_var
+
+    try:
+        value = float(load_var(VIDEO_MIN_READ_SECONDS_ENV, DEFAULT_VIDEO_MIN_READ_SECONDS))
+    except (TypeError, ValueError):
+        return float(DEFAULT_VIDEO_MIN_READ_SECONDS)
+    if value != value:  # NaN
+        return float(DEFAULT_VIDEO_MIN_READ_SECONDS)
+    return max(0.0, min(float(video_max_read_seconds()), value))
+
+
 # ---------- 原生文档（模型 supportDocTypes 声明的文件输入） ----------
 # read_document 按目标扩展名和模型 supportDocTypes 选择原生/文本模式，与
 # vision 图片能力分开判断。原生部件只随下一次模型请求发送一次；完整响应后
@@ -1146,6 +1172,36 @@ def _snap_frame_time(seconds: float, fps: float) -> float:
     return round(int(seconds * fps + 0.5) / fps, 6)
 
 
+def _enforce_video_min_span(
+    s: float, e: float, duration: float | None, fps: float,
+) -> tuple[float, float, bool]:
+    """区间不足供应商最短时长要求时按帧扩展，返回 (新start, 新end, 是否扩展)。
+
+    策略：优先保持 start 不动向后补足；贴近片尾放不下时以片尾为终点向前
+    平移 start（尽量覆盖用户请求的区间）。视频总长本身不足下限时扩展到
+    全片（无法再满足供应商要求，属源素材限制，不在此报错）。duration 未知
+    （探测失败兜底）时只向后扩展、不设终点上限。全程帧对齐，无浮点漂移。
+    """
+    import math
+
+    minimum = video_min_read_seconds()
+    fps = max(fps, 1e-6)
+    if minimum <= 0 or e - s >= minimum - 1e-9:
+        return s, e, False
+    need = max(1, int(math.ceil(minimum * fps - 1e-9)))
+    sf = int(round(s * fps))
+    ef = int(round(e * fps))
+    if ef - sf >= need:
+        return s, e, False
+    total_frames = int(round(duration * fps)) if duration is not None else None
+    ef2 = sf + need
+    sf2 = sf
+    if total_frames is not None and ef2 > total_frames:
+        ef2 = total_frames
+        sf2 = max(0, ef2 - need)
+    return round(sf2 / fps, 6), round(ef2 / fps, 6), True
+
+
 def _cut_video_clip_file(
     cut_source: Path,
     out_path: Path,
@@ -1266,7 +1322,9 @@ def _build_video_range_part(
             f"{fps:.3g}fps，分辨率 {video_meta['width']}x{video_meta['height']}，"
             f"大小 {stat.st_size / (1024 * 1024):.1f}MB。"
             f"区间读取约定：start_time == end_time 仅返回元数据；"
-            f"单次最多读取 {video_max_read_seconds()} 秒（超出自动截断）。"
+            f"单次最多读取 {video_max_read_seconds()} 秒（超出自动截断）；"
+            f"短于 {video_min_read_seconds():g} 秒的区间会自动扩展到该下限"
+            "（部分供应商拒绝过短视频）。"
         )
         return {"part": {"type": "text", "text": text}, "video": video_meta, "size": None}
     if end_time is not None and e < s:
@@ -1294,6 +1352,10 @@ def _build_video_range_part(
         e = _snap_frame_time(duration, fps)
     if e <= s:
         return {"error": f"读取区间为空（{s:.3f}s ~ {e:.3f}s）：请调整区间"}
+    # 供应商最短时长要求：不足下限自动扩展（实测 qwen 对 <2s 切片报
+    # "The video file is too short."）；read 元信息回显请求区间与扩展标记
+    requested_s, requested_e = s, e
+    s, e, min_extended = _enforce_video_min_span(s, e, duration, fps)
     # 切片缓存：<原名>.clip_<start>_<end>.mp4，按源文件 mtime+size 指纹失效
     clip_path = Path(cache_dir) / f"{source_path.name}.clip_{s:.3f}_{e:.3f}.mp4"
     try:
@@ -1321,6 +1383,16 @@ def _build_video_range_part(
         "seconds": round(e - s, 3),
         "truncated": truncated,
     }
+    if min_extended:
+        video_meta["read"]["min_extended"] = True
+        video_meta["read"]["requested"] = {
+            "start": requested_s, "end": requested_e,
+            "seconds": round(requested_e - requested_s, 3),
+        }
+        video_meta["read"]["note"] = (
+            f"请求区间短于供应商最短时长要求（{video_min_read_seconds():g}s），"
+            "已自动扩展到上述实际区间后注入"
+        )
     return {
         "part": {"type": "video_url", "video_url": {"url": _media_data_url("video/mp4", clip_b64)}},
         "video": video_meta,

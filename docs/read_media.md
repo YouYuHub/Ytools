@@ -49,6 +49,8 @@
 
 读取下一段时以返回的 `video.read.end` 为起点，不直接假定请求中的结束时间已经全部读取。单次区间上限由全局 `VIDEO_MAX_READ_SECONDS` 控制，默认 60 秒，生效范围 5–3600 秒；超长区间会截断并返回实际区间。时间按帧边界吸附，实际区间可能与请求略有差异。
 
+**最短时长下限**：部分供应商（实测 qwen/dashscope）对过短视频直接报 `invalid_parameter_error: The video file is too short.`。请求区间短于 `VIDEO_MIN_READ_SECONDS`（默认 3 秒，`.env` 可配，0 = 关闭）时自动扩展：优先保持 start 不动向后补足；贴近片尾放不下时以片尾为终点向前平移 start；视频总长本身不足下限时扩展到全片。发生扩展时 `video.read` 携带 `min_extended: true`、`requested`（原始请求区间）与 `note` 说明；`start_time == end_time` 的元数据探测不受影响。
+
 `start_time=end_time` 用于元数据探测，不发送视频画面，但仍受工具加载和已知媒体类型限制检查。网络 URL 指定时间区间会直接报错；需要切片时先下载到本地。静态图片和音频不使用这两个区间参数。质量必须是整数，时间必须是非负有限数字。
 
 ## 3. 返回与回传链路

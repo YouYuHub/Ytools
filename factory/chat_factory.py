@@ -1728,6 +1728,15 @@ async def _run_chat_generation(
             injected_round = getattr(stream, "live_round_no", None)
             if isinstance(injected_round, int) and injected_round > 0:
                 injected_payload["round"] = injected_round
+            # 轮内事件下标：刚追加的用户消息必为 pending 轮 events 末条。
+            # 前端据此打「引导消息」标记——删除入口只删该消息本身而非整轮。
+            try:
+                round_store = getattr(session_chat_memory, "_round_store", None)
+                pending_events = (round_store.pending_round or {}).get("events") if round_store else None
+                if isinstance(pending_events, list) and pending_events:
+                    injected_payload["event_index"] = len(pending_events) - 1
+            except Exception:
+                pass
             await _stream_emit(
                 stream,
                 f"data: {json.dumps(injected_payload, ensure_ascii=False)}\n\n",

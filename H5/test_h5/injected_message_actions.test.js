@@ -72,6 +72,19 @@ test('新后端帧：round/timestamp 透传给 appendUserMessage（就地挂操�
   assert.deepEqual(h.cleared, [['s', 'm1']], '待注入提示按 id 清除');
 });
 
+test('新后端帧：event_index 透传为第 8 参（引导消息单条删除定位）', t => {
+  const h = harness();
+  t.after(() => h.dom.window.close());
+  h.pipe.handle({ data: { event: 'message_injected', content: '中途引导', round: 3,
+    timestamp: TS, message_id: 'mx', event_index: 5 } });
+  assert.equal(h.appended[0][7], 5);
+  // 缺字段/非法值 → null（渲染层不打 midRound 标记，向后兼容）
+  h.pipe.handle({ data: { event: 'message_injected', text: 'x', round: 3, timestamp: TS } });
+  assert.equal(h.appended[1][7], null);
+  h.pipe.handle({ data: { event: 'message_injected', text: 'x', round: 3, timestamp: TS, event_index: -2 } });
+  assert.equal(h.appended[2][7], null);
+});
+
 test('旧后端帧（无 round/timestamp）：保持旧行为 round=null/ts=null', t => {
   const h = harness();
   t.after(() => h.dom.window.close());

@@ -9084,6 +9084,21 @@ body.chat-settings-open {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+.ask-questions .ask-supplement {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.ask-questions .ask-supplement .ask-question-text {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.ask-questions .ask-supplement .ask-custom {
+  min-height: 60px;
+}
 .ask-questions .ask-question-text {
   font-size: 14.5px;
   font-weight: 600;

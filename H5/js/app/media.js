@@ -247,9 +247,11 @@
         clampPreviewZoomPan();
         applyPreviewZoom();
     });
-    // Ctrl+滚轮：以鼠标位置为中心缩放；普通滚轮不拦截（文本预览仍可滚动）
+    // 滚轮：有缩放目标（图片/视频）时直接以鼠标位置为中心缩放（预览/全屏
+    // 通用，与 SVG 控件全屏手感一致）；无目标（文本/PDF/音频等）不拦截，
+    // 文本预览仍可滚动。纯水平滚动（触控板横滑，deltaY=0）不触发缩放。
     mediaPreviewBody.addEventListener("wheel", function (e) {
-        if (!e.ctrlKey && !e.metaKey)
+        if (!e.deltaY)
             return;
         if (!previewZoomTarget())
             return;

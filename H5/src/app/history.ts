@@ -252,23 +252,30 @@
     if (!pendingImport || pendingImport.submitting) return;
     const ctx = pendingImport;
     ctx.submitting = true;
+    // 提交期间允许取消：中止本地等待并关闭弹窗（后端写入若已开始会自行完成，
+    // 刷新侧栏可见）。此前挂起 30s+ 时确认/取消全部点不动，表现为“卡死”。
+    ctx.controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     let outcome: any = null;
     importConflictSubmit.disabled = true;
+    const submitLabel = importConflictSubmit.textContent;
+    importConflictSubmit.textContent = "导入中…";
     const decisions: any = {};
     importConflictList.querySelectorAll("select.ic-choice").forEach(function (sel: any) {
       decisions[sel.dataset.sessionId] = sel.value;
     });
     try {
-      const result = await API.submitImport(ctx.file, "ask", decisions);
+      const result = await API.submitImport(ctx.file, "ask", decisions, ctx.controller && ctx.controller.signal);
       const importedList = result.imported || [];
       const skippedList = result.skipped || [];
       const failedList = result.failed || [];
       outcome = {status:importedList.length ? "imported" : failedList.length ? "failed" : "skipped", imported:importedList.length, failed:failedList.length};
       const failedMsg = failedList.length
-        ? "，失败 " + failedList.length + " 个（" + (failedList[0].session_id || "") + "…）"
+        ? "，失败 " + failedList.length + " 个（" + (failedList[0].session_id || "") + "：" + String(failedList[0].error || "未知原因").slice(0, 120) + "）"
         : "";
       if (!importedList.length) {
-        toast("没有导入任何会话（冲突已跳过" + failedMsg + "）");
+        // 全部失败时也把真实原因透出（如锁超时），不再只显示笼统的“冲突已跳过”
+        ctx.failedAttempt = failedList.length > 0;
+        toast((failedList.length ? "导入失败" : "没有导入任何会话（冲突已跳过）") + failedMsg);
         return outcome;
       }
       await App.loadSessions();
@@ -288,13 +295,21 @@
       toast(msg + failedMsg);
       return outcome;
     } catch (err) {
+      if ((err as any) && (err as any).name === "AbortError") {
+        toast("已取消本次导入等待；若服务端已在写入，稍后可从侧栏查看结果");
+        // 赋值给 outcome：finally 据此关闭弹窗（否则取消后弹窗仍停留）
+        outcome = {status:"cancelled", imported:0, failed:0};
+        return outcome;
+      }
       if (outcome && outcome.imported) toast("会话已保存，但页面刷新失败，可从侧栏重新打开：" + (err as any).message);
       else { ctx.failedAttempt = true; toast("导入失败：" + (err as any).message); }
       return outcome || {status:"failed"};
     } finally {
       ctx.submitting = false;
+      ctx.controller = null;
       if (outcome && pendingImport === ctx) closeImportConflictFn(outcome);
       importConflictSubmit.disabled = false;
+      importConflictSubmit.textContent = submitLabel;
     }
   }
 
@@ -315,7 +330,12 @@
   }
 
   function closeImportConflictFn(outcome?: any): void {
-    if (pendingImport && pendingImport.submitting) return;
+    if (pendingImport && pendingImport.submitting) {
+      // 提交等待中点击取消/Esc/遮罩：中止请求，由 confirmImport 的 catch/finally
+      // 统一收尾关闭（不再静默忽略——后端挂起时这会让取消按钮永远点不动）。
+      if (pendingImport.controller) pendingImport.controller.abort();
+      return;
+    }
     const context = pendingImport;
     importConflictModal.classList.add("hidden");
     importConflictModal.setAttribute("aria-hidden", "true");

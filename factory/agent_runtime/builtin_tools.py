@@ -1890,6 +1890,11 @@ def build_read_media_tool_definition() -> dict[str, Any]:
     video_max_read_seconds() 的延迟读取语义一致（配置热重载即生效）。
     """
     max_seconds = file_memory.video_max_read_seconds()
+    min_seconds = file_memory.video_min_read_seconds()
+    min_note = (
+        f"短于 {min_seconds:g} 秒的区间自动扩展到该下限（部分供应商拒绝过短视频），实际区间见 video.read；"
+        if min_seconds > 0 else ""
+    )
     return {
         "type": "function",
         "function": {
@@ -1898,6 +1903,7 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                 "读取图片、音频或视频，供下一次模型请求查看。每轮一次，references 合并最多 5 个来源；"
                 "仍受模型媒体配额限制，检查 loaded/skipped。"
                 f"本地/会话视频每段最多 {max_seconds} 秒，按 video.read.end 续读；"
+                + min_note +
                 "start_time=end_time 仅探测元数据。网络 URL 不支持区间。旧视频画面会回收，回看需重读。"
             ),
             "parameters": {
@@ -1931,6 +1937,7 @@ def build_read_media_tool_definition() -> dict[str, Any]:
                         "description": (
                             "本地/会话视频或动图结束秒数；省略时读取 "
                             f"start_time 起 {max_seconds} 秒；"
+                            + (f"区间短于 {min_seconds:g} 秒自动扩展到该下限；" if min_seconds > 0 else "") +
                             "start_time == end_time 表示仅探测元数据（不回传视频数据）"
                         ),
                     },

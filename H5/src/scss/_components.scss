@@ -2608,6 +2608,25 @@ body.chat-settings-open { overflow: hidden; }
     border-radius: var(--radius-sm);
   }
 
+  // 固定补充输入框（问答之外的可选说明）：虚线边框区分于正式题目
+  .ask-supplement {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-sm);
+
+    .ask-question-text {
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+
+    .ask-custom {
+      min-height: 60px;
+    }
+  }
+
   .ask-question-text {
     font-size: 14.5px;
     font-weight: 600;

@@ -804,6 +804,7 @@ class DeleteRoundsRequest(BaseModel):
     delete_files: bool = True     # 是否连带清理该范围内不再被引用的用户上传附件
     dry_run: bool = False         # 预演：只返回明细不写盘
     keep_media_refs: list[str] = []  # 清理时排除的媒体 stored_name（编辑重发复用的附件）
+    event_index: Optional[int] = None  # 仅 single：只删该轮 events 中此下标的引导消息本身
 
 
 def _session_generation_busy(session_id: str) -> bool:
@@ -826,6 +827,8 @@ async def delete_chat_history_rounds(payload: DeleteRoundsRequest):
     - truncate：删除该轮及其后所有轮次（编辑消息重发的 GPT 同款语义）；
     - single：仅删除该轮整轮（用户消息与回复一并删除，后续轮次保留，
       轮次号自动前移）。
+    - single + event_index：只删除该轮内指定下标的一条中途注入引导消息，
+      本轮其余内容与轮次编号保持不变（首条提问不可按单条删除）。
 
     可选清理用户上传附件：媒体（media/ 图片/视频/音频）按引用计数差集
     精确判定（被删轮次引用 − 保留轮次引用），文档（files/）按上传时间窗
@@ -849,7 +852,8 @@ async def delete_chat_history_rounds(payload: DeleteRoundsRequest):
         if not payload.dry_run and has_restorable_round(session_id):
             # 参数或轮次无效时，不得先停止用户尚未决定的原任务。
             await manager.delete_rounds(start_round=payload.start_round, mode=payload.mode, delete_files=payload.delete_files,
-                                        dry_run=True, keep_media_refs=payload.keep_media_refs)
+                                        dry_run=True, keep_media_refs=payload.keep_media_refs,
+                                        event_index=payload.event_index)
             # 正式删除已由用户确认：先停止/收尾原任务，再按历史轮次删除。
             # 预演只读检查点，不能取消任务或清除审批。
             await stop_chat_task(session_id)
@@ -859,6 +863,7 @@ async def delete_chat_history_rounds(payload: DeleteRoundsRequest):
             delete_files=payload.delete_files,
             dry_run=payload.dry_run,
             keep_media_refs=payload.keep_media_refs,
+            event_index=payload.event_index,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -157,7 +157,7 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
 | /chat_history/meta | GET | session_id | `{title, user_questions, usage, created_at, updated_at, record_count, completion_count, context_summary, upload_id?}`；**只读接口**：优先仅解析首行 `_meta`（正常文件与全量重算结果一致），不再把全量内容重写回盘；首行不可靠（缺失/损坏/标题为默认值/缺 updated_at 或 user_questions）时回退全量重算兜底，两种路径均不落盘 |
 | /chat_history/title | PUT | title(必填), session_id | `{state, describe, title, meta}`；更新首行 `_meta` 的 `title` 字段，title 为空报 400 |
 | /chat_history/delete_file | DELETE | session_id | `{state, describe}`；**连带删除**该会话上传文件目录 `history_files/session_files/`（目录名取 `_meta.upload_id`，旧记录回退按 session_id 推导）；任一侧删除失败返回 500 `{detail}` |
-| /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs}` | 见下方「按轮次号删除（用户消息编辑重发）」；生成任务运行中报 409 |
+| /chat_history/delete_rounds | POST | `{session_id, start_round(必填,1-based 轮次号), mode, delete_files, dry_run, keep_media_refs, event_index?}` | 见下方「按轮次号删除（用户消息编辑重发）」；`single+event_index` 只删单条引导消息；生成任务运行中报 409 |
 | /chat_history/upload_chat_file | POST | 见下方说明 | 见下方说明 |
 | /chat_history/export_zip | GET | session_ids(逗号分隔，≤100 个) | 始终返回 ZIP；`Content-Disposition` 带 UTF-8 文件名（单会话 `<id>_chat.zip` / 多会话 `ytools_sessions_<时间戳>.zip`），`X-Skipped-Sessions` 列出不存在的会话；manifest v3 携带分组和仅所选会话配置的权限 SQLite 快照；详见下方「会话分享 / 导入」 |
 | /chat_history/import_preview | POST | 见下方说明 | 见下方说明 |
@@ -182,7 +182,8 @@ H5 客户端将执行阶段与连接状态分别记录：`[DONE]` 表示流正�
   - `mode`：`truncate`=删除该轮及其后所有轮次（编辑重发 GPT 语义）｜`single`=仅删除该轮整轮（用户消息与回复一并删除，后续轮次保留并前移）；
   - `delete_files`(默认 true)：连带清理该删除范围内引用、且保留内容不再引用的**用户上传附件**（媒体按引用差集精确判定；文档按上传时间窗近似判定）。**不动模型文件版本链与 diff**；
   - `dry_run`(默认 false)：预演——只返回明细不写盘不删文件；
-  - `keep_media_refs`：清理时排除的媒体 stored_name（编辑重发时被编辑消息的复用附件）。
+  - `keep_media_refs`：清理时排除的媒体 stored_name（编辑重发时被编辑消息的复用附件）；
+  - `event_index`(可选，仅 `single`)：只删除该轮 `events` 中此下标的**一条中途注入引导消息**，本轮其余内容与轮次编号保持不变（返回 `scope: "message"`、`removed_messages: 1`、`removed_rounds: 0`）。目标必须是真实用户消息且非本轮首条提问（首条承载轮次身份，删它请走整轮删除）；附件清理只做媒体引用差集，不按时间窗猜测文档归属。前端引导气泡（同轮非首条 user 消息）的「删除」按钮自动走此路径。
 - **返回**：dry_run 时 `{state: "planned", planned_rounds: [{round, question, status}], planned_files: {media_files, doc_files}}`；正式执行 `{state: "succeed", removed_rounds, planned_*, files_cleanup: {removed, failed}, meta_after, usage_after}`。
 - **一致性保障**：写盘前在 `history_files/sidecars/<历史文件>.bak` 生成覆盖式侧车备份；`context_summary` 不丢弃——`adjust_context_summary_for_deleted_rounds` 按删除位置平移游标/块范围/问题编号三处锚点，摘要继续生效（见 compact.md §6）；meta（usage/user_questions/标题）按剩余条目重算。
 

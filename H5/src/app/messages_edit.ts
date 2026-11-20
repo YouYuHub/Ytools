@@ -87,7 +87,12 @@
     // hover 显示，点击弹确认框，确认后走 single 删除并重载会话
     const deleteBtn = el("button", "msg-user-action-btn msg-user-delete-btn");
     deleteBtn.type = "button";
-    deleteBtn.title = "删除该轮对话（含该轮回复，后续轮次保留）";
+    // 中途注入的引导消息：只删这条消息本身，不连带整轮
+    if (msg.dataset && msg.dataset.midRound === "1") {
+      deleteBtn.title = "删除这条引导消息（仅本条，所属轮次与其他内容保留）";
+    } else {
+      deleteBtn.title = "删除该轮对话（含该轮回复，后续轮次保留）";
+    }
     deleteBtn.innerHTML = EDIT_TRASH_ICON + '<span class="msg-user-action-label">删除</span>';
     deleteBtn.addEventListener("click", function () { requestDeleteRound(msg); });
 
@@ -151,6 +156,28 @@
       App.toast("会话正在生成回复，请等待完成或停止后再删除");
       return;
     }
+    // 引导消息（运行中插入的 user 消息）：只删该消息事件本身。此前一律按
+    // data-round 走 single 整轮删除，会把本轮最初的提问与全部回复一起删掉。
+    const eventIndex = msg.dataset && msg.dataset.sourceEvent != null ? Number(msg.dataset.sourceEvent) : NaN;
+    const isMidRound = msg.dataset && msg.dataset.midRound === "1"
+      && Number.isInteger(eventIndex) && eventIndex > 0;
+    if (isMidRound) {
+      const previewText = contentToPlainText(data.content).slice(0, 60);
+      const doDelete = function () { performDeleteInjectedMessage(round, eventIndex); };
+      if (typeof App.openConfirmDialog !== "function") {
+        if (!window.confirm("确认删除这条引导消息？仅删除本条，所属轮次的提问与回复保留。")) return;
+        doDelete();
+        return;
+      }
+      App.openConfirmDialog({
+        title: "删除引导消息",
+        message: "将只删除这条运行中插入的引导消息" + (previewText ? "（“" + previewText + "…”）" : "") +
+          "，第 " + round + " 轮的原始提问、回复与其他内容保留。确认删除？",
+        confirmText: "确认删除",
+        onConfirm: doDelete,
+      });
+      return;
+    }
     if (typeof App.openConfirmDialog !== "function") {
       if (!window.confirm("确认删除第 " + round + " 轮对话？该轮回复将一并删除，后续轮次保留。")) return;
       performDeleteRound(round);
@@ -177,6 +204,20 @@
     // 删除成功：整段重载会话（data-round 与编辑数据随新解析自动刷新）
     await App.openSession(sessionId);
     App.toast("已删除第 " + round + " 轮对话");
+  }
+
+  /** 只删除轮内一条引导消息（后端 event_index 单事件删除），随后重载会话。 */
+  async function performDeleteInjectedMessage(round: any, eventIndex: any) {
+    const sessionId = App.state.sessionId;
+    if (!sessionId) return;
+    try {
+      await API.deleteRounds(sessionId, round, { mode: "single", deleteFiles: true, eventIndex: eventIndex });
+    } catch (err) {
+      App.toast("删除引导消息失败：" + (err as any).message);
+      return;
+    }
+    await App.openSession(sessionId);
+    App.toast("已删除该引导消息（所属轮次保留）");
   }
 
   /**

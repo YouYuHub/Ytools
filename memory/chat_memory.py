@@ -17,6 +17,7 @@ from contextlib import contextmanager, ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from contextvars import ContextVar
 
 # fastapi
 from fastapi import HTTPException
@@ -60,6 +61,31 @@ UPLOAD_HISTORY_ROOT = HISTORY_ROOT / "session_files"
 # 跨进程写锁文件的统一存放目录：避免 *.lock 散落在历史文件根目录
 # （会话附属侧车 .todo/.pending/.bak/.tmp 同样集中在 sidecars/ 子目录）
 LOCK_ROOT = HISTORY_ROOT / "lock"
+
+# ---------- 同任务导入锁重入保护 ----------
+# OS 级文件字节锁（msvcrt/flock）不可重入：同一调用链嵌套获取同名锁会自己等
+# 自己，直到 30s 超时。ZIP 导入外层持 import-<源ID>.lock、内层 JSONL 写入按
+# 目标 ID 抢锁——全新 ID 时两把锁同名即死锁；覆盖导入时 responses 镜像回写又
+# 会在 <文件名>.lock 内部再抢同一把文件锁。用 contextvar 记录当前调用链已持有
+# 的锁路径，嵌套获取直接复用（同线程同链路本就串行，无并发风险），跨请求/跨
+# 进程仍走真实互斥。仅对显式经此入口的导入相关锁生效，其它锁行为不变。
+_HELD_IMPORT_LOCKS: ContextVar[frozenset] = ContextVar("ytools_held_import_locks", default=frozenset())
+
+
+@contextmanager
+def _reentrant_cross_process_lock(lock_path):
+    """可重入包装：当前调用链已持有同一路径锁时直接复用，否则真实加锁并登记。"""
+    key = str(Path(lock_path).resolve()).lower()
+    held = _HELD_IMPORT_LOCKS.get()
+    if key in held:
+        yield
+        return
+    with cross_process_lock(lock_path):
+        token = _HELD_IMPORT_LOCKS.set(held | {key})
+        try:
+            yield
+        finally:
+            _HELD_IMPORT_LOCKS.reset(token)
 
 # 会话附属侧车文件（进行中轮次检查点 .pending、任务计划 .todo、写前备份
 # .bak、原子写临时文件 .tmp）的统一存放目录：历史根目录只保留 *.jsonl
@@ -405,7 +431,8 @@ def update_responses_session_meta(session_id: str, state: dict[str, Any]) -> Non
     path = _get_chat_history_file(session_id)
     if not path.exists():
         return
-    with cross_process_lock(LOCK_ROOT / (path.name + ".lock")):
+    # 可重入：导入/删除链已持同文件锁时（如 responses 镜像回写）直接复用
+    with _reentrant_cross_process_lock(LOCK_ROOT / (path.name + ".lock")):
         # Read the persisted first line, not an already overlaid metadata value.
         with path.open("r", encoding="utf-8") as fp:
             row = _safe_parse_jsonl_line(fp.readline())
@@ -2151,6 +2178,7 @@ class ChatMemoryManager:
         delete_files: bool = False,
         dry_run: bool = False,
         keep_media_refs: list[str] | None = None,
+        event_index: int | None = None,
     ) -> dict[str, Any]:
         """按轮次号删除历史轮次（编辑重发 / 整轮删除的持久层入口）。
 
@@ -2164,6 +2192,10 @@ class ChatMemoryManager:
             dry_run: 预演模式——只返回将删除的轮次与文件明细，不写盘不删文件。
             keep_media_refs: 清理时排除的媒体 stored_name 列表（编辑重发时
                 编辑态保留的附件仍要复用，不能删）。
+            event_index: 仅 mode="single" 有效：只删除该轮 events 中指定下标的
+                单条用户消息（运行中注入的引导消息），本轮其余内容与轮次编号
+                保持不变；目标必须是真实用户消息（非 _internal、非首条提问、
+                非「停止任务」控制消息）。None 时保持整轮删除语义。
 
         Notes:
             跨轮累计摘要（context_summary）不随删除丢弃：游标 source_round_count、
@@ -2177,6 +2209,15 @@ class ChatMemoryManager:
         """
         if mode not in ("truncate", "single"):
             raise ValueError(f"mode 必须是 truncate 或 single，收到: {mode}")
+        if event_index is not None:
+            if mode != "single":
+                raise ValueError("event_index 仅在 mode=single 时可用")
+            try:
+                event_index = int(event_index)
+            except (TypeError, ValueError):
+                raise ValueError("event_index 必须是整数")
+            if event_index < 0:
+                raise ValueError("event_index 不能为负数")
         try:
             start_round = int(start_round)
         except (TypeError, ValueError):
@@ -2203,6 +2244,13 @@ class ChatMemoryManager:
                 raise ValueError("当前会话没有可删除的轮次")
 
             idx_start = round_positions[start_round - 1]
+            if event_index is not None:
+                # ---- 单条引导消息删除：只摘除轮内一条用户事件，不动整轮 ----
+                return self._delete_single_user_event(
+                    meta, entries, idx_start, start_round, event_index,
+                    delete_files=delete_files, dry_run=dry_run,
+                    keep_media_refs=keep_media_refs,
+                )
             if mode == "truncate":
                 idx_end = len(entries) - 1
             else:
@@ -2312,6 +2360,123 @@ class ChatMemoryManager:
                 "meta_after": meta,
                 "usage_after": meta.get("usage", {}),
             }
+
+    def _delete_single_user_event(
+        self,
+        meta: dict[str, Any],
+        entries: list[dict[str, Any]],
+        round_entry_index: int,
+        round_number: int,
+        event_index: int,
+        *,
+        delete_files: bool,
+        dry_run: bool,
+        keep_media_refs: list[str] | None,
+    ) -> dict[str, Any]:
+        """只删除轮内一条中途注入的用户引导消息，本轮其余内容与编号不变。
+
+        目标必须是真实用户消息（非 _internal、非「停止任务」），且不能是本轮
+        首条提问——首条提问承载轮次身份（question/标题/摘要锚点），删它请走
+        整轮删除。附件清理只做媒体引用差集（被删消息引用 − 保留内容引用），
+        文档没有逐消息绑定，不按时间窗猜测归属（宁漏删不误删）。
+        """
+        entry = entries[round_entry_index]
+        events = entry.get("events")
+        if not isinstance(events, list) or event_index >= len(events):
+            raise ValueError(
+                f"事件下标 {event_index} 超出该轮范围（共 "
+                f"{len(events) if isinstance(events, list) else 0} 条事件）"
+            )
+
+        def _is_real_user(evt: Any) -> bool:
+            return (
+                isinstance(evt, dict) and evt.get("role") == "user"
+                and not evt.get("_internal") and bool(evt.get("content"))
+                and evt.get("content") != "停止任务"
+            )
+
+        target = events[event_index]
+        if not _is_real_user(target):
+            raise ValueError("该下标不是可删除的用户消息（仅支持删除引导消息本身）")
+        first_user_index = next(
+            (i for i, evt in enumerate(events) if _is_real_user(evt)), None
+        )
+        if first_user_index == event_index:
+            raise ValueError("本轮首条提问不能按单条消息删除，请使用整轮删除")
+
+        new_events = events[:event_index] + events[event_index + 1:]
+        new_entry = copy.deepcopy(entry)
+        new_entry["events"] = copy.deepcopy(new_events)
+        remaining_view = entries[:round_entry_index] + [new_entry] + entries[round_entry_index + 1:]
+        removed_fragment = {"event": "chat_round", "events": [target]}
+        planned_files = self._plan_deleted_files(
+            self.session_id, [removed_fragment], remaining_view, None,
+        )
+        keep_refs = {
+            file_memory._safe_filename(str(ref)) for ref in (keep_media_refs or [])
+            if str(ref or "").strip()
+        }
+        if keep_refs:
+            planned_files["media_files"] = [
+                name for name in planned_files["media_files"] if name not in keep_refs
+            ]
+        question_text = file_memory.content_part_to_text(
+            target.get("content"), include_media_labels=False
+        ).strip()
+        planned_messages = [{
+            "round": round_number,
+            "event_index": event_index,
+            "scope": "message",
+            "question": question_text[:120],
+            "status": str(entry.get("status") or ""),
+        }]
+        total_rounds = sum(
+            1 for item in entries
+            if isinstance(item, dict) and item.get("event") == "chat_round"
+        )
+        if dry_run:
+            return {
+                "state": "planned",
+                "mode": "single",
+                "scope": "message",
+                "start_round": round_number,
+                "event_index": event_index,
+                "total_rounds": total_rounds,
+                "planned_rounds": planned_messages,
+                "planned_files": planned_files,
+                "removed_rounds": 0,
+                "files_cleanup": {"removed": [], "failed": []},
+            }
+
+        files_cleanup = {"removed": [], "failed": []}
+        if delete_files:
+            files_cleanup = self._execute_deleted_files_cleanup(self.session_id, planned_files)
+        self._backup_history_file()
+        # 覆盖该轮的摘要块隔离待重建（轮次编号不变，游标无需平移）；
+        # 未受影响块保留，避免大会话退化为原文全量回传。
+        meta["context_summary"] = _mark_summary_for_repair(
+            meta.get("context_summary"), [round_number], total_rounds=total_rounds
+        )
+        _add_context_summary_raw_round(meta, round_number)
+        entries[round_entry_index] = new_entry
+        self._invalidate_remote_history(meta, "历史引导消息已删除")
+        meta = _recompute_meta_from_entries(self.session_id, meta, entries)
+        _write_meta_and_entries(self._file_path, meta, entries)
+        return {
+            "state": "succeed",
+            "mode": "single",
+            "scope": "message",
+            "start_round": round_number,
+            "event_index": event_index,
+            "total_rounds_before": total_rounds,
+            "planned_rounds": planned_messages,
+            "planned_files": planned_files,
+            "removed_rounds": 0,
+            "removed_messages": 1,
+            "files_cleanup": files_cleanup,
+            "meta_after": meta,
+            "usage_after": meta.get("usage", {}),
+        }
 
     def _backup_history_file(self) -> None:
         """写盘前把当前历史文件复制为 <名字>.bak（sidecars/ 子目录覆盖式备份）。
@@ -4024,7 +4189,9 @@ def _import_jsonl_payload(
         if staged_upload_id is None:
             # ZIP staging already holds this source lock. Bare JSONL imports
             # must also serialize collision resolution, registration and write.
-            guard.enter_context(cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(normalize_session_id(session_id)) + ".lock")))
+            # 可重入包装：即使调用链上层已持同名导入锁（如未来新增的嵌套导入
+            # 路径），也不会自己等自己 30 秒超时；跨请求/跨进程仍互斥。
+            guard.enter_context(_reentrant_cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(normalize_session_id(session_id)) + ".lock")))
         base_meta, candidate_entries, total_lines, skipped_lines = _parse_jsonl_payload(raw_bytes)
         if not candidate_entries and skipped_lines:
             raise ValueError("文件中没有有效轮次，已拒绝用无效记录覆盖或创建会话")
@@ -4447,7 +4614,7 @@ def _write_imported_session(
     file_path.parent.mkdir(parents=True, exist_ok=True)
     # Do not instantiate a manager here: its startup normalization/recovery can
     # change the old file before an import fails and makes exact rollback hard.
-    with cross_process_lock(LOCK_ROOT / (file_path.name + ".lock")), ExitStack() as rollback_state:
+    with _reentrant_cross_process_lock(LOCK_ROOT / (file_path.name + ".lock")), ExitStack() as rollback_state:
         _assert_import_target_idle(actual_session_id)
         previous_bytes = file_path.read_bytes() if file_path.exists() else None
         rollback_state.enter_context(_retire_import_sidecars(file_path))
@@ -4718,7 +4885,7 @@ async def _import_session_with_data(
     base_id = normalize_session_id(session_id)
     from memory.storage_layout import session_root as account_session_root, files_path
     from security.authorization import session as authorize_session
-    with cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(base_id) + ".lock")):
+    with _reentrant_cross_process_lock(LOCK_ROOT / ("import-" + safe_session_id(base_id) + ".lock")):
         actual_session_id, _path, collision = _resolve_import_target(base_id, overwrite)
         actual_session_id = authorize_session(actual_session_id, create=True)
         _assert_import_target_idle(actual_session_id)

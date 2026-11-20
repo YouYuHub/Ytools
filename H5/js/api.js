@@ -388,14 +388,14 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
      * @param {Object<string,string>} [decisions] {session_id: overwrite|rename|skip}
      * @returns {Promise<{state, imported:Array, skipped:Array, failed:Array}>}
      */
-    function submitImport(file, conflictStrategy, decisions) {
+    function submitImport(file, conflictStrategy, decisions, signal) {
         const params = new URLSearchParams();
         params.set("filename", file.name);
         params.set("conflict_strategy", conflictStrategy || "ask");
         if (decisions && Object.keys(decisions).length) {
             params.set("decisions", JSON.stringify(decisions));
         }
-        return uploadRaw("/chat_history/import_package?" + params.toString(), file);
+        return uploadRaw("/chat_history/import_package?" + params.toString(), file, undefined, signal);
     }
     // ---------- 工具 ----------
     /**
@@ -882,6 +882,7 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
      * @param {number} startRound 1-based 轮次号（第 N 个 chat_round）
      * @param {{mode?:string, deleteFiles?:boolean, dryRun?:boolean}} [opts]
      *   mode: "truncate"=该轮及之后全删（GPT 编辑语义）；"single"=仅删该轮整轮
+     *   eventIndex: 仅 single——只删该轮 events 中此下标的引导消息本身（不整轮删除）
      *   dryRun: true 时只返回将删除的轮次与文件明细（state="planned"），不写盘
      * @returns {Promise<object>} 后端结果（planned 明细 / succeed+meta_after）
      */
@@ -897,6 +898,7 @@ const api_url = (typeof location !== "undefined" && /^https?:$/.test(location.pr
                 delete_files: opts.deleteFiles !== false,
                 dry_run: !!opts.dryRun,
                 keep_media_refs: opts.keepMediaRefs || [],
+                ...(Number.isInteger(opts.eventIndex) && opts.eventIndex >= 0 ? { event_index: opts.eventIndex } : {}),
             }),
         });
     }

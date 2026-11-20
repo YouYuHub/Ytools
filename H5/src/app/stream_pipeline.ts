@@ -619,6 +619,10 @@
         // 复制/编辑」操作行与时间戳，与刷新后的历史回放一致；旧后端缺字段时
         // 保持旧行为（round=null 不挂入口，收尾重载随历史回放补挂）。
         const injectedRound = typeof data.round === "number" && data.round > 0 ? data.round : null;
+        // event_index（新后端）：轮内事件下标，>0 即中途引导消息——渲染层据此
+        // 打 midRound 标记，删除入口只删该消息本身；旧后端缺字段时不打标，
+        // 收尾重载随历史回放补挂。
+        const injectedEventIndex = Number.isInteger(data.event_index) && data.event_index >= 0 ? data.event_index : null;
         App.appendUserMessage(
           data.content || (typeof data.text === "string" ? data.text : ""),
           typeof data.timestamp === "string" && data.timestamp ? data.timestamp : null,
@@ -626,7 +630,8 @@
           null,
           msg,
           injectedRound,
-          data.quotes || []
+          data.quotes || [],
+          injectedEventIndex
         );
         App.rebuildQnav();
         if (!replayWindow) stickToBottom();

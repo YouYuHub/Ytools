@@ -42,10 +42,11 @@ def storage_write(additional=0, *, session_id=None):
         yield None
         return
     if session_id is not None:
-        from memory.chat_memory import LOCK_ROOT
+        from memory.chat_memory import LOCK_ROOT, _reentrant_cross_process_lock
         from memory.storage_layout import safe_session_id
-        from util.file_lock import cross_process_lock
-        with cross_process_lock(LOCK_ROOT / (safe_session_id(session_id) + "_chat.jsonl.lock")):
+        # 可重入：导入/删除链已持同文件锁时直接复用（OS 文件锁不可重入，
+        # 同链路嵌套获取会自己等自己直到 30s 超时）
+        with _reentrant_cross_process_lock(LOCK_ROOT / (safe_session_id(session_id) + "_chat.jsonl.lock")):
             from memory.session_catalog import get, BLOCKED
             row = get(principal.store, session_id)
             if row is None or row["owner"] != principal.user_id or row["state"] in BLOCKED:
