@@ -94,7 +94,7 @@ test("setChatModelConfig: 写缓存并原子重绘状态条（文本/title/可�
   assert.equal(ok, true);
   assert.equal(env.state.modelConfigs.chat_model.role_info.selection.model, "模型 A");
   assert.equal(env.app.contextTokenModel.textContent, "模型 A");
-  assert.equal(env.app.contextTokenModel.title, "当前聊天模型：模型 A");
+  assert.equal(env.app.contextTokenModel.title, "当前聊天模型：供应商 / 模型 A");
   assert.equal(env.app.contextTokenModel.classList.contains("hidden"), false);
   // 全程零网络请求：单一入口只做本地写入与渲染
   assert.equal(env.calls.getModels, 0);
@@ -196,4 +196,65 @@ test("refreshChatModelLabel: 拉取失败保留现有显示（不误清）", asy
   env.pending[0].reject(new Error("network down"));
   assert.equal(await p, false);
   assert.equal(env.app.contextTokenModel.textContent, "已有模型");
+});
+
+test("renderChatModelLabel: tooltip 透出供应商与协议（vendor/api_type）", function () {
+  const env = loadStatsModule({ sessionId: null });
+  env.state.modelConfigs = {
+    chat_model: {
+      role_info: {
+        selection: {
+          provider: "Qwen Completions",
+          model: "Qwen3.7 Max",
+          vendor: "custom_endpoint",
+          api_type: "chat_completions",
+        },
+      },
+    },
+  };
+
+  env.app.renderChatModelLabel();
+
+  assert.equal(env.app.contextTokenModel.textContent, "Qwen3.7 Max");
+  assert.equal(
+    env.app.contextTokenModel.title,
+    "当前聊天模型：Qwen Completions / Qwen3.7 Max（供应商：custom_endpoint · chat_completions）"
+  );
+});
+
+test("renderChatModelLabel: 旧后端缺 vendor/api_type 时省略对应段", function () {
+  const env = loadStatsModule({ sessionId: null });
+  env.state.modelConfigs = {
+    chat_model: { role_info: { selection: { provider: "分组", model: "模型" } } },
+  };
+
+  env.app.renderChatModelLabel();
+
+  assert.equal(env.app.contextTokenModel.textContent, "模型");
+  assert.equal(env.app.contextTokenModel.title, "当前聊天模型：分组 / 模型");
+});
+
+test("renderChatModelLabel: 缺 provider 降级只显示模型名（旧行为）", function () {
+  const env = loadStatsModule({ sessionId: null });
+  env.state.modelConfigs = {
+    chat_model: { role_info: { selection: { model: "孤立模型", vendor: "deepseek" } } },
+  };
+
+  env.app.renderChatModelLabel();
+
+  assert.equal(env.app.contextTokenModel.textContent, "孤立模型");
+  assert.equal(env.app.contextTokenModel.title, "当前聊天模型：孤立模型（供应商：deepseek）");
+});
+
+test("renderChatModelLabel: 缺模型名时隐藏（空 provider 不独显）", function () {
+  const env = loadStatsModule({ sessionId: null });
+  env.state.modelConfigs = {
+    chat_model: { role_info: { selection: { provider: "只有分组" } } },
+  };
+
+  env.app.renderChatModelLabel();
+
+  assert.equal(env.app.contextTokenModel.textContent, "");
+  assert.equal(env.app.contextTokenModel.title, "");
+  assert.equal(env.app.contextTokenModel.classList.contains("hidden"), true);
 });

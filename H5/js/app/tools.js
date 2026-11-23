@@ -356,24 +356,34 @@
     function updateToolSelected() {
         toolSelected.textContent = "已选 " + state.draftTools.size + " 项";
     }
+    // 工具是否可勾选：当前模型不支持视觉时 read_media 不可用（置灰禁用）。
+    // 分组全选/行渲染/勾选守卫统一走此口径。
+    function isToolSelectable(name) {
+        return !(name === "read_media" && !App.getChatModelVision());
+    }
     function updateGroupCheckbox(checkbox, tools) {
-        const selectedCount = tools.filter(function (tool) { return state.draftTools.has(tool.name); }).length;
-        checkbox.checked = tools.length > 0 && selectedCount === tools.length;
-        checkbox.indeterminate = selectedCount > 0 && selectedCount < tools.length;
+        // 分母只计可选工具：被模型能力禁用的工具永选不上，若计入分母，
+        // 一键全选后分组框永远是半选态（selectedCount 恒小于 tools.length）。
+        const selectable = tools.filter(function (tool) { return isToolSelectable(tool.name); });
+        const selectedCount = selectable.filter(function (tool) { return state.draftTools.has(tool.name); }).length;
+        checkbox.checked = selectable.length > 0 && selectedCount === selectable.length;
+        checkbox.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
         const group = checkbox.closest(".tool-group");
         if (group) {
             group.classList.toggle("has-selection", selectedCount > 0);
             const count = group.querySelector(".tool-group-count");
             if (count) {
-                count.textContent = selectedCount + " / " + tools.length;
-                count.title = "已选 " + selectedCount + " 项，共 " + tools.length + " 项";
+                const blocked = tools.length - selectable.length;
+                count.textContent = selectedCount + " / " + selectable.length;
+                count.title = "已选 " + selectedCount + " 项，共 " + selectable.length + " 项可选" +
+                    (blocked ? "（" + blocked + " 项当前模型不可用）" : "");
             }
         }
     }
     function toggleDraftTool(name, checked) {
-        // 当前模型不支持视觉（vision=false）时 read_media 不可用：勾选守卫，
-        // 整组全选/单独勾选/行点击三条路径都经过这里统一拦截
-        if (checked && name === "read_media" && !App.getChatModelVision())
+        // 勾选守卫：整组全选/单独勾选/行点击三条路径都经过这里统一拦截
+        // （当前模型不支持视觉时 read_media 不可用，取消勾选不受影响）
+        if (checked && !isToolSelectable(name))
             return;
         if (checked)
             state.draftTools.add(name);
@@ -423,9 +433,12 @@
             const groupCheck = document.createElement("input");
             groupCheck.type = "checkbox";
             groupCheck.className = "tool-group-check";
-            groupCheck.title = "选择此服务下的全部工具";
-            groupCheck.setAttribute("aria-label", "选择“" + groupLabel + "”的全部工具");
-            groupCheck.disabled = !allTools.length;
+            const blockedCount = allTools.filter(function (tool) { return !isToolSelectable(tool.name); }).length;
+            groupCheck.title = blockedCount
+                ? "选择此服务下的全部可选工具（" + blockedCount + " 项当前模型不可用）"
+                : "选择此服务下的全部工具";
+            groupCheck.setAttribute("aria-label", "选择“" + groupLabel + "”的全部" + (blockedCount ? "可选" : "") + "工具");
+            groupCheck.disabled = !allTools.length || blockedCount === allTools.length;
             const toggle = el("button", "tool-group-toggle");
             toggle.type = "button";
             toggle.innerHTML =
@@ -536,7 +549,7 @@
                         ? "模型调用名：" + tool.name
                         : tool.name;
                     // read_media 在当前模型不支持视觉时置灰禁用（勾选路径已统一守卫）
-                    const rowVisionBlocked = visionBlocked && tool.name === "read_media";
+                    const rowVisionBlocked = !isToolSelectable(tool.name);
                     if (rowVisionBlocked) {
                         checkbox.disabled = true;
                         row.classList.add("is-disabled");

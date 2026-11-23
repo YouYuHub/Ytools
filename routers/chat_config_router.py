@@ -1161,15 +1161,21 @@ def _role_info_payload(role: str, is_overridden: bool = False) -> dict:
     else:
         provider, model = selection.get("ownership_name"), selection.get("model_name")
     api_type = selection.get("api_type")
+    vendor = None
     if provider and model:
         chat_config = env_manager.get_model_config(provider, model)
         api_type = env_manager._derive_api_type(chat_config) if chat_config is not None else None
+        # 供应商标识（models.json 顶层 provider 的 vendor 字段）：前端状态栏展示
+        # “顶层归类 / 模型名”之外，用 tooltip 透出供应商与协议等完整信息
+        if isinstance(chat_config, dict):
+            vendor = str(chat_config.get("vendor") or "").strip() or None
     payload: dict[str, Any] = {
         "role": role,
         "is_overridden": is_overridden,
         "selection": {
             "provider": provider,
             "model": model,
+            "vendor": vendor,
             "api_type": api_type,
             "parameter": selection.get("parameter") or {},
             "headers": selection.get("headers") or [],

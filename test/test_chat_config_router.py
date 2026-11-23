@@ -127,6 +127,7 @@ class ChatConfigModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(role_info["role"], "chat_model")
         self.assertEqual(role_info["selection"]["provider"], "OpenCode Completions")
         self.assertEqual(role_info["selection"]["model"], "Deepseek V4 Pro")
+        self.assertEqual(role_info["selection"]["vendor"], "custom_endpoint")
         self.assertIn("parameter", role_info["selection"])
         self.assertIn("api_type", role_info["selection"])
         self.assertEqual(role_info["effective_parameter"], {})

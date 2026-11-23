@@ -1434,3 +1434,70 @@ test("完成/废弃的直播不再豁免：游离头随历史同步正常回收"
     x.close();
   }
 });
+
+test("折叠统计：压缩块计入“次压缩”（此前漏统）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.append(
+    div(x.document, "msg-time stage-time", "10:00"),
+    div(x.document, "msg-assistant-body", "第一段正文"),
+    div(x.document, "tool-block", "工具"),
+    div(x.document, "compaction-bar", "压缩摘要"),
+    div(x.document, "msg-time stage-time", "10:01"),
+    div(x.document, "msg-assistant-body", "最新一段正文"),
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const header = msg.querySelector(".round-fold-summary");
+  assert.ok(header, "应建折叠头");
+  const counts = header.querySelector(".round-fold-counts").textContent;
+  assert.match(counts, /1 次工具调用/);
+  assert.match(counts, /1 次压缩/);
+  assert.match(counts, /1 段正文/);
+  // 压缩块永不折叠（保持可见），但计入本轮统计
+  assert.equal(msg.querySelector(".compaction-bar").classList.contains("is-roundfold-hidden"), false);
+});
+
+test("折叠统计：中断态压缩块同时计压缩与异常（与 process_groups 同口径）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  const bad = div(x.document, "compaction-bar compaction-interrupted", "中断的压缩");
+  msg.append(
+    div(x.document, "msg-assistant-body", "第一段正文"),
+    bad,
+    div(x.document, "msg-assistant-body", "最新一段正文"),
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const counts = msg.querySelector(".round-fold-counts").textContent;
+  assert.match(counts, /1 次压缩/);
+  assert.match(counts, /1 项异常/);
+});
+
+test("折叠统计：无压缩块时不出现“次压缩”（零值不占位）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = liveMsg(x);
+  x.App.roundFold.sync(msg);
+  const counts = msg.querySelector(".round-fold-counts").textContent;
+  assert.doesNotMatch(counts, /压缩/);
+});
+
+test("折叠统计：尾后中断压缩块不重复计异常（liveTail 计一次即可）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.append(
+    div(x.document, "msg-assistant-body", "第一段正文"),
+    div(x.document, "msg-assistant-body", "最新一段正文"),
+    div(x.document, "compaction-bar compaction-interrupted", "尾后中断压缩"),
+  );
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const counts = msg.querySelector(".round-fold-counts").textContent;
+  assert.match(counts, /1 次压缩/);
+  assert.match(counts, /1 项异常/);
+  assert.doesNotMatch(counts, /2 项异常/);
+});

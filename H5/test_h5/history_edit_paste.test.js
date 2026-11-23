@@ -117,12 +117,12 @@ test('historical editor stages pasted screenshots beside existing media without 
   assert.equal(media.length, 2);
   assert.equal(media[0].media_ref, 'media://existing.png');
   assert.match(media[1].file.name, /^clipboard-.*\.png$/);
-  assert.equal(s.panel.querySelectorAll('.msg-edit-chip-thumb').length, 2);
+  assert.equal(s.panel.querySelectorAll('.media-thumb').length, 2);
   assert.equal(s.w.App.state.pendingMedia[0].id, 'composer-draft');
   assert.equal(s.calls.plans.length, 0); // No upload/send before confirmation.
   assert.equal(s.send.disabled, false);
   assert.equal(s.paste([], 'plain text').defaultPrevented, false);
-  s.panel.querySelector('.msg-edit-media-row .msg-edit-chip:last-child .msg-edit-chip-remove').click();
+  s.panel.querySelector('.msg-edit-attachment-blocks .media-chip:last-child .media-remove').click();
   assert.equal(s.panel._getMedia().length, 1);
   assert.deepEqual(s.calls.revoked, ['blob:edit/1']);
 });
@@ -188,7 +188,7 @@ test('preparation failures retain successful items and allow a later paste retry
   s.w.App.prepareMediaFile = file => file.name === 'bad.png' ? Promise.reject(new Error('decode failed')) : prepare(file);
   s.paste([s.file('good.png'), s.file('bad.png')]); await settle();
   assert.equal(s.panel._getMedia().length, 1);
-  assert.equal(s.panel.querySelectorAll('.msg-edit-chip-thumb').length, 1);
+  assert.equal(s.panel.querySelectorAll('.media-thumb').length, 1);
   assert.equal(s.send.disabled, false);
   assert.ok(s.calls.toasts.some(text => text.includes('附件处理失败')));
   s.paste([s.file('retry.png')]); await settle();

@@ -5,7 +5,6 @@
   --bg-sidebar: #ffffff;
   --bg-elevated: #ffffff;
   --bg-composer: #ffffff;
-  --bg-bubble-user: #ececec;
   --bg-code: #f5f5f5;
   --bg-hover: rgba(0, 0, 0, 0.06);
   --bg-active: rgba(0, 0, 0, 0.1);
@@ -69,7 +68,6 @@ html[data-theme=dark] {
 
 html[data-accent=blue] {
   --accent-swatch: #4a90e2;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -87,7 +85,6 @@ html[data-accent=green] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #1a7f4b;
   --tool-icon-pink: #177245;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -109,7 +106,6 @@ html[data-accent=purple] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #7c3aed;
   --tool-icon-pink: #6d28d9;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -132,7 +128,6 @@ html[data-accent=pink] {
   --status-running: color-mix(in srgb, var(--accent-swatch) 65%, black);
   --tool-icon-pink: color-mix(in srgb, var(--accent-swatch) 65%, black);
   /* 浅色气泡向浅色 hover 的淡粉靠近 */
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 16%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -143,8 +138,8 @@ html[data-theme=dark][data-accent=pink] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 18%, transparent);
   --status-running: var(--accent-swatch);
   --tool-icon-pink: var(--accent-swatch);
-  /* 气泡取 Windows 系统粉实测值，文字配深梅色保证对比度 */
   --bg-bubble-user: #e0aabb;
+  /* 气泡取 Windows 系统粉实测值，文字配深梅色保证对比度 */
   --bubble-text: #3d1f2e;
   /* 深色 hover/active 向系统粉提亮（白字对比度仍大于 4） */
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 40%, transparent);
@@ -157,7 +152,6 @@ html[data-accent=yellow] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #b45309;
   --tool-icon-pink: #8a5a09;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -179,7 +173,6 @@ html[data-accent=none] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #64748b;
   --tool-icon-pink: #525252;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -1653,7 +1646,7 @@ body.bulk-mode .bulk-group-empty {
 }
 .msg .msg-bubble {
   max-width: 90%;
-  background: var(--bg-bubble-user);
+  background: var(--bg-active);
   border: 1px solid var(--border);
   border-radius: 22px;
   padding: 10px 18px;
@@ -1667,6 +1660,10 @@ body.bulk-mode .bulk-group-empty {
 .msg .msg-assistant-body {
   width: 100%;
   overflow-wrap: anywhere;
+}
+
+html[data-theme=dark] .msg .msg-bubble:not(.msg-edit-bubble) {
+  background: var(--bg-bubble-user);
 }
 
 .msg-assistant-body {
@@ -3515,14 +3512,39 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 }
 .msg-user .msg-edit-bubble {
   width: 100%;
-  padding: 0;
-  background: transparent;
+  padding: 10px 12px;
+  background: var(--bg-composer);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow-soft);
+  color: var(--text);
+  --edit-fg: var(--text);
+  --edit-fg-secondary: var(--text-secondary);
 }
-.msg-user .msg-edit-media-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.msg-user .msg-edit-bubble:hover {
+  border-color: var(--border-strong);
+}
+.msg-user .msg-edit-bubble:focus-within {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 2px var(--focus-halo), var(--shadow-soft);
+}
+.msg-user .msg-edit-attachment-blocks {
+  display: grid;
+  grid-template-columns: repeat(var(--attachment-block-columns, 1), var(--attachment-block-size, 52px));
+  grid-auto-rows: var(--attachment-block-size, 52px);
+  gap: 6px;
   margin: 0 0 8px;
+}
+.msg-user .msg-edit-attachment-blocks [hidden] {
+  display: none;
+}
+.msg-user .msg-edit-attachment-blocks .composer-quotes-tile::before {
+  top: 100%;
+  bottom: auto;
+}
+.msg-user .msg-edit-attachment-blocks .composer-quotes-popover {
+  top: calc(100% + 8px);
+  bottom: auto;
 }
 .msg-user .msg-edit-upload-row {
   display: flex;
@@ -3536,104 +3558,21 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--edit-fg-secondary);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
 }
 .msg-user .msg-edit-upload:hover {
-  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
-  color: var(--text);
+  background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
+  color: var(--edit-fg);
 }
-.msg-user .msg-edit-upload-hint {
-  color: var(--text-secondary);
-  font-size: 12px;
+.msg-user .msg-edit-upload:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .msg-user .msg-edit-file-input {
   display: none;
-}
-.msg-user .msg-edit-quote-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 0 0 8px;
-}
-.msg-user .msg-edit-quote-chip {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  padding: 4px 8px;
-  border-radius: 10px;
-  border-left: 3px solid var(--accent);
-  background: color-mix(in srgb, var(--bg) 65%, transparent);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-.msg-user .msg-edit-quote-badge {
-  flex-shrink: 0;
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: var(--bg-active);
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-.msg-user .msg-edit-quote-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg-user .msg-edit-chip {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 220px;
-  padding: 4px 8px;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--bg) 65%, transparent);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-.msg-user .msg-edit-chip.clickable {
-  cursor: pointer;
-}
-.msg-user .msg-edit-chip.clickable:hover {
-  background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
-  color: var(--text);
-}
-.msg-user .msg-edit-chip-thumb {
-  width: 56px;
-  height: 44px;
-  max-width: none;
-  border-radius: 7px;
-  object-fit: cover;
-  display: block;
-}
-.msg-user .msg-edit-chip-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg-user .msg-edit-chip-remove {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 18px;
-  height: 18px;
-  border: none;
-  border-radius: 50%;
-  background: var(--bg);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-}
-.msg-user .msg-edit-chip-remove:hover {
-  color: var(--accent-contrast);
-  background: var(--danger);
 }
 .msg-user .msg-edit-textarea {
   display: block;
@@ -3644,16 +3583,14 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  background: transparent;
   color: var(--text);
   font: inherit;
   font-size: 14px;
   line-height: 1.55;
 }
-@supports not (background: color-mix(in srgb, red 50%, blue)) {
-  .msg-user .msg-edit-textarea {
-    background: var(--bg);
-  }
+.msg-user .msg-edit-textarea::placeholder {
+  color: var(--text-tertiary);
 }
 .msg-user .msg-edit-textarea:focus {
   outline: none;
@@ -3701,13 +3638,14 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
   border: none;
   border-radius: 999px;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--edit-fg-secondary);
   font-size: 12px;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .msg-user .msg-edit-mode:hover {
-  color: var(--text);
+  color: var(--edit-fg);
+  background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
 }
 .msg-user .msg-edit-mode.selected {
   background: var(--accent);
@@ -3729,10 +3667,11 @@ html[data-theme=dark] .tool-block-diff .diff-num.is-del {
 .msg-user .msg-edit-cancel {
   border: none;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--edit-fg-secondary);
 }
 .msg-user .msg-edit-cancel:hover {
-  color: var(--text);
+  color: var(--edit-fg);
+  background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
 }
 .msg-user .msg-edit-send {
   border: none;

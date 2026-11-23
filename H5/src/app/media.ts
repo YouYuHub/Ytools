@@ -109,6 +109,10 @@
     }
     mediaPreviewModal.classList.remove("hidden");
     mediaPreviewModal.setAttribute("aria-hidden", "false");
+    // 每次打开都按当前全屏态同步按钮：全屏中点 ✕ 关闭时，退出全屏的
+    // fullscreenchange 晚于 hidden 到达，旧逻辑直接 return 会把「退出全屏」
+    // 残留到下一次打开（未全屏却显示退出态，见 issue）。
+    syncMediaPreviewFullscreen();
   }
 
   // ---------- 预览缩放（图片/视频 pan & zoom） ----------
@@ -238,8 +242,11 @@
   }
   mediaPreviewFull.addEventListener("click", toggleMediaPreviewFullscreen);
   document.addEventListener("fullscreenchange", function () {
-    if (mediaPreviewModal.classList.contains("hidden")) return;
+    // 先同步按钮再判 hidden：全屏中关闭弹窗时 hidden 已加上、但退出
+    // 全屏事件随后才到，此时仍需把按钮复位为「全屏显示」，否则残留
+    // 「退出全屏」态污染下一次打开；位移钳制只在可见时做。
     syncMediaPreviewFullscreen();
+    if (mediaPreviewModal.classList.contains("hidden")) return;
     // 全屏切换改变 body 尺寸：钳制一次缩放位移，图片不飘出可视区
     clampPreviewZoomPan();
     applyPreviewZoom();

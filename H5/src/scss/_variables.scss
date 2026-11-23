@@ -7,7 +7,6 @@
   --bg-sidebar: #ffffff;
   --bg-elevated: #ffffff;
   --bg-composer: #ffffff;
-  --bg-bubble-user: #ececec;
   --bg-code: #f5f5f5;
   --bg-hover: rgba(0, 0, 0, 0.06);
   --bg-active: rgba(0, 0, 0, 0.1);
@@ -86,7 +85,6 @@ html[data-theme="dark"] {
 // 单色按钮 --accent 保持不变以保对比度。
 html[data-accent="blue"] {
   --accent-swatch: #4a90e2;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -103,7 +101,6 @@ html[data-accent="green"] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #1a7f4b;
   --tool-icon-pink: #177245;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -125,7 +122,6 @@ html[data-accent="purple"] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #7c3aed;
   --tool-icon-pink: #6d28d9;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -148,7 +144,6 @@ html[data-accent="pink"] {
   --status-running: color-mix(in srgb, var(--accent-swatch) 65%, black);
   --tool-icon-pink: color-mix(in srgb, var(--accent-swatch) 65%, black);
   /* 浅色气泡向浅色 hover 的淡粉靠近 */
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 16%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -159,8 +154,8 @@ html[data-theme="dark"][data-accent="pink"] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 18%, transparent);
   --status-running: var(--accent-swatch);
   --tool-icon-pink: var(--accent-swatch);
-  /* 气泡取 Windows 系统粉实测值，文字配深梅色保证对比度 */
   --bg-bubble-user: #e0aabb;
+  /* 气泡取 Windows 系统粉实测值，文字配深梅色保证对比度 */
   --bubble-text: #3d1f2e;
   /* 深色 hover/active 向系统粉提亮（白字对比度仍大于 4） */
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 40%, transparent);
@@ -173,7 +168,6 @@ html[data-accent="yellow"] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #b45309;
   --tool-icon-pink: #8a5a09;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }
@@ -196,7 +190,6 @@ html[data-accent="none"] {
   --focus-halo: color-mix(in srgb, var(--accent-swatch) 16%, transparent);
   --status-running: #64748b;
   --tool-icon-pink: #525252;
-  --bg-bubble-user: color-mix(in srgb, var(--accent-swatch) 32%, #ececec);
   --bg-hover: color-mix(in srgb, var(--accent-swatch) 12%, transparent);
   --bg-active: color-mix(in srgb, var(--accent-swatch) 20%, transparent);
 }

@@ -35,7 +35,9 @@
 
   .msg-bubble {
     max-width: 90%;
-    background: var(--bg-bubble-user);
+    // 浅色：与侧边栏会话选中项 / qnav 展开列表选中项同背景（--bg-active）；
+    // 深色：保持原独立气泡色（见下方 html[data-theme="dark"] 覆盖）
+    background: var(--bg-active);
     border: 1px solid var(--border);
     border-radius: 22px;
     padding: 10px 18px;
@@ -52,6 +54,12 @@
     // 在窄容器内强制断行（word-break:break-word 已废弃，改用标准属性）
     overflow-wrap: anywhere;
   }
+}
+
+// 深色模式：用户气泡保持原独立气泡色（--bg-bubble-user），不跟随 --bg-active；
+// 编辑面板自带输入框式底色，排除在外（:not 参数计特异性，普通气泡不受影响）
+html[data-theme="dark"] .msg .msg-bubble:not(.msg-edit-bubble) {
+  background: var(--bg-bubble-user);
 }
 
 // 裸 .msg-assistant-body：历史渲染直接挂在 #chatInner 下、无 .msg 包裹
@@ -2078,19 +2086,56 @@ html[data-theme="dark"] {
     display: none;
   }
 
-  // 编辑面板：附件行在输入框上方（GPT 编辑态同款），面板本身无边框
+  // 编辑面板：输入框式卡片（自带底色/边框/圆角/柔光，不再透出气泡粉）
   .msg-edit-bubble {
     width: 100%;
-    padding: 0;
-    background: transparent;
+    padding: 10px 12px;
+    background: var(--bg-composer);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow-soft);
+    // 面板自带底色：文字直接用页面色（覆盖 .msg-bubble 基类的
+    // --bubble-text 气泡字，防深梅色落在深色卡片上）
+    color: var(--text);
+    --edit-fg: var(--text);
+    --edit-fg-secondary: var(--text-secondary);
+
+    &:hover {
+      border-color: var(--border-strong);
+    }
+
+    &:focus-within {
+      border-color: var(--border-strong);
+      box-shadow: 0 0 0 2px var(--focus-halo), var(--shadow-soft);
+    }
   }
 
-  // 附件行：图片/视频显示真实缩略图，右上角浮层 × 移除（无边框芯片）
-  .msg-edit-media-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+  // 附件方块网格：与输入框 .composer-attachment-blocks 同构（52px 方块，
+  // 列数由 fitAttachmentBlockGrid 按可用宽度写入，两行封顶+N）；引用 tile +
+  // 媒体/文档 chip 共用同一容器，类名直接复用输入框那套
+  .msg-edit-attachment-blocks {
+    display: grid;
+    grid-template-columns: repeat(var(--attachment-block-columns, 1), var(--attachment-block-size, 52px));
+    grid-auto-rows: var(--attachment-block-size, 52px);
+    gap: 6px;
     margin: 0 0 8px;
+
+    [hidden] {
+      display: none;
+    }
+  }
+
+  // 引用原文浮层向下展开：输入框在底部、向上弹是安全的；编辑面板在消息流
+  // 中部，向上弹会被顶部裁掉。连同悬停桥一起翻到下方（三类选择器压过
+  // _composer 原规则——_chat 在 main.scss 中先于 _composer 编译）。
+  .msg-edit-attachment-blocks .composer-quotes-tile::before {
+    top: 100%;
+    bottom: auto;
+  }
+
+  .msg-edit-attachment-blocks .composer-quotes-popover {
+    top: calc(100% + 8px);
+    bottom: auto;
   }
 
   .msg-edit-upload-row {
@@ -2106,120 +2151,24 @@ html[data-theme="dark"] {
     border: 1px solid var(--border-strong);
     border-radius: 999px;
     background: transparent;
-    color: var(--text-secondary);
+    color: var(--edit-fg-secondary);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
 
     &:hover {
-      background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
-      color: var(--text);
+      background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
+      color: var(--edit-fg);
     }
-  }
 
-  .msg-edit-upload-hint {
-    color: var(--text-secondary);
-    font-size: 12px;
+    &:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   }
 
   .msg-edit-file-input {
     display: none;
-  }
-
-  // 引用芯片行（编辑态）：短预览 + 移除，位于附件行下方、输入框上方
-  .msg-edit-quote-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin: 0 0 8px;
-  }
-
-  .msg-edit-quote-chip {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    max-width: 100%;
-    padding: 4px 8px;
-    border-radius: 10px;
-    border-left: 3px solid var(--accent);
-    background: color-mix(in srgb, var(--bg) 65%, transparent);
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .msg-edit-quote-badge {
-    flex-shrink: 0;
-    padding: 1px 7px;
-    border-radius: 999px;
-    background: var(--bg-active);
-    color: var(--text-secondary);
-    font-size: 11px;
-  }
-
-  .msg-edit-quote-text {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .msg-edit-chip {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    max-width: 220px;
-    padding: 4px 8px;
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--bg) 65%, transparent);
-    font-size: 12px;
-    color: var(--text-secondary);
-
-    // 可点击预览的芯片：hover 提示 + 指针
-    &.clickable {
-      cursor: pointer;
-
-      &:hover {
-        background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
-        color: var(--text);
-      }
-    }
-  }
-
-  .msg-edit-chip-thumb {
-    width: 56px;
-    height: 44px;
-    max-width: none;
-    border-radius: 7px;
-    object-fit: cover;
-    display: block;
-  }
-
-  .msg-edit-chip-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .msg-edit-chip-remove {
-    position: absolute;
-    top: -6px;
-    right: -6px;
-    width: 18px;
-    height: 18px;
-    border: none;
-    border-radius: 50%;
-    background: var(--bg);
-    color: var(--text-secondary);
-    font-size: 12px;
-    line-height: 1;
-    cursor: pointer;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-
-    &:hover {
-      color: var(--accent-contrast);
-      background: var(--danger);
-    }
   }
 
   .msg-edit-textarea {
@@ -2231,14 +2180,15 @@ html[data-theme="dark"] {
     padding: 10px 12px;
     border: 1px solid var(--border);
     border-radius: 12px;
-    background: color-mix(in srgb, var(--bg) 72%, transparent);
+    // 透明融入卡片（此前半透明叠加在深色卡片上会“黑上加黑”）
+    background: transparent;
     color: var(--text);
     font: inherit;
     font-size: 14px;
     line-height: 1.55;
-    // 优雅降级：不支持 color-mix 的浏览器回退纯色
-    @supports not (background: color-mix(in srgb, red 50%, blue)) {
-      background: var(--bg);
+
+    &::placeholder {
+      color: var(--text-tertiary);
     }
 
     &:focus {
@@ -2288,18 +2238,22 @@ html[data-theme="dark"] {
     gap: 4px;
   }
 
-  // 模式切换：无边框胶囊，选中态用 accent 底色反白（明暗主题均高对比）
+  // 模式切换：无边框胶囊，选中态用 accent 底色反白（明暗主题均高对比）；
+  // 未选中态跟随气泡文字色（浅色气泡下仍清晰可辨），hover 给淡底增强可点感
   .msg-edit-mode {
     padding: 4px 12px;
     border: none;
     border-radius: 999px;
     background: transparent;
-    color: var(--text-secondary);
+    color: var(--edit-fg-secondary);
     font-size: 12px;
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
 
-    &:hover { color: var(--text); }
+    &:hover {
+      color: var(--edit-fg);
+      background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
+    }
 
     &.selected {
       background: var(--accent);
@@ -2322,13 +2276,16 @@ html[data-theme="dark"] {
     font-weight: 500;
   }
 
-  // 取消：纯文字按钮（无边框）
+  // 取消：纯文字按钮（无边框），hover 淡底 + 加深文字
   .msg-edit-cancel {
     border: none;
     background: transparent;
-    color: var(--text-secondary);
+    color: var(--edit-fg-secondary);
 
-    &:hover { color: var(--text); }
+    &:hover {
+      color: var(--edit-fg);
+      background: color-mix(in srgb, var(--edit-fg-secondary) 12%, transparent);
+    }
   }
 
   // 发送：accent 底 + accent-contrast 文字，明暗主题都有足够对比度

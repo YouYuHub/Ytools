@@ -109,6 +109,11 @@
     }
     function renderHeader(fold) {
         var tools = 0, agents = 0, bodies = 0, thinks = 0, failures = 0;
+        // 压缩计数走 fold 预计算（syncSegment 按段内全量 nodes 统计）：压缩块在
+        // EXCLUDE_SELECTOR 里永不折叠、进不了 members，从 members 里数永远是 0。
+        // 中断态同理：tail 之前的压缩块既不在 members 也不在 liveTail 里，异常会漏统。
+        var compactions = fold.compactionCount || 0;
+        failures += fold.compactionOutsideFailures || 0;
         var waiting = null, active = false;
         var times = [];
         fold.members.forEach(function (node) {
@@ -160,6 +165,8 @@
             counts.push(thinks + " 段思考");
         if (bodies)
             counts.push(bodies + " 段正文");
+        if (compactions)
+            counts.push(compactions + " 次压缩");
         if (failures)
             counts.push(failures + " 项异常");
         // 直播流等待模型时同样亮运行态（转圈 + 计时），与 foldActiveNow 同口径；
@@ -829,6 +836,20 @@
         fold.members = members;
         fold.tail = tail;
         fold.liveTail = liveTail;
+        // 段内压缩统计（renderHeader 消费）：压缩块永不折叠但属于本轮过程，
+        // 计数按段内全量 nodes 口径；中断态只补 members/liveTail 之外的
+        // （tail 之前的压缩块），liveTail 里的中断块由 renderHeader 现有判定计入。
+        var compactionCount = 0, compactionOutsideFailures = 0;
+        nodes.forEach(function (node) {
+            if (node.nodeType !== 1 || !node.matches(".compaction-bar"))
+                return;
+            compactionCount++;
+            if (node.matches(".compaction-interrupted") && liveTail.indexOf(node) < 0) {
+                compactionOutsideFailures++;
+            }
+        });
+        fold.compactionCount = compactionCount;
+        fold.compactionOutsideFailures = compactionOutsideFailures;
         // 引导段不用直播轮次起点（那是整轮开始，会把本段用时拉长回轮首）；
         // 本段起点一律用段首用户气泡时间。
         fold.allowLiveFloor = allowLiveFloor;

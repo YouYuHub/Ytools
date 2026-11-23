@@ -283,8 +283,8 @@
     textarea.rows = Math.min(10, Math.max(2, originalText.split("\n").length));
     textarea.placeholder = insertBefore ? "在此轮之前插入新消息…" : "编辑消息内容…";
 
-    // 引用芯片（编辑态）：保留/移除旧引用，也可从当前选区新增引用。
-    const quoteRow = el("div", "msg-edit-quote-row");
+    // 引用方块（编辑态）：与输入框同款“一方块+计数+悬浮原文卡”结构
+    // （见 quotes.ts renderComposerQuotes），回调接到 keptQuotes。
     const addQuoteButton = el("button", "msg-edit-upload", "引用所选文字");
     addQuoteButton.type = "button";
     addQuoteButton.title = "先在对话正文中选择一段文字，再点击添加引用";
@@ -312,130 +312,181 @@
         text: snapshot.text,
         source: QuoteUtils.normalizeQuoteSource(snapshot.source),
       });
-      renderQuoteRow();
+      renderAttachmentBlocks();
     });
-    function renderQuoteRow() {
-      quoteRow.innerHTML = "";
-      quoteRow.appendChild(addQuoteButton);
+    // 引用方块只负责向统一网格追加 tile（清空/显隐/列数由调度函数处理）
+    function renderQuoteTile() {
+      if (!keptQuotes.length) return;
+      const tile = el("div", "composer-quotes-tile");
+      const trigger = el("button", "composer-quotes-trigger");
+      trigger.type = "button";
+      trigger.title = "悬停或聚焦查看引用原文";
+      trigger.setAttribute("aria-label", "查看 " + keptQuotes.length + " 条引用原文");
+      trigger.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 4a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.4Z"/><path d="M8 10h8M8 14h5"/></svg>';
+      trigger.appendChild(el("span", "composer-quotes-count", String(keptQuotes.length)));
+      tile.appendChild(trigger);
+      const popover = el("div", "composer-quotes-popover");
+      popover.setAttribute("role", "region");
+      popover.setAttribute("aria-label", "已添加的引用原文");
       keptQuotes.forEach(function(quote: any, index: any) {
-        const chip = el("span", "msg-edit-quote-chip");
-        chip.title = quote.text;
-        chip.appendChild(el("span", "msg-edit-quote-badge", "引用 " + (index + 1)));
-        chip.appendChild(el("span", "msg-edit-quote-text",
-          (window as any).QuoteUtils ? QuoteUtils.quotePreview(quote.text, 60) : quote.text));
-        const remove = el("button", "msg-edit-chip-remove", "×");
+        const card = el("div", "composer-quote");
+        const jump = el("button", "composer-quote-jump");
+        jump.type = "button";
+        jump.title = "点击跳转到引用原文";
+        jump.setAttribute("aria-label", "跳转到引用 " + (index + 1) + " 的原文");
+        jump.addEventListener("click", function () {
+          if (App.jumpToQuoteSource) App.jumpToQuoteSource(quote.source, quote.text);
+        });
+        const head = el("span", "composer-quote-head");
+        head.appendChild(el("span", "composer-quote-badge", "引用 " + (index + 1)));
+        const label = (window as any).QuoteUtils ? QuoteUtils.quoteSourceLabel(
+          App.quoteSourceDisplay ? App.quoteSourceDisplay(quote.source, quote.text) : quote.source) : "";
+        if (label) head.appendChild(el("span", "composer-quote-source", label));
+        jump.appendChild(head);
+        jump.appendChild(el("span", "composer-quote-text", quote.text));
+        const remove = el("button", "composer-quote-remove", "×");
         remove.type = "button";
         remove.title = "移除该引用";
+        remove.setAttribute("aria-label", "移除引用 " + (index + 1));
         remove.addEventListener("click", function(event: any) {
           event.stopPropagation();
           keptQuotes.splice(index, 1);
-          renderQuoteRow();
+          renderAttachmentBlocks();
         });
-        chip.appendChild(remove);
-        quoteRow.appendChild(chip);
+        card.appendChild(jump);
+        card.appendChild(remove);
+        popover.appendChild(card);
       });
-      quoteRow.style.display = "";
+      tile.appendChild(popover);
+      blocks.appendChild(tile);
     }
-    renderQuoteRow();
 
-    // 附件芯片：旧 media:// 引用可直接复用，新选文件仅保存在浏览器内存，
-    // 确认发送后才上传；图片/视频显示缩略图，音频显示徽标
+    // 附件方块：与输入框同款 52px 方块网格（引用 tile + 媒体/文档 chip 共用
+    // 同一容器，列数经 App.fitAttachmentBlockGrid 按可用宽度适配，两行封顶+N）
     const keptMedia = mediaItems.slice();
     const editSessionId = App.state.sessionId;
     let editDisposed = false, attachmentsPending = 0;
     let attachmentQueue = Promise.resolve();
-    const mediaRow = el("div", "msg-edit-media-row");
-    const docRow = el("div", "msg-edit-media-row msg-edit-doc-row");
+    const blocks = el("div", "msg-edit-attachment-blocks");
     const uploadControls = el("div", "msg-edit-upload-row");
     const uploadButton = el("button", "msg-edit-upload", "添加图片、音视频或文档");
     uploadButton.type = "button";
-    const uploadHintText = "可直接粘贴剪贴板图片，点击发送后上传";
-    const uploadHint = el("span", "msg-edit-upload-hint", uploadHintText);
     const fileInput = el("input", "msg-edit-file-input");
     fileInput.type = "file";
     fileInput.multiple = true;
     fileInput.setAttribute("aria-label", "选择要添加到历史消息的附件");
     uploadButton.addEventListener("click", function () { fileInput.click(); });
     uploadControls.appendChild(uploadButton);
-    uploadControls.appendChild(uploadHint);
+    // 引用按钮与上传按钮同行
+    uploadControls.appendChild(addQuoteButton);
     uploadControls.appendChild(fileInput);
     function revokeObjectUrl(item: any) {
       if (!item || !item.objUrl) return;
       try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
       item.objUrl = "";
     }
-    function renderMediaRow() {
-      mediaRow.innerHTML = "";
+    // 统一调度：引用 tile + 媒体/文档 chip 共用同一方块网格（与输入框一致）
+    function renderAttachmentBlocks() {
+      // fit 挂在容器上的 +N 展开块随 innerHTML 一起销毁：先清引用，下一轮
+      // fit 会按需重建（输入框把 tile 放内层、fit 作用外层，无此问题）
+      if (blocks._attachmentMoreTile) {
+        blocks._attachmentMoreTile.remove();
+        blocks._attachmentMoreTile = null;
+      }
+      blocks.innerHTML = "";
+      renderQuoteTile();
+      renderMediaChips();
+      renderDocChips();
+      const hasBlocks = blocks.children.length > 0;
+      blocks.classList.toggle("hidden", !hasBlocks);
+      if (hasBlocks && App.fitAttachmentBlockGrid) App.fitAttachmentBlockGrid(blocks);
+    }
+    // 媒体方块：与输入框 renderComposerAttachments 同构（纯缩略图/占位，
+    // 文件名只进 title/aria，不占方块版面）
+    function renderMediaChips() {
       keptMedia.forEach(function(item: any, index: any) {
-        const chip = el("span", "msg-edit-chip");
-        const remove = el("button", "msg-edit-chip-remove", "×");
+        const chip = el("div", "media-chip");
+        const name = item.stored_name || item.name || "媒体文件";
+        chip.title = name;
+        chip.setAttribute("aria-label", name);
+        const src = item.objUrl || (item.media_ref
+          ? App.resolveMediaSrc(item.media_ref, App.state.sessionId) : "");
+        if (item.kind === "image" && src) {
+          const thumb = el("img", "media-thumb");
+          thumb.src = src;
+          thumb.alt = name;
+          thumb.title = "点击预览";
+          thumb.classList.add("clickable");
+          thumb.addEventListener("click", function () {
+            App.openMediaPreview({ type: "image", src: src, title: "图片" });
+          });
+          chip.appendChild(thumb);
+        } else if (item.kind === "video" && src) {
+          // 输入框视频无预览帧用占位；编辑态有真实 src，直接显示首帧
+          const thumb = el("video", "media-thumb");
+          thumb.src = src + "#t=0.1";
+          thumb.muted = true;
+          thumb.preload = "metadata";
+          thumb.playsInline = true;
+          thumb.title = "点击播放";
+          thumb.classList.add("clickable");
+          thumb.addEventListener("click", function () {
+            App.openMediaPreview({ type: "video", src: src, title: "视频" });
+          });
+          chip.appendChild(thumb);
+        } else if (src) {
+          const placeholder = el("div", "media-thumb media-thumb-placeholder",
+            item.kind === "audio" ? "音频" : item.kind === "video" ? "视频" : "文件");
+          placeholder.title = item.kind === "audio" ? "点击收听" : "点击预览";
+          placeholder.classList.add("clickable");
+          placeholder.addEventListener("click", function () {
+            App.openMediaPreview({
+              type: item.kind === "audio" ? "audio" : item.kind === "video" ? "video" : "download",
+              src: src, title: name,
+            });
+          });
+          chip.appendChild(placeholder);
+        } else {
+          chip.appendChild(el("div", "media-thumb media-thumb-placeholder",
+            item.kind === "audio" ? "音频" : item.kind === "video" ? "视频" : "文件"));
+        }
+        const remove = el("button", "media-remove", "✕");
         remove.type = "button";
         remove.title = "移除该附件";
         remove.addEventListener("click", function(event: any) {
           event.stopPropagation();
           revokeObjectUrl(item);
           keptMedia.splice(index, 1);
-          renderMediaRow();
+          renderAttachmentBlocks();
         });
-        const src = item.objUrl || (item.media_ref
-          ? App.resolveMediaSrc(item.media_ref, App.state.sessionId) : "");
-        if (item.kind === "image" && src) {
-          const thumb = el("img", "msg-edit-chip-thumb");
-          thumb.src = src;
-          thumb.alt = "附件图片";
-          chip.appendChild(thumb);
-          chip.appendChild(el("span", "msg-edit-chip-name", chipShortName(item.stored_name || item.name)));
-          // 点击预览（编辑态同样支持，与消息气泡缩略图一致）
-          chip.classList.add("clickable");
-          chip.title = "点击预览";
-          chip.addEventListener("click", function () {
-            App.openMediaPreview({ type: "image", src: src, title: "图片" });
-          });
-        } else if (item.kind === "video" && src) {
-          const thumb = el("video", "msg-edit-chip-thumb");
-          thumb.src = src + "#t=0.1";
-          thumb.muted = true;
-          thumb.preload = "metadata";
-          thumb.playsInline = true;
-          chip.appendChild(thumb);
-          chip.appendChild(el("span", "msg-edit-chip-name", "🎬 " + chipShortName(item.stored_name || item.name)));
-          chip.classList.add("clickable");
-          chip.title = "点击播放";
-          chip.addEventListener("click", function () {
-            App.openMediaPreview({ type: "video", src: src, title: "视频" });
-          });
-        } else if (item.kind === "audio" && src) {
-          chip.appendChild(el("span", "msg-edit-chip-name", item.name || mediaChipLabel(item.media_ref, "🎵")));
-          chip.classList.add("clickable");
-          chip.title = "点击收听";
-          chip.addEventListener("click", function () {
-            App.openMediaPreview({ type: "audio", src: src, title: "音频" });
-          });
-        } else {
-          chip.appendChild(el("span", "msg-edit-chip-name", item.name || mediaChipLabel(item.media_ref, "🎵")));
-        }
         chip.appendChild(remove);
-        mediaRow.appendChild(chip);
+        blocks.appendChild(chip);
       });
-      mediaRow.style.display = keptMedia.length ? "" : "none";
     }
-    function renderDocRow() {
-      docRow.innerHTML = "";
+    // 文档方块：与输入框待发送文档同款（图标 + 扩展名）
+    function renderDocChips() {
       keptDocs.forEach(function(item: any, index: any) {
-        const chip = el("span", "msg-edit-chip");
-        chip.appendChild(el("span", "msg-edit-chip-name", "📄 " + item.name));
-        const remove = el("button", "msg-edit-chip-remove", "×");
+        const chip = el("div", "doc-chip doc-chip-pending");
+        const icon = el("span", "doc-chip-symbol");
+        icon.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>';
+        chip.appendChild(icon);
+        const name = String(item.name || "");
+        const dot = name.lastIndexOf(".");
+        const extension = dot >= 0 && dot < name.length - 1 ? name.slice(dot + 1, dot + 5).toUpperCase() : "FILE";
+        chip.appendChild(el("span", "doc-chip-ext", extension));
+        chip.title = "待发送文档：" + (item.name || "未命名") + "；点击发送后上传并解析";
+        chip.setAttribute("aria-label", item.name || "文件");
+        const remove = el("button", "media-remove", "✕");
         remove.type = "button";
         remove.title = "移除待上传文档";
         remove.addEventListener("click", function(event: any) {
           event.stopPropagation();
           keptDocs.splice(index, 1);
-          renderDocRow();
+          renderAttachmentBlocks();
         });
         chip.appendChild(remove);
-        docRow.appendChild(chip);
+        blocks.appendChild(chip);
       });
-      docRow.style.display = keptDocs.length ? "" : "none";
     }
     async function stageEditFiles(files: any) {
       if (editDisposed || !panel.isConnected || App.state.sessionId !== editSessionId) {
@@ -481,14 +532,13 @@
           name: file.name,
         });
       }
-      renderMediaRow();
-      renderDocRow();
+      renderAttachmentBlocks();
     }
     function enqueueEditFiles(files: any) {
       if (!files.length || editDisposed) return;
       attachmentsPending++;
       sendBtn.disabled = true;
-      uploadHint.textContent = "正在处理附件…";
+      uploadButton.disabled = true;
       // 新附件使旧的发送/删除确认预览失效，处理完成后再确认当前内容。
       if (panel._confirmShown && panel._planArea) {
         panel._confirmShown = false;
@@ -497,8 +547,7 @@
       attachmentQueue = attachmentQueue.then(function () { return stageEditFiles(files); })
         .catch(function () {
           if (!editDisposed && panel.isConnected) {
-            renderMediaRow();
-            renderDocRow();
+            renderAttachmentBlocks();
             App.toast("附件处理失败，请重新粘贴或选择文件");
           }
         })
@@ -506,7 +555,7 @@
           attachmentsPending--;
           if (!editDisposed && panel.isConnected) {
             sendBtn.disabled = attachmentsPending > 0;
-            uploadHint.textContent = attachmentsPending ? "正在处理附件…" : uploadHintText;
+            uploadButton.disabled = attachmentsPending > 0;
           }
         });
     }
@@ -521,17 +570,14 @@
       event.preventDefault();
       enqueueEditFiles(files);
     });
-    renderMediaRow();
-    renderDocRow();
+    renderAttachmentBlocks();
     panel._cleanupEdit = function () {
       editDisposed = true;
       keptMedia.forEach(revokeObjectUrl);
     };
     panel.appendChild(uploadControls);
-    panel.appendChild(mediaRow);
-    panel.appendChild(docRow);
-    // 引用芯片行在附件行下方（两者都不占 textarea 文本值）
-    panel.appendChild(quoteRow);
+    // 引用/附件共用方块网格（两者都不占 textarea 文本值）
+    panel.appendChild(blocks);
     panel.appendChild(textarea);
 
     const foot = el("div", "msg-edit-foot");
@@ -543,15 +589,23 @@
     truncateBtn.type = "button";
     regenBtn.title = "删除该轮回复后原位重新生成，之后的轮次保留（其上下文不含旧回复）";
     truncateBtn.title = "删除该轮及其后所有轮次（新回复追加在末尾，GPT 同款语义）";
+    // 切换重发范围时关闭已弹出的确认条/预演明细：它们是针对旧范围生成的，
+    // 留着会造成“确认内容与当前选中范围不一致”的歧义
+    function dismissPlanConfirm() {
+      panel._confirmShown = false;
+      if (panel._planArea) panel._planArea.innerHTML = "";
+    }
     regenBtn.addEventListener("click", function () {
       mode = "regen";
       regenBtn.classList.add("selected");
       truncateBtn.classList.remove("selected");
+      dismissPlanConfirm();
     });
     truncateBtn.addEventListener("click", function () {
       mode = "truncate";
       truncateBtn.classList.add("selected");
       regenBtn.classList.remove("selected");
+      dismissPlanConfirm();
     });
     if (insertBefore) {
       modes.appendChild(el("span", "msg-edit-insert-hint", "在第 " + data.round + " 轮之前插入 · 仅使用此前上下文"));
@@ -697,7 +751,7 @@
     if (!msg || !msg.classList.contains("is-editing")) return;
     const panel = msg.querySelector(".msg-edit-bubble");
     if (panel) {
-      panel.querySelectorAll(".msg-edit-chip-thumb").forEach(function(thumb: any) {
+      panel.querySelectorAll(".media-thumb").forEach(function(thumb: any) {
         if (thumb.tagName === "VIDEO") {
           try { thumb.pause(); } catch (_) { /* ignore */ }
         }
@@ -709,24 +763,6 @@
     if (msg._editRestore) msg._editRestore.style.display = "";
     msg._editRestore = null;
     msg.classList.remove("is-editing");
-  }
-
-  // 媒体徽标文案：固定格式（图标+类型+名称），名称取 media:// 引用的存储文件名
-  function mediaChipLabel(mediaRef: any, icon: any) {
-    if (mediaRef && mediaRef.indexOf("media://") === 0) {
-      const stored = mediaRef.slice("media://".length);
-      const dot = stored.lastIndexOf(".");
-      return icon + " · " + (dot > 0 ? stored.slice(0, dot) : stored);
-    }
-    return icon;
-  }
-
-  // 附件芯片短名：stored_name 去扩展名，超长截断（缩略图芯片用）
-  function chipShortName(stored: any) {
-    if (!stored) return "附件";
-    const dot = stored.lastIndexOf(".");
-    const base = dot > 0 ? stored.slice(0, dot) : stored;
-    return base.length > 24 ? base.slice(0, 24) + "…" : base;
   }
 
   function appendStaticAssistant(content: any) {

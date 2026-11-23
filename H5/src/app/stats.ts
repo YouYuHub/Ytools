@@ -50,9 +50,20 @@
     if (!contextTokenModel) return;
     const cfg = state.modelConfigs && state.modelConfigs.chat_model;
     const sel = cfg && cfg.role_info && cfg.role_info.selection;
+    // 常态只显示模型名（与旧行为一致，不占状态栏空间）；顶层归类
+    // （models.json 顶层 provider 分组名）、供应商、协议等完整信息放 tooltip。
+    const provider = sel ? (sel.provider || sel.provider_name || sel.ownership_name || "") : "";
     const name = sel ? (sel.model || sel.model_name || "") : "";
+    const vendor = sel && typeof sel.vendor === "string" ? sel.vendor.trim() : "";
+    const apiType = sel && sel.api_type ? String(sel.api_type) : "";
+    const full = provider && name ? provider + " / " + name : name;
+    const extras: string[] = [];
+    if (vendor) extras.push("供应商：" + vendor);
+    if (apiType) extras.push(apiType);
     contextTokenModel.textContent = name;
-    contextTokenModel.title = name ? "当前聊天模型：" + name : "";
+    contextTokenModel.title = name
+      ? "当前聊天模型：" + full + (extras.length ? "（" + extras.join(" · ") + "）" : "")
+      : "";
     contextTokenModel.classList.toggle("hidden", !name);
     // 会话生效模型的视觉能力：read_media 工具可用性与附件发送提示的判定来源
     //（后端 role_info.vision 为权威值；接口失败时保守置 true，不误伤可用功能）
