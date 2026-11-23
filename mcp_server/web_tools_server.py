@@ -10,6 +10,8 @@ MCP 网页工具服务（web_tools_server）。
     web_find        在静态正文中查找字面文本，只返回匹配行、字符偏移与上下文
 
 实现说明：
+    - 本文件零项目依赖：可复制到任意目录独立运行（仅需第三方包 mcp /
+      pydantic / regex；fitz/PyMuPDF 可选，用于 PDF 文本提取）；
     - 阻塞网络请求统一通过 asyncio.to_thread
       放到工作线程执行，避免卡死 stdio 事件循环；
     - 所有大输出统一截断保护，避免撑爆模型上下文；
@@ -18,28 +20,27 @@ MCP 网页工具服务（web_tools_server）。
 # 标准库
 import asyncio
 import base64
+import codecs
+import contextvars
 import json
+import locale
+import math
 import re
 import sys
+import threading
+import time
 import zlib
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 from http.client import IncompleteRead
-from pathlib import Path
 from typing import Optional, Annotated, Literal, Union
 from pydantic import Field
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, parse_qs, urljoin
 from urllib.request import Request, urlopen
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from util.text_encoding import decode_text
-from util.tool_arguments import string_arg, int_arg, number_arg
-from util.bounded_regex import compile_pattern
-from factory.agent_runtime.tool_control import tool_deadline, remaining_seconds
+import regex
 
 # 第三方库
 try:
@@ -50,6 +51,181 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 # 创建 MCP 服务器实例
 web_mcp_server = FastMCP("web-tools-server")
+
+
+# ============================ 内联依赖（独立运行） ============================
+# 本文件刻意零项目依赖：可复制到任意目录独立运行（仅需第三方包 mcp /
+# pydantic / regex；fitz/PyMuPDF 可选，用于 PDF 文本提取）。以下 4 组辅助
+# 函数原属项目模块，此处逐行内联、行为完全一致；改动项目原模块时请同步：
+#   decode_text/order_decode_candidates  <- util/text_encoding.py
+#   string_arg/int_arg/number_arg        <- util/tool_arguments.py
+#   compile_pattern                      <- util/bounded_regex.py
+#   tool_deadline/remaining_seconds      <- factory/agent_runtime/tool_control.py
+#     （仅取截止期相关部分；run_sync_tool 为内置工具专用，此处不需要）
+
+_BOMS = ((codecs.BOM_UTF32_LE, 'utf-32'), (codecs.BOM_UTF32_BE, 'utf-32'),
+        (codecs.BOM_UTF8, 'utf-8-sig'), (codecs.BOM_UTF16_LE, 'utf-16'),
+        (codecs.BOM_UTF16_BE, 'utf-16'))
+
+
+def unicode_bom(data: bytes) -> str:
+    return next((name for bom, name in _BOMS if data.startswith(bom)), '')
+
+
+# 单字节西文代码页（ANSI/OEM）：几乎任何字节序列都能"成功"解码，若排在
+# CJK 候选之前，英文代码页服务器（cp1252 等）会把 GBK 中文静默解成西文乱码
+# （中文机器 locale=cp936 掩盖了该问题）。自动识别时统一降权到 CJK 之后。
+_SINGLE_BYTE_WESTERN = {
+    'ascii', 'cp437', 'cp850', 'cp852', 'cp866', 'mac-roman',
+    'cp1250', 'cp1251', 'cp1252', 'cp1253', 'cp1254', 'cp1255', 'cp1256', 'cp1257', 'cp1258',
+}
+
+
+def _is_single_byte_western(name: str) -> bool:
+    try:
+        canonical = codecs.lookup(name).name
+    except (LookupError, TypeError):
+        return False
+    return canonical in _SINGLE_BYTE_WESTERN or canonical.startswith('iso8859')
+
+
+def order_decode_candidates(names, ansi: str = '') -> list:
+    """自动解码候选排序：utf-8 恒最前；单字节西文代码页降到 CJK 候选之后。
+
+    西文组内部系统 ANSI 优先（比通用 latin-1 兜底更可能是真实编码）。
+    显式 encoding 不走此排序（用户指定即权威）。双字节 CJK（gbk/big5/shift_jis
+    等）与 utf-8 保持原有相对顺序。
+    """
+    ordered = list(dict.fromkeys(n for n in names if n))
+    western = [n for n in ordered if _is_single_byte_western(n)]
+    if not western:
+        return ordered
+    primary = [n for n in ordered if n not in western]
+    tail = ([ansi] if ansi in western else []) + [n for n in western if n != ansi]
+    return primary + tail
+
+
+def decode_text(data: bytes, encoding: str = '', candidates=(), *, strict=False):
+    """Explicit encoding wins; otherwise BOM, strict UTF-8, supplied/local codecs.
+
+    Detection without a BOM is ambiguous. Explicit encoding is the escape hatch.
+    Strict mode prevents lossy edits; replacement fallback is for display only.
+    """
+    if encoding:
+        return data.decode(encoding, errors='strict' if strict else 'replace'), encoding
+    bom = unicode_bom(data)
+    if bom:
+        return data.decode(bom, errors='strict' if strict else 'replace'), bom
+    locale_name = locale.getpreferredencoding(False)
+    ordered = order_decode_candidates(
+        ('utf-8', *candidates, locale_name, 'gb18030', 'big5'), ansi=locale_name)
+    for name in ordered:
+        if not name:
+            continue
+        try:
+            return data.decode(name), name
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if strict:
+        raise UnicodeError('无法可靠解码文本，请显式指定 encoding')
+    # 严格全失败的 replace 兜底：优先系统 ANSI（西文单字节文本的真实归属，
+    # 排序降权只影响"严格成功"的优先级，不应把兜底也交给 CJK 产生乱码）。
+    fallback = next((name for name in (locale_name, *ordered)
+                     if name and name.lower() not in ('utf-8', 'utf8')), 'utf-8')
+    try:
+        return data.decode(fallback, errors='replace'), fallback
+    except LookupError:
+        return data.decode('utf-8', errors='replace'), 'utf-8'
+
+
+def string_arg(args, name, default="", *, required=False, max_length=None):
+    value = args.get(name, default)
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必须是字符串")
+    if required and not value.strip():
+        raise ValueError(f"{name} 不能为空")
+    if max_length is not None and len(value) > max_length:
+        raise ValueError(f"{name} 最多 {max_length} 字符")
+    return value
+
+
+def int_arg(args, name, default, *, minimum=0, maximum=None):
+    value = args.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} 必须是整数")
+    if value < minimum or (maximum is not None and value > maximum):
+        bounds = f"{minimum}-{maximum}" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"{name} 必须为 {bounds} 的整数")
+    return value
+
+
+def number_arg(args, name, default, *, minimum=0, maximum=None):
+    value = args.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是数字")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise ValueError(f"{name} 必须是有限数字")
+    if value < minimum or (maximum is not None and value > maximum):
+        bounds = f"{minimum}-{maximum}" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"{name} 必须在 {bounds} 范围内")
+    return float(value)
+
+
+def compile_pattern(pattern, *, ignore_case=False):
+    if len(pattern) > 8192:
+        raise ValueError("pattern 最多 8192 字符；请缩小表达式")
+    try:
+        return regex.compile(pattern, regex.VERSION0 | (regex.IGNORECASE if ignore_case else 0))
+    except regex.error as exc:
+        raise ValueError(f"正则表达式不合法: {exc}") from exc
+
+
+class ToolCancelledError(RuntimeError):
+    pass
+
+
+@dataclass
+class ToolControl:
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    deadline: float | None = None
+
+
+CURRENT_CONTROL = contextvars.ContextVar("builtin_tool_control", default=None)
+
+
+def check_tool_control(*, check_deadline=True):
+    control = CURRENT_CONTROL.get()
+    if control and control.cancelled.is_set():
+        raise ToolCancelledError("任务已停止，工具执行已取消")
+    if check_deadline and control and control.deadline is not None and time.monotonic() >= control.deadline:
+        raise TimeoutError("工具执行超时")
+
+
+def remaining_seconds(default):
+    check_tool_control()
+    control = CURRENT_CONTROL.get()
+    if control and control.deadline is not None:
+        return max(0.001, min(default, control.deadline - time.monotonic()))
+    return default
+
+
+@contextmanager
+def tool_deadline(seconds):
+    previous = CURRENT_CONTROL.get()
+    deadline = time.monotonic() + seconds
+    if previous and previous.deadline is not None:
+        deadline = min(deadline, previous.deadline)
+    control = ToolControl(previous.cancelled if previous else threading.Event(), deadline)
+    token = CURRENT_CONTROL.set(control)
+    try:
+        check_tool_control()
+        yield control
+    finally:
+        CURRENT_CONTROL.reset(token)
 
 
 # ============================ 通用辅助 ============================
