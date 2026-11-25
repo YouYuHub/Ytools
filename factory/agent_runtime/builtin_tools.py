@@ -3958,6 +3958,10 @@ def _cmd_syntax_hints(command: str, exit_code, stdout_text: str, stderr_text: st
     - 命令名不存在（如 Unix 命令 ls/cat/grep）：给出 Windows 等价物或 shell=bash 建议。
     """
     hints: list = []
+    # FOR 循环变量交互式单 % 写法：批处理执行层会自动双写，给一条说明（不改命令）
+    hints.extend(_cmd_for_variable_hint(command))
+    # 字面量孤立 %：批处理层会吞掉致输出丢字符，已自动双写，给一条说明
+    hints.extend(_cmd_literal_percent_hint(command))
     segments = _split_top_level_pipes(command)
     joined = "|".join(segments)
     stripped = re.sub(r'"[^"]*"', '""', joined)
@@ -3994,6 +3998,161 @@ def _append_command_notes(text: str, notes: list) -> str:
     if not lines:
         return text
     return text + "\n" + "\n".join(lines)
+
+
+# cmd FOR 循环变量修饰符字母（%~dpnxfsatz 等）；变量本身是 token 末位字母。
+_CMD_FOR_DECL_RE = re.compile(r"\bfor\b[^%]*?(?:%%?)([a-zA-Z])\s+in\s*\(", re.IGNORECASE)
+
+
+def _normalize_cmd_for_variables(command: str, batch: bool = True):
+    """规范化 cmd FOR 循环变量的百分号写法，返回 (新命令, 是否改动)。
+
+    背景（实测真 bug）：cmd 命令经 `.run.cmd` 批处理文件执行时，FOR 循环变量
+    必须写 `%%d`（批处理语法），而模型习惯按交互式控制台写 `%d`，导致
+    `d was unexpected at this time.`、`%~nd` 报 invalid path operator。
+    本函数把【本命令中实际声明的 FOR 变量字母】的引用统一为目标写法：
+      batch=True  → 批处理双写（%d→%%d、%~nd→%%~nd）；
+      batch=False → 交互式单写（%%d→%d），供常驻控制台会话使用。
+    严格只动声明过的 FOR 变量，绝不碰：
+      - `%PATH%`/`%VAR%` 环境变量展开（成对 %…%，且变量名多字符）；
+      - `%1`…`%9`/`%*` 批处理参数（数字，不在声明字母集）；
+      - 已正确的 `%%d`（批处理）/`%d`（交互式）与 `%%` 字面量。
+    幂等：重复调用不再改动。无法识别 FOR 声明时原样返回。
+    """
+    if not command or "%" not in command:
+        return command, False
+    declared = {m.group(1) for m in _CMD_FOR_DECL_RE.finditer(command)}
+    if not declared:
+        return command, False
+    changed = False
+    if batch:
+        # 修饰符形式 %~modsX（X 为声明变量，位于字母 token 末位）→ %%~modsX
+        def _mod(m):
+            nonlocal changed
+            tok = m.group(0)
+            if tok[-1] in declared:
+                changed = True
+                return "%" + tok
+            return tok
+        command = re.sub(r"(?<!%)%~[a-zA-Z]+", _mod, command)
+        # 普通形式 %X：后随非字母数字（保护 %VAR% 环境变量名多字符；允许后随 %
+        # 以支持相邻嵌套变量 %a%b）。前置 (?<!%) 避免命中已双写的 %%X 的第二个 %。
+        for var in sorted(declared):
+            pat = re.compile(r"(?<!%)%" + re.escape(var) + r"(?![a-zA-Z0-9])")
+            new = pat.sub("%%" + var, command)
+            if new != command:
+                changed = True
+                command = new
+    else:
+        # 交互式：把双写降为单写（%%~modsX→%~modsX、%%X→%X）
+        def _mod_single(m):
+            nonlocal changed
+            tok = m.group(0)  # %%~....
+            if tok[-1] in declared:
+                changed = True
+                return tok[1:]
+            return tok
+        command = re.sub(r"%%~[a-zA-Z]+", _mod_single, command)
+        for var in sorted(declared):
+            pat = re.compile(r"%%" + re.escape(var) + r"(?![a-zA-Z0-9])")
+            new = pat.sub("%" + var, command)
+            if new != command:
+                changed = True
+                command = new
+    return command, changed
+
+
+def _cmd_for_variable_hint(command: str) -> list:
+    """检测到 FOR 循环变量用交互式单 % 写法（批处理层会自动双写）时给一条说明。"""
+    if not command or "%" not in command:
+        return []
+    _, changed = _normalize_cmd_for_variables(command, batch=True)
+    if not changed:
+        return []
+    return [
+        "检测到 FOR 循环变量使用交互式单 `%` 写法（如 `%d`/`%~nd`）：cmd 批处理执行层"
+        "要求双写 `%%d`/`%%~nd`，已自动规范化（仅转换本命令声明的 FOR 变量，不影响 "
+        "`%PATH%` 等环境变量与 `%1` 批参数）。常驻会话(session_id)为交互式控制台，单 `%` 即可。"
+    ]
+
+
+# 环境变量引用对：%NAME%（NAME 以字母/下划线开头，后随字母数字下划线）
+_CMD_ENV_PAIR_RE = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%")
+_CMD_FOR_MOD_RE = re.compile(r"%~[a-zA-Z]+")
+# 字面量孤立 % 的后随字符：非标识符起始（空白/结尾/标点），确保不是变量名/批参数
+_CMD_LITERAL_PERCENT_NEXT = re.compile(r"(?![A-Za-z0-9_%~])")
+
+
+def _escape_cmd_literal_percent(command: str):
+    """把 cmd 批处理中【明确是字面量】的孤立 `%` 双写为 `%%`，返回 (新命令, 是否改动)。
+
+    背景（实测真 bug）：批处理层会吞掉孤立 `%`（`echo 100%` 输出 `100`、
+    `echo 50% off` 输出 `50 off`），静默丢数据。本函数用左到右扫描精确分类每个 `%`：
+      - `%%` 字面量、`%~modsX` FOR 修饰符、`%数字` 批参数、`%NAME%` 环境变量对：原样保留；
+      - 其余孤立 `%` 且后随非标识符字符（空白/结尾/标点）：判定为字面量，双写 `%%`。
+    只动无歧义的字面量 `%`（如 `100%`、`50% off`、`(50%)`），绝不碰 `%PATH%`/`%1`/
+    FOR 变量/`%NAME` 这类可能有意展开的写法。须在 FOR 变量规范化之后调用（此时 FOR
+    变量已是 `%%X`，扫描会跳过）。幂等。
+    """
+    if not command or "%" not in command:
+        return command, False
+    out = []
+    i = 0
+    n = len(command)
+    changed = False
+    while i < n:
+        ch = command[i]
+        if ch != "%":
+            out.append(ch)
+            i += 1
+            continue
+        # %% 字面量
+        if command[i:i + 2] == "%%":
+            out.append("%%")
+            i += 2
+            continue
+        # %~modsX FOR 修饰符（已规范化为 %%~ 时上面 %% 分支已处理首个 %）
+        m = _CMD_FOR_MOD_RE.match(command, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        # %数字 批参数（run_command 无批参数传入，但保留写法不擅改）
+        if i + 1 < n and command[i + 1].isdigit():
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        # %NAME% 环境变量对
+        m = _CMD_ENV_PAIR_RE.match(command, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        # 孤立 %：仅当后随非标识符字符（含结尾）才判字面量并双写
+        if _CMD_LITERAL_PERCENT_NEXT.match(command, i + 1):
+            out.append("%%")
+            changed = True
+            i += 1
+            continue
+        # 其余（%letter 无闭合等可能有意展开）原样保留
+        out.append(ch)
+        i += 1
+    return "".join(out), changed
+
+
+def _cmd_literal_percent_hint(command: str) -> list:
+    """检测到字面量孤立 % 被自动双写时给一条说明（避免模型误以为输出丢字符是 bug）。"""
+    if not command or "%" not in command:
+        return []
+    # 先做 FOR 规范化（与执行层同序），避免把 FOR 变量的单 % 误判为字面量
+    normalized, _ = _normalize_cmd_for_variables(command, batch=True)
+    _, changed = _escape_cmd_literal_percent(normalized)
+    if not changed:
+        return []
+    return [
+        "检测到字面量孤立 `%`（如 `echo 100%`）：cmd 批处理层会吞掉孤立 `%` 导致输出丢字符，"
+        "已自动双写为 `%%`（仅处理无歧义字面量，不影响 `%PATH%` 环境变量、`%1` 批参数与 FOR 变量）。"
+    ]
 
 
 # 日志目录清理节流：24h 过期清理不需要每次调用都跑（万级文件时单次
@@ -4275,6 +4434,14 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_
     """
     normalized = command.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
     if shell_kind == "cmd":
+        # FOR 循环变量规范化：批处理文件要求 %%d，模型常按交互式写 %d（实测
+        # `d was unexpected at this time.`）。只转换本命令声明的 FOR 变量，
+        # 不碰 %PATH% 环境变量/%1 批参数/已双写的 %%d。直连 Popen 兜底走
+        # cmd /c（命令行模式，单 % 正确），不经过此处，故不受影响。
+        normalized, _ = _normalize_cmd_for_variables(normalized, batch=True)
+        # 字面量孤立 % 双写（echo 100% → echo 100%%）：批处理层吞孤立 % 致输出丢字符。
+        # 须在 FOR 规范化之后（FOR 变量已是 %%X，扫描跳过）；只动无歧义字面量。
+        normalized, _ = _escape_cmd_literal_percent(normalized)
         # cmd 按行解释 .cmd：行尾必须是 CRLF；行内 LF 会被当命令结束（多行内联代码
         # 已在上游改写为临时脚本，此处只做兜底归一化）
         text = "@echo off\r\n" + normalized.replace("\n", "\r\n") + "\r\n"

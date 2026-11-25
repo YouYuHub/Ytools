@@ -64,6 +64,12 @@ def _is_for_loop(command, shell_kind):
 
 def _build_payload(command, shell_kind, nonce):
     """返回 (payload, marker, has_exit)。多行/for 循环不加标记。"""
+    # 常驻会话是真实交互式 cmd 控制台（命令经 stdin 喂入，非批处理文件）：
+    # FOR 循环变量用单 %d 才正确；若模型写了批处理双写 %%d，降为单写。
+    # 与批处理执行层（_write_runner_script 双写）方向相反，各自匹配自身语境。
+    if shell_kind == "cmd":
+        from . import builtin_tools as bt
+        command, _ = bt._normalize_cmd_for_variables(command, batch=False)
     multiline = "\n" in command.strip()
     if multiline or _is_for_loop(command, shell_kind):
         return command + "\n", None, False

@@ -274,6 +274,7 @@ def build_sys_prompt(
         "用 read_file 核对原文，edit_file 修改局部；多文件修改可用 apply_patch。write_file 的 mode 必传（create 新建/overwrite 覆盖/append 追加），"
         "不传会报 INVALID_ARGUMENTS 且文件不会被修改，每次调用务必显式带上。"
         "命令语法须与 shell 一致；run_command 默认短等，poll_command 只传 job_id 自动续取输出；"
+        "cmd 的 FOR 循环变量按交互式单 % 写（%d/%~nd，工具自动转批处理双写），字面量百分号写单个 %（工具自动转义防吞字符），%VAR% 环境变量正常展开；"
         "status=running 或 has_more=true 时继续查询（completion=awaiting_input 表示在等输入）。"
         "需跨调用保住 cwd/环境变量/REPL 状态时传 session_id 复用同一常驻 shell（不传=每次新建）；list_jobs 看全部在跑任务。"
         "独立服务显式 background=true，stop_command 停止（graceful=true 先软中断再杀树）。"
