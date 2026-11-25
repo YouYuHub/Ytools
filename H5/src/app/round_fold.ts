@@ -541,7 +541,25 @@
       keys.push(segKey);
       syncSegment(seg.nodes, segKey, seg.head, i === segments.length - 1, roundLastUsage, i === 0);
     });
+    updateLiveTimerTakeover();
     return keys;
+  }
+  // 折叠接管顶部直播计时行（集中判定，全部段同步完后执行）：仅当直播容器内
+  // 存在「带尾正文的折叠」（会显示运行态计时）时才隐藏计时行；否则恢复显示。
+  // 不能按 fold.container === liveMsg 逐段接管：引导注入后封存段（无尾、
+  // 永不计时）也满足该条件，而末段在纯工具阶段不建折叠——两边都不显示计时，
+  // 顶部用时凭空消失直到新正文出现。多条引导时旧末段转封存同理要交还计时行。
+  // 注意是隐藏而非删除：折叠解散时由 disbandFold 恢复，收尾由管线彻底移除。
+  function updateLiveTimerTakeover(): void {
+    var liveMsg = activeLiveContainer();
+    if (!liveMsg || !liveMsg.querySelector) return;
+    var row = liveMsg.querySelector(".live-round-timer");
+    if (!row) return;
+    var covered = false;
+    foldMap.forEach(function (fold: any) {
+      if (fold.container === liveMsg && fold.tail) covered = true;
+    });
+    row.classList.toggle("is-taken-over", covered);
   }
   // 单段同步：末段 tail 取最后一段正文（即使尚空——流式新段先占位）；
   // 非末段无尾（内容已结算，引导在检查点消费，之前节点必然完成），全部收纳，
@@ -722,18 +740,8 @@
     else if (choices.has(key)) fold.open = choices.get(key);
     else fold.open = false;
     if (fold.header.nextElementSibling !== members[0]) members[0].parentNode.insertBefore(fold.header, members[0]);
-    // 折叠接管计时：仅直播折叠隐藏自己容器内的计时行（起播到成折叠前的过渡显示）。
-    // 扁平/历史折叠绝不能碰计时行：其 members[0].parentNode 是整个 chatInner，
-    // 按它查找会把正在直播轮的计时行“偷走”（切回/窗口重建的全量同步即触发），
-    // 而单单元直播轮自己永远不成折叠 → 计时永久消失。容器口径与解散恢复一致。
-    // 注意是隐藏而非删除：折叠随后可能因成员收缩被解散（单段规则/键迁移
-    // 边沿），删除会导致计时两头落空（头没了、行也没了）；隐藏的行在解散
-    // 时恢复显示，收尾时仍由管线 stopLiveTimer 彻底移除。
-    var liveMsg = activeLiveContainer();
-    if (liveMsg && fold.container === liveMsg) {
-      var liveTimer = liveMsg.querySelector(".live-round-timer:not(.is-taken-over)");
-      if (liveTimer) liveTimer.classList.add("is-taken-over");
-    }
+    // 计时行接管/交还由 syncRound 末尾的 updateLiveTimerTakeover 集中判定
+    // （封存段不得藏行；扁平/历史折叠作用域是整个 chatInner，绝不能碰直播行）。
     applyVisibility(fold);
     renderHeader(fold);
   }

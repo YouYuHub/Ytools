@@ -191,3 +191,93 @@ def downgrade_native_doc_on_format_error(error, messages):
     if not native_doc_format_error(error):
         return None
     return downgrade_native_doc_to_text(messages)
+
+
+# ---------- input_audio 双格式兼容（OpenAI 纯 base64 vs DashScope data URL） ----------
+# OpenAI 官方要求 input_audio.data 为纯 base64；DashScope compatible-mode
+# （qwen-omni / qwen-asr 等，含转发到它的网关如 opencode）要求
+# ``data:<mime>;base64,<b64>`` data URL 形态——纯 base64 会被当 URL 校验并报
+# 「The provided URL does not appear to be valid」。两条防线：
+#   1. 主动：端点 host 是 dashscope.aliyuncs.com 时发送前直接转 data URL
+#      （避免一次必败请求）；
+#   2. 反应式兜底：任意端点报上述确定性签名且请求里有纯 base64 音频部件时，
+#      转 data URL 经 retry_messages 通道重发一次（覆盖未知网关转发场景）。
+# 转换后 data 以 data: 开头，两个函数第二次都返回原样/None，无循环风险。
+_AUDIO_MIME_BY_FORMAT = {
+    'wav': 'audio/wav', 'mp3': 'audio/mpeg', 'm4a': 'audio/mp4',
+    'aac': 'audio/aac', 'ogg': 'audio/ogg', 'opus': 'audio/ogg',
+    'flac': 'audio/flac', 'amr': 'audio/amr',
+}
+
+
+def _audio_data_url(data: str, fmt) -> str:
+    mime = _AUDIO_MIME_BY_FORMAT.get(str(fmt or '').strip().lower(), '')
+    # 未知格式用空 mime（DashScope ASR 文档同款 ``data:;base64,`` 写法）
+    return f'data:{mime};base64,{data}'
+
+
+def _pure_base64_audio_part(part):
+    """识别可转换的纯 base64 音频部件；http(s)/已内联 data:/media:// 引用不动。"""
+    if not isinstance(part, dict) or part.get('type') != 'input_audio':
+        return None
+    audio = part.get('input_audio')
+    if not isinstance(audio, dict):
+        return None
+    data = audio.get('data')
+    if not isinstance(data, str) or not data:
+        return None
+    lowered = data.lstrip().lower()
+    if lowered.startswith(('data:', 'http://', 'https://', 'media://')):
+        return None
+    return audio
+
+
+def _convert_audio_parts(messages):
+    """把纯 base64 音频部件转为 data URL 形态；无可转换部件返回 None（原列表不动）。"""
+    if not any(isinstance(msg, dict) and isinstance(msg.get('content'), list)
+               and any(_pure_base64_audio_part(p) is not None for p in msg['content'])
+               for msg in (messages or [])):
+        return None
+    result = copy.deepcopy(messages)
+    for msg in result:
+        content = msg.get('content') if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for index, part in enumerate(content):
+            audio = _pure_base64_audio_part(part)
+            if audio is None:
+                continue
+            content[index] = {**part, 'input_audio': {
+                **audio, 'data': _audio_data_url(audio['data'], audio.get('format'))}}
+    return result
+
+
+def normalize_input_audio_for_endpoint(messages, endpoint_url):
+    """DashScope 端点主动转 data URL（其余端点保持 OpenAI 纯 base64 原样）。"""
+    try:
+        host = (re.sub(r'^https?://', '', str(endpoint_url or ''), flags=re.I)
+                .split('/', 1)[0].split(':', 1)[0].lower())
+    except Exception:
+        return messages
+    if not (host == 'dashscope.aliyuncs.com' or host.endswith('.dashscope.aliyuncs.com')):
+        return messages
+    converted = _convert_audio_parts(messages)
+    return converted if converted is not None else messages
+
+
+def audio_base64_url_error(error) -> bool:
+    """供应商把纯 base64 音频当 URL 校验失败的确定性签名（DashScope 系实测）。"""
+    text = str(error or '')
+    return ('provided URL does not appear to be valid' in text
+            or ('URL does not appear to be valid' in text and 'invalid_parameter_error' in text))
+
+
+def upgrade_audio_on_url_error(error, messages):
+    """命中签名且有纯 base64 音频部件时返回 data URL 形态的新 messages，否则 None。
+
+    供 chat_llm 400 分支调用：经 retry_messages 通道重发一次（不计网络重试），
+    与 NATIVE_DOC_TEXT_DOWNGRADE 同模式；转换幂等，无循环风险。
+    """
+    if not audio_base64_url_error(error):
+        return None
+    return _convert_audio_parts(messages)

@@ -100,3 +100,57 @@ test('游离直播容器（切会话/窗口重建）成员不被位置护栏误�
   const above = h.heads().filter(x => x.parentNode === h.chatInner && (user.compareDocumentPosition(x) & 2));
   assert.equal(above.length, 0);
 });
+
+// 回归：引导注入后末段处于纯工具阶段（尚无新正文、不建末段折叠），
+// 封存段（无尾、永不计时）不得把顶部直播计时行藏掉——否则这段时间
+// 页面上没有任何计时显示，直到新正文出现才恢复。
+test('引导后纯工具阶段：封存段不接管计时行，顶部计时保持可见', t => {
+  const h = harness(); t.after(() => h.dom.window.close());
+  const user = h.mk('msg msg-user', 21); h.chatInner.appendChild(user);
+  const msg = h.mk('msg', 21); h.chatInner.appendChild(msg);
+  h.App.state.activeStream = { messageNode: msg, userNode: user, completed: false };
+  const row = h.el('div', 'live-round-timer'); msg.appendChild(row);
+  msg.appendChild(h.mk('think-block'));
+  msg.appendChild(h.mk('tool-block'));
+  msg.appendChild(h.mk('msg-assistant-body'));
+  h.sync(h.chatInner);
+  assert.equal(row.classList.contains('is-taken-over'), true, '首段成折叠后正常接管隐藏');
+  // 注入引导 + 后续多个已完成工具（无新正文）
+  msg.appendChild(h.mk('msg msg-user', 21));
+  msg.appendChild(h.mk('tool-block'));
+  msg.appendChild(h.mk('think-block'));
+  msg.appendChild(h.mk('tool-block'));
+  h.sync(h.chatInner);
+  const running = h.heads().filter(x => x.classList.contains('is-running'));
+  assert.equal(running.length, 0, '封存段不亮灯，末段无正文不建折叠');
+  assert.equal(row.classList.contains('is-taken-over'), false, '无任何显示计时的折叠时，顶部计时行必须可见');
+  // 新正文流式出现 → 末段成折叠 → 重新接管隐藏
+  msg.appendChild(h.mk('think-block'));
+  msg.appendChild(h.mk('msg-assistant-body msg-cursor'));
+  h.sync(h.chatInner);
+  assert.equal(row.classList.contains('is-taken-over'), true, '末段折叠形成后重新接管');
+});
+
+test('多条引导：旧末段转封存后交还计时行（集中判定覆盖段迁移）', t => {
+  const h = harness(); t.after(() => h.dom.window.close());
+  const user = h.mk('msg msg-user', 21); h.chatInner.appendChild(user);
+  const msg = h.mk('msg', 21); h.chatInner.appendChild(msg);
+  h.App.state.activeStream = { messageNode: msg, userNode: user, completed: false };
+  const row = h.el('div', 'live-round-timer'); msg.appendChild(row);
+  msg.appendChild(h.mk('think-block'));
+  msg.appendChild(h.mk('tool-block'));
+  msg.appendChild(h.mk('msg-assistant-body'));
+  h.sync(h.chatInner);
+  // 第一条引导 + 第二段内容成折叠（有尾正文）→ 接管
+  msg.appendChild(h.mk('msg msg-user', 21));
+  msg.appendChild(h.mk('think-block'));
+  msg.appendChild(h.mk('tool-block'));
+  msg.appendChild(h.mk('msg-assistant-body'));
+  h.sync(h.chatInner);
+  assert.equal(row.classList.contains('is-taken-over'), true);
+  // 第二条引导：旧末段变封存段，新末段只有工具 → 交还计时行
+  msg.appendChild(h.mk('msg msg-user', 21));
+  msg.appendChild(h.mk('tool-block'));
+  h.sync(h.chatInner);
+  assert.equal(row.classList.contains('is-taken-over'), false, '所有带尾折叠都已封存时必须交还计时行');
+});

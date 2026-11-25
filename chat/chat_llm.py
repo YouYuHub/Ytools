@@ -23,7 +23,13 @@ from typing import(
 import asyncio
 from contextlib import suppress
 
-from util.media_limits import limit_media_messages, learn_media_limit, downgrade_native_doc_on_format_error
+from util.media_limits import (
+    limit_media_messages,
+    learn_media_limit,
+    downgrade_native_doc_on_format_error,
+    normalize_input_audio_for_endpoint,
+    upgrade_audio_on_url_error,
+)
 from util.logger import get_logger
 from util.token_estimate import text_token_estimate
 from .http_pool import default_ssl_context, configure_response
@@ -721,6 +727,8 @@ class ChatLLM:
                 if retry_messages is not None:
                     payload["messages"] = retry_messages
                 payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
+                # DashScope 系端点：纯 base64 音频主动转 data URL（其 URL 校验拒收纯 base64）
+                payload["messages"] = normalize_input_audio_for_endpoint(payload["messages"], url)
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
@@ -811,6 +819,11 @@ class ChatLLM:
                                 retry_messages = downgraded
                                 yield f"data: {json.dumps({'warning': {'code': 'NATIVE_DOC_TEXT_DOWNGRADE', 'message': '网关不支持原生文档 file 部件格式，已自动转为文本并重新请求。'}}, ensure_ascii=False)}\n\n"
                                 continue
+                            upgraded = upgrade_audio_on_url_error(error_text, payload["messages"])
+                            if upgraded is not None:
+                                retry_messages = upgraded
+                                yield f"data: {json.dumps({'warning': {'code': 'AUDIO_DATA_URL_UPGRADE', 'message': '供应商要求音频为 data URL 形态，已将纯 base64 音频转换后重新请求。'}}, ensure_ascii=False)}\n\n"
+                                continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -862,6 +875,13 @@ class ChatLLM:
                                 media_limit_retry = True
                                 yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求。'}}, ensure_ascii=False)}\n\n"
                                 break
+                            if not saw_any_output:
+                                upgraded = upgrade_audio_on_url_error(error_frame_text, payload["messages"])
+                                if upgraded is not None:
+                                    retry_messages = upgraded
+                                    media_limit_retry = True
+                                    yield f"data: {json.dumps({'warning': {'code': 'AUDIO_DATA_URL_UPGRADE', 'message': '供应商要求音频为 data URL 形态，已将纯 base64 音频转换后重新请求。'}}, ensure_ascii=False)}\n\n"
+                                    break
                             retry_count += 1
                             failure = _upstream_retry_frame(error_frame_text, retry_count, retry_max_attempts, partial=saw_any_output)
                             yield f"data: {json.dumps(failure, ensure_ascii=False)}\n\n"
@@ -1044,6 +1064,8 @@ class ChatLLM:
                 if retry_messages is not None:
                     payload["messages"] = retry_messages
                 payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
+                # DashScope 系端点：纯 base64 音频主动转 data URL（其 URL 校验拒收纯 base64）
+                payload["messages"] = normalize_input_audio_for_endpoint(payload["messages"], url)
                 parsed = urllib.parse.urlparse(url)
                 host = parsed.hostname
                 port = parsed.port
@@ -1139,6 +1161,11 @@ class ChatLLM:
                                 retry_messages = downgraded
                                 yield f"data: {json.dumps({'warning': {'code': 'NATIVE_DOC_TEXT_DOWNGRADE', 'message': '网关不支持原生文档 file 部件格式，已自动转为文本并重新请求。'}}, ensure_ascii=False)}\n\n"
                                 continue
+                            upgraded = upgrade_audio_on_url_error(error_text, payload["messages"])
+                            if upgraded is not None:
+                                retry_messages = upgraded
+                                yield f"data: {json.dumps({'warning': {'code': 'AUDIO_DATA_URL_UPGRADE', 'message': '供应商要求音频为 data URL 形态，已将纯 base64 音频转换后重新请求。'}}, ensure_ascii=False)}\n\n"
+                                continue
                         http_error = f"HTTP Error: {status_str}: {error_text}"
                         retry_count += 1
                         if retry_max_attempts > 0 and retry_count > retry_max_attempts:
@@ -1189,6 +1216,13 @@ class ChatLLM:
                                 media_limit_retry = True
                                 yield f"data: {json.dumps({'warning': {'code': 'MEDIA_LIMIT_DOWNGRADE', 'message': '供应商限制媒体类型或数量，已按限制降级并重新请求。'}}, ensure_ascii=False)}\n\n"
                                 break
+                            if not saw_any_output:
+                                upgraded = upgrade_audio_on_url_error(error_frame_text, payload["messages"])
+                                if upgraded is not None:
+                                    retry_messages = upgraded
+                                    media_limit_retry = True
+                                    yield f"data: {json.dumps({'warning': {'code': 'AUDIO_DATA_URL_UPGRADE', 'message': '供应商要求音频为 data URL 形态，已将纯 base64 音频转换后重新请求。'}}, ensure_ascii=False)}\n\n"
+                                    break
                             retry_count += 1
                             failure = _upstream_retry_frame(error_frame_text, retry_count, retry_max_attempts, partial=saw_any_output)
                             yield f"data: {json.dumps(failure, ensure_ascii=False)}\n\n"
@@ -1400,6 +1434,8 @@ class ChatLLM:
             if retry_messages is not None:
                 payload["messages"] = retry_messages
             payload["messages"], _ = limit_media_messages(payload["messages"], chat_config)
+            # DashScope 系端点：纯 base64 音频主动转 data URL（同流式版）
+            payload["messages"] = normalize_input_audio_for_endpoint(payload["messages"], url)
             # 每次尝试都预检（语义见流式版注释）
             hard_limit_error = ChatLLM._precheck_hard_limit(payload)
             if hard_limit_error is not None:
@@ -1469,6 +1505,10 @@ class ChatLLM:
                         downgraded = downgrade_native_doc_on_format_error(error_text, payload["messages"])
                         if downgraded is not None:
                             retry_messages = downgraded
+                            continue
+                        upgraded = upgrade_audio_on_url_error(error_text, payload["messages"])
+                        if upgraded is not None:
+                            retry_messages = upgraded
                             continue
                     raise RuntimeError(f"HTTP Error: {status_str}: {error_text}")
                 last_step = "read_body"
