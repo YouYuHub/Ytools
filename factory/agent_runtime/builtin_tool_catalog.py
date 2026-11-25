@@ -415,8 +415,8 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                             'timeout_seconds': {'type': 'number',
                                                                 'minimum': 1,
                                                                 'maximum': 1800,
-                                                                'description': '仅前台有效，默认 120 秒，范围 '
-                                                                               '1-1800；含预处理和启动，超时终止进程树。',
+                                                                'description': '前台阻塞与短等任务的生命上限，默认 120 秒，范围 '
+                                                                               '1-1800；含预处理和启动，超时终止进程树。background/常驻会话不受限。',
                                                                 'default': 120.0},
                                             'background': {'type': 'boolean',
                                                            'description': 'true 启动后台任务并返回 job_id；不受 '

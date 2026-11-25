@@ -9050,8 +9050,8 @@ body.chat-settings-open {
   margin-left: 8px;
   padding: 1px 8px;
   border-radius: 999px;
-  background: rgba(11, 132, 216, 0.14);
-  color: #0b84d8;
+  background: var(--bg-hover);
+  color: var(--tool-icon-pink);
   font-size: 11px;
   font-weight: 500;
   vertical-align: 1px;
@@ -9074,9 +9074,9 @@ body.chat-settings-open {
   color: var(--text);
 }
 .ask-questions .ask-option.selected {
-  background: rgba(11, 132, 216, 0.14);
-  border-color: #0b84d8;
-  color: #0b84d8;
+  background: var(--bg-active);
+  border-color: var(--tool-icon-pink);
+  color: var(--tool-icon-pink);
   font-weight: 600;
 }
 .ask-questions .ask-custom {
@@ -9096,7 +9096,7 @@ body.chat-settings-open {
   outline: none;
 }
 .ask-questions .ask-custom:focus {
-  border-color: #0b84d8;
+  border-color: var(--focus-ring);
 }
 .ask-questions .ask-custom::placeholder {
   color: var(--text-tertiary);

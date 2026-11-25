@@ -235,7 +235,15 @@
   function attachLiveRoundEntry(activeStream: any, round: any) {
     if (!activeStream || typeof round !== "number" || round < 1) return;
     const userNode = activeStream.userNode;
-    if (!userNode) return;
+    if (!userNode) {
+      // 续跑（无用户气泡）：回复容器也必须打轮次归属，否则编辑重发按
+      // data-round 删不掉它（此前续跑新容器永不打标，暂停后编辑重发残留）。
+      // 幂等：已有标记不改写。
+      if (activeStream.messageNode && !activeStream.messageNode.dataset.round) {
+        activeStream.messageNode.dataset.round = String(round);
+      }
+      return;
+    }
     // 刷新重连可复用已打标的历史提问，但回复容器是新建的；也必须补上
     // 轮次归属，否则编辑重发会漏删该容器内的子任务/思考/工具轨迹。
     if (activeStream.messageNode) {

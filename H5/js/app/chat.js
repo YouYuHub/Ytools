@@ -443,6 +443,9 @@
             messageNode: msg,
             completed: false,
             usage: null,
+            // 原地重发替换的旧轮次号（普通/插入/续跑为 null）：切回/附接时的历史
+            // 裁剪据此撤掉被替换旧轮，不校验文本（编辑改了文本是常态）。
+            replacesRound: direct && direct.targetRound != null ? direct.targetRound : null,
         };
         state.activeStream = activeStream;
         if (App.taskStatus)
@@ -454,6 +457,11 @@
         // 普通发送直接追加末尾
         if (direct && direct.targetRound) {
             const oldRound = String(direct.targetRound);
+            // 原地重发被编辑气泡引用（doSend 传入，不在此预移除）：删除循环按引用
+            // 匹配，即使气泡未打标也能触发清扫；已游离（队列重试等延迟发送）时
+            // 回退纯 data-round 匹配。
+            const dropNode = direct._regenDropNode && direct._regenDropNode.isConnected
+                ? direct._regenDropNode : null;
             // 锚点：下一轮首节点；若嵌套在容器内则上浮到顶层子节点（直接用嵌套
             // 节点会导致 parentNode 判定失败而追加末尾，轮次显示错乱）。
             let firstNext = chatInner.querySelector('[data-round="' + (direct.targetRound + 1) + '"]');
@@ -469,7 +477,7 @@
             Array.from(chatInner.childNodes).forEach(function (node) {
                 if (node.nodeType !== 1)
                     return;
-                if (node.getAttribute("data-round") === oldRound) {
+                if (node.getAttribute("data-round") === oldRound || node === dropNode) {
                     node.remove();
                     removed = true;
                     return;
@@ -1096,7 +1104,15 @@
                     if (Array.isArray(data.question_quotes) && data.question_quotes.length) {
                         activeStream.quotes = QuoteUtils.quotesForRequest(data.question_quotes);
                     }
-                    if (activeStream.replayComplete && App.prepareActiveRoundReplay) {
+                    // 原地重发替换关系（新后端随 marker 下发，旧后端缺字段时保持原行为）：
+                    // 旧轮是错轮快照，回放准备/历史裁剪按轮次直接撤掉，不校验文本。
+                    if (typeof data.replaces_round === "number" && data.replaces_round > 0) {
+                        activeStream.replacesRound = data.replaces_round;
+                    }
+                    // 原地重发附接同样要撤旧轮（旧轮是错轮快照，与回放完整度无关，
+                    // prepareActiveRoundReplay 内部按 replacesRound 放行）；普通附接
+                    // 保持完整回放确认后才撤。
+                    if ((activeStream.replayComplete || activeStream.replacesRound != null) && App.prepareActiveRoundReplay) {
                         App.prepareActiveRoundReplay(activeStream);
                     }
                     // 本轮生效聊天模型（round_model 帧在回放起点之前，消费端收不到，
@@ -1407,11 +1423,19 @@
             .filter(Boolean);
         const doSend = function (targetRound) {
             App.exitUserMessageEdit(plan.msg);
-            // 原地重发：被编辑的气泡可能尚未打标（暂停早于 round_started 补打标），
-            // 删除循环按 data-round 匹配不到会残留成重复气泡，这里显式移除。
+            // 原地重发：被编辑气泡的移除并入 send() 删除循环（按引用匹配），不能在此
+            // 预移除——预移除会拿掉删除循环的 data-round 锚点；暂停早于 round_started
+            // 补打标、续跑新容器等 msg 未打标场景下清扫被整体跳过，旧 msg（含 svg 等
+            // 内容）残留在新气泡上方。嵌套气泡（轮内引导消息）不在顶层循环视野内，
+            // 仍在此直接移除（与旧行为一致）。
             // insert 模式气泡保留（新轮插在其后），truncate 经 openSession 重建，此处跳过无害。
-            if (targetRound != null && plan.msg && plan.msg.isConnected)
-                plan.msg.remove();
+            let regenDropNode = null;
+            if (targetRound != null && plan.msg && plan.msg.isConnected) {
+                if (plan.msg.parentNode === chatInner)
+                    regenDropNode = plan.msg;
+                else
+                    plan.msg.remove();
+            }
             App.send({
                 text: plan.text,
                 media: plan.media,
@@ -1419,6 +1443,7 @@
                 // 引用快照：编辑态保留/移除后的最终列表（无则空数组）
                 quotes: plan.quotes || [],
                 targetRound: targetRound,
+                _regenDropNode: regenDropNode,
             });
         };
         const reloadAndSend = async function (mode, targetRound, keepRefs) {

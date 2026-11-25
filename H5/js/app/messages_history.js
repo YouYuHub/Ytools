@@ -106,12 +106,14 @@
     // 等中部轮场景：一刀裁会连后续轮一起删掉），后续节点 data-history-index
     // 整体前移，与拼接后的 records 对齐。
     function prepareActiveRoundReplay(active) {
-        if (!active || !active.replayComplete || active.sessionId !== state.sessionId)
+        if (!active || active.sessionId !== state.sessionId)
             return;
         const records = loadOlderState.records;
         if (!records)
             return;
-        const split = HistoryParser.splitActiveRound(records, active.userText, active.round, active.quotes);
+        // 拆除口径见 splitForActiveReplay：原地重发一律撤旧轮（与回放完整度无关）；
+        // 普通轮只在完整回放确认后撤（检查点回放需要旧快照做底）。
+        const split = HistoryParser.splitForActiveReplay(records, active);
         if (!split)
             return;
         if (loadOlderState.timer != null)

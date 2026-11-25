@@ -26,3 +26,15 @@ test("缺少旧后端提问部件时仍标记回复归属，并避免生成不�
   assert.equal(reply.dataset.round, "4");
   assert.equal(user._editData, undefined);
 });
+
+test("续跑无用户气泡时，新回复容器仍打轮次归属（编辑重发删得掉）", () => {
+  const reply = { dataset: {} };
+  attach({ userNode: null, messageNode: reply }, 5);
+  assert.equal(reply.dataset.round, "5");
+});
+
+test("续跑容器已有标记时不改写（幂等）", () => {
+  const reply = { dataset: { round: "5" } };
+  attach({ userNode: null, messageNode: reply }, 6);
+  assert.equal(reply.dataset.round, "5");
+});

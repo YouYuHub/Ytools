@@ -376,6 +376,10 @@ class _SessionStream:
         self.question_parts: list | None = None  # 提问原始 content 部件（含 media:// 引用，前端重建气泡用）
         self.question_quotes: list | None = None  # 本轮引用快照（回放 marker 携带，前端重建引用卡片用）
         self.live_round_no: int | None = None  # 本轮最终轮次号（round_started 推送时记录，回放 marker 携带）
+        # 原地重发目标轮次（任务接受时由请求 target_round 记录）：附接 marker 携带
+        # replaces_round，前端据此撤掉被替换旧轮（不校验文本——编辑改了文本是常态）。
+        # 每任务新建 stream 对象，无跨任务污染；普通/插入/续跑任务保持 None。
+        self.target_round: int | None = None
         # 本轮开始墙钟（epoch ms）：注册时先记任务接受时刻（近似），检查点确认/
         # worker 事件到达后覆盖为精确值。附接 marker 独立携带它（不随轮次号门控），
         # 否则确认前的附接拿不到起点，前端计时从附接时刻重计。
@@ -3417,6 +3421,13 @@ async def _prepare_chat_stream(tool_request):
             except Exception as error:
                 logger.warning(f"旧生成任务退出异常（已忽略）: {error}")
     stream = _set_session_stream(session_id)
+    # 原地重发替换关系随任务记录（主进程请求上下文，无需 worker 同步）：
+    # 附接 marker 携带 replaces_round，前端撤掉被替换旧轮。非法值归一为 None。
+    try:
+        _tr = getattr(tool_request, "target_round", None)
+        stream.target_round = int(_tr) if _tr is not None and int(_tr) > 0 else None
+    except (TypeError, ValueError):
+        stream.target_round = None
     await _start_session_generation(proxy, stream, tool_request)
     # A failed start still owns its error frames and must be consumed by the
     # creating request, even if finish() has already run.
@@ -3511,6 +3522,13 @@ def _build_attach_marker(stream, replay_complete: bool) -> dict:
         marker["round_usage_total"] = copy.deepcopy(
             getattr(stream, "live_round_usage_total", None) or {}
         )
+    # 原地重发替换关系（独立于轮次号门控）：运行任务是编辑重发时，前端
+    # 据此撤掉被替换旧轮——不校验文本（编辑改了文本是常态；只凭轮次+文本
+    # 裁剪会在文本不一致时漏裁，切回/刷新附接后旧轮与新轮重复显示）。
+    # 普通/插入/续跑任务无此字段，老前端忽略未知字段，行为不变。
+    replaces_round = getattr(stream, "target_round", None)
+    if isinstance(replaces_round, int) and replaces_round > 0:
+        marker["replaces_round"] = replaces_round
     # 轮次开始墙钟（epoch ms）：回放重建的节点时间戳都是“现在”，
     # 前端计时以此为下限，否则刷新一次就从 1s 重计。独立于轮次号
     # 门控下发（注册时已有近似值，确认后为精确值），确认前的附接

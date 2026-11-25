@@ -109,7 +109,12 @@ function loadSessionsModule() {
   global.cancelAnimationFrame = function (id) { clearTimeout(id); };
   global.SessionUtils = require("../js/session_utils.js");
   global.SessionListUtils = require("../js/session_list_utils.js");
-  global.HistoryParser = { parseHistory: function () { return { records: [], metaUsage: {} }; } };
+  global.HistoryParser = {
+    parseHistory: function () { return { records: [], metaUsage: {} }; },
+    // openSession 经 visibleRecordsForActive 裁剪（原地重发分支等），桩保持直通
+    visibleRecordsForActive: function (records) { return records; },
+    recordsBeforeActiveRound: function (records) { return records; },
+  };
 
   const spies = { stopVoiceInput: 0, loadWorkDir: 0, terminalSessions: [] };
   global.API = {

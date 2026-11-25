@@ -2641,8 +2641,8 @@ body.chat-settings-open { overflow: hidden; }
     margin-left: 8px;
     padding: 1px 8px;
     border-radius: 999px;
-    background: rgba(11, 132, 216, 0.14);
-    color: #0b84d8;
+    background: var(--bg-hover);
+    color: var(--tool-icon-pink);
     font-size: 11px;
     font-weight: 500;
     vertical-align: 1px;
@@ -2668,9 +2668,9 @@ body.chat-settings-open { overflow: hidden; }
     }
 
     &.selected {
-      background: rgba(11, 132, 216, 0.14);
-      border-color: #0b84d8;
-      color: #0b84d8;
+      background: var(--bg-active);
+      border-color: var(--tool-icon-pink);
+      color: var(--tool-icon-pink);
       font-weight: 600;
     }
   }
@@ -2692,7 +2692,7 @@ body.chat-settings-open { overflow: hidden; }
     outline: none;
 
     &:focus {
-      border-color: #0b84d8;
+      border-color: var(--focus-ring);
     }
 
     &::placeholder {

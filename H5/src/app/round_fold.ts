@@ -123,8 +123,14 @@
       pushSpan(times, fold.tail);
       if (fold.tail.matches(".msg-cursor")) active = true;
     }
-    // 尾后可见区（进行中/待确认/整组可见的小折叠）计入状态与用时，不计入折叠统计
+    // 尾后可见区（进行中/待确认/整组可见的小折叠）：类型计数与 members 同口径
+    // 计入（否则最新工具调用等不计入，头显总数与正文对不上——异常数此前已计入，
+    // 两边口径必须一致）；状态与用时同样计入。members 与 liveTail 互斥，无重复计数。
     (fold.liveTail || []).forEach(function (node: any) {
+      if (node.matches(".tool-block")) tools++;
+      else if (node.matches(".agent-block")) agents++;
+      else if (node.matches(".msg-assistant-body")) bodies++;
+      else if (node.matches(".think-block")) thinks++;
       if (node.matches(".is-error, .is-failed, .compaction-interrupted") ||
         node.querySelector(".tool-block-tool-icon.is-failed")) failures++;
       if (node.matches(".is-waiting")) waiting = node;

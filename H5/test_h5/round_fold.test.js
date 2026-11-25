@@ -229,10 +229,36 @@ test("尾正文之后的进行中内容保持可见（不收进大折叠）", as
   assert.equal(tail.classList.contains("is-roundfold-hidden"), false);
   assert.equal(groupHead.classList.contains("is-roundfold-hidden"), false);
   assert.equal(runningTool.classList.contains("is-roundfold-hidden"), false);
-  // 头统计只计尾前成员
+  // 头统计含尾后可见区（与异常口径一致）：运行中工具同样计数
   const counts = msg.querySelector(".round-fold-counts").textContent;
   assert.match(counts, /1 段正文/);
-  assert.doesNotMatch(counts, /工具调用/);
+  assert.match(counts, /1 次工具调用/);
+});
+
+test("折叠头统计含尾后可见区（最新工具/思考不漏统）", async t => {
+  const x = setup();
+  t.after(x.close);
+  const msg = div(x.document, "msg");
+  msg.dataset.round = "31";
+  const thinkOld = div(x.document, "think-block", "旧思考");
+  const toolOld1 = div(x.document, "tool-block", "旧工具1");
+  const toolOld2 = div(x.document, "tool-block", "旧工具2");
+  const bodyOld = div(x.document, "msg-assistant-body", "旧段");
+  const tail = div(x.document, "msg-assistant-body", "最新正文");
+  // 尾后进行中组（整组可见，进 liveTail）：思考 + 执行中工具
+  const thinkNew = div(x.document, "think-block is-executing", "新思考");
+  const toolNew = div(x.document, "tool-block is-executing", "新工具");
+  msg.append(thinkOld, toolOld1, toolOld2, bodyOld, tail, thinkNew, toolNew);
+  x.chatInner.appendChild(msg);
+  x.App.roundFold.sync(msg);
+  const counts = msg.querySelector(".round-fold-counts").textContent;
+  assert.match(counts, /3 次工具调用/);
+  assert.match(counts, /2 段思考/);
+  assert.match(counts, /1 段正文/);
+  // 可见性不变：尾前收起，尾与尾后可见
+  assert.equal(toolOld1.classList.contains("is-roundfold-hidden"), true);
+  assert.equal(tail.classList.contains("is-roundfold-hidden"), false);
+  assert.equal(toolNew.classList.contains("is-roundfold-hidden"), false);
 });
 
 test("扁平历史按用户节点分轮，各轮独立折叠", async t => {

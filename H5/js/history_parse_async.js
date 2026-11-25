@@ -10,7 +10,7 @@
     return new Promise(function (resolve, reject) {
       let worker;
       try {
-        worker = new global.Worker("js/history_parse_worker.js?v=a2675de61840");
+        worker = new global.Worker("js/history_parse_worker.js?v=022bf436c6e4");
       } catch (_) {
         resolve(global.HistoryParser.parseHistory(text, options));
         return;

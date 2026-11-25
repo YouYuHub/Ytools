@@ -630,6 +630,86 @@ test("removeRound: 纯按轮次号去掉一轮区间", function () {
   assert.equal(historyParser.removeRound(records, null), null);
 });
 
+test("visibleRecordsForActive: 原地重发按替换轮次撤旧轮，不校验文本", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "旧第二问", round: 2 },
+    { kind: "assistant", content: "旧第二答", round: 2 },
+    { kind: "user", content: "第三问", round: 3 },
+    { kind: "assistant", content: "第三答", round: 3 },
+  ];
+  // 编辑改了文本：旧口径（轮次+文本双匹配）会漏裁，切回后旧轮与新轮重复显示
+  const active = { replacesRound: 2, round: 2, userText: "改后的第二问", replayComplete: true };
+  assert.deepEqual(
+    historyParser.visibleRecordsForActive(records, active).map(function (r) { return r.content; }),
+    ["第一问", "第一答", "第三问", "第三答"]);
+  // 附接中途切回（replayComplete=false）同样要裁
+  const attaching = { replacesRound: 2, round: 2, userText: "改后的第二问", replayComplete: false };
+  assert.deepEqual(
+    historyParser.visibleRecordsForActive(records, attaching).map(function (r) { return r.content; }),
+    ["第一问", "第一答", "第三问", "第三答"]);
+  // 旧轮不在记录里（后端已替换/尚未落盘）：原样返回
+  assert.equal(
+    historyParser.visibleRecordsForActive(records, { replacesRound: 99 }).length, 6);
+});
+
+test("visibleRecordsForActive: 非重发沿用旧口径（回归保护）", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "第二问", round: 2 },
+    { kind: "assistant", content: "第二答", round: 2 },
+  ];
+  assert.equal(historyParser.visibleRecordsForActive(records, null).length, 4);
+  // replayComplete=false 不裁
+  assert.equal(historyParser.visibleRecordsForActive(
+    records, { round: 2, userText: "第二问", replayComplete: false }).length, 4);
+  // 正常裁剪与 recordsBeforeActiveRound 一致
+  assert.deepEqual(historyParser.visibleRecordsForActive(
+    records, { round: 2, userText: "第二问", replayComplete: true }).map(function (r) { return r.content; }),
+    ["第一问", "第一答"]);
+});
+
+test("splitForActiveReplay: 原地重发无视回放完整度一律拆除旧轮", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "旧第二问", round: 2 },
+    { kind: "assistant", content: "旧第二答", round: 2 },
+    { kind: "user", content: "第三问", round: 3 },
+  ];
+  for (const replayComplete of [true, false]) {
+    const sp = historyParser.splitForActiveReplay(records,
+      { replacesRound: 2, round: 2, userText: "改后的第二问", replayComplete: replayComplete });
+    assert.ok(sp, "replacesRound 有效时必须命中");
+    assert.equal(sp.cutStart, 2);
+    assert.equal(sp.cutEnd, 4);
+    assert.deepEqual(sp.records.map(function (r) { return r.content; }),
+      ["第一问", "第一答", "第三问"]);
+  }
+  assert.equal(historyParser.splitForActiveReplay(records, null), null);
+  assert.equal(historyParser.splitForActiveReplay(
+    records, { replacesRound: 99, replayComplete: true }), null);
+});
+
+test("splitForActiveReplay: 非重发沿用旧口径（回归保护）", function () {
+  const records = [
+    { kind: "user", content: "第一问", round: 1 },
+    { kind: "assistant", content: "第一答", round: 1 },
+    { kind: "user", content: "第二问", round: 2 },
+    { kind: "assistant", content: "第二答", round: 2 },
+  ];
+  // replayComplete=false 不拆
+  assert.equal(historyParser.splitForActiveReplay(
+    records, { round: 2, userText: "第二问", replayComplete: false }), null);
+  // 完整回放确认后拆，与 splitActiveRound 一致
+  const sp = historyParser.splitForActiveReplay(
+    records, { round: 2, userText: "第二问", replayComplete: true });
+  assert.equal(sp.cutStart, 2);
+  assert.equal(sp.cutEnd, 4);
+});
+
 // ---------- sub_agent 子任务事件块聚合 ----------
 
 test("parseHistory: 子任务冲突/压缩提示和工具差异在刷新回放后保留，心跳不膨胀轨迹", () => {

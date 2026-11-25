@@ -138,6 +138,43 @@
         }
         return { records: records.slice(0, cutStart).concat(records.slice(cutEnd)), cutStart: cutStart, cutEnd: cutEnd };
     }
+    /**
+     * 打开会话时的可见记录裁剪（含原地重发分支，供 sessions.openSession 用）。
+     * - replacesRound 有效（原地重发进行中）：旧轮是错轮快照，区间式撤掉
+     *   （只去该轮区间、保留后续轮），不校验文本（编辑改了文本是常态），
+     *   也不看 replayComplete（附接中途切回同样要裁）。
+     * - 否则沿用旧口径：replayComplete === false 不裁；否则按轮次+文本裁掉
+     *   当前轮及之后（与旧内联三元语义一致）。
+     */
+    function visibleRecordsForActive(records, active) {
+        if (!active)
+            return records;
+        const rr = Number(active.replacesRound);
+        if (Number.isFinite(rr) && rr > 0) {
+            const split = removeRound(records, rr);
+            return split ? split.records : records;
+        }
+        if (active.replayComplete === false)
+            return records;
+        return recordsBeforeActiveRound(records, active.userText, active.round, active.quotes);
+    }
+    /**
+     * 回放准备期的当前轮拆除（含原地重发分支，供 prepareActiveRoundReplay 用）。
+     * - replacesRound 有效：一律区间式拆除旧轮（与回放完整度无关——新任务
+     *   日志与旧轮无关，旧快照留着只会造成新旧混排/重复），不校验文本。
+     * - 否则沿用旧口径：replayComplete 为真才拆（检查点回放需要旧快照做底）。
+     * 返回 split 形状（含 cutStart/cutEnd，供调用方同步窗口下标与 DOM）。
+     */
+    function splitForActiveReplay(records, active) {
+        if (!active)
+            return null;
+        const rr = Number(active.replacesRound);
+        if (Number.isFinite(rr) && rr > 0)
+            return removeRound(records, rr);
+        if (!active.replayComplete)
+            return null;
+        return splitActiveRound(records, active.userText, active.round, active.quotes);
+    }
     function compactionRecord(obj) {
         const compactionUsage = obj.compress_usage || obj.summary_usage || null;
         return {
@@ -660,6 +697,8 @@
         recordsBeforeActiveRound: recordsBeforeActiveRound,
         splitActiveRound: splitActiveRound,
         removeRound: removeRound,
+        visibleRecordsForActive: visibleRecordsForActive,
+        splitForActiveReplay: splitForActiveReplay,
         parseHistory: parseHistory,
     };
     if (typeof module !== "undefined" && module.exports) {

@@ -1448,12 +1448,10 @@
             if (seq !== sessionOpenSeq)
                 return false;
             const active = state.activeStream && state.activeStream.sessionId === id ? state.activeStream : null;
-            // 当前轮裁剪：优先按轮次号精确匹配（active.round 由附接回放的 replay
-            // marker / round_started 回填）。附接流确认能完整重建才裁掉快照；
-            // 旧后端/权限恢复段保留历史，避免只剩附接后的少数工具。
-            const visibleRecords = active && active.replayComplete !== false
-                ? HistoryParser.recordsBeforeActiveRound(parsed.records, active.userText, active.round, active.quotes)
-                : parsed.records;
+            // 当前轮裁剪：原地重发进行中按 replacesRound 区间式撤掉旧轮（不校验文本，
+            // 否则编辑改了文本就漏裁，切回后旧轮与新轮重复显示）；其余沿用旧口径
+            // （replayComplete 才裁；旧后端/权限恢复段保留历史，避免只剩附接后的少数工具）。
+            const visibleRecords = HistoryParser.visibleRecordsForActive(parsed.records, active);
             App.setSessionUsage(parsed.metaUsage);
             App.refreshContextTokenStats(id);
             state.hasConversation = visibleRecords.length > 0 || Boolean(active);

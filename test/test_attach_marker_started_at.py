@@ -20,6 +20,7 @@ class AttachMarkerStartedAtTests(unittest.TestCase):
             "live_round_started_at_ms": None,
             "live_round_model": None,
             "live_round_usage_total": None,
+            "target_round": None,
         }
         base.update(overrides)
         return SimpleNamespace(**base)
@@ -64,6 +65,27 @@ class AttachMarkerStartedAtTests(unittest.TestCase):
         )
         self.assertEqual(marker.get("round"), 2)
         self.assertNotIn("round_started_at", marker)
+
+    def test_stream_defaults_target_round_none(self):
+        self.assertIsNone(cf._SessionStream("sid-marker-tr").target_round)
+
+    def test_marker_carries_replaces_round_for_regen(self):
+        """原地重发任务的附接 marker 携带替换关系（独立于轮次号门控）。"""
+        marker = cf._build_attach_marker(self._stream(target_round=3), False)
+        self.assertEqual(marker.get("replaces_round"), 3)
+
+    def test_marker_omits_replaces_round_for_normal_task(self):
+        marker = cf._build_attach_marker(
+            self._stream(live_round_no=3, target_round=None), True
+        )
+        self.assertNotIn("replaces_round", marker)
+
+    def test_marker_skips_invalid_target_round(self):
+        for bad in (0, -2, "3", 2.5):
+            marker = cf._build_attach_marker(
+                self._stream(live_round_no=3, target_round=bad), True
+            )
+            self.assertNotIn("replaces_round", marker)
 
 
 if __name__ == "__main__":
