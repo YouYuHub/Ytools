@@ -245,7 +245,7 @@ def test_default_short_wait_preserves_cmd_syntax_hints(job, monkeypatch):
         return {'status': 'completed', 'message': 'done'}
     monkeypatch.setattr(command_leases, 'start', launch)
     result = bt.try_execute_builtin_command_tool('run_command', {'command': 'echo one; echo two'})
-    assert seen[0][7] == 1000
+    assert seen[0][7] == bt._RUN_COMMAND_YIELD_MS
     assert 'cmd 不支持' in result['message']
 
 

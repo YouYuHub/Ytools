@@ -2716,6 +2716,15 @@ def execute_read_media(
 # 前台 stdout 截断上限（防止超大输出撑爆模型上下文；超限时完整输出落盘）
 _RUN_COMMAND_MAX_CHARS = 12000
 
+# run_command 默认短等（lease 短等待路径）：启动命令后先等这么久，没结束才
+# 返回 job_id 让模型 poll。Windows 中转链固定开销约 300ms，旧默认 1000ms 只给
+# 命令本身留约 700ms——凡真实工作超 ~0.7s 的命令（git/python/pip 等几乎所有
+# 有用命令）100% 需要第二次工具调用，token 接近翻倍。提到 5000ms 后 5 秒内
+# 命令一次返回；调用内多等几秒远比一整轮模型往返便宜（工具超时 300s+5s 宽限，
+# 无超时风险）。交互式保持 1000ms：等输入提示要快速返回给模型。
+_RUN_COMMAND_YIELD_MS = 5000
+_RUN_COMMAND_INTERACTIVE_YIELD_MS = 1000
+
 def _decode_command_bytes_used(data: bytes, encoding: str = "", candidates: tuple = ("utf-8", "gbk")) -> tuple:
     """显式编码/BOM 优先；逐行严格 UTF-8 后回退系统代码页，支持混合输出。"""
     if encoding or unicode_bom(data):
@@ -4887,7 +4896,8 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
     work_text = string_arg({"work_dir": work_dir}, "work_dir").strip()
     cwd = str(_resolve_dir_path(work_text)) if work_text else os.getcwd()
     if auto_yield and yield_time_ms is None and not background and local_filter is None:
-        yield_time_ms = 1000
+        # 模型默认短等（非交互）：交互式在入口已显式置 1000ms，到这里的一律是非交互
+        yield_time_ms = _RUN_COMMAND_YIELD_MS
     if yield_time_ms is not None:
         if background:
             raise ValueError('yield_time_ms 与 background=true 不能同时指定')
@@ -5112,7 +5122,7 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         if _optional_bool(args, 'background'):
             raise ValueError('session_id 与 background=true 不能同时指定')
         from . import command_sessions
-        wait_ms = int_arg(args, 'yield_time_ms', 1000, maximum=30000) if 'yield_time_ms' in args else 1000
+        wait_ms = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=30000) if 'yield_time_ms' in args else _RUN_COMMAND_YIELD_MS
         sess = command_sessions.run(
             str(args.get('_session_id') or ''), shell_session, args.get('command'),
             args.get('shell') or args.get('_default_shell') or 'auto', args.get('work_dir', ''),
@@ -5127,14 +5137,15 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
                 "stdout": sess['output'], "stderr": "", "background": False, "pid": None,
                 "timed_out": False, "truncated": False, "output_path": None, "completion_path": None,
                 "shell_session": shell_session}
-    yield_time = int_arg(args, 'yield_time_ms', 1000, maximum=30000) if 'yield_time_ms' in args else None
+    yield_time = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=30000) if 'yield_time_ms' in args else None
     tty = _optional_bool(args, 'tty')
     interactive = _optional_bool(args, 'interactive') or tty
     if interactive:
         if _optional_bool(args, 'background'):
             raise ValueError('interactive/tty 与 background=true 不能同时指定')
         if yield_time is None:
-            yield_time = 1000
+            # 交互式默认保持 1 秒：等输入提示要快速返回给模型，不跟随非交互的 5 秒
+            yield_time = _RUN_COMMAND_INTERACTIVE_YIELD_MS
     if yield_time is not None and _optional_bool(args, 'background'):
         raise ValueError('yield_time_ms 与 background=true 不能同时指定')
     return _run_command_impl(

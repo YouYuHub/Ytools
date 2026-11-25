@@ -60,7 +60,8 @@ def test_real_yield_and_resume_preserve_output(logs, shell):
 @pytest.mark.parametrize('shell', ['cmd', 'powershell'] if os.name == 'nt' else ['sh'])
 def test_model_common_flow_needs_no_wait_or_cursor_arguments(logs, shell):
     result = bt.try_execute_builtin_command_tool('run_command', {
-        'command': python_command("import time; print('begin',flush=True); time.sleep(2); print('end')", shell),
+        # 超过默认短等（非交互 5 秒）才 yield：2 秒命令在新默认下首次调用即完成
+        'command': python_command("import time; print('begin',flush=True); time.sleep(7); print('end')", shell),
         'shell': shell, 'work_dir': str(logs), '_session_id': 'lease-test'})
     assert result['status'] == 'running', result
     assert result['background'] is False

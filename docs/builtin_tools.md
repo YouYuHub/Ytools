@@ -16,7 +16,7 @@
 | 跨文件搜内容 | `search_files(pattern, dir_path?)`；默认普通文本，正则设 `is_regex=true`。`file_pattern` 筛选文件名或相对路径 glob |
 | 读取文档 | `read_document(filename)` 默认自动选择。`text` 用 `offset/limit`；`table` 用 `next_row/next_sheet`；PDF 选页同时给 `page_start/page_count` |
 | 查看媒体 | `read_media(references)`，每条回复一次、最多 5 个来源；可用 `media://`、本地路径、HTTP(S) 直链，检查 `loaded/skipped` |
-| 执行命令 | `run_command(command, work_dir?)` 默认每次新 shell、短等 1000ms；未结束返回 `job_id`。语法须匹配 shell。传 `session_id="名"` 复用同一常驻 shell（保住 cwd/环境变量/REPL 状态），不传=每次新建。PowerShell 引号转义用双写（单引号串 `''` / 双引号串 `""`）或反引号，勿用 C 风格 `\'`/`\"`；工具会对含此类转义的命令做解析预检，能安全修复则自动改双写后执行，修不好在执行前拒绝；向原生程序传含双引号的参数会额外告警（WinPS 传参不转义内嵌引号，参数可能分裂/篡改，建议改文件传参） |
+| 执行命令 | `run_command(command, work_dir?)` 默认每次新 shell、短等 5000ms（交互式 1000ms）；未结束返回 `job_id`。语法须匹配 shell。传 `session_id="名"` 复用同一常驻 shell（保住 cwd/环境变量/REPL 状态），不传=每次新建。PowerShell 引号转义用双写（单引号串 `''` / 双引号串 `""`）或反引号，勿用 C 风格 `\'`/`\"`；工具会对含此类转义的命令做解析预检，能安全修复则自动改双写后执行，修不好在执行前拒绝；向原生程序传含双引号的参数会额外告警（WinPS 传参不转义内嵌引号，参数可能分裂/篡改，建议改文件传参） |
 | 继续查看 | `poll_command(job_id)` 自动续取新增输出。`status=running` 或 `has_more=true` 时继续查询；`completion=awaiting_input` 表示在等输入；footer 带 `elapsed_ms`/`cwd` |
 | 连续输入 | `run_command(..., interactive=true)`；需 TTY 的 REPL 加 `tty=true`。用 `write_stdin(job_id, chars="内容\n")` 输入并续取输出；控制键用 `key`（ctrl+c/enter/方向键等）；管道读取至 EOF 的程序再传 `eof=true` |
 | 独立服务 | `run_command(..., background=true)`，不受前台总超时/任务结束回收；`poll_command(job_id)` 查看，`stop_command(job_id)` 停止（`graceful=true` 先软中断再杀树） |

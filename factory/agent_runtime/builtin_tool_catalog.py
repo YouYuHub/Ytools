@@ -388,7 +388,7 @@ READ_DOCUMENT_TOOL_DEFINITION = {'type': 'function',
 
 RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
  'function': {'name': 'run_command',
-              'description': '运行命令，每次新建 shell，默认短等 1000ms；未结束返回 job_id。'
+              'description': '运行命令，每次新建 shell，默认短等 5000ms（交互式 1000ms）；未结束返回 job_id。'
                              '用 poll_command(job_id) 续取输出，stop_command(job_id) 停止。'
                              '需输入设 interactive=true，需终端再加 tty=true；独立服务用 background=true。文件读写优先专用工具。',
               'parameters': {'type': 'object',
@@ -423,7 +423,7 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                                                           'timeout_seconds 限制，结束后仍可查询日志。',
                                                            'default': False},
                                             'yield_time_ms': {'type': 'integer', 'minimum': 0, 'maximum': 30000,
-                                                              'description': '启动后最多等待多久，默认 1000ms，0 立即返回。与 background 互斥；总超时仍由 timeout_seconds 控制。'},
+                                                              'description': '启动后最多等待多久，默认 5000ms（交互式默认 1000ms），0 立即返回。与 background 互斥；总超时仍由 timeout_seconds 控制。'},
                                             'interactive': {'type': 'boolean', 'default': False,
                                                             'description': '保持 UTF-8 stdin 可写；用 write_stdin 继续输入。与 background 互斥，任务结束时停止。'},
                                             'tty': {'type': 'boolean', 'default': False,
