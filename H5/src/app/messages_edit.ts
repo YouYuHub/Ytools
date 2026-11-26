@@ -516,6 +516,10 @@
           return;
         }
         if (!item) continue;
+        if (item.hash && keptMedia.some(function (existing: any) { return existing && existing.hash === item.hash; })) {
+          App.toast("已添加过相同的文件，已跳过");
+          continue;
+        }
         if (typeof URL.createObjectURL === "function") {
           item.objUrl = URL.createObjectURL(item.file);
         }

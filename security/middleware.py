@@ -4,7 +4,6 @@ import hmac
 import json
 import math
 import re
-import time
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlsplit
 
@@ -329,13 +328,16 @@ class SecurityMiddleware:
         refresh_values = [data.get("refresh"), *query.get("refresh", [])]
         force_refresh = any(str(item).strip().lower() in {"1", "true", "on", "yes", "t", "y"} for item in refresh_values)
         if path == "/tools/diagnostics":
-            if not principal.admin or time.time() - principal.recent_auth > 300:
-                raise HTTPException(403, "工具诊断需要近期验证的管理员")
+            # 诊断（含手动执行）仅要求管理员，不做近期验证：同一管理员用普通
+            # 登录经聊天就能触发同样的 MCP 工具执行（含终端等内置工具），近期
+            # 验证挡不住任何事，只会把正常管理员挡在弹窗外。真正的账号安全
+            # 操作（建用户/改密码/配额）仍由 recent_admin/密码修改口近期验证守。
+            if not principal.admin:
+                raise HTTPException(403, "工具诊断需要管理员权限")
         if path == "/tools/list" and force_refresh:
             # 手动刷新只是重跑“配置热重载线程本来就会自动做的”服务发现，
             # 不新增任何能力；近期验证门槛只会把正常管理员挡在外面
-            # （工具弹窗内无重新验证入口），故仅要求管理员。诊断接口
-            # 可实际执行工具，保持近期验证。
+            # （工具弹窗内无重新验证入口），故仅要求管理员（与诊断接口同口径）。
             if not principal.admin:
                 raise HTTPException(403, "工具强制发现需要管理员权限")
         from security.preferences import PERSONAL_PATHS

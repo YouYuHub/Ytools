@@ -43,7 +43,8 @@ test('搜索窗口外已有回答时仍先确认处理方式', () => {
   vm.runInContext(source.slice(source.indexOf('  function submitAskAnswer('),source.indexOf('  function showAskAnswerConfirm(')),context);
   context.submitAskAnswer('新回答',block);
   assert.equal(sent.length,0);
-  assert.deepEqual(confirmed,[['新回答',20,true]]);
+  // 空数组来自 vm  realm（原型与宿主不同），用 JSON 做 realm 无关比较
+  assert.equal(JSON.stringify(confirmed),JSON.stringify([['新回答',20,true,[],[]]]));
 });
 
 test('自动弹窗的最新提问续答按普通新轮发送，避免误入历史插入分支', () => {
@@ -58,4 +59,21 @@ test('自动弹窗的最新提问续答按普通新轮发送，避免误入历�
   assert.equal(sent.length,1);
   assert.equal(sent[0].text,'【回答模型提问】\n完整回答');
   assert.equal(sent[0].insertAfterRound,undefined);
+  assert.equal(JSON.stringify(sent[0].media), '[]');
+  assert.equal(JSON.stringify(sent[0].docs), '[]');
+});
+
+test('续答透传附件：媒体与文档随回答一起直接发送', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../js/app/builtin.js'), 'utf8');
+  const sent = [], chatInner = { children: [] };
+  const block = { isConnected:true, getAttribute:()=>'2', parentElement:chatInner };
+  const context = { chatInner, App: { historyQuestionAfterRound:()=>null, send:data=>sent.push(data) },
+    showAskAnswerConfirm:()=>assert.fail('最新提问无需再次确认') };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('  function submitAskAnswer('),source.indexOf('  function showAskAnswerConfirm(')),context);
+  const media = [{ name: 'a.png' }], docs = [{ name: 'b.pdf' }];
+  context.submitAskAnswer('【回答模型提问】\\n完整回答',block,media,docs);
+  assert.equal(sent.length,1);
+  assert.deepEqual(sent[0].media,media);
+  assert.deepEqual(sent[0].docs,docs);
 });

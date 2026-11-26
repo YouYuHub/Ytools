@@ -14,19 +14,41 @@ body.mcp-test-open { overflow: hidden; }
 .mcp-test-modal { position: fixed; inset: 0; z-index: 1900; display: grid; place-items: center; padding: 20px; }
 .mcp-test-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, .5); }
 .mcp-test-dialog {
-  position: relative; display: flex; flex-direction: column; width: min(1040px, 100%); max-height: calc(100dvh - 40px);
+  position: relative; display: flex; flex-direction: column; width: min(1160px, 100%); max-height: calc(100dvh - 40px);
   min-height: 0; min-width: 0; overflow: hidden; background: var(--bg-elevated); color: var(--text);
   border: 1px solid var(--border-strong); border-radius: 18px; box-shadow: var(--shadow-menu); font-size: 14px;
 }
 .mcp-test-header, .mcp-test-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 20px; }
 .mcp-test-header { border-bottom: 1px solid var(--border); h2 { margin: 0; font-size: 20px; } }
 .mcp-test-footer { border-top: 1px solid var(--border); justify-content: flex-end; flex-wrap: wrap; }
-.mcp-test-body { overflow: auto; min-height: 0; padding: 12px 20px 20px; overscroll-behavior: contain; }
+.mcp-test-body { overflow: auto; min-height: 0; padding: 14px 20px 20px; overscroll-behavior: contain; }
 .mcp-test-hint { color: var(--text-secondary); font-size: 13px; line-height: 1.6; margin: 6px 0 10px; overflow-wrap: anywhere; }
-.mcp-test-connection { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; margin: 16px 0 22px;
-  .mcp-test-field:first-child { flex: 1 1 230px; }
-  .mcp-test-field:nth-child(2) { flex: 0 1 135px; }
+
+// 双栏布局：左列「服务连接 + 工具清单」，右列「手动调用 + 结果」。
+// 工具清单是内嵌常驻面板（内部滚动），滚动页面不会把它隐藏。
+.mcp-test-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 14px; align-items: start; }
+// 左列 sticky 常驻：右列滚动时连接/清单保持可见；固定填满可用高度，
+// 清单卡 flex:1 吃掉全部剩余空间（内容高度只会让清单卡缩到 min-height 下限）。
+// overflow-y:auto 是兜底：视口过矮、连两卡下限都放不下时，左列自身内部滚动，
+// 保证清单内容永远可达（sticky 列不随 body 滚动，无此兜底会被裁掉且够不着）。
+.mcp-test-side { position: sticky; top: 0; display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0;
+  height: calc(100dvh - 230px); overflow-y: auto; overscroll-behavior: contain; }
+.mcp-test-main { min-width: 0; }
+.mcp-test-card { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 12px 14px; min-width: 0; }
+.mcp-test-card-title { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.mcp-test-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px;
+  .mcp-test-card-title { margin: 0; }
 }
+.mcp-test-tools-count { font-size: 12px; color: var(--tool-icon-pink); white-space: nowrap; }
+
+.mcp-test-connection { display: grid; grid-template-columns: minmax(0, 1fr) 112px; gap: 8px 10px; align-items: end;
+  // 紧凑两行：服务+超时同行，两个按钮自动换行均分下行；纵向空间让给工具清单。
+  // 超时列 112px 保证“测试超时（秒）”标签单行（92px 会折行撑高第一行）。
+  > * { min-width: 0; }
+  .mcp-test-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+  .mcp-test-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+.mcp-test-btn-icon { width: 16px; height: 16px; flex: none; }
 .mcp-test-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; margin: 0; }
 .mcp-test-dialog {
   input, select, textarea { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 8px;
@@ -39,28 +61,26 @@ body.mcp-test-open { overflow: hidden; }
   summary { cursor: pointer; color: var(--text-secondary); padding: 6px 0; }
   h3 { font-size: 16px; margin: 0 0 12px; }
 }
-.mcp-test-call { border-top: 1px solid var(--border); padding-top: 18px;
+.mcp-test-call {
   > .mcp-test-button { margin-top: 8px; }
   > .mcp-test-button:last-child { color: var(--tool-icon-pink); }
 }
+#mcpTestExecute { width: 100%; white-space: normal; }
 .mcp-test-schema, .mcp-test-description { margin: 4px 0; }
-.mcp-test-picker-wrap { position: relative; margin-bottom: 8px; }
-#mcpTestChooseTools { width: 100%; white-space: normal; text-align: left; padding: 9px 11px; }
-.mcp-test-picker { position: absolute; z-index: 3; top: calc(100% + 5px); left: 0; right: 0;
-  display: flex; flex-direction: column; gap: 7px; padding: 10px; box-sizing: border-box; min-height: 0;
-  background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: var(--shadow-menu);
-  &.opens-up { top: auto; bottom: calc(100% + 5px); }
-  > input { flex-shrink: 0; }
-}
+
+// 工具清单面板：搜索 + 批量操作 + 内部滚动列表（高度自适应左列剩余空间）
+.mcp-test-tools-card { display: flex; flex-direction: column; gap: 8px; flex: 1 1 auto; min-height: 300px; }
 .mcp-test-picker-actions { display: flex; flex-wrap: wrap; gap: 5px;
   .mcp-test-button { padding: 4px 7px; font-size: 12px; }
 }
-.mcp-test-tool-options { min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.mcp-test-tool-option { display: flex; align-items: flex-start; gap: 8px; padding: 8px 5px; border-radius: 6px; cursor: pointer;
+.mcp-test-tool-options { min-height: 60px; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 2px; }
+.mcp-test-tool-option { display: flex; align-items: flex-start; gap: 6px; padding: 4px 8px; border-radius: 8px; cursor: pointer;
   &:hover, &:focus-within { background: var(--bg-hover); }
-  input[type="checkbox"] { flex: 0 0 16px; width: 16px; height: 16px; padding: 0; margin: 2px 0 0; accent-color: var(--tool-icon-pink); }
+  &:has(input:checked) { background: color-mix(in srgb, var(--tool-icon-pink) 12%, transparent); }
+  input[type="checkbox"] { flex: 0 0 16px; width: 16px; height: 16px; padding: 0; margin: 1px 0 0; accent-color: var(--tool-icon-pink); }
 }
-.mcp-test-tool-option-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mcp-test-tool-option-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .mcp-test-tool-name { font-size: 13px; overflow-wrap: anywhere; }
 .mcp-test-tool-summary { font-size: 11px; color: var(--text-secondary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mcp-test-selected-tools { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
@@ -102,27 +122,44 @@ body.mcp-test-open { overflow: hidden; }
   summary { font-size: 12px; overflow-wrap: anywhere; }
   textarea { min-height: 72px; }
 }
-.mcp-test-status { margin: 20px 0 10px; font-weight: 600; overflow-wrap: anywhere; }
+.mcp-test-status { margin: 12px 0 8px; font-weight: 600; overflow-wrap: anywhere; }
 .mcp-test-error { color: var(--tool-icon-pink); white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (min-width: 760px) {
   .mcp-param-object { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .mcp-param-wide { grid-column: 1 / -1; }
 }
+// 宽屏双栏：连接提示收起为 2 行，把纵向空间让给工具清单；完整内容在 title tooltip。
+// 窄屏单列纵向充裕，显示全文。
+@media (min-width: 961px) {
+  #mcpTestConnectionHint { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-clamp: 2; }
+}
+// 窄屏：双栏塌为单列（连接 → 清单 → 调用），清单限高内部滚动
+@media (max-width: 960px) {
+  .mcp-test-layout { grid-template-columns: minmax(0, 1fr); }
+  .mcp-test-side { position: static; height: auto; overflow-y: visible; }
+  .mcp-test-tools-card { flex: 0 0 auto; min-height: 0; }
+  .mcp-test-tool-options { flex: 0 0 auto; max-height: 260px; }
+}
 @media (max-width: 640px) {
-  .mcp-test-modal { padding: 8px; }
-  .mcp-test-dialog { max-height: calc(100dvh - 16px); border-radius: 12px; font-size: 13px; }
+  .mcp-test-modal { padding: 0; }
+  .mcp-test-dialog { width: 100%; max-height: 100dvh; border-radius: 0; border-left: 0; border-right: 0; font-size: 13px; }
   .mcp-test-header, .mcp-test-footer { padding: 10px 12px; }
   .mcp-test-body { padding: 10px 12px 16px; }
   .mcp-test-dialog input, .mcp-test-dialog select, .mcp-test-dialog textarea { font-size: 16px; }
-  .mcp-test-connection .mcp-test-field:first-child { flex-basis: 100%; }
+  .mcp-test-connection .mcp-test-field:first-child, .mcp-test-connection .mcp-test-field:nth-child(2) { grid-column: 1 / -1; }
+  // 窄屏按钮只显示图标：对称两列 + 足够触控高度，大字体/缩放下也不重叠
+  .mcp-test-connection { grid-template-columns: 1fr 1fr; }
+  .mcp-test-connection .mcp-test-btn-label { display: none; }
+  .mcp-test-connection .mcp-test-button { min-height: 38px; padding: 7px 8px; }
   .mcp-test-header h2 { font-size: 18px; }
+  .mcp-test-card { padding: 10px; }
+  .mcp-test-tool-options { max-height: 220px; }
   .mcp-param-field { padding: 7px 8px; }
   .mcp-param-head { gap: 5px 7px; }
   .mcp-param-label { font-size: 13px; }
   .mcp-param-type, .mcp-param-option { font-size: 11px; }
   .mcp-param-field > .mcp-test-hint { font-size: 12px; }
   .mcp-test-modes .mcp-test-button { flex: 1; padding-inline: 8px; }
-  .mcp-test-picker { padding: 7px; }
   .mcp-test-picker-actions .mcp-test-button { font-size: 11px; }
   .mcp-test-tool-current { gap: 6px; }
   .mcp-test-tool-current > .mcp-test-button { padding: 9px 8px; font-size: 12px; }

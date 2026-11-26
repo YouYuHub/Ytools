@@ -35,6 +35,13 @@ test('opening only inventories configured services; connection probe never auto-
   assert.equal(s.calls.length, 0);
   s.$('#mcpDiagnosticsOpen').click(); await settle();
   assert.equal(s.calls.length, 1); assert.equal(s.calls[0].type, 'inventory');
+  // 连接区按钮：图标 + 文字（窄屏 CSS 隐藏文字只留图标；textContent 保持精确可查）
+  for (const text of ['测试连接', '刷新服务']) {
+    const b = s.btn(text);
+    assert.ok(b.querySelector('svg.mcp-test-btn-icon'), text + ' 应有图标');
+    assert.equal(b.querySelector('.mcp-test-btn-label').textContent, text);
+    assert.equal(b.getAttribute('aria-label'), text);
+  }
   s.btn('测试连接').click(); await settle();
   assert.equal(s.calls[1].payload.action, 'connect');
   assert.equal(s.calls[1].payload.tool_name, null);
@@ -51,6 +58,7 @@ test('extension services show authorization hints without initiating a browser t
   assert.match(s.$('#mcpTestConnectionHint').textContent, /Chrome.*目标标签页/);
   assert.match(s.$('#mcpTestConnectionHint').textContent, /120 秒.*常驻连接/);
   assert.equal(s.$('#mcpTestConnectionHint').hidden, false);
+  assert.equal(s.$('#mcpTestConnectionHint').title, s.$('#mcpTestConnectionHint').textContent);
   assert.match(s.$('#mcpTestServer').selectedOptions[0].textContent, /现有浏览器/);
   assert.equal(s.calls.length, 0);
   s.$('#mcpTestServer').value = 'Other'; s.$('#mcpTestServer').dispatchEvent(new s.w.Event('change'));
@@ -292,28 +300,34 @@ function pick(s, name, checked = true) {
 }
 function editSelected(s, name) { s.w.document.querySelector(`[aria-label="编辑参数 ${name}"]`).click(); }
 
-test('custom picker shows all tools, supports multiple checks, search and scroll/resize/outside/Escape dismissal', async t => {
+test('resident tool panel shows all tools, supports multiple checks and search; page scroll never hides it', async t => {
   const s = setup(); t.after(s.close); await discoverMultiple(s);
   assert.equal(s.$('#mcpTestTool').hasAttribute('list'), false);
-  s.$('#mcpTestChooseTools').click(); assert.equal(s.$('#mcpTestToolPicker').hidden, false);
+  // 清单是内嵌常驻面板：打开弹窗即可见，无需点击展开
   assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 3);
+  assert.match(s.$('.mcp-test-tools-count').textContent, /已选 1/);
   pick(s, 'second'); assert.equal(s.$('#mcpTestTool').value, 'second');
   assert.equal(s.$('.mcp-test-selected-tools').children.length, 2);
   assert.match(s.$('#mcpTestExecute').textContent, /2 项/);
+  assert.match(s.$('.mcp-test-tools-count').textContent, /已选 2/);
   s.$('#mcpTestToolSearch').value = 'third'; s.$('#mcpTestToolSearch').dispatchEvent(new s.w.Event('input'));
   assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
-  s.$('.mcp-test-body').dispatchEvent(new s.w.Event('scroll')); assert.equal(s.$('#mcpTestToolPicker').hidden, false); // Ignore an already-delivered position.
+  // 外部滚动/窗口变化不再隐藏清单（内嵌面板，内部滚动）
   s.$('.mcp-test-body').scrollTop = 1;
-  s.$('.mcp-test-body').dispatchEvent(new s.w.Event('scroll')); assert.equal(s.$('#mcpTestToolPicker').hidden, true);
-  s.$('#mcpTestChooseTools').click(); s.$('#mcpTestTools').dispatchEvent(new s.w.Event('scroll'));
-  assert.equal(s.$('#mcpTestToolPicker').hidden, false); // Scrolling the list itself must be possible.
-  s.w.dispatchEvent(new s.w.Event('resize')); assert.equal(s.$('#mcpTestToolPicker').hidden, true);
-  s.$('#mcpTestChooseTools').click(); Object.defineProperty(s.w, 'scrollY', { value: 2 }); s.w.dispatchEvent(new s.w.Event('scroll'));
-  assert.equal(s.$('#mcpTestToolPicker').hidden, true);
-  s.$('#mcpTestChooseTools').click(); s.$('#mcpTestTimeout').dispatchEvent(new s.w.Event('pointerdown', { bubbles: true }));
-  assert.equal(s.$('#mcpTestToolPicker').hidden, true);
-  s.$('#mcpTestChooseTools').click(); s.$('#mcpTestToolSearch').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-  assert.equal(s.$('#mcpTestToolPicker').hidden, true); assert.equal(s.$('.mcp-test-modal').hidden, false);
+  s.$('.mcp-test-body').dispatchEvent(new s.w.Event('scroll'));
+  assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
+  s.$('#mcpTestTools').dispatchEvent(new s.w.Event('scroll'));
+  assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
+  s.w.dispatchEvent(new s.w.Event('resize'));
+  assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
+  Object.defineProperty(s.w, 'scrollY', { value: 2 }); s.w.dispatchEvent(new s.w.Event('scroll'));
+  assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
+  // 面板外点击也不隐藏
+  s.$('#mcpTestTimeout').dispatchEvent(new s.w.Event('pointerdown', { bubbles: true }));
+  assert.equal(s.$('#mcpTestTools').querySelectorAll('input').length, 1);
+  // Escape 直接关闭整个弹窗（清单不再是浮层）
+  s.$('#mcpTestToolSearch').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(s.$('.mcp-test-modal').hidden, true);
   assert.equal(s.calls.length, 2); // Checking and editing never invokes business tools.
 });
 

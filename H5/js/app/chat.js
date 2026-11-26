@@ -637,8 +637,13 @@
         if (App.setResumeAvailable)
             App.setResumeAvailable(streamSessionId, false);
         try {
-            streamResult = await API.chatStream(payload, pipe.handle, state.abort.signal, { onOpen: () => { if (App.taskStatus)
-                    App.taskStatus.connected(activeStream.taskHandle); } });
+            streamResult = await API.chatStream(payload, pipe.handle, state.abort.signal, { onOpen: () => {
+                    if (App.taskStatus)
+                        App.taskStatus.connected(activeStream.taskHandle);
+                    // 后端已接受：新会话首发也即记为“上次打开”，刷新不丢（后台发送不走这里）
+                    if (App.rememberOpenSession)
+                        App.rememberOpenSession(streamSessionId);
+                } });
         }
         catch (err) {
             streamFailed = true;

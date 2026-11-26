@@ -45,6 +45,9 @@ def secured(tmp_path, monkeypatch):
     @app.get("/tools/diagnostics")
     def diagnostics():
         return {"servers": []}
+    @app.post("/tools/diagnostics")
+    def diagnose():
+        return {"ok": True}
     @app.post("/chat_config/models/select")
     def write_global():
         pytest.fail("query session ID must not turn a global body into a session update")
@@ -291,15 +294,24 @@ def test_member_tool_refresh_denied_even_when_fresh(secured):
     assert "管理员" in response.json()["detail"]
 
 
-def test_tool_diagnostics_still_requires_recent_admin(secured):
-    # 诊断接口可实际执行工具：近期验证门槛保持不动。
+def test_tool_diagnostics_needs_admin_only_for_read_and_execute(secured):
+    # 诊断读写（清单/建连/手动执行）仅要求管理员，不做近期验证：
+    # 同一管理员经聊天本就能触发同样的工具执行，近期验证挡不住任何事。
     client, store, _, _ = secured
-    login(client)
+    headers = login(client)
     assert client.get("/tools/diagnostics").status_code == 200
+    assert client.post("/tools/diagnostics", json={}, headers=headers).status_code == 200
     _age_recent_auth(store)
+    assert client.get("/tools/diagnostics").status_code == 200
+    assert client.post("/tools/diagnostics", json={}, headers=headers).status_code == 200
+
+
+def test_tool_diagnostics_denied_for_non_admin(secured):
+    client, *_ = secured
+    login(client, "member")
     response = client.get("/tools/diagnostics")
     assert response.status_code == 403
-    assert "近期验证" in response.json()["detail"]
+    assert "管理员" in response.json()["detail"]
 
 
 def test_active_content_is_downloaded_and_pdf_keeps_same_origin_preview(secured):

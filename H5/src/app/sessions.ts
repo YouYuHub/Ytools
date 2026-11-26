@@ -1059,9 +1059,24 @@
   let sessionOpenSeq = 0;
 
   async function openInitialSession(rawId: any) {
-    // An ordinary homepage is a new conversation, never an implicit shared ID.
-    if (rawId == null || !String(rawId).trim()) { startNewChat(); return false; }
-    const id = SessionUtils.sanitizeSessionId(rawId), seq = sessionOpenSeq, previous = state.sessionId;
+    // 启动目标优先级：显式深链 > 上次打开的会话 > 新对话。
+    // 深链/记忆 id 都先验成员资格，避免打开幽灵会话建出空历史文件。
+    const deep = rawId == null ? "" : String(rawId).trim();
+    if (deep && await openValidatedInitialSession(deep)) return true;
+    if (!deep) {
+      const remembered = recallOpenSession();
+      if (remembered) {
+        if (await openValidatedInitialSession(remembered)) return true;
+        forgetOpenSession(remembered);
+      }
+    }
+    startNewChat();
+    return false;
+  }
+
+  async function openValidatedInitialSession(id: any) {
+    id = SessionUtils.sanitizeSessionId(id);
+    const seq = sessionOpenSeq, previous = state.sessionId;
     const initialInput = input.value;
     try {
       const rows = await fetchSessionSummaries(id);
@@ -1073,7 +1088,6 @@
         if (App.noteSessionArchive) App.noteSessionArchive(id, Boolean(row.archived));
         return openSession(id);
       }
-      startNewChat();
     } catch (_) {
       // Never open an unchecked id and create a phantom default history file.
       if (seq === sessionOpenSeq && state.sessionId === previous) toast("初始会话暂时无法加载，可稍后从历史列表打开");
@@ -1088,6 +1102,27 @@
   // 的路径（删除轮次后重载、流失败对齐、深链启动等）不受影响，始终真实重载。
   let readySessionId = "";
   let loadingSessionId = "";
+
+  // 上次打开的会话（刷新恢复用，ChatGPT 同款）：openSession 成功进入即记，
+  // startNewChat（显式新对话/会话删除）清掉；启动无深链时恢复它。
+  // 跨用户/已删除等脏数据由成员资格校验 + 加载失败兜底消化，不建幽灵会话。
+  const LAST_OPEN_KEY = "ytools-last-open-session";
+  function rememberOpenSession(id: any): void {
+    try { if (id) localStorage.setItem(LAST_OPEN_KEY, String(id)); } catch (_) { /* 忽略 */ }
+  }
+  function recallOpenSession(): string {
+    try {
+      const raw = localStorage.getItem(LAST_OPEN_KEY);
+      return raw ? SessionUtils.sanitizeSessionId(raw) : "";
+    } catch (_) { return ""; }
+  }
+  function forgetOpenSession(onlyId?: any): void {
+    try {
+      if (onlyId == null || localStorage.getItem(LAST_OPEN_KEY) === onlyId) {
+        localStorage.removeItem(LAST_OPEN_KEY);
+      }
+    } catch (_) { /* 忽略 */ }
+  }
 
   /**
    * 惰性生成会话 ID：仅在真正产生会话内容时分配（发送消息 / 上传文件）。
@@ -1120,6 +1155,8 @@
     if (App.stopVoiceInput) App.stopVoiceInput();
     // 只进入"待开始"状态，不生成本地 ID；首次发送消息时才由 ensureSessionId() 分配
     state.sessionId = null;
+    // 显式离开当前会话：清掉“上次打开”记忆，刷新后停留在新对话页
+    forgetOpenSession();
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     if (App.taskCosts) App.taskCosts.noteSessionChanged();
     if (App.contextPanel) App.contextPanel.noteSessionChanged();
@@ -1301,6 +1338,8 @@
     if (App.stopVoiceInput) App.stopVoiceInput();
     id = SessionUtils.sanitizeSessionId(id);
     state.sessionId = id;
+    // 进入真实会话即记为“上次打开”（刷新恢复用；失败分支按 id 清掉，避免脏记忆）。
+    rememberOpenSession(id);
     if (App.terminalJobs) App.terminalJobs.noteSessionChanged();
     if (App.taskCosts) App.taskCosts.noteSessionChanged();
     if (App.contextPanel) App.contextPanel.noteSessionChanged();
@@ -1405,6 +1444,9 @@
       if (seq === sessionOpenSeq) {
         loadingSessionId = "";
         readySessionId = "";
+        // 加载失败的会话不值得记住（已删除/无权限等），清掉避免刷新后反复撞错；
+        // 只清仍指向本 id 的记忆，不动更新切换产生的记忆。
+        forgetOpenSession(id);
       }
       return false;
     }
@@ -1548,6 +1590,8 @@
   App.startNewChat = startNewChat;
   App.openSession = openSession;
   App.openInitialSession = openInitialSession;
+  // 发送确认后登记“上次打开”（新会话首发即记，刷新不丢；后台发送不调用）
+  App.rememberOpenSession = rememberOpenSession;
   // 视图就绪标记（本地导入预览等直接铺开内容的路径调用；重复点击守卫依据）
   App.markSessionViewReady = markSessionViewReady;
   App.restoreActiveStream = restoreActiveStream;

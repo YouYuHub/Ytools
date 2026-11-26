@@ -5,6 +5,18 @@
   const node = (tag: any, cls?: any, text?: any): any => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
   const button = (text: any, handler: any): any => { const n = node("button", "mcp-test-button", text); n.type = "button"; n.addEventListener("click", handler); return n; };
   const pretty = (value: any): string => JSON.stringify(value, null, 2);
+  // 线性图标（viewBox 24，同项目惯例）：插头=测试连接，循环箭头=刷新服务。
+  // 窄屏只显示图标（文字 span 隐藏），从根本上避免大字体/缩放下按钮文字重叠。
+  const ICON_PROBE = '<svg class="icon mcp-test-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0V8Z"/><path d="M12 17v5"/></svg>';
+  const ICON_RELOAD = '<svg class="icon mcp-test-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M20.5 15a9 9 0 1 1-2.1-9.4L23 10"/></svg>';
+  function iconButton(icon: string, text: string, handler: any): any {
+    const b = node("button", "mcp-test-button");
+    b.type = "button"; b.insertAdjacentHTML("beforeend", icon);
+    b.append(node("span", "mcp-test-btn-label", text));
+    // 纯图标态（窄屏）靠 title/aria-label 辨认
+    b.title = text; b.setAttribute("aria-label", text);
+    b.addEventListener("click", handler); return b;
+  }
   const stages: any = { configuration: "配置检查", connect: "启动与连接", initialize: "协议握手", list_tools: "工具清单", validate_arguments: "参数验证", call_tool: "工具执行", queued: "等待测试" };
   const codes: any = { busy: "测试繁忙", timeout: "测试超时", invalid_config: "配置错误", command_not_found: "启动命令不存在",
     unsupported_transport: "不支持的连接方式", permission_denied: "权限或认证失败", transport_error: "连接中断",
@@ -16,24 +28,20 @@
   const header = node("header", "mcp-test-header"), title = node("h2", "", "MCP 测试"); title.id = "mcpTestTitle";
   const closeButton = button("关闭", close); header.append(title, closeButton);
   const body = node("div", "mcp-test-body");
-  const intro = node("p", "mcp-test-hint", "选择已配置的 MCP 服务，测试连接或手动调用工具。每次测试新建连接；连接测试只握手并读取工具清单。");
+  const intro = node("p", "mcp-test-hint", "选择已配置的 MCP 服务，测试连接或手动调用工具。每次测试新建连接；连接测试只握手并读取工具清单，在工具清单中勾选（可多选）。");
   const connection = node("div", "mcp-test-connection");
   const connectionHint = node("p", "mcp-test-hint"); connectionHint.id = "mcpTestConnectionHint"; connectionHint.hidden = true;
   const serverInfo: any = new Map();
   const server = node("select"); server.id = "mcpTestServer";
   const profileSelect = node("select"); profileSelect.id = "mcpTestProfile";
   const timeout = node("input"); timeout.id = "mcpTestTimeout"; timeout.type = "number"; timeout.min = "1"; timeout.max = "300"; timeout.value = "30";
-  const probe = button("测试连接", () => run("connect")), reload = button("刷新服务", loadServers);
+  const probe = iconButton(ICON_PROBE, "测试连接", () => run("connect")), reload = iconButton(ICON_RELOAD, "刷新服务", loadServers);
   function field(text: any, input: any): any { const label = node("label", "mcp-test-field"); label.append(node("span", "", text), input); return label; }
   connection.append(field("MCP 服务", server), field("测试超时（秒）", timeout), probe, reload);
   const profileSelectField = field("连接配置（profile）", profileSelect); profileSelectField.hidden = true;
-  const form = node("section", "mcp-test-call"); form.append(node("h3", "", "手动调用工具"));
-  const tool = node("input"); tool.id = "mcpTestTool"; tool.type = "text"; tool.placeholder = "输入工具原名，或从上方列表勾选"; tool.autocomplete = "off"; tool.spellcheck = false;
+  const form = node("section", "mcp-test-card mcp-test-call"); form.append(node("h3", "mcp-test-card-title", "手动调用工具"));
+  const tool = node("input"); tool.id = "mcpTestTool"; tool.type = "text"; tool.placeholder = "输入工具原名，或从工具清单勾选"; tool.autocomplete = "off"; tool.spellcheck = false;
   const selections: any = new Map();
-  let pickerScroll: any = null;
-  const pickerWrap = node("div", "mcp-test-picker-wrap"), picker = node("div", "mcp-test-picker"); picker.id = "mcpTestToolPicker"; picker.hidden = true;
-  const pickerButton = button("选择工具（可多选）", () => picker.hidden ? openPicker() : closePicker()); pickerButton.id = "mcpTestChooseTools";
-  pickerButton.setAttribute("aria-expanded", "false"); pickerButton.setAttribute("aria-controls", picker.id);
   const toolSearch = node("input"); toolSearch.id = "mcpTestToolSearch"; toolSearch.type = "search"; toolSearch.placeholder = "搜索工具名称或说明"; toolSearch.setAttribute("aria-label", "搜索工具名称或说明");
   const pickerActions = node("div", "mcp-test-picker-actions");
   const selectAll = button("全选筛选结果", () => {
@@ -43,9 +51,19 @@
     syncSelectionUI();
   });
   const clearSelection = button("清空选择", () => { if (!busy) { selectedTools().clear(); activateTool(""); } });
-  pickerActions.append(selectAll, clearSelection, button("收起列表", () => { closePicker(); pickerButton.focus(); }));
+  pickerActions.append(selectAll, clearSelection);
   const names = node("div", "mcp-test-tool-options"); names.id = "mcpTestTools"; names.setAttribute("role", "group"); names.setAttribute("aria-label", "可选测试工具");
-  picker.append(toolSearch, pickerActions, names); pickerWrap.append(pickerButton, picker);
+  // 工具清单为内嵌常驻面板（内部滚动），不再是浮层：滚动外部区域不会把它
+  // 隐藏，从根本上消除“滚轮一碰就消失”的交互问题。
+  const toolsCount = node("span", "mcp-test-tools-count", "已选 0");
+  const toolsCard = node("section", "mcp-test-card mcp-test-tools-card");
+  const toolsHead = node("div", "mcp-test-card-head"); toolsHead.append(node("h3", "mcp-test-card-title", "工具清单"), toolsCount);
+  toolsCard.append(toolsHead, toolSearch, pickerActions, names);
+  const connCard = node("section", "mcp-test-card");
+  // 连接卡无标题（字段自解释），纵向空间让给工具清单
+  connCard.append(connection, profileSelectField, connectionHint);
+  const side = node("div", "mcp-test-side"); side.append(connCard, toolsCard);
+  const main = node("div", "mcp-test-main");
   const selectedTabs = node("div", "mcp-test-selected-tools"); selectedTabs.setAttribute("role", "group"); selectedTabs.setAttribute("aria-label", "已选工具，点击切换参数");
   const toolCurrent = node("div", "mcp-test-tool-current");
   const addTool = button("加入测试", () => {
@@ -70,33 +88,28 @@
   const continueLabel = node("label", "mcp-param-option mcp-test-continue"), continueOnError = node("input"); continueOnError.type = "checkbox"; continueOnError.id = "mcpTestContinueOnError";
   continueLabel.append(continueOnError, node("span", "", "单项失败后继续测试其他工具")); continueLabel.hidden = true;
   const callHint = node("p", "mcp-test-hint"); callHint.id = "mcpTestCallHint";
-  form.append(pickerWrap, selectedTabs, toolCurrent, descriptionDetails, schemaDetails, argumentModes, modeHint, formArguments, jsonArguments, example, continueLabel, callHint, execute);
+  form.append(selectedTabs, toolCurrent, descriptionDetails, schemaDetails, argumentModes, modeHint, formArguments, jsonArguments, example, continueLabel, callHint, execute);
   const status = node("p", "mcp-test-status"); status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
   const result = node("div", "mcp-test-result");
+  main.append(form, status, result);
+  const layout = node("div", "mcp-test-layout"); layout.append(side, main);
   const footer = node("footer", "mcp-test-footer");
   const stop = button("停止等待", cancel), copy = button("复制脱敏报告", copyReport), download = button("下载脱敏报告", downloadReport);
   stop.hidden = true; copy.disabled = download.disabled = true;
   footer.append(stop, copy, download);
-  body.append(intro, connection, profileSelectField, connectionHint, form, status, result); dialog.append(header, body, footer); modal.append(backdrop, dialog); document.body.append(modal);
+  body.append(intro, layout); dialog.append(header, body, footer); modal.append(backdrop, dialog); document.body.append(modal);
   backdrop.addEventListener("click", close);
   toolSearch.addEventListener("input", renderPicker);
-  // Unlike the native datalist, this popup belongs to the scrolling body. Close
-  // it when the surrounding page moves, but allow scrolling its own tool list.
-  body.addEventListener("scroll", onPageScroll);
-  window.addEventListener("scroll", onPageScroll, true);
-  window.addEventListener("resize", () => closePicker());
-  modal.addEventListener("pointerdown", (event: any) => { if (!pickerWrap.contains(event.target)) closePicker(); });
 
   function setBusy(value: any): void {
     busy = value; dialog.setAttribute("aria-busy", String(value));
-    [server, profileSelect, timeout, probe, reload, tool, args, example, execute, pickerButton, toolSearch, selectAll, clearSelection, continueOnError].forEach((n: any) => { n.disabled = value; });
-    if (value) closePicker();
+    [server, profileSelect, timeout, probe, reload, tool, args, example, execute, toolSearch, selectAll, clearSelection, continueOnError].forEach((n: any) => { n.disabled = value; });
     formArguments.disabled = value; jsonMode.disabled = value; formMode.disabled = value || !(draft && draft.editor || canGenerateForm());
     stop.hidden = !value; copy.disabled = download.disabled = !lastReport;
     syncSelectionUI();
   }
   function resetResult(): void { lastReport = null; result.replaceChildren(); copy.disabled = download.disabled = true; }
-  function resetTools(): void { tools = []; toolSearch.value = ""; closePicker(); renderPicker(); showSchema(); }
+  function resetTools(): void { tools = []; toolSearch.value = ""; renderPicker(); showSchema(); }
   server.addEventListener("change", () => { tool.value = ""; profileSelect.value = ""; showConnectionHint(); resetTools(); resetResult(); status.textContent = "已切换服务，请测试连接或填写工具参数。"; });
   profileSelect.addEventListener("change", () => { showConnectionHint(); tool.value = ""; resetTools(); resetResult(); status.textContent = "已切换连接；各连接的工具选择和参数草稿分别保留，请测试连接获取当前清单。"; });
   tool.addEventListener("input", showSchema);
@@ -115,6 +128,8 @@
     connectionHint.textContent = [info.connection_hint, current !== info && (current.description || current.connection_hint)].filter(Boolean).join(" ");
     if (current.browser_mode === "extension") connectionHint.textContent += " 测试连接只检查 MCP 握手与清单。实际调用需要浏览器授权，首次测试可将超时设为 120 秒；测试结束释放此连接，聊天中使用独立的常驻连接。";
     connectionHint.hidden = !connectionHint.textContent;
+    // 宽屏下提示收起为 3 行，完整内容放 tooltip（窄屏单列显示全文，无需 tooltip 也保留无妨）
+    connectionHint.title = connectionHint.hidden ? "" : (connectionHint.textContent || "");
   }
   function selectionKey(): string { return JSON.stringify([server.value, profileSelect.value]); }
   function selectedTools(): any {
@@ -126,29 +141,6 @@
   function filteredTools(): any {
     const query = toolSearch.value.trim().toLowerCase();
     return tools.filter((item: any) => !query || (item.name + " " + (item.description || "")).toLowerCase().includes(query));
-  }
-  function openPicker(): void {
-    if (busy) return;
-    toolSearch.value = ""; renderPicker(); picker.hidden = false; pickerButton.setAttribute("aria-expanded", "true");
-    const anchor = pickerButton.getBoundingClientRect(), bounds = body.getBoundingClientRect();
-    const below = bounds.bottom - anchor.bottom - 8, above = anchor.top - bounds.top - 8;
-    const up = below < 220 && above > below; picker.classList.toggle("opens-up", up);
-    picker.style.maxHeight = Math.max(90, Math.min(360, up ? above : below)) + "px";
-    toolSearch.focus({ preventScroll: true });
-    pickerScroll = [body.scrollTop, body.scrollLeft, window.scrollX, window.scrollY];
-  }
-  function onPageScroll(event: any): void {
-    if (picker.hidden || event.target instanceof Node && picker.contains(event.target)) return;
-    // A click can first scroll the trigger into view; that scroll event may be
-    // delivered after the popup opens. Only a subsequent position change closes it.
-    if ([body, document, window].includes(event.target) && pickerScroll &&
-      [body.scrollTop, body.scrollLeft, window.scrollX, window.scrollY].every((value: any, index: any) => value === pickerScroll[index])) return;
-    closePicker();
-  }
-  function closePicker(): void {
-    const restoreFocus = !picker.hidden && picker.contains(document.activeElement);
-    picker.hidden = true; pickerScroll = null; pickerButton.setAttribute("aria-expanded", "false");
-    if (restoreFocus) pickerButton.focus({ preventScroll: true });
   }
   function renderPicker(): void {
     names.replaceChildren();
@@ -170,16 +162,15 @@
   }
   function syncSelectionUI(): void {
     const selected = selectedTools(), count = selected.size;
-    pickerButton.textContent = "选择工具（可多选） · 已选 " + count;
+    toolsCount.textContent = "已选 " + count;
     names.querySelectorAll("input[data-tool-name]").forEach((input: any) => { input.checked = selected.has(input.dataset.toolName); input.disabled = busy; });
     selectedTabs.replaceChildren();
     [...selected].forEach((name: any, index: any) => {
-      const chip = node("span", "mcp-test-tool-chip"), edit = button((index + 1) + ". " + name, () => { if (!busy) { closePicker(); activateTool(name); } });
+      const chip = node("span", "mcp-test-tool-chip"), edit = button((index + 1) + ". " + name, () => { if (!busy) activateTool(name); });
       edit.setAttribute("aria-pressed", String(tool.value.trim() === name)); edit.setAttribute("aria-label", "编辑参数 " + name); edit.title = name; edit.disabled = busy;
       const remove = button("×", () => {
         if (busy) return;
         selected.delete(name); activateTool(tool.value.trim() === name ? selected.values().next().value || "" : tool.value.trim());
-        pickerButton.focus({ preventScroll: true });
       }); remove.setAttribute("aria-label", "移除测试工具 " + name); remove.disabled = busy;
       chip.append(edit, remove); selectedTabs.append(chip);
     });
@@ -354,7 +345,10 @@
           lastReport = { version: 1, action: "batch_call", redacted: true, ok: reports.length === jobs.length && reports.every((item: any) => item.ok),
             requested_count: jobs.length, completed_count: reports.length, tools: latestTools || [], reports: reports.slice() };
         } else { reports.push(report); lastReport = report; renderReport(report); }
-        if (requestError) (batch ? result.lastElementChild : result).append(node("p", "mcp-test-error", "测试请求失败：" + requestError.message));
+        if (requestError) {
+          (batch ? result.lastElementChild : result).append(node("p", "mcp-test-error",
+            "测试请求失败：" + requestError.message));
+        }
         copy.disabled = download.disabled = false;
         if (!report.ok && !continueOnError.checked) {
           if (batch) lastReport.stopped_on_error = true;
@@ -421,7 +415,6 @@
   function close(): void {
     if (!opened) return;
     opened = false; ++version; if (controller) controller.abort(); controller = null;
-    closePicker();
     document.body.classList.remove("mcp-test-open");
     modal.hidden = true; setBusy(false); background.forEach(([n, old]: any) => { n.inert = old; }); background = [];
     modal.inert = previousInert;
@@ -429,7 +422,7 @@
   }
   modal.addEventListener("keydown", (event: any) => {
     if (event.isComposing) return;
-    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (!picker.hidden) { closePicker(); pickerButton.focus(); } else close(); }
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
     if (event.key !== "Tab") return;
     const targets: any = Array.from(dialog.querySelectorAll("button,input,textarea,select,summary")).filter((n: any) => !n.matches(":disabled") && !n.closest("[hidden]") && n.getClientRects().length);
     const first = targets[0], last = targets[targets.length - 1];

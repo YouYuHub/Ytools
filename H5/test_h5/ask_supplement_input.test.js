@@ -42,13 +42,16 @@ function harness(questions) {
 
 const QS2 = [{ question: '选甲还是乙？', options: ['甲', '乙'] }, { question: '还有别的吗' }];
 
-test('渲染：任意题数都追加且仅追加一个补充输入框（在末尾）', t => {
+test('渲染：任意题数都追加且仅追加一个补充输入框（附件区之前）', t => {
   for (const qs of [[{ question: '单题' }], QS2, [1, 2, 3, 4, 5].map(i => ({ question: '第' + i + '题' }))]) {
     const h = harness(qs);
     t.after(() => h.dom.window.close());
     const fields = h.askQuestions.querySelectorAll('.ask-supplement-input');
     assert.equal(fields.length, 1);
-    assert.ok(h.askQuestions.lastElementChild.classList.contains('ask-supplement'));
+    // 顺序：题目 → 补充说明 → 附件区（附件区始终在末尾）
+    const kids = Array.from(h.askQuestions.children).map((n) => n.className);
+    assert.ok(kids.indexOf('ask-supplement') < kids.indexOf('ask-attachments'));
+    assert.ok(h.askQuestions.lastElementChild.classList.contains('ask-attachments'));
     // 正式题目数量不受影响
     assert.equal(h.askQuestions.querySelectorAll('.ask-question').length, qs.length);
   }

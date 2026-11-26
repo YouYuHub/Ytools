@@ -107,6 +107,15 @@ function loadSessionsModule() {
   };
   global.requestAnimationFrame = function (cb) { return setTimeout(function () { cb(Date.now()); }, 16); };
   global.cancelAnimationFrame = function (id) { clearTimeout(id); };
+  // 刷新恢复记忆桩（每用例隔离；模块经裸 localStorage 读写）
+  global.localStorage = (function () {
+    const store = new Map();
+    return {
+      getItem: function (k) { return store.has(String(k)) ? store.get(String(k)) : null; },
+      setItem: function (k, v) { store.set(String(k), String(v)); },
+      removeItem: function (k) { store.delete(String(k)); },
+    };
+  })();
   global.SessionUtils = require("../js/session_utils.js");
   global.SessionListUtils = require("../js/session_list_utils.js");
   global.HistoryParser = {
@@ -121,6 +130,7 @@ function loadSessionsModule() {
     fetchSessionFile: function () { return Promise.resolve(""); },
     getSessionMeta: function () { return Promise.resolve({}); },
     streamStatus: function () { return Promise.resolve({ running: false }); },
+    listSessionSummaries: function () { return Promise.resolve([]); },
   };
 
   const app = global.window.App;
@@ -292,4 +302,56 @@ test("过期失败响应不清掉新加载的就绪态", async function () {
   const itemB = env.app.buildSessionItem("s-b", "B");
   selectButtonOf(itemB).emit("click");
   assert.equal(env.spies.stopVoiceInput, 2, "b 的就绪态应保持，点击仍跳过");
+});
+
+// ---------- 刷新恢复上次打开的会话 ----------
+
+test("openSession 成功进入即记住会话 id", async function () {
+  const env = loadSessionsModule();
+  await env.app.openSession("s-1");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), "s-1");
+  await env.app.openSession("s-2");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), "s-2", "切换后记忆更新");
+});
+
+test("startNewChat 清掉记忆（刷新停留在新对话页）", async function () {
+  const env = loadSessionsModule();
+  await env.app.openSession("s-1");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), "s-1");
+  env.app.startNewChat();
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), null);
+  assert.equal(env.app.state.sessionId, null);
+});
+
+test("启动无深链恢复上次会话；深链优先于记忆", async function () {
+  const env = loadSessionsModule();
+  global.API.listSessionSummaries = function () {
+    return Promise.resolve([{ id: "s-9" }, { id: "s-1" }]);
+  };
+  global.localStorage.setItem("ytools-last-open-session", "s-9");
+  await env.app.openInitialSession(null);
+  assert.equal(env.app.state.sessionId, "s-9", "无深链时恢复记忆会话");
+  assert.equal(env.spies.stopVoiceInput, 1);
+
+  await env.app.openInitialSession("s-1");
+  assert.equal(env.app.state.sessionId, "s-1", "深链优先于记忆");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), "s-1", "打开后记忆更新");
+});
+
+test("记忆 id 无成员资格则回退新对话并清记忆", async function () {
+  const env = loadSessionsModule();
+  global.API.listSessionSummaries = function () {
+    return Promise.resolve([{ id: "s-1" }]);
+  };
+  global.localStorage.setItem("ytools-last-open-session", "s-ghost");
+  await env.app.openInitialSession(null);
+  assert.equal(env.app.state.sessionId, null, "脏记忆不建幽灵会话，回退新对话");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), null, "脏记忆被清除");
+});
+
+test("加载失败清掉对应记忆（刷新不再反复撞错）", async function () {
+  const env = loadSessionsModule();
+  global.API.fetchSessionFile = function () { return Promise.reject(new Error("boom")); };
+  await env.app.openSession("s-1");
+  assert.equal(global.localStorage.getItem("ytools-last-open-session"), null);
 });

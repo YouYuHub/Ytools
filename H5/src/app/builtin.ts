@@ -324,7 +324,190 @@
     supplementInput.setAttribute("aria-label", "补充说明");
     supplement.appendChild(supplementInput);
     askQuestions.appendChild(supplement);
+    // 回答附件（可选）：粘贴图片/音视频或按钮选择文件（含文档），缩略图预览，
+    // 提交时随回答文本一起发送。暂存挂在 askQuestions 元素上（弹窗级隔离，
+    // 不污染主输入框的 pendingMedia；每次打开重建）。
+    askQuestions._askMedia = [];
+    askQuestions._askDocs = [];
+    askQuestions._askPending = 0;
+    askQuestions._askQueue = null; // 懒初始化：旧切片桩无 Promise，render 时不碰
+    askQuestions._askDisposed = false;
+    askQuestions._askSessionId = state.sessionId;
+    const attachWrap = el("div", "ask-attachments");
+    attachWrap.appendChild(el("div", "ask-question-text", "附件（可选）"));
+    attachWrap.appendChild(el("div", "ask-attach-hint", "可粘贴图片，或添加图片、音视频、文档，随回答一起发送"));
+    const attachRow = el("div", "ask-attach-row");
+    const attachButton = el("button", "ask-attach-button", "添加附件");
+    attachButton.type = "button";
+    const attachInput = document.createElement("input");
+    attachInput.type = "file";
+    attachInput.multiple = true;
+    attachInput.className = "ask-attach-input";
+    attachInput.setAttribute("aria-label", "选择要随回答发送的附件");
+    attachButton.addEventListener("click", function () { attachInput.click(); });
+    attachInput.addEventListener("change", function () {
+      const files = Array.from(attachInput.files || []);
+      attachInput.value = "";
+      enqueueAskFiles(files);
+    });
+    attachRow.appendChild(attachButton);
+    attachRow.appendChild(attachInput);
+    attachWrap.appendChild(attachRow);
+    attachWrap.appendChild(el("div", "ask-attach-grid"));
+    askQuestions.appendChild(attachWrap);
+    // 粘贴监听挂在容器上（冒泡覆盖所有作答框），只绑定一次
+    if (!askQuestions._askPasteBound) {
+      askQuestions._askPasteBound = true;
+      askQuestions.addEventListener("paste", onAskPaste);
+    }
     updateAskSubmitState();
+  }
+
+  // ---------- 提问弹窗附件暂存（必须位于 renderAskModal 与 updateAskSubmitState
+  // 之间：切片单测按源码位置载入，此区间两份 harness 都包含） ----------
+  function askMediaList(): any {
+    if (!Array.isArray(askQuestions._askMedia)) askQuestions._askMedia = [];
+    return askQuestions._askMedia;
+  }
+  function askDocsList(): any {
+    if (!Array.isArray(askQuestions._askDocs)) askQuestions._askDocs = [];
+    return askQuestions._askDocs;
+  }
+  function revokeAskObjectUrl(item: any): void {
+    if (item && item.objUrl) {
+      try { URL.revokeObjectURL(item.objUrl); } catch (_) { /* ignore */ }
+      item.objUrl = "";
+    }
+  }
+  function clearAskAttachments(): void {
+    askMediaList().forEach(revokeAskObjectUrl);
+    askMediaList().length = 0;
+    askDocsList().length = 0;
+    askQuestions._askPending = 0;
+  }
+  function renderAskAttachments(): void {
+    const grid = askQuestions.querySelector(".ask-attach-grid");
+    if (!grid) return;
+    grid.replaceChildren();
+    askMediaList().forEach(function (item: any) {
+      const chip = el("div", "ask-attach-chip");
+      chip.title = item.name || "媒体文件";
+      if (item.kind === "image" && item.objUrl) {
+        const thumb = document.createElement("img");
+        thumb.className = "ask-attach-thumb";
+        thumb.src = item.objUrl;
+        thumb.alt = item.name || "";
+        thumb.addEventListener("click", function () {
+          if (App.openMediaPreview) App.openMediaPreview({ type: "image", src: item.objUrl, title: item.name });
+        });
+        chip.appendChild(thumb);
+      } else {
+        const badge = el("div", "ask-attach-badge", item.kind === "audio" ? "音频" : item.kind === "video" ? "视频" : "图片");
+        badge.addEventListener("click", function () {
+          if (!App.openMediaPreview || !item.file) return;
+          if (!item.objUrl && typeof URL.createObjectURL === "function") item.objUrl = URL.createObjectURL(item.file);
+          if (item.objUrl) App.openMediaPreview({ type: item.kind === "audio" ? "audio" : "video", src: item.objUrl, title: item.name });
+        });
+        chip.appendChild(badge);
+      }
+      const remove = el("button", "ask-attach-remove", "✕");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "移除附件 " + (item.name || ""));
+      remove.addEventListener("click", function () {
+        const list = askMediaList();
+        const at = list.indexOf(item);
+        if (at >= 0) list.splice(at, 1);
+        revokeAskObjectUrl(item);
+        renderAskAttachments();
+      });
+      chip.appendChild(remove);
+      grid.appendChild(chip);
+    });
+    askDocsList().forEach(function (item: any) {
+      const chip = el("div", "ask-attach-chip ask-attach-doc");
+      const name = item.name || "文件";
+      chip.title = name;
+      const dot = name.lastIndexOf(".");
+      chip.appendChild(el("div", "ask-attach-badge",
+        dot >= 0 && dot < name.length - 1 ? name.slice(dot + 1, dot + 5).toUpperCase() : "FILE"));
+      const remove = el("button", "ask-attach-remove", "✕");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "移除附件 " + name);
+      remove.addEventListener("click", function () {
+        const list = askDocsList();
+        const at = list.indexOf(item);
+        if (at >= 0) list.splice(at, 1);
+        renderAskAttachments();
+      });
+      chip.appendChild(remove);
+      grid.appendChild(chip);
+    });
+  }
+  async function stageAskFiles(files: any): Promise<void> {
+    if (askQuestions._askDisposed || state.sessionId !== askQuestions._askSessionId) return;
+    const mediaFiles = files.filter(function (file: any) { return App.mediaKindOf(file.name); });
+    const docFiles = files.filter(function (file: any) { return !App.mediaKindOf(file.name); });
+    const media = askMediaList();
+    let mediaAdded = 0;
+    for (const file of mediaFiles) {
+      if (media.length >= App.MAX_PENDING_MEDIA) {
+        toast("最多附加 " + App.MAX_PENDING_MEDIA + " 个媒体文件");
+        break;
+      }
+      const item = await App.prepareMediaFile(file);
+      if (askQuestions._askDisposed || state.sessionId !== askQuestions._askSessionId) return;
+      if (!item) continue;
+      if (item.hash && media.some(function (existing: any) { return existing && existing.hash === item.hash; })) {
+        toast("已添加过相同的文件，已跳过");
+        continue;
+      }
+      if (typeof URL.createObjectURL === "function") item.objUrl = URL.createObjectURL(item.file);
+      media.push(item);
+      mediaAdded += 1;
+    }
+    if (mediaAdded && App.getChatModelVision && !App.getChatModelVision()) {
+      toast("当前模型不支持视觉：新增媒体会存档，但模型可能无法读取图片内容");
+    }
+    const docs = askDocsList();
+    for (const file of docFiles) {
+      if (docs.length >= 10) {
+        toast("最多新增 10 个文档");
+        break;
+      }
+      if (file.size > App.MAX_DOC_FILE_SIZE) {
+        toast("文件超过 10MB 限制：" + file.name);
+        continue;
+      }
+      docs.push({
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+        file: file,
+        name: file.name,
+      });
+    }
+    renderAskAttachments();
+  }
+  function enqueueAskFiles(files: any): void {
+    if (!files.length || askQuestions._askDisposed) return;
+    askQuestions._askPending = (askQuestions._askPending || 0) + 1;
+    updateAskSubmitState();
+    const prev = askQuestions._askQueue || Promise.resolve();
+    askQuestions._askQueue = prev.then(function () { return stageAskFiles(files); })
+      .catch(function () {
+        if (!askQuestions._askDisposed) {
+          renderAskAttachments();
+          toast("附件处理失败，请重新粘贴或选择文件");
+        }
+      })
+      .finally(function () {
+        askQuestions._askPending = Math.max(0, (askQuestions._askPending || 1) - 1);
+        if (!askQuestions._askDisposed) updateAskSubmitState();
+      });
+  }
+  function onAskPaste(event: any): void {
+    const files = ClipboardMediaUtils.mediaFiles(event.clipboardData, App.mediaKindOf);
+    if (!files.length) return; // 纯文字沿用浏览器原生粘贴。
+    event.preventDefault();
+    enqueueAskFiles(files);
   }
 
   // 提交门禁：允许跳过——单题可留空（回传“（未回答）”）、多选可 0 选择提交。
@@ -333,7 +516,8 @@
   function updateAskSubmitState(): void {
     if (!askSubmit) return;
     const items = askQuestions.querySelectorAll(".ask-question");
-    askSubmit.disabled = items.length === 0;
+    // 附件处理中禁用提交：暂存未落定就发送会丢附件
+    askSubmit.disabled = items.length === 0 || (askQuestions._askPending || 0) > 0;
   }
 
   function openAskModal(questions: any, sourceBlock: any): void {
@@ -345,6 +529,9 @@
   }
 
   function closeAskModal(): void {
+    // 丢弃弹窗级附件暂存（提交路径已提前切片，不受影响）
+    askQuestions._askDisposed = true;
+    clearAskAttachments();
     askModal.classList.add("hidden");
     askModal.setAttribute("aria-hidden", "true");
     state.pendingAskQuestions = null;
@@ -380,6 +567,11 @@
     // 提交按钮仅在无题目时禁用（上已拦截）；此处为兜底。注意未作答题目
     // 允许提交，回传“（未回答）”而不是拦住用户（跳过/0 选择是合法语义）。
     if (askSubmit && askSubmit.disabled) return;
+    // 附件处理中不允许提交（门禁已禁用按钮，此处防竞态兜底）
+    if ((askQuestions._askPending || 0) > 0) {
+      toast("附件处理中，请稍候再提交");
+      return;
+    }
     // 会话仍在输出时不允许提交：覆盖式回答需要确定的历史边界，
     // 等当前流结束后重新点击提问卡片提交即可
     if (state.streaming && state.streamingSession === state.sessionId) {
@@ -416,8 +608,10 @@
     }
     const text = lines.join("\n");
     const sourceBlock = state.pendingAskBlock;
+    const media = askMediaList().slice();
+    const docs = askDocsList().slice();
     closeAskModal();
-    submitAskAnswer(text, sourceBlock);
+    submitAskAnswer(text, sourceBlock, media, docs);
   }
   askSubmit.addEventListener("click", handleAskSubmit);
   $("#askModalClose").addEventListener("click", closeAskModal);
@@ -431,7 +625,7 @@
   //   「插入回答（后续轮次整体后推）」/「删除提问之后所有」/「取消」。
   //   模式信息从卡片所在轮次的 data-round 推导（历史/实时流均有标注）；
   // 找不到轮号（旧数据/异常结构）降级为普通发送
-  function submitAskAnswer(text: any, sourceBlock: any): void {
+  function submitAskAnswer(text: any, sourceBlock: any, media?: any, docs?: any): void {
     // 定位提问卡片所在轮次号：卡片 → 所在轮次 DOM 锚点 → data-round
     function findAskRound(): any {
       if (!sourceBlock || !sourceBlock.isConnected) return null;
@@ -445,11 +639,13 @@
       return null;
     }
     const askRound = findAskRound();
+    const askMedia = Array.isArray(media) ? media : [];
+    const askDocs = Array.isArray(docs) ? docs : [];
     if (!askRound) {
-      // 降级：拿不到轮号走旧行为（覆盖式清理 + 普通发送）
+      // 降级：拿不到轮号走直接发送（不碰主输入框：旧 input.value 写法会覆盖
+      // 用户正在输入的草稿，还会把主输入框附件误带进回答）
       clearNodesAfterAskBlock(sourceBlock);
-      input.value = text;
-      App.send();
+      App.send({ text: text, media: askMedia, docs: askDocs });
       return;
     }
     // 提问轮之后是否已有回答轮 / 是否存在任何后续轮次
@@ -480,15 +676,15 @@
     if (!hasLaterRounds) {
       // 自动弹窗的正常续答走普通发送，统一接收 round_started 并跟随实时输出。
       // 只有中间插入才需要 insert_round，末尾续答不应进入历史编辑分支。
-      App.send({ text: text });
+      App.send({ text: text, media: askMedia, docs: askDocs });
       return;
     }
     // 后面已有对话（回答轮或普通对话）：三选确认后再发送
-    showAskAnswerConfirm(text, askRound, hasExistingAnswer);
+    showAskAnswerConfirm(text, askRound, hasExistingAnswer, askMedia, askDocs);
   }
 
   // 三选确认弹层（独立轻量模态，复用 tool-modal 遮罩风格）
-  function showAskAnswerConfirm(text: any, askRound: any, hasExistingAnswer: any): void {
+  function showAskAnswerConfirm(text: any, askRound: any, hasExistingAnswer: any, media?: any, docs?: any): void {
     const backdrop = el("div", "tool-modal-backdrop ask-answer-backdrop");
     const dialog = el("div", "ask-answer-confirm");
     // hasExistingAnswer=true → 主操作「更新该回答轮」（regen 替换旧回答轮）；
@@ -522,12 +718,13 @@
           msg: null,
           round: askRound + 1,
           text: text,
-          media: [],
+          media: Array.isArray(media) ? media : [],
+          docs: Array.isArray(docs) ? docs : [],
           mode: "regen",
         });
       } else {
         // 插入回答 = 插入语义：新回答轮插入提问轮之后，后续轮次整体后推
-        App.send({ text: text, insertAfterRound: askRound });
+        App.send({ text: text, insertAfterRound: askRound, media: Array.isArray(media) ? media : [], docs: Array.isArray(docs) ? docs : [] });
       }
     });
     truncateBtn.addEventListener("click", function () {
@@ -537,7 +734,8 @@
         msg: null,
         round: askRound + 1,
         text: text,
-        media: [],
+        media: Array.isArray(media) ? media : [],
+        docs: Array.isArray(docs) ? docs : [],
         mode: "truncate",
       });
     });

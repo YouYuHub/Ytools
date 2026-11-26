@@ -6572,8 +6572,8 @@ body.tool-settings-open {
   border-color: color-mix(in srgb, var(--focus-ring) 32%, var(--border-strong));
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-head {
-  min-height: 56px;
-  gap: 10px;
+  min-height: 44px;
+  gap: 8px;
   padding: 0 12px;
   background: var(--bg-code);
 }
@@ -6581,15 +6581,15 @@ body.tool-settings-open {
   background: color-mix(in srgb, var(--bg-elevated) 94%, var(--text));
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-toggle {
-  min-height: 56px;
+  min-height: 44px;
   height: auto;
-  gap: 10px;
-  padding: 6px 0;
+  gap: 8px;
+  padding: 4px 0;
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-icon {
-  width: 28px;
-  height: 28px;
-  padding: 5px;
+  width: 24px;
+  height: 24px;
+  padding: 4px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--focus-ring) 10%, transparent);
   color: var(--focus-ring);
@@ -6601,10 +6601,12 @@ body.tool-settings-open {
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-name {
   font-weight: 500;
+  line-height: 1.35;
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-id {
   font-family: var(--font);
   font-size: 11px;
+  line-height: 1.35;
 }
 .tool-config-modal .tool-groups .tool-group .tool-group-count {
   min-width: 40px;
@@ -9037,6 +9039,94 @@ body.chat-settings-open {
 }
 .ask-questions .ask-supplement .ask-custom {
   min-height: 60px;
+}
+.ask-questions .ask-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.ask-questions .ask-attach-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.ask-questions .ask-attach-row {
+  display: flex;
+  gap: 8px;
+}
+.ask-questions .ask-attach-button {
+  padding: 6px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-code);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.ask-questions .ask-attach-button:hover {
+  background: var(--bg-hover);
+  color: var(--tool-icon-pink);
+}
+.ask-questions .ask-attach-input {
+  display: none;
+}
+.ask-questions .ask-attach-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ask-questions .ask-attach-grid:empty {
+  display: none;
+}
+.ask-questions .ask-attach-chip {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-code);
+  flex: none;
+}
+.ask-questions .ask-attach-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  cursor: pointer;
+}
+.ask-questions .ask-attach-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.ask-questions .ask-attach-remove {
+  position: absolute;
+  z-index: 3;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ask-questions .ask-attach-remove:hover {
+  background: rgba(0, 0, 0, 0.8);
 }
 .ask-questions .ask-question-text {
   font-size: 14.5px;
@@ -11751,7 +11841,7 @@ body.mcp-test-open {
   position: relative;
   display: flex;
   flex-direction: column;
-  width: min(1040px, 100%);
+  width: min(1160px, 100%);
   max-height: calc(100dvh - 40px);
   min-height: 0;
   min-width: 0;
@@ -11790,7 +11880,7 @@ body.mcp-test-open {
 .mcp-test-body {
   overflow: auto;
   min-height: 0;
-  padding: 12px 20px 20px;
+  padding: 14px 20px 20px;
   overscroll-behavior: contain;
 }
 
@@ -11802,18 +11892,87 @@ body.mcp-test-open {
   overflow-wrap: anywhere;
 }
 
-.mcp-test-connection {
+.mcp-test-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.mcp-test-side {
+  position: sticky;
+  top: 0;
   display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin: 16px 0 22px;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  min-height: 0;
+  height: calc(100dvh - 230px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
-.mcp-test-connection .mcp-test-field:first-child {
-  flex: 1 1 230px;
+
+.mcp-test-main {
+  min-width: 0;
 }
-.mcp-test-connection .mcp-test-field:nth-child(2) {
-  flex: 0 1 135px;
+
+.mcp-test-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.mcp-test-card-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.mcp-test-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.mcp-test-card-head .mcp-test-card-title {
+  margin: 0;
+}
+
+.mcp-test-tools-count {
+  font-size: 12px;
+  color: var(--tool-icon-pink);
+  white-space: nowrap;
+}
+
+.mcp-test-connection {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 112px;
+  gap: 8px 10px;
+  align-items: end;
+}
+.mcp-test-connection > * {
+  min-width: 0;
+}
+.mcp-test-connection .mcp-test-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.mcp-test-connection .mcp-test-btn-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-test-btn-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
 }
 
 .mcp-test-field {
@@ -11869,10 +12028,6 @@ body.mcp-test-open {
   margin: 0 0 12px;
 }
 
-.mcp-test-call {
-  border-top: 1px solid var(--border);
-  padding-top: 18px;
-}
 .mcp-test-call > .mcp-test-button {
   margin-top: 8px;
 }
@@ -11880,45 +12035,21 @@ body.mcp-test-open {
   color: var(--tool-icon-pink);
 }
 
+#mcpTestExecute {
+  width: 100%;
+  white-space: normal;
+}
+
 .mcp-test-schema, .mcp-test-description {
   margin: 4px 0;
 }
 
-.mcp-test-picker-wrap {
-  position: relative;
-  margin-bottom: 8px;
-}
-
-#mcpTestChooseTools {
-  width: 100%;
-  white-space: normal;
-  text-align: left;
-  padding: 9px 11px;
-}
-
-.mcp-test-picker {
-  position: absolute;
-  z-index: 3;
-  top: calc(100% + 5px);
-  left: 0;
-  right: 0;
+.mcp-test-tools-card {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 10px;
-  box-sizing: border-box;
-  min-height: 0;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  box-shadow: var(--shadow-menu);
-}
-.mcp-test-picker.opens-up {
-  top: auto;
-  bottom: calc(100% + 5px);
-}
-.mcp-test-picker > input {
-  flex-shrink: 0;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-height: 300px;
 }
 
 .mcp-test-picker-actions {
@@ -11932,35 +12063,42 @@ body.mcp-test-open {
 }
 
 .mcp-test-tool-options {
-  min-height: 0;
+  min-height: 60px;
+  flex: 1 1 auto;
   overflow: auto;
   overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .mcp-test-tool-option {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 8px 5px;
-  border-radius: 6px;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
   cursor: pointer;
 }
 .mcp-test-tool-option:hover, .mcp-test-tool-option:focus-within {
   background: var(--bg-hover);
+}
+.mcp-test-tool-option:has(input:checked) {
+  background: color-mix(in srgb, var(--tool-icon-pink) 12%, transparent);
 }
 .mcp-test-tool-option input[type=checkbox] {
   flex: 0 0 16px;
   width: 16px;
   height: 16px;
   padding: 0;
-  margin: 2px 0 0;
+  margin: 1px 0 0;
   accent-color: var(--tool-icon-pink);
 }
 
 .mcp-test-tool-option-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
@@ -12153,7 +12291,7 @@ body.mcp-test-open {
 }
 
 .mcp-test-status {
-  margin: 20px 0 10px;
+  margin: 12px 0 8px;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
@@ -12172,13 +12310,43 @@ body.mcp-test-open {
     grid-column: 1/-1;
   }
 }
+@media (min-width: 961px) {
+  #mcpTestConnectionHint {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-clamp: 2;
+  }
+}
+@media (max-width: 960px) {
+  .mcp-test-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mcp-test-side {
+    position: static;
+    height: auto;
+    overflow-y: visible;
+  }
+  .mcp-test-tools-card {
+    flex: 0 0 auto;
+    min-height: 0;
+  }
+  .mcp-test-tool-options {
+    flex: 0 0 auto;
+    max-height: 260px;
+  }
+}
 @media (max-width: 640px) {
   .mcp-test-modal {
-    padding: 8px;
+    padding: 0;
   }
   .mcp-test-dialog {
-    max-height: calc(100dvh - 16px);
-    border-radius: 12px;
+    width: 100%;
+    max-height: 100dvh;
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
     font-size: 13px;
   }
   .mcp-test-header, .mcp-test-footer {
@@ -12190,11 +12358,27 @@ body.mcp-test-open {
   .mcp-test-dialog input, .mcp-test-dialog select, .mcp-test-dialog textarea {
     font-size: 16px;
   }
-  .mcp-test-connection .mcp-test-field:first-child {
-    flex-basis: 100%;
+  .mcp-test-connection .mcp-test-field:first-child, .mcp-test-connection .mcp-test-field:nth-child(2) {
+    grid-column: 1/-1;
+  }
+  .mcp-test-connection {
+    grid-template-columns: 1fr 1fr;
+  }
+  .mcp-test-connection .mcp-test-btn-label {
+    display: none;
+  }
+  .mcp-test-connection .mcp-test-button {
+    min-height: 38px;
+    padding: 7px 8px;
   }
   .mcp-test-header h2 {
     font-size: 18px;
+  }
+  .mcp-test-card {
+    padding: 10px;
+  }
+  .mcp-test-tool-options {
+    max-height: 220px;
   }
   .mcp-param-field {
     padding: 7px 8px;
@@ -12214,9 +12398,6 @@ body.mcp-test-open {
   .mcp-test-modes .mcp-test-button {
     flex: 1;
     padding-inline: 8px;
-  }
-  .mcp-test-picker {
-    padding: 7px;
   }
   .mcp-test-picker-actions .mcp-test-button {
     font-size: 11px;

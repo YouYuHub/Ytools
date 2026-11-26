@@ -127,6 +127,22 @@ test('historical editor stages pasted screenshots beside existing media without 
   assert.deepEqual(s.calls.revoked, ['blob:edit/1']);
 });
 
+test('duplicate pastes are skipped by content hash without consuming quota', async t => {
+  const s = setup(t);
+  s.w.App.prepareMediaFile = async (file) => {
+    const buf = new s.w.Uint8Array(await file.arrayBuffer());
+    let hex = '';
+    for (const b of buf) hex += b.toString(16).padStart(2, '0');
+    return { file, name: file.name, kind: 'image', hash: file.size + ':t:' + hex };
+  };
+  const shot = s.file('shot.png');
+  s.paste([shot]); await settle();
+  s.paste([shot]); await settle();
+  assert.equal(s.panel._getMedia().length, 1);
+  assert.equal(s.panel.querySelectorAll('.media-chip').length, 1);
+  assert.ok(s.calls.toasts.some((m) => m.includes('已添加过相同的文件')), s.calls.toasts.join('|'));
+});
+
 test('image-only historical resend and inserted conversation pass staged files to the existing send flow', async t => {
   for (const insert of [false, true]) {
     const s = setup(t, { insert });

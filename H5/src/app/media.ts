@@ -407,6 +407,37 @@
     }).catch(function () { return file; });
   }
 
+  // ---------- 媒体文件哈希（粘贴/选择去重） ----------
+  // 超大文件跳过哈希（避免整文件读入内存卡顿/OOM）：无哈希永不判重。
+  const MEDIA_HASH_MAX_BYTES = 64 * 1024 * 1024;
+  function fnv1aHex(bytes: any): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return ("0000000" + (hash >>> 0).toString(16)).slice(-8);
+  }
+  async function hashMediaFile(file: any): Promise<string> {
+    if (!file || typeof file.size !== "number" || file.size > MEDIA_HASH_MAX_BYTES) return "";
+    let bytes: any = null;
+    try {
+      if (typeof file.arrayBuffer !== "function") return "";
+      bytes = new Uint8Array(await file.arrayBuffer());
+    } catch (_) { return ""; }
+    // 键含文件大小：32 位 FNV 备用路径下多一重区分度
+    try {
+      if (typeof crypto !== "undefined" && crypto.subtle) {
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        const hex = Array.from(new Uint8Array(digest)).map(function (b: any) { return b.toString(16).padStart(2, "0"); }).join("");
+        return file.size + ":sha256:" + hex;
+      }
+    } catch (_) { /* 非安全上下文无 subtle，降级 FNV */ }
+    try {
+      return file.size + ":fnv1a:" + fnv1aHex(bytes);
+    } catch (_) { return ""; }
+  }
+
   async function prepareMediaFile(file: any): Promise<any> {
     if (!file) return null;
     const kind = mediaKindOf(file.name || "");
@@ -430,6 +461,8 @@
       name: finalFile.name,
       kind: kind,
       dataUrl: "",
+      // 内容哈希（上传前最终字节）：各暂存点凭此去重；"" 表示未计算，永不判重
+      hash: await hashMediaFile(finalFile),
     };
   }
 
@@ -448,6 +481,10 @@
       }
       const item = await prepareMediaFile(file);
       if (!item) continue;
+      if (item.hash && state.pendingMedia.some(function (existing: any) { return existing && existing.hash === item.hash; })) {
+        toast("已添加过相同的文件，已跳过");
+        continue;
+      }
       state.pendingMedia.push(item);
       added.push(item);
     }

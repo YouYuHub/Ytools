@@ -13,6 +13,7 @@ function setup(){
   const timers=new Map();let timerId=0;
   const opened=[],groupRows=[],notices=[];
   const ctx={state:{sessionId:null,sessionRecency:{}},input:{value:''},sessionOpenSeq:0,
+    localStorage:new (class{constructor(){this.m=new Map();}getItem(k){return this.m.has(String(k))?this.m.get(String(k)):null;}setItem(k,v){this.m.set(String(k),String(v));}removeItem(k){this.m.delete(String(k));}})(),
     SessionUtils:require('../js/session_utils.js'),SessionListUtils:require('../js/session_list_utils.js'),
     sessionList:list,API:{},App:{sessionGroups:{render:rows=>groupRows.push(rows)}},
     el,toast:msg=>notices.push(msg),bulkMode:false,syncBulkSelectionUi(){},refreshSessionFades(){},
@@ -24,6 +25,7 @@ function setup(){
   vm.runInContext(source.slice(source.indexOf('  let lastSortedRows'),source.indexOf('  // 溢出淡出标记')),ctx);
   vm.runInContext(source.slice(source.indexOf('  function renderSessionItems()'),source.indexOf('  /** 多选分组视图')),ctx);
   vm.runInContext(source.slice(source.indexOf('  async function openInitialSession('),source.indexOf('  // 视图就绪跟踪')),ctx);
+  vm.runInContext(source.slice(source.indexOf('  const LAST_OPEN_KEY'),source.indexOf('  /**\r\n   * 惰性生成会话 ID')),ctx);
   vm.runInContext('this.rows=()=>lastSortedRows;',ctx);
   return {ctx,list,opened,groupRows,notices,drain(){while(timers.size){const [id,fn]=timers.entries().next().value;timers.delete(id);fn();}}};
 }

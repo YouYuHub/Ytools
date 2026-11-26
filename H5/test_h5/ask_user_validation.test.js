@@ -93,7 +93,7 @@ test('回答分流：后续用户气泡是回答轮时走更新分支（DOM 直�
   vm.runInContext(src.slice(src.indexOf('  function submitAskAnswer('), src.indexOf('  function showAskAnswerConfirm(')), context);
   context.submitAskAnswer('新回答', block);
   assert.equal(sent.length, 0);
-  assert.deepEqual(confirmed, [['新回答', 20, true]]);
+  assert.equal(JSON.stringify(confirmed), JSON.stringify([['新回答', 20, true, [], []]]));
 });
 
 test('回答分流：后续是普通对话轮时走插入分支', () => {
@@ -116,5 +116,5 @@ test('回答分流：后续是普通对话轮时走插入分支', () => {
   vm.runInContext(src.slice(src.indexOf('  function submitAskAnswer('), src.indexOf('  function showAskAnswerConfirm(')), context);
   context.submitAskAnswer('新回答', block);
   assert.equal(sent.length, 0);
-  assert.deepEqual(confirmed, [['新回答', 20, false]]);
+  assert.equal(JSON.stringify(confirmed), JSON.stringify([['新回答', 20, false, [], []]]));
 });

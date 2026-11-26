@@ -507,6 +507,13 @@
                     const out = await API.createSessionGroup(res.name);
                     const group = out && out.group;
                     if (group) {
+                        // 本地先补齐新分组定义再归组渲染：assign() 只更新 assignments/rows，
+                        // render() 按 groups 建块；不补会导致分组栏看不到新分组（刷新才出现）。
+                        // 同名幂等可能返回既有分组，按 id 去重。
+                        const created = SessionGroupUtils.normalizeGroups([group])[0];
+                        if (created && !groups.some(function (g) { return g.id === created.id; })) {
+                            groups.push(created);
+                        }
                         await assign(sessionId, group.id, group.name);
                     }
                     else {
