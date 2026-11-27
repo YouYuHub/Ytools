@@ -1,6 +1,7 @@
 """Byte-to-text decoding shared by tools; never reinterpret valid UTF-8 by scoring Han characters."""
 import codecs
 import locale
+import os
 
 BOMS = ((codecs.BOM_UTF32_LE, 'utf-32'), (codecs.BOM_UTF32_BE, 'utf-32'),
         (codecs.BOM_UTF8, 'utf-8-sig'), (codecs.BOM_UTF16_LE, 'utf-16'),
@@ -9,6 +10,99 @@ BOMS = ((codecs.BOM_UTF32_LE, 'utf-32'), (codecs.BOM_UTF32_BE, 'utf-32'),
 
 def unicode_bom(data: bytes) -> str:
     return next((name for bom, name in BOMS if data.startswith(bom)), '')
+
+
+# Windows 代码页 → Python 编解码器名（控制台 OEM 页 + 系统 ANSI 页全覆盖：
+# 各国默认不同——中文 936、俄文 OEM866/ANSI1251、西文 OEM437/850/ANSI1252 等）。
+# 读 .cmd 的是控制台代码页（OEM），不是 ANSI：写死 mbcs 会在 ANSI≠OEM 的
+# 地区乱码（如俄文机 1251 字节被 866 控制台误读）。
+CONSOLE_CP_TO_CODEC = {
+    65001: 'utf-8',
+    936: 'gbk', 950: 'big5', 932: 'shift_jis', 949: 'cp949',
+    437: 'cp437', 720: 'cp720', 737: 'cp737', 775: 'cp775', 850: 'cp850',
+    852: 'cp852', 855: 'cp855', 857: 'cp857', 858: 'cp858', 860: 'cp860',
+    861: 'cp861', 862: 'cp862', 863: 'cp863', 865: 'cp865', 866: 'cp866',
+    869: 'cp869', 874: 'cp874',
+    1250: 'cp1250', 1251: 'cp1251', 1252: 'cp1252', 1253: 'cp1253',
+    1254: 'cp1254', 1255: 'cp1255', 1256: 'cp1256', 1257: 'cp1257', 1258: 'cp1258',
+}
+
+
+def _kernel32():
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        return ctypes.windll.kernel32
+    except Exception:
+        return None
+
+
+def oem_console_codec() -> str:
+    """新建隐藏控制台的默认编码（系统 OEM 代码页映射）。
+
+    中转链子进程运行在新建隐藏控制台下，代码页恒为系统 OEM 默认值，
+    与本进程控制台当前值无关。未知代码页回退 mbcs（=旧行为，不回归）。
+    """
+    kernel32 = _kernel32()
+    if kernel32 is not None:
+        try:
+            codec = CONSOLE_CP_TO_CODEC.get(int(kernel32.GetOEMCP()))
+            if codec:
+                return codec
+        except Exception:
+            pass
+    return 'mbcs'
+
+
+def shared_console_codec() -> tuple:
+    """当前进程控制台的（编码，代码页）：写直连子进程共享的脚本用。
+
+    无控制台时返回 (OEM 编码, None)——直连子进程将新建 OEM 控制台。
+    """
+    kernel32 = _kernel32()
+    if kernel32 is not None:
+        try:
+            cp = int(kernel32.GetConsoleCP())
+            if cp:
+                return CONSOLE_CP_TO_CODEC.get(cp, 'mbcs'), cp
+        except Exception:
+            pass
+    return oem_console_codec(), None
+
+
+# GetLocaleInfoW 常量：系统默认地区（“非 Unicode 程序语言”）的默认 OEM 代码页
+_LOCALE_SYSTEM_DEFAULT = 0x800
+_LOCALE_IDEFAULTCODEPAGE = 11
+
+
+def traditional_oem_cp() -> int:
+    """地区传统 OEM 代码页（不受 Beta UTF-8 影响：中文机恒为 936）。
+
+    cmd.exe 在 65001 控制台下读管道 stdin 会把每个非 ASCII 字节变成 U+FFFD
+    （实测），因此 cmd 交互会话的控制台必须设为传统 OEM 页、stdin 按其编码。
+    取不到时回退 GetOEMCP()，再失败返回 0（调用方再回退 mbcs）。
+    """
+    kernel32 = _kernel32()
+    if kernel32 is not None:
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(16)
+            if kernel32.GetLocaleInfoW(_LOCALE_SYSTEM_DEFAULT, _LOCALE_IDEFAULTCODEPAGE, buf, 16):
+                return int(buf.value)
+        except Exception:
+            pass
+        try:
+            return int(kernel32.GetOEMCP())
+        except Exception:
+            pass
+    return 0
+
+
+def traditional_oem_codec() -> str:
+    """地区传统 OEM 代码页对应的 Python 编解码器名；未知回退 OEM 检测。"""
+    codec = CONSOLE_CP_TO_CODEC.get(traditional_oem_cp())
+    return codec or oem_console_codec()
 
 
 # 单字节西文代码页（ANSI/OEM）：几乎任何字节序列都能"成功"解码，若排在
@@ -77,22 +171,31 @@ def decode_text(data: bytes, encoding: str = '', candidates=(), *, strict=False)
         return data.decode('utf-8', errors='replace'), 'utf-8'
 
 
-def cmd_script_bytes(text: str, ansi: str = 'mbcs') -> bytes:
-    """cmd 家族脚本（.cmd/.bat 启动器与 runner）的落盘字节。
+def cmd_script_bytes(text: str, ansi: str = None, restore_cp=None) -> bytes:
+    """cmd 家族脚本（.cmd 启动器/runner/探针）的落盘字节。
 
-    优先按系统 ANSI 代码页（mbcs）无损编码：中文机器（cp936）与控制台默认
-    代码页一致，行为零变化。非中文代码页服务器（如英文 cp1252）上，环境块
-    （PATH 等）、命令或路径一旦含中文，strict mbcs 会抛 UnicodeEncodeError
-    ——这是终端工具在该类服务器上所有模式全失败的根因（启动器要注入整份
-    环境变量，纯 ASCII 命令也躲不开）。此时回退 UTF-8 并在首行切代码页：
-    cmd 执行 chcp 后会按新代码页重新读取后续行，中文得以原样保留；首行
-    自身纯 ASCII，不受旧代码页影响。ansi 参数仅供测试模拟其它代码页。
+    ansi=None（默认）按**新建隐藏控制台**的系统 OEM 代码页编码：中转链子进程
+    不共享本进程控制台，cmd 读脚本用的是 OEM 页——写死 mbcs(ANSI) 会在
+    ANSI≠OEM 的地区乱码（如俄文机 1251 字节被 866 控制台误读；中文机两者
+    都是 936 才碰巧没事）。探针等共享本进程控制台的脚本，调用方传
+    shared_console_codec() 的结果。
+    目标编码写不下时回退 UTF-8 并首行切代码页（cmd 执行 chcp 后按新代码页
+    重读后续行）；restore_cp 非空时末尾恢复原代码页（共享控制台探针用，
+    避免污染宿主控制台；隔离的新控制台不需要恢复）。
+    ansi 参数显式传值时保持旧语义（测试可模拟其它代码页）。
     """
+    if ansi is None:
+        ansi = oem_console_codec()
     try:
         return text.encode(ansi)
     except (UnicodeEncodeError, LookupError):
         body = text.replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\r\n')
-        return b'@chcp 65001 >nul\r\n' + body.encode('utf-8')
+        out = b'@chcp 65001 >nul\r\n' + body.encode('utf-8')
+        if restore_cp:
+            if not out.endswith(b'\n'):
+                out += b'\r\n'
+            out += ('@chcp %d >nul\r\n' % int(restore_cp)).encode('ascii')
+        return out
 
 
 def wscript_text_bytes(text: str, ansi: str = 'mbcs') -> bytes:

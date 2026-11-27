@@ -7,6 +7,8 @@
 import os
 import time
 
+import json
+
 import pytest
 
 from factory.agent_runtime import builtin_tools as bt, command_jobs
@@ -55,8 +57,43 @@ def test_yield_defaults_contract():
     assert bt._RUN_COMMAND_INTERACTIVE_YIELD_MS == 1000
     desc = RUN_COMMAND_TOOL_DEFINITION["function"]["description"]
     assert "5000ms" in desc
+    # PS 5.1 收发 JSON 默认 latin-1 编解码（中文必乱码）：描述中必须保留该警告
+    assert "charset=utf-8" in desc
     props = RUN_COMMAND_TOOL_DEFINITION["function"]["parameters"]["properties"]
     assert "5000ms" in props["yield_time_ms"]["description"]
+
+
+def test_yield_maximum_contract():
+    # 上限 120000 与默认 timeout_seconds=120 对齐：默认配置下一次调用可覆盖
+    # 任何不超时的命令；实际等待仍受 timeout 约束，超限拒绝而非钳制
+    props = RUN_COMMAND_TOOL_DEFINITION["function"]["parameters"]["properties"]
+    assert props["yield_time_ms"]["maximum"] == 120000
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_yield_boundary_accepts_120s_rejects_above(logs, shell):
+    ok = bt.try_execute_builtin_command_tool("run_command", {
+        "command": "echo ok", "shell": shell,
+        "work_dir": str(logs), "yield_time_ms": 120000, "_session_id": SID})
+    assert ok.get("success", True) is not False, ok
+    assert ok["status"] == "completed", ok
+    bad = bt.try_execute_builtin_command_tool("run_command", {
+        "command": "echo ok", "shell": shell,
+        "work_dir": str(logs), "yield_time_ms": 120001, "_session_id": SID})
+    assert bad["success"] is False
+    assert "0-120000" in json.dumps(bad, ensure_ascii=False)
+
+
+def test_yield_maximum_session_path(logs):
+    shell = SHELLS[0]
+    ok = bt.try_execute_builtin_command_tool("run_command", {
+        "command": "echo ok", "shell": shell, "work_dir": str(logs),
+        "session_id": "yield-max-test", "yield_time_ms": 120000, "_session_id": SID})
+    assert ok.get("success", True) is not False, ok
+    bad = bt.try_execute_builtin_command_tool("run_command", {
+        "command": "echo ok", "shell": shell, "work_dir": str(logs),
+        "session_id": "yield-max-test", "yield_time_ms": 120001, "_session_id": SID})
+    assert bad["success"] is False
 
 
 @pytest.mark.parametrize("shell", SHELLS)

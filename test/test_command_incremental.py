@@ -109,10 +109,23 @@ def test_poll_validation_and_legacy_tail(job):
     assert command_jobs.action(identifier, 'poll', 's')['output_tail'] == 'tail\n'
     assert bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', 'wait_seconds': 0})['output'] == ''
     # cursor 与 tail_lines 仍互斥；wait_seconds 超上限仍拒绝
-    for extra in ({'cursor': '', 'tail_lines': 5}, {'cursor': '', 'wait_seconds': 31}):
+    for extra in ({'cursor': '', 'tail_lines': 5}, {'cursor': '', 'wait_seconds': 121}):
         result = bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', **extra})
         assert result['success'] is False
     # P0-3 放宽：tail_lines + wait_seconds 共存合法（边等边看尾部，不推进读取位置）
     relaxed = bt.try_execute_builtin_command_tool('poll_command', {'job_id': identifier, '_session_id': 's', 'tail_lines': 5, 'wait_seconds': 1})
     assert relaxed.get('success') is not False
     assert relaxed['output_tail'] == 'tail\n'
+
+
+def test_wait_seconds_cap_is_120(job):
+    from factory.agent_runtime import builtin_tool_catalog as catalog
+    identifier, meta, output, done = job
+    output.write_bytes(b'data\n')
+    # 代码与 schema 上限均为 120（与 timeout 默认 120 / yield 上限 120000 对齐）
+    assert catalog.POLL_COMMAND_TOOL_DEFINITION['function']['parameters']['properties']['wait_seconds']['maximum'] == 120
+    assert catalog.WRITE_STDIN_TOOL_DEFINITION['function']['parameters']['properties']['wait_seconds']['maximum'] == 120
+    page = bt.try_execute_builtin_command_tool('poll_command', {
+        'job_id': identifier, '_session_id': 's', 'cursor': '', 'wait_seconds': 120})
+    assert page.get('success', True) is not False
+    assert 'data' in page['output']

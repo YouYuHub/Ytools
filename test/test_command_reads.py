@@ -171,7 +171,7 @@ def test_input_validation_happens_before_side_effect(job):
 
 def test_model_defaults_are_applied_but_internal_legacy_calls_unchanged(monkeypatch):
     captured = []
-    def run(*args):
+    def run(*args, **kwargs):
         captured.append(args)
         return {'status': 'completed', 'exit_code': 0}
     monkeypatch.setattr(bt, '_run_command_impl', run)
@@ -240,7 +240,7 @@ def test_default_short_wait_preserves_cmd_syntax_hints(job, monkeypatch):
     monkeypatch.setattr(bt, '_resolve_shell', lambda *_: ('cmd', 'cmd', ['/c']))
     monkeypatch.setattr(bt, '_guard_cmd_pipeline', lambda command: (command, None, []))
     seen = []
-    def launch(*args):
+    def launch(*args, **kwargs):
         seen.append(args)
         return {'status': 'completed', 'message': 'done'}
     monkeypatch.setattr(command_leases, 'start', launch)

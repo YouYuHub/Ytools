@@ -16,7 +16,7 @@
 | 跨文件搜内容 | `search_files(pattern, dir_path?)`；默认普通文本，正则设 `is_regex=true`。`file_pattern` 筛选文件名或相对路径 glob |
 | 读取文档 | `read_document(filename)` 默认自动选择。`text` 用 `offset/limit`；`table` 用 `next_row/next_sheet`；PDF 选页同时给 `page_start/page_count` |
 | 查看媒体 | `read_media(references)`，每条回复一次、最多 5 个来源；可用 `media://`、本地路径、HTTP(S) 直链，检查 `loaded/skipped` |
-| 执行命令 | `run_command(command, work_dir?)` 默认每次新 shell、短等 5000ms（交互式 1000ms）；未结束返回 `job_id`。语法须匹配 shell。传 `session_id="名"` 复用同一常驻 shell（保住 cwd/环境变量/REPL 状态），不传=每次新建。PowerShell 引号转义用双写（单引号串 `''` / 双引号串 `""`）或反引号，勿用 C 风格 `\'`/`\"`；工具会对含此类转义的命令做解析预检，能安全修复则自动改双写后执行，修不好在执行前拒绝；向原生程序传含双引号的参数会额外告警（WinPS 传参不转义内嵌引号，参数可能分裂/篡改，建议改文件传参） |
+| 执行命令 | `run_command(command, work_dir?)` 默认每次新 shell、短等 5000ms（交互式 1000ms）；未结束返回 `job_id`。语法须匹配 shell。传 `session_id="名"` 复用同一常驻 shell（保住 cwd/环境变量/REPL 状态），不传=每次新建。PowerShell 引号转义用双写（单引号串 `''` / 双引号串 `""`）或反引号，勿用 C 风格 `\'`/`\"`；工具会对含此类转义的命令做解析预检，能安全修复则自动改双写后执行，修不好在执行前拒绝；向原生程序传含双引号的参数会额外告警（WinPS 传参不转义内嵌引号，参数可能分裂/篡改，建议改文件传参）。`python -c`/`node -e` 内联代码的引号嵌套（`\"`/`""`/反引号/单引号含双引号）、`$` 展开等会自动改写为临时脚本并还原转义，直接写即可，无需手写临时文件 |
 | 继续查看 | `poll_command(job_id)` 自动续取新增输出。`status=running` 或 `has_more=true` 时继续查询；`completion=awaiting_input` 表示在等输入；footer 带 `elapsed_ms`/`cwd` |
 | 连续输入 | `run_command(..., interactive=true)`；需 TTY 的 REPL 加 `tty=true`。用 `write_stdin(job_id, chars="内容\n")` 输入并续取输出；控制键用 `key`（ctrl+c/enter/方向键等）；管道读取至 EOF 的程序再传 `eof=true` |
 | 独立服务 | `run_command(..., background=true)`，不受前台总超时/任务结束回收；`poll_command(job_id)` 查看，`stop_command(job_id)` 停止（`graceful=true` 先软中断再杀树） |
@@ -37,10 +37,11 @@
 - 本地文档文本/表格解析最多 10 MiB；原生读取使用配置中的原生文档配额，硬上限 64 MiB，需当前模型支持该格式。
 - 原生文档只发送到下一次模型请求。视频旧画面会回收，回看需重读。本地/会话视频按返回的 `video.read.end` 续读；网络 URL 不接受时间区间。
 - 命令生命上限（`timeout_seconds`）默认 120 秒、允许 1–1800 秒：前台阻塞调用与短等任务（含交互式）都受它约束，超时终止进程树；预算包括预处理和启动，进程回收可能额外耗时。后台任务与常驻会话不使用此超时，停止聊天后仍保留后台任务。
-- 终端默认自动续读，无新增输出时最多等 1 秒；`wait_seconds=0–30` 可调。`cursor=""` 重读，传 `next_cursor` 可指定位置，之后继续自动续读；`tail_lines=1–200` 只预览尾部、不推进位置，与 cursor 互斥但可配 `wait_seconds`（边等边看尾部）与 `encoding`。乱码可设 `encoding`，后续沿用，空字符串恢复自动识别。完整日志见 `output_path`。tty 输出默认剥离 ANSI，`raw=true` 保留原始控制码。
+- 终端默认自动续读，无新增输出时最多等 1 秒；`wait_seconds=0–120` 可调。`cursor=""` 重读，传 `next_cursor` 可指定位置，之后继续自动续读；`tail_lines=1–200` 只预览尾部、不推进位置，与 cursor 互斥但可配 `wait_seconds`（边等边看尾部）与 `encoding`。乱码可设 `encoding`，后续沿用，空字符串恢复自动识别。完整日志见 `output_path`。tty 输出默认剥离 ANSI，`raw=true` 保留原始控制码。
 - 常驻会话（`session_id`）跨调用保持 cwd/环境变量/REPL import 状态；cmd/PS 自动用结束标记取退出码（for 循环/多行命令不加标记、无单一退出码）。`env={名:值}` 仅本次调用生效、不污染宿主。会话空闲 30 分钟自动回收，`stop_command(job_id)` 可手动关闭。
 - cmd 百分号自动规范化（批处理执行层）：FOR 循环变量按交互式单 `%` 写（`for /d %d in (*) do @echo %d`、修饰符 `%~nd`），工具自动转批处理双写 `%%d`/`%%~nd`（含嵌套/多行块）；字面量百分号写单个 `%`（`echo 100%`、`echo 50% off`），工具自动双写防批处理吞字符。`%VAR%` 环境变量、`%1` 批参数、已双写的 `%%` 均不受影响。常驻会话是交互式控制台，FOR 变量用单 `%`（工具会把误写的 `%%d` 降为 `%d`）。
-- 交互模式默认短等 1000ms，与后台互斥。输入仅限当前任务/代理，ask 权限模式下发送输入须审批；空输入只读取。`write_stdin` 原样发送 UTF-8，最多 16384 字符/64KiB，换行需显式包含；只传 job_id/request_id 查回执，重试沿用 request_id 和原文，勿换 ID 自动重发。PTY 不支持 `eof=true`，程序退出或 `stop_command` 结束终端。
+- 交互模式默认短等 1000ms，与后台互斥。输入仅限当前任务/代理，ask 权限模式下发送输入须审批；空输入只读取。`write_stdin` 原样发送（编码跟随会话终端实际代码页：powershell 会话 UTF-8，cmd 会话为系统地区传统代码页如 GBK），最多 16384 字符/64KiB，换行需显式包含；只传 job_id/request_id 查回执，重试沿用 request_id 和原文，勿换 ID 自动重发。PTY 不支持 `eof=true`，程序退出或 `stop_command` 结束终端。
+- 终端编码按系统实际代码页检测、不写死：cmd 会话固定地区传统代码页（中文 GBK），powershell 会话 UTF-8；cmd 下超集字符（如 emoji）无法表示时会明确报错（改用 powershell 会话或 `tty=true`，后者走 Unicode 通道无此限制）。输出自动识别（UTF-8 优先、系统页回退），极少数恰好合法 UTF-8 的 GBK 短行可能误判，可设 `encoding` 强制重读。
 
 ## 最小示例
 

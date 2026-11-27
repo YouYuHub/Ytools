@@ -1,6 +1,7 @@
 """由服务端本地执行的内置工具。"""
 # from __future__ import annotations
 from urllib.parse import urlsplit
+import ast
 import base64
 import codecs
 import copy
@@ -29,7 +30,9 @@ from typing import Any, Optional
 
 
 from util.text_encoding import (decode_text, unicode_bom, powershell_text_prelude,
-                                cmd_script_bytes, wscript_text_bytes)
+                                cmd_script_bytes, wscript_text_bytes, CONSOLE_CP_TO_CODEC,
+                                oem_console_codec, shared_console_codec,
+                                traditional_oem_cp, traditional_oem_codec)
 from util.tool_arguments import string_arg, int_arg, number_arg
 from util.file_lock import cross_process_lock
 from factory.agent_runtime.tool_control import (
@@ -2755,17 +2758,9 @@ def _decode_command_bytes(data: bytes, encoding: str = "", candidates: tuple = (
     return _decode_command_bytes_used(data, encoding, candidates)[0]
 
 
-# Windows 控制台代码页 → Python 编解码器名
-_CONSOLE_CP_TO_CODEC = {
-    65001: "utf-8",    # UTF-8（开启"Beta: 使用 Unicode UTF-8 提供全球语言支持"后）
-    936: "gbk",        # 简体中文（CP936/GBK）
-    950: "big5",       # 繁体中文
-    932: "shift_jis",  # 日语
-    949: "cp949",      # 韩语
-    1252: "cp1252",    # 西文 ANSI
-    850: "cp850",      # 西文 OEM
-    437: "cp437",      # 美式 OEM
-}
+# Windows 控制台代码页 → Python 编解码器名（正本在 util.text_encoding，
+# 此处保留别名兼容旧引用）
+_CONSOLE_CP_TO_CODEC = CONSOLE_CP_TO_CODEC
 
 _windows_console_cp_cache = None
 
@@ -3252,7 +3247,10 @@ def _pipe_filter_works(tool: str, args: str, exe_path: str = "") -> bool:
         try:
             handle, probe_path = tempfile.mkstemp(prefix="rc_probe_", suffix=".cmd")
             with os.fdopen(handle, "wb") as file:
-                file.write(cmd_script_bytes("@echo off\r\n" + probe))
+                # 探针直连本进程控制台：按共享控制台实际代码页落盘（非 mbcs/ANSI）；
+                # 回退分支末尾恢复原代码页，不污染宿主控制台
+                _probe_codec, _probe_cp = shared_console_codec()
+                file.write(cmd_script_bytes("@echo off\r\n" + probe, ansi=_probe_codec, restore_cp=_probe_cp))
             proc = subprocess.run(
                 [os.environ.get("COMSPEC") or "cmd.exe", "/c", "call", probe_path],
                 capture_output=True, timeout=remaining_seconds(2), stdin=subprocess.DEVNULL,
@@ -3385,7 +3383,8 @@ def _guard_powershell_pipeline(command: str) -> tuple[str, list[str]]:
     return "|".join(segments), notes
 
 
-def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
+def _find_inline_code(command: str, min_lines: int = 2, start: int = 0,
+                      shell_kind: str = "cmd"):
     """定位内联代码执行（python -c / node -e）。
 
     返回 dict（含解释器、入口 flag 及其在命令中的位置、代码文本、multi_line 与
@@ -3396,6 +3395,10 @@ def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
     匹配继续向后找）。
     定位失败（引号未配对/尾部语法复杂/代码区吞并后续引号段）时跳过该匹配并
     继续向后找，全部不可用才返回 None，由调用方决定拒绝或跳过。
+    shell_kind 仅影响尾部 `;` 的接受：PowerShell 里 `;` 是合法语句分隔符，
+    单行代码 + `;` 尾部可安全定界（如 `python -c "print(\"x\")"; echo done`）；
+    多行代码 + `;` 仍拒绝（定界歧义，调用方按跨行意图抛错）；cmd 里 `;`
+    不是分隔符，一律不接受（保持既有行为）。
     """
     search_from = start
     while True:
@@ -3410,7 +3413,10 @@ def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
         # 判据（实测踩坑后放宽）：remainder 为空、或以空白开头且不含引号、不含 ";"。
         # 例：` 2>&1 | tail -2`（多行代码 + 管道）此前被过严的字符类规则漏判，
         # 导致不改写 → cmd 拆行 → 管道失效且输出混乱。
+        # PowerShell 另接受 `;` 开头的尾部（语句分隔符），但仅限单行代码：多行
+        # 代码 + `;` 定界歧义，仍拒绝（由调用方按跨行意图抛错）。
         close_index = None
+        allow_semicolon = shell_kind in ("powershell", "pwsh")
         for index in range(len(command) - 1, open_index, -1):
             if command[index] != quote:
                 continue
@@ -3418,6 +3424,14 @@ def _find_inline_code(command: str, min_lines: int = 2, start: int = 0):
             if remainder == "" or (
                 re.match(r"^\s[^\"']*$", remainder)
                 and ";" not in remainder
+                and "\n" not in remainder
+            ):
+                close_index = index
+                break
+            if (
+                allow_semicolon
+                and "\n" not in command[open_index + 1: index]
+                and re.match(r"^\s*;[^\"']*$", remainder)
                 and "\n" not in remainder
             ):
                 close_index = index
@@ -3479,13 +3493,23 @@ def _inline_code_needs_script(code: str, multi_line: bool, shell_kind: str = "cm
     内联与 .ps1 解析中都极易错乱，模型习惯性写法必炸；改写后语义等价）。
     所有 shell 都需要：代码含与外层同种的引号（引号嵌套，如
     `python -c "print("hi")"`——内外层引号无法区分，不改写必错乱）。
+    powershell/pwsh 另需要：单引号代码含 `"`（原生边界会剥掉它，如
+    `python -c 'print("x")'` 传给解释器的变成 `print(x)`），或双引号代码
+    含变量展开式 `$`（PS 会先展开再传，如 `print('$x')` 变成 `print('')`）。
+    cmd 另需要：单引号代码（cmd 单引号无分组含义，原生是静默无操作）。
     powershell 下 `%` 无特殊含义，单行含 `%` 不改写；其余单行交给 shell
     原生处理（保持既有行为与低开销）。
     """
     if quote and quote in code:
         return True
     if shell_kind in ("powershell", "pwsh"):
+        if quote == "'" and '"' in code:
+            return True
+        if quote == '"' and re.search(r"\$[{(\w?^$]", code):
+            return True
         return multi_line
+    if quote == "'":
+        return True
     return multi_line or ("%" in code)
 
 
@@ -3500,7 +3524,7 @@ def _locate_inline_code_segment(command: str, start: int = 0, shell_kind: str = 
        `python -X utf8 -c` 等前置选项形态（正则已支持）。
     只接受"单行含 `%`"或"多行"的段；其余段跳过继续向后找。
     """
-    found = _find_inline_code(command, min_lines=1, start=start)
+    found = _find_inline_code(command, min_lines=1, start=start, shell_kind=shell_kind)
     if found is not None and _inline_code_needs_script(found["code"], found["multi_line"], shell_kind, found.get("quote") or ""):
         return found
     search_from = start
@@ -3570,20 +3594,118 @@ def _locate_inline_code_segment(command: str, start: int = 0, shell_kind: str = 
     return None
 
 
+# PowerShell 双引号串的反引号转义表（改写抽取时还原；未知组合保留原样，
+# 与 PS 行为一致——PS 只解释已知转义）。
+_PS_DQUOTE_ESCAPES = {
+    '"': '"', "'": "'", "`": "`", "$": "$",
+    "0": "\0", "a": "\a", "b": "\b", "f": "\f",
+    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+}
+
+
+def _unescape_inline_code(code: str, shell_kind: str, quote: str, language: str = "python") -> str:
+    """按外层引号规则还原抽取出的内联代码（写入临时脚本前调用）。
+
+    目标：文件内容 = 解释器本应收到的代码（模型意图），而不是 shell 源文本。
+    - 单引号外层：PowerShell 里 `''` 是转义（无条件折叠；`'a''b'` 只可能是
+      转义写法）；cmd 无单引号转义，原样保留。
+    - 双引号外层：奇偶感知的反斜杠扫描——奇数个反斜杠后的 `"` 是 C 风格转义
+      （奇数个折半，cmd 与 PS 通用写法）；偶数个反斜杠后的 "" 配对含义
+      看语言：Python 用 AST 裁决（折叠后能解析、且原样解析失败时才折叠——
+      既修嵌套意图，又不破坏空字符串/相邻串拼接）；node 一律原样
+      （与今日行为一致，JS 空字符串优先）。
+      PowerShell 另处理反引号转义（`` `" ``→`"` 等），未知组合原样保留；
+      cmd 里反引号是普通字符，不动。其它反斜杠一律原样（路径/正则）。
+    孤立 `"`（贪心嵌套定位进来、如 `print("hi")`）原样保留——它就是代码本身。
+    """
+    if quote == "'":
+        if shell_kind in ("powershell", "pwsh"):
+            return code.replace("''", "'")
+        return code
+    if quote != '"':
+        return code
+    is_ps = shell_kind in ("powershell", "pwsh")
+    # 第一遍：PowerShell 反引号转义（cmd 不认反引号，原样保留）
+    if is_ps and "`" in code:
+        parts = []
+        i, n = 0, len(code)
+        while i < n:
+            if code[i] == "`" and i + 1 < n:
+                nxt = code[i + 1]
+                parts.append(_PS_DQUOTE_ESCAPES.get(nxt, "`" + nxt))
+                i += 2
+            else:
+                parts.append(code[i])
+                i += 1
+        code = "".join(parts)
+    # 第二遍：反斜杠奇偶扫描，\" 去一根反斜杠，其余原样
+    out = []
+    i, n = 0, len(code)
+    pending = 0
+    while i < n:
+        ch = code[i]
+        if ch == "\\":
+            pending += 1
+            i += 1
+            continue
+        if ch == '"':
+            if pending % 2 == 1:
+                # C 风格转义：奇数个反斜杠折半（bash/MSVCRT/C 一致语义；
+                # \" → " 是最常见的 n=0 情形）
+                out.append("\\" * (pending // 2))
+                out.append('"')
+            else:
+                out.append("\\" * pending)
+                out.append('"')
+            pending = 0
+            i += 1
+            continue
+        out.append("\\" * pending)
+        pending = 0
+        out.append(ch)
+        i += 1
+    out.append("\\" * pending)
+    code = "".join(out)
+    # 第三遍："" 配对折叠仅 Python 且 AST 裁决后执行——折叠后能解析、且原样
+    # 解析失败时才折叠（修嵌套意图）；原样能解析则保持今日行为（空字符串、
+    # 相邻串拼接优先原样）；node 一律原样（与今日行为一致）。
+    if language != "python" or '""' not in code:
+        return code
+    collapsed = code.replace('""', '"')
+    if collapsed == code:
+        return code
+    try:
+        ast.parse(collapsed)
+        collapsed_ok = True
+    except (SyntaxError, ValueError):
+        collapsed_ok = False
+    if not collapsed_ok:
+        return code
+    try:
+        ast.parse(code)
+        return code
+    except (SyntaxError, ValueError):
+        return collapsed
+
+
 def _rewrite_inline_code_to_script(command: str, shell_kind: str):
     """把 shell 无法安全直接执行的内联代码改写为临时脚本。
 
-    cmd 会破坏两类内联代码，因此两类都改写为 `<解释器> "<临时脚本>"`：
+    cmd 会破坏三类内联代码，因此三类都改写为 `<解释器> "<临时脚本>"`：
     - 多行：命令写入 .run.cmd 后按行解释，后续行被当独立命令执行
       （实测 `i was unexpected at this time.`）；
     - 含 `%` 的单行：批处理层先做 `%` 展开，孤立 `%` 被吞、`%VAR%` 被替换成
       环境变量值（实测 `python -c "print('100%')"` 输出 `100`；`print('%d' % 5)`
       直接 SyntaxError）。脚本文件内容不经 cmd 批处理解析，两种链路
-      （隐藏中转链 / Popen 直连）下语义都稳定，且退出码透传。
-    powershell/pwsh 只改写多行内联代码：双引号字符串里的引号嵌套/换行在
-    PowerShell 解析中极易错乱（模型习惯性写法必炸）；单行（含 `%`，在
-    PowerShell 无特殊含义）交给原生处理。其它 shell（bash/sh/zsh）原生支持
-    多行引号字符串，不改写。
+      （隐藏中转链 / Popen 直连）下语义都稳定，且退出码透传；
+    - 单引号代码：cmd 单引号无分组含义，原生是静默无操作。
+    powershell/pwsh 改写：多行（双引号内联代码的引号嵌套/换行在 -Command
+    内联与 .ps1 解析中都极易错乱，模型习惯性写法必炸）；单引号代码含 `"`
+    （原生边界剥引号）；双引号代码含变量展开式 `$`（PS 先展开再传）。
+    单行含 `%`（在 PowerShell 无特殊含义）等其余情况交给原生处理。
+    其它 shell（bash/sh/zsh）原生支持多行引号字符串，不改写。
+    写入脚本前按外层引号规则反转义（见 _unescape_inline_code）：文件内容是
+    解释器本应收到的代码（模型意图），而不是 shell 源文本。
     注意必须连入口 flag（`-c`/`-e`）一起替换掉：`python -c "<路径>"` 会把路径
     当代码字符串执行（实测 SyntaxError），而 `python "<路径>"` 才是执行脚本。
     无法安全定位且存在跨行代码意图时抛 ValueError（拒绝执行）。
@@ -3605,7 +3727,11 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
     interp = found["interp"]
     interp_name = Path(interp).stem.lower()
     extension = "js" if interp_name == "node" else "py"
-    code = found["code"]
+    language = "node" if interp_name == "node" else "python"
+    raw_code = found["code"]
+    # 反转义：文件内容 = 解释器本应收到的代码（模型意图），而不是 shell 源文本
+    # （\" 还原、PS 的 ""/反引号还原等；详见 _unescape_inline_code）。
+    code = _unescape_inline_code(raw_code, shell_kind, found.get("quote") or "", language)
     try:
         _BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -3627,7 +3753,8 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
     )
     # 嵌套判定：代码含与外层同种的引号（只有贪心第三级能产出这种 found，
     # 精确/退化定位的闭引号就是第一个同种引号，代码里不可能还有）。
-    nested = bool(found.get("quote") and found["quote"] in code)
+    # 注意用改写前的原文判定（反转义后引号形态已变）。
+    nested = bool(found.get("quote") and found["quote"] in raw_code)
     if found["multi_line"]:
         if nested:
             note = (
@@ -3654,6 +3781,28 @@ def _rewrite_inline_code_to_script(command: str, shell_kind: str):
             note = (
                 f"检测到单行内联代码中的引号嵌套（{interp} {found['flag']}）：内外层"
                 "引号无法区分，直接执行必错乱，"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（转义已还原，语义等价，退出码透传）"
+            )
+        elif shell_kind in ("powershell", "pwsh") and found.get("quote") == "'":
+            note = (
+                f"检测到单引号内联代码含双引号（{interp} {found['flag']}）：PowerShell "
+                "传给原生程序时不转义内嵌双引号，参数会在命令行层被剥掉 "
+                "（实测 `print(\"x\")` 变成 `print(x)`），"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（语义等价，退出码透传）"
+            )
+        elif shell_kind in ("powershell", "pwsh"):
+            note = (
+                f"检测到内联代码含变量展开式（{interp} {found['flag']}）：PowerShell "
+                "会先展开 `$` 再传给解释器（实测 `print('$x')` 变成 `print('')`），"
+                f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
+                "（代码原样交给解释器，语义等价，退出码透传）"
+            )
+        elif found.get("quote") == "'":
+            note = (
+                f"检测到单引号内联代码（{interp} {found['flag']}）：cmd 单引号无分组"
+                "含义，原生执行是静默无操作，"
                 f"已自动改写为临时脚本 {_display_path(script_path)} 后执行"
                 "（语义等价，退出码透传）"
             )
@@ -3699,7 +3848,7 @@ def _ps_parse_errors(shell_exe: str, command: str):
     try:
         proc = subprocess.run(
             [shell_exe, "-NoProfile", "-NonInteractive", "-Command", checker],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            capture_output=True,
             timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
@@ -3711,7 +3860,9 @@ def _ps_parse_errors(shell_exe: str, command: str):
             pass
     if proc.returncode != 0:
         return None
-    out = (proc.stdout or "").strip()
+    # 检查器输出按子进程实际代码页解码（勿写死 utf-8：非 UTF-8 控制台下
+    # 本地化的中文错误信息会被误读成乱码，导致 JSON 解析失败、预检失效）
+    out = _decode_command_bytes(proc.stdout or b"").strip()
     if out in ("", "null"):
         return []
     try:
@@ -4396,9 +4547,11 @@ def _write_relay_script(command, work_dir, shell_exe, shell_kind, shell_prefix, 
         'f.Write code\r\n'
         'f.Close\r\n'
     )
-    # 启动器要注入整份环境块（set "PATH=…"）：非中文代码页服务器上环境值含
-    # 中文时 strict mbcs 必抛 UnicodeEncodeError（旧 except 只捕 OSError/LookupError，
-    # 漏了它 → 所有模式全失败）。cmd_script_bytes 回退 UTF-8+chcp 65001 保中文。
+    # 启动器要注入整份环境块（set "PATH=…"）：目标编码写不下中文时
+    # cmd_script_bytes 回退 UTF-8+chcp 65001 保中文（旧 except 只捕
+    # OSError/LookupError 漏 UnicodeEncodeError → 所有模式全失败，已修）。
+    # 落盘编码取新建隐藏控制台的系统 OEM 代码页（非 mbcs/ANSI），ANSI≠OEM
+    # 的地区（俄文 1251/866 等）才不会乱码。
     launcher_path.write_bytes(cmd_script_bytes(launcher_text))
     vbs_path.write_bytes(wscript_text_bytes(vbs_text))
     if runner_path is not None:
@@ -4430,12 +4583,16 @@ def _powershell_literal_cwd_line(cwd: str) -> str:
 
 
 def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_dir: str = "",
-                         utf8_console: bool = False) -> None:
-    """写执行脚本：cmd→.run.cmd（mbcs 优先，非中文代码页回退 UTF-8+chcp 65001）；
+                         interactive_cmd: bool = False) -> None:
+    """写执行脚本：cmd→.run.cmd（新建隐藏控制台的系统 OEM 代码页编码，
+    写不下回退 UTF-8+chcp 65001；勿用 mbcs/ANSI，ANSI≠OEM 的地区会乱码）；
     powershell/pwsh→.run.ps1（UTF-8 BOM，-File 读）；bash/sh/zsh→.run.sh（UTF-8，
     stdin 喂给 shell）。ps1/sh 末尾附加退出码透传，让中转链 done 文件记录命令
-    本身的退出码。utf8_console=True（交互式 cmd）强制 UTF-8+chcp：write_stdin
-    按 UTF-8 送字节，控制台代码页必须同口径，否则中文输入被按 ANSI 误读。
+    本身的退出码。interactive_cmd=True（交互式 cmd 会话）：控制台固定地区传统
+    OEM 页（cmd 在 65001 下读管道 stdin 会把非 ASCII 字节逐个变成 U+FFFD，
+    实测硬伤；stdin/批处理/输出全跟输出口径），脚本首行自带 chcp 自校正、
+    按传统 OEM 编码；含超集字符（emoji 等）时直接报错并指引 powershell
+    会话/tty 模式——静默建会话只会得到满屏 �。
 
     换行统一为 LF 再按目标 shell 组装：命令原文若已含 CRLF（如从文件复制而来），
     直接拼接会产生 CR CR LF，cmd 解析层会出现空行/多余回车（实测 runner 文件里
@@ -4454,8 +4611,16 @@ def _write_runner_script(runner_path: Path, shell_kind: str, command: str, work_
         # cmd 按行解释 .cmd：行尾必须是 CRLF；行内 LF 会被当命令结束（多行内联代码
         # 已在上游改写为临时脚本，此处只做兜底归一化）
         text = "@echo off\r\n" + normalized.replace("\n", "\r\n") + "\r\n"
-        if utf8_console:
-            runner_path.write_bytes(b"@chcp 65001 >nul\r\n" + text.encode("utf-8"))
+        if interactive_cmd:
+            cp = traditional_oem_cp() or 65001
+            codec = traditional_oem_codec()
+            try:
+                body = text.encode(codec)
+            except (UnicodeEncodeError, LookupError):
+                raise ValueError(
+                    f"cmd 交互会话控制台代码页({cp}/{codec})无法表示命令中的字符"
+                    f"（如 emoji/生僻字）：请改用 powershell 会话（UTF-8）或 tty=true")
+            runner_path.write_bytes(("@chcp %d >nul\r\n" % cp).encode("ascii") + body)
         else:
             runner_path.write_bytes(cmd_script_bytes(text))
         return
@@ -4835,17 +5000,18 @@ def _pid_alive_posix(pid: int) -> bool:
 
 def _run_command_impl(command, shell, work_dir, timeout_seconds, background, max_output_chars=None,
                       structured=False, session_id="", yield_time_ms=None, owner_agent='main',
-                      interactive=False, tty=False, auto_yield=False) -> str | dict[str, Any]:
+                      interactive=False, tty=False, auto_yield=False, tty_rows=30, tty_cols=120) -> str | dict[str, Any]:
     command = string_arg({"command": command}, "command", required=True, max_length=200000).strip()
     timeout = number_arg({"timeout_seconds": timeout_seconds}, "timeout_seconds", 120, minimum=1, maximum=1800)
     with tool_deadline(30 if background else timeout):
         return _execute_command_impl(command, shell, work_dir, timeout, background,
-                                     max_output_chars, structured, session_id, yield_time_ms, owner_agent, interactive, tty, auto_yield)
+                                     max_output_chars, structured, session_id, yield_time_ms, owner_agent, interactive, tty, auto_yield,
+                                     tty_rows=tty_rows, tty_cols=tty_cols)
 
 
 def _execute_command_impl(command, shell, work_dir, timeout, background, max_output_chars,
                           structured, session_id, yield_time_ms=None, owner_agent='main', interactive=False, tty=False,
-                          auto_yield=False):
+                          auto_yield=False, tty_rows=30, tty_cols=120):
     output_limit = max(512, min(_RUN_COMMAND_MAX_CHARS, int(max_output_chars or _RUN_COMMAND_MAX_CHARS)))
     is_nt = os.name == "nt"
     # 顺手清理超过 24h 的历史日志/中转文件（后台输出、前台中转与完整输出文件）
@@ -4907,7 +5073,8 @@ def _execute_command_impl(command, shell, work_dir, timeout, background, max_out
         if shell_kind == 'cmd':
             guard_notes.extend(_cmd_syntax_hints(command, None, '', ''))
         result = start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id,
-                       remaining_seconds(timeout), yield_time_ms, output_limit, owner_agent, interactive, tty)
+                       remaining_seconds(timeout), yield_time_ms, output_limit, owner_agent, interactive, tty,
+                       tty_rows=tty_rows, tty_cols=tty_cols)
         result['message'] = _append_command_notes(result['message'], guard_notes)
         return result
     if background:
@@ -5042,7 +5209,7 @@ def execute_write_stdin(args):
     eof = _optional_bool(args, 'eof')
     cursor = string_arg(args, 'cursor', max_length=512) if 'cursor' in args else None
     automatic = bool(args.get('_command_auto_defaults'))
-    wait = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=30)
+    wait = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=120)
     limit = max(512, min(12000, int(args.get('_max_chars') or 12000)))
     if automatic:
         from .command_reads import read
@@ -5063,7 +5230,7 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
     args = tool_args if isinstance(tool_args, dict) else {}
     action = str(args.get("action") or "run").strip().lower()
     if action in ("poll", "stop"):
-        if any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty")):
+        if any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty", "tty_rows", "tty_cols")):
             raise ValueError("poll/stop 仅接受 job_id；请移除执行命令专用参数")
         tail_lines = args.get("tail_lines", 30)
         cursor = args.get('cursor')
@@ -5077,7 +5244,7 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         # tail 模式也允许 wait_seconds/encoding（边等边看尾部，不推进读取位置）。
         if cursor is None and not automatic and 'tail_lines' not in args and any(key in args for key in ('wait_seconds', 'encoding')):
             raise ValueError('wait_seconds/encoding 需配合 cursor 或 tail_lines 使用')
-        wait_seconds = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=30)
+        wait_seconds = number_arg(args, 'wait_seconds', 1 if automatic else 0, maximum=120)
         if action == "stop" and "tail_lines" in args:
             raise ValueError("stop 不接受 tail_lines；请在 poll_command 中使用")
         if action == 'poll' and 'graceful' in args:
@@ -5122,7 +5289,7 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         if _optional_bool(args, 'background'):
             raise ValueError('session_id 与 background=true 不能同时指定')
         from . import command_sessions
-        wait_ms = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=30000) if 'yield_time_ms' in args else _RUN_COMMAND_YIELD_MS
+        wait_ms = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=120000) if 'yield_time_ms' in args else _RUN_COMMAND_YIELD_MS
         sess = command_sessions.run(
             str(args.get('_session_id') or ''), shell_session, args.get('command'),
             args.get('shell') or args.get('_default_shell') or 'auto', args.get('work_dir', ''),
@@ -5137,8 +5304,12 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
                 "stdout": sess['output'], "stderr": "", "background": False, "pid": None,
                 "timed_out": False, "truncated": False, "output_path": None, "completion_path": None,
                 "shell_session": shell_session}
-    yield_time = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=30000) if 'yield_time_ms' in args else None
+    yield_time = int_arg(args, 'yield_time_ms', _RUN_COMMAND_YIELD_MS, maximum=120000) if 'yield_time_ms' in args else None
     tty = _optional_bool(args, 'tty')
+    if ('tty_rows' in args or 'tty_cols' in args) and not tty:
+        raise ValueError('tty_rows/tty_cols 需要 tty=true')
+    tty_rows = int_arg(args, 'tty_rows', 30, minimum=5, maximum=200)
+    tty_cols = int_arg(args, 'tty_cols', 120, minimum=20, maximum=500)
     interactive = _optional_bool(args, 'interactive') or tty
     if interactive:
         if _optional_bool(args, 'background'):
@@ -5160,6 +5331,7 @@ def execute_run_command(tool_args: dict[str, Any]) -> str | dict[str, Any]:
         yield_time,
         str(args.get('_command_owner_agent') or 'main'),
         interactive, tty, bool(args.get('_command_auto_defaults')),
+        tty_rows=tty_rows, tty_cols=tty_cols,
     )
 
 
@@ -5224,7 +5396,7 @@ def try_execute_builtin_command_tool(
             result = execute_write_stdin(args)
         else:
             if tool_name != RUN_COMMAND_NAME:
-                if "action" in args or any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty")):
+                if "action" in args or any(key in args for key in ("command", "shell", "work_dir", "timeout_seconds", "background", "yield_time_ms", "interactive", "tty", "tty_rows", "tty_cols")):
                     raise ValueError(f"{tool_name} 只接受 job_id 及相应的输出读取参数")
                 args = {**args, "action": "poll" if tool_name == POLL_COMMAND_NAME else "stop"}
             result = execute_run_command({**args, "_structured_output": True})

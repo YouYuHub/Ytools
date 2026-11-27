@@ -276,3 +276,38 @@ def test_receipt_commit_retries_windows_occupation_without_replaying_input(logs,
     assert failures==[True,True] and delivered==['exactly once']
     assert receipt['status']=='accepted' and receipt['accepted_bytes']==12
     assert not request.exists() and not list(logs.glob('*.tmp'))
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='ConPTY size probe is Windows-only')
+def test_tty_size_default_and_custom(logs):
+    from factory.agent_runtime import builtin_tool_catalog as catalog
+    props = catalog.RUN_COMMAND_TOOL_DEFINITION['function']['parameters']['properties']
+    assert props['tty_rows']['minimum'] == 5 and props['tty_rows']['maximum'] == 200
+    assert props['tty_cols']['minimum'] == 20 and props['tty_cols']['maximum'] == 500
+    probe = '$w = $Host.UI.RawUI.WindowSize; Write-Output "W=$($w.Width) H=$($w.Height)"'
+    for options, expect in (({}, 'W=120 H=30'), ({'tty_cols': 200, 'tty_rows': 50}, 'W=200 H=50')):
+        result = bt.try_execute_builtin_command_tool('run_command', {
+            'command': probe, 'shell': 'powershell', 'tty': True,
+            'timeout_seconds': 60, 'work_dir': str(logs),
+            '_session_id': 'interactive-test', **options})
+        assert 'job_id' in result, result
+        final, output = finish(result)
+        assert final['status'] == 'completed', (final, output)
+        assert expect in output, output
+
+
+@pytest.mark.parametrize('args', [
+    {'tty_cols': 200},
+    {'tty_rows': 30},
+    {'tty': True, 'tty_cols': 19},
+    {'tty': True, 'tty_cols': 501},
+    {'tty': True, 'tty_rows': 4},
+    {'tty': True, 'tty_rows': 201},
+    {'tty': True, 'tty_cols': True},
+])
+def test_tty_size_options_validated(logs, args):
+    result = bt.try_execute_builtin_command_tool('run_command', {
+        'command': 'echo hi', 'shell': 'cmd', 'work_dir': str(logs),
+        '_session_id': 'interactive-test', **args})
+    assert result['success'] is False
+    assert not list(logs.glob('*.meta.json'))

@@ -48,9 +48,11 @@ def _key(session_id, name):
 
 def _shell_argv(shell_kind, shell_exe):
     if shell_kind == "cmd":
-        # /k 先切 UTF-8 代码页再驻留：write_stdin 按 UTF-8 送字节，控制台代码页
-        # 必须同口径（英文代码页服务器上中文输入否则被按 cp1252 误读成乱码）
-        return [shell_exe, "/q", "/k", "chcp 65001 >nul"]
+        # /k 先切传统 OEM 代码页再驻留（cmd 在 65001 下读管道 stdin 会把非
+        # ASCII 字节逐个变成 U+FFFD，实测硬伤；stdin/批处理/输出全跟输出口径）。
+        # 监督进程也会预先设置，这里是自校正兜底（无控制台监督进程的场景）。
+        from util.text_encoding import traditional_oem_cp
+        return [shell_exe, "/q", "/k", "chcp %d >nul" % (traditional_oem_cp() or 65001)]
     if shell_kind in {"powershell", "pwsh"}:
         return [shell_exe, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "-"]
     return [shell_exe, "-i"]

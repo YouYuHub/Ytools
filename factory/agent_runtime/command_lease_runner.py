@@ -10,7 +10,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from util.process_identity import process_identity
-from factory.agent_runtime.command_pty import Terminal, Pipe
+from factory.agent_runtime.command_pty import Terminal, Pipe, resolve_stdin_codec, stdin_env_vars
 from factory.agent_runtime import command_input, command_jobs
 
 
@@ -41,21 +41,59 @@ def run(spec_path):
         if not persistent and time.monotonic() >= spec['monotonic_deadline']:
             outcome.update(timed_out=True, exit_code=-1)
             return -1
+        stdin_codec = 'utf-8'
         if os.name == 'nt' and spec.get('interactive') and not spec.get('tty'):
-            # Pipe 子进程共享本监督进程的控制台，按控制台代码页解码 stdin 字节，
-            # 而 write_stdin 恒按 UTF-8 送：不对齐会把中文输入读成乱码（常驻
-            # PowerShell 会话无脚本 prelude 可设 InputEncoding，靠这里对齐）。
-            # 仅限交互式：非交互式脚本在中文机器上是 mbcs(GBK) 字节，若提前把
-            # 共享控制台切成 65001 反而会被按 UTF-8 误读（回归）。交互式 cmd 的
-            # runner 已强制 UTF-8+chcp，与此处一致。无控制台时静默失败不影响启动。
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetConsoleCP(65001)
-                ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-            except Exception:
-                pass
-        process = Terminal(spec['argv'], spec['cwd']) if spec.get('tty') else Pipe(
-            spec['argv'], spec['cwd'], spec.get('interactive', False))
+            # Pipe 子进程共享本监督进程的控制台，按控制台代码页解码 stdin 字节；
+            # stdin 字节编码必须与子进程实际解码口径一致（写死 UTF-8 会乱码）。
+            # cmd 与 PS 口径不同，需分开处理（实测结论）：
+            # - cmd：控制台固定地区传统 OEM 页（输入输出都设：stdin/批处理/输出
+            #   全跟输出口径；65001 下读管道 stdin 会逐字节变 U+FFFD），stdin
+            #   同口径编码；输出 GBK 由解码回退处理；
+            # - PS 按 InputEncoding 真实解码，65001+UTF-8 正常工作，保持强制。
+            from util.text_encoding import traditional_oem_cp
+            has_script = bool(spec.get('script'))
+            shell_kind = spec.get('shell_kind') or ''
+            if not shell_kind and not has_script:
+                # 兼容升级前创建的常驻会话（spec 无 shell_kind）：从 argv 推断
+                base = str((spec.get('argv') or [''])[0]).lower().replace('/', '\\').rsplit('\\', 1)[-1]
+                if base in ('cmd.exe', 'cmd'):
+                    shell_kind = 'cmd'
+                elif base in ('powershell.exe', 'pwsh.exe', 'powershell', 'pwsh'):
+                    shell_kind = 'powershell'
+            forced_utf8 = False
+            if shell_kind == 'cmd':
+                # cmd 会话控制台固定地区传统 OEM 页（输入输出都设：stdin/批处理
+                # 文件/输出全跟输出口径；cmd 在 65001 下读管道 stdin 会把非 ASCII
+                # 字节逐个变成 U+FFFD，实测硬伤）。脚本与 /k 参数自带 chcp 自校正。
+                try:
+                    import ctypes
+                    from util.text_encoding import traditional_oem_cp as _trad_cp
+                    target = _trad_cp() or 65001
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleCP(target)
+                    kernel32.SetConsoleOutputCP(target)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleCP(65001)
+                    kernel32.SetConsoleOutputCP(65001)
+                    forced_utf8 = (int(kernel32.GetConsoleCP()) == 65001)
+                except Exception:
+                    pass
+            # 仅限交互式：非交互式脚本按 OEM 落盘，若提前切控制台反而误读（回归）。
+            child_self_forces = has_script or shell_kind == 'cmd'
+            stdin_codec = resolve_stdin_codec(shell_kind=shell_kind, console_forced_utf8=forced_utf8,
+                                              child_self_forces_utf8=child_self_forces)
+            # python 读管道 stdin 用 locale/ANSI 而非控制台代码页：跟随 stdin 口径
+            # 声明 PYTHONIOENCODING（setdefault，不覆盖用户显式配置；注意不能用
+            # PYTHONUTF8，那会破坏 cmd/GBK 会话的一致性）。
+            for key, value in stdin_env_vars(stdin_codec).items():
+                os.environ.setdefault(key, value)
+        process = Terminal(spec['argv'], spec['cwd'], rows=spec.get('tty_rows', 30), cols=spec.get('tty_cols', 120)) if spec.get('tty') else Pipe(
+            spec['argv'], spec['cwd'], spec.get('interactive', False), stdin_codec=stdin_codec)
         child_identity = process_identity(process.pid)
         if spec.get('interactive'):
             writer = threading.Thread(target=command_input.serve,

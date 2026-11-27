@@ -156,7 +156,7 @@ def test_owner_cancellation_does_not_cancel_independent_background(logs):
 
 
 def test_invalid_yield_options_do_not_start_command(logs):
-    for args in ({'yield_time_ms': -1}, {'yield_time_ms': True}, {'yield_time_ms': 30001},
+    for args in ({'yield_time_ms': -1}, {'yield_time_ms': True}, {'yield_time_ms': 120001},
                  {'yield_time_ms': 0, 'background': True}):
         result = bt.try_execute_builtin_command_tool('run_command', {'command': 'echo bad', **args})
         assert result['success'] is False

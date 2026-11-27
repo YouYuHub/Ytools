@@ -10,7 +10,7 @@ import uuid
 
 
 def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout, wait_ms, max_chars, agent,
-          interactive=False, tty=False, persistent=False):
+          interactive=False, tty=False, persistent=False, tty_rows=30, tty_cols=120):
     from . import builtin_tools as bt, command_jobs
     from .permission_runtime import CURRENT
     from .tool_control import check_tool_control
@@ -18,9 +18,10 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
     bt._BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
     spec_path = bt._BG_LOG_DIR / ('bg_lease_' + uuid.uuid4().hex + '.json')
     script = spec_path.with_suffix('.run.cmd' if shell_kind == 'cmd' else '.run.ps1' if shell_kind in {'powershell', 'pwsh'} else '.run.sh')
-    # 交互式 cmd：write_stdin 按 UTF-8 送字节，runner 首行 chcp 65001 对齐控制台代码页
+    # 交互式 cmd：控制台固定传统 OEM 页（cmd 在 65001 下读管道 stdin 会把
+    # 非 ASCII 字节逐个变成 U+FFFD，实测），脚本自带 chcp 自校正
     bt._write_runner_script(script, shell_kind, command, cwd,
-                            utf8_console=bool(interactive and shell_kind == 'cmd'))
+                            interactive_cmd=bool(interactive and shell_kind == 'cmd'))
     argv = ([shell_exe, '/c', str(script)] if shell_kind == 'cmd' else
             [shell_exe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
             if shell_kind in {'powershell', 'pwsh'} else [shell_exe, str(script)])
@@ -29,7 +30,8 @@ def start(command, shell_exe, shell_kind, shell_prefix, cwd, session_id, timeout
     spec = {'argv': argv, 'script': str(script), 'cwd': cwd,
             'deadline': time.time() + timeout, 'monotonic_deadline': time.monotonic() + timeout, 'owner_pid': os.getpid(),
             'owner_identity': process_identity(os.getpid()), 'interactive': interactive, 'tty': tty,
-            'persistent': persistent}
+            'persistent': persistent, 'shell_kind': shell_kind,
+            'tty_rows': tty_rows, 'tty_cols': tty_cols}
     spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding='utf-8')
     runner = [sys.executable, str(Path(__file__).with_name('command_lease_runner.py')), str(spec_path)]
     outer_exe, outer_kind, outer_prefix = bt._resolve_shell('cmd' if os.name == 'nt' else 'sh', os.name == 'nt')
@@ -105,7 +107,7 @@ def start_resident(argv, cwd, session_id, agent, shell_kind):
     spec = {'argv': argv, 'script': '', 'cwd': cwd,
             'deadline': time.time() + 1800, 'monotonic_deadline': time.monotonic() + 1800,
             'owner_pid': os.getpid(), 'owner_identity': process_identity(os.getpid()),
-            'interactive': True, 'tty': False, 'persistent': True}
+            'interactive': True, 'tty': False, 'persistent': True, 'shell_kind': shell_kind}
     spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding='utf-8')
     runner = [sys.executable, str(Path(__file__).with_name('command_lease_runner.py')), str(spec_path)]
     outer_exe, outer_kind, outer_prefix = bt._resolve_shell('cmd' if os.name == 'nt' else 'sh', os.name == 'nt')

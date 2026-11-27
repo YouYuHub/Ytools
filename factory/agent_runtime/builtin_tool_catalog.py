@@ -390,7 +390,11 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
  'function': {'name': 'run_command',
               'description': '运行命令，每次新建 shell，默认短等 5000ms（交互式 1000ms）；未结束返回 job_id。'
                              '用 poll_command(job_id) 续取输出，stop_command(job_id) 停止。'
-                             '需输入设 interactive=true，需终端再加 tty=true；独立服务用 background=true。文件读写优先专用工具。',
+                             '需输入设 interactive=true，需终端再加 tty=true；独立服务用 background=true。文件读写优先专用工具。'
+                             'PowerShell 5.1 收发 JSON 中文必须带 charset=utf-8（请求 ContentType 与响应头都要），'
+                             '否则按 latin-1 编解码乱码；服务端不配合时改用 pwsh 或 Python 发请求。'
+                             'python -c/node -e 内联代码的引号嵌套/转义会自动改写还原，'
+                             '直接写即可，无需手写临时文件。',
               'parameters': {'type': 'object',
                              'properties': {'command': {'type': 'string',
                                                         'description': '目标 shell 的命令原文；语法须与 shell 一致。cmd 用 '
@@ -422,12 +426,16 @@ RUN_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                                            'description': 'true 启动后台任务并返回 job_id；不受 '
                                                                           'timeout_seconds 限制，结束后仍可查询日志。',
                                                            'default': False},
-                                            'yield_time_ms': {'type': 'integer', 'minimum': 0, 'maximum': 30000,
-                                                              'description': '启动后最多等待多久，默认 5000ms（交互式默认 1000ms），0 立即返回。与 background 互斥；总超时仍由 timeout_seconds 控制。'},
+                                            'yield_time_ms': {'type': 'integer', 'minimum': 0, 'maximum': 120000,
+                                                              'description': '启动后最多等待多久，范围 0-120000，默认 5000ms（交互式默认 1000ms），0 立即返回。与 background 互斥；总超时仍由 timeout_seconds 控制。'},
                                             'interactive': {'type': 'boolean', 'default': False,
-                                                            'description': '保持 UTF-8 stdin 可写；用 write_stdin 继续输入。与 background 互斥，任务结束时停止。'},
+                                                            'description': '保持 stdin 可写（编码跟随会话终端实际代码页）；用 write_stdin 继续输入。与 background 互斥，任务结束时停止。'},
                                             'tty': {'type': 'boolean', 'default': False,
-                                                    'description': '启用伪终端（120×30），自动启用 interactive。用于 REPL/需 TTY 的程序；输出可能含 ANSI 控制码。'},
+                                                    'description': '启用伪终端（默认 120×30，可用 tty_cols/tty_rows 调整），自动启用 interactive。用于 REPL/需 TTY 的程序；输出可能含 ANSI 控制码。'},
+                                            'tty_cols': {'type': 'integer', 'minimum': 20, 'maximum': 500, 'default': 120,
+                                                         'description': '伪终端列数，需 tty=true，默认 120。'},
+                                            'tty_rows': {'type': 'integer', 'minimum': 5, 'maximum': 200, 'default': 30,
+                                                         'description': '伪终端行数，需 tty=true，默认 30。'},
                                              'session_id': {'type': 'string', 'default': '', 'maxLength': 64,
                                                             'description': '可选常驻 shell 会话名：同名复用同一 shell，保住 cwd/环境变量/REPL 状态；'
                                                                            '不传=每次新建（现有行为）。用 stop_command(job_id) 关闭。'},
@@ -455,7 +463,7 @@ POLL_COMMAND_TOOL_DEFINITION = {'type': 'function',
                                                                            '可配 wait_seconds（边等边看尾部）与 encoding。'},
                                             'cursor': {'type': 'string', 'maxLength': 512,
                                                        'description': '通常省略。空字符串从头重读；传 next_cursor 从指定位置读，之后自动续读。'},
-                                            'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 30, 'default': 1,
+                                            'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 120, 'default': 1,
                                                              'description': '无新增输出时最多等待秒数，默认 1；0 立即查询。'},
                                             'encoding': {'type': 'string', 'maxLength': 64,
                                                          'description': '默认自动识别；乱码时指定如 gbk，后续沿用；空字符串恢复自动识别。'},
@@ -505,8 +513,8 @@ WRITE_STDIN_TOOL_DEFINITION = {'type': 'function', 'function': {
                 'description': '发送完 chars 后关闭管道 stdin；PTY 不支持此选项。'},
         'cursor': {'type': 'string', 'maxLength': 512,
                    'description': '通常省略，与 poll_command 共用读取位置；空字符串重读，next_cursor 指定位置。'},
-        'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 30, 'default': 1,
-                         'description': '发送后无新增输出时最多等待秒数，默认 1，范围 0-30。'},
+        'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 120, 'default': 1,
+                         'description': '发送后无新增输出时最多等待秒数，默认 1，范围 0-120。'},
         'request_id': {'type': 'string', 'maxLength': 128, 'minLength': 1,
                        'description': '可选去重标识；重试同一输入沿用它。只传 job_id/request_id 查回执，不重发；queued/writing 时先查询，勿换标识重发。'},
     }, 'required': ['job_id'], 'additionalProperties': False}}}

@@ -139,7 +139,7 @@ class NonChineseCodepageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='工具目录_') as folder:
             with patch.object(bt, '_BG_LOG_DIR', Path(folder)), \
                  patch.object(bt, '_merged_child_env', return_value={'PATH': 'D:\\软件\\bin'}), \
-                 patch.object(bt, 'cmd_script_bytes', lambda text, ansi='mbcs': cmd_script_bytes(text, 'cp1252')), \
+                 patch.object(bt, 'cmd_script_bytes', lambda text, ansi='mbcs', **kw: cmd_script_bytes(text, 'cp1252')), \
                  patch.object(bt, 'wscript_text_bytes', lambda text, ansi='mbcs': wscript_text_bytes(text, 'cp1252')), \
                  patch.object(bt, '_wmi_create_process', return_value=4321):
                 info = bt._write_relay_script('echo 你好', folder, 'cmd.exe', 'cmd', None, 'fg')
@@ -151,13 +151,28 @@ class NonChineseCodepageTests(unittest.TestCase):
             self.assertIn('echo 你好'.encode('utf-8'), runner)
             self.assertTrue(Path(info['vbs']).read_bytes().startswith(codecs.BOM_UTF16_LE))
 
-    def test_runner_interactive_cmd_forces_utf8_console(self):
+    def test_runner_interactive_cmd_uses_traditional_oem_console(self):
+        # 交互式 cmd 会话控制台固定地区传统 OEM 页（stdin/批处理/输出全跟输出
+        # 口径；cmd 在 65001 下读管道 stdin 会逐字节变 U+FFFD，实测硬伤）：
+        # 脚本自带 chcp 自校正 + 按传统 OEM 编码落盘。
         with tempfile.TemporaryDirectory() as folder:
             runner = Path(folder, 'run.cmd')
-            bt._write_runner_script(runner, 'cmd', 'echo 中文', utf8_console=True)
+            with patch.object(bt, 'traditional_oem_cp', return_value=936), \
+                    patch.object(bt, 'traditional_oem_codec', return_value='gbk'):
+                bt._write_runner_script(runner, 'cmd', 'echo 中文', interactive_cmd=True)
             data = runner.read_bytes()
-            self.assertTrue(data.startswith(b'@chcp 65001 >nul\r\n'))
-            self.assertIn('echo 中文'.encode('utf-8'), data)
+            self.assertTrue(data.startswith('@chcp 936 >nul\r\n'.encode('ascii')))
+            self.assertIn('echo 中文'.encode('gbk'), data)
+
+    def test_runner_interactive_cmd_rejects_unencodable_chars_loudly(self):
+        # 超集字符（emoji）在 OEM 页写不下：大声报错并指引，不静默建出必乱码的会话
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Path(folder, 'run.cmd')
+            with patch.object(bt, 'traditional_oem_cp', return_value=936), \
+                    patch.object(bt, 'traditional_oem_codec', return_value='gbk'):
+                with self.assertRaises(ValueError) as ctx:
+                    bt._write_runner_script(runner, 'cmd', 'echo 🎉', interactive_cmd=True)
+        self.assertIn('powershell', str(ctx.exception).lower())
 
     def test_gbk_not_mojibake_under_western_locale(self):
         text = '名称,内容\n工具,中文说明\n'

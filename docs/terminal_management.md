@@ -7,8 +7,8 @@ Windows 上短暂占用命令记录／输入回执文件时，原子替换会有
 ## 短等待和增量输出
 
 - 模型通常只需 `run_command(command=...)` → `poll_command(job_id)` → 按需 `stop_command(job_id)`。默认短等 5000ms（交互式 1000ms）；尚在运行时返回 `job_id`，5 秒内命令在首次调用中返回最终状态。命令仍属前台任务，受总超时约束；任务结束、停止、所属子任务退出或工作进程消失时回收。独立监督进程负责超时和所属进程检查。
-- `yield_time_ms` 为 0–30000 毫秒，默认 5000（交互式默认 1000），0 立即返回；显式指定时与 `background=true` 互斥。启动和预处理可能额外占用时间，故它不代表整个工具调用严格在该时长内返回。Windows cmd 的本地 head/tail 兜底需要完整输出，此少见情况默认仍等结束；可直接运行上游命令以短等返回。
-- `poll_command(job_id)` 自动续取新增 `output`，默认无输出时最多等 1 秒，`wait_seconds=0–30` 可调。`status=running` 或 `has_more=true` 时继续查询；命令退出不表示输出已读完。以 `status/exit_code/timed_out` 判断执行结果，不以是否有输出判断成功。
+- `yield_time_ms` 为 0–120000 毫秒，默认 5000（交互式默认 1000），0 立即返回；显式指定时与 `background=true` 互斥。启动和预处理可能额外占用时间，故它不代表整个工具调用严格在该时长内返回。Windows cmd 的本地 head/tail 兜底需要完整输出，此少见情况默认仍等结束；可直接运行上游命令以短等返回。
+- `poll_command(job_id)` 自动续取新增 `output`，默认无输出时最多等 1 秒，`wait_seconds=0–120` 可调。`status=running` 或 `has_more=true` 时继续查询；命令退出不表示输出已读完。以 `status/exit_code/timed_out` 判断执行结果，不以是否有输出判断成功。
 - 位置按会话、任务和代理隔离，并持久化到命令记录；首次 run 返回的输出已经计入位置。`poll_command` 与 `write_stdin` 共用位置，同一消费者并发读取串行处理；页面查看日志不会推进模型位置。每个命令最多保存 64 个消费者，超出后淘汰最久未使用者，该消费者下次从头读。网络丢包等情况仍可显式重读，不承诺消息端到端只交付一次。
 - `cursor=""` 从头重读，传 `next_cursor` 从指定位置读；显式读取也更新后续自动位置。自动位置遇到日志替换/截断时从头读取并返回 `output_reset=true`；显式失效游标报错并提示从头重读。位置保存失败时仍返回输出/输入回执及 `cursor_saved=false`，后续显式传 `next_cursor` 继续。未完成的多字节字符延后解码。
 - 乱码时可指定 `encoding`，后续自动沿用；`encoding=""` 恢复自动识别，不固定自动探测出的编码，以支持 Windows 混合编码输出。
@@ -19,7 +19,7 @@ Windows 上短暂占用命令记录／输入回执文件时，原子替换会有
 
 ## 交互输入与 PTY
 
-- `run_command(..., interactive=true)` 保持 UTF-8 管道 stdin 可写，默认短等 1000ms 返回；`tty=true` 自动启用交互，提供 120×30 伪终端，适用于 REPL。Windows 需要项目依赖 `pywinpty`，POSIX 使用系统 PTY。两者均与 `background=true` 互斥，继承前台任务生命周期和总超时。
+- `run_command(..., interactive=true)` 保持 UTF-8 管道 stdin 可写，默认短等 1000ms 返回；`tty=true` 自动启用交互，提供伪终端（默认 120×30，可用 `tty_cols`/`tty_rows` 调整），适用于 REPL。Windows 需要项目依赖 `pywinpty`，POSIX 使用系统 PTY。两者均与 `background=true` 互斥，继承前台任务生命周期和总超时。
 - `write_stdin(job_id, chars, cursor?, wait_seconds?, eof?, request_id?)` 原样发送并自动续取输出，默认无输出时最多等 1 秒，通常不用传 cursor。提交一行须显式包含换行（如管道 `\n`，终端回车 `\r`）。单次最多 16384 字符/64KiB；`eof=true` 关闭管道 stdin，PTY 拒绝此选项。无输入且不带 request_id 时等同 `poll_command(job_id)`，也可读取非交互命令。
 - 输入或查询输入回执限制在同一会话、任务和代理，发送前检查进程身份；只读日志按会话校验。ask 权限模式下，非空输入或 EOF 须审批，并绑定审批时的终端身份；空输入不另审批。
 - 结果含 `input_status=accepted|queued|writing|failed|not_sent`、`input_bytes`、`request_id` 和增量输出字段。`accepted` 只表示已写入 stdin，不代表程序处理成功。只传 `job_id/request_id` 可查回执，不重发输入；需重试时沿用同一 `request_id` 与原文，相同 ID 不重发、内容不同会拒绝。每个终端最多 1024 个输入请求；输入队列正文被处理后删除，回执仅保留摘要与状态。进程异常退出时 `writing` 可能表示部分写入，不能换 ID 自动重发。
